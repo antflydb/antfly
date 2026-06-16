@@ -117,6 +117,95 @@ pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
     };
 }
 
+pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try appendLine(alloc, &out, "result", resultName(result));
+    switch (result) {
+        .identify_system => |response| {
+            try appendIdentityLines(alloc, &out, "identity", response.identity);
+            try appendU64Line(alloc, &out, "current_lsn", response.current_lsn);
+            try appendU64Line(alloc, &out, "next_lsn", response.next_lsn);
+            try appendU64Line(alloc, &out, "record_format_version", response.record_format_version);
+        },
+        .slot => |slot_result| try appendSlotResultLines(alloc, &out, slot_result),
+        .slot_list => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
+        .seed_begin => |response| {
+            try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
+            try appendU64Line(alloc, &out, "start_record_lsn", response.start_record_lsn);
+        },
+        .start_replication => |response| {
+            try appendLine(alloc, &out, "slot_name", response.slot_name);
+            try appendU64Line(alloc, &out, "timeline_id", response.timeline_id);
+            try appendU64Line(alloc, &out, "from_lsn", response.from_lsn);
+            try appendU64Line(alloc, &out, "current_lsn", response.current_lsn);
+            try appendU64Line(alloc, &out, "last_sent_lsn", response.last_sent_lsn);
+            try appendU64Line(alloc, &out, "next_lsn", response.next_lsn);
+            try appendBoolLine(alloc, &out, "end_of_wal", response.end_of_wal);
+            try appendUsizeLine(alloc, &out, "encoded_bytes", response.encoded_bytes);
+            try appendUsizeLine(alloc, &out, "record_count", response.records.len);
+        },
+        .standby_status_update => |response| {
+            try appendLine(alloc, &out, "slot_name", response.slot_name);
+            try appendU64Line(alloc, &out, "timeline_id", response.timeline_id);
+            try appendU64Line(alloc, &out, "received_lsn", response.received_lsn);
+            try appendU64Line(alloc, &out, "applied_lsn", response.applied_lsn);
+            try appendU64Line(alloc, &out, "restart_lsn", response.restart_lsn);
+            try appendU64Line(alloc, &out, "current_lsn", response.current_lsn);
+        },
+        .primary_status => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
+        .standby_status => |snapshot| try appendStandbySnapshotLines(alloc, &out, snapshot),
+        .primary_metrics => |snapshot| try appendPrimaryMetricsLines(alloc, &out, snapshot),
+        .standby_metrics => |snapshot| try appendStandbyMetricsLines(alloc, &out, snapshot),
+        .commit_check => |gate| {
+            try appendU64Line(alloc, &out, "target_lsn", gate.target_lsn);
+            try appendLine(alloc, &out, "action", @tagName(gate.action));
+            try appendLine(alloc, &out, "durability.status", @tagName(gate.decision.status));
+            try appendLine(alloc, &out, "durability.mode", @tagName(gate.decision.mode));
+            try appendLine(alloc, &out, "durability.selection", @tagName(gate.decision.selection));
+            try appendU64Line(alloc, &out, "durability.target_lsn", gate.decision.target_lsn);
+            try appendUsizeLine(alloc, &out, "durability.satisfied_count", gate.decision.satisfied_count);
+            try appendUsizeLine(alloc, &out, "durability.required_count", gate.decision.required_count);
+            try appendUsizeLine(alloc, &out, "durability.candidate_count", gate.decision.candidate_count);
+        },
+        .read_check => |decision| {
+            try appendLine(alloc, &out, "action", @tagName(decision.action));
+            try appendLine(alloc, &out, "consistency", @tagName(decision.consistency));
+            try appendOptionalU64Line(alloc, &out, "required_lsn", decision.required_lsn);
+            try appendU64Line(alloc, &out, "received_lsn", decision.received_lsn);
+            try appendU64Line(alloc, &out, "applied_lsn", decision.applied_lsn);
+            try appendU64Line(alloc, &out, "safe_read_lsn", decision.safe_read_lsn);
+            try appendOptionalU64Line(alloc, &out, "serve_lsn", decision.serve_lsn);
+            try appendU64Line(alloc, &out, "missing_lsn_count", decision.missing_lsn_count);
+        },
+        .promote => |promotion_result| {
+            try appendPromotionAssessmentLines(alloc, &out, "assessment", promotion_result.assessment);
+            try appendU64Line(alloc, &out, "promotion.switch_lsn", promotion_result.promotion.switch_lsn);
+            try appendIdentityLines(alloc, &out, "promotion.old_identity", promotion_result.promotion.old_identity);
+            try appendIdentityLines(alloc, &out, "promotion.new_identity", promotion_result.promotion.new_identity);
+            try appendBoolLine(alloc, &out, "promotion.forced", promotion_result.promotion.forced);
+            try appendBoolLine(alloc, &out, "promotion.data_loss_possible", promotion_result.promotion.data_loss_possible);
+            try appendU64Line(alloc, &out, "fence_generation", promotion_result.fence_generation);
+            try appendLine(alloc, &out, "fence_token", promotion_result.fence_token);
+            try appendBoolLine(alloc, &out, "forced", promotion_result.forced);
+        },
+        .rejoin_assess => |assessment| {
+            try appendLine(alloc, &out, "action", @tagName(assessment.action));
+            try appendLine(alloc, &out, "reason", @tagName(assessment.reason));
+            try appendLine(alloc, &out, "former_node_id", assessment.former_node_id);
+            try appendU64Line(alloc, &out, "target_timeline_id", assessment.target_timeline_id);
+            try appendU64Line(alloc, &out, "target_epoch", assessment.target_epoch);
+            try appendU64Line(alloc, &out, "fork_lsn", assessment.fork_lsn);
+            try appendU64Line(alloc, &out, "former_last_lsn", assessment.former_last_lsn);
+            try appendU64Line(alloc, &out, "retained_from_lsn", assessment.retained_from_lsn);
+            try appendBoolLine(alloc, &out, "data_loss_discarded", assessment.data_loss_discarded);
+        },
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn renderOutputAlloc(alloc: Allocator, result: Result, output: admin_cli.OutputFormat) !RenderedOutput {
     return switch (output) {
         .json => .{
@@ -127,7 +216,10 @@ pub fn renderOutputAlloc(alloc: Allocator, result: Result, output: admin_cli.Out
             .content_type = "text/plain; version=0.0.4",
             .body = try renderPrometheusAlloc(alloc, result),
         },
-        .table => error.TableOutputRequiresIntegration,
+        .table => .{
+            .content_type = "text/plain; charset=utf-8",
+            .body = try renderTableAlloc(alloc, result),
+        },
     };
 }
 
@@ -215,6 +307,333 @@ fn requireStandby(ctx: Context) !*standby_mod.Standby {
 
 fn requireFenceStore(ctx: Context) !*fencing.Store {
     return ctx.fence_store orelse error.FenceStoreUnavailable;
+}
+
+fn resultName(result: Result) []const u8 {
+    return switch (result) {
+        .identify_system => "identify_system",
+        .slot => "slot",
+        .slot_list => "slot_list",
+        .seed_begin => "seed_begin",
+        .start_replication => "start_replication",
+        .standby_status_update => "standby_status_update",
+        .primary_status => "primary_status",
+        .standby_status => "standby_status",
+        .primary_metrics => "primary_metrics",
+        .standby_metrics => "standby_metrics",
+        .commit_check => "commit_check",
+        .read_check => "read_check",
+        .promote => "promote",
+        .rejoin_assess => "rejoin_assess",
+    };
+}
+
+fn appendSlotResultLines(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), result: admin.SlotResult) !void {
+    switch (result) {
+        .create => |slot| {
+            try appendLine(alloc, out, "slot_action", "create");
+            try appendCreateSlotResponseLines(alloc, out, slot);
+        },
+        .pause => |slot| {
+            try appendLine(alloc, out, "slot_action", "pause");
+            try appendSlotLifecycleResponseLines(alloc, out, slot);
+        },
+        .@"resume" => |slot| {
+            try appendLine(alloc, out, "slot_action", "resume");
+            try appendSlotLifecycleResponseLines(alloc, out, slot);
+        },
+        .drop => |slot| {
+            try appendLine(alloc, out, "slot_action", "drop");
+            try appendSlotLifecycleResponseLines(alloc, out, slot);
+        },
+    }
+}
+
+fn appendCreateSlotResponseLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    slot: replication_api.CreateReplicationSlotResponse,
+) !void {
+    try appendLine(alloc, out, "slot_name", slot.slot_name);
+    try appendU64Line(alloc, out, "timeline_id", slot.timeline_id);
+    try appendU64Line(alloc, out, "restart_lsn", slot.restart_lsn);
+    try appendU64Line(alloc, out, "received_lsn", slot.received_lsn);
+    try appendU64Line(alloc, out, "applied_lsn", slot.applied_lsn);
+    try appendBoolLine(alloc, out, "active", slot.active);
+    try appendBoolLine(alloc, out, "reseed_required", slot.reseed_required);
+    try appendU64Line(alloc, out, "current_lsn", slot.current_lsn);
+}
+
+fn appendSlotLifecycleResponseLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    slot: replication_api.SlotLifecycleResponse,
+) !void {
+    try appendLine(alloc, out, "slot_name", slot.slot_name);
+    try appendU64Line(alloc, out, "timeline_id", slot.timeline_id);
+    try appendU64Line(alloc, out, "restart_lsn", slot.restart_lsn);
+    try appendU64Line(alloc, out, "received_lsn", slot.received_lsn);
+    try appendU64Line(alloc, out, "applied_lsn", slot.applied_lsn);
+    try appendBoolLine(alloc, out, "active", slot.active);
+    try appendBoolLine(alloc, out, "reseed_required", slot.reseed_required);
+    try appendU64Line(alloc, out, "current_lsn", slot.current_lsn);
+    try appendBoolLine(alloc, out, "dropped", slot.dropped);
+}
+
+fn appendPrimarySnapshotLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: status.PrimarySnapshot,
+) !void {
+    try appendLine(alloc, out, "role", @tagName(snapshot.role));
+    try appendIdentityLines(alloc, out, "identity", snapshot.identity);
+    try appendU64Line(alloc, out, "current_lsn", snapshot.current_lsn);
+    try appendUsizeLine(alloc, out, "slot_count", snapshot.slots.len);
+    try appendU64Line(alloc, out, "retention.primary_lsn", snapshot.retention.primary_lsn);
+    try appendU64Line(alloc, out, "retention.oldest_restart_lsn", snapshot.retention.oldest_restart_lsn);
+    try appendU64Line(alloc, out, "retention.retained_lsn_count", snapshot.retention.retained_lsn_count);
+    try appendUsizeLine(alloc, out, "retention.active_slots", snapshot.retention.active_slots);
+    try appendUsizeLine(alloc, out, "retention.reseed_recommended", snapshot.retention.reseed_recommended);
+
+    if (snapshot.durability) |decision| {
+        try appendBoolLine(alloc, out, "durability.configured", true);
+        try appendLine(alloc, out, "durability.status", @tagName(decision.status));
+        try appendLine(alloc, out, "durability.mode", @tagName(decision.mode));
+        try appendLine(alloc, out, "durability.selection", @tagName(decision.selection));
+        try appendU64Line(alloc, out, "durability.target_lsn", decision.target_lsn);
+        try appendUsizeLine(alloc, out, "durability.satisfied_count", decision.satisfied_count);
+        try appendUsizeLine(alloc, out, "durability.required_count", decision.required_count);
+        try appendUsizeLine(alloc, out, "durability.candidate_count", decision.candidate_count);
+    } else {
+        try appendBoolLine(alloc, out, "durability.configured", false);
+    }
+
+    for (snapshot.slots, 0..) |slot, idx| try appendSlotSnapshotLines(alloc, out, idx, slot);
+}
+
+fn appendSlotSnapshotLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    idx: usize,
+    slot: status.SlotSnapshot,
+) !void {
+    try appendIndexedLine(alloc, out, "slots", idx, "name", slot.name);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "timeline_id", slot.timeline_id);
+    try appendIndexedBoolLine(alloc, out, "slots", idx, "active", slot.active);
+    try appendIndexedBoolLine(alloc, out, "slots", idx, "reseed_required", slot.reseed_required);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "restart_lsn", slot.restart_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "received_lsn", slot.received_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "applied_lsn", slot.applied_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "write_lag_lsn", slot.write_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "apply_lag_lsn", slot.apply_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "retention_lag_lsn", slot.retention_lag_lsn);
+    try appendIndexedLine(alloc, out, "slots", idx, "status", @tagName(slot.status));
+}
+
+fn appendStandbySnapshotLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: status.StandbySnapshot,
+) !void {
+    try appendLine(alloc, out, "role", @tagName(snapshot.role));
+    try appendIdentityLines(alloc, out, "identity", snapshot.identity);
+    try appendU64Line(alloc, out, "received_lsn", snapshot.received_lsn);
+    try appendU64Line(alloc, out, "applied_lsn", snapshot.applied_lsn);
+    try appendU64Line(alloc, out, "safe_read_lsn", snapshot.safe_read_lsn);
+    try appendOptionalU64Line(alloc, out, "upstream_lsn", snapshot.upstream_lsn);
+    try appendOptionalU64Line(alloc, out, "receive_lag_lsn", snapshot.receive_lag_lsn);
+    try appendOptionalU64Line(alloc, out, "apply_lag_lsn", snapshot.apply_lag_lsn);
+    try appendU64Line(alloc, out, "unapplied_lsn_count", snapshot.unapplied_lsn_count);
+    try appendBoolLine(alloc, out, "caught_up_to_received", snapshot.caught_up_to_received);
+    try appendBoolLine(alloc, out, "can_serve_safe_reads", snapshot.can_serve_safe_reads);
+}
+
+fn appendPrimaryMetricsLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: metrics.PrimaryMetrics,
+) !void {
+    try appendU64Line(alloc, out, "current_lsn", snapshot.current_lsn);
+    try appendU64Line(alloc, out, "slot_count", snapshot.slot_count);
+    try appendU64Line(alloc, out, "active_slots", snapshot.active_slots);
+    try appendU64Line(alloc, out, "reseed_required_slots", snapshot.reseed_required_slots);
+    try appendU64Line(alloc, out, "max_write_lag_lsn", snapshot.max_write_lag_lsn);
+    try appendU64Line(alloc, out, "max_apply_lag_lsn", snapshot.max_apply_lag_lsn);
+    try appendU64Line(alloc, out, "max_retention_lag_lsn", snapshot.max_retention_lag_lsn);
+    try appendU64Line(alloc, out, "retention_oldest_restart_lsn", snapshot.retention_oldest_restart_lsn);
+    try appendU64Line(alloc, out, "retention_retained_lsn_count", snapshot.retention_retained_lsn_count);
+    try appendU64Line(alloc, out, "retention_active_slots", snapshot.retention_active_slots);
+    try appendU64Line(alloc, out, "retention_reseed_recommended", snapshot.retention_reseed_recommended);
+    try appendU64Line(alloc, out, "durability_configured", snapshot.durability_configured);
+    try appendU64Line(alloc, out, "durability_satisfied", snapshot.durability_satisfied);
+    try appendU64Line(alloc, out, "durability_degraded", snapshot.durability_degraded);
+    try appendU64Line(alloc, out, "durability_status_code", snapshot.durability_status_code);
+    try appendU64Line(alloc, out, "durability_required_count", snapshot.durability_required_count);
+    try appendU64Line(alloc, out, "durability_satisfied_count", snapshot.durability_satisfied_count);
+    try appendU64Line(alloc, out, "durability_candidate_count", snapshot.durability_candidate_count);
+
+    for (snapshot.slots, 0..) |slot, idx| try appendSlotMetricsLines(alloc, out, idx, slot);
+}
+
+fn appendSlotMetricsLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    idx: usize,
+    slot: metrics.SlotMetrics,
+) !void {
+    try appendIndexedLine(alloc, out, "slots", idx, "name", slot.name);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "active", slot.active);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "reseed_required", slot.reseed_required);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "received_lsn", slot.received_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "applied_lsn", slot.applied_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "restart_lsn", slot.restart_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "write_lag_lsn", slot.write_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "apply_lag_lsn", slot.apply_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "retention_lag_lsn", slot.retention_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "status_code", slot.status_code);
+}
+
+fn appendStandbyMetricsLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: metrics.StandbyMetrics,
+) !void {
+    try appendU64Line(alloc, out, "received_lsn", snapshot.received_lsn);
+    try appendU64Line(alloc, out, "applied_lsn", snapshot.applied_lsn);
+    try appendU64Line(alloc, out, "safe_read_lsn", snapshot.safe_read_lsn);
+    try appendU64Line(alloc, out, "upstream_configured", snapshot.upstream_configured);
+    try appendU64Line(alloc, out, "receive_lag_lsn", snapshot.receive_lag_lsn);
+    try appendU64Line(alloc, out, "apply_lag_lsn", snapshot.apply_lag_lsn);
+    try appendU64Line(alloc, out, "unapplied_lsn_count", snapshot.unapplied_lsn_count);
+    try appendU64Line(alloc, out, "caught_up_to_received", snapshot.caught_up_to_received);
+    try appendU64Line(alloc, out, "can_serve_safe_reads", snapshot.can_serve_safe_reads);
+}
+
+fn appendPromotionAssessmentLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    assessment: status.PromotionAssessment,
+) !void {
+    try appendPrefixedU64Line(alloc, out, prefix, "required_lsn", assessment.required_lsn);
+    try appendPrefixedU64Line(alloc, out, prefix, "received_lsn", assessment.received_lsn);
+    try appendPrefixedU64Line(alloc, out, prefix, "applied_lsn", assessment.applied_lsn);
+    try appendPrefixedBoolLine(alloc, out, prefix, "has_required_lsn", assessment.has_required_lsn);
+    try appendPrefixedBoolLine(alloc, out, prefix, "caught_up_to_received", assessment.caught_up_to_received);
+    try appendPrefixedBoolLine(alloc, out, prefix, "fencing_confirmed", assessment.fencing_confirmed);
+    try appendPrefixedBoolLine(alloc, out, prefix, "force", assessment.force);
+    try appendPrefixedBoolLine(alloc, out, prefix, "data_loss_possible", assessment.data_loss_possible);
+    try appendPrefixedBoolLine(alloc, out, prefix, "safe", assessment.safe);
+    try appendPrefixedBoolLine(alloc, out, prefix, "requires_fencing", assessment.requires_fencing);
+    try appendPrefixedBoolLine(alloc, out, prefix, "requires_force", assessment.requires_force);
+    try appendPrefixedBoolLine(alloc, out, prefix, "can_promote", assessment.can_promote);
+}
+
+fn appendIdentityLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    identity: standby_mod.Identity,
+) !void {
+    try appendPrefixedU64Line(alloc, out, prefix, "cluster_id", identity.cluster_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "shard_id", identity.shard_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "table_id", identity.table_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "timeline_id", identity.timeline_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "epoch", identity.epoch);
+}
+
+fn appendLine(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
+    try out.appendSlice(alloc, key);
+    try out.append(alloc, '=');
+    try out.appendSlice(alloc, value);
+    try out.append(alloc, '\n');
+}
+
+fn appendU64Line(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: u64) !void {
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{d}", .{value});
+    try appendLine(alloc, out, key, text);
+}
+
+fn appendUsizeLine(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: usize) !void {
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{d}", .{value});
+    try appendLine(alloc, out, key, text);
+}
+
+fn appendBoolLine(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
+    try appendLine(alloc, out, key, if (value) "true" else "false");
+}
+
+fn appendOptionalU64Line(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: ?u64) !void {
+    if (value) |present| {
+        try appendU64Line(alloc, out, key, present);
+    } else {
+        try appendLine(alloc, out, key, "-");
+    }
+}
+
+fn appendPrefixedU64Line(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    suffix: []const u8,
+    value: u64,
+) !void {
+    const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, suffix });
+    defer alloc.free(key);
+    try appendU64Line(alloc, out, key, value);
+}
+
+fn appendPrefixedBoolLine(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    suffix: []const u8,
+    value: bool,
+) !void {
+    const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, suffix });
+    defer alloc.free(key);
+    try appendBoolLine(alloc, out, key, value);
+}
+
+fn appendIndexedLine(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    idx: usize,
+    suffix: []const u8,
+    value: []const u8,
+) !void {
+    const key = try std.fmt.allocPrint(alloc, "{s}.{d}.{s}", .{ prefix, idx, suffix });
+    defer alloc.free(key);
+    try appendLine(alloc, out, key, value);
+}
+
+fn appendIndexedU64Line(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    idx: usize,
+    suffix: []const u8,
+    value: u64,
+) !void {
+    const key = try std.fmt.allocPrint(alloc, "{s}.{d}.{s}", .{ prefix, idx, suffix });
+    defer alloc.free(key);
+    try appendU64Line(alloc, out, key, value);
+}
+
+fn appendIndexedBoolLine(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    idx: usize,
+    suffix: []const u8,
+    value: bool,
+) !void {
+    const key = try std.fmt.allocPrint(alloc, "{s}.{d}.{s}", .{ prefix, idx, suffix });
+    defer alloc.free(key);
+    try appendBoolLine(alloc, out, key, value);
 }
 
 const TestPaths = struct {
@@ -348,6 +767,13 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(prometheus_body, "antfly_ha_primary_current_lsn 2\n");
     try expectContains(prometheus_body, "antfly_ha_slot_apply_lag_lsn{slot=\"standby-a\"} 1\n");
 
+    const table_body = try renderTableAlloc(alloc, primary_metrics);
+    defer alloc.free(table_body);
+    try expectContains(table_body, "result=primary_metrics\n");
+    try expectContains(table_body, "current_lsn=2\n");
+    try expectContains(table_body, "slot_count=1\n");
+    try expectContains(table_body, "slots.0.name=standby-a\n");
+
     var rendered_plan = try admin_cli.parse(alloc, &.{ "--prometheus", "status", "primary", "--view", "metrics", "--max-lag-lsn", "10" });
     defer rendered_plan.deinit(alloc);
     var rendered = try executeAndRenderAlloc(alloc, .{ .primary = &primary }, rendered_plan);
@@ -454,7 +880,12 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
 
     var table_plan = try admin_cli.parse(alloc, &.{ "--table", "read", "check", "--at-least-lsn", "1" });
     defer table_plan.deinit(alloc);
-    try std.testing.expectError(error.TableOutputRequiresIntegration, executeAndRenderAlloc(alloc, .{ .standby = &standby }, table_plan));
+    var rendered_table = try executeAndRenderAlloc(alloc, .{ .standby = &standby }, table_plan);
+    defer rendered_table.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", rendered_table.content_type);
+    try expectContains(rendered_table.body, "result=read_check\n");
+    try expectContains(rendered_table.body, "action=serve_standby\n");
+    try expectContains(rendered_table.body, "applied_lsn=");
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
