@@ -62386,6 +62386,21 @@ fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
     return true;
 }
 
+fn appParityFixtureSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    const expected = entry.summary.select orelse return true;
+    return switch (entry.family) {
+        .ddl => true,
+        .query,
+        .read,
+        .window,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":select=", expected),
+        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":select=", expected) or
+            appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_insert=", expected),
+        .merge_mutation => appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_insert=", expected),
+        else => false,
+    };
+}
+
 fn appParityFixtureAllowsJoinSelectSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .join,
@@ -62909,6 +62924,9 @@ fn validateAppParityFixtureMetadata(
     if (!appParityFixtureAggregateSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
+    if (!appParityFixtureSelectSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.join_select != null and !appParityFixtureAllowsJoinSelectSummary(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -63190,6 +63208,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "query:table=usage_records:ctes=1:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc);
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query select summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid query select summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc);
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid mutation source pagination summary",
         .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed' ORDER BY id LIMIT 5 OFFSET 2",
@@ -63237,6 +63271,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1 },
         .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale merge select summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .select = 2 },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=1:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid merge select summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, status) VALUES (source.id, source.status)",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .select = 2 },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=2:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{
         .name = "valid insert source operations summary",
