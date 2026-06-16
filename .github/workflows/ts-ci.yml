@@ -25,7 +25,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: ["22.x"]
+        node-version: ["24.x"]
 
     steps:
       - uses: actions/checkout@v6
@@ -97,7 +97,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version: 24.x
 
       - name: Configure pnpm cache
         run: pnpm config set store-dir "$PNPM_STORE_PATH"
