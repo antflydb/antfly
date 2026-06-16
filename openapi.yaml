@@ -16405,11 +16405,15 @@ components:
 
             Temporal foreign keys with `period` on both child and parent
 
-            references are restrictive-only: `restrict` / `no_action` are
+            references accept restrictive actions plus bounded delete-side
 
-            accepted, while mutating `set_null` / `cascade` actions are rejected
+            `set_null` / `cascade` actions through remaining-coverage proofs.
 
-            because period coverage is validated as range ownership.
+            Mutating temporal update actions are rejected because changing a
+
+            parent interval/key requires update-side period action semantics
+
+            broader than a scalar child-row rewrite.
 
             `match: "simple"` is the default; `full` is accepted for composite
 
