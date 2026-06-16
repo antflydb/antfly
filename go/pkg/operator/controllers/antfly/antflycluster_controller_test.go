@@ -167,8 +167,9 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: antflyv1.AntflyClusterSpec{
-			Image:           "antfly:test",
-			ImagePullPolicy: "IfNotPresent",
+			Image:              "antfly:test",
+			ImagePullPolicy:    "IfNotPresent",
+			ServiceAccountName: "antfly-ha-admin",
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
 				Mode: antflyv1.HAModeHotStandby,
 				Admin: &antflyv1.HAAdminSpec{
@@ -238,6 +239,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
 	g.Expect(createSlotJob.Spec.Template.Spec.Volumes).To(HaveLen(1))
 	g.Expect(createSlotJob.Spec.Template.Spec.Volumes[0].Name).To(Equal("ha-seed"))
+	g.Expect(createSlotJob.Spec.Template.Spec.ServiceAccountName).To(Equal("antfly-ha-admin"))
 	container := createSlotJob.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Command).To(Equal([]string{"/antfly"}))
 	g.Expect(container.EnvFrom).To(HaveLen(1))

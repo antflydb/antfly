@@ -4039,8 +4039,9 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					RestartPolicy:   corev1.RestartPolicyOnFailure,
-					SecurityContext: antflyPodSecurityContext(),
+					ServiceAccountName: cluster.Spec.ServiceAccountName,
+					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					SecurityContext:    antflyPodSecurityContext(),
 					Containers: []corev1.Container{{
 						Name:            "ha-admin",
 						Image:           cluster.Spec.Image,
