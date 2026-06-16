@@ -537,6 +537,16 @@ type HAStandbySpec struct {
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
 
+	// SeedManifestPath is the base-backup manifest path visible to HA admin Jobs.
+	// When set, the operator can run seed finish on the primary and seed bootstrap on this standby.
+	// +optional
+	SeedManifestPath string `json:"seedManifestPath,omitempty"`
+
+	// SeedContentRoot is the copied base-backup content root visible to the standby HA admin Job.
+	// Defaults to the manifest parent directory when omitted.
+	// +optional
+	SeedContentRoot string `json:"seedContentRoot,omitempty"`
+
 	// RouteSelector is the public-api Service selector to use when this standby is promoted.
 	// +optional
 	RouteSelector map[string]string `json:"routeSelector,omitempty"`
@@ -1444,6 +1454,14 @@ type HAPlannedActionStatus struct {
 	// AdminURL is the HA admin endpoint that should execute AdminCommand.
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
+
+	// SeedManifestPath is the base-backup manifest path used by seed finish/bootstrap actions.
+	// +optional
+	SeedManifestPath string `json:"seedManifestPath,omitempty"`
+
+	// SeedContentRoot is the copied base-backup content root used by seed bootstrap actions.
+	// +optional
+	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
 	// AdminJobName is the Kubernetes Job created to execute AdminCommand.
 	// +optional

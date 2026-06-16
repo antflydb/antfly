@@ -2027,6 +2027,25 @@ func TestValidateCreate_HighAvailabilityRejectsIncompleteIdentity(t *testing.T) 
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsIncompleteSeedPaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:            "standby-a",
+			SeedContentRoot: "/backup/base-standby-a",
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected seed manifest path validation error")
+	}
+	if !strings.Contains(err.Error(), "seedManifestPath is required when seedContentRoot is set") {
+		t.Fatalf("expected seed path dependency error, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

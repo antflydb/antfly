@@ -288,6 +288,85 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(degraded.Message).To(ContainSubstring(seedJob.Name))
 }
 
+func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	initial := uint64(5)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image:           "antfly:test",
+			ImagePullPolicy: "IfNotPresent",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:             "standby-a",
+					InitialLSN:       &initial,
+					AdminURL:         "http://standby-a-ha.default.svc:8081",
+					SeedManifestPath: "/backup/base-standby-a-5.afha",
+					SeedContentRoot:  "/backup/base-standby-a-5",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{PrimaryLSN: 9},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+	g.Expect(cluster.Status.HAStatus.PlannedActions).To(HaveLen(4))
+
+	for i := 0; i < 3; i++ {
+		g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+		action := cluster.Status.HAStatus.PlannedActions[i]
+		job := &batchv1.Job{}
+		g.Expect(reconciler.Get(context.Background(), types.NamespacedName{Name: action.AdminJobName, Namespace: cluster.Namespace}, job)).To(Succeed())
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type:   batchv1.JobComplete,
+			Status: corev1.ConditionTrue,
+		}}
+		g.Expect(reconciler.Status().Update(context.Background(), job)).To(Succeed())
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	finish := cluster.Status.HAStatus.PlannedActions[2]
+	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
+	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+
+	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
+	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
+	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	bootstrapJob := &batchv1.Job{}
+	g.Expect(reconciler.Get(context.Background(), types.NamespacedName{Name: bootstrap.AdminJobName, Namespace: cluster.Namespace}, bootstrapJob)).To(Succeed())
+	g.Expect(bootstrapJob.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+		"ha",
+		"--ha-url",
+		"http://standby-a-ha.default.svc:8081",
+		"--",
+		"seed",
+		"bootstrap",
+		"--manifest",
+		"/backup/base-standby-a-5.afha",
+		"--content-root",
+		"/backup/base-standby-a-5",
+	}))
+}
+
 func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g := NewWithT(t)
 

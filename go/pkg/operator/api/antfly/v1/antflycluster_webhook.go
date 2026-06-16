@@ -1156,6 +1156,15 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		errors = append(errors, validateHAAdminURL(standby.AdminURL, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL", i))...)
 		errors = append(errors, validateHARouteSelector(standby.RouteSelector, fmt.Sprintf("spec.highAvailability.standbys[%d].routeSelector", i))...)
+		if strings.TrimSpace(standby.SeedManifestPath) == "" && standby.SeedManifestPath != "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath must not be whitespace", i))
+		}
+		if strings.TrimSpace(standby.SeedContentRoot) == "" && standby.SeedContentRoot != "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot must not be whitespace", i))
+		}
+		if strings.TrimSpace(standby.SeedContentRoot) != "" && strings.TrimSpace(standby.SeedManifestPath) == "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedContentRoot is set", i))
+		}
 	}
 
 	if admin := ha.Admin; admin != nil {

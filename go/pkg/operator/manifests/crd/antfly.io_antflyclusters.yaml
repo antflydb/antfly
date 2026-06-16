@@ -1655,6 +1655,16 @@ spec:
                           description: RouteSelector is the public-api Service selector
                             to use when this standby is promoted.
                           type: object
+                        seedContentRoot:
+                          description: |-
+                            SeedContentRoot is the copied base-backup content root visible to the standby HA admin Job.
+                            Defaults to the manifest parent directory when omitted.
+                          type: string
+                        seedManifestPath:
+                          description: |-
+                            SeedManifestPath is the base-backup manifest path visible to HA admin Jobs.
+                            When set, the operator can run seed finish on the primary and seed bootstrap on this standby.
+                          type: string
                         slotName:
                           description: SlotName overrides the replication slot name.
                             Defaults to name.
@@ -6693,6 +6703,14 @@ spec:
                           format: int64
                           type: integer
                         routeTo:
+                          type: string
+                        seedContentRoot:
+                          description: SeedContentRoot is the copied base-backup content
+                            root used by seed bootstrap actions.
+                          type: string
+                        seedManifestPath:
+                          description: SeedManifestPath is the base-backup manifest
+                            path used by seed finish/bootstrap actions.
                           type: string
                         slotName:
                           type: string

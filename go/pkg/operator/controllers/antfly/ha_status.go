@@ -17,29 +17,33 @@ import (
 type haActionKind string
 
 const (
-	haActionCreateSlot          haActionKind = "CreateSlot"
-	haActionSeedStandby         haActionKind = "SeedStandby"
-	haActionMarkReseed          haActionKind = "MarkReseed"
-	haActionAcquireFence        haActionKind = "AcquireFence"
-	haActionPromoteStandby      haActionKind = "PromoteStandby"
-	haActionUpdatePrimaryRoute  haActionKind = "UpdatePrimaryRoute"
-	haActionDemoteFormerPrimary haActionKind = "DemoteFormerPrimary"
-	haActionRewindFormerPrimary haActionKind = "RewindFormerPrimary"
-	haActionReseedFormerPrimary haActionKind = "ReseedFormerPrimary"
+	haActionCreateSlot           haActionKind = "CreateSlot"
+	haActionSeedStandby          haActionKind = "SeedStandby"
+	haActionFinishStandbySeed    haActionKind = "FinishStandbySeed"
+	haActionBootstrapStandbySeed haActionKind = "BootstrapStandbySeed"
+	haActionMarkReseed           haActionKind = "MarkReseed"
+	haActionAcquireFence         haActionKind = "AcquireFence"
+	haActionPromoteStandby       haActionKind = "PromoteStandby"
+	haActionUpdatePrimaryRoute   haActionKind = "UpdatePrimaryRoute"
+	haActionDemoteFormerPrimary  haActionKind = "DemoteFormerPrimary"
+	haActionRewindFormerPrimary  haActionKind = "RewindFormerPrimary"
+	haActionReseedFormerPrimary  haActionKind = "ReseedFormerPrimary"
 )
 
 type haPlannedAction struct {
-	Kind            haActionKind
-	StandbyName     string
-	SlotName        string
-	TargetLSN       uint64
-	ObservedLSN     uint64
-	RetainedFromLSN uint64
-	RouteTo         string
-	FenceAuthority  antflyv1.HAFencingAuthority
-	FenceHolder     string
-	FenceGeneration uint64
-	Reason          string
+	Kind             haActionKind
+	StandbyName      string
+	SlotName         string
+	TargetLSN        uint64
+	ObservedLSN      uint64
+	RetainedFromLSN  uint64
+	RouteTo          string
+	FenceAuthority   antflyv1.HAFencingAuthority
+	FenceHolder      string
+	FenceGeneration  uint64
+	SeedManifestPath string
+	SeedContentRoot  string
+	Reason           string
 }
 
 type haSyncEvaluation struct {
@@ -222,6 +226,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				TargetLSN:   initialStandbyLSN(standby, status.PrimaryLSN),
 				Reason:      "StandbyNeedsBaseBackup",
 			})
+			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, initialStandbyLSN(standby, status.PrimaryLSN), "StandbyNeedsBaseBackup")...)
 			continue
 		}
 		if observed.ReseedRequired || observed.Status == "reseed_required" {
@@ -233,6 +238,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				TargetLSN:   status.PrimaryLSN,
 				Reason:      "SlotRequiresReseed",
 			})
+			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "SlotRequiresReseed")...)
 			continue
 		}
 		if observed.Active && observed.ApplyLagLSN == 0 {
@@ -347,19 +353,21 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	out := make([]antflyv1.HAPlannedActionStatus, 0, len(actions))
 	for _, action := range actions {
 		out = append(out, antflyv1.HAPlannedActionStatus{
-			Kind:            string(action.Kind),
-			StandbyName:     action.StandbyName,
-			SlotName:        action.SlotName,
-			TargetLSN:       action.TargetLSN,
-			ObservedLSN:     action.ObservedLSN,
-			RetainedFromLSN: action.RetainedFromLSN,
-			RouteTo:         action.RouteTo,
-			FenceAuthority:  action.FenceAuthority,
-			FenceHolder:     action.FenceHolder,
-			FenceGeneration: action.FenceGeneration,
-			AdminCommand:    haAdminCommand(action, haReplicationIdentity(ha), status),
-			AdminURL:        haAdminURL(action, ha),
-			Reason:          action.Reason,
+			Kind:             string(action.Kind),
+			StandbyName:      action.StandbyName,
+			SlotName:         action.SlotName,
+			TargetLSN:        action.TargetLSN,
+			ObservedLSN:      action.ObservedLSN,
+			RetainedFromLSN:  action.RetainedFromLSN,
+			RouteTo:          action.RouteTo,
+			FenceAuthority:   action.FenceAuthority,
+			FenceHolder:      action.FenceHolder,
+			FenceGeneration:  action.FenceGeneration,
+			SeedManifestPath: action.SeedManifestPath,
+			SeedContentRoot:  action.SeedContentRoot,
+			AdminCommand:     haAdminCommand(action, haReplicationIdentity(ha), status),
+			AdminURL:         haAdminURL(action, ha),
+			Reason:           action.Reason,
 		})
 	}
 	return out
@@ -385,6 +393,20 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			return nil
 		}
 		return []string{"seed", "begin", "--slot", slotName, "--manifest-id", fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)}
+	case haActionFinishStandbySeed:
+		if action.SeedManifestPath == "" {
+			return nil
+		}
+		return []string{"seed", "finish", "--manifest", action.SeedManifestPath}
+	case haActionBootstrapStandbySeed:
+		if action.SeedManifestPath == "" {
+			return nil
+		}
+		args := []string{"seed", "bootstrap", "--manifest", action.SeedManifestPath}
+		if action.SeedContentRoot != "" {
+			args = append(args, "--content-root", action.SeedContentRoot)
+		}
+		return args
 	case haActionPromoteStandby:
 		return []string{"promote", "--current-fence"}
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
@@ -495,11 +517,13 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 		return ""
 	}
 	switch action.Kind {
-	case haActionCreateSlot, haActionSeedStandby, haActionMarkReseed, haActionAcquireFence:
+	case haActionCreateSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed, haActionAcquireFence:
 		if ha.Admin == nil {
 			return ""
 		}
 		return ha.Admin.PrimaryURL
+	case haActionBootstrapStandbySeed:
+		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionPromoteStandby:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
@@ -537,6 +561,32 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 		return nil
 	}
 	return identity
+}
+
+func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64, reason string) []haPlannedAction {
+	if standby.SeedManifestPath == "" {
+		return nil
+	}
+	return []haPlannedAction{
+		{
+			Kind:             haActionFinishStandbySeed,
+			StandbyName:      standby.Name,
+			SlotName:         slotName,
+			TargetLSN:        targetLSN,
+			SeedManifestPath: standby.SeedManifestPath,
+			SeedContentRoot:  standby.SeedContentRoot,
+			Reason:           reason,
+		},
+		{
+			Kind:             haActionBootstrapStandbySeed,
+			StandbyName:      standby.Name,
+			SlotName:         slotName,
+			TargetLSN:        targetLSN,
+			SeedManifestPath: standby.SeedManifestPath,
+			SeedContentRoot:  standby.SeedContentRoot,
+			Reason:           reason,
+		},
+	}
 }
 
 func haAutomaticFailoverFormerPrimaryID(ha *antflyv1.HighAvailabilitySpec) string {

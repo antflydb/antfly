@@ -88,6 +88,38 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	}
 }
 
+func TestPlanHAPlansSeedFinishAndBootstrapWhenManifestPathConfigured(t *testing.T) {
+	initial := uint64(5)
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 9}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:             "standby-a",
+		InitialLSN:       &initial,
+		AdminURL:         "http://standby-a-ha.default.svc:8081",
+		SeedManifestPath: "/backup/base-standby-a-5.afha",
+		SeedContentRoot:  "/backup/base-standby-a-5",
+	}}
+
+	reconciler := &AntflyClusterReconciler{}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	actions := cluster.Status.HAStatus.PlannedActions
+	if len(actions) != 4 {
+		t.Fatalf("expected create-slot, seed begin, finish, and bootstrap actions, got %#v", actions)
+	}
+	if actions[2].Kind != string(haActionFinishStandbySeed) ||
+		!reflect.DeepEqual(actions[2].AdminCommand, []string{"seed", "finish", "--manifest", "/backup/base-standby-a-5.afha"}) ||
+		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("unexpected seed finish action: %#v", actions[2])
+	}
+	if actions[3].Kind != string(haActionBootstrapStandbySeed) ||
+		!reflect.DeepEqual(actions[3].AdminCommand, []string{"seed", "bootstrap", "--manifest", "/backup/base-standby-a-5.afha", "--content-root", "/backup/base-standby-a-5"}) ||
+		actions[3].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		t.Fatalf("unexpected seed bootstrap action: %#v", actions[3])
+	}
+}
+
 func TestUpdateHAStatusReportsReseedAndDegradedSync(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
