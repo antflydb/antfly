@@ -2720,6 +2720,7 @@ fn rowMatchesExpressionCondition(
             defer alloc.free(rhs_json);
             var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidColumnValue;
             defer rhs.deinit();
+            if (lhs.value == .null or rhs.value == .null) break :blk false;
             const comparison = compareJsonScalars(lhs.value, rhs.value) orelse return error.InvalidColumnValue;
             break :blk switch (condition.op) {
                 .gt => comparison == .gt,

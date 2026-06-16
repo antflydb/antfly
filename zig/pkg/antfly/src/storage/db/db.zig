@@ -26093,6 +26093,7 @@ pub const DB = struct {
                 defer alloc.free(rhs_json);
                 var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return error.InvalidQueryRequest;
                 defer rhs.deinit();
+                if (lhs.value == .null or rhs.value == .null) break :blk false;
                 const comparison = compareRelationalRowsJsonScalars(lhs.value, rhs.value) orelse return error.InvalidQueryRequest;
                 break :blk switch (condition.op) {
                     .gt => comparison == .gt,

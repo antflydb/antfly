@@ -77504,7 +77504,7 @@ test "postgres sql adapter classifies read sql into typed plan families" {
 test "postgres sql adapter typed read plans execute through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"scope":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -77537,6 +77537,8 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             .{ .key = "row:b1", .value = "{\"kind\":\"balance\",\"tenant\":\"t1\",\"id\":\"b1\",\"organization_id\":\"org1\",\"amount\":4,\"created_at\":10}" },
             .{ .key = "row:b2", .value = "{\"kind\":\"balance\",\"tenant\":\"t1\",\"id\":\"b2\",\"organization_id\":\"org1\",\"amount\":9,\"created_at\":20}" },
             .{ .key = "row:b3", .value = "{\"kind\":\"balance\",\"tenant\":\"t1\",\"id\":\"b3\",\"organization_id\":\"org2\",\"amount\":7,\"created_at\":15}" },
+            .{ .key = "row:a1", .value = "{\"kind\":\"array\",\"tenant\":\"t1\",\"id\":\"a1\",\"scope\":\"read write\",\"tags\":[\"hot\",\"old\",\"hot\"]}" },
+            .{ .key = "row:a2", .value = "{\"kind\":\"array\",\"tenant\":\"t1\",\"id\":\"a2\",\"scope\":\"read\",\"tags\":[\"cold\"]}" },
         },
         .sync_level = .write,
     });
@@ -77664,6 +77666,37 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             try std.testing.expectEqualStrings("{\"id\":\"p1\",\"status\":\"op_en\"}", result.rows[0]);
             try std.testing.expectEqualStrings("{\"id\":\"p2\",\"status\":\"open\"}", result.rows[1]);
             try std.testing.expectEqualStrings("{\"id\":\"p3\",\"status\":\"OP_en\"}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var array_expression_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, array_position(tags, 'hot') AS hot_pos, array_positions(tags, 'hot') AS hot_positions, array_append(tags, 'fresh') AS tags_plus, array_prepend('first', tags) AS tags_prefixed, array_cat(tags, string_to_array('tail last', ' ')) AS tags_cat, array_remove(tags, 'old') AS tags_clean, array_replace(tags, 'old', 'fresh') AS tags_replaced FROM usage_records WHERE kind = 'array' AND array_position(tags, 'hot') > 0 AND string_to_array(scope, ' ') @> ARRAY['write'] ORDER BY array_position(tags, 'old') ASC NULLS LAST, id ASC",
+        schema,
+        &.{},
+    );
+    defer array_expression_plan.deinit(alloc);
+
+    switch (array_expression_plan) {
+        .query => |lowered| {
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_array_contains.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_position, lowered.plan.query.expressions[0].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_positions, lowered.plan.query.expressions[1].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_append, lowered.plan.query.expressions[2].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_prepend, lowered.plan.query.expressions[3].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_cat, lowered.plan.query.expressions[4].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_remove, lowered.plan.query.expressions[5].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_replace, lowered.plan.query.expressions[6].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.plan.query.expression_array_contains[0].expression.kind);
+            var result = try db.queryRelationalRows(alloc, schema, lowered.plan.query);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 1), result.total);
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"a1\",\"hot_pos\":1,\"hot_positions\":[1,3],\"tags_plus\":[\"hot\",\"old\",\"hot\",\"fresh\"],\"tags_prefixed\":[\"first\",\"hot\",\"old\",\"hot\"],\"tags_cat\":[\"hot\",\"old\",\"hot\",\"tail\",\"last\"],\"tags_clean\":[\"hot\",\"hot\"],\"tags_replaced\":[\"hot\",\"fresh\",\"hot\"]}", result.rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }

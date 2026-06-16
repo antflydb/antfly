@@ -473,7 +473,13 @@ cardinality predicates such as `WHERE jsonb_array_length(metadata->'flags') > $1
 JSON path-array predicates such as `WHERE metadata #>> '{billing,plan}' = 'pro'`,
 and JSON type predicates such as `WHERE jsonb_typeof(metadata->'flags') = 'array'`
 lower to the same `expression_where` contract and evaluate through the shared
-expression executor.
+expression executor. SQL read execution coverage pins the same contract for
+array-position predicates, `array_positions` projections, computed array
+append/prepend/concat/remove/replace projections, and `string_to_array`
+containment predicates over committed relational rows. Ordered expression
+comparisons whose left or right expression evaluates to JSON `null` are
+non-matches, not query aborts; explicit null behavior stays modeled through
+`IS NULL`, `IS NOT NULL`, and distinctness predicates.
 
 Row-query `expressions` are emitted by the same storage executor rather than
 being SQL-adapter-only projections. REST/SDK callers can project computed fields
