@@ -6491,6 +6491,45 @@ spec:
                           decision.
                         type: string
                     type: object
+                  formerPrimary:
+                    description: FormerPrimary reports the old primary's rejoin disposition
+                      after promotion.
+                    properties:
+                      action:
+                        type: string
+                      diverged:
+                        type: boolean
+                      fenceGeneration:
+                        format: int64
+                        type: integer
+                      fenced:
+                        type: boolean
+                      newTimelineID:
+                        format: int64
+                        type: integer
+                      nodeID:
+                        type: string
+                      observedLSN:
+                        format: int64
+                        type: integer
+                      observedTimelineID:
+                        format: int64
+                        type: integer
+                      parentTimelineID:
+                        format: int64
+                        type: integer
+                      reason:
+                        type: string
+                      rejoinRequired:
+                        type: boolean
+                      reseedRequired:
+                        type: boolean
+                      rewindPossible:
+                        type: boolean
+                      switchLSN:
+                        format: int64
+                        type: integer
+                    type: object
                   healthyStandbyCount:
                     description: HealthyStandbyCount is the count of desired standbys
                       caught up to apply.

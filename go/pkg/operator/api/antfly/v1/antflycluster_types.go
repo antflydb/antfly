@@ -1262,6 +1262,10 @@ type HAStatus struct {
 	// +optional
 	Retention HARetentionStatus `json:"retention,omitempty"`
 
+	// FormerPrimary reports the old primary's rejoin disposition after promotion.
+	// +optional
+	FormerPrimary *HAFormerPrimaryStatus `json:"formerPrimary,omitempty"`
+
 	// LastPromotion records the last completed promotion.
 	// +optional
 	LastPromotion *HAPromotionStatus `json:"lastPromotion,omitempty"`
@@ -1371,6 +1375,37 @@ type HARetentionStatus struct {
 	ActiveSlots int32 `json:"activeSlots,omitempty"`
 
 	ReseedRecommended int32 `json:"reseedRecommended,omitempty"`
+}
+
+// HAFormerPrimaryStatus reports the old primary's rejoin disposition after promotion.
+type HAFormerPrimaryStatus struct {
+	NodeID string `json:"nodeID,omitempty"`
+
+	Fenced bool `json:"fenced,omitempty"`
+
+	RejoinRequired bool `json:"rejoinRequired,omitempty"`
+
+	RewindPossible bool `json:"rewindPossible,omitempty"`
+
+	ReseedRequired bool `json:"reseedRequired,omitempty"`
+
+	Diverged bool `json:"diverged,omitempty"`
+
+	ParentTimelineID uint64 `json:"parentTimelineID,omitempty"`
+
+	NewTimelineID uint64 `json:"newTimelineID,omitempty"`
+
+	ObservedTimelineID uint64 `json:"observedTimelineID,omitempty"`
+
+	SwitchLSN uint64 `json:"switchLSN,omitempty"`
+
+	ObservedLSN uint64 `json:"observedLSN,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	Action string `json:"action,omitempty"`
+
+	Reason string `json:"reason,omitempty"`
 }
 
 // HAPromotionStatus reports a completed HA promotion.

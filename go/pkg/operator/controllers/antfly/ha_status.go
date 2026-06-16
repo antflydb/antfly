@@ -23,6 +23,8 @@ const (
 	haActionPromoteStandby      haActionKind = "PromoteStandby"
 	haActionUpdatePrimaryRoute  haActionKind = "UpdatePrimaryRoute"
 	haActionDemoteFormerPrimary haActionKind = "DemoteFormerPrimary"
+	haActionRewindFormerPrimary haActionKind = "RewindFormerPrimary"
+	haActionReseedFormerPrimary haActionKind = "ReseedFormerPrimary"
 )
 
 type haPlannedAction struct {
@@ -48,6 +50,24 @@ type haSyncEvaluation struct {
 	Action        string
 }
 
+type haFormerPrimaryEvaluation struct {
+	Present            bool
+	NodeID             string
+	Fenced             bool
+	RejoinRequired     bool
+	RewindPossible     bool
+	ReseedRequired     bool
+	Diverged           bool
+	ParentTimelineID   uint64
+	NewTimelineID      uint64
+	ObservedTimelineID uint64
+	SwitchLSN          uint64
+	ObservedLSN        uint64
+	FenceGeneration    uint64
+	Action             string
+	Reason             string
+}
+
 type haPlan struct {
 	Actions                   []haPlannedAction
 	AutomaticPromotionAllowed bool
@@ -59,6 +79,7 @@ type haPlan struct {
 	PromotionStandbyName      string
 	SyncPolicyDegraded        bool
 	SyncPolicy                haSyncEvaluation
+	FormerPrimary             haFormerPrimaryEvaluation
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -254,6 +275,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 		)
 	}
+	plan.FormerPrimary = haEvaluateFormerPrimary(status)
+	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary); action.Kind != "" {
+		plan.Actions = append(plan.Actions, action)
+	}
 
 	return plan
 }
@@ -276,6 +301,7 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
 	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
+	cluster.Status.HAStatus.FormerPrimary = haFormerPrimaryStatus(plan.FormerPrimary)
 	mergeConfiguredStandbys(cluster.Status.HAStatus, ha)
 }
 
@@ -311,6 +337,46 @@ func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActi
 		})
 	}
 	return out
+}
+
+func haFormerPrimaryStatus(evaluation haFormerPrimaryEvaluation) *antflyv1.HAFormerPrimaryStatus {
+	if !evaluation.Present {
+		return nil
+	}
+	return &antflyv1.HAFormerPrimaryStatus{
+		NodeID:             evaluation.NodeID,
+		Fenced:             evaluation.Fenced,
+		RejoinRequired:     evaluation.RejoinRequired,
+		RewindPossible:     evaluation.RewindPossible,
+		ReseedRequired:     evaluation.ReseedRequired,
+		Diverged:           evaluation.Diverged,
+		ParentTimelineID:   evaluation.ParentTimelineID,
+		NewTimelineID:      evaluation.NewTimelineID,
+		ObservedTimelineID: evaluation.ObservedTimelineID,
+		SwitchLSN:          evaluation.SwitchLSN,
+		ObservedLSN:        evaluation.ObservedLSN,
+		FenceGeneration:    evaluation.FenceGeneration,
+		Action:             evaluation.Action,
+		Reason:             evaluation.Reason,
+	}
+}
+
+func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation) haPlannedAction {
+	if !evaluation.Present {
+		return haPlannedAction{}
+	}
+	switch evaluation.Action {
+	case string(haActionDemoteFormerPrimary), string(haActionRewindFormerPrimary), string(haActionReseedFormerPrimary):
+		return haPlannedAction{
+			Kind:            haActionKind(evaluation.Action),
+			StandbyName:     evaluation.NodeID,
+			TargetLSN:       evaluation.SwitchLSN,
+			FenceGeneration: evaluation.FenceGeneration,
+			Reason:          evaluation.Reason,
+		}
+	default:
+		return haPlannedAction{}
+	}
 }
 
 func mergeConfiguredStandbys(status *antflyv1.HAStatus, ha *antflyv1.HighAvailabilitySpec) {
@@ -592,6 +658,88 @@ func haSyncFailureAction(policy antflyv1.HAFailurePolicy) string {
 	default:
 		return "BlockWrites"
 	}
+}
+
+func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluation {
+	if status == nil || status.LastPromotion == nil || status.LastPromotion.OldPrimaryID == "" {
+		return haFormerPrimaryEvaluation{}
+	}
+	promotion := status.LastPromotion
+	evaluation := haFormerPrimaryEvaluation{
+		Present:          true,
+		NodeID:           promotion.OldPrimaryID,
+		RejoinRequired:   true,
+		ParentTimelineID: promotion.ParentTimelineID,
+		NewTimelineID:    promotion.NewTimelineID,
+		SwitchLSN:        promotion.SwitchLSN,
+		FenceGeneration:  promotion.FenceGeneration,
+		Action:           string(haActionDemoteFormerPrimary),
+		Reason:           "FormerPrimaryFenceNotObserved",
+	}
+	evaluation.Fenced = haFormerPrimaryFenced(status, promotion)
+	if !evaluation.Fenced {
+		return evaluation
+	}
+
+	standby, ok := haStandbyStatusByName(status)[promotion.OldPrimaryID]
+	if !ok {
+		evaluation.Reason = "FormerPrimaryNotObserved"
+		return evaluation
+	}
+	evaluation.ObservedTimelineID = standby.TimelineID
+	evaluation.ObservedLSN = maxHAObservedLSN(standby)
+	if evaluation.ObservedTimelineID == 0 {
+		evaluation.Reason = "FormerPrimaryTimelineUnknown"
+		return evaluation
+	}
+	if evaluation.ObservedTimelineID == promotion.NewTimelineID {
+		evaluation.RejoinRequired = false
+		evaluation.Action = "None"
+		evaluation.Reason = "FormerPrimaryOnPromotionTimeline"
+		return evaluation
+	}
+	if evaluation.ObservedTimelineID != promotion.ParentTimelineID {
+		evaluation.ReseedRequired = true
+		evaluation.Diverged = true
+		evaluation.Action = string(haActionReseedFormerPrimary)
+		evaluation.Reason = "FormerPrimaryTimelineDiverged"
+		return evaluation
+	}
+	if !promotion.DataLossPossible && evaluation.ObservedLSN <= promotion.SwitchLSN {
+		evaluation.RewindPossible = true
+		evaluation.Action = string(haActionRewindFormerPrimary)
+		evaluation.Reason = "FormerPrimaryNeedsRewind"
+		return evaluation
+	}
+	evaluation.ReseedRequired = true
+	evaluation.Diverged = true
+	evaluation.Action = string(haActionReseedFormerPrimary)
+	evaluation.Reason = "FormerPrimaryRequiresReseed"
+	return evaluation
+}
+
+func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) bool {
+	if promotion.FenceGeneration == 0 {
+		return false
+	}
+	if status.Fencing.Generation < promotion.FenceGeneration {
+		return false
+	}
+	if promotion.PromotedStandbyID != "" && status.Fencing.Holder != promotion.PromotedStandbyID {
+		return false
+	}
+	return status.Fencing.Ready
+}
+
+func maxHAObservedLSN(standby antflyv1.HAStandbyStatus) uint64 {
+	lsn := standby.ReceivedLSN
+	if standby.AppliedLSN > lsn {
+		lsn = standby.AppliedLSN
+	}
+	if standby.SafeReadLSN > lsn {
+		lsn = standby.SafeReadLSN
+	}
+	return lsn
 }
 
 func haStandbyStatusByName(status *antflyv1.HAStatus) map[string]antflyv1.HAStandbyStatus {

@@ -359,6 +359,104 @@ func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
 	}
 }
 
+func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
+		{Name: "old-primary"},
+		{Name: "standby-a"},
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 12,
+		Fencing: antflyv1.HAFencingStatus{
+			Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			Ready:      true,
+			Holder:     "standby-a",
+			Generation: 4,
+			Reason:     "LeaseHeld",
+		},
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			NewTimelineID:     2,
+			SwitchLSN:         10,
+			FenceGeneration:   4,
+		},
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:        "old-primary",
+			SlotName:    "old-primary",
+			Active:      true,
+			TimelineID:  1,
+			ReceivedLSN: 10,
+			AppliedLSN:  10,
+		}, {
+			Name:        "standby-a",
+			SlotName:    "standby-a",
+			Active:      true,
+			TimelineID:  2,
+			ReceivedLSN: 12,
+			AppliedLSN:  12,
+			SafeReadLSN: 12,
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former := cluster.Status.HAStatus.FormerPrimary
+	if former == nil {
+		t.Fatal("expected former-primary status")
+	}
+	if former.NodeID != "old-primary" ||
+		!former.Fenced ||
+		!former.RejoinRequired ||
+		!former.RewindPossible ||
+		former.ReseedRequired ||
+		former.Action != string(haActionRewindFormerPrimary) ||
+		former.Reason != "FormerPrimaryNeedsRewind" {
+		t.Fatalf("unexpected rewind disposition: %#v", former)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionRewindFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[0].StandbyName != "old-primary" ||
+		cluster.Status.HAStatus.PlannedActions[0].TargetLSN != 10 {
+		t.Fatalf("expected rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+
+	cluster.Status.HAStatus.Standbys[0].ReceivedLSN = 11
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former = cluster.Status.HAStatus.FormerPrimary
+	if former == nil ||
+		!former.ReseedRequired ||
+		!former.Diverged ||
+		former.RewindPossible ||
+		former.Action != string(haActionReseedFormerPrimary) ||
+		former.Reason != "FormerPrimaryRequiresReseed" {
+		t.Fatalf("unexpected reseed disposition: %#v", former)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) {
+		t.Fatalf("expected reseed planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+
+	cluster.Status.HAStatus.Standbys[0].TimelineID = 2
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former = cluster.Status.HAStatus.FormerPrimary
+	if former == nil ||
+		former.RejoinRequired ||
+		former.RewindPossible ||
+		former.ReseedRequired ||
+		former.Action != "None" ||
+		former.Reason != "FormerPrimaryOnPromotionTimeline" {
+		t.Fatalf("unexpected joined disposition: %#v", former)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 0 {
+		t.Fatalf("expected no former-primary planned action after rejoin, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+}
+
 func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	reconciler := testHAReconciler(t)
