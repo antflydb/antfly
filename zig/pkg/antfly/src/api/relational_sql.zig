@@ -56144,7 +56144,7 @@ test "postgres sql adapter lowers array_length predicate into expression predica
 test "postgres sql adapter lowers insert values returning into row batch" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"amount":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -56464,6 +56464,27 @@ test "postgres sql adapter lowers insert values returning into row batch" {
             try std.testing.expectEqual(@as(usize, 1), where_expression.rhs.len);
             try std.testing.expectEqualStrings("amount", where_expression.rhs[0].field);
             try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.existing, where_expression.rhs[0].field_source);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_default_update_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_default_update_plan.deinit(alloc);
+    switch (insert_source_default_update_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.operations.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set, conflict.operations[0].op);
+            try std.testing.expectEqualStrings("status", conflict.operations[0].path);
+            try std.testing.expectEqualStrings("\"active\"", conflict.operations[0].value_json.?);
+            try std.testing.expectEqual(@as(usize, 0), conflict.patch_expressions.len);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -62258,6 +62279,7 @@ const AppParityCorpusCoverage = struct {
     insert_source_expression_or_source: bool = false,
     insert_source_expression_not_source: bool = false,
     insert_source_returning_all_expression: bool = false,
+    insert_source_conflict_default_update: bool = false,
     insert_source_conflict_json_set_expression: bool = false,
     insert_source_conflict_regexp_expression: bool = false,
     insert_source_conflict_boolean_is_not_guard: bool = false,
@@ -64014,6 +64036,10 @@ const AppParityCorpusCoverage = struct {
             (entry.family == .insert_source and
                 appParityPlanHasNonZeroToken(entry.plan, ":returning_all=") and
                 appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.insert_source_conflict_default_update = self.insert_source_conflict_default_update or
+            (entry.family == .insert_source and
+                std.mem.indexOf(u8, entry.sql, "SET status = DEFAULT") != null and
+                appParityPlanHasNonZeroToken(entry.plan, ":conflict_ops="));
         self.insert_source_conflict_json_set_expression = self.insert_source_conflict_json_set_expression or
             (entry.family == .insert_source and
                 appParityPlanHasNonZeroToken(entry.plan, ":conflict_json_set_expr="));
@@ -64077,6 +64103,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.insert_source_expression_or_source);
         try std.testing.expect(self.insert_source_expression_not_source);
         try std.testing.expect(self.insert_source_returning_all_expression);
+        try std.testing.expect(self.insert_source_conflict_default_update);
         try std.testing.expect(self.insert_source_conflict_regexp_expression);
         try std.testing.expect(self.insert_source_cross_table_source_schema);
         try std.testing.expect(self.joined_source_cross_table_source_schema);
@@ -68056,6 +68083,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 3, .patch_expressions = 1, .returning = 2 },
             .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=1:source_order=0:source_limit=-1:assignments=3:conflict=1:returning=2:returning_expr=0:returning_all=0:conflict_action=update:conflict_patch_expr=1:conflict_where_expr=1:conflict_where=1",
             .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.amount > amount RETURNING id, status",
+        },
+        .{
+            .name = "same-table insert select conflict default update",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 3, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=1:source_order=0:source_limit=-1:assignments=3:conflict=1:returning=2:returning_expr=0:returning_all=0:conflict_action=update:conflict_ops=1",
+            .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status",
         },
         .{
             .name = "same-table insert select conflict jsonb expression update",
@@ -75119,7 +75153,7 @@ test "postgres sql adapter mutation source expression transforms execute through
 test "postgres sql adapter insert source unique conflict executes through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"target_source_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","source_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_source_id_key","columns":["source_id"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"target_source_id":{"type":"keyword"},"status":{"type":"keyword","default":"active"}},"required":["id","source_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_source_id_key","columns":["source_id"]}]}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -75140,6 +75174,7 @@ test "postgres sql adapter insert source unique conflict executes through relati
         .writes = &.{
             .{ .key = "row:existing", .value = "{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"old\"}" },
             .{ .key = "row:source", .value = "{\"id\":\"source\",\"source_id\":\"source:input\",\"target_source_id\":\"source:1\",\"status\":\"new\"}" },
+            .{ .key = "row:source_default", .value = "{\"id\":\"source_default\",\"source_id\":\"source:input:default\",\"target_source_id\":\"source:1\",\"status\":\"ignored\"}" },
             .{ .key = "row:source_guard", .value = "{\"id\":\"source_guard\",\"source_id\":\"source:input:guard\",\"target_source_id\":\"source:1\",\"status\":\"guarded\"}" },
             .{ .key = "row:source_nothing", .value = "{\"id\":\"source_nothing\",\"source_id\":\"source:input:2\",\"target_source_id\":\"source:1\",\"status\":\"ignored\"}" },
         },
@@ -75192,9 +75227,55 @@ test "postgres sql adapter insert source unique conflict executes through relati
     }
 
     const existing_after_update_version = try db.getTimestamp(alloc, "row:existing");
-    var guarded_resolver_ctx = TestPrimaryResolver{
+    var default_resolver_ctx = TestPrimaryResolver{
         .row_json = "{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"NEW\"}",
         .version = existing_after_update_version,
+        .resolved_key = "row:existing",
+    };
+    var default_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, source_id, status) SELECT id || '_copy' AS id, target_source_id AS source_id, upper(status) AS status FROM usage_records WHERE id = 'source_default' ON CONFLICT (source_id) DO UPDATE SET status = DEFAULT RETURNING id, source_id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = default_resolver_ctx.resolver() },
+    );
+    defer default_plan.deinit(alloc);
+
+    switch (default_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.operations.len);
+            try std.testing.expectEqualStrings("status", conflict.operations[0].path);
+            try std.testing.expectEqualStrings("\"active\"", conflict.operations[0].value_json.?);
+
+            var source_result = try db.queryRelationalRows(alloc, schema, insert_source.insert_source.req.source);
+            defer source_result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), source_result.total);
+            try std.testing.expectEqual(@as(usize, 1), source_result.rows.len);
+
+            var batch = try relational_rows.buildRowsInsertSourceBatchAlloc(
+                alloc,
+                insert_source.table_name,
+                schema,
+                insert_source.insert_source.req,
+                source_result.rows,
+                default_resolver_ctx.resolver(),
+            );
+            defer batch.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), batch.inserted);
+            try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 1), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"active\"}", batch.returning_rows[0]);
+            try db.batch(batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const existing_after_default_version = try db.getTimestamp(alloc, "row:existing");
+    var guarded_resolver_ctx = TestPrimaryResolver{
+        .row_json = "{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"active\"}",
+        .version = existing_after_default_version,
         .resolved_key = "row:existing",
     };
     var guarded_plan = try lowerWritePlanAlloc(
@@ -75238,7 +75319,7 @@ test "postgres sql adapter insert source unique conflict executes through relati
 
     const existing_after_guard_version = try db.getTimestamp(alloc, "row:existing");
     var do_nothing_resolver_ctx = TestPrimaryResolver{
-        .row_json = "{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"NEW\"}",
+        .row_json = "{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"active\"}",
         .version = existing_after_guard_version,
         .resolved_key = "row:existing",
     };
@@ -75293,7 +75374,7 @@ test "postgres sql adapter insert source unique conflict executes through relati
     defer rows.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 1), rows.total);
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"NEW\"}", rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"existing\",\"source_id\":\"source:1\",\"status\":\"active\"}", rows.rows[0]);
 }
 
 test "postgres sql adapter insert source temporal unique conflict executes through relational storage" {

@@ -5122,6 +5122,18 @@
       "sql": "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.amount > amount RETURNING id, status"
     },
     {
+      "name": "same-table insert select conflict default update",
+      "family": "insert_source",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "operations": 3,
+        "returning": 2
+      },
+      "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=1:source_order=0:source_limit=-1:assignments=3:conflict=1:returning=2:returning_expr=0:returning_all=0:conflict_action=update:conflict_ops=1",
+      "sql": "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status"
+    },
+    {
       "name": "same-table insert select conflict jsonb expression update",
       "family": "insert_source",
       "summary": {
