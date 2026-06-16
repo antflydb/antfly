@@ -4466,6 +4466,14 @@ type haAdminStatusJSON struct {
 	} `json:"result"`
 }
 
+type haPrimaryStatusEnvelopeJSON struct {
+	Snapshot *haPrimaryStatusJSON `json:"snapshot,omitempty"`
+}
+
+type haStandbyStatusEnvelopeJSON struct {
+	Snapshot *haStandbyStatusJSON `json:"snapshot,omitempty"`
+}
+
 type haPrimaryStatusJSON struct {
 	CurrentLSN *uint64 `json:"current_lsn"`
 	Retention  struct {
@@ -4509,14 +4517,21 @@ type haStandbyStatusJSON struct {
 }
 
 func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
-	var doc haAdminStatusJSON
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	var direct haPrimaryStatusEnvelopeJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
-	if doc.Result.PrimaryStatus == nil {
-		return haObservedPrimaryStatus{}, fmt.Errorf("missing primary_status")
+	snapshot := direct.Snapshot
+	if snapshot == nil {
+		var doc haAdminStatusJSON
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return haObservedPrimaryStatus{}, err
+		}
+		snapshot = doc.Result.PrimaryStatus
 	}
-	snapshot := doc.Result.PrimaryStatus
+	if snapshot == nil {
+		return haObservedPrimaryStatus{}, fmt.Errorf("missing primary status snapshot")
+	}
 	if snapshot.CurrentLSN == nil {
 		return haObservedPrimaryStatus{}, fmt.Errorf("missing current_lsn")
 	}
@@ -4554,14 +4569,21 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 }
 
 func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {
-	var doc haAdminStatusJSON
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	var direct haStandbyStatusEnvelopeJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
-	if doc.Result.StandbyStatus == nil {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby_status")
+	snapshot := direct.Snapshot
+	if snapshot == nil {
+		var doc haAdminStatusJSON
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return antflyv1.HAStandbyStatus{}, err
+		}
+		snapshot = doc.Result.StandbyStatus
 	}
-	snapshot := doc.Result.StandbyStatus
+	if snapshot == nil {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status snapshot")
+	}
 	status := antflyv1.HAStandbyStatus{
 		Name:               standbyName,
 		SlotName:           slotName,
