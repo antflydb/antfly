@@ -4754,6 +4754,14 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    projections, and mutation expressions, not in persisted check, partial-index,
    or partial-unique predicates that storage must reevaluate during replay,
    rebuild, owner repair, and routed write maintenance.
+   Unaliased projection expressions and window functions use deterministic
+   typed output names rather than carrying SQL source text into result metadata:
+   for example `lower(status)` projects as `lower`, `coalesce(...)` as
+   `coalesce`, and `row_number() OVER (...)` as `row_number`. Explicit `AS`
+   aliases remain the public way to choose a stable application-facing name.
+   When a canonical or explicit name collides with a selected column or another
+   computed output, lowering fails closed instead of suffixing or widening the
+   result schema implicitly.
 
 4. **Index and conflict-target completeness.**
    Keep ordinary, partial, and expression indexes as durable typed metadata.

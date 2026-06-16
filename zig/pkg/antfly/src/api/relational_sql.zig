@@ -67522,6 +67522,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS amount_row_num, row_number() OVER (PARTITION BY tenant_id ORDER BY id DESC) AS id_row_num FROM usage_records WHERE status = 'open' ORDER BY amount_row_num ASC, id_row_num ASC LIMIT 5",
         },
         .{
+            .name = "canonical unnamed window output",
+            .family = .window,
+            .summary = .{ .table_name = "usage_records", .ctes = 0, .predicates = 1, .select = 2, .windows = 1, .order_by = 1, .limit = 5 },
+            .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=2:order=1:limit=5",
+            .sql = "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) FROM usage_records WHERE status = 'open' ORDER BY row_number ASC LIMIT 5",
+        },
+        .{
             .name = "multi-key window range frame",
             .family = .window,
             .summary = .{ .table_name = "usage_records", .ctes = 0, .select = 1, .windows = 1 },
@@ -78504,6 +78511,19 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expect(ordinal_order.plan.window.order_by[1].null_test == null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_order.plan.window.order_by[1].direction);
 
+    var canonical_output = try lowerWindowPlanAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) FROM usage_records WHERE status = 'open' ORDER BY row_number ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer canonical_output.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), canonical_output.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.row_number, canonical_output.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("row_number", canonical_output.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(usize, 1), canonical_output.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("row_number", canonical_output.plan.window.order_by[0].field);
+
     var expression_order = try lowerWindowPlanAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY (row_num + 1) DESC LIMIT 5",
@@ -78879,6 +78899,12 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC), row_number() OVER (PARTITION BY tenant ORDER BY id ASC) FROM usage_records",
         schema,
         &.{},
     ));

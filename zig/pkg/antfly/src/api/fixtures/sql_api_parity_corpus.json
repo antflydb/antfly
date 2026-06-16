@@ -4353,6 +4353,21 @@
       "sql": "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS amount_row_num, row_number() OVER (PARTITION BY tenant_id ORDER BY id DESC) AS id_row_num FROM usage_records WHERE status = 'open' ORDER BY amount_row_num ASC, id_row_num ASC LIMIT 5"
     },
     {
+      "name": "canonical unnamed window output",
+      "family": "window",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 0,
+        "predicates": 1,
+        "select": 2,
+        "order_by": 1,
+        "limit": 5,
+        "windows": 1
+      },
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=2:order=1:limit=5",
+      "sql": "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) FROM usage_records WHERE status = 'open' ORDER BY row_number ASC LIMIT 5"
+    },
+    {
       "name": "multi-key window range frame",
       "family": "window",
       "summary": {
