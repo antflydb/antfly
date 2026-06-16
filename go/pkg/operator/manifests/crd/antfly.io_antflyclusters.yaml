@@ -1549,6 +1549,35 @@ spec:
                           before automatic promotion.
                         type: boolean
                     type: object
+                  identity:
+                    description: Identity identifies the replicated HA unit for admin/fencing
+                      commands.
+                    properties:
+                      clusterID:
+                        description: ClusterID is the stable replicated cluster identifier.
+                        format: int64
+                        type: integer
+                      currentPrimaryID:
+                        description: CurrentPrimaryID is the logical id of the current
+                          primary.
+                        type: string
+                      epoch:
+                        description: Epoch is the current primary epoch.
+                        format: int64
+                        type: integer
+                      shardID:
+                        description: ShardID is the replicated shard identifier.
+                        format: int64
+                        type: integer
+                      tableID:
+                        description: TableID is the replicated table identifier.
+                        format: int64
+                        type: integer
+                      timelineID:
+                        description: TimelineID is the current primary timeline.
+                        format: int64
+                        type: integer
+                    type: object
                   mode:
                     default: Disabled
                     description: Mode selects whether hot standby is managed.

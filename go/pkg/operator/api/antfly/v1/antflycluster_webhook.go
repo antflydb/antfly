@@ -1155,6 +1155,27 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 	}
 
+	if identity := ha.Identity; identity != nil {
+		if identity.ClusterID == 0 {
+			errors = append(errors, "spec.highAvailability.identity.clusterID must be greater than 0")
+		}
+		if identity.ShardID == 0 {
+			errors = append(errors, "spec.highAvailability.identity.shardID must be greater than 0")
+		}
+		if identity.TableID == 0 {
+			errors = append(errors, "spec.highAvailability.identity.tableID must be greater than 0")
+		}
+		if identity.TimelineID == 0 {
+			errors = append(errors, "spec.highAvailability.identity.timelineID must be greater than 0")
+		}
+		if identity.Epoch == 0 {
+			errors = append(errors, "spec.highAvailability.identity.epoch must be greater than 0")
+		}
+		if strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID is required")
+		}
+	}
+
 	if sync := ha.SyncPolicy; sync != nil && sync.modeOrDefault() != HADurabilityModeAsync {
 		if sync.Required < 0 {
 			errors = append(errors, "spec.highAvailability.syncPolicy.required must not be negative")

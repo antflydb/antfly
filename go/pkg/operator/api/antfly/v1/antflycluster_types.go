@@ -493,6 +493,10 @@ type HighAvailabilitySpec struct {
 	// +optional
 	Standbys []HAStandbySpec `json:"standbys,omitempty"`
 
+	// Identity identifies the replicated HA unit for admin/fencing commands.
+	// +optional
+	Identity *HAReplicationIdentitySpec `json:"identity,omitempty"`
+
 	// SyncPolicy configures async, remote-write, or remote-apply durability.
 	// +optional
 	SyncPolicy *HASyncPolicy `json:"syncPolicy,omitempty"`
@@ -524,6 +528,33 @@ type HAStandbySpec struct {
 	// InitialLSN optionally pins slot creation to an existing primary LSN.
 	// +optional
 	InitialLSN *uint64 `json:"initialLSN,omitempty"`
+}
+
+// HAReplicationIdentitySpec identifies one replicated HA unit.
+type HAReplicationIdentitySpec struct {
+	// ClusterID is the stable replicated cluster identifier.
+	// +optional
+	ClusterID uint64 `json:"clusterID,omitempty"`
+
+	// ShardID is the replicated shard identifier.
+	// +optional
+	ShardID uint64 `json:"shardID,omitempty"`
+
+	// TableID is the replicated table identifier.
+	// +optional
+	TableID uint64 `json:"tableID,omitempty"`
+
+	// TimelineID is the current primary timeline.
+	// +optional
+	TimelineID uint64 `json:"timelineID,omitempty"`
+
+	// Epoch is the current primary epoch.
+	// +optional
+	Epoch uint64 `json:"epoch,omitempty"`
+
+	// CurrentPrimaryID is the logical id of the current primary.
+	// +optional
+	CurrentPrimaryID string `json:"currentPrimaryID,omitempty"`
 }
 
 // HASyncPolicy configures synchronous standby durability.

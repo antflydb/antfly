@@ -127,6 +127,14 @@ func TestUpdateHAStatusReportsReseedAndDegradedSync(t *testing.T) {
 
 func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t *testing.T) {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
 		Mode:         antflyv1.HADurabilityModeRemoteApply,
 		Required:     1,
@@ -227,6 +235,24 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
 		cluster.Status.HAStatus.PlannedActions[2].RouteTo != "standby-a" {
 		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	expectedAcquireCommand := []string{
+		"fence", "acquire",
+		"--cluster-id", "100",
+		"--shard-id", "10",
+		"--table-id", "20",
+		"--timeline-id", "4",
+		"--epoch", "6",
+		"--old-primary-id", "primary-a",
+		"--promoted-node-id", "standby-a",
+		"--new-timeline-id", "5",
+		"--new-epoch", "7",
+		"--required-lsn", "12",
+		"--observed-lsn", "12",
+		"--reason", "AutomaticFailoverReady",
+	}
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, expectedAcquireCommand) {
+		t.Fatalf("unexpected acquire-fence admin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
 	}
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "--current-fence"}) {
 		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)

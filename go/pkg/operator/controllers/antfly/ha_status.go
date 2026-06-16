@@ -315,7 +315,7 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
-	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions)
+	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha)
 	cluster.Status.HAStatus.PrimaryRoute = haPrimaryRouteStatus(plan.PrimaryRoute)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
 	cluster.Status.HAStatus.FormerPrimary = haFormerPrimaryStatus(plan.FormerPrimary)
@@ -335,7 +335,7 @@ func haSyncStatus(evaluation haSyncEvaluation) antflyv1.HASyncStatus {
 	}
 }
 
-func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActionStatus {
+func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec) []antflyv1.HAPlannedActionStatus {
 	if len(actions) == 0 {
 		return nil
 	}
@@ -350,14 +350,14 @@ func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActi
 			FenceAuthority:  action.FenceAuthority,
 			FenceHolder:     action.FenceHolder,
 			FenceGeneration: action.FenceGeneration,
-			AdminCommand:    haAdminCommand(action),
+			AdminCommand:    haAdminCommand(action, haReplicationIdentity(ha)),
 			Reason:          action.Reason,
 		})
 	}
 	return out
 }
 
-func haAdminCommand(action haPlannedAction) []string {
+func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec) []string {
 	switch action.Kind {
 	case haActionCreateSlot:
 		slotName := action.SlotName
@@ -379,9 +379,40 @@ func haAdminCommand(action haPlannedAction) []string {
 		return []string{"seed", "begin", "--slot", slotName, "--manifest-id", fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)}
 	case haActionPromoteStandby:
 		return []string{"promote", "--current-fence"}
+	case haActionAcquireFence:
+		if identity == nil || identity.CurrentPrimaryID == "" || action.StandbyName == "" {
+			return nil
+		}
+		return []string{
+			"fence", "acquire",
+			"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+			"--shard-id", strconv.FormatUint(identity.ShardID, 10),
+			"--table-id", strconv.FormatUint(identity.TableID, 10),
+			"--timeline-id", strconv.FormatUint(identity.TimelineID, 10),
+			"--epoch", strconv.FormatUint(identity.Epoch, 10),
+			"--old-primary-id", identity.CurrentPrimaryID,
+			"--promoted-node-id", action.StandbyName,
+			"--new-timeline-id", strconv.FormatUint(identity.TimelineID+1, 10),
+			"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
+			"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
+			"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
+			"--reason", action.Reason,
+		}
 	default:
 		return nil
 	}
+}
+
+func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplicationIdentitySpec {
+	if ha == nil || ha.Identity == nil {
+		return nil
+	}
+	identity := ha.Identity
+	if identity.ClusterID == 0 || identity.ShardID == 0 || identity.TableID == 0 ||
+		identity.TimelineID == 0 || identity.Epoch == 0 || identity.CurrentPrimaryID == "" {
+		return nil
+	}
+	return identity
 }
 
 func haPrimaryRouteStatus(evaluation haPrimaryRouteEvaluation) antflyv1.HAPrimaryRouteStatus {

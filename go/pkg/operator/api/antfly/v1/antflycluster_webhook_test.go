@@ -1940,6 +1940,31 @@ func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutStandbys(
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsIncompleteIdentity(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID: 100,
+			ShardID:   10,
+			TableID:   20,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected incomplete identity validation errors")
+	}
+	if !strings.Contains(err.Error(), "identity.timelineID") ||
+		!strings.Contains(err.Error(), "identity.epoch") ||
+		!strings.Contains(err.Error(), "identity.currentPrimaryID") {
+		t.Fatalf("expected incomplete identity errors, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
