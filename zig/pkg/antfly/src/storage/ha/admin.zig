@@ -194,6 +194,7 @@ pub fn promoteWithFence(
     standby: *standby_mod.Standby,
     request: FencedPromotionRequest,
 ) !FencedPromotionResult {
+    try validateFenceRequestForStandby(standby.identity, request.fence);
     const receipt = try fence_store.acquirePromotionFence(request.fence);
     defer fencing.freeReceipt(fence_store.alloc, receipt);
     return try promoteWithReceipt(alloc, standby, receipt);
@@ -214,6 +215,7 @@ fn promoteWithReceipt(
     standby: *standby_mod.Standby,
     receipt: fencing.Receipt,
 ) !FencedPromotionResult {
+    try validateFenceReceiptForStandby(standby.identity, receipt);
     const assessment = status.assessPromotionWithFence(standby, receipt);
     if (!assessment.can_promote) return error.PromotionNotAllowed;
 
@@ -228,6 +230,29 @@ fn promoteWithReceipt(
         .fence_token = token,
         .forced = receipt.forced,
     };
+}
+
+fn validateFenceRequestForStandby(identity: standby_mod.Identity, request: fencing.FenceRequest) !void {
+    try validateParentIdentityForStandby(identity, request.identity.cluster_id, request.identity.shard_id, request.identity.table_id, request.identity.timeline_id, request.identity.epoch);
+}
+
+fn validateFenceReceiptForStandby(identity: standby_mod.Identity, receipt: fencing.Receipt) !void {
+    try validateParentIdentityForStandby(identity, receipt.identity.cluster_id, receipt.identity.shard_id, receipt.identity.table_id, receipt.parent_timeline_id, receipt.parent_epoch);
+}
+
+fn validateParentIdentityForStandby(
+    standby_identity: standby_mod.Identity,
+    cluster_id: u64,
+    shard_id: u64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
+) !void {
+    if (standby_identity.cluster_id != cluster_id) return error.WrongCluster;
+    if (standby_identity.shard_id != shard_id) return error.WrongShard;
+    if (standby_identity.table_id != table_id) return error.WrongTable;
+    if (standby_identity.timeline_id != timeline_id) return error.WrongTimeline;
+    if (standby_identity.epoch != epoch) return error.WrongEpoch;
 }
 
 pub fn assessFormerPrimaryRejoin(
@@ -522,6 +547,55 @@ test "storage.ha admin acquires fence and promotes standby" {
     try std.testing.expectEqual(@as(u64, 3), result.promotion.switch_lsn);
     try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
     try std.testing.expect(!result.forced);
+}
+
+test "storage.ha admin rejects mismatched fence identity for promotion" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "promote-fence-identity");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(baseRecord(identity, 1, "one"));
+    var apply_counter = ApplyCounter{};
+    try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&apply_counter, ApplyCounter.apply));
+
+    var store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer store.close();
+
+    var wrong_request_identity = identity;
+    wrong_request_identity.shard_id += 1;
+    try std.testing.expectError(error.WrongShard, promoteWithFence(alloc, &store, &standby, .{
+        .fence = .{
+            .identity = wrong_request_identity,
+            .old_primary_id = "primary-a",
+            .promoted_node_id = "standby-a",
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .required_lsn = 1,
+            .observed_lsn = 1,
+            .reason = "admin-test",
+        },
+    }));
+    try std.testing.expect((try store.current(alloc)) == null);
+
+    var wrong_parent = identity;
+    wrong_parent.timeline_id += 1;
+    wrong_parent.epoch += 1;
+    const wrong_receipt = try store.acquirePromotionFence(.{
+        .identity = wrong_parent,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = wrong_parent.timeline_id + 1,
+        .new_epoch = wrong_parent.epoch + 1,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "admin-test",
+    });
+    defer fencing.freeReceipt(alloc, wrong_receipt);
+    try std.testing.expectError(error.WrongTimeline, promoteWithCurrentFence(alloc, &store, &standby));
+    try std.testing.expectEqual(@as(u64, identity.timeline_id), standby.identity.timeline_id);
 }
 
 test "storage.ha admin assesses former primary rejoin workflow" {
