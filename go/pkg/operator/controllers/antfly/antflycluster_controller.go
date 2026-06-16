@@ -84,6 +84,7 @@ const (
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/finalizers,verbs=update
@@ -3043,6 +3044,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
+		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+			return err
+		}
 		r.updateHAStatusAndConditions(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
@@ -3107,6 +3111,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
 	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
+	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+		return err
+	}
 	r.updateHAStatusAndConditions(cluster)
 
 	// Update ServiceMeshReady condition

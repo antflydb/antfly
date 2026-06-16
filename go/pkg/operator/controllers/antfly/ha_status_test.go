@@ -1,11 +1,17 @@
 package controllers
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestUpdateHAStatusDisabledClearsStatusAndPublishesConditions(t *testing.T) {
@@ -235,6 +241,65 @@ func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromot
 	}
 }
 
+func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	reconciler := testHAReconciler(t)
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+
+	if cluster.Status.HAStatus == nil {
+		t.Fatal("expected HA status to be initialized")
+	}
+	fencing := cluster.Status.HAStatus.Fencing
+	if fencing.Authority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		fencing.Ready ||
+		fencing.Reason != "LeaseMissing" {
+		t.Fatalf("expected missing lease fencing status, got %#v", fencing)
+	}
+}
+
+func TestObserveHAFencingStatusReportsExpiredKubernetesLease(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	lease := haFenceLease(cluster, time.Now().Add(-time.Minute), 10, 2, "standby-a")
+	reconciler := testHAReconciler(t, lease)
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+
+	fencing := cluster.Status.HAStatus.Fencing
+	if fencing.Ready || fencing.Holder != "standby-a" || fencing.Generation != 2 || fencing.Reason != "LeaseExpired" {
+		t.Fatalf("expected expired lease fencing status, got %#v", fencing)
+	}
+}
+
+func TestObserveHAFencingStatusAllowsPromotionWithReadyKubernetesLease(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:         antflyv1.HADurabilityModeRemoteApply,
+		Required:     1,
+		StandbyNames: []string{"standby-a"},
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	lease := haFenceLease(cluster, time.Now(), 30, 3, "standby-a")
+	reconciler := testHAReconciler(t, lease)
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	fencing := cluster.Status.HAStatus.Fencing
+	if !fencing.Ready || fencing.Holder != "standby-a" || fencing.Generation != 3 || fencing.Reason != "LeaseHeld" {
+		t.Fatalf("expected ready lease fencing status, got %#v", fencing)
+	}
+	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected ready Kubernetes lease to satisfy automatic promotion fencing gate")
+	}
+}
+
 func haCluster() *antflyv1.AntflyCluster {
 	return &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -253,6 +318,15 @@ func haCluster() *antflyv1.AntflyCluster {
 	}
 }
 
+func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+	}
+	return cluster
+}
+
 func caughtUpHAStatus() *antflyv1.HAStatus {
 	return &antflyv1.HAStatus{
 		PrimaryLSN: 12,
@@ -266,6 +340,40 @@ func caughtUpHAStatus() *antflyv1.HAStatus {
 			ApplyLagLSN: 0,
 			Status:      "healthy",
 		}},
+	}
+}
+
+func haFenceLease(cluster *antflyv1.AntflyCluster, renewTime time.Time, durationSeconds int32, transitions int32, holder string) *coordinationv1.Lease {
+	renew := metav1.NewMicroTime(renewTime)
+	return &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      haFencingLeaseName(cluster),
+			Namespace: cluster.Namespace,
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &durationSeconds,
+			RenewTime:            &renew,
+			LeaseTransitions:     &transitions,
+		},
+	}
+}
+
+func testHAReconciler(t *testing.T, objects ...client.Object) *AntflyClusterReconciler {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := antflyv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add antfly scheme: %v", err)
+	}
+	if err := coordinationv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add coordination scheme: %v", err)
+	}
+	return &AntflyClusterReconciler{
+		Client: clientfake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(objects...).
+			Build(),
+		Scheme: scheme,
 	}
 }
 

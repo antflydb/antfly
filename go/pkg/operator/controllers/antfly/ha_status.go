@@ -1,11 +1,16 @@
 package controllers
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type haActionKind string
@@ -42,6 +47,82 @@ func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.
 	plan := planHA(cluster)
 	applyHAPlanStatus(cluster, plan)
 	setHAConditions(cluster, plan)
+}
+
+func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled {
+		return nil
+	}
+	if ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
+		return nil
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      haFencingLeaseName(cluster),
+		Namespace: cluster.Namespace,
+	}, lease)
+	if apierrors.IsNotFound(err) {
+		cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+			Authority: antflyv1.HAFencingAuthorityKubernetesLease,
+			Reason:    "LeaseMissing",
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	generation := haLeaseFenceGeneration(lease)
+	holder := ""
+	if lease.Spec.HolderIdentity != nil {
+		holder = *lease.Spec.HolderIdentity
+	}
+	ready, reason := haLeaseFenceReady(lease, generation, time.Now())
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		Ready:      ready,
+		Holder:     holder,
+		Generation: generation,
+		Reason:     reason,
+	}
+	return nil
+}
+
+func haFencingLeaseName(cluster *antflyv1.AntflyCluster) string {
+	return cluster.Name + "-ha-fence"
+}
+
+func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.Time) (bool, string) {
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return false, "LeaseNotHeld"
+	}
+	if generation == 0 {
+		return false, "LeaseGenerationMissing"
+	}
+	if lease.Spec.RenewTime == nil || lease.Spec.LeaseDurationSeconds == nil || *lease.Spec.LeaseDurationSeconds <= 0 {
+		return false, "LeaseTimingMissing"
+	}
+	expiresAt := lease.Spec.RenewTime.Time.Add(time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second)
+	if !now.Before(expiresAt) {
+		return false, "LeaseExpired"
+	}
+	return true, "LeaseHeld"
+}
+
+func haLeaseFenceGeneration(lease *coordinationv1.Lease) uint64 {
+	if lease.Spec.LeaseTransitions != nil && *lease.Spec.LeaseTransitions > 0 {
+		return uint64(*lease.Spec.LeaseTransitions)
+	}
+	if lease.Generation > 0 {
+		return uint64(lease.Generation)
+	}
+	return 0
 }
 
 func planHA(cluster *antflyv1.AntflyCluster) haPlan {
