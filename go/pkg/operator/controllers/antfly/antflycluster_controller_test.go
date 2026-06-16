@@ -1068,11 +1068,18 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 					AdminJobName:  "promote-job",
 					AdminJobPhase: haAdminJobPhasePending,
 				}, {
-					Kind:          string(haActionDemoteFormerPrimary),
-					StandbyName:   "primary-a",
-					AdminCommand:  []string{"rejoin", "assess"},
-					AdminJobName:  "demote-job",
-					AdminJobPhase: haAdminJobPhaseSucceeded,
+					Kind:            string(haActionDemoteFormerPrimary),
+					StandbyName:     "primary-a",
+					TargetLSN:       12,
+					ObservedLSN:     11,
+					RetainedFromLSN: 8,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					Reason:          "PromotionPlanned",
+					AdminCommand:    []string{"rejoin", "assess"},
+					AdminJobName:    "demote-job",
+					AdminJobPhase:   haAdminJobPhaseSucceeded,
 				}},
 			},
 		},
@@ -1086,6 +1093,14 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.ObservedLSN).To(Equal(uint64(11)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.RetainedFromLSN).To(Equal(uint64(8)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.FenceHolder).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionDemoteFormerPrimary)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("PromotionPlanned"))
 }
 
 func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {

@@ -3371,6 +3371,7 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 		if cluster.Status.HAStatus.FormerPrimary == nil {
 			cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: action.StandbyName}
 		}
+		applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, action)
 		r.updateHAFormerPrimaryStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.FormerPrimary)
 		return
 	}
@@ -3395,6 +3396,33 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryStatusFromAdminJobLogs(ct
 		return
 	}
 	applyHARejoinJobResult(former, result)
+}
+
+func applyHAFormerPrimaryActionStatus(former *antflyv1.HAFormerPrimaryStatus, action antflyv1.HAPlannedActionStatus) {
+	if former == nil {
+		return
+	}
+	if action.StandbyName != "" {
+		former.NodeID = action.StandbyName
+	}
+	if action.TargetLSN != 0 {
+		former.SwitchLSN = action.TargetLSN
+	}
+	if action.ObservedLSN != 0 {
+		former.ObservedLSN = action.ObservedLSN
+	}
+	if action.RetainedFromLSN != 0 {
+		former.RetainedFromLSN = action.RetainedFromLSN
+	}
+	former.FenceAuthority = action.FenceAuthority
+	former.FenceHolder = action.FenceHolder
+	former.FenceGeneration = action.FenceGeneration
+	if former.Action == "" {
+		former.Action = action.Kind
+	}
+	if former.Reason == "" {
+		former.Reason = action.Reason
+	}
 }
 
 func (r *AntflyClusterReconciler) haAdminJobLogBody(ctx context.Context, cluster *antflyv1.AntflyCluster, jobName string) (string, bool) {
