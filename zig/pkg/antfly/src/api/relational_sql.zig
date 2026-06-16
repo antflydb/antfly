@@ -62707,6 +62707,11 @@ const AppParityCorpusCoverage = struct {
     multi_row_insert: bool = false,
     multi_row_conflict_do_nothing: bool = false,
     multi_row_conflict_do_nothing_duplicate_target: bool = false,
+    write_plan_insert_op_set: bool = false,
+    write_plan_insert_op_inc: bool = false,
+    write_plan_update_op_set: bool = false,
+    write_plan_update_op_push: bool = false,
+    write_plan_update_op_pull: bool = false,
     point_update_jsonb: bool = false,
     point_update_jsonb_concat: bool = false,
     point_update_array: bool = false,
@@ -62973,6 +62978,11 @@ const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":ops="));
         self.point_update_array = self.point_update_array or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "array_") != null);
+        self.write_plan_insert_op_set = self.write_plan_insert_op_set or (entry.family == .insert and appParityPlanHasNonZeroToken(entry.plan, ":op_set="));
+        self.write_plan_insert_op_inc = self.write_plan_insert_op_inc or (entry.family == .insert and appParityPlanHasNonZeroToken(entry.plan, ":op_inc="));
+        self.write_plan_update_op_set = self.write_plan_update_op_set or (entry.family == .update and appParityPlanHasNonZeroToken(entry.plan, ":op_set="));
+        self.write_plan_update_op_push = self.write_plan_update_op_push or (entry.family == .update and appParityPlanHasNonZeroToken(entry.plan, ":op_push="));
+        self.write_plan_update_op_pull = self.write_plan_update_op_pull or (entry.family == .update and appParityPlanHasNonZeroToken(entry.plan, ":op_pull="));
         self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null);
         self.point_update_patch_expression = self.point_update_patch_expression or
             (entry.family == .update and std.mem.eql(u8, entry.name, "point update expression assignment"));
@@ -64684,6 +64694,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.multi_row_insert);
         try std.testing.expect(self.multi_row_conflict_do_nothing);
         try std.testing.expect(self.multi_row_conflict_do_nothing_duplicate_target);
+        try self.expectRowBatchTransformOpCoverage();
         try std.testing.expect(self.point_update_jsonb);
         try std.testing.expect(self.point_update_jsonb_concat);
         try std.testing.expect(self.point_update_array);
@@ -64887,6 +64898,14 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.point_update_array);
         try std.testing.expect(self.update_joined_source_array_expression);
         try std.testing.expect(self.delete_joined_source_array_expression);
+    }
+
+    fn expectRowBatchTransformOpCoverage(self: @This()) !void {
+        try std.testing.expect(self.write_plan_insert_op_set);
+        try std.testing.expect(self.write_plan_insert_op_inc);
+        try std.testing.expect(self.write_plan_update_op_set);
+        try std.testing.expect(self.write_plan_update_op_push);
+        try std.testing.expect(self.write_plan_update_op_pull);
     }
 
     fn expectRowAssignmentCoverage(self: @This()) !void {

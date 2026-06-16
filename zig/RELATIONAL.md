@@ -1015,7 +1015,10 @@ SQL/API parity fingerprints for row-batch inserts and updates include total
 transform-op counts plus native storage operation-family suffixes such as
 `op_set`, `op_inc`, `op_push`, and `op_pull`, so conflict actions, JSON/array
 transforms, and ordinary patch updates cannot collapse to the same golden write
-plan when their row-batch effects differ.
+plan when their row-batch effects differ. The corpus coverage gate requires
+representative row-batch insert and update plans with those operation-family
+suffixes, so removing the native transform signal is a CI-visible typed-plan
+contract regression.
 Ordered SELECT outputs lower to typed target assignments in projection order;
 computed outputs such as `lower(status)` or `amount + 1` stay in the shared
 row-expression AST with source-row field bindings before the inserted image is
