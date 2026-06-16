@@ -19082,12 +19082,12 @@ const Parser = struct {
                 else => false,
             };
         }
-        if (self.expressionCanStartAt(self.pos) or self.jsonKeySetExpressionCanStartAt(self.pos) or self.jsonExtractExpressionPredicateCanStartAt(self.pos)) return true;
+        if (self.expressionPredicateCanStartAt(self.pos)) return true;
         if (self.canParseExpressionNotWhere()) return true;
         if (self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment()) return true;
         if (self.peekKind(.lparen)) {
             const inner = self.predicateStartIndexAfterOpenParens(self.pos);
-            return self.expressionCanStartAt(inner) or self.jsonKeySetExpressionCanStartAt(inner) or self.jsonExtractExpressionPredicateCanStartAt(inner);
+            return self.expressionPredicateCanStartAt(inner);
         }
         return false;
     }
@@ -19159,6 +19159,11 @@ const Parser = struct {
 
         if (self.whereHasTopLevelOr() or self.parenthesizedExpressionOrWhereCanStart()) {
             try self.parseExpressionOrWhere(expression_or_predicates);
+            return;
+        }
+
+        if (try self.canParseBareBooleanWhereExpression()) {
+            try self.parseBareBooleanWhereExpression(expression_predicates);
             return;
         }
 
@@ -25873,6 +25878,10 @@ const Parser = struct {
             sqlKeywordIsDateTruncFunction(token.text) or
             sqlKeywordIsDateBinFunction(token.text) or
             sqlKeywordIsDatePartFunction(token.text) or
+            sqlKeywordIsRegexpMatchFunction(token.text) or
+            sqlKeywordIsRegexpCountFunction(token.text) or
+            sqlKeywordIsRegexpSubstrFunction(token.text) or
+            sqlKeywordIsRegexpInstrFunction(token.text) or
             std.ascii.eqlIgnoreCase(token.text, "replace") or
             sqlKeywordIsTranslateFunction(token.text) or
             std.ascii.eqlIgnoreCase(token.text, "true") or
@@ -61828,6 +61837,8 @@ const AppParityCorpusCoverage = struct {
     update_joined_source_row_value_semijoin: bool = false,
     delete_joined_source_row_value_semijoin: bool = false,
     update_joined_source_modulo_expression: bool = false,
+    update_joined_source_regexp_expression: bool = false,
+    delete_joined_source_regexp_expression: bool = false,
     update_joined_source_row_assignment: bool = false,
     update_source_patch_expression: bool = false,
     update_source_increment_expression: bool = false,
@@ -62314,6 +62325,19 @@ const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "MOD(source.quantity + usage_records.quantity, 7)") != null and
             std.mem.indexOf(u8, entry.sql, "quantity % 2") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.update_joined_source_regexp_expression = self.update_joined_source_regexp_expression or (is_update_joined_source and
+            std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
+            std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
+            std.mem.indexOf(u8, entry.sql, "regexp_count(source.status") != null and
+            std.mem.indexOf(u8, entry.sql, "regexp_instr(source.status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.delete_joined_source_regexp_expression = self.delete_joined_source_regexp_expression or (is_delete_joined_source and
+            std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
+            std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
             appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
@@ -63786,6 +63810,27 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.window_modulo_expression);
         try std.testing.expect(self.update_source_modulo_expression);
         try std.testing.expect(self.update_joined_source_modulo_expression);
+    }
+
+    fn expectRegexpCoverage(self: @This()) !void {
+        try std.testing.expect(self.query_regexp_replace_expression);
+        try std.testing.expect(self.query_regexp_substr_expression);
+        try std.testing.expect(self.query_regexp_match_expression);
+        try std.testing.expect(self.query_regexp_count_expression);
+        try std.testing.expect(self.query_regexp_instr_expression);
+        try std.testing.expect(self.conflict_regexp_replace_expression_update);
+        try std.testing.expect(self.conflict_regexp_match_expression_update);
+        try std.testing.expect(self.conflict_regexp_count_expression_update);
+        try std.testing.expect(self.conflict_regexp_instr_expression_update);
+        try std.testing.expect(self.conflict_regexp_substr_expression_update);
+        try std.testing.expect(self.insert_source_conflict_regexp_expression);
+        try std.testing.expect(self.update_source_regexp_replace_expression);
+        try std.testing.expect(self.update_source_regexp_match_expression);
+        try std.testing.expect(self.update_source_regexp_count_expression);
+        try std.testing.expect(self.update_source_regexp_instr_expression);
+        try std.testing.expect(self.update_source_regexp_substr_expression);
+        try std.testing.expect(self.update_joined_source_regexp_expression);
+        try std.testing.expect(self.delete_joined_source_regexp_expression);
     }
 
     fn expectRowAssignmentCoverage(self: @This()) !void {
@@ -69552,6 +69597,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE usage_records SET enabled = usage_records.enabled OR source.enabled FROM source_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id, enabled",
         },
         .{
+            .name = "joined update source regexp expression assignment",
+            .family = .update_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .patch_expressions = 2, .returning = 1 },
+            .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:patch_expr=2:right_expr_pred=1",
+            .sql = "UPDATE usage_records SET status = regexp_substr(source.status, '[a-z]+'), amount = regexp_count(source.status, '[0-9]+') FROM source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^ready', true) FOR UPDATE RETURNING id, regexp_instr(source.status, '[0-9]+') AS source_digit",
+        },
+        .{
             .name = "joined delete source returning field",
             .family = .delete_joined_source,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .returning = 1 },
@@ -69564,6 +69616,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .join_on = 1, .returning = 1 },
             .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0",
             .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id, lower(source.status) AS source_status_key",
+        },
+        .{
+            .name = "joined delete source regexp returning expression",
+            .family = .delete_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
+            .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
+            .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^stale', true) FOR UPDATE RETURNING id, regexp_substr(source.status, '[a-z]+') AS source_token",
         },
         .{
             .name = "distinct on ordered query",
@@ -69781,6 +69840,7 @@ test "postgres sql adapter classifies application parity corpus" {
     try coverage.expectWindowAggregateFilter();
     try coverage.expectComputedPatternCoverage();
     try coverage.expectModuloCoverage();
+    try coverage.expectRegexpCoverage();
     try coverage.expectRowAssignmentCoverage();
     try coverage.expectSeededBooleanAssignmentCoverage();
     try coverage.expectJsonSetCoverage();
