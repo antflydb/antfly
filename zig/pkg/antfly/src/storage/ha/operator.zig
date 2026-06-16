@@ -79,9 +79,16 @@ pub const ConditionType = enum {
     automatic_failover_ready,
 };
 
+pub const ConditionSeverity = enum {
+    info,
+    warning,
+    critical,
+};
+
 pub const Condition = struct {
     type: ConditionType,
     status: bool,
+    severity: ConditionSeverity = .info,
     reason: []const u8,
     message: []const u8,
 };
@@ -216,6 +223,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         try conditions.append(alloc, .{
             .type = .available,
             .status = false,
+            .severity = .info,
             .reason = "Disabled",
             .message = "HA hot standby mode is disabled",
         });
@@ -298,30 +306,35 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     try conditions.append(alloc, .{
         .type = .available,
         .status = healthy_count > 0 or desired_count == 0,
+        .severity = if (healthy_count > 0 or desired_count == 0) .info else .warning,
         .reason = if (healthy_count > 0) "HealthyStandbyAvailable" else "NoHealthyStandby",
         .message = if (healthy_count > 0) "At least one desired standby is caught up to apply" else "No desired standby is caught up to apply",
     });
     try conditions.append(alloc, .{
         .type = .degraded,
         .status = degraded,
+        .severity = if (degraded) .critical else .info,
         .reason = if (degraded) "SyncPolicyUnsatisfied" else "SyncPolicySatisfied",
         .message = if (degraded) "Synchronous HA policy is not currently satisfied" else "Synchronous HA policy is satisfied or not configured",
     });
     try conditions.append(alloc, .{
         .type = .retention_pressure,
         .status = retention_pressure,
+        .severity = if (retention_pressure) .warning else .info,
         .reason = if (retention_pressure) "RetentionCapExceeded" else "RetentionWithinPolicy",
         .message = if (retention_pressure) "One or more slots are forcing WAL retention beyond policy" else "WAL retention is within configured policy",
     });
     try conditions.append(alloc, .{
         .type = .reseed_required,
         .status = reseed_count > 0,
+        .severity = if (reseed_count > 0) .warning else .info,
         .reason = if (reseed_count > 0) "StandbyRequiresReseed" else "NoReseedRequired",
         .message = if (reseed_count > 0) "One or more desired standbys must be reseeded" else "No desired standby requires reseed",
     });
     try conditions.append(alloc, .{
         .type = .automatic_failover_ready,
         .status = automatic_allowed,
+        .severity = if (automatic_allowed or !spec.auto_failover.enabled) .info else .warning,
         .reason = automaticFailoverReason(spec, observed.primary, observed.fencing, automatic_allowed),
         .message = if (automatic_allowed) "Automatic failover may acquire a fence and promote a caught-up standby" else "Automatic failover is disabled or missing a safe fencing/readiness prerequisite",
     });
@@ -736,6 +749,9 @@ test "storage.ha operator plans slots and standby bootstrap" {
     try std.testing.expectEqual(ActionKind.seed_standby, plan.actions[1].kind);
     try std.testing.expectEqual(@as(usize, 1), plan.desired_standby_count);
     try std.testing.expectEqual(@as(usize, 0), plan.healthy_standby_count);
+    const available = condition(plan, .available) orelse return error.TestExpectedEqual;
+    try std.testing.expect(!available.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, available.severity);
     try std.testing.expect(!plan.automatic_promotion_allowed);
 }
 
@@ -793,11 +809,18 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
 
     try std.testing.expectEqual(@as(usize, 1), plan.reseed_required_count);
     try std.testing.expectEqual(ActionKind.mark_reseed, plan.actions[0].kind);
-    try std.testing.expect((condition(plan, .retention_pressure) orelse return error.TestExpectedEqual).status);
-    try std.testing.expect((condition(plan, .degraded) orelse return error.TestExpectedEqual).status);
-    try std.testing.expect((condition(plan, .reseed_required) orelse return error.TestExpectedEqual).status);
+    const retention_pressure = condition(plan, .retention_pressure) orelse return error.TestExpectedEqual;
+    try std.testing.expect(retention_pressure.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, retention_pressure.severity);
+    const degraded_condition = condition(plan, .degraded) orelse return error.TestExpectedEqual;
+    try std.testing.expect(degraded_condition.status);
+    try std.testing.expectEqual(ConditionSeverity.critical, degraded_condition.severity);
+    const reseed_condition = condition(plan, .reseed_required) orelse return error.TestExpectedEqual;
+    try std.testing.expect(reseed_condition.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, reseed_condition.severity);
     const failover = condition(plan, .automatic_failover_ready) orelse return error.TestExpectedEqual;
     try std.testing.expect(!failover.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, failover.severity);
     try std.testing.expectEqualStrings("SyncPolicyUnsatisfied", failover.reason);
 }
 
@@ -1036,6 +1059,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
+    try expectContains(rendered, "\"severity\":\"info\"");
     try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
     try expectContains(rendered, "\"reason\":\"FencedPromotionReady\"");
 }
