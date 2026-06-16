@@ -50,6 +50,7 @@ pub const SlotMetrics = struct {
     apply_lag_lsn: u64,
     retention_lag_lsn: u64,
     status_code: u64,
+    last_error: u64,
 };
 
 pub const PrimaryMetrics = struct {
@@ -141,6 +142,7 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
             .apply_lag_lsn = slot.apply_lag_lsn,
             .retention_lag_lsn = slot.retention_lag_lsn,
             .status_code = @intFromEnum(slotStatusCode(slot.status)),
+            .last_error = boolGauge(slot.last_error != null),
         };
         filled += 1;
     }
@@ -268,6 +270,7 @@ pub fn renderPrimaryPrometheusAlloc(alloc: Allocator, metrics: PrimaryMetrics) !
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_apply_lag_lsn", metrics.slots, .apply_lag_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_retention_lag_lsn", metrics.slots, .retention_lag_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_status_code", metrics.slots, .status_code);
+    try appendSlotGauges(alloc, &out, "antfly_ha_slot_last_error", metrics.slots, .last_error);
 
     return try out.toOwnedSlice(alloc);
 }
@@ -319,6 +322,7 @@ const SlotMetricField = enum {
     apply_lag_lsn,
     retention_lag_lsn,
     status_code,
+    last_error,
 };
 
 fn appendGauge(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: u64) !void {
@@ -385,6 +389,7 @@ fn slotMetricValue(slot: SlotMetrics, field: SlotMetricField) u64 {
         .apply_lag_lsn => slot.apply_lag_lsn,
         .retention_lag_lsn => slot.retention_lag_lsn,
         .status_code => slot.status_code,
+        .last_error => slot.last_error,
     };
 }
 
@@ -421,6 +426,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
             .apply_lag_lsn = 14,
             .retention_lag_lsn = 17,
             .status = .reseed_required,
+            .last_error = "IntentionalApplyFailure",
         },
     };
     const snapshot = status_mod.PrimarySnapshot{
@@ -479,6 +485,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqual(@as(u64, 2), metrics.durability_candidate_count);
     try std.testing.expectEqualStrings("standby-b", metrics.slots[1].name);
     try std.testing.expectEqual(@as(u64, @intFromEnum(SlotStatusCode.reseed_required)), metrics.slots[1].status_code);
+    try std.testing.expectEqual(@as(u64, 1), metrics.slots[1].last_error);
 }
 
 test "storage.ha metrics derives standby and promotion gauges" {
@@ -545,6 +552,7 @@ test "storage.ha metrics renders prometheus text" {
             .apply_lag_lsn = 3,
             .retention_lag_lsn = 12,
             .status_code = @intFromEnum(SlotStatusCode.healthy),
+            .last_error = 0,
         },
     };
     const primary = PrimaryMetrics{
@@ -581,6 +589,7 @@ test "storage.ha metrics renders prometheus text" {
     try expectContains(primary_text, "antfly_ha_primary_durability_missing_lsn_count 0\n");
     try expectContains(primary_text, "# TYPE antfly_ha_slot_apply_lag_lsn gauge\n");
     try expectContains(primary_text, "antfly_ha_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n");
+    try expectContains(primary_text, "antfly_ha_slot_last_error{slot=\"standby\\\"a\\\\b\\nc\"} 0\n");
 
     const standby_text = try renderStandbyPrometheusAlloc(alloc, .{
         .received_lsn = 12,
