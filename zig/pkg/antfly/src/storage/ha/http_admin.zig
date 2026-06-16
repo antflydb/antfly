@@ -208,7 +208,9 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer snapshot.deinit(self.alloc);
-        return try self.handleTypedJson(status_mod.primaryStatusDocument(snapshot));
+        const slots = try slotListDocuments(self.alloc, snapshot);
+        defer self.alloc.free(slots);
+        return try self.handleTypedJson(SlotListDocument{ .slots = slots });
     }
 
     fn handleAdminCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -771,6 +773,31 @@ const SlotDocument = struct {
     dropped: ?bool = null,
 };
 
+const SlotListDocument = struct {
+    schema_version: u32 = 1,
+    slots: []const SlotDocument,
+};
+
+fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]SlotDocument {
+    const slots = try alloc.alloc(SlotDocument, snapshot.slots.len);
+    errdefer alloc.free(slots);
+    for (snapshot.slots, 0..) |slot, idx| {
+        slots[idx] = .{
+            .slot_name = slot.name,
+            .timeline_id = slot.timeline_id,
+            .restart_lsn = slot.restart_lsn,
+            .received_lsn = slot.received_lsn,
+            .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
+            .active = slot.active,
+            .reseed_required = slot.reseed_required,
+            .last_error = slot.last_error,
+            .current_lsn = snapshot.current_lsn,
+        };
+    }
+    return slots;
+}
+
 fn slotActionDocument(action: []const u8, slot: anytype, dropped: ?bool) SlotActionDocument {
     return .{
         .slot_action = action,
@@ -1330,10 +1357,10 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_slots.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_slots.status);
     try std.testing.expectEqualStrings("application/json", typed_slots.content_type.?);
-    try expectContains(typed_slots.body, "\"snapshot\"");
     try expectContains(typed_slots.body, "\"slots\"");
-    try expectContains(typed_slots.body, "\"name\":\"standby-a\"");
-    try expectContains(typed_slots.body, "\"name\":\"standby-b\"");
+    try expectContains(typed_slots.body, "\"slot_name\":\"standby-a\"");
+    try expectContains(typed_slots.body, "\"slot_name\":\"standby-b\"");
+    try std.testing.expect(std.mem.indexOf(u8, typed_slots.body, "\"snapshot\"") == null);
 
     const typed_pause_uri = try admin_api.routes.replicationSlotPausePathAlloc(alloc, "standby-b");
     defer alloc.free(typed_pause_uri);

@@ -29,6 +29,7 @@ pub const FenceAcquireRequest = openapi.FenceAcquireRequest;
 pub const HAFenceReceipt = openapi.HAFenceReceipt;
 pub const PromotionAssessRequest = openapi.PromotionAssessRequest;
 pub const RejoinAssessRequest = openapi.RejoinAssessRequest;
+pub const HAReplicationSlotListResponse = openapi.HAReplicationSlotListResponse;
 
 test {
     _ = openapi;

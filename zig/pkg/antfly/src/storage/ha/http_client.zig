@@ -220,10 +220,10 @@ pub const Client = struct {
     pub fn listReplicationSlots(
         self: *Client,
         base_uri: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HAPrimaryStatusResponse) {
+    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotListResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.openapi.HAPrimaryStatusResponse, .{
+        return try self.executeJson(admin_api.openapi.HAReplicationSlotListResponse, .{
             .method = .GET,
             .uri = uri,
         });
@@ -682,8 +682,9 @@ test "storage.ha http client round trips admin commands" {
 
     var typed_slots = try client.listReplicationSlots("http://ha-admin.test");
     defer typed_slots.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), typed_slots.parsed.value.snapshot.slots.len);
-    try std.testing.expectEqualStrings("standby-typed", typed_slots.parsed.value.snapshot.slots[0].name);
+    try std.testing.expectEqual(@as(i64, 1), typed_slots.parsed.value.schema_version);
+    try std.testing.expectEqual(@as(usize, 1), typed_slots.parsed.value.slots.len);
+    try std.testing.expectEqualStrings("standby-typed", typed_slots.parsed.value.slots[0].slot_name);
 
     var typed_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby-typed");
     defer typed_paused.deinit(alloc);

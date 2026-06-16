@@ -236,14 +236,17 @@ fn executeTypedRemote(
             },
         },
         .slot_list => |command| {
-            var out = if (command.retention_policy.max_lag_lsn == 0)
-                try client.listReplicationSlots(remote_url)
-            else
-                try client.getPrimaryStatus(remote_url, .{
+            if (command.retention_policy.max_lag_lsn == 0) {
+                var out = try client.listReplicationSlots(remote_url);
+                defer out.deinit(alloc);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            } else {
+                var out = try client.getPrimaryStatus(remote_url, .{
                     .max_lag_lsn = command.retention_policy.max_lag_lsn,
                 });
-            defer out.deinit(alloc);
-            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+                defer out.deinit(alloc);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            }
             return true;
         },
         .seed => |command| switch (command) {

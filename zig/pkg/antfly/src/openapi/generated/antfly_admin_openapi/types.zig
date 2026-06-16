@@ -303,6 +303,11 @@ pub const HAReplicationSlotActionResponse = struct {
     slot: HAReplicationSlot,
 };
 
+pub const HAReplicationSlotListResponse = struct {
+    schema_version: i64,
+    slots: []const HAReplicationSlot,
+};
+
 pub const RejoinAssessRequest = struct {
     /// Former primary node id that is attempting to rejoin.
     node_id: []const u8,

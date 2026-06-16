@@ -223,7 +223,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HAPrimaryStatusResponse"
+                $ref: "#/components/schemas/HAReplicationSlotListResponse"
         "409":
           $ref: "#/components/responses/Conflict"
     post:
@@ -972,6 +972,19 @@ components:
           enum: [create, pause, resume, drop]
         slot:
           $ref: "#/components/schemas/HAReplicationSlot"
+    HAReplicationSlotListResponse:
+      type: object
+      required: [schema_version, slots]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/HAReplicationSlot"
     HABaseBackupBeginResponse:
       type: object
       required: [schema_version, backup_lsn, start_record_lsn]

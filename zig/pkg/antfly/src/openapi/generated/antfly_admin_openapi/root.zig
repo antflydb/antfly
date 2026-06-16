@@ -28,6 +28,7 @@ pub const HAReadCheckResponse = types.HAReadCheckResponse;
 pub const HAWriteCheckResponse = types.HAWriteCheckResponse;
 pub const HAOwnerJobCheckResponse = types.HAOwnerJobCheckResponse;
 pub const HAReplicationSlotActionResponse = types.HAReplicationSlotActionResponse;
+pub const HAReplicationSlotListResponse = types.HAReplicationSlotListResponse;
 pub const HABaseBackupBeginResponse = types.HABaseBackupBeginResponse;
 pub const HABaseBackupFinishResponse = types.HABaseBackupFinishResponse;
 pub const HAStandbyBootstrapResponse = types.HAStandbyBootstrapResponse;
