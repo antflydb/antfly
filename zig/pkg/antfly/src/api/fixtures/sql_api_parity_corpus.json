@@ -5993,7 +5993,8 @@
       "family": "update",
       "summary": {
         "table_name": "usage_records",
-        "operations": 2
+        "operations": 2,
+        "returning": 1
       },
       "plan": "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2:op_set=2",
       "returning_rows": ["{\"source_text\":\"old\",\"flags_json\":[\"rated\"]}"],

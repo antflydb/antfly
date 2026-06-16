@@ -62367,6 +62367,11 @@ fn validateAppParityFixtureMetadata(
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.returning_rows.len > 0) {
+        if (entry.summary.returning == null or entry.summary.returning.? != entry.returning_rows.len) {
+            return error.TestUnexpectedResult;
+        }
+    }
     for (entry.returning_rows) |returning_row| {
         if (!(try appParityJsonTextIsObject(alloc, returning_row))) return error.TestUnexpectedResult;
     }
@@ -62598,6 +62603,24 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .returning = 1 },
         .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
         .returning_rows = &.{"[\"u1\"]"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "returning rows without returning summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+        .returning_rows = &.{"{\"id\":\"u1\"}"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "returning rows count mismatch",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active'), ('u2', 'active') RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 2 },
+        .plan = "insert:table=usage_records:writes=2:transforms=0:ops=0:deletes=0:returning_rows=2:returning_expr=0",
+        .returning_rows = &.{"{\"id\":\"u1\"}"},
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -69453,7 +69476,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "point update jsonb concat",
             .family = .update,
-            .summary = .{ .table_name = "usage_records", .operations = 2 },
+            .summary = .{ .table_name = "usage_records", .operations = 2, .returning = 1 },
             .plan = "update:table=usage_records:transforms=1:ops=2:returning_rows=1:returning_expr=2:op_set=2",
             .resolver_row_json = "{\"id\":\"u1\",\"metadata\":{\"billing\":{\"plan\":\"free\"},\"source\":\"old\"}}",
             .resolver_version = 10,
