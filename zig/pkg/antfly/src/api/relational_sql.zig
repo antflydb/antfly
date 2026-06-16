@@ -62265,16 +62265,50 @@ fn appParityFixtureFamilyAllowsReturningRows(family: AppParityCorpusPlanFamily) 
     };
 }
 
-fn appParitySqlHasNumberedParameter(sql: []const u8) bool {
+fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
+    if (dollar + 1 >= sql.len) return null;
+    if (sql[dollar] != '$') return null;
+    if (sql[dollar + 1] < '0' or sql[dollar + 1] > '9') return null;
+
+    var index = dollar + 1;
+    var value: usize = 0;
+    while (index < sql.len and sql[index] >= '0' and sql[index] <= '9') : (index += 1) {
+        value = value * 10 + (sql[index] - '0');
+    }
+    return value;
+}
+
+fn appParitySqlHasParameterIndex(sql: []const u8, expected: usize) bool {
     var index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
-        const digit_index = dollar + 1;
-        if (digit_index < sql.len and sql[digit_index] >= '0' and sql[digit_index] <= '9') {
-            return true;
+        if (appParitySqlParameterIndexAt(sql, dollar)) |param_index| {
+            if (param_index == expected) return true;
         }
         index = dollar + 1;
     }
     return false;
+}
+
+fn appParitySqlParameterCoverageMatches(sql: []const u8, param_count: usize) bool {
+    if (param_count == 0) return true;
+
+    var index: usize = 0;
+    var saw_parameter = false;
+    var max_index: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
+        if (appParitySqlParameterIndexAt(sql, dollar)) |param_index| {
+            if (param_index == 0 or param_index > param_count) return false;
+            saw_parameter = true;
+            max_index = @max(max_index, param_index);
+        }
+        index = dollar + 1;
+    }
+    if (!saw_parameter or max_index != param_count) return false;
+
+    for (1..param_count + 1) |param_index| {
+        if (!appParitySqlHasParameterIndex(sql, param_index)) return false;
+    }
+    return true;
 }
 
 fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
@@ -62419,7 +62453,7 @@ fn validateAppParityFixtureMetadata(
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
         return error.TestUnexpectedResult;
     }
-    if (entry.params.len > 0 and !appParitySqlHasNumberedParameter(entry.sql)) {
+    if (!appParitySqlParameterCoverageMatches(entry.sql, entry.params.len)) {
         return error.TestUnexpectedResult;
     }
     if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
@@ -62567,6 +62601,33 @@ test "app parity fixture metadata requires typed summary anchors" {
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "params without placeholder",
         .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{.{ .string = "u1" }},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "extra bind param",
+        .sql = "SELECT id FROM usage_records WHERE id = $1",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{ .{ .string = "u1" }, .{ .string = "unused" } },
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "skipped bind param",
+        .sql = "SELECT id FROM usage_records WHERE id = $2",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{ .{ .string = "unused" }, .{ .string = "u1" } },
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "zero bind param",
+        .sql = "SELECT id FROM usage_records WHERE id = $0",
         .family = .query,
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records",
