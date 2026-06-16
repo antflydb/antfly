@@ -143,6 +143,7 @@ pub const AdminCommand = struct {
 
 pub const Observed = struct {
     primary: status.PrimarySnapshot,
+    current_primary_id: ?[]const u8 = null,
     fencing: FencingObservation = .{},
     former_primary: ?rejoin.FormerPrimaryState = null,
     promotion_receipt: ?fencing.Receipt = null,
@@ -330,14 +331,18 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         });
         try actions.append(alloc, .{
             .kind = .update_primary_endpoint,
+            .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "PromotionPlanned",
         });
-        try actions.append(alloc, .{
-            .kind = .demote_former_primary,
-            .target_lsn = observed.primary.current_lsn,
-            .reason = "PromotionPlanned",
-        });
+        if (observed.current_primary_id) |current_primary_id| {
+            try actions.append(alloc, .{
+                .kind = .demote_former_primary,
+                .standby_name = current_primary_id,
+                .target_lsn = observed.primary.current_lsn,
+                .reason = "PromotionPlanned",
+            });
+        }
     }
 
     const former_primary_assessment = if (observed.former_primary) |former| blk: {
@@ -908,6 +913,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     }, .{
         .primary = primary,
+        .current_primary_id = "primary-a",
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -923,6 +929,8 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(ActionKind.promote_standby, safe.actions[1].kind);
     try std.testing.expectEqual(ActionKind.update_primary_endpoint, safe.actions[2].kind);
     try std.testing.expectEqual(ActionKind.demote_former_primary, safe.actions[3].kind);
+    try std.testing.expectEqualStrings("standby-a", safe.actions[2].standby_name.?);
+    try std.testing.expectEqualStrings("primary-a", safe.actions[3].standby_name.?);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
 }
 
