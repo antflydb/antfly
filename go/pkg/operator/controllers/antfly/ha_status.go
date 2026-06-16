@@ -1460,6 +1460,9 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 		evaluation.Reason = "FormerPrimaryTimelineDiverged"
 		return evaluation
 	}
+	if haApplyFormerPrimaryAssessment(&evaluation, status.FormerPrimary, promotion) {
+		return evaluation
+	}
 	if !promotion.DataLossPossible && evaluation.ObservedLSN <= promotion.SwitchLSN {
 		evaluation.RewindPossible = true
 		evaluation.Action = string(haActionRewindFormerPrimary)
@@ -1471,6 +1474,58 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 	evaluation.Action = string(haActionReseedFormerPrimary)
 	evaluation.Reason = "FormerPrimaryRequiresReseed"
 	return evaluation
+}
+
+func haApplyFormerPrimaryAssessment(evaluation *haFormerPrimaryEvaluation, former *antflyv1.HAFormerPrimaryStatus, promotion *antflyv1.HAPromotionStatus) bool {
+	if evaluation == nil || former == nil || promotion == nil ||
+		former.NodeID != promotion.OldPrimaryID ||
+		former.TargetTimelineID != promotion.NewTimelineID ||
+		former.TargetEpoch != promotion.NewEpoch ||
+		former.ForkLSN == 0 ||
+		former.AssessedAction == "" {
+		return false
+	}
+	evaluation.SwitchLSN = former.ForkLSN
+	if former.FormerLastLSN != 0 {
+		evaluation.ObservedLSN = former.FormerLastLSN
+	}
+	reason := former.AssessedReason
+	if reason == "" {
+		reason = former.Reason
+	}
+	switch former.AssessedAction {
+	case "already_current":
+		evaluation.RejoinRequired = false
+		evaluation.RewindPossible = false
+		evaluation.ReseedRequired = false
+		evaluation.Diverged = false
+		evaluation.Action = "None"
+		if reason == "" {
+			reason = "FormerPrimaryOnPromotionTimeline"
+		}
+	case "rewind":
+		evaluation.RejoinRequired = true
+		evaluation.RewindPossible = true
+		evaluation.ReseedRequired = false
+		evaluation.Diverged = false
+		evaluation.Action = string(haActionRewindFormerPrimary)
+		if reason == "" {
+			reason = "FormerPrimaryNeedsRewind"
+		}
+	case "reseed":
+		evaluation.RejoinRequired = true
+		evaluation.RewindPossible = false
+		evaluation.ReseedRequired = true
+		evaluation.Diverged = true
+		evaluation.Action = string(haActionReseedFormerPrimary)
+		if reason == "" {
+			reason = "FormerPrimaryRequiresReseed"
+		}
+	default:
+		return false
+	}
+	evaluation.Reason = reason
+	return true
 }
 
 func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) bool {
