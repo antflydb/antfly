@@ -167,6 +167,7 @@ pub const Primary = struct {
 
     pub fn createSlot(self: *Primary, name: []const u8, initial_lsn: u64) !void {
         if (self.slots.get(name) != null) return error.SlotAlreadyExists;
+        if (initial_lsn > self.lastLsn()) return error.InitialLsnAheadOfPrimary;
         try self.slots.createOrUpdate(.{
             .name = name,
             .timeline_id = self.identity.timeline_id,
@@ -614,6 +615,31 @@ test "storage.ha primary rejects duplicate slot creation without regressing prog
     try std.testing.expectEqual(@as(u64, 2), slot.restart_lsn);
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
+}
+
+test "storage.ha primary rejects future slot creation at storage boundary" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "future-slot");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+
+    try std.testing.expectError(error.InitialLsnAheadOfPrimary, primary.createSlot("standby-a", 2));
+    try std.testing.expect(primary.slot("standby-a") == null);
+
+    const names = [_][]const u8{"standby-a"};
+    const decision = try primary.evaluateDurability(1, .{
+        .mode = .remote_write,
+        .selection = .any,
+        .required = 1,
+        .standby_names = &names,
+        .failure_policy = .fail_closed,
+    });
+    try std.testing.expectEqual(DurabilityStatus.fail_closed, decision.status);
+    try std.testing.expectEqual(@as(usize, 0), decision.satisfied_count);
 }
 
 test "storage.ha primary begins base backup with slot retention pin" {
