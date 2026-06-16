@@ -2976,6 +2976,10 @@ execution. Expression projections currently cover `field`, JSON-literal
 `jsonb_build_object`, `to_jsonb`, `array_length`, `array_position`, `array_positions`,
 `array_append`, `array_prepend`, `array_cat`, `array_remove`, `array_replace`, `array_to_string`, and
 `string_to_array`.
+`array_to_string(array, delimiter)` skips null array elements. The optional
+third `null_text` operand preserves null-element positions by emitting that text
+for each null element, while a null source array, delimiter, or `null_text`
+operand still produces a null expression result.
 The storage-side row-expression evaluator also executes the JSON subset needed
 by schema/catalog enforcement, including `json_extract`, `json_path_exists`,
 `json_typeof`, `json_array_length`, and `to_jsonb`, so check constraints,

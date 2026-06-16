@@ -19519,6 +19519,29 @@ test "relational rows query contract projects array lengths" {
     try std.testing.expectEqual(@as(u32, 1), array_to_string_where_result.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", array_to_string_where_result.rows[0]);
 
+    var array_to_string_null_text_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"tag_text_skip_nulls\",\"expr\":{\"op\":\"array_to_string\",\"args\":[{\"field\":\"tags\"},{\"value\":\",\"}]}},{\"as\":\"tag_text_with_nulls\",\"expr\":{\"op\":\"array_to_string\",\"args\":[{\"field\":\"tags\"},{\"value\":\",\"},{\"value\":\"<NULL>\"}]}}],\"expression_where\":[{\"lhs\":{\"op\":\"array_to_string\",\"args\":[{\"field\":\"tags\"},{\"value\":\",\"},{\"value\":\"<NULL>\"}]},\"op\":\"eq\",\"rhs\":{\"value\":\"hot,<NULL>,new\"}}],\"order_by\":[{\"field\":\"id\"}]}",
+        schema,
+    );
+    defer array_to_string_null_text_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), array_to_string_null_text_request.expressions.len);
+    try std.testing.expectEqualStrings("tag_text_with_nulls", array_to_string_null_text_request.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, array_to_string_null_text_request.expressions[1].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), array_to_string_null_text_request.expressions[1].expression.operands.len);
+    try std.testing.expectEqualStrings("\"<NULL>\"", array_to_string_null_text_request.expressions[1].expression.operands[2].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, array_to_string_null_text_request.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 3), array_to_string_null_text_request.expression_predicates[0].lhs.operands.len);
+
+    const rows_with_nulls = [_][]const u8{
+        "{\"id\":\"c\",\"tags\":[\"hot\",null,\"new\"]}",
+        "{\"id\":\"d\",\"tags\":[\"hot\",\"new\"]}",
+    };
+    var array_to_string_null_text_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, array_to_string_null_text_request, rows_with_nulls[0..]);
+    defer array_to_string_null_text_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), array_to_string_null_text_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"tag_text_skip_nulls\":\"hot,new\",\"tag_text_with_nulls\":\"hot,<NULL>,new\"}", array_to_string_null_text_result.rows[0]);
+
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"array_length\":[{\"as\":\"bad\",\"field\":\"id\"}]}",

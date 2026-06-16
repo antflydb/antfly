@@ -50456,6 +50456,28 @@ test "postgres sql adapter lowers array_length projection" {
     try std.testing.expect(joined_text.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, joined_text.query.order_by[0].expression.?.kind);
 
+    var joined_text_nulls = try lowerSelectAlloc(
+        alloc,
+        "SELECT id, array_to_string(tags, ',', '<NULL>') AS tag_text FROM usage_records WHERE array_to_string(tags, ',', '<NULL>') = $1 ORDER BY array_to_string(tags, ',', '<NULL>') ASC",
+        schema,
+        &.{.{ .string = "hot,<NULL>,new" }},
+    );
+    defer joined_text_nulls.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), joined_text_nulls.query.select.len);
+    try std.testing.expectEqualStrings("id", joined_text_nulls.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), joined_text_nulls.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, joined_text_nulls.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), joined_text_nulls.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("\"<NULL>\"", joined_text_nulls.query.expressions[0].expression.operands[2].value_json);
+    try std.testing.expectEqual(@as(usize, 1), joined_text_nulls.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, joined_text_nulls.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 3), joined_text_nulls.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), joined_text_nulls.query.order_by.len);
+    try std.testing.expect(joined_text_nulls.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, joined_text_nulls.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 3), joined_text_nulls.query.order_by[0].expression.?.operands.len);
+
     var element_transform = try lowerSelectAlloc(
         alloc,
         "SELECT id, array_append(tags, 'fresh') AS tags_plus, array_prepend('first', tags) AS tags_prefixed, array_cat(tags, string_to_array('tail last', ' ')) AS tags_cat, array_remove(tags, 'old') AS tags_clean, array_replace(tags, 'old', 'fresh') AS tags_replaced FROM usage_records WHERE array_prepend('first', tags) = $1 ORDER BY id",
@@ -66641,6 +66663,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
             .sql = "SELECT id FROM usage_records WHERE array_to_string(tags, ',') = $1 ORDER BY id ASC LIMIT 5",
             .params = &.{.{ .string = "hot,new" }},
+        },
+        .{
+            .name = "single table array to string null replacement query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE array_to_string(tags, ',', '<NULL>') = $1 ORDER BY array_to_string(tags, ',', '<NULL>') ASC LIMIT 5",
+            .params = &.{.{ .string = "hot,<NULL>,new" }},
         },
         .{
             .name = "single table computed array containment query",
