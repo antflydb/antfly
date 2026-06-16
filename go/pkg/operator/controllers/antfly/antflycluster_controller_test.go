@@ -288,6 +288,75 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(degraded.Message).To(ContainSubstring(seedJob.Name))
 }
 
+func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{Mode: antflyv1.HAModeHotStandby},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode: antflyv1.HAModeHotStandby,
+				PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+					ServiceName:   "test-cluster-public-api",
+					CurrentTarget: "primary",
+					DesiredTarget: "standby-a",
+					Stale:         true,
+					Action:        string(haActionUpdatePrimaryRoute),
+				},
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPromoteStandby),
+					StandbyName:   "standby-a",
+					AdminCommand:  []string{"promote", "--current-fence"},
+					AdminURL:      "http://standby-a-ha.default.svc:8081",
+					AdminJobName:  "promote-job",
+					AdminJobPhase: haAdminJobPhasePending,
+				}, {
+					Kind:            string(haActionUpdatePrimaryRoute),
+					StandbyName:     "standby-a",
+					RouteTo:         "standby-a",
+					FenceGeneration: 7,
+				}},
+			},
+		},
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-public-api",
+			Namespace: "default",
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, service).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+	observed := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Stale).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Action).To(Equal("None"))
+
+	g.Expect(reconciler.observeHAPrimaryRouteStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
+}
+
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false
 func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	g := NewWithT(t)

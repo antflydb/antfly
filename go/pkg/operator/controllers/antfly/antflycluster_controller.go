@@ -72,6 +72,9 @@ const (
 	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
 	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 
+	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
+	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
+
 	haAdminJobPhasePending   = "Pending"
 	haAdminJobPhaseRunning   = "Running"
 	haAdminJobPhaseSucceeded = "Succeeded"
@@ -3054,8 +3057,14 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
 			return err
 		}
+		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
+			return err
+		}
 		r.updateHAStatusAndConditions(cluster)
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+			return err
+		}
+		if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
 			return err
 		}
 		r.updateHAAdminJobExecutionCondition(cluster)
@@ -3125,8 +3134,14 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
 		return err
 	}
+	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
+		return err
+	}
 	r.updateHAStatusAndConditions(cluster)
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+		return err
+	}
+	if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
 		return err
 	}
 	r.updateHAAdminJobExecutionCondition(cluster)
@@ -3172,6 +3187,90 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Mode == "" ||
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeDisabled {
+		return nil
+	}
+
+	service := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-public-api", Namespace: cluster.Namespace}, service)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	target := strings.TrimSpace(service.Annotations[haPrimaryRouteTargetAnnotation])
+	if target == "" {
+		target = "primary"
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
+	}
+	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = target
+	return nil
+}
+
+func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Mode == "" ||
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeDisabled ||
+		cluster.Status.HAStatus == nil {
+		return nil
+	}
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind != string(haActionUpdatePrimaryRoute) {
+			continue
+		}
+		if !haPriorAdminActionsSucceeded(cluster.Status.HAStatus.PlannedActions[:i]) {
+			return nil
+		}
+		if action.RouteTo == "" {
+			return nil
+		}
+		return r.updateHAPrimaryRouteService(ctx, cluster, action)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) error {
+	service := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-public-api", Namespace: cluster.Namespace}, service); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	patch := client.MergeFrom(service.DeepCopy())
+	if service.Annotations == nil {
+		service.Annotations = map[string]string{}
+	}
+	service.Annotations[haPrimaryRouteTargetAnnotation] = action.RouteTo
+	if action.FenceGeneration > 0 {
+		service.Annotations[haPrimaryRouteFenceGenerationAnnotation] = strconv.FormatUint(action.FenceGeneration, 10)
+	}
+	if err := r.Patch(ctx, service, patch); err != nil {
+		return err
+	}
+	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = action.RouteTo
+	cluster.Status.HAStatus.PrimaryRoute.Stale = false
+	cluster.Status.HAStatus.PrimaryRoute.Action = "None"
+	cluster.Status.HAStatus.PrimaryRoute.Reason = "PrimaryRouteCurrent"
+	return nil
+}
+
+func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool {
+	for _, action := range actions {
+		if len(action.AdminCommand) == 0 {
+			continue
+		}
+		if action.AdminJobPhase != haAdminJobPhaseSucceeded {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
