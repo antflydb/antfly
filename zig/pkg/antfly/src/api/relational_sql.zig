@@ -1070,12 +1070,14 @@ pub const IdentityAllocatorPlan = struct {
     table_name: []const u8,
     column: runtime_schema.RelationalColumn,
     kind: IdentityAllocatorKind,
+    options: SequenceOptions = .{},
     primary_key: bool = false,
     additional_columns: []const runtime_schema.RelationalColumn = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         freeDdlRelationalColumn(alloc, self.column);
+        self.options.deinit(alloc);
         clearDdlRelationalColumns(alloc, self.additional_columns);
         alloc.free(self.additional_columns);
         self.* = undefined;
@@ -1087,6 +1089,16 @@ pub const IdentityAllocatorKind = enum {
     bigserial,
     generated_by_default,
     generated_always,
+};
+
+pub const IdentityAllocatorSpec = struct {
+    kind: IdentityAllocatorKind,
+    options: SequenceOptions = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.options.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 pub const SchemaNamespaceCatalogPlan = union(enum) {
@@ -8645,7 +8657,9 @@ const Parser = struct {
         var path_transferred = false;
         errdefer if (!path_transferred) self.alloc.free(path);
 
-        const kind = try self.parseIdentityAllocatorKind();
+        var identity = try self.parseIdentityAllocatorSpec();
+        var identity_transferred = false;
+        errdefer if (!identity_transferred) identity.deinit(self.alloc);
         var primary_key = false;
         if (self.matchKeyword("primary")) {
             try self.expectKeyword("key");
@@ -8677,22 +8691,32 @@ const Parser = struct {
         try self.expect(.rparen);
         try self.expectDdlEnd();
 
+        const owned_additional_columns = try additional_columns.toOwnedSlice(self.alloc);
+        var additional_columns_transferred = false;
+        errdefer if (!additional_columns_transferred) {
+            clearDdlRelationalColumns(self.alloc, owned_additional_columns);
+            self.alloc.free(owned_additional_columns);
+        };
+
         table_name_transferred = true;
         column_name_transferred = true;
         path_transferred = true;
         column_transferred = true;
+        identity_transferred = true;
+        additional_columns_transferred = true;
         return .{
             .table_name = table_name,
             .column = column,
-            .kind = kind,
+            .kind = identity.kind,
+            .options = identity.options,
             .primary_key = primary_key,
-            .additional_columns = try additional_columns.toOwnedSlice(self.alloc),
+            .additional_columns = owned_additional_columns,
         };
     }
 
-    fn parseIdentityAllocatorKind(self: *@This()) !IdentityAllocatorKind {
-        if (self.matchKeyword("serial")) return .serial;
-        if (self.matchKeyword("bigserial")) return .bigserial;
+    fn parseIdentityAllocatorSpec(self: *@This()) !IdentityAllocatorSpec {
+        if (self.matchKeyword("serial")) return .{ .kind = .serial };
+        if (self.matchKeyword("bigserial")) return .{ .kind = .bigserial };
         const ddl_type = try self.parseDdlType();
         if (ddl_type.field_type != .numeric) return error.UnsupportedSqlShape;
         try self.expectKeyword("generated");
@@ -8705,8 +8729,20 @@ const Parser = struct {
         };
         try self.expectKeyword("as");
         try self.expectKeyword("identity");
-        if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
-        return kind;
+        var options: SequenceOptions = .{};
+        errdefer options.deinit(self.alloc);
+        if (self.match(.lparen) != null) {
+            while (!self.peekKind(.rparen)) {
+                try self.parseIdentitySequenceOption(&options);
+            }
+            try self.expect(.rparen);
+        }
+        return .{ .kind = kind, .options = options };
+    }
+
+    fn parseIdentitySequenceOption(self: *@This(), options: *SequenceOptions) !void {
+        if (self.peekKeyword("as") or self.peekKeyword("owned")) return error.UnsupportedSqlShape;
+        try self.parseCreateSequenceOption(options);
     }
 
     fn parseCreateTableDdl(self: *@This()) !CreateTablePlan {
@@ -47200,6 +47236,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:identity_allocator:table=usage_records:column=id:kind=generated_by_default:primary=true:columns=1", generated_identity_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, generated_identity));
 
+    var generated_identity_options = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 CACHE 4 NO CYCLE) PRIMARY KEY, status text);");
+    defer generated_identity_options.deinit(alloc);
+    const generated_identity_options_plan = switch (generated_identity_options) {
+        .identity_allocator_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("usage_records", generated_identity_options_plan.table_name);
+    try std.testing.expectEqualStrings("id", generated_identity_options_plan.column.name);
+    try std.testing.expectEqual(IdentityAllocatorKind.generated_always, generated_identity_options_plan.kind);
+    try std.testing.expect(generated_identity_options_plan.primary_key);
+    try std.testing.expectEqual(@as(?i64, 100), generated_identity_options_plan.options.start_with);
+    try std.testing.expectEqual(@as(?i64, 10), generated_identity_options_plan.options.increment_by);
+    try std.testing.expectEqual(@as(?i64, 4), generated_identity_options_plan.options.cache);
+    try std.testing.expectEqual(@as(?bool, false), generated_identity_options_plan.options.cycle);
+    const generated_identity_options_fingerprint = try ddlFingerprintAlloc(alloc, generated_identity_options);
+    defer alloc.free(generated_identity_options_fingerprint);
+    try std.testing.expectEqualStrings("ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=4", generated_identity_options_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, generated_identity_options));
+
     var create_public_schema = try lowerDdlPlanAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
     defer create_public_schema.deinit(alloc);
     const create_public_schema_noop = switch (create_public_schema) {
@@ -57880,17 +57935,21 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     .{ drop.sequence_name, drop.if_exists },
                 ),
         },
-        .identity_allocator_catalog => |plan| try std.fmt.allocPrint(
-            alloc,
-            "ddl:identity_allocator:table={s}:column={s}:kind={s}:primary={}:columns={d}",
-            .{
-                plan.table_name,
-                plan.column.name,
-                identityAllocatorKindName(plan.kind),
-                plan.primary_key,
-                plan.additional_columns.len,
-            },
-        ),
+        .identity_allocator_catalog => |plan| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "ddl:identity_allocator:table={s}:column={s}:kind={s}:primary={}:columns={d}",
+                .{
+                    plan.table_name,
+                    plan.column.name,
+                    identityAllocatorKindName(plan.kind),
+                    plan.primary_key,
+                    plan.additional_columns.len,
+                },
+            );
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "options", sequenceOptionCount(plan.options));
+            break :blk fingerprint;
+        },
         .schema_namespace_catalog => |plan| switch (plan) {
             .create => |create| try std.fmt.allocPrint(
                 alloc,
@@ -61698,6 +61757,7 @@ const AppParityCorpusCoverage = struct {
     ddl_sequence_drop: bool = false,
     ddl_identity_allocator_serial: bool = false,
     ddl_identity_allocator_generated: bool = false,
+    ddl_identity_allocator_generated_options: bool = false,
     ddl_schema_namespace_create: bool = false,
     ddl_schema_namespace_rename: bool = false,
     ddl_schema_namespace_drop: bool = false,
@@ -62890,6 +62950,9 @@ const AppParityCorpusCoverage = struct {
                 .identity_allocator => {
                     self.ddl_identity_allocator_serial = self.ddl_identity_allocator_serial or std.mem.indexOf(u8, entry.plan, ":kind=bigserial:") != null or std.mem.indexOf(u8, entry.plan, ":kind=serial:") != null;
                     self.ddl_identity_allocator_generated = self.ddl_identity_allocator_generated or std.mem.indexOf(u8, entry.plan, ":kind=generated_") != null;
+                    self.ddl_identity_allocator_generated_options = self.ddl_identity_allocator_generated_options or
+                        (std.mem.indexOf(u8, entry.plan, ":kind=generated_always:") != null and
+                            appParityPlanHasNonZeroToken(entry.plan, ":options="));
                 },
                 .create_schema_namespace => self.ddl_schema_namespace_create = true,
                 .rename_schema_namespace => self.ddl_schema_namespace_rename = true,
@@ -63678,6 +63741,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_rollback_to_savepoint);
         try std.testing.expect(self.ddl_identity_allocator_serial);
         try std.testing.expect(self.ddl_identity_allocator_generated);
+        try std.testing.expect(self.ddl_identity_allocator_generated_options);
         try std.testing.expect(self.ddl_table_lock);
         try std.testing.expect(self.ddl_constraint_mode);
         try std.testing.expect(self.ddl_set_transaction_mode);
@@ -69219,6 +69283,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .identity_allocator, .table_name = "usage_records", .select = 2, .operations = 1 },
             .plan = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_by_default:primary=true:columns=1",
             .sql = "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text)",
+        },
+        .{
+            .name = "generated identity options allocator catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .identity_allocator, .table_name = "usage_records", .select = 2, .operations = 1 },
+            .plan = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=4",
+            .sql = "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 CACHE 4 NO CYCLE) PRIMARY KEY, status text)",
         },
         .{
             .name = "row security enable catalog ddl",

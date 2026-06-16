@@ -4118,14 +4118,15 @@ Schema application remains fail-closed until the durable sequence catalog and
 allocator exist: sequences must allocate transactionally through owner/range
 routing, expose snapshot-consistent catalog state, and track schema-owned
 dependencies. Column-level `serial`/`bigserial`, `GENERATED ... AS IDENTITY`,
-and sequence-backed column defaults are schema-bearing allocator intent.
-`serial`/`bigserial` columns and `GENERATED ... AS IDENTITY` columns lower to
-typed fail-closed identity-allocator catalog plans that preserve table identity,
-column identity, allocator kind, primary-key intent, and the count of ordinary
-peer columns. Schema application remains fail-closed until those defaults can
-claim monotonic values through the native allocator instead of raw SQL state.
-Generated-identity option clauses still fail closed until the same durable
-allocator metadata owns them.
+generated-identity option clauses, and sequence-backed column defaults are
+schema-bearing allocator intent. `serial`/`bigserial` columns and
+`GENERATED ... AS IDENTITY` columns lower to typed fail-closed
+identity-allocator catalog plans that preserve table identity, column identity,
+allocator kind, supported sequence-style options (`START`, `INCREMENT`,
+`MINVALUE`, `MAXVALUE`, `CACHE`, and `CYCLE`), primary-key intent, and the
+count of ordinary peer columns. Schema application remains fail-closed until
+those defaults can claim monotonic values through the native allocator instead
+of raw SQL state.
 
 PostgreSQL table partition DDL is schema-bearing catalog intent, not adapter
 text. `CREATE TABLE ... PARTITION BY RANGE (...)`, `CREATE TABLE ... PARTITION
