@@ -380,20 +380,16 @@ fn backupStartPayload(
     manifest_id: []const u8,
     backup_lsn: u64,
 ) ![]u8 {
-    return try std.fmt.allocPrint(
-        alloc,
-        "{{\"cluster_id\":{d},\"shard_id\":{d},\"table_id\":{d},\"timeline_id\":{d},\"epoch\":{d},\"slot_name\":\"{s}\",\"manifest_id\":\"{s}\",\"backup_lsn\":{d}}}",
-        .{
-            identity.cluster_id,
-            identity.shard_id,
-            identity.table_id,
-            identity.timeline_id,
-            identity.epoch,
-            slot_name,
-            manifest_id,
-            backup_lsn,
-        },
-    );
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .slot_name = slot_name,
+        .manifest_id = manifest_id,
+        .backup_lsn = backup_lsn,
+    }, .{});
 }
 
 const Counts = struct {
@@ -571,6 +567,42 @@ test "storage.ha primary begins base backup with slot retention pin" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(replication_record.RecordKind.backup_start, entries[0].record.kind);
     try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"manifest_id\":\"manifest-1\"") != null);
+}
+
+test "storage.ha primary escapes backup start json payload fields" {
+    const alloc = std.testing.allocator;
+    const identity = testIdentity();
+
+    const payload = try backupStartPayload(
+        alloc,
+        identity,
+        "standby-\"a\\b\nc",
+        "manifest-\"x\\y\nz",
+        42,
+    );
+    defer alloc.free(payload);
+
+    const Payload = struct {
+        cluster_id: u64,
+        shard_id: u64,
+        table_id: u64,
+        timeline_id: u64,
+        epoch: u64,
+        slot_name: []const u8,
+        manifest_id: []const u8,
+        backup_lsn: u64,
+    };
+    var parsed = try std.json.parseFromSlice(Payload, alloc, payload, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(identity.cluster_id, parsed.value.cluster_id);
+    try std.testing.expectEqual(identity.shard_id, parsed.value.shard_id);
+    try std.testing.expectEqual(identity.table_id, parsed.value.table_id);
+    try std.testing.expectEqual(identity.timeline_id, parsed.value.timeline_id);
+    try std.testing.expectEqual(identity.epoch, parsed.value.epoch);
+    try std.testing.expectEqualStrings("standby-\"a\\b\nc", parsed.value.slot_name);
+    try std.testing.expectEqualStrings("manifest-\"x\\y\nz", parsed.value.manifest_id);
+    try std.testing.expectEqual(@as(u64, 42), parsed.value.backup_lsn);
 }
 
 test "storage.ha primary ends base backup with decodable manifest payload" {
