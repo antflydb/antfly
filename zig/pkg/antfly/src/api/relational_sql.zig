@@ -24331,6 +24331,7 @@ const Parser = struct {
     fn mutationRowClaimAlloc(self: *@This(), skip_locked: bool) !db_mod.types.RowClaimRequest {
         const claim = self.mutation_claim orelse return error.UnsupportedRowsQuery;
         if (claim.txn_id == null) return error.UnsupportedRowsQuery;
+        if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.UnsupportedRowsQuery;
         return .{
             .mode = claim.mode,
             .wait_policy = if (skip_locked) .skip_locked else claim.effectiveWaitPolicy(),
@@ -72265,6 +72266,21 @@ test "postgres sql adapter lowers claimed update mutation source" {
     try std.testing.expectEqualStrings("status", table_wide.mutation.req.operations[0].path);
     try std.testing.expectEqual(@as(usize, 1), table_wide.mutation.req.returning.len);
     try std.testing.expectEqualStrings("id", table_wide.mutation.req.returning[0]);
+
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' RETURNING id",
+        schema,
+        &.{},
+        .{ .mode = .for_update, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' RETURNING id",
+        schema,
+        &.{},
+        .{ .mode = .for_update, .owner_id = "worker-a", .lease_ms = 0, .txn_id = txn_id },
+    ));
 
     var targeted_claim = try lowerUpdateMutationSourceAlloc(
         alloc,
