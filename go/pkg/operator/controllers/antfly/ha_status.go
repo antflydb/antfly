@@ -119,6 +119,7 @@ type haPlan struct {
 	ReseedRequiredCount       int32
 	FencingReady              bool
 	PromotionBoundaryReady    bool
+	PromotionAlreadyRecorded  bool
 	PromotionStandbyName      string
 	PrimaryAdminUnavailable   bool
 	SyncPolicyDegraded        bool
@@ -419,6 +420,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.FencingReady = haFencingReady(ha, status)
 	plan.PrimaryAdminUnavailable = haPrimaryAdminUnavailable(status)
 	plan.PromotionBoundaryReady = haPromotionBoundaryReady(status)
+	plan.PromotionAlreadyRecorded = haPromotionAlreadyRecorded(ha, status)
 	plan.PromotionStandbyName = haAutomaticPromotionStandby(ha, status, plan)
 	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
 	if plan.AutomaticPromotionAllowed {
@@ -999,6 +1001,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if !haPromotionBoundaryReady(status) {
 		return ""
 	}
+	if plan.PromotionAlreadyRecorded {
+		return ""
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return ""
 	}
@@ -1131,6 +1136,9 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	if !plan.PromotionBoundaryReady {
 		return antflyv1.ReasonHAPromotionBoundaryMissing
 	}
+	if plan.PromotionAlreadyRecorded {
+		return antflyv1.ReasonHAPromotionAlreadyRecorded
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return antflyv1.ReasonHASyncPolicyUnsatisfied
 	}
@@ -1143,6 +1151,24 @@ func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {
 
 func haPromotionBoundaryReady(status *antflyv1.HAStatus) bool {
 	return status != nil && status.PrimaryLSN > 0
+}
+
+func haPromotionAlreadyRecorded(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) bool {
+	if status == nil || status.LastPromotion == nil {
+		return false
+	}
+	identity := haReplicationIdentity(ha)
+	if identity == nil {
+		return false
+	}
+	promotion := status.LastPromotion
+	return promotion.OldPrimaryID == identity.CurrentPrimaryID &&
+		promotion.ParentTimelineID == identity.TimelineID &&
+		promotion.ParentEpoch == identity.Epoch &&
+		promotion.PromotedStandbyID != "" &&
+		promotion.NewTimelineID != 0 &&
+		promotion.NewEpoch != 0 &&
+		promotion.SwitchLSN != 0
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {

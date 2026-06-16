@@ -224,6 +224,9 @@ const (
 	// ReasonHAPromotionBoundaryMissing indicates automatic failover lacks an observed primary LSN boundary.
 	ReasonHAPromotionBoundaryMissing = "HAPromotionBoundaryMissing"
 
+	// ReasonHAPromotionAlreadyRecorded indicates automatic failover already recorded a promotion for this identity.
+	ReasonHAPromotionAlreadyRecorded = "HAPromotionAlreadyRecorded"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 

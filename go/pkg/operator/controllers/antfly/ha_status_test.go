@@ -888,6 +888,60 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	}
 }
 
+func TestUpdateHAStatusDoesNotReplanRecordedPromotion(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.PrimaryRoute = antflyv1.HAPrimaryRouteStatus{CurrentTarget: "standby-a"}
+	cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		SwitchLSN:         12,
+		RequiredLSN:       12,
+		ObservedLSN:       12,
+		FenceGeneration:   1,
+		FenceToken:        "token",
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked after a promotion has already been recorded")
+	}
+	failover := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAPromotionAlreadyRecorded {
+		t.Fatalf("expected promotion-already-recorded condition, got %#v", failover)
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+			t.Fatalf("expected no repeated promotion action after recorded promotion, got %#v", cluster.Status.HAStatus.PlannedActions)
+		}
+	}
+	route := cluster.Status.HAStatus.PrimaryRoute
+	if route.Stale || route.Action != "None" || route.CurrentTarget != "standby-a" || route.DesiredTarget != "standby-a" {
+		t.Fatalf("expected route to remain current after recorded promotion, got %#v", route)
+	}
+}
+
 func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	reconciler := testHAReconciler(t)
