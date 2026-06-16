@@ -170,6 +170,8 @@ test "storage.ha commit gate waits rejects or degrades by failure policy" {
     });
     try std.testing.expectEqual(Action.wait_for_standby, appended.gate.action);
     try std.testing.expect(appended.gate.shouldWait());
+    try std.testing.expectEqual(@as(u64, 0), appended.gate.decision.progress_lsn);
+    try std.testing.expectEqual(@as(u64, 1), appended.gate.decision.missing_lsn_count);
 
     var gate = try evaluate(&primary, appended.lsn, .{
         .mode = .remote_apply,
@@ -186,6 +188,8 @@ test "storage.ha commit gate waits rejects or degrades by failure policy" {
     });
     try std.testing.expectEqual(Action.acknowledge_degraded, gate.action);
     try std.testing.expect(gate.shouldAcknowledge());
+    try std.testing.expectEqual(@as(u64, 0), gate.decision.progress_lsn);
+    try std.testing.expectEqual(@as(u64, 1), gate.decision.missing_lsn_count);
 
     try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 1);
     gate = try evaluate(&primary, appended.lsn, .{
@@ -194,6 +198,8 @@ test "storage.ha commit gate waits rejects or degrades by failure policy" {
         .failure_policy = .block,
     });
     try std.testing.expectEqual(Action.acknowledge, gate.action);
+    try std.testing.expectEqual(@as(u64, 1), gate.decision.progress_lsn);
+    try std.testing.expectEqual(@as(u64, 0), gate.decision.missing_lsn_count);
 }
 
 test "storage.ha commit gate ignores paused or reseed-required slots" {

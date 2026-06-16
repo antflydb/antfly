@@ -436,6 +436,8 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
             .mode = .remote_write,
             .selection = .any,
             .target_lsn = 20,
+            .progress_lsn = 18,
+            .missing_lsn_count = 2,
             .satisfied_count = 0,
             .required_count = 1,
             .candidate_count = 2,

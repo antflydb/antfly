@@ -100,6 +100,8 @@ pub const DurabilityDecision = struct {
     mode: DurabilityMode,
     selection: StandbySelection,
     target_lsn: u64,
+    progress_lsn: u64,
+    missing_lsn_count: u64,
     satisfied_count: usize,
     required_count: usize,
     candidate_count: usize,
@@ -272,6 +274,8 @@ pub const Primary = struct {
                 .mode = .async,
                 .selection = policy.selection,
                 .target_lsn = target_lsn,
+                .progress_lsn = target_lsn,
+                .missing_lsn_count = 0,
                 .satisfied_count = 0,
                 .required_count = 0,
                 .candidate_count = 0,
@@ -287,11 +291,14 @@ pub const Primary = struct {
         };
 
         const satisfied = counts.satisfied_count >= counts.required_count;
+        const progress_lsn = if (satisfied) target_lsn else counts.progress_lsn;
         return .{
             .status = if (satisfied) .satisfied else statusForFailurePolicy(policy.failure_policy),
             .mode = policy.mode,
             .selection = policy.selection,
             .target_lsn = target_lsn,
+            .progress_lsn = progress_lsn,
+            .missing_lsn_count = missingLsnCount(target_lsn, progress_lsn),
             .satisfied_count = counts.satisfied_count,
             .required_count = counts.required_count,
             .candidate_count = counts.candidate_count,
@@ -305,6 +312,7 @@ pub const Primary = struct {
         for (policy.standby_names) |name| {
             const state = self.eligibleSlot(name) orelse continue;
             counts.candidate_count += 1;
+            counts.progress_lsn = counts.progressForAny(policy.required, progressForMode(state, policy.mode));
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
         }
         return counts;
@@ -317,6 +325,7 @@ pub const Primary = struct {
         for (policy.standby_names) |name| {
             const state = self.eligibleSlot(name) orelse continue;
             counts.candidate_count += 1;
+            counts.progress_lsn = counts.progressFloor(progressForMode(state, policy.mode));
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
             if (counts.candidate_count == policy.required) break;
         }
@@ -330,6 +339,7 @@ pub const Primary = struct {
         for (policy.standby_names) |name| {
             const state = self.eligibleSlot(name) orelse continue;
             counts.candidate_count += 1;
+            counts.progress_lsn = counts.progressFloor(progressForMode(state, policy.mode));
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
         }
         return counts;
@@ -378,6 +388,17 @@ const Counts = struct {
     satisfied_count: usize = 0,
     required_count: usize = 0,
     candidate_count: usize = 0,
+    progress_lsn: u64 = 0,
+
+    fn progressForAny(self: Counts, required: usize, progress_lsn: u64) u64 {
+        if (required == 1) return @max(self.progress_lsn, progress_lsn);
+        return self.progressFloor(progress_lsn);
+    }
+
+    fn progressFloor(self: Counts, progress_lsn: u64) u64 {
+        if (self.candidate_count == 1) return progress_lsn;
+        return @min(self.progress_lsn, progress_lsn);
+    }
 };
 
 fn slotSatisfies(state: slot_store.SlotState, target_lsn: u64, mode: DurabilityMode) bool {
@@ -386,6 +407,18 @@ fn slotSatisfies(state: slot_store.SlotState, target_lsn: u64, mode: DurabilityM
         .remote_write => state.received_lsn >= target_lsn,
         .remote_apply => state.applied_lsn >= target_lsn,
     };
+}
+
+fn progressForMode(state: slot_store.SlotState, mode: DurabilityMode) u64 {
+    return switch (mode) {
+        .async => state.applied_lsn,
+        .remote_write => state.received_lsn,
+        .remote_apply => state.applied_lsn,
+    };
+}
+
+fn missingLsnCount(target_lsn: u64, progress_lsn: u64) u64 {
+    return target_lsn -| @min(target_lsn, progress_lsn);
 }
 
 fn statusForFailurePolicy(policy: FailurePolicy) DurabilityStatus {
@@ -408,6 +441,8 @@ fn decisionForUnsatisfied(
         .mode = policy.mode,
         .selection = policy.selection,
         .target_lsn = target_lsn,
+        .progress_lsn = 0,
+        .missing_lsn_count = target_lsn,
         .satisfied_count = satisfied_count,
         .required_count = required_count,
         .candidate_count = candidate_count,

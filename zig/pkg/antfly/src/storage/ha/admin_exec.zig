@@ -764,6 +764,8 @@ fn appendCommitGateLines(
     try appendLine(alloc, out, "durability.mode", @tagName(gate.decision.mode));
     try appendLine(alloc, out, "durability.selection", @tagName(gate.decision.selection));
     try appendU64Line(alloc, out, "durability.target_lsn", gate.decision.target_lsn);
+    try appendU64Line(alloc, out, "durability.progress_lsn", gate.decision.progress_lsn);
+    try appendU64Line(alloc, out, "durability.missing_lsn_count", gate.decision.missing_lsn_count);
     try appendUsizeLine(alloc, out, "durability.satisfied_count", gate.decision.satisfied_count);
     try appendUsizeLine(alloc, out, "durability.required_count", gate.decision.required_count);
     try appendUsizeLine(alloc, out, "durability.candidate_count", gate.decision.candidate_count);
@@ -1257,6 +1259,8 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(append_table, "result=commit_append\n");
     try expectContains(append_table, "lsn=2\n");
     try expectContains(append_table, "action=acknowledge_degraded\n");
+    try expectContains(append_table, "durability.progress_lsn=1\n");
+    try expectContains(append_table, "durability.missing_lsn_count=1\n");
 
     var read_plan = try admin_cli.parse(alloc, &.{ "read", "check", "--at-least-lsn", "1" });
     defer read_plan.deinit(alloc);
