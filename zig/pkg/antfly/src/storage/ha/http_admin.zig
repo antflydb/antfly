@@ -1,0 +1,295 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the Elastic License 2.0 is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+// the Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! HTTP adapter for HA admin commands.
+//!
+//! The storage HA command vocabulary lives in `admin_cli.zig`, and execution
+//! lives in `admin_exec.zig`. This adapter gives operators and future node
+//! servers a small HTTP surface without creating a second command contract.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const http_common = @import("../../common/http/http_common.zig");
+const admin_cli = @import("admin_cli.zig");
+const admin_exec = @import("admin_exec.zig");
+const fencing = @import("fencing.zig");
+const primary_mod = @import("primary.zig");
+const standby_mod = @import("standby.zig");
+
+var test_path_counter: u64 = 0;
+
+pub const Routes = struct {
+    pub const health = "/ha/v1/health";
+    pub const command = "/ha/v1/admin/command";
+};
+
+pub const CommandRequest = struct {
+    argv: []const []const u8,
+};
+
+pub const Server = struct {
+    alloc: Allocator,
+    ctx: admin_exec.Context,
+
+    pub fn init(alloc: Allocator, ctx: admin_exec.Context) Server {
+        return .{
+            .alloc = alloc,
+            .ctx = ctx,
+        };
+    }
+
+    pub fn executor(self: *Server) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.* = undefined;
+    }
+
+    pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        switch (req.method) {
+            .GET => {
+                if (std.mem.eql(u8, req.uri, Routes.health)) {
+                    return try textResponse(self.alloc, 200, "ok");
+                }
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            .POST => {
+                if (std.mem.eql(u8, req.uri, Routes.command)) {
+                    return try self.handleCommand(req);
+                }
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            else => return try textResponse(self.alloc, 405, "method not allowed"),
+        }
+    }
+
+    fn handleCommand(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA command request");
+
+        var parsed = std.json.parseFromSlice(
+            CommandRequest,
+            self.alloc,
+            req.body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 400, "invalid HA command request");
+        defer parsed.deinit();
+
+        var plan = admin_cli.parse(self.alloc, parsed.value.argv) catch return try textResponse(self.alloc, 400, "invalid HA command argv");
+        defer plan.deinit(self.alloc);
+
+        var rendered = admin_exec.executeAndRenderAlloc(self.alloc, self.ctx, plan) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        errdefer rendered.deinit(self.alloc);
+
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, rendered.content_type),
+            .body = rendered.body,
+        };
+    }
+
+    fn execute(ptr: *anyopaque, _: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *Server = @ptrCast(@alignCast(ptr));
+        return try self.handle(req);
+    }
+};
+
+fn commandErrorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.PrimaryUnavailable,
+        error.StandbyUnavailable,
+        error.FenceStoreUnavailable,
+        => 409,
+        error.SlotNotFound,
+        error.BackupStartNotFound,
+        => 404,
+        error.PrometheusUnsupportedForResult,
+        error.InvalidSlotName,
+        error.InvalidReplicationStartLsn,
+        error.InvalidCheckpointLsn,
+        error.InitialLsnAheadOfPrimary,
+        error.ManifestPathMissing,
+        error.ManifestFileTooLarge,
+        error.ManifestFileMissing,
+        error.ManifestFileCrcMismatch,
+        error.ManifestFileSizeMismatch,
+        => 400,
+        else => 500,
+    };
+}
+
+fn textResponse(alloc: Allocator, status: u16, body: []const u8) !http_common.HttpResponse {
+    return .{
+        .status = status,
+        .content_type = try alloc.dupe(u8, "text/plain"),
+        .body = try alloc.dupe(u8, body),
+    };
+}
+
+const TestPaths = struct {
+    primary_log: [:0]u8,
+    primary_slots: [:0]u8,
+    standby_log: [:0]u8,
+    standby_progress: [:0]u8,
+
+    fn deinit(self: TestPaths, alloc: Allocator) void {
+        alloc.free(self.primary_log);
+        alloc.free(self.primary_slots);
+        alloc.free(self.standby_log);
+        alloc.free(self.standby_progress);
+    }
+};
+
+fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
+    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
+    const primary_log = try allocPrintPath(alloc, name, "primary-log", nonce);
+    defer alloc.free(primary_log);
+    const primary_slots = try allocPrintPath(alloc, name, "primary-slots", nonce);
+    defer alloc.free(primary_slots);
+    const standby_log = try allocPrintPath(alloc, name, "standby-log", nonce);
+    defer alloc.free(standby_log);
+    const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    return .{
+        .primary_log = try alloc.dupeZ(u8, primary_log),
+        .primary_slots = try alloc.dupeZ(u8, primary_slots),
+        .standby_log = try alloc.dupeZ(u8, standby_log),
+        .standby_progress = try alloc.dupeZ(u8, standby_progress),
+    };
+}
+
+fn allocPrintPath(alloc: Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/ha-http-admin-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
+        .{ std.testing.random_seed, nonce },
+    );
+}
+
+fn testIdentity() standby_mod.Identity {
+    return .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+}
+
+test "storage.ha http admin serves health and command endpoint" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "command");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    defer server.deinit();
+
+    var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+    try std.testing.expectEqualStrings("ok", health.body);
+
+    var create = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"slot\",\"create\",\"standby-a\",\"--initial-lsn\",\"0\"]}",
+    });
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), create.status);
+    try std.testing.expectEqualStrings("application/json", create.content_type.?);
+    try expectContains(create.body, "\"slot_name\":\"standby-a\"");
+
+    try std.testing.expectEqual(@as(u64, 1), try primary.append(.{ .payload = "one" }));
+    var stream = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"stream\",\"once\",\"--slot\",\"standby-a\"]}",
+    });
+    defer stream.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), stream.status);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", stream.content_type.?);
+    try expectContains(stream.body, "result=stream_once\n");
+    try expectContains(stream.body, "received_count=1\n");
+    try expectContains(stream.body, "applied_lsn=1\n");
+}
+
+test "storage.ha http admin returns route method and command errors" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var missing = try server.handle(.{ .method = .GET, .uri = "/ha/v1/missing" });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), missing.status);
+
+    var wrong_method = try server.handle(.{ .method = .PUT, .uri = Routes.command });
+    defer wrong_method.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), wrong_method.status);
+
+    var bad_json = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{",
+    });
+    defer bad_json.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), bad_json.status);
+
+    var unavailable = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer unavailable.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), unavailable.status);
+    try expectContains(unavailable.body, "PrimaryUnavailable");
+}
+
+test "storage.ha http admin exposes request executor" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+    const executor = server.executor();
+    var health = try executor.execute(alloc, .{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
