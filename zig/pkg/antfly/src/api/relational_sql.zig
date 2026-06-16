@@ -57565,6 +57565,10 @@ const AppParityPlanSummary = struct {
     lateral_correlations: ?usize = null,
     windows: ?usize = null,
     row_claim_skip_locked: ?bool = null,
+    temporal_periods: ?usize = null,
+    temporal_primary_key: ?bool = null,
+    temporal_unique: ?usize = null,
+    temporal_foreign_keys: ?usize = null,
 };
 
 const AppParityCorpusEntry = struct {
@@ -61444,6 +61448,10 @@ fn parseAppParityFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         "lateral_correlations",
         "windows",
         "row_claim_skip_locked",
+        "temporal_periods",
+        "temporal_primary_key",
+        "temporal_unique",
+        "temporal_foreign_keys",
     });
     return .{
         .ddl_tag = if (object.get("ddl_tag")) |tag_value| std.meta.stringToEnum(AppParityDdlTag, try appParityJsonString(tag_value)) orelse return error.TestUnexpectedResult else null,
@@ -61497,6 +61505,10 @@ fn parseAppParityFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         .lateral_correlations = try appParityJsonOptionalUsize(object, "lateral_correlations"),
         .windows = try appParityJsonOptionalUsize(object, "windows"),
         .row_claim_skip_locked = try appParityJsonOptionalBool(object, "row_claim_skip_locked"),
+        .temporal_periods = try appParityJsonOptionalUsize(object, "temporal_periods"),
+        .temporal_primary_key = try appParityJsonOptionalBool(object, "temporal_primary_key"),
+        .temporal_unique = try appParityJsonOptionalUsize(object, "temporal_unique"),
+        .temporal_foreign_keys = try appParityJsonOptionalUsize(object, "temporal_foreign_keys"),
     };
 }
 
@@ -61551,7 +61563,11 @@ fn appParitySummaryHasFields(summary: AppParityPlanSummary) bool {
         summary.join_select != null or
         summary.lateral_correlations != null or
         summary.windows != null or
-        summary.row_claim_skip_locked != null;
+        summary.row_claim_skip_locked != null or
+        summary.temporal_periods != null or
+        summary.temporal_primary_key != null or
+        summary.temporal_unique != null or
+        summary.temporal_foreign_keys != null;
 }
 
 fn appParityWriteObjectComma(writer: anytype, first: *bool) !void {
@@ -61687,6 +61703,10 @@ fn appParityWriteSummaryField(writer: anytype, first: *bool, summary: AppParityP
     try appParityWriteUsizeSummaryField(writer, &summary_first, "lateral_correlations", summary.lateral_correlations);
     try appParityWriteUsizeSummaryField(writer, &summary_first, "windows", summary.windows);
     try appParityWriteBoolSummaryField(writer, &summary_first, "row_claim_skip_locked", summary.row_claim_skip_locked);
+    try appParityWriteUsizeSummaryField(writer, &summary_first, "temporal_periods", summary.temporal_periods);
+    try appParityWriteBoolSummaryField(writer, &summary_first, "temporal_primary_key", summary.temporal_primary_key);
+    try appParityWriteUsizeSummaryField(writer, &summary_first, "temporal_unique", summary.temporal_unique);
+    try appParityWriteUsizeSummaryField(writer, &summary_first, "temporal_foreign_keys", summary.temporal_foreign_keys);
     try writer.writeAll("\n      }");
 }
 
@@ -62302,6 +62322,13 @@ fn appParityFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureHasTemporalDdlSummary(entry: AppParityCorpusEntry) bool {
+    return entry.summary.temporal_periods != null or
+        entry.summary.temporal_primary_key != null or
+        entry.summary.temporal_unique != null or
+        entry.summary.temporal_foreign_keys != null;
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62569,6 +62596,33 @@ fn validateAppParityFixtureMetadata(
     }
     if (entry.summary.row_claim_skip_locked != null and !appParityFixtureAllowsRowClaimSummary(entry)) {
         return error.TestUnexpectedResult;
+    }
+    if (appParityFixtureHasTemporalDdlSummary(entry)) {
+        if (entry.family != .ddl) return error.TestUnexpectedResult;
+        if (entry.summary.temporal_periods) |periods| {
+            if (!appParityPlanHasExactUsizeToken(entry.plan, ":periods=", periods) and
+                !appParityPlanHasExactUsizeToken(entry.plan, ":add_period=", periods))
+            {
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (entry.summary.temporal_primary_key) |has_temporal_primary_key| {
+            if (!appParityPlanHasExactBoolToken(entry.plan, ":temporal_pk=", has_temporal_primary_key)) {
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (entry.summary.temporal_unique) |temporal_unique| {
+            if (!appParityPlanHasExactUsizeToken(entry.plan, ":temporal_unique=", temporal_unique) and
+                !(temporal_unique == 1 and appParityPlanHasExactBoolToken(entry.plan, ":temporal_unique=", true)))
+            {
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (entry.summary.temporal_foreign_keys) |temporal_foreign_keys| {
+            if (!appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", temporal_foreign_keys)) {
+                return error.TestUnexpectedResult;
+            }
+        }
     }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
         return error.TestUnexpectedResult;
@@ -62850,6 +62904,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .merge_mutation,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .row_claim_skip_locked = false },
         .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "query temporal ddl summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .temporal_periods = 1 },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale temporal periods summary",
+        .sql = "CREATE TABLE products (product_id int NOT NULL, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .table_name = "products", .select = 3, .temporal_periods = 2, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 0 },
+        .plan = "ddl:create_table:table=products:columns=3:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale temporal primary summary",
+        .sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 1, .temporal_primary_key = true },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:pk=1",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -63238,6 +63316,23 @@ fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected
             value = value * 10 + @as(usize, plan[pos] - '0');
         }
         if (value == expected) return true;
+        start = index + token.len;
+    }
+    return false;
+}
+
+fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
+    const expected_text = if (expected) "true" else "false";
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const value_start = index + token.len;
+        const value_end = value_start + expected_text.len;
+        if (value_end <= plan.len and
+            std.mem.eql(u8, plan[value_start..value_end], expected_text) and
+            (value_end == plan.len or plan[value_end] == ':'))
+        {
+            return true;
+        }
         start = index + token.len;
     }
     return false;
@@ -65967,7 +66062,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal parent table",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_table, .table_name = "account_prices", .select = 5 },
+            .summary = .{ .ddl_tag = .create_table, .table_name = "account_prices", .select = 5, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 1, .temporal_foreign_keys = 0 },
             .plan = "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0:pk=2",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
@@ -65986,7 +66081,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal period migration",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 4 },
+            .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 4, .temporal_periods = 1 },
             .plan = "ddl:alter_table:table=usage_records:ops=4:if_exists=false:add_col=2:add_period=1:add_unique=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL);",
@@ -66003,7 +66098,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal unique index migration",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1, .temporal_unique = 1 },
             .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:temporal_unique=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, PERIOD FOR valid_time (valid_from, valid_to));",
@@ -66014,7 +66109,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal range-column parent table",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_table, .table_name = "products", .select = 5 },
+            .summary = .{ .ddl_tag = .create_table, .table_name = "products", .select = 5, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 0 },
             .plan = "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
@@ -66030,7 +66125,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal child table",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments", .select = 6 },
+            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments", .select = 6, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 1 },
             .plan = "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
@@ -66052,7 +66147,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal foreign key cascade action",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_cascade", .select = 5 },
+            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_cascade", .select = 5, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 1 },
             .plan = "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
@@ -66074,7 +66169,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal foreign key set-null delete action",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_set_null_delete", .select = 5 },
+            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_set_null_delete", .select = 5, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 1 },
             .plan = "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
             .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =

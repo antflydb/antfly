@@ -83,7 +83,11 @@
       "summary": {
         "ddl_tag": "create_table",
         "table_name": "account_prices",
-        "select": 5
+        "select": 5,
+        "temporal_periods": 1,
+        "temporal_primary_key": true,
+        "temporal_unique": 1,
+        "temporal_foreign_keys": 0
       },
       "plan": "ddl:create_table:table=account_prices:columns=5:unique=1:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=1:temporal_fk=0:pk=2",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
@@ -95,7 +99,8 @@
       "summary": {
         "ddl_tag": "alter_table",
         "table_name": "usage_records",
-        "operations": 4
+        "operations": 4,
+        "temporal_periods": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=4:if_exists=false:add_col=2:add_period=1:add_unique=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL);"],
@@ -108,7 +113,8 @@
       "summary": {
         "ddl_tag": "create_index",
         "table_name": "usage_records",
-        "select": 1
+        "select": 1,
+        "temporal_unique": 1
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:temporal_unique=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, PERIOD FOR valid_time (valid_from, valid_to));"],
@@ -121,7 +127,11 @@
       "summary": {
         "ddl_tag": "create_table",
         "table_name": "products",
-        "select": 5
+        "select": 5,
+        "temporal_periods": 1,
+        "temporal_primary_key": true,
+        "temporal_unique": 0,
+        "temporal_foreign_keys": 0
       },
       "plan": "ddl:create_table:table=products:columns=5:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
@@ -133,7 +143,11 @@
       "summary": {
         "ddl_tag": "create_table",
         "table_name": "price_adjustments",
-        "select": 6
+        "select": 6,
+        "temporal_periods": 1,
+        "temporal_primary_key": true,
+        "temporal_unique": 0,
+        "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
@@ -145,7 +159,11 @@
       "summary": {
         "ddl_tag": "create_table",
         "table_name": "price_adjustments_cascade",
-        "select": 5
+        "select": 5,
+        "temporal_periods": 1,
+        "temporal_primary_key": true,
+        "temporal_unique": 0,
+        "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
@@ -157,7 +175,11 @@
       "summary": {
         "ddl_tag": "create_table",
         "table_name": "price_adjustments_set_null_delete",
-        "select": 5
+        "select": 5,
+        "temporal_periods": 1,
+        "temporal_primary_key": true,
+        "temporal_unique": 0,
+        "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
