@@ -72753,6 +72753,161 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
     ));
 }
 
+fn expectSqlTemporalJsonNumberEqual(expected: f64, actual: std.json.Value) !void {
+    switch (actual) {
+        .integer => |value| try std.testing.expectEqual(expected, @as(f64, @floatFromInt(value))),
+        .float => |value| try std.testing.expectEqual(expected, value),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+fn expectSqlTemporalPriceRow(
+    alloc: std.mem.Allocator,
+    row_json: []const u8,
+    sku: []const u8,
+    valid_from: f64,
+    valid_to: f64,
+    price: f64,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(sku, object.get("sku").?.string);
+    try expectSqlTemporalJsonNumberEqual(valid_from, object.get("valid_from").?);
+    try expectSqlTemporalJsonNumberEqual(valid_to, object.get("valid_to").?);
+    try expectSqlTemporalJsonNumberEqual(price, object.get("price").?);
+}
+
+test "postgres sql adapter temporal portion mutation sources execute through relational storage" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-temporal-portion-execution", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:a:v1", .value = "{\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}" },
+            .{ .key = "price:b:v1", .value = "{\"sku\":\"sku:b\",\"valid_from\":0,\"valid_to\":10,\"price\":20}" },
+        },
+        .sync_level = .write,
+    });
+
+    const update_txn = try db.beginTransaction(2_000);
+    var update_committed = false;
+    defer if (!update_committed) db.abortTransaction(update_txn, 2_001) catch {};
+    const update_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-temporal-update",
+        .txn_id = update_txn,
+    };
+    var update_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' FOR UPDATE RETURNING *",
+        schema,
+        &.{},
+        .{ .row_claim = update_claim },
+    );
+    defer update_plan.deinit(alloc);
+
+    switch (update_plan) {
+        .update_source => |update_source| {
+            var result = try db.mutateRelationalRowsFromSource(alloc, schema, update_source.mutation.req);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), result.matched);
+            try std.testing.expectEqual(@as(u32, 1), result.staged);
+            try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+            try expectSqlTemporalPriceRow(alloc, result.returning_rows[0], "sku:a", 3, 7, 99);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try db.commitTransaction(update_txn, 2_010);
+    update_committed = true;
+
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "valid_from",
+        .direction = .asc,
+    }};
+    const sku_a_predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"sku:a\"",
+    }};
+    var sku_a_rows = try db.queryRelationalRows(alloc, schema, .{
+        .predicates = sku_a_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer sku_a_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), sku_a_rows.total);
+    try std.testing.expectEqual(@as(usize, 3), sku_a_rows.rows.len);
+    try expectSqlTemporalPriceRow(alloc, sku_a_rows.rows[0], "sku:a", 0, 3, 10);
+    try expectSqlTemporalPriceRow(alloc, sku_a_rows.rows[1], "sku:a", 3, 7, 99);
+    try expectSqlTemporalPriceRow(alloc, sku_a_rows.rows[2], "sku:a", 7, 10, 10);
+
+    const delete_txn = try db.beginTransaction(2_020);
+    var delete_committed = false;
+    defer if (!delete_committed) db.abortTransaction(delete_txn, 2_021) catch {};
+    const delete_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-temporal-delete",
+        .txn_id = delete_txn,
+    };
+    var delete_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' FOR UPDATE RETURNING *",
+        schema,
+        &.{},
+        .{ .row_claim = delete_claim },
+    );
+    defer delete_plan.deinit(alloc);
+
+    switch (delete_plan) {
+        .delete_source => |delete_source| {
+            var result = try db.mutateRelationalRowsFromSource(alloc, schema, delete_source.mutation.req);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), result.matched);
+            try std.testing.expectEqual(@as(u32, 1), result.staged);
+            try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+            try expectSqlTemporalPriceRow(alloc, result.returning_rows[0], "sku:b", 2, 8, 20);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try db.commitTransaction(delete_txn, 2_030);
+    delete_committed = true;
+
+    const sku_b_predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"sku:b\"",
+    }};
+    var sku_b_rows = try db.queryRelationalRows(alloc, schema, .{
+        .predicates = sku_b_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer sku_b_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), sku_b_rows.total);
+    try std.testing.expectEqual(@as(usize, 2), sku_b_rows.rows.len);
+    try expectSqlTemporalPriceRow(alloc, sku_b_rows.rows[0], "sku:b", 0, 2, 20);
+    try expectSqlTemporalPriceRow(alloc, sku_b_rows.rows[1], "sku:b", 8, 10, 20);
+}
+
 test "postgres sql adapter lowers claimed delete mutation source" {
     const alloc = std.testing.allocator;
     const schema_json =

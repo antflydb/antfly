@@ -1179,7 +1179,11 @@ the exact owner interval instead of rejecting `WITHOUT OVERLAPS` primary keys or
 collapsing multiple intervals onto a scalar key. Hosted remote period-qualified owner lookup uses typed internal
 group read routes rather than exposing internal key scans to callers; the
 resolved owner group performs the temporal owner-prefix scan locally and returns
-only the matching owner row key. The temporal gate includes combined
+only the matching owner row key. SQL `FOR PORTION OF` update/delete coverage
+executes through the same adapter-to-typed-plan-to-storage path: the lowerer
+emits a temporal mutation-source request, DB staging splits or trims the matched
+owner interval transactionally, `RETURNING *` is projected from the affected
+portion, and committed queries observe the surviving fragments. The temporal gate includes combined
 `FOR PORTION OF` + temporal-FK cases that split a child row, revalidate period
 coverage through the FK proof path, validate the temporal unique-owner rows,
 repair missing temporal FK reverse-reference rows from live child fragments, and
