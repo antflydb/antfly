@@ -424,6 +424,34 @@ Expose consistency options:
 The API should surface standby lag so clients and routers can make informed
 choices.
 
+## API and CLI Surface
+
+The HA control plane should be API-first. The stable automation contract should
+be a typed, versioned `/admin/v1/ha` API. The CLI should remain as an ergonomic
+human and break-glass interface, but long-term operator automation should not
+depend on shelling out to a command as the primary protocol.
+
+Recommended split:
+
+- `/admin/v1/ha`: human and operator control-plane actions. This API owns
+  replication slot lifecycle, base-backup orchestration, HA status, fencing
+  receipts, promotion, former-primary rejoin, rewind, and reseed workflows. It
+  should return typed responses with action ids, LSNs, timelines, fence tokens,
+  receipts, and idempotency state.
+- `/internal/v1`: runtime-to-runtime traffic inside a trusted deployment. This
+  is where WAL streaming, replication pulls, standby status updates, identity
+  probes, and other node-to-node mechanisms belong. It should not be the
+  operator policy or human operations surface.
+- CLI: a thin client over `/admin/v1/ha` for remote operations, plus local
+  offline helpers where useful. CLI output should be derived from the same typed
+  responses the admin API returns.
+
+Kubernetes Jobs that run `antfly ha ...` are acceptable as a bootstrap mechanism
+for workflows that need pod-local volume mounts or shared backup files. They
+should not become the only production automation path. The operator should move
+toward typed `/admin/v1/ha` calls for idempotent actions and reserve CLI Jobs
+for explicitly local file-transfer or recovery steps.
+
 ## Failure Cases
 
 ### Primary crash, async standby behind
@@ -470,7 +498,7 @@ and either rewind or reseed.
 
 ### Phase 3: Streaming Transport
 
-- Add a pull or bidirectional stream API:
+- Add a pull or bidirectional internal replication API under `/internal/v1`:
   - `IDENTIFY_SYSTEM`
   - `CREATE_REPLICATION_SLOT`
   - `START_REPLICATION from_lsn`
@@ -516,16 +544,22 @@ and either rewind or reseed.
 
 ### Phase 8: CLI and Admin API
 
-- Add admin APIs and CLI commands to create, drop, and list replication slots.
-- Add commands to seed a standby from a base backup.
-- Add commands to show primary LSN, standby received/apply LSN, lag, slot
-  retention, degraded sync status, and reseed recommendations.
-- Add commands to pause, resume, and remove standby replication.
-- Add promotion commands with explicit safe, forced, and lossy modes.
-- Add commands to validate timeline/LSN compatibility before promotion or
-  rejoin.
-- Add former-primary workflows for rewind when possible and reseed when rewind
-  is unsafe.
+- Define `/admin/v1/ha` as the stable typed control-plane API.
+- Add admin API endpoints to create, drop, pause, resume, and list replication
+  slots.
+- Add admin API endpoints to seed a standby from a base backup and report
+  resumable action state.
+- Add admin API endpoints to show primary LSN, standby received/apply LSN, lag,
+  slot retention, degraded sync status, and reseed recommendations.
+- Add admin API promotion endpoints with explicit safe, forced, and lossy modes.
+- Add admin API endpoints to validate timeline/LSN compatibility before
+  promotion or rejoin.
+- Add former-primary API workflows for rewind when possible and reseed when
+  rewind is unsafe.
+- Keep the CLI as a thin client over `/admin/v1/ha` for remote operations, with
+  local/offline helpers only where direct filesystem access is required.
+- Keep CLI table and JSON output aligned with admin API response schemas so
+  humans, tests, and the operator observe the same fields.
 
 ### Phase 9: Operator Integration
 
@@ -538,6 +572,9 @@ be validated against that operator package.
   retention caps, and automatic-failover policy.
 - Bootstrap standby pods from base backup and attach them to replication slots.
 - Manage slot lifecycle and WAL retention pressure.
+- Prefer typed `/admin/v1/ha` calls for idempotent operator actions.
+- Use CLI-backed Kubernetes Jobs only for workflows that need pod-local mounted
+  files, shared backup volumes, or explicit break-glass execution.
 - Publish lag, degraded, unhealthy, and reseed-required conditions.
 - Coordinate fenced failover through Kubernetes Lease, storage fencing, or
   another configured ownership authority.
