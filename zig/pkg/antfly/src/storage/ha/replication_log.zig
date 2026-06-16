@@ -112,7 +112,7 @@ pub const ReplicationLog = struct {
     }
 };
 
-fn freeEntries(alloc: Allocator, entries: []Entry) void {
+pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
     for (entries) |*entry| entry.deinit(alloc);
     alloc.free(entries);
 }
