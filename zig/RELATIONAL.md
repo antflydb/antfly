@@ -504,7 +504,11 @@ execution uses that same path: storage-backed SQL read-plan tests pin
 expression filters such as `lower(status) = 'open'`, computed-array containment
 filters such as `string_to_array(scope, ' ') @> ARRAY['write']`, JSON
 containment filters, and declared-array containment filters through
-`aggregateRelationalRowsPlan`, not just SQL lowerer fingerprints. Joined mutation-source
+`aggregateRelationalRowsPlan`, not just SQL lowerer fingerprints. Window
+aggregate filters use the same contract through `windowRelationalRowsPlan`, so
+partitioned window `COUNT` and `SUM` filters over expressions, computed-array
+containment, JSON containment, and declared-array containment are verified
+against stored rows. Joined mutation-source
 `patch_expr` assignments use the same source-aware expression nodes, so a
 source-row field and a target-row field can participate in one typed arithmetic
 assignment without adapter-private evaluation. PostgreSQL row-list mutation

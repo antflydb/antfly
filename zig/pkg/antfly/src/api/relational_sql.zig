@@ -77886,6 +77886,36 @@ test "postgres sql adapter typed read plans execute through relational storage" 
         else => return error.TestUnexpectedResult,
     }
 
+    var filtered_window_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT tenant, id, COUNT(*) FILTER (WHERE string_to_array(scope, ' ') @> ARRAY['write']) OVER (PARTITION BY tenant) AS writable_orders, SUM(amount) FILTER (WHERE lower(status) = 'open') OVER (PARTITION BY tenant) AS open_amount, COUNT(*) FILTER (WHERE metadata @> '{\"source\":\"api\"}'::jsonb) OVER (PARTITION BY tenant) AS api_orders, COUNT(*) FILTER (WHERE tags @> ARRAY['hot']) OVER (PARTITION BY tenant) AS hot_orders FROM usage_records WHERE kind = 'order' ORDER BY id ASC",
+        schema,
+        &.{},
+    );
+    defer filtered_window_plan.deinit(alloc);
+
+    switch (filtered_window_plan) {
+        .window => |lowered| {
+            try std.testing.expectEqual(@as(usize, 4), lowered.plan.window.windows.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows[0].filter_expression_array_contains.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.plan.window.windows[0].filter_expression_array_contains[0].expression.kind);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows[1].filter_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.window.windows[1].filter_expressions[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows[2].filter_json_contains.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows[3].filter_array_contains.len);
+
+            var result = try db.windowRelationalRowsPlan(alloc, schema, lowered.plan);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 3), result.total_rows);
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o1\",\"writable_orders\":1,\"open_amount\":15,\"api_orders\":1,\"hot_orders\":1}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o2\",\"writable_orders\":1,\"open_amount\":15,\"api_orders\":1,\"hot_orders\":1}", result.rows[1]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"o3\",\"writable_orders\":1,\"open_amount\":7,\"api_orders\":1,\"hot_orders\":1}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var lateral_plan = try lowerReadPlanAlloc(
         alloc,
         "SELECT org.id AS organization_id, latest.amount AS latest_amount, latest.created_at AS latest_created_at FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC NULLS LAST LIMIT 10",
