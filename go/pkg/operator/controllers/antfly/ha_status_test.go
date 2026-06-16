@@ -449,8 +449,8 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "--current-fence"}) {
 		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" {
-		t.Fatalf("expected acquire-fence action to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
+	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		t.Fatalf("expected acquire-fence action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
 	if cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://standby-a-ha.default.svc:8081" {
 		t.Fatalf("expected promote action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1])

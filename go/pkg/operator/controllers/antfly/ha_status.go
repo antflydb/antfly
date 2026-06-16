@@ -701,7 +701,15 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 		return ""
 	}
 	switch action.Kind {
-	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed, haActionAcquireFence:
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
+		if ha.Admin == nil {
+			return ""
+		}
+		return ha.Admin.PrimaryURL
+	case haActionAcquireFence:
+		if url := haStandbyAdminURL(ha, action.StandbyName); url != "" {
+			return url
+		}
 		if ha.Admin == nil {
 			return ""
 		}
