@@ -517,7 +517,8 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 1 {
+		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 1 ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceReason != "LeaseHeld" {
 		t.Fatalf("expected planned action to publish fence precondition, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
 	route := cluster.Status.HAStatus.PrimaryRoute
@@ -870,6 +871,7 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 		LastPromotion: &antflyv1.HAPromotionStatus{
 			PromotedStandbyID: "standby-a",
 			FenceGeneration:   5,
+			FenceReason:       "operator-approved",
 		},
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "standby-a",
@@ -897,7 +899,8 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionUpdatePrimaryRoute) ||
 		cluster.Status.HAStatus.PlannedActions[0].RouteFrom != "primary" ||
 		cluster.Status.HAStatus.PlannedActions[0].RouteTo != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 5 {
+		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 5 ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceReason != "operator-approved" {
 		t.Fatalf("expected route planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 

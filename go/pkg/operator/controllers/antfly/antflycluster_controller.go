@@ -3316,12 +3316,19 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			RequiredLSN:       action.TargetLSN,
 			ObservedLSN:       action.TargetLSN,
 			FenceGeneration:   action.FenceGeneration,
-			FenceReason:       action.Reason,
+			FenceReason:       haPromotionFenceReason(action),
 			CompletionTime:    &now,
 		}
 		r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
 		return
 	}
+}
+
+func haPromotionFenceReason(action antflyv1.HAPlannedActionStatus) string {
+	if action.FenceReason != "" {
+		return action.FenceReason
+	}
+	return action.Reason
 }
 
 func (r *AntflyClusterReconciler) updateHAPromotionStatusFromAdminJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, promotion *antflyv1.HAPromotionStatus) {
@@ -4162,6 +4169,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
 		RouteFrom    string   `json:"routeFrom,omitempty"`
 		RouteTo      string   `json:"routeTo,omitempty"`
+		FenceReason  string   `json:"fenceReason,omitempty"`
 		SeedManifest string   `json:"seedManifestPath,omitempty"`
 		SeedRoot     string   `json:"seedContentRoot,omitempty"`
 		AdminURL     string   `json:"adminURL,omitempty"`
@@ -4179,6 +4187,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		RetainedLSN:  action.RetainedFromLSN,
 		RouteFrom:    action.RouteFrom,
 		RouteTo:      action.RouteTo,
+		FenceReason:  action.FenceReason,
 		SeedManifest: action.SeedManifestPath,
 		SeedRoot:     action.SeedContentRoot,
 		AdminURL:     action.AdminURL,

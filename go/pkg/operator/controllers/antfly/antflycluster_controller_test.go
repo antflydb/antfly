@@ -429,6 +429,11 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	routeHash := haAdminActionHash(route)
 	route.RouteFrom = "standby-b"
 	g.Expect(haAdminActionHash(route)).NotTo(Equal(routeHash))
+
+	fenced := antflyv1.HAPlannedActionStatus{Kind: string(haActionAcquireFence), FenceReason: "LeaseAcquired"}
+	fencedHash := haAdminActionHash(fenced)
+	fenced.FenceReason = "LeaseRenewed"
+	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
 }
 
 func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
@@ -537,6 +542,7 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminJobName:    "promote-job",
 					AdminJobPhase:   haAdminJobPhaseSucceeded,
@@ -556,6 +562,7 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
 	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(promotion.FenceReason).To(Equal("LeaseAcquired"))
 	g.Expect(promotion.CompletionTime).NotTo(BeNil())
 	firstCompletion := promotion.CompletionTime
 

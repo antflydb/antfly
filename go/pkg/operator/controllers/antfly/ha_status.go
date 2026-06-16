@@ -83,6 +83,7 @@ type haPlannedAction struct {
 	FenceAuthority   antflyv1.HAFencingAuthority
 	FenceHolder      string
 	FenceGeneration  uint64
+	FenceReason      string
 	SeedManifestPath string
 	SeedContentRoot  string
 	Reason           string
@@ -458,6 +459,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
+				FenceReason:     fence.Reason,
 				Reason:          "AutomaticFailoverReady",
 			},
 			haPlannedAction{
@@ -468,6 +470,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
+				FenceReason:     fence.Reason,
 				Reason:          "AutomaticFailoverReady",
 			},
 			haPlannedAction{
@@ -480,6 +483,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
+				FenceReason:     fence.Reason,
 				Reason:          "PromotionPlanned",
 			},
 			haPlannedAction{
@@ -492,6 +496,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
+				FenceReason:     fence.Reason,
 				Reason:          "PromotionPlanned",
 			},
 		)
@@ -567,6 +572,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			FenceAuthority:   action.FenceAuthority,
 			FenceHolder:      action.FenceHolder,
 			FenceGeneration:  action.FenceGeneration,
+			FenceReason:      action.FenceReason,
 			SeedManifestPath: action.SeedManifestPath,
 			SeedContentRoot:  action.SeedContentRoot,
 			AdminCommand:     haAdminCommand(action, haReplicationIdentity(ha), status),
@@ -877,6 +883,7 @@ func haPrimaryRoutePlannedAction(evaluation haPrimaryRouteEvaluation, status *an
 		action.TargetLSN = status.PrimaryLSN
 		action.FenceAuthority = status.Fencing.Authority
 		action.FenceHolder = status.Fencing.Holder
+		action.FenceReason = haPlannedActionFenceReason(status)
 	}
 	if evaluation.DesiredTarget != "" && evaluation.DesiredTarget != "primary" {
 		action.StandbyName = evaluation.DesiredTarget
@@ -920,8 +927,12 @@ func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation, status *
 		return haPlannedAction{}
 	}
 	retainedFromLSN := uint64(0)
+	fenceReason := ""
 	if status != nil {
 		retainedFromLSN = status.Retention.OldestRestartLSN
+		if status.LastPromotion != nil {
+			fenceReason = status.LastPromotion.FenceReason
+		}
 	}
 	switch evaluation.Action {
 	case string(haActionDemoteFormerPrimary), string(haActionRewindFormerPrimary), string(haActionReseedFormerPrimary):
@@ -932,6 +943,7 @@ func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation, status *
 			ObservedLSN:     evaluation.ObservedLSN,
 			RetainedFromLSN: retainedFromLSN,
 			FenceGeneration: evaluation.FenceGeneration,
+			FenceReason:     fenceReason,
 			Reason:          evaluation.Reason,
 		}
 	default:
@@ -1358,6 +1370,19 @@ func haPrimaryRouteCurrentTarget(status *antflyv1.HAStatus) string {
 		return status.PrimaryRoute.CurrentTarget
 	}
 	return "primary"
+}
+
+func haPlannedActionFenceReason(status *antflyv1.HAStatus) string {
+	if status == nil {
+		return ""
+	}
+	if status.Fencing.Reason != "" {
+		return status.Fencing.Reason
+	}
+	if status.LastPromotion != nil {
+		return status.LastPromotion.FenceReason
+	}
+	return ""
 }
 
 func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluation {
