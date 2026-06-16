@@ -1528,12 +1528,13 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("primary admin refused connection"))
 }
 
-func TestObserveHAPrimaryAdminStatusFallsBackToCommandEndpoint(t *testing.T) {
+func TestObserveHAPrimaryAdminStatusDoesNotFallbackToCommandEndpoint(t *testing.T) {
 	g := NewWithT(t)
 
-	var observedArgv []string
+	var requestCount int
 	reconciler := &AntflyClusterReconciler{
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requestCount++
 			if req.Method == http.MethodGet {
 				g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 				return &http.Response{
@@ -1541,26 +1542,8 @@ func TestObserveHAPrimaryAdminStatusFallsBackToCommandEndpoint(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader("not found")),
 				}, nil
 			}
-			g.Expect(req.Method).To(Equal(http.MethodPost))
-			g.Expect(req.URL.String()).To(Equal("http://primary-ha.default.svc:8081/ha/v1/admin/command"))
-			var payload struct {
-				Argv []string `json:"argv"`
-			}
-			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
-			observedArgv = append([]string{}, payload.Argv...)
-			body := strings.Join([]string{
-				"result=primary_status",
-				"current_lsn=12",
-				"retention.oldest_restart_lsn=7",
-				"retention.retained_lsn_count=5",
-				"retention.active_slots=1",
-				"",
-			}, "\n")
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
-				Body:       io.NopCloser(strings.NewReader(body)),
-			}, nil
+			t.Fatalf("operator status observation must use typed /admin/v1/ha endpoints only, got %s %s", req.Method, req.URL.String())
+			return nil, nil
 		})},
 	}
 	cluster := &antflyv1.AntflyCluster{
@@ -1572,9 +1555,10 @@ func TestObserveHAPrimaryAdminStatusFallsBackToCommandEndpoint(t *testing.T) {
 		},
 	}
 
-	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
-	g.Expect(observedArgv).To(Equal([]string{"--table", "status", "primary"}))
-	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(12)))
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).NotTo(Succeed())
+	g.Expect(requestCount).To(Equal(1))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("HA admin API returned status 404"))
 }
 
 func TestObserveHAStandbyAdminStatuses(t *testing.T) {

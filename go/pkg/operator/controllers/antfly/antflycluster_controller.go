@@ -4133,17 +4133,6 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	}
 	status, err := r.observeHAPrimaryStatusTyped(ctx, ha.Admin.PrimaryURL, ha)
 	if err != nil {
-		body, tableErr := r.executeHAAdminTableCommand(ctx, ha.Admin.PrimaryURL, haPrimaryStatusCommand(ha))
-		if tableErr == nil {
-			status, tableErr = parseHAPrimaryStatusTable(body)
-		}
-		if tableErr != nil {
-			err = tableErr
-		} else {
-			err = nil
-		}
-	}
-	if err != nil {
 		cluster.Status.HAStatus.PrimaryAdminReachable = false
 		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
 		return err
@@ -4172,16 +4161,10 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 		}
 		status, err := r.observeHAStandbyStatusTyped(ctx, standby.AdminURL, standby.Name, standbySlotName(standby), cluster.Status.HAStatus.PrimaryLSN)
 		if err != nil {
-			body, tableErr := r.executeHAAdminTableCommand(ctx, standby.AdminURL, haStandbyStatusCommand(cluster.Status.HAStatus.PrimaryLSN))
-			if tableErr == nil {
-				status, tableErr = parseHAStandbyStatusTable(body, standby.Name, standbySlotName(standby))
+			if observedErr == nil {
+				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
 			}
-			if tableErr != nil {
-				if observedErr == nil {
-					observedErr = fmt.Errorf("standby %s: %w", standby.Name, tableErr)
-				}
-				continue
-			}
+			continue
 		}
 		mergeHAStandbyStatus(cluster.Status.HAStatus, status)
 	}
@@ -4271,72 +4254,6 @@ func (r *AntflyClusterReconciler) requestHAAdminJSONRaw(ctx context.Context, met
 		return nil, fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return raw, nil
-}
-
-func (r *AntflyClusterReconciler) executeHAAdminTableCommand(ctx context.Context, baseURL string, argv []string) (string, error) {
-	requestBody, err := json.Marshal(struct {
-		Argv []string `json:"argv"`
-	}{Argv: argv})
-	if err != nil {
-		return "", err
-	}
-	endpoint := strings.TrimRight(baseURL, "/") + "/ha/v1/admin/command"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(requestBody)))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/plain")
-
-	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("HA admin command returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return string(raw), nil
-}
-
-func haPrimaryStatusCommand(ha *antflyv1.HighAvailabilitySpec) []string {
-	argv := []string{"--table", "status", "primary"}
-	if ha == nil {
-		return argv
-	}
-	if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
-		argv = append(argv, "--max-lag-lsn", strconv.FormatUint(ha.Retention.MaxLagLSN, 10))
-	}
-	if ha.SyncPolicy != nil && ha.SyncPolicy.Mode != "" && ha.SyncPolicy.Mode != antflyv1.HADurabilityModeAsync {
-		argv = append(argv, "--sync-mode", haDurabilityModeCLI(ha.SyncPolicy.Mode))
-		if ha.SyncPolicy.Selection != "" {
-			argv = append(argv, "--sync-selection", haStandbySelectionCLI(ha.SyncPolicy.Selection))
-		}
-		if ha.SyncPolicy.Required > 0 {
-			argv = append(argv, "--sync-required", strconv.FormatInt(int64(ha.SyncPolicy.Required), 10))
-		}
-		for _, name := range ha.SyncPolicy.StandbyNames {
-			if strings.TrimSpace(name) != "" {
-				argv = append(argv, "--sync-standby", name)
-			}
-		}
-		if ha.SyncPolicy.FailurePolicy != "" {
-			argv = append(argv, "--sync-failure", haFailurePolicyCLI(ha.SyncPolicy.FailurePolicy))
-		}
-	}
-	return argv
-}
-
-func haStandbyStatusCommand(upstreamLSN uint64) []string {
-	argv := []string{"--table", "status", "standby"}
-	if upstreamLSN > 0 {
-		argv = append(argv, "--upstream-lsn", strconv.FormatUint(upstreamLSN, 10))
-	}
-	return argv
 }
 
 func haPrimaryStatusQuery(ha *antflyv1.HighAvailabilitySpec) url.Values {
@@ -4547,89 +4464,6 @@ func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (
 	if snapshot.ApplyLagLSN != nil {
 		status.ApplyLagLSN = *snapshot.ApplyLagLSN
 	}
-	if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
-		status.Status = "lagging"
-	} else if status.CanServeSafeReads && status.Status == "" {
-		status.Status = "healthy"
-	}
-	return status, nil
-}
-
-func parseHAPrimaryStatusTable(body string) (haObservedPrimaryStatus, error) {
-	lines := parseHATableLines(body)
-	if result := lines["result"]; result != "" && result != "primary_status" {
-		return haObservedPrimaryStatus{}, fmt.Errorf("unexpected HA status result %q", result)
-	}
-
-	var status haObservedPrimaryStatus
-	var ok bool
-	if status.PrimaryLSN, ok = parseHAResultUint(lines, "current_lsn"); !ok {
-		return haObservedPrimaryStatus{}, fmt.Errorf("missing current_lsn")
-	}
-	status.Retention.OldestRestartLSN, _ = parseHAResultUint(lines, "retention.oldest_restart_lsn")
-	status.Retention.RetainedLSNCount, _ = parseHAResultUint(lines, "retention.retained_lsn_count")
-	if activeSlots, ok := parseHAResultUint(lines, "retention.active_slots"); ok {
-		status.Retention.ActiveSlots = int32(activeSlots)
-	}
-	if reseedRecommended, ok := parseHAResultUint(lines, "retention.reseed_recommended"); ok {
-		status.Retention.ReseedRecommended = int32(reseedRecommended)
-	}
-
-	slotCount, _ := parseHAResultUint(lines, "slot_count")
-	for i := uint64(0); i < slotCount; i++ {
-		prefix := fmt.Sprintf("slots.%d.", i)
-		name := strings.TrimSpace(lines[prefix+"name"])
-		if name == "" {
-			continue
-		}
-		slot := antflyv1.HAStandbyStatus{Name: name, SlotName: name}
-		slot.TimelineID, _ = parseHAResultUint(lines, prefix+"timeline_id")
-		slot.Active, _ = parseHAResultBool(lines, prefix+"active")
-		slot.ReseedRequired, _ = parseHAResultBool(lines, prefix+"reseed_required")
-		slot.RestartLSN, _ = parseHAResultUint(lines, prefix+"restart_lsn")
-		slot.ReceivedLSN, _ = parseHAResultUint(lines, prefix+"received_lsn")
-		slot.AppliedLSN, _ = parseHAResultUint(lines, prefix+"applied_lsn")
-		slot.SafeReadLSN, _ = parseHAResultUint(lines, prefix+"safe_read_lsn")
-		slot.WriteLagLSN, _ = parseHAResultUint(lines, prefix+"write_lag_lsn")
-		slot.ApplyLagLSN, _ = parseHAResultUint(lines, prefix+"apply_lag_lsn")
-		slot.SafeReadLagLSN, _ = parseHAResultUint(lines, prefix+"safe_read_lag_lsn")
-		slot.Status = strings.TrimSpace(lines[prefix+"status"])
-		slot.LastError = strings.TrimSpace(lines[prefix+"last_error"])
-		status.Standbys = append(status.Standbys, slot)
-	}
-	return status, nil
-}
-
-func parseHAStandbyStatusTable(body string, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {
-	lines := parseHATableLines(body)
-	if result := lines["result"]; result != "" && result != "standby_status" {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("unexpected HA standby status result %q", result)
-	}
-	if role := lines["role"]; role != "" && role != "standby" {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("unexpected HA standby role %q", role)
-	}
-
-	status := antflyv1.HAStandbyStatus{
-		Name:     standbyName,
-		SlotName: slotName,
-		Active:   true,
-	}
-	var ok bool
-	status.TimelineID, _ = parseHAResultUint(lines, "identity.timeline_id")
-	if status.ReceivedLSN, ok = parseHAResultUint(lines, "received_lsn"); !ok {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing received_lsn")
-	}
-	if status.AppliedLSN, ok = parseHAResultUint(lines, "applied_lsn"); !ok {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing applied_lsn")
-	}
-	status.SafeReadLSN, _ = parseHAResultUint(lines, "safe_read_lsn")
-	status.UpstreamLSN, _ = parseHAResultUint(lines, "upstream_lsn")
-	status.WriteLagLSN, _ = parseHAResultUint(lines, "write_lag_lsn")
-	status.ReceiveLagLSN, _ = parseHAResultUint(lines, "receive_lag_lsn")
-	status.ApplyLagLSN, _ = parseHAResultUint(lines, "apply_lag_lsn")
-	status.UnappliedLSNCount, _ = parseHAResultUint(lines, "unapplied_lsn_count")
-	status.CaughtUpToReceived, _ = parseHAResultBool(lines, "caught_up_to_received")
-	status.CanServeSafeReads, _ = parseHAResultBool(lines, "can_serve_safe_reads")
 	if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
 		status.Status = "lagging"
 	} else if status.CanServeSafeReads && status.Status == "" {
