@@ -5210,10 +5210,15 @@ Mutation transform summary fields are scoped to the typed plans that structurall
 assert them. `patch_expressions`, `increment_expressions`, and
 `json_set_expressions` are valid only on insert-source conflict plans,
 update-source plans, joined update-source plans, or `EXPLAIN` wrappers around
-those plans. `conflict_where` is valid only on point insert and insert-source
-conflict plans, or `EXPLAIN` wrappers around those plans, because guarded upsert
-predicates belong to the native conflict action rather than generic write
-metadata. `source_assignments` is valid only on joined update-source plans.
+those plans, and they must match the relevant fingerprint tokens:
+`conflict_patch_expr`, `conflict_increment_expr`, and `conflict_json_set_expr`
+for insert-source conflict actions, or `patch_expr`, `increment_expr`, and
+`json_set_expr` for mutation-source updates. `conflict_where` is valid only on
+point insert and insert-source conflict plans, or `EXPLAIN` wrappers around
+those plans, because guarded upsert predicates belong to the native conflict
+action rather than generic write metadata. `source_assignments` is valid only on
+joined update-source plans and must match the joined mutation-source
+`source_assignments` fingerprint token.
 Merge-arm summaries such as matched predicates, matched deletes, matched
 do-nothing arms, not-matched predicates, and not-matched do-nothing arms are
 valid only on merge mutation plans. Other families reject those fields so corpus

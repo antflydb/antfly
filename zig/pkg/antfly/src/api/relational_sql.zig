@@ -62274,6 +62274,40 @@ fn appParityFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) b
     };
 }
 
+fn appParityFixtureSourceAssignmentsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    return switch (entry.family) {
+        .update_joined_source,
+        .explain,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":source_assignments=", expected),
+        else => false,
+    };
+}
+
+fn appParityFixtureTransformSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    if (entry.summary.patch_expressions) |patch_expressions| {
+        const token = if (entry.family == .insert_source or appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"))
+            ":conflict_patch_expr="
+        else
+            ":patch_expr=";
+        if (!appParityPlanHasExactUsizeToken(entry.plan, token, patch_expressions)) return false;
+    }
+    if (entry.summary.increment_expressions) |increment_expressions| {
+        const token = if (entry.family == .insert_source or appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"))
+            ":conflict_increment_expr="
+        else
+            ":increment_expr=";
+        if (!appParityPlanHasExactUsizeToken(entry.plan, token, increment_expressions)) return false;
+    }
+    if (entry.summary.json_set_expressions) |json_set_expressions| {
+        const token = if (entry.family == .insert_source or appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"))
+            ":conflict_json_set_expr="
+        else
+            ":json_set_expr=";
+        if (!appParityPlanHasExactUsizeToken(entry.plan, token, json_set_expressions)) return false;
+    }
+    return true;
+}
+
 fn appParityFixtureAllowsMergeArmSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .merge_mutation => true,
@@ -62704,8 +62738,16 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if (!appParityFixtureTransformSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.source_assignments != null and !appParityFixtureAllowsSourceAssignmentsSummary(entry)) {
         return error.TestUnexpectedResult;
+    }
+    if (entry.summary.source_assignments) |source_assignments| {
+        if (!appParityFixtureSourceAssignmentsSummaryMatchesPlan(entry, source_assignments)) {
+            return error.TestUnexpectedResult;
+        }
     }
     if ((entry.summary.matched_predicates != null or
         entry.summary.matched_delete != null or
@@ -63090,12 +63132,52 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale update source transform summary",
+        .sql = "UPDATE usage_records SET status = lower(status) WHERE id = 'u1'",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .patch_expressions = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=0:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale insert source transform summary",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM usage_records ON CONFLICT (id) DO UPDATE SET status = lower(excluded.status)",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records", .patch_expressions = 1 },
+        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=1:conflict=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid update source transform summary",
+        .sql = "UPDATE usage_records SET status = lower(status), priority = priority + 1, metadata = jsonb_set(metadata, '{billing,status}', to_jsonb(status), true) WHERE id = 'u1'",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .patch_expressions = 1, .increment_expressions = 1, .json_set_expressions = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=0:patch_expr=1:increment_expr=1:json_set_expr=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "update source source assignment summary",
         .sql = "UPDATE usage_records SET status = 'active' WHERE id = 'u1'",
         .family = .update_source,
         .summary = .{ .table_name = "usage_records", .source_assignments = 1 },
         .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale joined source assignment summary",
+        .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id",
+        .family = .update_joined_source,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .source_assignments = 1 },
+        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid joined source assignment summary",
+        .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id",
+        .family = .update_joined_source,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .source_assignments = 1 },
+        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "update source merge arm summary",
