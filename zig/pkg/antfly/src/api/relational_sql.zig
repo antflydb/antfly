@@ -62338,6 +62338,21 @@ fn appParityFixtureHasTemporalDdlSummary(entry: AppParityCorpusEntry) bool {
         entry.summary.temporal_foreign_keys != null;
 }
 
+fn appParityFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_table_name: []const u8) bool {
+    return switch (entry.family) {
+        .insert_source => appParityPlanHasExactStringToken(entry.plan, ":source_table=", source_table_name),
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => appParityPlanHasExactStringToken(entry.plan, ":source=", source_table_name),
+        .read,
+        .join,
+        .lateral,
+        => appParityPlanHasExactStringToken(entry.plan, ":right=", source_table_name),
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62660,6 +62675,9 @@ fn validateAppParityFixtureMetadata(
         if (source_table_name.len == 0) return error.TestUnexpectedResult;
         if (entry.summary.table_name) |target_table_name| {
             if (std.mem.eql(u8, source_table_name, target_table_name)) return error.TestUnexpectedResult;
+        }
+        if (!appParityFixturePlanMatchesSourceTable(entry, source_table_name)) {
+            return error.TestUnexpectedResult;
         }
     }
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
@@ -63109,7 +63127,29 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "INSERT INTO usage_records (id) SELECT id FROM usage_records",
         .family = .insert_source,
         .summary = .{ .table_name = "usage_records" },
-        .plan = "insert_source:target=usage_records:source=usage_records:assignments=1:source_pred=0:returning=0:returning_expr=0:returning_all=0",
+        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=1:conflict=0:returning=0:returning_expr=0:returning_all=0",
+        .source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "source schema stale insert source plan",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM archived_records",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "insert_source:table=usage_records:source_table=stale_records:source_pred=0:source_order=0:source_limit=-1:assignments=1:conflict=0:returning=0:returning_expr=0:returning_all=0",
+        .source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "source schema stale join plan",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records", .join_on = 1 },
+        .plan = "join:left=usage_records:right=stale_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
         .source_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ,
@@ -63295,6 +63335,17 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{
+        .name = "valid source schema insert plan",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM archived_records",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=1:conflict=0:returning=0:returning_expr=0:returning_all=0",
+        .source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
         .name = "valid applied plan",
         .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
         .family = .ddl,
@@ -63372,6 +63423,22 @@ fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected:
         const value_end = value_start + expected_text.len;
         if (value_end <= plan.len and
             std.mem.eql(u8, plan[value_start..value_end], expected_text) and
+            (value_end == plan.len or plan[value_end] == ':'))
+        {
+            return true;
+        }
+        start = index + token.len;
+    }
+    return false;
+}
+
+fn appParityPlanHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const value_start = index + token.len;
+        const value_end = value_start + expected.len;
+        if (value_end <= plan.len and
+            std.mem.eql(u8, plan[value_start..value_end], expected) and
             (value_end == plan.len or plan[value_end] == ':'))
         {
             return true;
