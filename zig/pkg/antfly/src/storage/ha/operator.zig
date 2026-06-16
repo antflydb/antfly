@@ -118,9 +118,15 @@ pub const ActionPhase = enum {
     rejoin,
 };
 
+pub const ActionExecutor = enum {
+    admin_command,
+    controller_action,
+};
+
 pub const Action = struct {
     kind: ActionKind,
     phase: ActionPhase = .reconcile,
+    executor: ActionExecutor = .admin_command,
     depends_on: ?ActionKind = null,
     standby_name: ?[]const u8 = null,
     slot_name: ?[]const u8 = null,
@@ -400,6 +406,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         try actions.append(alloc, .{
             .kind = .update_primary_endpoint,
             .phase = .route,
+            .executor = .controller_action,
             .depends_on = .promote_standby,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
@@ -1190,6 +1197,10 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(ActionPhase.promote, safe.actions[1].phase);
     try std.testing.expectEqual(ActionPhase.route, safe.actions[2].phase);
     try std.testing.expectEqual(ActionPhase.rejoin, safe.actions[3].phase);
+    try std.testing.expectEqual(ActionExecutor.admin_command, safe.actions[0].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_command, safe.actions[1].executor);
+    try std.testing.expectEqual(ActionExecutor.controller_action, safe.actions[2].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_command, safe.actions[3].executor);
     try std.testing.expectEqual(@as(?ActionKind, null), safe.actions[0].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .acquire_fence), safe.actions[1].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[2].depends_on);
@@ -1276,6 +1287,8 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"lagging_standby_count\":0");
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"phase\":\"fence\"");
+    try expectContains(rendered, "\"executor\":\"admin_command\"");
+    try expectContains(rendered, "\"executor\":\"controller_action\"");
     try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
     try expectContains(rendered, "\"severity\":\"info\"");
     try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
