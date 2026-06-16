@@ -29,6 +29,21 @@ pub const ResumeHAReplicationSlotPathParams = struct {
     slot_name: []const u8,
 };
 
+/// Parse the JSON request body for beginHABaseBackup.
+pub fn parseBeginHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupStartRequest) {
+    return std.json.parseFromSlice(types.BaseBackupStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for finishHABaseBackup.
+pub fn parseFinishHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupManifestPathRequest) {
+    return std.json.parseFromSlice(types.BaseBackupManifestPathRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for bootstrapHAStandby.
+pub fn parseBootstrapHAStandbyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyBootstrapRequest) {
+    return std.json.parseFromSlice(types.StandbyBootstrapRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for acquireHAFence.
 pub fn parseAcquireHAFenceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
     return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -59,6 +74,9 @@ pub const routes = [_]Route{
     .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/pause", .operation_id = "pauseHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/resume", .operation_id = "resumeHAReplicationSlot" },
+    .{ .method = "POST", .path = "/ha/base-backups", .operation_id = "beginHABaseBackup" },
+    .{ .method = "POST", .path = "/ha/base-backups/finish", .operation_id = "finishHABaseBackup" },
+    .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby" },
     .{ .method = "POST", .path = "/ha/fence", .operation_id = "acquireHAFence" },
     .{ .method = "GET", .path = "/ha/fence/current", .operation_id = "getHACurrentFence" },
     .{ .method = "POST", .path = "/ha/promotion/assess", .operation_id = "assessHAPromotion" },
@@ -84,6 +102,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "dropHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'dropHAReplicationSlot'");
         if (!@hasDecl(Impl, "pauseHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'pauseHAReplicationSlot'");
         if (!@hasDecl(Impl, "resumeHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'resumeHAReplicationSlot'");
+        if (!@hasDecl(Impl, "beginHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'beginHABaseBackup'");
+        if (!@hasDecl(Impl, "finishHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'finishHABaseBackup'");
+        if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
         if (!@hasDecl(Impl, "acquireHAFence")) @compileError("ServerRouter: Impl missing required method 'acquireHAFence'");
         if (!@hasDecl(Impl, "getHACurrentFence")) @compileError("ServerRouter: Impl missing required method 'getHACurrentFence'");
         if (!@hasDecl(Impl, "assessHAPromotion")) @compileError("ServerRouter: Impl missing required method 'assessHAPromotion'");
@@ -110,6 +131,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.delete("/ha/replication-slots/:slot_name", dropHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/pause", pauseHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/resume", resumeHAReplicationSlot);
+            try server.post("/ha/base-backups", beginHABaseBackup);
+            try server.post("/ha/base-backups/finish", finishHABaseBackup);
+            try server.post("/ha/standby/bootstrap", bootstrapHAStandby);
             try server.post("/ha/fence", acquireHAFence);
             try server.get("/ha/fence/current", getHACurrentFence);
             try server.post("/ha/promotion/assess", assessHAPromotion);
@@ -169,6 +193,27 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.resumeHAReplicationSlot(ctx, slot_name);
         }
 
+        /// Begin an HA base backup and reserve its replication slot
+        /// POST /ha/base-backups
+        fn beginHABaseBackup(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.beginHABaseBackup(ctx);
+        }
+
+        /// Finish an HA base backup from a local manifest path
+        /// POST /ha/base-backups/finish
+        fn finishHABaseBackup(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.finishHABaseBackup(ctx);
+        }
+
+        /// Bootstrap this standby from a local base-backup manifest and copied files
+        /// POST /ha/standby/bootstrap
+        fn bootstrapHAStandby(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.bootstrapHAStandby(ctx);
+        }
+
         /// Acquire a durable HA promotion fence
         /// POST /ha/fence
         fn acquireHAFence(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -215,6 +260,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn pauseHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn resumeHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
+//   fn beginHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn finishHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn acquireHAFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHACurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn assessHAPromotion(self: *Impl, ctx: *httpx.Context) !httpx.Response

@@ -25,6 +25,7 @@ const http_common = @import("../../common/http/http_common.zig");
 const ha_admin = @import("admin.zig");
 const admin_cli = @import("admin_cli.zig");
 const admin_exec = @import("admin_exec.zig");
+const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const standby_mod = @import("standby.zig");
@@ -96,6 +97,15 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminCreateReplicationSlot(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups)) {
+                    return try self.handleAdminBeginBaseBackup(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish)) {
+                    return try self.handleAdminFinishBaseBackup(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap)) {
+                    return try self.handleAdminBootstrapStandby(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
                     return try self.handleAdminAcquireFence(req);
@@ -205,6 +215,62 @@ pub const Server = struct {
                     .slot_name = slot_name,
                 },
             } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup request");
+        var parsed = admin_api.openapi.server.parseBeginHABaseBackupBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA base backup request");
+        defer parsed.deinit();
+
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .seed = .{ .begin = .{
+                .slot_name = parsed.value.slot_name,
+                .manifest_id = parsed.value.manifest_id,
+            } } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminFinishBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup finish request");
+        var parsed = admin_api.openapi.server.parseFinishHABaseBackupBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA base backup finish request");
+        defer parsed.deinit();
+
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .seed = .{ .finish = .{
+                .manifest_path = parsed.value.manifest_path,
+            } } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminBootstrapStandby(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA standby bootstrap request");
+        var parsed = admin_api.openapi.server.parseBootstrapHAStandbyBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA standby bootstrap request");
+        defer parsed.deinit();
+
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .seed = .{ .bootstrap = .{
+                .manifest_path = parsed.value.manifest_path,
+                .content_root = parsed.value.content_root,
+            } } },
         };
         defer plan.deinit(self.alloc);
         return try self.handleJsonPlan(plan);
@@ -352,6 +418,9 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
         std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
+        std.mem.eql(u8, path, admin_api.routes.ha_base_backups) or
+        std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
+        std.mem.eql(u8, path, admin_api.routes.ha_standby_bootstrap) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion) or
@@ -473,6 +542,7 @@ const TestPaths = struct {
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
     fence_wal: [:0]u8,
+    backup_root: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
@@ -480,6 +550,7 @@ const TestPaths = struct {
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
         alloc.free(self.fence_wal);
+        alloc.free(self.backup_root);
     }
 };
 
@@ -495,6 +566,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_progress);
     const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
     defer alloc.free(fence_wal);
+    const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -503,6 +576,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
@@ -510,6 +584,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
         .fence_wal = try alloc.dupeZ(u8, fence_wal),
+        .backup_root = try alloc.dupeZ(u8, backup_root),
     };
 }
 
@@ -529,6 +604,23 @@ fn testIdentity() standby_mod.Identity {
         .timeline_id = 1,
         .epoch = 1,
     };
+}
+
+fn seedFiles() [2]backup_manifest.FileEntry {
+    return .{
+        .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+        .{ .path = "sst/0001", .kind = .sstable, .size_bytes = 7, .crc32 = backup_manifest.crc32("sstable") },
+    };
+}
+
+fn writeTestFile(path: []const u8, bytes: []const u8) !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = path,
+        .data = bytes,
+    });
 }
 
 test "storage.ha http admin serves health and command endpoint" {
@@ -767,6 +859,89 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqualStrings("application/json", typed_promote.content_type.?);
     try expectContains(typed_promote.body, "\"promote_current_fence\"");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
+}
+
+test "storage.ha http admin serves typed base backup seed endpoints" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "seed");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    defer server.deinit();
+
+    var typed_begin = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_base_backups,
+        .content_type = "application/json",
+        .body = "{\"slot_name\":\"standby-seed\",\"manifest_id\":\"base-http\"}",
+    });
+    defer typed_begin.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_begin.status);
+    try std.testing.expectEqualStrings("application/json", typed_begin.content_type.?);
+    try expectContains(typed_begin.body, "\"seed_begin\"");
+    try expectContains(typed_begin.body, "\"backup_lsn\":1");
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
+
+    const files = seedFiles();
+    const encoded_manifest = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = identity,
+        .manifest_id = "base-http",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 2,
+        .files = &files,
+    });
+    defer alloc.free(encoded_manifest);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "backup.afha" });
+    defer alloc.free(manifest_path);
+    const manifest_file_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "manifest" });
+    defer alloc.free(manifest_file_path);
+    const sstable_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "sst/0001" });
+    defer alloc.free(sstable_path);
+    try writeTestFile(manifest_path, encoded_manifest);
+    try writeTestFile(manifest_file_path, "manifest");
+    try writeTestFile(sstable_path, "sstable");
+
+    const finish_body = try std.fmt.allocPrint(alloc, "{{\"manifest_path\":\"{s}\"}}", .{manifest_path});
+    defer alloc.free(finish_body);
+    var typed_finish = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_base_backups_finish,
+        .content_type = "application/json",
+        .body = finish_body,
+    });
+    defer typed_finish.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_finish.status);
+    try std.testing.expectEqualStrings("application/json", typed_finish.content_type.?);
+    try expectContains(typed_finish.body, "\"seed_finish\"");
+    try expectContains(typed_finish.body, "\"manifest_id\":\"base-http\"");
+    try expectContains(typed_finish.body, "\"end_record_lsn\":3");
+
+    const bootstrap_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"manifest_path\":\"{s}\",\"content_root\":\"{s}\"}}",
+        .{ manifest_path, paths.backup_root },
+    );
+    defer alloc.free(bootstrap_body);
+    var typed_bootstrap = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_standby_bootstrap,
+        .content_type = "application/json",
+        .body = bootstrap_body,
+    });
+    defer typed_bootstrap.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_bootstrap.status);
+    try std.testing.expectEqualStrings("application/json", typed_bootstrap.content_type.?);
+    try expectContains(typed_bootstrap.body, "\"seed_bootstrap\"");
+    try expectContains(typed_bootstrap.body, "\"manifest_id\":\"base-http\"");
+    try expectContains(typed_bootstrap.body, "\"checkpoint_lsn\":2");
+    try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
 }
 
 test "storage.ha http admin returns route method and command errors" {

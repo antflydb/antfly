@@ -133,6 +133,72 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/base-backups:
+    post:
+      tags: [ha]
+      operationId: beginHABaseBackup
+      summary: Begin an HA base backup and reserve its replication slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BaseBackupStartRequest"
+      responses:
+        "200":
+          description: Base backup start boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/base-backups/finish:
+    post:
+      tags: [ha]
+      operationId: finishHABaseBackup
+      summary: Finish an HA base backup from a local manifest path
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BaseBackupManifestPathRequest"
+      responses:
+        "200":
+          description: Base backup end boundary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/standby/bootstrap:
+    post:
+      tags: [ha]
+      operationId: bootstrapHAStandby
+      summary: Bootstrap this standby from a local base-backup manifest and copied files
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StandbyBootstrapRequest"
+      responses:
+        "200":
+          description: Standby bootstrap result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/fence:
     post:
       tags: [ha]
@@ -276,6 +342,44 @@ components:
           minimum: 0
           nullable: true
           description: Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    BaseBackupStartRequest:
+      type: object
+      required: [slot_name, manifest_id]
+      additionalProperties: false
+      properties:
+        slot_name:
+          type: string
+          description: Stable standby replication slot name to reserve for the base backup.
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9._-]+$"
+        manifest_id:
+          type: string
+          description: Operator-chosen stable id for the base-backup manifest.
+          minLength: 1
+          maxLength: 256
+    BaseBackupManifestPathRequest:
+      type: object
+      required: [manifest_path]
+      additionalProperties: false
+      properties:
+        manifest_path:
+          type: string
+          description: Pod-local path to the HA base-backup manifest.
+          minLength: 1
+    StandbyBootstrapRequest:
+      type: object
+      required: [manifest_path]
+      additionalProperties: false
+      properties:
+        manifest_path:
+          type: string
+          description: Pod-local path to the HA base-backup manifest.
+          minLength: 1
+        content_root:
+          type: string
+          nullable: true
+          description: Optional pod-local directory containing files referenced by the manifest.
     HAIdentity:
       type: object
       required: [cluster_id, shard_id, table_id, timeline_id, epoch]

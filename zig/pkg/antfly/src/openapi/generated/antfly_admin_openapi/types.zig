@@ -10,6 +10,25 @@ pub const ReplicationSlotCreateRequest = struct {
     initial_lsn: ?i64 = null,
 };
 
+pub const BaseBackupStartRequest = struct {
+    /// Stable standby replication slot name to reserve for the base backup.
+    slot_name: []const u8,
+    /// Operator-chosen stable id for the base-backup manifest.
+    manifest_id: []const u8,
+};
+
+pub const BaseBackupManifestPathRequest = struct {
+    /// Pod-local path to the HA base-backup manifest.
+    manifest_path: []const u8,
+};
+
+pub const StandbyBootstrapRequest = struct {
+    /// Pod-local path to the HA base-backup manifest.
+    manifest_path: []const u8,
+    /// Optional pod-local directory containing files referenced by the manifest.
+    content_root: ?[]const u8 = null,
+};
+
 pub const HAIdentity = struct {
     cluster_id: i64,
     shard_id: i64,

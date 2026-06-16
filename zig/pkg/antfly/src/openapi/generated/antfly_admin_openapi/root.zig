@@ -6,6 +6,9 @@ pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
 pub const ReplicationSlotCreateRequest = types.ReplicationSlotCreateRequest;
+pub const BaseBackupStartRequest = types.BaseBackupStartRequest;
+pub const BaseBackupManifestPathRequest = types.BaseBackupManifestPathRequest;
+pub const StandbyBootstrapRequest = types.StandbyBootstrapRequest;
 pub const HAIdentity = types.HAIdentity;
 pub const FenceAcquireRequest = types.FenceAcquireRequest;
 pub const PromotionAssessRequest = types.PromotionAssessRequest;
