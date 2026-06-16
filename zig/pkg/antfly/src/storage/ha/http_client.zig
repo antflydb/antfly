@@ -238,6 +238,37 @@ test "storage.ha http client round trips admin commands" {
     try expectContains(streamed.body, "result=stream_once\n");
     try expectContains(streamed.body, "applied_lsn=1\n");
 
+    var operator_plan = try client.executeCommand("http://ha-admin.test", &.{
+        "operator",
+        "plan",
+        "--standby",
+        "standby-a",
+        "--sync-mode",
+        "remote-apply",
+        "--sync-standby",
+        "standby-a",
+        "--auto-failover",
+        "--fencing-authority",
+        "kubernetes-lease",
+        "--current-primary-id",
+        "primary-a",
+        "--fence-authority",
+        "kubernetes-lease",
+        "--fence-ready",
+        "--fence-holder",
+        "standby-a",
+        "--fence-generation",
+        "4",
+        "--fence-reason",
+        "LeaseAcquired",
+    });
+    defer operator_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("application/json", operator_plan.content_type);
+    try expectContains(operator_plan.body, "\"operator_plan\"");
+    try expectContains(operator_plan.body, "\"automatic_promotion_allowed\":true");
+    try expectContains(operator_plan.body, "\"fencing_precondition\"");
+    try expectContains(operator_plan.body, "\"generation\":4");
+
     var fenced = try client.executeCommand("http://ha-admin.test", &.{
         "--table",
         "fence",
@@ -281,6 +312,55 @@ test "storage.ha http client round trips admin commands" {
     defer promoted.deinit(alloc);
     try expectContains(promoted.body, "result=promote_current_fence\n");
     try expectContains(promoted.body, "promotion.new_identity.timeline_id=2\n");
+
+    var rejoin_plan = try client.executeCommand("http://ha-admin.test", &.{
+        "--table",
+        "operator",
+        "plan",
+        "--former-primary-id",
+        "primary-a",
+        "--former-cluster-id",
+        "100",
+        "--former-shard-id",
+        "10",
+        "--former-table-id",
+        "20",
+        "--former-timeline-id",
+        "1",
+        "--former-epoch",
+        "1",
+        "--former-last-lsn",
+        "1",
+        "--retained-from-lsn",
+        "1",
+        "--receipt-old-primary-id",
+        "primary-a",
+        "--receipt-promoted-node-id",
+        "standby-a",
+        "--receipt-parent-timeline-id",
+        "1",
+        "--receipt-parent-epoch",
+        "1",
+        "--receipt-new-timeline-id",
+        "2",
+        "--receipt-new-epoch",
+        "2",
+        "--receipt-required-lsn",
+        "1",
+        "--receipt-observed-lsn",
+        "1",
+        "--receipt-generation",
+        "1",
+        "--receipt-token",
+        "token",
+        "--receipt-reason",
+        "http-client-test",
+    });
+    defer rejoin_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", rejoin_plan.content_type);
+    try expectContains(rejoin_plan.body, "result=operator_plan\n");
+    try expectContains(rejoin_plan.body, "former_primary.action=rewind\n");
+    try expectContains(rejoin_plan.body, "former_primary.fork_lsn=1\n");
 }
 
 test "storage.ha http client maps admin errors" {
