@@ -139,6 +139,8 @@ pub const Action = struct {
     standby_name: ?[]const u8 = null,
     slot_name: ?[]const u8 = null,
     target_lsn: ?u64 = null,
+    route_from: ?[]const u8 = null,
+    route_to: ?[]const u8 = null,
     reason: []const u8,
 };
 
@@ -389,12 +391,13 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     });
 
     if (automatic_allowed) {
+        const promoted_node_id = automatic_standby orelse unreachable;
         const fence_precondition = automaticFencingPrecondition(observed.fencing) orelse unreachable;
         try actions.append(alloc, .{
             .kind = .acquire_fence,
             .phase = .fence,
             .fencing_precondition = fence_precondition,
-            .standby_name = automatic_standby,
+            .standby_name = promoted_node_id,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
         });
@@ -403,7 +406,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .phase = .promote,
             .depends_on = .acquire_fence,
             .fencing_precondition = fence_precondition,
-            .standby_name = automatic_standby,
+            .standby_name = promoted_node_id,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
         });
@@ -413,7 +416,9 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .executor = .controller_action,
             .depends_on = .promote_standby,
             .fencing_precondition = fence_precondition,
-            .standby_name = automatic_standby,
+            .standby_name = promoted_node_id,
+            .route_from = observed.current_primary_id,
+            .route_to = promoted_node_id,
             .target_lsn = observed.primary.current_lsn,
             .reason = "PromotionPlanned",
         });
@@ -1258,6 +1263,8 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         try std.testing.expectEqualStrings("LeaseAcquired", precondition.reason);
     }
     try std.testing.expectEqualStrings("standby-a", safe.actions[2].standby_name.?);
+    try std.testing.expectEqualStrings("primary-a", safe.actions[2].route_from.?);
+    try std.testing.expectEqualStrings("standby-a", safe.actions[2].route_to.?);
     try std.testing.expectEqualStrings("primary-a", safe.actions[3].standby_name.?);
     try std.testing.expect((try adminCommandForAction(alloc, safe.actions[2], primary.identity, .{})) == null);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
@@ -1316,6 +1323,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
         },
     }, .{
         .primary = primary,
+        .current_primary_id = "primary-a",
         .fencing = .{
             .authority = .kubernetes_lease,
             .ready = true,
@@ -1342,6 +1350,8 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"executor\":\"admin_command\"");
     try expectContains(rendered, "\"executor\":\"controller_action\"");
+    try expectContains(rendered, "\"route_from\":\"primary-a\"");
+    try expectContains(rendered, "\"route_to\":\"standby-a\"");
     try expectContains(rendered, "\"fencing_precondition\"");
     try expectContains(rendered, "\"generation\":11");
     try expectContains(rendered, "\"holder\":\"standby-a\"");
