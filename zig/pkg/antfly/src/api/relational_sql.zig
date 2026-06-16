@@ -62303,6 +62303,40 @@ fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) boo
     };
 }
 
+fn appParityFixtureAllowsPaginationSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .query,
+        .aggregate,
+        .join,
+        .lateral,
+        .window,
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        => true,
+        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
+            appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:") or
+            appParityReadPlanHasPrefix(entry, "read:window:"),
+        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
+            appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:") or
+            appParityReadPlanHasPrefix(entry, "read:window:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
+        else => false,
+    };
+}
+
 fn appParityFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .query,
@@ -62623,6 +62657,11 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if ((entry.summary.order_by != null or entry.summary.limit != null or entry.summary.offset != null) and
+        !appParityFixtureAllowsPaginationSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.row_claim_skip_locked != null and !appParityFixtureAllowsRowClaimSummary(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -62790,6 +62829,30 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "point insert pagination summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .order_by = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "merge pagination summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .offset = 3 },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "relation population source pagination summary",
+        .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed' ORDER BY id LIMIT 5",
+        .family = .relation_population,
+        .summary = .{ .table_name = "usage_archive", .limit = 5 },
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "stale query cte summary",
         .sql = "WITH active_usage AS (SELECT id FROM usage_records WHERE status = 'active') SELECT id FROM active_usage",
         .family = .query,
@@ -62803,6 +62866,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "usage_records", .ctes = 1 },
         .plan = "query:table=usage_records:ctes=1:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid mutation source pagination summary",
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed' ORDER BY id LIMIT 5 OFFSET 2",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .order_by = 1, .limit = 5, .offset = 2, .operations = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=1:source_limit=5:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0:source_offset=2",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

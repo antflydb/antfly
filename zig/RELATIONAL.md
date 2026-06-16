@@ -5242,6 +5242,14 @@ or `EXPLAIN` wrappers around those plans. Aggregate, join, lateral, window, and
 point-write families reject those fields because their runners do not read the
 full query-output contract.
 
+Pagination summaries are scoped to typed stages that actually order or trim a
+row stream. `order_by`, `limit`, and `offset` are valid on row-query, aggregate,
+join, lateral, window, source-query mutation, joined mutation-source, generic
+read, and `EXPLAIN` wrapper plans whose runner structurally asserts those
+fields. Point writes, merge arms, DDL, and relation-population metadata reject
+pagination summaries unless their verifier grows a dedicated typed stream
+assertion path.
+
 Row-claim summaries are tied to lockable query sources. `row_claim_skip_locked`
 is valid only on row-query plans, join/lateral plans that assert the left
 lockable source, mutation-source write plans, joined mutation-source write plans,
