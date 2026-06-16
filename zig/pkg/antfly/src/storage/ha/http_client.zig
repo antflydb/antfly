@@ -54,6 +54,7 @@ pub fn ParsedOutput(comptime T: type) type {
 
 pub const PrimaryStatusOptions = struct {
     max_lag_lsn: ?u64 = null,
+    sync_policy: ?primary_mod.SyncPolicy = null,
 };
 
 pub const Client = struct {
@@ -123,6 +124,9 @@ pub const Client = struct {
         defer self.alloc.free(uri);
         if (options.max_lag_lsn) |max_lag_lsn| {
             uri = try appendQueryU64(self.alloc, uri, "max_lag_lsn", max_lag_lsn);
+        }
+        if (options.sync_policy) |sync_policy| {
+            uri = try appendQuerySyncPolicy(self.alloc, uri, sync_policy);
         }
 
         return try self.executeJson(admin_api.openapi.HAPrimaryStatusResponse, .{
@@ -502,6 +506,27 @@ fn appendQueryU64(alloc: Allocator, old_uri: []u8, key: []const u8, value: u64) 
     const next = try std.fmt.allocPrint(alloc, "{s}{s}{s}={d}", .{ old_uri, separator, key, value });
     alloc.free(old_uri);
     return next;
+}
+
+fn appendQueryString(alloc: Allocator, old_uri: []u8, key: []const u8, value: []const u8) ![]u8 {
+    const separator: []const u8 = if (std.mem.indexOfScalar(u8, old_uri, '?') == null) "?" else "&";
+    const next = try std.fmt.allocPrint(alloc, "{s}{s}{s}={s}", .{ old_uri, separator, key, value });
+    alloc.free(old_uri);
+    return next;
+}
+
+fn appendQuerySyncPolicy(alloc: Allocator, old_uri: []u8, policy: primary_mod.SyncPolicy) ![]u8 {
+    var uri = old_uri;
+    errdefer alloc.free(uri);
+
+    uri = try appendQueryString(alloc, uri, "sync_mode", @tagName(policy.mode));
+    uri = try appendQueryString(alloc, uri, "sync_selection", @tagName(policy.selection));
+    uri = try appendQueryU64(alloc, uri, "sync_required", policy.required);
+    uri = try appendQueryString(alloc, uri, "sync_failure", @tagName(policy.failure_policy));
+    for (policy.standby_names) |name| {
+        uri = try appendQueryString(alloc, uri, "sync_standby", name);
+    }
+    return uri;
 }
 
 fn i64FromU64(value: u64) !i64 {

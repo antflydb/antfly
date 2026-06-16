@@ -15,7 +15,9 @@
 const std = @import("std");
 const antfly = @import("antfly-zig");
 
+const admin_api = antfly.admin;
 const ha = antfly.ha;
+const http_common = antfly.common.http.http_common;
 
 var test_path_counter: u64 = 0;
 
@@ -114,11 +116,7 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
         }
         var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{});
         defer executor.deinit();
-        var client = ha.http_client.Client.init(alloc, executor.executor());
-        var rendered = try client.executeCommand(remote_url, parsed.command_args);
-        defer rendered.deinit(alloc);
-        std.Io.File.stdout().writeStreamingAll(io, rendered.body) catch {};
-        std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+        try runRemoteArgv(alloc, io, remote_url, parsed.command_args, executor.executor());
         return;
     }
 
@@ -177,6 +175,316 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 
     std.Io.File.stdout().writeStreamingAll(io, rendered.body) catch {};
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+}
+
+fn runRemoteArgv(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    remote_url: []const u8,
+    command_args: []const []const u8,
+    executor: http_common.RequestExecutor,
+) !void {
+    var plan = try ha.admin_cli.parse(alloc, command_args);
+    defer plan.deinit(alloc);
+
+    var client = ha.http_client.Client.init(alloc, executor);
+    if (try executeTypedRemote(alloc, io, &client, remote_url, plan)) return;
+
+    var rendered = try client.executeCommand(remote_url, command_args);
+    defer rendered.deinit(alloc);
+    writeRemoteBody(io, rendered.body);
+}
+
+fn executeTypedRemote(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    client: *ha.http_client.Client,
+    remote_url: []const u8,
+    plan: ha.admin_cli.Plan,
+) !bool {
+    if (plan.output != .json) return false;
+
+    switch (plan.command) {
+        .slot => |command| switch (command.action) {
+            .create => {
+                var out = try client.createReplicationSlot(
+                    remote_url,
+                    command.request.slot_name,
+                    command.request.initial_lsn,
+                );
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+            .pause => {
+                var out = try client.pauseReplicationSlot(remote_url, command.request.slot_name);
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+            .@"resume" => {
+                var out = try client.resumeReplicationSlot(remote_url, command.request.slot_name);
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+            .drop => {
+                var out = try client.dropReplicationSlot(remote_url, command.request.slot_name);
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+        },
+        .slot_list => |command| {
+            var out = if (command.retention_policy.max_lag_lsn == 0)
+                try client.listReplicationSlots(remote_url)
+            else
+                try client.getPrimaryStatus(remote_url, .{
+                    .max_lag_lsn = command.retention_policy.max_lag_lsn,
+                });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .seed => |command| switch (command) {
+            .begin => |request| {
+                var out = try client.beginBaseBackup(remote_url, .{
+                    .slot_name = request.slot_name,
+                    .manifest_id = request.manifest_id,
+                });
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+            .finish => |request| {
+                var out = try client.finishBaseBackup(remote_url, .{
+                    .manifest_path = request.manifest_path,
+                });
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+            .bootstrap => |request| {
+                var out = try client.bootstrapStandby(remote_url, .{
+                    .manifest_path = request.manifest_path,
+                    .content_root = request.content_root,
+                });
+                defer out.deinit(alloc);
+                writeRemoteBody(io, out.body);
+                return true;
+            },
+        },
+        .primary_status => |command| {
+            if (command.view != .status) return false;
+            var out = try client.getPrimaryStatus(remote_url, .{
+                .max_lag_lsn = if (command.retention_policy.max_lag_lsn == 0) null else command.retention_policy.max_lag_lsn,
+                .sync_policy = command.sync_policy,
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .standby_status => |command| {
+            if (command.view != .status) return false;
+            var out = try client.getStandbyStatus(remote_url, command.upstream_lsn);
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .commit_check => |command| {
+            var out = try client.checkCommit(remote_url, .{
+                .target_lsn = try i64FromU64(command.target_lsn),
+                .sync_policy = try syncPolicyOpenApi(command.policy),
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .commit_append => |command| {
+            var out = try client.appendCommit(remote_url, .{
+                .payload = command.append.payload,
+                .kind = try recordKindName(command.append.kind),
+                .payload_codec = try payloadCodecName(command.append.payload_codec),
+                .shard_id = if (command.append.shard_id) |raw| try i64FromU64(raw) else null,
+                .table_id = if (command.append.table_id) |raw| try i64FromU64(raw) else null,
+                .commit_timestamp_ns = command.append.commit_timestamp_ns,
+                .sync_policy = try syncPolicyOpenApi(command.policy),
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .read_check => |request| {
+            var out = try client.checkRead(remote_url, .{
+                .consistency = @tagName(request.consistency),
+                .required_lsn = if (request.required_lsn) |raw| try i64FromU64(raw) else null,
+                .required_metadata_lsn = if (request.required_metadata_lsn) |raw| try i64FromU64(raw) else null,
+                .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| try i64FromU64(raw) else null,
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .write_check => |command| {
+            var out = try client.checkWrite(remote_url, .{
+                .role = @tagName(command.role),
+                .expected_identity = if (command.request.expected_identity) |identity| try adminIdentity(identity) else null,
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .owner_job_check => |command| {
+            var out = try client.checkOwnerJob(remote_url, .{
+                .role = @tagName(command.role),
+                .kind = @tagName(command.request.kind),
+                .expected_identity = if (command.request.expected_identity) |identity| try adminIdentity(identity) else null,
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .fence_acquire => |request| {
+            var out = try client.acquireFence(remote_url, try fenceRequestOpenApi(request));
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .fence_current => {
+            var out = try client.currentFence(remote_url);
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .promote_assess => |command| {
+            var out = try client.assessPromotion(remote_url, .{
+                .required_lsn = if (command.check.required_lsn) |raw| try i64FromU64(raw) else null,
+                .fencing_confirmed = command.check.fencing_confirmed,
+                .force = command.check.force,
+                .use_current_fence = command.use_current_fence,
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .promote_current_fence => {
+            var out = try client.promoteWithCurrentFence(remote_url);
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .promote => |command| {
+            var out = try client.promote(remote_url, try fenceRequestOpenApi(command.fence));
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .rejoin_assess => |command| {
+            var out = try client.assessRejoin(remote_url, .{
+                .node_id = command.former.node_id,
+                .identity = try adminIdentity(command.former.identity),
+                .last_lsn = try i64FromU64(command.former.last_lsn),
+                .retained_from_lsn = try i64FromU64(command.policy.retained_from_lsn),
+                .allow_rewind_after_forced_promotion = command.policy.allow_rewind_after_forced_promotion,
+                .receipt = if (command.receipt) |receipt| try fenceReceiptOpenApi(receipt) else null,
+            });
+            defer out.deinit(alloc);
+            writeRemoteBody(io, out.body);
+            return true;
+        },
+        .identify_system,
+        .start_replication,
+        .stream_once,
+        .standby_status_update,
+        .operator_plan,
+        => return false,
+    }
+}
+
+fn writeRemoteBody(io: std.Io, body: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(io, body) catch {};
+    std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+}
+
+fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPolicy {
+    return .{
+        .mode = @tagName(policy.mode),
+        .selection = @tagName(policy.selection),
+        .required = try i64FromU64(policy.required),
+        .standby_names = policy.standby_names,
+        .failure_policy = @tagName(policy.failure_policy),
+    };
+}
+
+fn adminIdentity(identity: ha.standby.Identity) !admin_api.openapi.HAIdentity {
+    return .{
+        .cluster_id = try i64FromU64(identity.cluster_id),
+        .shard_id = try i64FromU64(identity.shard_id),
+        .table_id = try i64FromU64(identity.table_id),
+        .timeline_id = try i64FromU64(identity.timeline_id),
+        .epoch = try i64FromU64(identity.epoch),
+    };
+}
+
+fn fenceRequestOpenApi(request: ha.fencing.FenceRequest) !admin_api.openapi.FenceAcquireRequest {
+    return .{
+        .identity = try adminIdentity(request.identity),
+        .old_primary_id = request.old_primary_id,
+        .promoted_node_id = request.promoted_node_id,
+        .new_timeline_id = try i64FromU64(request.new_timeline_id),
+        .new_epoch = try i64FromU64(request.new_epoch),
+        .required_lsn = try i64FromU64(request.required_lsn),
+        .observed_lsn = try i64FromU64(request.observed_lsn),
+        .force = request.force,
+        .reason = request.reason,
+    };
+}
+
+fn fenceReceiptOpenApi(receipt: ha.fencing.Receipt) !admin_api.openapi.HAFenceReceipt {
+    return .{
+        .identity = try adminIdentity(receipt.identity),
+        .old_primary_id = receipt.old_primary_id,
+        .promoted_node_id = receipt.promoted_node_id,
+        .parent_timeline_id = try i64FromU64(receipt.parent_timeline_id),
+        .parent_epoch = try i64FromU64(receipt.parent_epoch),
+        .new_timeline_id = try i64FromU64(receipt.new_timeline_id),
+        .new_epoch = try i64FromU64(receipt.new_epoch),
+        .required_lsn = try i64FromU64(receipt.required_lsn),
+        .observed_lsn = try i64FromU64(receipt.observed_lsn),
+        .generation = try i64FromU64(receipt.generation),
+        .forced = receipt.forced,
+        .token = receipt.token,
+        .reason = receipt.reason,
+    };
+}
+
+fn recordKindName(kind: ha.replication_record.RecordKind) ![]const u8 {
+    return switch (kind) {
+        .batch_mutation => "batch_mutation",
+        .metadata_mutation => "metadata_mutation",
+        .derived_effect => "derived_effect",
+        .backup_start => "backup_start",
+        .backup_end => "backup_end",
+        .checkpoint => "checkpoint",
+        .manifest => "manifest",
+        .truncate => "truncate",
+        .timeline_switch => "timeline_switch",
+        _ => error.InvalidHaCommand,
+    };
+}
+
+fn payloadCodecName(codec: ha.replication_record.PayloadCodec) ![]const u8 {
+    return switch (codec) {
+        .raw => "raw",
+        .json => "json",
+        .binary => "binary",
+        _ => error.InvalidHaCommand,
+    };
+}
+
+fn i64FromU64(raw: u64) !i64 {
+    if (raw > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidHaCommand;
+    return @intCast(raw);
 }
 
 fn zPath(alloc: std.mem.Allocator, path: []const u8) ![:0]u8 {
@@ -322,6 +630,44 @@ test "ha cmd parses remote admin URL before command" {
     try std.testing.expectEqualStrings("--table", parsed.command_args[0]);
     try std.testing.expectEqualStrings("status", parsed.command_args[1]);
     try std.testing.expectEqualStrings("primary", parsed.command_args[2]);
+}
+
+test "ha cmd remote JSON commands prefer typed admin routes" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "remote-typed");
+    defer paths.deinit(alloc);
+
+    var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+
+    var server = ha.http_admin.Server.init(alloc, .{ .primary = &primary });
+    defer server.deinit();
+    var recorder = RecordingExecutor.init(alloc, server.executor());
+    defer recorder.deinit();
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "slot",
+        "create",
+        "standby-json",
+        "--initial-lsn",
+        "0",
+    }, recorder.executor());
+
+    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
+    try expectContains(recorder.last_uri.?, admin_api.routes.ha_replication_slots);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "--table",
+        "slot",
+        "create",
+        "standby-table",
+        "--initial-lsn",
+        "0",
+    }, recorder.executor());
+
+    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
+    try expectContains(recorder.last_uri.?, ha.http_admin.Routes.command);
 }
 
 test "ha cmd keeps promotion identity flags in admin command" {
@@ -470,4 +816,47 @@ fn testIdentity() ha.standby.Identity {
         .timeline_id = 1,
         .epoch = 2,
     };
+}
+
+const RecordingExecutor = struct {
+    alloc: std.mem.Allocator,
+    inner: http_common.RequestExecutor,
+    last_method: ?http_common.Method = null,
+    last_uri: ?[]u8 = null,
+
+    fn init(alloc: std.mem.Allocator, inner: http_common.RequestExecutor) RecordingExecutor {
+        return .{
+            .alloc = alloc,
+            .inner = inner,
+        };
+    }
+
+    fn deinit(self: *RecordingExecutor) void {
+        if (self.last_uri) |uri| self.alloc.free(uri);
+        self.* = undefined;
+    }
+
+    fn executor(self: *RecordingExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *RecordingExecutor = @ptrCast(@alignCast(ptr));
+        if (self.last_uri) |uri| self.alloc.free(uri);
+        self.last_uri = try self.alloc.dupe(u8, req.uri);
+        self.last_method = req.method;
+        return try self.inner.execute(alloc, req);
+    }
+};
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, haystack, needle) == null) {
+        std.debug.print("expected to find '{s}' in '{s}'\n", .{ needle, haystack });
+        return error.TestExpectedSubstring;
+    }
 }
