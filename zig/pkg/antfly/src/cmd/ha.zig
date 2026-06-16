@@ -276,8 +276,10 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} ha --ha-url http://127.0.0.1:8081 -- status primary
         \\  {s} ha --primary-log primary.wal --primary-slots slots.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
         \\  {s} ha --standby-log standby.wal --standby-progress progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
+        \\  {s} ha --primary-log primary.wal --primary-slots slots.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
+        \\  {s} ha --standby-log standby.wal --standby-progress progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- owner-job check --role standby --kind derived-effect-writer
         \\
-    , .{ argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
 }
 
 test "ha cmd parses local handles before admin command" {

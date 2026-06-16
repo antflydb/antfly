@@ -28,6 +28,7 @@ const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const metrics = @import("metrics.zig");
+const owner_job_gate = @import("owner_job_gate.zig");
 const operator = @import("operator.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
@@ -37,6 +38,7 @@ const replication_record = @import("replication_record.zig");
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
+const write_gate = @import("write_gate.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -88,6 +90,8 @@ pub const Result = union(enum) {
     commit_check: commit_gate.GateResult,
     commit_append: commit_gate.AppendResult,
     read_check: read_gate.Decision,
+    write_check: write_gate.Decision,
+    owner_job_check: owner_job_gate.Decision,
     fence_acquire: admin.FenceReceiptResult,
     fence_current: ?admin.FenceReceiptResult,
     promote_assess: status.PromotionAssessment,
@@ -242,6 +246,8 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendOptionalU64Line(alloc, &out, "serve_lsn", decision.serve_lsn);
             try appendU64Line(alloc, &out, "missing_lsn_count", decision.missing_lsn_count);
         },
+        .write_check => |decision| try appendWriteGateLines(alloc, &out, decision),
+        .owner_job_check => |decision| try appendOwnerJobGateLines(alloc, &out, decision),
         .fence_acquire => |fence_result| {
             try appendFenceReceiptLines(alloc, &out, fence_result.receipt);
         },
@@ -352,6 +358,12 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .read_check => |request| .{
             .read_check = try admin.evaluateStandbyRead(try requireStandby(ctx), request),
         },
+        .write_check => |command| .{
+            .write_check = try executeWriteCheck(ctx, command),
+        },
+        .owner_job_check => |command| .{
+            .owner_job_check = try executeOwnerJobCheck(ctx, command),
+        },
         .fence_acquire => |request| .{
             .fence_acquire = try admin.acquirePromotionFence(alloc, try requireFenceStore(ctx), request),
         },
@@ -391,6 +403,20 @@ fn executeOperatorPlan(
         .promotion_receipt = command.promotion_receipt,
         .rejoin_policy = command.rejoin_policy,
     });
+}
+
+fn executeWriteCheck(ctx: Context, command: admin_cli.WriteCheckCommand) !write_gate.Decision {
+    return switch (command.role) {
+        .primary => try admin.evaluatePrimaryWrite(try requirePrimary(ctx), command.request),
+        .standby => try admin.evaluateStandbyWrite(try requireStandby(ctx), command.request),
+    };
+}
+
+fn executeOwnerJobCheck(ctx: Context, command: admin_cli.OwnerJobCheckCommand) !owner_job_gate.Decision {
+    return switch (command.role) {
+        .primary => try admin.evaluatePrimaryOwnerJob(try requirePrimary(ctx), command.request),
+        .standby => try admin.evaluateStandbyOwnerJob(try requireStandby(ctx), command.request),
+    };
 }
 
 fn executePromoteAssess(
@@ -605,6 +631,8 @@ fn resultName(result: Result) []const u8 {
         .commit_check => "commit_check",
         .commit_append => "commit_append",
         .read_check => "read_check",
+        .write_check => "write_check",
+        .owner_job_check => "owner_job_check",
         .fence_acquire => "fence_acquire",
         .fence_current => "fence_current",
         .promote_assess => "promote_assess",
@@ -821,6 +849,43 @@ fn appendCommitGateLines(
     try appendUsizeLine(alloc, out, "durability.satisfied_count", gate.decision.satisfied_count);
     try appendUsizeLine(alloc, out, "durability.required_count", gate.decision.required_count);
     try appendUsizeLine(alloc, out, "durability.candidate_count", gate.decision.candidate_count);
+}
+
+fn appendWriteGateLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    decision: write_gate.Decision,
+) !void {
+    try appendLine(alloc, out, "role", @tagName(decision.role));
+    try appendLine(alloc, out, "action", @tagName(decision.action));
+    try appendBoolLine(alloc, out, "can_write", decision.canWrite());
+    try appendIdentityLines(alloc, out, "identity", decision.identity);
+    try appendU64Line(alloc, out, "durable_lsn", decision.durable_lsn);
+    try appendU64Line(alloc, out, "next_lsn", decision.next_lsn);
+    if (decision.promotion_handoff) |handoff| {
+        try appendIdentityLines(alloc, out, "handoff.identity", handoff.identity);
+        try appendU64Line(alloc, out, "handoff.switch_lsn", handoff.switch_lsn);
+        try appendU64Line(alloc, out, "handoff.next_lsn", handoff.next_lsn);
+    }
+}
+
+fn appendOwnerJobGateLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    decision: owner_job_gate.Decision,
+) !void {
+    try appendLine(alloc, out, "kind", @tagName(decision.kind));
+    try appendLine(alloc, out, "role", @tagName(decision.role));
+    try appendLine(alloc, out, "action", @tagName(decision.action));
+    try appendBoolLine(alloc, out, "can_run", decision.canRun());
+    try appendIdentityLines(alloc, out, "identity", decision.identity);
+    try appendU64Line(alloc, out, "durable_lsn", decision.durable_lsn);
+    try appendU64Line(alloc, out, "next_lsn", decision.next_lsn);
+    if (decision.promotion_handoff) |handoff| {
+        try appendIdentityLines(alloc, out, "handoff.identity", handoff.identity);
+        try appendU64Line(alloc, out, "handoff.switch_lsn", handoff.switch_lsn);
+        try appendU64Line(alloc, out, "handoff.next_lsn", handoff.next_lsn);
+    }
 }
 
 fn appendPromotionAssessmentLines(
@@ -1503,6 +1568,37 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var read = try execute(alloc, .{ .standby = &standby }, read_plan);
     defer read.deinit(alloc);
     try std.testing.expectEqual(read_gate.Action.serve_standby, read.read_check.action);
+
+    var primary_write_plan = try admin_cli.parse(alloc, &.{ "--table", "write", "check", "--role", "primary" });
+    defer primary_write_plan.deinit(alloc);
+    var primary_write = try execute(alloc, .{ .primary = &primary }, primary_write_plan);
+    defer primary_write.deinit(alloc);
+    try std.testing.expect(primary_write.write_check.canWrite());
+    try std.testing.expectEqual(write_gate.Action.allow_write, primary_write.write_check.action);
+    const primary_write_table = try renderTableAlloc(alloc, primary_write);
+    defer alloc.free(primary_write_table);
+    try expectContains(primary_write_table, "result=write_check\n");
+    try expectContains(primary_write_table, "action=allow_write\n");
+    try expectContains(primary_write_table, "can_write=true\n");
+
+    var standby_write_plan = try admin_cli.parse(alloc, &.{ "write", "check", "--role", "standby" });
+    defer standby_write_plan.deinit(alloc);
+    var standby_write = try execute(alloc, .{ .standby = &standby }, standby_write_plan);
+    defer standby_write.deinit(alloc);
+    try std.testing.expect(!standby_write.write_check.canWrite());
+    try std.testing.expectEqual(write_gate.Action.reject_read_only_standby, standby_write.write_check.action);
+
+    var owner_job_plan = try admin_cli.parse(alloc, &.{ "--table", "owner-job", "check", "--role", "standby", "--kind", "retention-advance" });
+    defer owner_job_plan.deinit(alloc);
+    var owner_job = try execute(alloc, .{ .standby = &standby }, owner_job_plan);
+    defer owner_job.deinit(alloc);
+    try std.testing.expect(!owner_job.owner_job_check.canRun());
+    try std.testing.expectEqual(owner_job_gate.Action.disable_on_standby, owner_job.owner_job_check.action);
+    const owner_job_table = try renderTableAlloc(alloc, owner_job);
+    defer alloc.free(owner_job_table);
+    try expectContains(owner_job_table, "result=owner_job_check\n");
+    try expectContains(owner_job_table, "kind=retention_advance\n");
+    try expectContains(owner_job_table, "action=disable_on_standby\n");
 
     var fence_plan = try admin_cli.parse(alloc, &.{
         "--table",

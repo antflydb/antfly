@@ -23,6 +23,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const admin = @import("admin.zig");
 const fencing = @import("fencing.zig");
+const owner_job_gate = @import("owner_job_gate.zig");
 const operator = @import("operator.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
@@ -32,6 +33,7 @@ const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
+const write_gate = @import("write_gate.zig");
 
 pub const OutputFormat = enum {
     json,
@@ -93,6 +95,21 @@ pub const CommitAppendCommand = struct {
     policy: primary_mod.SyncPolicy,
 };
 
+pub const GateRole = enum {
+    primary,
+    standby,
+};
+
+pub const WriteCheckCommand = struct {
+    role: GateRole,
+    request: write_gate.Request = .{},
+};
+
+pub const OwnerJobCheckCommand = struct {
+    role: GateRole,
+    request: owner_job_gate.Request,
+};
+
 pub const RejoinAssessCommand = struct {
     former: rejoin.FormerPrimaryState,
     receipt: ?fencing.Receipt = null,
@@ -126,6 +143,8 @@ pub const Command = union(enum) {
     commit_check: CommitCheckCommand,
     commit_append: CommitAppendCommand,
     read_check: read_gate.Request,
+    write_check: WriteCheckCommand,
+    owner_job_check: OwnerJobCheckCommand,
     fence_acquire: fencing.FenceRequest,
     fence_current,
     promote_assess: PromoteAssessCommand,
@@ -231,6 +250,16 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     }
     if (std.mem.eql(u8, root, "read")) {
         plan.command = .{ .read_check = try parseReadCheck(&cursor) };
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "write")) {
+        plan.command = .{ .write_check = try parseWriteCheck(&cursor) };
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "owner-job")) {
+        plan.command = .{ .owner_job_check = try parseOwnerJobCheck(&cursor) };
         try cursor.expectEnd();
         return plan;
     }
@@ -605,6 +634,49 @@ fn parseReadCheck(cursor: *Cursor) !read_gate.Request {
         }
     }
     return request;
+}
+
+fn parseWriteCheck(cursor: *Cursor) !WriteCheckCommand {
+    const subcommand = cursor.next() orelse return error.WriteSubcommandMissing;
+    if (!std.mem.eql(u8, subcommand, "check")) return error.UnknownWriteSubcommand;
+
+    var role: ?GateRole = null;
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--role")) {
+            _ = cursor.next();
+            role = try parseGateRole(try cursor.value("--role"));
+        } else {
+            break;
+        }
+    }
+
+    return .{
+        .role = role orelse return error.RoleMissing,
+    };
+}
+
+fn parseOwnerJobCheck(cursor: *Cursor) !OwnerJobCheckCommand {
+    const subcommand = cursor.next() orelse return error.OwnerJobSubcommandMissing;
+    if (!std.mem.eql(u8, subcommand, "check")) return error.UnknownOwnerJobSubcommand;
+
+    var role: ?GateRole = null;
+    var kind: ?owner_job_gate.JobKind = null;
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--role")) {
+            _ = cursor.next();
+            role = try parseGateRole(try cursor.value("--role"));
+        } else if (std.mem.eql(u8, arg, "--kind")) {
+            _ = cursor.next();
+            kind = try parseOwnerJobKind(try cursor.value("--kind"));
+        } else {
+            break;
+        }
+    }
+
+    return .{
+        .role = role orelse return error.RoleMissing,
+        .request = .{ .kind = kind orelse return error.OwnerJobKindMissing },
+    };
 }
 
 fn parseFence(cursor: *Cursor) !Command {
@@ -1259,6 +1331,20 @@ fn parseConsistency(raw: []const u8) !read_gate.Consistency {
     return error.InvalidReadConsistency;
 }
 
+fn parseGateRole(raw: []const u8) !GateRole {
+    if (std.mem.eql(u8, raw, "primary")) return .primary;
+    if (std.mem.eql(u8, raw, "standby")) return .standby;
+    return error.InvalidGateRole;
+}
+
+fn parseOwnerJobKind(raw: []const u8) !owner_job_gate.JobKind {
+    if (std.mem.eql(u8, raw, "compaction_publish") or std.mem.eql(u8, raw, "compaction-publish")) return .compaction_publish;
+    if (std.mem.eql(u8, raw, "derived_effect_writer") or std.mem.eql(u8, raw, "derived-effect-writer")) return .derived_effect_writer;
+    if (std.mem.eql(u8, raw, "enrichment_writer") or std.mem.eql(u8, raw, "enrichment-writer")) return .enrichment_writer;
+    if (std.mem.eql(u8, raw, "retention_advance") or std.mem.eql(u8, raw, "retention-advance")) return .retention_advance;
+    return error.InvalidOwnerJobKind;
+}
+
 fn parseRecordKind(raw: []const u8) !replication_record.RecordKind {
     if (std.mem.eql(u8, raw, "batch_mutation") or std.mem.eql(u8, raw, "batch-mutation")) return .batch_mutation;
     if (std.mem.eql(u8, raw, "metadata_mutation") or std.mem.eql(u8, raw, "metadata-mutation")) return .metadata_mutation;
@@ -1513,6 +1599,15 @@ test "storage.ha admin cli parses stream ack commit and read checks" {
     defer read.deinit(alloc);
     try std.testing.expectEqual(read_gate.Consistency.at_least_lsn, read.command.read_check.consistency);
     try std.testing.expectEqual(@as(?u64, 9), read.command.read_check.required_lsn);
+
+    var write = try parse(alloc, &.{ "write", "check", "--role", "standby" });
+    defer write.deinit(alloc);
+    try std.testing.expectEqual(GateRole.standby, write.command.write_check.role);
+
+    var owner_job = try parse(alloc, &.{ "owner-job", "check", "--role", "primary", "--kind", "derived-effect-writer" });
+    defer owner_job.deinit(alloc);
+    try std.testing.expectEqual(GateRole.primary, owner_job.command.owner_job_check.role);
+    try std.testing.expectEqual(owner_job_gate.JobKind.derived_effect_writer, owner_job.command.owner_job_check.request.kind);
 }
 
 test "storage.ha admin cli parses fenced promotion request" {
