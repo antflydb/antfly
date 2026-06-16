@@ -62265,6 +62265,18 @@ fn appParityFixtureFamilyAllowsReturningRows(family: AppParityCorpusPlanFamily) 
     };
 }
 
+fn appParitySqlHasNumberedParameter(sql: []const u8) bool {
+    var index: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
+        const digit_index = dollar + 1;
+        if (digit_index < sql.len and sql[digit_index] >= '0' and sql[digit_index] <= '9') {
+            return true;
+        }
+        index = dollar + 1;
+    }
+    return false;
+}
+
 fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
     if (entry.family != .ddl) return false;
     return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -62405,6 +62417,9 @@ fn validateAppParityFixtureMetadata(
         return error.TestUnexpectedResult;
     }
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.params.len > 0 and !appParitySqlHasNumberedParameter(entry.sql)) {
         return error.TestUnexpectedResult;
     }
     if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
@@ -62549,6 +62564,15 @@ test "app parity fixture metadata requires typed summary anchors" {
         .resolver_exists = false,
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "params without placeholder",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{.{ .string = "u1" }},
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid unsupported reason",
         .sql = "TRUNCATE usage_records CASCADE",
@@ -62591,6 +62615,15 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
         .returning_rows = &.{"{\"id\":\"u1\"}"},
         .resolver_exists = false,
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid params with placeholder",
+        .sql = "SELECT id FROM usage_records WHERE id = $1",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{.{ .string = "u1" }},
     }, &seen, alloc);
 }
 
