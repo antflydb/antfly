@@ -80,6 +80,21 @@ const (
 	// TypeInferenceReady indicates whether inference is ready when managed in swarm mode.
 	TypeInferenceReady = "InferenceReady"
 
+	// TypeHAAvailable indicates whether hot-standby HA has an available standby.
+	TypeHAAvailable = "HAAvailable"
+
+	// TypeHADegraded indicates whether the configured HA durability policy is degraded.
+	TypeHADegraded = "HADegraded"
+
+	// TypeHARetentionPressure indicates whether HA slots are forcing WAL retention beyond policy.
+	TypeHARetentionPressure = "HARetentionPressure"
+
+	// TypeHAReseedRequired indicates whether one or more HA standbys require reseeding.
+	TypeHAReseedRequired = "HAReseedRequired"
+
+	// TypeHAAutomaticFailoverReady indicates whether fenced automatic promotion is allowed.
+	TypeHAAutomaticFailoverReady = "HAAutomaticFailoverReady"
+
 	// TypeAvailable indicates whether the cluster is serving.
 	TypeAvailable = "Available"
 
@@ -179,6 +194,21 @@ const (
 	// ReasonAvailable indicates the cluster is available.
 	ReasonAvailable = "Available"
 
+	// ReasonHADisabled indicates hot-standby HA is disabled.
+	ReasonHADisabled = "HADisabled"
+
+	// ReasonHAStandbyAvailable indicates at least one standby is caught up enough to serve.
+	ReasonHAStandbyAvailable = "HAStandbyAvailable"
+
+	// ReasonHANoHealthyStandby indicates no desired standby is currently healthy.
+	ReasonHANoHealthyStandby = "HANoHealthyStandby"
+
+	// ReasonHASyncPolicyUnsatisfied indicates synchronous HA durability is not satisfied.
+	ReasonHASyncPolicyUnsatisfied = "HASyncPolicyUnsatisfied"
+
+	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
+	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 
@@ -223,6 +253,11 @@ type AntflyClusterSpec struct {
 	// pools, or referenced as platform-managed shared pools.
 	// +optional
 	Inference *AntflyInferenceSpec `json:"inference,omitempty"`
+
+	// HighAvailability configures Postgres-style hot-standby HA for the Zig runtime.
+	// This mode is separate from Raft-backed distributed write ownership.
+	// +optional
+	HighAvailability *HighAvailabilitySpec `json:"highAvailability,omitempty"`
 
 	// ProductTier records the CloudAF/product tier intent that was expanded
 	// into the explicit operator fields below. The operator does not resolve
@@ -392,6 +427,160 @@ type InferencePoolReference struct {
 	// higher-level platform wiring may resolve the URL from the referenced pool.
 	// +optional
 	APIURL string `json:"apiURL,omitempty"`
+}
+
+// HAMode selects the HA strategy managed by the operator.
+type HAMode string
+
+const (
+	// HAModeDisabled disables hot-standby HA management.
+	HAModeDisabled HAMode = "Disabled"
+
+	// HAModeHotStandby enables single-primary hot standby WAL replication.
+	HAModeHotStandby HAMode = "HotStandby"
+)
+
+// HADurabilityMode selects when a primary write may be acknowledged.
+type HADurabilityMode string
+
+const (
+	HADurabilityModeAsync       HADurabilityMode = "Async"
+	HADurabilityModeRemoteWrite HADurabilityMode = "RemoteWrite"
+	HADurabilityModeRemoteApply HADurabilityMode = "RemoteApply"
+)
+
+// HAStandbySelection selects which named standbys satisfy synchronous commit.
+type HAStandbySelection string
+
+const (
+	HAStandbySelectionAny   HAStandbySelection = "Any"
+	HAStandbySelectionFirst HAStandbySelection = "First"
+	HAStandbySelectionAll   HAStandbySelection = "All"
+)
+
+// HAFailurePolicy selects what happens when synchronous durability cannot be met.
+type HAFailurePolicy string
+
+const (
+	HAFailurePolicyBlock          HAFailurePolicy = "Block"
+	HAFailurePolicyFailClosed     HAFailurePolicy = "FailClosed"
+	HAFailurePolicyDegradeToAsync HAFailurePolicy = "DegradeToAsync"
+)
+
+// HAFencingAuthority selects the authority used before automatic promotion.
+type HAFencingAuthority string
+
+const (
+	HAFencingAuthorityNone            HAFencingAuthority = "None"
+	HAFencingAuthorityKubernetesLease HAFencingAuthority = "KubernetesLease"
+	HAFencingAuthorityStorageFence    HAFencingAuthority = "StorageFence"
+	HAFencingAuthorityMetadataRaft    HAFencingAuthority = "MetadataRaft"
+	HAFencingAuthorityExternal        HAFencingAuthority = "External"
+)
+
+// HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
+type HighAvailabilitySpec struct {
+	// Mode selects whether hot standby is managed.
+	// +kubebuilder:validation:Enum=Disabled;HotStandby
+	// +kubebuilder:default=Disabled
+	// +optional
+	Mode HAMode `json:"mode,omitempty"`
+
+	// Standbys declares desired standby replicas and replication slots.
+	// +optional
+	Standbys []HAStandbySpec `json:"standbys,omitempty"`
+
+	// SyncPolicy configures async, remote-write, or remote-apply durability.
+	// +optional
+	SyncPolicy *HASyncPolicy `json:"syncPolicy,omitempty"`
+
+	// Retention caps WAL retention pressure from replication slots.
+	// +optional
+	Retention *HARetentionPolicy `json:"retention,omitempty"`
+
+	// AutomaticFailover configures fenced automatic promotion.
+	// +optional
+	AutomaticFailover *HAAutomaticFailoverPolicy `json:"automaticFailover,omitempty"`
+}
+
+// HAStandbySpec declares one desired hot standby.
+type HAStandbySpec struct {
+	// Name is the logical standby and default replication slot name.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// SlotName overrides the replication slot name. Defaults to name.
+	// +optional
+	SlotName string `json:"slotName,omitempty"`
+
+	// Desired controls whether the operator should keep this standby attached.
+	// +kubebuilder:default=true
+	// +optional
+	Desired *bool `json:"desired,omitempty"`
+
+	// InitialLSN optionally pins slot creation to an existing primary LSN.
+	// +optional
+	InitialLSN *uint64 `json:"initialLSN,omitempty"`
+}
+
+// HASyncPolicy configures synchronous standby durability.
+type HASyncPolicy struct {
+	// Mode selects async, remote-write, or remote-apply acknowledgement.
+	// +kubebuilder:validation:Enum=Async;RemoteWrite;RemoteApply
+	// +kubebuilder:default=Async
+	// +optional
+	Mode HADurabilityMode `json:"mode,omitempty"`
+
+	// Selection chooses how named standbys satisfy the policy.
+	// +kubebuilder:validation:Enum=Any;First;All
+	// +kubebuilder:default=Any
+	// +optional
+	Selection HAStandbySelection `json:"selection,omitempty"`
+
+	// Required is the number of standbys needed for Any/First policies.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Required int32 `json:"required,omitempty"`
+
+	// StandbyNames are the synchronous standby names in priority order.
+	// +optional
+	StandbyNames []string `json:"standbyNames,omitempty"`
+
+	// FailurePolicy controls writes when synchronous durability is unavailable.
+	// +kubebuilder:validation:Enum=Block;FailClosed;DegradeToAsync
+	// +kubebuilder:default=Block
+	// +optional
+	FailurePolicy HAFailurePolicy `json:"failurePolicy,omitempty"`
+}
+
+// HARetentionPolicy caps WAL retained for HA slots.
+type HARetentionPolicy struct {
+	// MaxLagLSN marks standbys for reseed after this many retained LSNs.
+	// Zero disables the cap.
+	// +optional
+	MaxLagLSN uint64 `json:"maxLagLSN,omitempty"`
+}
+
+// HAAutomaticFailoverPolicy configures automatic standby promotion.
+type HAAutomaticFailoverPolicy struct {
+	// Enabled allows the operator to promote a standby automatically.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// FencingAuthority must be set to a concrete authority before automatic promotion.
+	// +kubebuilder:validation:Enum=None;KubernetesLease;StorageFence;MetadataRaft;External
+	// +kubebuilder:default=None
+	// +optional
+	FencingAuthority HAFencingAuthority `json:"fencingAuthority,omitempty"`
+
+	// RequireRemoteApply requires an applied standby before automatic promotion.
+	// +kubebuilder:default=true
+	// +optional
+	RequireRemoteApply *bool `json:"requireRemoteApply,omitempty"`
+
+	// MaximumLagLSN is the tolerated standby lag for automatic promotion.
+	// +optional
+	MaximumLagLSN uint64 `json:"maximumLagLSN,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
@@ -900,6 +1089,10 @@ type AntflyClusterStatus struct {
 	// +optional
 	StorageAutoGrowStatus *StorageAutoGrowStatus `json:"storageAutoGrowStatus,omitempty"`
 
+	// HAStatus reports hot-standby replication and failover state.
+	// +optional
+	HAStatus *HAStatus `json:"haStatus,omitempty"`
+
 	// ProductTierStatus reports the concrete shape observed for spec.productTier.
 	// +optional
 	ProductTierStatus *ProductTierStatus `json:"productTierStatus,omitempty"`
@@ -1014,6 +1207,104 @@ type StorageAutoGrowStatus struct {
 
 	// LastEvaluationTime records when auto-grow was last evaluated.
 	LastEvaluationTime *metav1.Time `json:"lastEvaluationTime,omitempty"`
+}
+
+// HAStatus reports hot-standby replication and failover state.
+type HAStatus struct {
+	// Mode is the observed HA mode.
+	// +optional
+	Mode HAMode `json:"mode,omitempty"`
+
+	// PrimaryLSN is the current primary replication LSN.
+	// +optional
+	PrimaryLSN uint64 `json:"primaryLSN,omitempty"`
+
+	// DesiredStandbyCount is the count requested by spec.highAvailability.
+	// +optional
+	DesiredStandbyCount int32 `json:"desiredStandbyCount,omitempty"`
+
+	// HealthyStandbyCount is the count of desired standbys caught up to apply.
+	// +optional
+	HealthyStandbyCount int32 `json:"healthyStandbyCount,omitempty"`
+
+	// ReseedRequiredCount is the count of desired standbys requiring reseed.
+	// +optional
+	ReseedRequiredCount int32 `json:"reseedRequiredCount,omitempty"`
+
+	// AutomaticPromotionAllowed reports whether the operator planner allows promotion.
+	// +optional
+	AutomaticPromotionAllowed bool `json:"automaticPromotionAllowed,omitempty"`
+
+	// Standbys contains per-standby slot state.
+	// +optional
+	Standbys []HAStandbyStatus `json:"standbys,omitempty"`
+
+	// Retention summarizes primary WAL retention pressure.
+	// +optional
+	Retention HARetentionStatus `json:"retention,omitempty"`
+
+	// LastPromotion records the last completed promotion.
+	// +optional
+	LastPromotion *HAPromotionStatus `json:"lastPromotion,omitempty"`
+}
+
+// HAStandbyStatus reports one hot standby slot.
+type HAStandbyStatus struct {
+	Name string `json:"name,omitempty"`
+
+	SlotName string `json:"slotName,omitempty"`
+
+	Active bool `json:"active,omitempty"`
+
+	ReseedRequired bool `json:"reseedRequired,omitempty"`
+
+	TimelineID uint64 `json:"timelineID,omitempty"`
+
+	RestartLSN uint64 `json:"restartLSN,omitempty"`
+
+	ReceivedLSN uint64 `json:"receivedLSN,omitempty"`
+
+	AppliedLSN uint64 `json:"appliedLSN,omitempty"`
+
+	WriteLagLSN uint64 `json:"writeLagLSN,omitempty"`
+
+	ApplyLagLSN uint64 `json:"applyLagLSN,omitempty"`
+
+	Status string `json:"status,omitempty"`
+
+	LastError string `json:"lastError,omitempty"`
+}
+
+// HARetentionStatus reports HA WAL retention pressure.
+type HARetentionStatus struct {
+	OldestRestartLSN uint64 `json:"oldestRestartLSN,omitempty"`
+
+	RetainedLSNCount uint64 `json:"retainedLSNCount,omitempty"`
+
+	ActiveSlots int32 `json:"activeSlots,omitempty"`
+
+	ReseedRecommended int32 `json:"reseedRecommended,omitempty"`
+}
+
+// HAPromotionStatus reports a completed HA promotion.
+type HAPromotionStatus struct {
+	OldPrimaryID string `json:"oldPrimaryID,omitempty"`
+
+	PromotedStandbyID string `json:"promotedStandbyID,omitempty"`
+
+	ParentTimelineID uint64 `json:"parentTimelineID,omitempty"`
+
+	NewTimelineID uint64 `json:"newTimelineID,omitempty"`
+
+	SwitchLSN uint64 `json:"switchLSN,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	Forced bool `json:"forced,omitempty"`
+
+	DataLossPossible bool `json:"dataLossPossible,omitempty"`
+
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 }
 
 // ProductTierStatus reports the concrete operator fields produced from a tier.

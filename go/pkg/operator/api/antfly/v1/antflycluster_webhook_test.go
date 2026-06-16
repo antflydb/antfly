@@ -1802,6 +1802,78 @@ func TestValidateUpdate_ModeImmutable(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeRemoteApply,
+			Selection:     HAStandbySelectionAny,
+			Required:      1,
+			StandbyNames:  []string{"standby-a", "standby-b"},
+			FailurePolicy: HAFailurePolicyBlock,
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected valid hot-standby HA config, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRequiresFencingForAutomaticFailover(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityNone,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without fencing to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover.fencingAuthority") {
+		t.Fatalf("expected fencing validation error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-a"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{"standby-missing"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected duplicate and missing sync standby validation errors")
+	}
+	if !strings.Contains(err.Error(), "duplicated") || !strings.Contains(err.Error(), "standby-missing") {
+		t.Fatalf("expected duplicate and undeclared standby errors, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

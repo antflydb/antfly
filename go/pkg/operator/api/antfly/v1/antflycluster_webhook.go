@@ -159,6 +159,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 		allErrors = append(allErrors, err.Error())
 	}
 
+	if err := r.validateHighAvailabilitySpec(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
 	if len(allErrors) > 0 {
 		return fmt.Errorf("AntflyCluster validation failed:\n  - %s",
 			strings.Join(allErrors, "\n  - "))
@@ -1115,6 +1119,100 @@ func resourceSpecHasCPUAndMemory(resources ResourceSpec) bool {
 	hasCPU := resources.CPU != "" || resources.Limits.CPU != ""
 	hasMemory := resources.Memory != "" || resources.Limits.Memory != ""
 	return hasCPU && hasMemory
+}
+
+func (r *AntflyCluster) validateHighAvailabilitySpec() error {
+	ha := r.Spec.HighAvailability
+	if ha == nil || ha.modeOrDefault() == HAModeDisabled {
+		return nil
+	}
+
+	var errors []string
+	names := map[string]struct{}{}
+	for i, standby := range ha.Standbys {
+		name := strings.TrimSpace(standby.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name is required", i))
+			continue
+		}
+		if _, exists := names[name]; exists {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name %q is duplicated", i, name))
+		}
+		names[name] = struct{}{}
+		if strings.TrimSpace(standby.SlotName) == "" && standby.SlotName != "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not be whitespace", i))
+		}
+	}
+
+	if sync := ha.SyncPolicy; sync != nil && sync.modeOrDefault() != HADurabilityModeAsync {
+		if sync.Required < 0 {
+			errors = append(errors, "spec.highAvailability.syncPolicy.required must not be negative")
+		}
+		if sync.requiredOrDefault() == 0 {
+			errors = append(errors, "spec.highAvailability.syncPolicy.required must be at least 1 for synchronous modes")
+		}
+		if len(sync.StandbyNames) == 0 {
+			errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames is required for synchronous modes")
+		}
+		for i, name := range sync.StandbyNames {
+			if strings.TrimSpace(name) == "" {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] is empty", i))
+				continue
+			}
+			if _, ok := names[name]; !ok {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
+			}
+		}
+	}
+
+	if failover := ha.AutomaticFailover; failover != nil && failover.Enabled {
+		if failover.fencingAuthorityOrDefault() == HAFencingAuthorityNone {
+			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must not be None when automatic failover is enabled")
+		}
+		if failover.requireRemoteApplyOrDefault() && ha.SyncPolicy != nil && ha.SyncPolicy.modeOrDefault() == HADurabilityModeRemoteWrite {
+			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply requires syncPolicy.mode RemoteApply or Async")
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("high availability validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func (s *HighAvailabilitySpec) modeOrDefault() HAMode {
+	if s == nil || s.Mode == "" {
+		return HAModeDisabled
+	}
+	return s.Mode
+}
+
+func (p *HASyncPolicy) modeOrDefault() HADurabilityMode {
+	if p == nil || p.Mode == "" {
+		return HADurabilityModeAsync
+	}
+	return p.Mode
+}
+
+func (p *HASyncPolicy) requiredOrDefault() int32 {
+	if p == nil || p.Required == 0 {
+		return 1
+	}
+	return p.Required
+}
+
+func (p *HAAutomaticFailoverPolicy) fencingAuthorityOrDefault() HAFencingAuthority {
+	if p == nil || p.FencingAuthority == "" {
+		return HAFencingAuthorityNone
+	}
+	return p.FencingAuthority
+}
+
+func (p *HAAutomaticFailoverPolicy) requireRemoteApplyOrDefault() bool {
+	if p == nil || p.RequireRemoteApply == nil {
+		return true
+	}
+	return *p.RequireRemoteApply
 }
 
 // validateResourceQuantities validates that resource quantity strings are parseable.

@@ -1515,6 +1515,132 @@ spec:
                     - enabled
                     type: object
                 type: object
+              highAvailability:
+                description: |-
+                  HighAvailability configures Postgres-style hot-standby HA for the Zig runtime.
+                  This mode is separate from Raft-backed distributed write ownership.
+                properties:
+                  automaticFailover:
+                    description: AutomaticFailover configures fenced automatic promotion.
+                    properties:
+                      enabled:
+                        description: Enabled allows the operator to promote a standby
+                          automatically.
+                        type: boolean
+                      fencingAuthority:
+                        default: None
+                        description: FencingAuthority must be set to a concrete authority
+                          before automatic promotion.
+                        enum:
+                        - None
+                        - KubernetesLease
+                        - StorageFence
+                        - MetadataRaft
+                        - External
+                        type: string
+                      maximumLagLSN:
+                        description: MaximumLagLSN is the tolerated standby lag for
+                          automatic promotion.
+                        format: int64
+                        type: integer
+                      requireRemoteApply:
+                        default: true
+                        description: RequireRemoteApply requires an applied standby
+                          before automatic promotion.
+                        type: boolean
+                    type: object
+                  mode:
+                    default: Disabled
+                    description: Mode selects whether hot standby is managed.
+                    enum:
+                    - Disabled
+                    - HotStandby
+                    type: string
+                  retention:
+                    description: Retention caps WAL retention pressure from replication
+                      slots.
+                    properties:
+                      maxLagLSN:
+                        description: |-
+                          MaxLagLSN marks standbys for reseed after this many retained LSNs.
+                          Zero disables the cap.
+                        format: int64
+                        type: integer
+                    type: object
+                  standbys:
+                    description: Standbys declares desired standby replicas and replication
+                      slots.
+                    items:
+                      description: HAStandbySpec declares one desired hot standby.
+                      properties:
+                        desired:
+                          default: true
+                          description: Desired controls whether the operator should
+                            keep this standby attached.
+                          type: boolean
+                        initialLSN:
+                          description: InitialLSN optionally pins slot creation to
+                            an existing primary LSN.
+                          format: int64
+                          type: integer
+                        name:
+                          description: Name is the logical standby and default replication
+                            slot name.
+                          minLength: 1
+                          type: string
+                        slotName:
+                          description: SlotName overrides the replication slot name.
+                            Defaults to name.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  syncPolicy:
+                    description: SyncPolicy configures async, remote-write, or remote-apply
+                      durability.
+                    properties:
+                      failurePolicy:
+                        default: Block
+                        description: FailurePolicy controls writes when synchronous
+                          durability is unavailable.
+                        enum:
+                        - Block
+                        - FailClosed
+                        - DegradeToAsync
+                        type: string
+                      mode:
+                        default: Async
+                        description: Mode selects async, remote-write, or remote-apply
+                          acknowledgement.
+                        enum:
+                        - Async
+                        - RemoteWrite
+                        - RemoteApply
+                        type: string
+                      required:
+                        description: Required is the number of standbys needed for
+                          Any/First policies.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      selection:
+                        default: Any
+                        description: Selection chooses how named standbys satisfy
+                          the policy.
+                        enum:
+                        - Any
+                        - First
+                        - All
+                        type: string
+                      standbyNames:
+                        description: StandbyNames are the synchronous standby names
+                          in priority order.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                type: object
               image:
                 description: Image is the container image to use for Antfly
                 type: string
@@ -6321,6 +6447,116 @@ spec:
                       final replica count.
                     format: int32
                     type: integer
+                type: object
+              haStatus:
+                description: HAStatus reports hot-standby replication and failover
+                  state.
+                properties:
+                  automaticPromotionAllowed:
+                    description: AutomaticPromotionAllowed reports whether the operator
+                      planner allows promotion.
+                    type: boolean
+                  desiredStandbyCount:
+                    description: DesiredStandbyCount is the count requested by spec.highAvailability.
+                    format: int32
+                    type: integer
+                  healthyStandbyCount:
+                    description: HealthyStandbyCount is the count of desired standbys
+                      caught up to apply.
+                    format: int32
+                    type: integer
+                  lastPromotion:
+                    description: LastPromotion records the last completed promotion.
+                    properties:
+                      completionTime:
+                        format: date-time
+                        type: string
+                      dataLossPossible:
+                        type: boolean
+                      fenceGeneration:
+                        format: int64
+                        type: integer
+                      forced:
+                        type: boolean
+                      newTimelineID:
+                        format: int64
+                        type: integer
+                      oldPrimaryID:
+                        type: string
+                      parentTimelineID:
+                        format: int64
+                        type: integer
+                      promotedStandbyID:
+                        type: string
+                      switchLSN:
+                        format: int64
+                        type: integer
+                    type: object
+                  mode:
+                    description: Mode is the observed HA mode.
+                    type: string
+                  primaryLSN:
+                    description: PrimaryLSN is the current primary replication LSN.
+                    format: int64
+                    type: integer
+                  reseedRequiredCount:
+                    description: ReseedRequiredCount is the count of desired standbys
+                      requiring reseed.
+                    format: int32
+                    type: integer
+                  retention:
+                    description: Retention summarizes primary WAL retention pressure.
+                    properties:
+                      activeSlots:
+                        format: int32
+                        type: integer
+                      oldestRestartLSN:
+                        format: int64
+                        type: integer
+                      reseedRecommended:
+                        format: int32
+                        type: integer
+                      retainedLSNCount:
+                        format: int64
+                        type: integer
+                    type: object
+                  standbys:
+                    description: Standbys contains per-standby slot state.
+                    items:
+                      description: HAStandbyStatus reports one hot standby slot.
+                      properties:
+                        active:
+                          type: boolean
+                        appliedLSN:
+                          format: int64
+                          type: integer
+                        applyLagLSN:
+                          format: int64
+                          type: integer
+                        lastError:
+                          type: string
+                        name:
+                          type: string
+                        receivedLSN:
+                          format: int64
+                          type: integer
+                        reseedRequired:
+                          type: boolean
+                        restartLSN:
+                          format: int64
+                          type: integer
+                        slotName:
+                          type: string
+                        status:
+                          type: string
+                        timelineID:
+                          format: int64
+                          type: integer
+                        writeLagLSN:
+                          format: int64
+                          type: integer
+                      type: object
+                    type: array
                 type: object
               metadataNodesReady:
                 description: MetadataNodesReady represents the number of ready metadata
