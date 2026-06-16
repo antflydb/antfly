@@ -1368,6 +1368,18 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(seed.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(seed.StartRecordLSN).To(Equal(uint64(5)))
 
+	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(finish.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(finish.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
+
+	bootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(bootstrap.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(bootstrap.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(bootstrap.CheckpointLSN).To(Equal(uint64(7)))
+
 	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(slot.SlotAction).To(Equal("pause"))
@@ -1378,6 +1390,44 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(fence.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(fence.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(fence.FenceToken).To(Equal("legacy-token"))
+}
+
+func TestParseHAAdminActionResultTable(t *testing.T) {
+	g := NewWithT(t)
+
+	finish, ok := parseHAAdminActionResultTable(strings.Join([]string{
+		"result=seed_finish",
+		"manifest_id=base-standby-a-5",
+		"backup_lsn=5",
+		"end_record_lsn=8",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(finish.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(finish.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
+
+	bootstrap, ok := parseHAAdminActionResultTable(strings.Join([]string{
+		"result=seed_bootstrap",
+		"manifest_id=base-standby-a-5",
+		"backup_lsn=5",
+		"checkpoint_lsn=7",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(bootstrap.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(bootstrap.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(bootstrap.CheckpointLSN).To(Equal(uint64(7)))
+
+	fence, ok := parseHAAdminActionResultTable(strings.Join([]string{
+		"result=fence_acquire",
+		"generation=3",
+		"token=ha-fence-token",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(fence.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(fence.FenceToken).To(Equal("ha-fence-token"))
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {

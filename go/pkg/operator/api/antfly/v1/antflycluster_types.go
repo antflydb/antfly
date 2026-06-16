@@ -1591,6 +1591,14 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	StartRecordLSN uint64 `json:"startRecordLSN,omitempty"`
 
+	// EndRecordLSN is the durable backup_end record LSN returned by seed finish.
+	// +optional
+	EndRecordLSN uint64 `json:"endRecordLSN,omitempty"`
+
+	// CheckpointLSN is the standby checkpoint LSN returned by seed bootstrap.
+	// +optional
+	CheckpointLSN uint64 `json:"checkpointLSN,omitempty"`
+
 	// FenceGeneration is the promotion fence generation returned by fence operations.
 	// +optional
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`

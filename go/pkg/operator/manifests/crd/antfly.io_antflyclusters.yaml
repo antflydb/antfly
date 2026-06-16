@@ -8773,6 +8773,16 @@ spec:
                                 returned by seed operations.
                               format: int64
                               type: integer
+                            checkpointLSN:
+                              description: CheckpointLSN is the standby checkpoint
+                                LSN returned by seed bootstrap.
+                              format: int64
+                              type: integer
+                            endRecordLSN:
+                              description: EndRecordLSN is the durable backup_end
+                                record LSN returned by seed finish.
+                              format: int64
+                              type: integer
                             fenceGeneration:
                               description: FenceGeneration is the promotion fence
                                 generation returned by fence operations.

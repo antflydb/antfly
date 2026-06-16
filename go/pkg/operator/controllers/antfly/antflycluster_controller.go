@@ -3260,6 +3260,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
+			if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
+				r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+			}
 			continue
 		}
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
@@ -3294,6 +3297,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			return err
 		}
 		action.AdminJobPhase = haAdminJobPhase(existing)
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+		}
 		if !haAdminJobComplete(existing) {
 			continue
 		}
@@ -3576,6 +3582,8 @@ type haDirectAdminActionResultJSON struct {
 	ManifestID     string `json:"manifest_id"`
 	BackupLSN      uint64 `json:"backup_lsn"`
 	StartRecordLSN uint64 `json:"start_record_lsn"`
+	EndRecordLSN   uint64 `json:"end_record_lsn"`
+	CheckpointLSN  uint64 `json:"checkpoint_lsn"`
 	Receipt        struct {
 		Generation uint64 `json:"generation"`
 		Token      string `json:"token"`
@@ -3633,6 +3641,8 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		ManifestID:      strings.TrimSpace(result.ManifestID),
 		BackupLSN:       result.BackupLSN,
 		StartRecordLSN:  result.StartRecordLSN,
+		EndRecordLSN:    result.EndRecordLSN,
+		CheckpointLSN:   result.CheckpointLSN,
 		FenceGeneration: result.Receipt.Generation,
 		FenceToken:      strings.TrimSpace(result.Receipt.Token),
 	}
@@ -3644,6 +3654,8 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		status.ManifestID == "" &&
 		status.BackupLSN == 0 &&
 		status.StartRecordLSN == 0 &&
+		status.EndRecordLSN == 0 &&
+		status.CheckpointLSN == 0 &&
 		status.FenceGeneration == 0 &&
 		status.FenceToken == "" {
 		return nil, false
@@ -3658,8 +3670,62 @@ func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionRes
 		strings.TrimSpace(result.ManifestID) != "" ||
 		result.BackupLSN != 0 ||
 		result.StartRecordLSN != 0 ||
+		result.EndRecordLSN != 0 ||
+		result.CheckpointLSN != 0 ||
 		result.Receipt.Generation != 0 ||
 		strings.TrimSpace(result.Receipt.Token) != ""
+}
+
+func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) {
+	if r.KubeClient == nil || action == nil || action.AdminJobName == "" || action.AdminJobName == haAdminDirectAPIName {
+		return
+	}
+	body, ok := r.haAdminJobLogBody(ctx, cluster, action.AdminJobName)
+	if !ok {
+		return
+	}
+	result, ok := parseHAAdminActionResultTable(body)
+	if !ok {
+		return
+	}
+	action.AdminResult = result
+}
+
+func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultStatus, bool) {
+	lines := parseHATableLines(body)
+	resultName := strings.TrimSpace(lines["result"])
+	if resultName == "" {
+		return nil, false
+	}
+	result := &antflyv1.HAAdminActionResultStatus{
+		SlotAction: strings.TrimSpace(lines["slot_action"]),
+		SlotName:   strings.TrimSpace(lines["slot_name"]),
+		ManifestID: strings.TrimSpace(lines["manifest_id"]),
+		FenceToken: strings.TrimSpace(lines["token"]),
+	}
+	result.BackupLSN, _ = parseHAResultUint(lines, "backup_lsn")
+	result.StartRecordLSN, _ = parseHAResultUint(lines, "start_record_lsn")
+	result.EndRecordLSN, _ = parseHAResultUint(lines, "end_record_lsn")
+	result.CheckpointLSN, _ = parseHAResultUint(lines, "checkpoint_lsn")
+	result.FenceGeneration, _ = parseHAResultUint(lines, "generation")
+	if result.SlotName == "" {
+		result.SlotName = strings.TrimSpace(lines["name"])
+	}
+	if result.SlotAction == "" && strings.HasPrefix(resultName, "slot") {
+		result.SlotAction = resultName
+	}
+	if result.SlotAction == "" &&
+		result.SlotName == "" &&
+		result.ManifestID == "" &&
+		result.BackupLSN == 0 &&
+		result.StartRecordLSN == 0 &&
+		result.EndRecordLSN == 0 &&
+		result.CheckpointLSN == 0 &&
+		result.FenceGeneration == 0 &&
+		result.FenceToken == "" {
+		return nil, false
+	}
+	return result, true
 }
 
 func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, raw []byte) {
