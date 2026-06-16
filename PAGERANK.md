@@ -5166,9 +5166,9 @@ than PR unit coverage:
   runs exercise the coordinator/worker-pool boundary by default. Promotion is a
   floor, not just a label: a `promotion` run may raise workload knobs, but it
   cannot lower the split/reopen, document, fanout, top-k, shard, active-shard,
-  mutation, worker, iteration, failure-repeat, diagnostic, or status-page
-  evidence below the profile baseline while still emitting `profile:
-  "promotion"`. Promotion
+  mutation, worker, iteration, successful-generation-repeat, failure-repeat,
+  diagnostic, or status-page evidence below the profile baseline while still
+  emitting `profile: "promotion"`. Promotion
   also requires `top_k` not to divide evenly by the synthetic shard count, so
   the emitted shard min/max counters prove a nonuniform merge layout instead of
   a perfectly even fixture; `top_k` must also exceed the synthetic shard count,
@@ -5190,9 +5190,10 @@ than PR unit coverage:
   cross-range qualification. The
   CLI also rejects `--fanout` values larger than `--docs`, keeping generated
   cyclic source targets unique enough for graph-shape evidence to be
-  meaningful. The promotion profile also starts with three active mutation
-  writes before the active rebuild, while smoke keeps a single mutation write
-  for fast local validation.
+  meaningful. The promotion profile also starts with two successful generation
+  repeats before the failed-build churn phase and three active mutation writes
+  before the active rebuild, while smoke keeps a single mutation write for fast
+  local validation.
   Independent of those optional thresholds, the harness treats scheduler summary
   shape and graph topology as correctness gates: before drain the graph index's
   persisted stats must match the generated node and edge counts, the edge
@@ -5294,13 +5295,15 @@ than PR unit coverage:
   metric family under the CI-sized profile floor: `docs: 128`, `fanout: 4`,
   `top_k: 33`, eight synthetic fan-in shards, three active mutation writes,
   four split worker identities, reopen-between-ticks, eight maximum iterations,
-  five failed rebuild repeats, sixteen retained diagnostic/status slots, and a
-  four-family budgeted promotion summary floor.
+  two successful generation repeats, five failed rebuild repeats, sixteen
+  retained diagnostic/status slots, and a four-family budgeted promotion
+  summary floor.
   Degree, PageRank, eigenvector, and paired HITS each prove local-oracle parity,
   split coordinator/worker-pool sweep shape, all configured worker identities
   making tick and page progress, active and failed `published`/`fresh` read
-  behavior, cleanup/storage footprint bounds, nonuniform synthetic fan-in
-  layout, active-shard and mixed-active `published` merge plus `fresh` rejection, zero/stale/
+  behavior, repeated successful-generation storage growth, cleanup/storage
+  footprint bounds, nonuniform synthetic fan-in layout, active-shard and
+  mixed-active `published` merge plus `fresh` rejection, zero/stale/
   incompatible/malformed fan-in rejection, identity-mismatch rejection, and
   invalid published-state rejection. The PageRank promotion run also proves
   fixed-iteration non-converged metadata at the iteration cap, eigenvector

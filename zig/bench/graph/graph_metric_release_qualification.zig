@@ -37,7 +37,7 @@ const promotion_floor_synthetic_fan_in_active_shards: usize = 4;
 const promotion_floor_active_mutation_writes: usize = 3;
 const promotion_floor_workers: usize = 4;
 const promotion_floor_max_iterations: usize = 8;
-const promotion_floor_successful_generation_repeats: usize = 1;
+const promotion_floor_successful_generation_repeats: usize = 2;
 const promotion_floor_failure_repeats: usize = 5;
 const promotion_floor_max_failure_diagnostics: usize = 16;
 const promotion_floor_max_status_pages: usize = 16;
@@ -8311,7 +8311,7 @@ fn validateProfileShape(cfg: Config) !void {
         cfg.max_status_pages < promotion_floor_max_status_pages)
     {
         std.debug.print(
-            "promotion profile requires split mode, reopen evidence, docs>=128, fanout>=4, top_k>=33, synthetic_fan_in_shards>=8, synthetic_fan_in_active_shards>=4, top_k>synthetic_fan_in_shards, nonuniform top_k/shard layout, active_mutation_writes>=3, workers>=4, max_iterations>=8, successful_generation_repeats>=1, failure_repeats>=5, max_failure_diagnostics>=16, and max_status_pages>=16\n",
+            "promotion profile requires split mode, reopen evidence, docs>=128, fanout>=4, top_k>=33, synthetic_fan_in_shards>=8, synthetic_fan_in_active_shards>=4, top_k>synthetic_fan_in_shards, nonuniform top_k/shard layout, active_mutation_writes>=3, workers>=4, max_iterations>=8, successful_generation_repeats>=2, failure_repeats>=5, max_failure_diagnostics>=16, and max_status_pages>=16\n",
             .{},
         );
         return error.InvalidArgument;
