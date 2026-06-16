@@ -299,6 +299,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             });
             try actions.append(alloc, .{
                 .kind = .seed_standby,
+                .depends_on = .create_slot,
                 .standby_name = standby.name,
                 .slot_name = standby.name,
                 .target_lsn = initial_lsn,
@@ -890,6 +891,8 @@ test "storage.ha operator plans slots and standby bootstrap" {
     try std.testing.expectEqual(ActionKind.seed_standby, plan.actions[1].kind);
     try std.testing.expectEqual(@as(?u64, 3), plan.actions[0].target_lsn);
     try std.testing.expectEqual(@as(?u64, 3), plan.actions[1].target_lsn);
+    try std.testing.expectEqual(@as(?ActionKind, null), plan.actions[0].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .create_slot), plan.actions[1].depends_on);
     try std.testing.expectEqualStrings("SlotMissing", plan.actions[0].reason);
     try std.testing.expectEqualStrings("StandbyNeedsBaseBackup", plan.actions[1].reason);
     try std.testing.expectEqual(@as(usize, 1), plan.desired_standby_count);
