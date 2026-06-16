@@ -62152,6 +62152,41 @@ fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
+    return entry.family == .explain and
+        std.mem.startsWith(u8, entry.plan, "explain:kind=write:") and
+        std.mem.indexOf(u8, entry.plan, inner_prefix) != null;
+}
+
+fn appParityFixtureAllowsMutationTransformSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .insert_source,
+        .update_source,
+        .update_joined_source,
+        => true,
+        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .update_joined_source => true,
+        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureAllowsMergeArmSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .merge_mutation => true,
+        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:"),
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62363,6 +62398,25 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if ((entry.summary.patch_expressions != null or
+        entry.summary.increment_expressions != null or
+        entry.summary.json_set_expressions != null) and
+        !appParityFixtureAllowsMutationTransformSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.summary.source_assignments != null and !appParityFixtureAllowsSourceAssignmentsSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
+    if ((entry.summary.matched_predicates != null or
+        entry.summary.matched_delete != null or
+        entry.summary.matched_do_nothing != null or
+        entry.summary.not_matched_predicates != null or
+        entry.summary.not_matched_do_nothing != null) and
+        !appParityFixtureAllowsMergeArmSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
         return error.TestUnexpectedResult;
     }
@@ -62491,6 +62545,46 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .truncate_source,
         .summary = .{ .table_name = "usage_records", .returning = 0 },
         .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "query mutation transform summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .patch_expressions = 1 },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "point insert mutation transform summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .patch_expressions = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "delete source mutation transform summary",
+        .sql = "DELETE FROM usage_records WHERE status = 'closed'",
+        .family = .delete_source,
+        .summary = .{ .table_name = "usage_records", .json_set_expressions = 1 },
+        .plan = "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "update source source assignment summary",
+        .sql = "UPDATE usage_records SET status = 'active' WHERE id = 'u1'",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .source_assignments = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "update source merge arm summary",
+        .sql = "UPDATE usage_records SET status = 'active' WHERE id = 'u1'",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .matched_predicates = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
