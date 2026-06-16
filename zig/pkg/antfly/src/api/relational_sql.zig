@@ -62240,6 +62240,24 @@ fn appParityFixtureAllowsWindowSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .query,
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        => true,
+        .read => appParityReadPlanHasPrefix(entry, "read:query:"),
+        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:"),
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62497,6 +62515,11 @@ fn validateAppParityFixtureMetadata(
     if (entry.summary.windows != null and !appParityFixtureAllowsWindowSummary(entry)) {
         return error.TestUnexpectedResult;
     }
+    if ((entry.summary.select_all != null or entry.summary.distinct_on != null) and
+        !appParityFixtureAllowsFullQueryOutputSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
         return error.TestUnexpectedResult;
     }
@@ -62729,6 +62752,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .lateral,
         .summary = .{ .table_name = "usage_records", .windows = 1 },
         .plan = "lateral:left=usage_records:right=archived_records:left_pred=0:right_pred=1:correlations=1:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "aggregate full query output summary",
+        .sql = "SELECT status, count(*) AS count FROM usage_records GROUP BY status",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .aggregations = 1, .select_all = true },
+        .plan = "aggregate:table=usage_records:ctes=0:source_cte=0:source_pred=0:group_by=1:group_expr=0:agg=1:filter_groups=0:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "join full query distinct summary",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .distinct_on = 1 },
+        .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
