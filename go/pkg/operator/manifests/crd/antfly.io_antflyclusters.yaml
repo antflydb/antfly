@@ -8779,6 +8779,8 @@ spec:
                         retainedFromLSN:
                           format: int64
                           type: integer
+                        routeFrom:
+                          type: string
                         routeTo:
                           type: string
                         seedContentRoot:

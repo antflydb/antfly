@@ -424,6 +424,11 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, -1)).To(BeFalse())
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, len(actions))).To(BeFalse())
+
+	route := antflyv1.HAPlannedActionStatus{Kind: string(haActionUpdatePrimaryRoute), RouteFrom: "primary", RouteTo: "standby-a"}
+	routeHash := haAdminActionHash(route)
+	route.RouteFrom = "standby-b"
+	g.Expect(haAdminActionHash(route)).NotTo(Equal(routeHash))
 }
 
 func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
@@ -471,6 +476,7 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 				}, {
 					Kind:            string(haActionUpdatePrimaryRoute),
 					StandbyName:     "standby-a",
+					RouteFrom:       "primary",
 					RouteTo:         "standby-a",
 					FenceGeneration: 7,
 				}},

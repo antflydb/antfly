@@ -4160,6 +4160,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		TargetLSN    uint64   `json:"targetLSN,omitempty"`
 		ObservedLSN  uint64   `json:"observedLSN,omitempty"`
 		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
+		RouteFrom    string   `json:"routeFrom,omitempty"`
 		RouteTo      string   `json:"routeTo,omitempty"`
 		SeedManifest string   `json:"seedManifestPath,omitempty"`
 		SeedRoot     string   `json:"seedContentRoot,omitempty"`
@@ -4176,6 +4177,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		TargetLSN:    action.TargetLSN,
 		ObservedLSN:  action.ObservedLSN,
 		RetainedLSN:  action.RetainedFromLSN,
+		RouteFrom:    action.RouteFrom,
 		RouteTo:      action.RouteTo,
 		SeedManifest: action.SeedManifestPath,
 		SeedRoot:     action.SeedContentRoot,

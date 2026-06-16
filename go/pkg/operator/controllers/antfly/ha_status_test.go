@@ -461,6 +461,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionAcquireFence) ||
 		cluster.Status.HAStatus.PlannedActions[2].DependsOn != string(haActionPromoteStandby) ||
 		cluster.Status.HAStatus.PlannedActions[3].DependsOn != string(haActionPromoteStandby) ||
+		cluster.Status.HAStatus.PlannedActions[2].RouteFrom != "primary" ||
 		cluster.Status.HAStatus.PlannedActions[2].RouteTo != "standby-a" {
 		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
@@ -894,6 +895,7 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	}
 	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
 		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionUpdatePrimaryRoute) ||
+		cluster.Status.HAStatus.PlannedActions[0].RouteFrom != "primary" ||
 		cluster.Status.HAStatus.PlannedActions[0].RouteTo != "standby-a" ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 5 {
 		t.Fatalf("expected route planned action, got %#v", cluster.Status.HAStatus.PlannedActions)

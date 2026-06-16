@@ -1510,6 +1510,8 @@ type HAPlannedActionStatus struct {
 
 	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
 
+	RouteFrom string `json:"routeFrom,omitempty"`
+
 	RouteTo string `json:"routeTo,omitempty"`
 
 	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
