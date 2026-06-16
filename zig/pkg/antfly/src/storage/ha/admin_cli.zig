@@ -119,6 +119,7 @@ pub const Command = union(enum) {
     fence_acquire: fencing.FenceRequest,
     fence_current,
     promote_assess: PromoteAssessCommand,
+    promote_current_fence,
     promote: admin.FencedPromotionRequest,
     rejoin_assess: RejoinAssessCommand,
 };
@@ -604,6 +605,14 @@ fn parsePromote(cursor: *Cursor) !Command {
         if (std.mem.eql(u8, subcommand, "assess")) {
             _ = cursor.next();
             return .{ .promote_assess = try parsePromoteAssess(cursor) };
+        }
+        if (std.mem.eql(u8, subcommand, "current-fence")) {
+            _ = cursor.next();
+            return .promote_current_fence;
+        }
+        if (std.mem.eql(u8, subcommand, "--current-fence") or std.mem.eql(u8, subcommand, "--use-current-fence")) {
+            _ = cursor.next();
+            return .promote_current_fence;
         }
     }
     return .{ .promote = .{ .fence = try parseFenceRequest(cursor) } };
@@ -1242,6 +1251,13 @@ test "storage.ha admin cli parses fenced promotion request" {
     var fenced_assess = try parse(alloc, &.{ "promote", "assess", "--current-fence" });
     defer fenced_assess.deinit(alloc);
     try std.testing.expect(fenced_assess.command.promote_assess.use_current_fence);
+
+    var current_fence_promote = try parse(alloc, &.{ "promote", "--current-fence" });
+    defer current_fence_promote.deinit(alloc);
+    switch (current_fence_promote.command) {
+        .promote_current_fence => {},
+        else => return error.TestExpectedEqual,
+    }
 
     var plan = try parse(alloc, &.{
         "promote",

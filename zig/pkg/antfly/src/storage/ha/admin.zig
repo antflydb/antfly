@@ -196,7 +196,24 @@ pub fn promoteWithFence(
 ) !FencedPromotionResult {
     const receipt = try fence_store.acquirePromotionFence(request.fence);
     defer fencing.freeReceipt(fence_store.alloc, receipt);
+    return try promoteWithReceipt(alloc, standby, receipt);
+}
 
+pub fn promoteWithCurrentFence(
+    alloc: Allocator,
+    fence_store: *const fencing.Store,
+    standby: *standby_mod.Standby,
+) !FencedPromotionResult {
+    const receipt = (try fence_store.current(fence_store.alloc)) orelse return error.FenceReceiptMissing;
+    defer fencing.freeReceipt(fence_store.alloc, receipt);
+    return try promoteWithReceipt(alloc, standby, receipt);
+}
+
+fn promoteWithReceipt(
+    alloc: Allocator,
+    standby: *standby_mod.Standby,
+    receipt: fencing.Receipt,
+) !FencedPromotionResult {
     const assessment = status.assessPromotionWithFence(standby, receipt);
     if (!assessment.can_promote) return error.PromotionNotAllowed;
 

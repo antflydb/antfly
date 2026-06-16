@@ -90,6 +90,7 @@ pub const Result = union(enum) {
     fence_acquire: admin.FenceReceiptResult,
     fence_current: ?admin.FenceReceiptResult,
     promote_assess: status.PromotionAssessment,
+    promote_current_fence: admin.FencedPromotionResult,
     promote: admin.FencedPromotionResult,
     rejoin_assess: rejoin.Assessment,
 
@@ -103,6 +104,7 @@ pub const Result = union(enum) {
             .primary_metrics => |*snapshot| snapshot.deinit(alloc),
             .fence_acquire => |*result| result.deinit(alloc),
             .fence_current => |*maybe_result| if (maybe_result.*) |*result| result.deinit(alloc),
+            .promote_current_fence => |*result| result.deinit(alloc),
             .promote => |*result| result.deinit(alloc),
             else => {},
         }
@@ -248,16 +250,11 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .promote_assess => |assessment| {
             try appendPromotionAssessmentLines(alloc, &out, "assessment", assessment);
         },
+        .promote_current_fence => |promotion_result| {
+            try appendPromotionResultLines(alloc, &out, promotion_result);
+        },
         .promote => |promotion_result| {
-            try appendPromotionAssessmentLines(alloc, &out, "assessment", promotion_result.assessment);
-            try appendU64Line(alloc, &out, "promotion.switch_lsn", promotion_result.promotion.switch_lsn);
-            try appendIdentityLines(alloc, &out, "promotion.old_identity", promotion_result.promotion.old_identity);
-            try appendIdentityLines(alloc, &out, "promotion.new_identity", promotion_result.promotion.new_identity);
-            try appendBoolLine(alloc, &out, "promotion.forced", promotion_result.promotion.forced);
-            try appendBoolLine(alloc, &out, "promotion.data_loss_possible", promotion_result.promotion.data_loss_possible);
-            try appendU64Line(alloc, &out, "fence_generation", promotion_result.fence_generation);
-            try appendLine(alloc, &out, "fence_token", promotion_result.fence_token);
-            try appendBoolLine(alloc, &out, "forced", promotion_result.forced);
+            try appendPromotionResultLines(alloc, &out, promotion_result);
         },
         .rejoin_assess => |assessment| {
             try appendLine(alloc, &out, "action", @tagName(assessment.action));
@@ -341,6 +338,9 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         },
         .promote_assess => |command| .{
             .promote_assess = try executePromoteAssess(alloc, ctx, command),
+        },
+        .promote_current_fence => .{
+            .promote_current_fence = try admin.promoteWithCurrentFence(alloc, try requireFenceStore(ctx), try requireStandby(ctx)),
         },
         .promote => |request| .{
             .promote = try admin.promoteWithFence(alloc, try requireFenceStore(ctx), try requireStandby(ctx), request),
@@ -566,6 +566,7 @@ fn resultName(result: Result) []const u8 {
         .fence_acquire => "fence_acquire",
         .fence_current => "fence_current",
         .promote_assess => "promote_assess",
+        .promote_current_fence => "promote_current_fence",
         .promote => "promote",
         .rejoin_assess => "rejoin_assess",
     };
@@ -786,6 +787,22 @@ fn appendPromotionAssessmentLines(
     try appendPrefixedBoolLine(alloc, out, prefix, "requires_fencing", assessment.requires_fencing);
     try appendPrefixedBoolLine(alloc, out, prefix, "requires_force", assessment.requires_force);
     try appendPrefixedBoolLine(alloc, out, prefix, "can_promote", assessment.can_promote);
+}
+
+fn appendPromotionResultLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    promotion_result: admin.FencedPromotionResult,
+) !void {
+    try appendPromotionAssessmentLines(alloc, out, "assessment", promotion_result.assessment);
+    try appendU64Line(alloc, out, "promotion.switch_lsn", promotion_result.promotion.switch_lsn);
+    try appendIdentityLines(alloc, out, "promotion.old_identity", promotion_result.promotion.old_identity);
+    try appendIdentityLines(alloc, out, "promotion.new_identity", promotion_result.promotion.new_identity);
+    try appendBoolLine(alloc, out, "promotion.forced", promotion_result.promotion.forced);
+    try appendBoolLine(alloc, out, "promotion.data_loss_possible", promotion_result.promotion.data_loss_possible);
+    try appendU64Line(alloc, out, "fence_generation", promotion_result.fence_generation);
+    try appendLine(alloc, out, "fence_token", promotion_result.fence_token);
+    try appendBoolLine(alloc, out, "forced", promotion_result.forced);
 }
 
 fn appendFenceReceiptLines(
@@ -1321,38 +1338,16 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try std.testing.expectEqualStrings("text/plain; version=0.0.4", fenced_assess_prometheus.content_type);
     try expectContains(fenced_assess_prometheus.body, "antfly_ha_promotion_can_promote 1\n");
 
-    var promote_plan = try admin_cli.parse(alloc, &.{
-        "promote",
-        "--cluster-id",
-        "100",
-        "--shard-id",
-        "10",
-        "--table-id",
-        "20",
-        "--timeline-id",
-        "1",
-        "--epoch",
-        "1",
-        "--old-primary-id",
-        "primary-a",
-        "--promoted-node-id",
-        "standby-a",
-        "--new-timeline-id",
-        "2",
-        "--new-epoch",
-        "2",
-        "--required-lsn",
-        "1",
-        "--observed-lsn",
-        "1",
-        "--reason",
-        "admin-exec-test",
-    });
+    var promote_plan = try admin_cli.parse(alloc, &.{ "--table", "promote", "--current-fence" });
     defer promote_plan.deinit(alloc);
     var promoted = try execute(alloc, .{ .standby = &standby, .fence_store = &fence_store }, promote_plan);
     defer promoted.deinit(alloc);
-    try std.testing.expect(promoted.promote.assessment.can_promote);
+    try std.testing.expect(promoted.promote_current_fence.assessment.can_promote);
     try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    const promoted_table = try renderTableAlloc(alloc, promoted);
+    defer alloc.free(promoted_table);
+    try expectContains(promoted_table, "result=promote_current_fence\n");
+    try expectContains(promoted_table, "promotion.new_identity.timeline_id=2\n");
 
     var rejoin_plan = try admin_cli.parse(alloc, &.{
         "rejoin",              "assess",

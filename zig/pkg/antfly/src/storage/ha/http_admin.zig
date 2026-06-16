@@ -304,6 +304,17 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), promote_assess.status);
     try expectContains(promote_assess.body, "result=promote_assess\n");
     try expectContains(promote_assess.body, "assessment.can_promote=true\n");
+
+    var promote = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"promote\",\"--current-fence\"]}",
+    });
+    defer promote.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), promote.status);
+    try expectContains(promote.body, "result=promote_current_fence\n");
+    try expectContains(promote.body, "promotion.new_identity.timeline_id=2\n");
 }
 
 test "storage.ha http admin returns route method and command errors" {
