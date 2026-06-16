@@ -236,6 +236,7 @@ pub fn freeDecoded(alloc: Allocator, view: ManifestView) void {
 }
 
 pub fn validateManifestInput(manifest: Manifest) !void {
+    try validateManifestIdentity(manifest.identity);
     if (manifest.manifest_id.len == 0) return error.InvalidManifestId;
     if (manifest.manifest_id.len > std.math.maxInt(u32)) return error.ManifestIdTooLong;
     if (manifest.files.len == 0) return error.EmptyManifest;
@@ -246,11 +247,18 @@ pub fn validateManifestInput(manifest: Manifest) !void {
 }
 
 pub fn validateManifestView(view: ManifestView) !void {
+    try validateManifestIdentity(view.identity);
     if (view.manifest_id.len == 0) return error.InvalidManifestId;
     if (view.files.len == 0) return error.EmptyManifest;
     if (view.backup_lsn == 0) return error.InvalidBackupLsn;
     if (view.checkpoint_lsn < view.backup_lsn) return error.InvalidCheckpointLsn;
     try validateFiles(view.files);
+}
+
+fn validateManifestIdentity(identity: Identity) !void {
+    if (identity.cluster_id == 0) return error.InvalidClusterId;
+    if (identity.timeline_id == 0) return error.InvalidTimelineId;
+    if (identity.epoch == 0) return error.InvalidEpoch;
 }
 
 pub fn verifyFileContents(view: ManifestView, contents: []const FileContent) !void {
@@ -380,6 +388,34 @@ test "storage.ha backup manifest rejects unsafe paths and invalid wal bounds" {
     try std.testing.expectError(error.DuplicateManifestPath, validateManifestInput(.{
         .identity = testIdentity(),
         .manifest_id = "dupes",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 1,
+        .files = &dupes,
+    }));
+
+    var missing_identity = testIdentity();
+    missing_identity.cluster_id = 0;
+    try std.testing.expectError(error.InvalidClusterId, validateManifestInput(.{
+        .identity = missing_identity,
+        .manifest_id = "missing-cluster",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 1,
+        .files = &dupes,
+    }));
+    missing_identity = testIdentity();
+    missing_identity.timeline_id = 0;
+    try std.testing.expectError(error.InvalidTimelineId, validateManifestInput(.{
+        .identity = missing_identity,
+        .manifest_id = "missing-timeline",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 1,
+        .files = &dupes,
+    }));
+    missing_identity = testIdentity();
+    missing_identity.epoch = 0;
+    try std.testing.expectError(error.InvalidEpoch, validateManifestInput(.{
+        .identity = missing_identity,
+        .manifest_id = "missing-epoch",
         .backup_lsn = 1,
         .checkpoint_lsn = 1,
         .files = &dupes,
