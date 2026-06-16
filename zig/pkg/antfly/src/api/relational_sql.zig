@@ -61946,21 +61946,7 @@ fn freeAppParityFixtureEntry(alloc: std.mem.Allocator, entry: AppParityCorpusEnt
 }
 
 fn appParityFixtureFamilyNeedsReason(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .adapter_noop_ddl,
-        .unsupported,
-        .unsupported_read,
-        .unsupported_ddl,
-        .unsupported_write,
-        .unsupported_insert,
-        .unsupported_update,
-        .unsupported_update_source,
-        .unsupported_delete,
-        .unsupported_update_joined_source,
-        .unsupported_delete_joined_source,
-        => true,
-        else => false,
-    };
+    return family == .adapter_noop_ddl or appParityPlanFamilyIsUnsupported(family);
 }
 
 fn appParityStableReasonToken(reason: []const u8) bool {
@@ -61991,27 +61977,27 @@ fn appParityPlanMatchesReason(
             defer alloc.free(token);
             return std.mem.indexOf(u8, plan, token) != null;
         },
-        .unsupported,
-        .unsupported_read,
-        .unsupported_ddl,
-        .unsupported_write,
-        .unsupported_insert,
-        .unsupported_update,
-        .unsupported_update_source,
-        .unsupported_delete,
-        .unsupported_update_joined_source,
-        .unsupported_delete_joined_source,
-        => {
-            if (!std.mem.startsWith(u8, plan, "unsupported:")) return false;
+        else => if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
+            const prefix = try std.fmt.allocPrint(alloc, "unsupported:{s}:", .{unsupported_family});
+            defer alloc.free(prefix);
+            if (!std.mem.startsWith(u8, plan, prefix)) return false;
             const token = try std.fmt.allocPrint(alloc, ":requires={s}", .{reason});
             defer alloc.free(token);
             return std.mem.indexOf(u8, plan, token) != null;
-        },
-        else => return true,
+        } else return true,
     }
 }
 
 fn appParityPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const u8) bool {
+    if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
+        const unsupported_prefix = "unsupported:";
+        if (!std.mem.startsWith(u8, plan, unsupported_prefix)) return false;
+        const rest = plan[unsupported_prefix.len..];
+        return std.mem.startsWith(u8, rest, unsupported_family) and
+            rest.len > unsupported_family.len and
+            rest[unsupported_family.len] == ':';
+    }
+
     const prefix = switch (family) {
         .ddl => "ddl:",
         .read => "read:",
@@ -62033,16 +62019,17 @@ fn appParityPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const u
         .delete_joined_source => "delete_joined_source:",
         .merge_mutation => "merge_mutation:",
         .adapter_noop_ddl => "adapter_noop:ddl:",
-        .unsupported => "unsupported:query:",
-        .unsupported_read => "unsupported:read:",
-        .unsupported_ddl => "unsupported:ddl:",
-        .unsupported_write => "unsupported:write:",
-        .unsupported_insert => "unsupported:insert:",
-        .unsupported_update => "unsupported:update:",
-        .unsupported_update_source => "unsupported:update_source:",
-        .unsupported_delete => "unsupported:delete:",
-        .unsupported_update_joined_source => "unsupported:update_joined_source:",
-        .unsupported_delete_joined_source => "unsupported:delete_joined_source:",
+        .unsupported,
+        .unsupported_read,
+        .unsupported_ddl,
+        .unsupported_write,
+        .unsupported_insert,
+        .unsupported_update,
+        .unsupported_update_source,
+        .unsupported_delete,
+        .unsupported_update_joined_source,
+        .unsupported_delete_joined_source,
+        => unreachable,
     };
     return std.mem.startsWith(u8, plan, prefix);
 }
