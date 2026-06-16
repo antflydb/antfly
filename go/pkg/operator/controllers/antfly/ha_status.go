@@ -18,6 +18,8 @@ type haActionKind string
 
 const (
 	haActionCreateSlot           haActionKind = "CreateSlot"
+	haActionResumeSlot           haActionKind = "ResumeSlot"
+	haActionPauseSlot            haActionKind = "PauseSlot"
 	haActionSeedStandby          haActionKind = "SeedStandby"
 	haActionFinishStandbySeed    haActionKind = "FinishStandbySeed"
 	haActionBootstrapStandbySeed haActionKind = "BootstrapStandbySeed"
@@ -202,16 +204,30 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		if name != "" {
 			slotByName[name] = standby
 		}
+		if standby.SlotName != "" {
+			slotByName[standby.SlotName] = standby
+		}
 	}
 
 	var plan haPlan
 	for _, standby := range ha.Standbys {
+		slotName := standbySlotName(standby)
+		observed, ok := slotByName[standby.Name]
+		if !ok {
+			observed, ok = slotByName[slotName]
+		}
 		if !standbyDesired(standby) {
+			if ok && observed.Active {
+				plan.Actions = append(plan.Actions, haPlannedAction{
+					Kind:        haActionPauseSlot,
+					StandbyName: standby.Name,
+					SlotName:    slotName,
+					Reason:      "StandbyMarkedUndesired",
+				})
+			}
 			continue
 		}
 		plan.DesiredStandbyCount++
-		observed, ok := slotByName[standby.Name]
-		slotName := standbySlotName(standby)
 		if !ok {
 			plan.Actions = append(plan.Actions, haPlannedAction{
 				Kind:        haActionCreateSlot,
@@ -227,6 +243,15 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Reason:      "StandbyNeedsBaseBackup",
 			})
 			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, initialStandbyLSN(standby, status.PrimaryLSN), "StandbyNeedsBaseBackup")...)
+			continue
+		}
+		if !observed.Active && !observed.ReseedRequired {
+			plan.Actions = append(plan.Actions, haPlannedAction{
+				Kind:        haActionResumeSlot,
+				StandbyName: standby.Name,
+				SlotName:    slotName,
+				Reason:      "SlotInactive",
+			})
 			continue
 		}
 		if observed.ReseedRequired || observed.Status == "reseed_required" {
@@ -384,6 +409,10 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			return nil
 		}
 		return []string{"slot", "create", "--slot", slotName, "--initial-lsn", strconv.FormatUint(action.TargetLSN, 10)}
+	case haActionResumeSlot:
+		return haSlotLifecycleCommand("resume", action)
+	case haActionPauseSlot:
+		return haSlotLifecycleCommand("pause", action)
 	case haActionSeedStandby, haActionMarkReseed:
 		slotName := action.SlotName
 		if slotName == "" {
@@ -433,6 +462,17 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 	default:
 		return nil
 	}
+}
+
+func haSlotLifecycleCommand(operation string, action haPlannedAction) []string {
+	slotName := action.SlotName
+	if slotName == "" {
+		slotName = action.StandbyName
+	}
+	if slotName == "" {
+		return nil
+	}
+	return []string{"slot", operation, "--slot", slotName}
 }
 
 func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {
@@ -517,7 +557,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 		return ""
 	}
 	switch action.Kind {
-	case haActionCreateSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed, haActionAcquireFence:
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed, haActionAcquireFence:
 		if ha.Admin == nil {
 			return ""
 		}
