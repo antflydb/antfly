@@ -62461,6 +62461,20 @@ fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) boo
     };
 }
 
+fn appParityFixtureFullQueryOutputSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    if (entry.summary.select_all) |select_all| {
+        if (select_all) {
+            if (!appParityPlanHasExactUsizeToken(entry.plan, ":select_all=", 1)) return false;
+        } else if (appParityPlanHasExactUsizeToken(entry.plan, ":select_all=", 1)) {
+            return false;
+        }
+    }
+    if (entry.summary.distinct_on) |distinct_on| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":distinct_on=", distinct_on)) return false;
+    }
+    return true;
+}
+
 fn appParityFixtureAllowsPaginationSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .query,
@@ -62899,6 +62913,9 @@ fn validateAppParityFixtureMetadata(
     if ((entry.summary.select_all != null or entry.summary.distinct_on != null) and
         !appParityFixtureAllowsFullQueryOutputSummary(entry))
     {
+        return error.TestUnexpectedResult;
+    }
+    if (!appParityFixtureFullQueryOutputSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
     if ((entry.summary.order_by != null or entry.summary.limit != null or entry.summary.offset != null) and
@@ -63469,6 +63486,38 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .join_on = 1, .distinct_on = 1 },
         .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query select all summary",
+        .sql = "SELECT * FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select_all = true },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query distinct on summary",
+        .sql = "SELECT DISTINCT ON (customer) customer, id FROM usage_records ORDER BY customer, id",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 2, .distinct_on = 1, .order_by = 2 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:distinct_on=2:order=2:order_expr=0:limit=-1:claim=none",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid query full output summary",
+        .sql = "SELECT *, lower(status) AS status_lower FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 0, .select_all = true },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none:select_all=1",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid query distinct on summary",
+        .sql = "SELECT DISTINCT ON (customer) customer, id FROM usage_records ORDER BY customer, id",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 2, .distinct_on = 1, .order_by = 2 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:distinct_on=1:order=2:order_expr=0:limit=-1:claim=none",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "query join summary",
