@@ -42,8 +42,10 @@ pub const SlotSnapshot = struct {
     restart_lsn: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: u64,
     write_lag_lsn: u64,
     apply_lag_lsn: u64,
+    safe_read_lag_lsn: u64,
     retention_lag_lsn: u64,
     status: slot_store.SlotStatus,
     last_error: ?[]const u8 = null,
@@ -176,8 +178,10 @@ pub fn primarySnapshot(
             .restart_lsn = slot.restart_lsn,
             .received_lsn = slot.received_lsn,
             .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
             .write_lag_lsn = current_lsn -| slot.received_lsn,
             .apply_lag_lsn = current_lsn -| slot.applied_lsn,
+            .safe_read_lag_lsn = current_lsn -| slot.safe_read_lsn,
             .retention_lag_lsn = current_lsn -| slot.restart_lsn,
             .status = slot.status(current_lsn, retention_policy.max_lag_lsn),
             .last_error = owned_last_error,
@@ -341,7 +345,7 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     _ = try primary.append(.{ .payload = "one" });
     _ = try primary.append(.{ .payload = "two" });
     _ = try primary.append(.{ .payload = "three" });
-    try primary.standbyStatusUpdate("a", identity.timeline_id, 3, 2);
+    try primary.standbyStatusUpdateWithSafeRead("a", identity.timeline_id, 3, 2, 1);
     try primary.standbyStatusUpdate("b", identity.timeline_id, 1, 1);
     try primary.reportReplicationError("b", "IntentionalApplyFailure");
 
@@ -361,6 +365,11 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.retention.reseed_recommended);
     try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, snapshot.durability.?.status);
     try std.testing.expectEqual(@as(usize, 1), snapshot.durability.?.candidate_count);
+
+    const slot_a = if (std.mem.eql(u8, snapshot.slots[0].name, "a")) snapshot.slots[0] else snapshot.slots[1];
+    try std.testing.expectEqual(@as(u64, 2), slot_a.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot_a.safe_read_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot_a.safe_read_lag_lsn);
 
     const slot_b = if (std.mem.eql(u8, snapshot.slots[0].name, "b")) snapshot.slots[0] else snapshot.slots[1];
     try std.testing.expectEqual(slot_store.SlotStatus.reseed_required, slot_b.status);

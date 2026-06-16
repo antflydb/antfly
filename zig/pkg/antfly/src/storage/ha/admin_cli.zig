@@ -473,6 +473,7 @@ fn parseStandbyStatusUpdate(cursor: *Cursor) !replication_api.StandbyStatusUpdat
     var timeline_id: ?u64 = null;
     var received_lsn: ?u64 = null;
     var applied_lsn: ?u64 = null;
+    var safe_read_lsn: ?u64 = null;
 
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--slot")) {
@@ -487,6 +488,9 @@ fn parseStandbyStatusUpdate(cursor: *Cursor) !replication_api.StandbyStatusUpdat
         } else if (std.mem.eql(u8, arg, "--applied-lsn")) {
             _ = cursor.next();
             applied_lsn = try parseU64(try cursor.value("--applied-lsn"));
+        } else if (std.mem.eql(u8, arg, "--safe-read-lsn")) {
+            _ = cursor.next();
+            safe_read_lsn = try parseU64(try cursor.value("--safe-read-lsn"));
         } else {
             break;
         }
@@ -497,6 +501,7 @@ fn parseStandbyStatusUpdate(cursor: *Cursor) !replication_api.StandbyStatusUpdat
         .timeline_id = timeline_id orelse return error.TimelineIdMissing,
         .received_lsn = received_lsn orelse return error.ReceivedLsnMissing,
         .applied_lsn = applied_lsn orelse return error.AppliedLsnMissing,
+        .safe_read_lsn = safe_read_lsn,
     };
 }
 
@@ -1571,11 +1576,12 @@ test "storage.ha admin cli parses stream ack commit and read checks" {
     defer stream_once.deinit(alloc);
     try std.testing.expectEqualStrings("standby-a", stream_once.command.stream_once.slot_name);
 
-    var ack = try parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "2", "--received-lsn", "9", "--applied-lsn", "8" });
+    var ack = try parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "2", "--received-lsn", "9", "--applied-lsn", "8", "--safe-read-lsn", "7" });
     defer ack.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), ack.command.standby_status_update.timeline_id);
     try std.testing.expectEqual(@as(u64, 9), ack.command.standby_status_update.received_lsn);
     try std.testing.expectEqual(@as(u64, 8), ack.command.standby_status_update.applied_lsn);
+    try std.testing.expectEqual(@as(?u64, 7), ack.command.standby_status_update.safe_read_lsn);
 
     var commit = try parse(alloc, &.{ "commit", "check", "--target-lsn", "9", "--sync-mode", "remote-write", "--sync-standby", "standby-a" });
     defer commit.deinit(alloc);

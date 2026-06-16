@@ -219,6 +219,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendU64Line(alloc, &out, "timeline_id", response.timeline_id);
             try appendU64Line(alloc, &out, "received_lsn", response.received_lsn);
             try appendU64Line(alloc, &out, "applied_lsn", response.applied_lsn);
+            try appendU64Line(alloc, &out, "safe_read_lsn", response.safe_read_lsn);
             try appendU64Line(alloc, &out, "restart_lsn", response.restart_lsn);
             try appendBoolLine(alloc, &out, "active", response.active);
             try appendBoolLine(alloc, &out, "reseed_required", response.reseed_required);
@@ -677,6 +678,7 @@ fn appendCreateSlotResponseLines(
     try appendU64Line(alloc, out, "restart_lsn", slot.restart_lsn);
     try appendU64Line(alloc, out, "received_lsn", slot.received_lsn);
     try appendU64Line(alloc, out, "applied_lsn", slot.applied_lsn);
+    try appendU64Line(alloc, out, "safe_read_lsn", slot.safe_read_lsn);
     try appendBoolLine(alloc, out, "active", slot.active);
     try appendBoolLine(alloc, out, "reseed_required", slot.reseed_required);
     try appendOptionalLine(alloc, out, "last_error", slot.last_error);
@@ -693,6 +695,7 @@ fn appendSlotLifecycleResponseLines(
     try appendU64Line(alloc, out, "restart_lsn", slot.restart_lsn);
     try appendU64Line(alloc, out, "received_lsn", slot.received_lsn);
     try appendU64Line(alloc, out, "applied_lsn", slot.applied_lsn);
+    try appendU64Line(alloc, out, "safe_read_lsn", slot.safe_read_lsn);
     try appendBoolLine(alloc, out, "active", slot.active);
     try appendBoolLine(alloc, out, "reseed_required", slot.reseed_required);
     try appendOptionalLine(alloc, out, "last_error", slot.last_error);
@@ -746,8 +749,10 @@ fn appendSlotSnapshotLines(
     try appendIndexedU64Line(alloc, out, "slots", idx, "restart_lsn", slot.restart_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "received_lsn", slot.received_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "applied_lsn", slot.applied_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "safe_read_lsn", slot.safe_read_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "write_lag_lsn", slot.write_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "apply_lag_lsn", slot.apply_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "safe_read_lag_lsn", slot.safe_read_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "retention_lag_lsn", slot.retention_lag_lsn);
     try appendIndexedLine(alloc, out, "slots", idx, "status", @tagName(slot.status));
     try appendIndexedOptionalLine(alloc, out, "slots", idx, "last_error", slot.last_error);
@@ -782,6 +787,7 @@ fn appendPrimaryMetricsLines(
     try appendU64Line(alloc, out, "reseed_required_slots", snapshot.reseed_required_slots);
     try appendU64Line(alloc, out, "max_write_lag_lsn", snapshot.max_write_lag_lsn);
     try appendU64Line(alloc, out, "max_apply_lag_lsn", snapshot.max_apply_lag_lsn);
+    try appendU64Line(alloc, out, "max_safe_read_lag_lsn", snapshot.max_safe_read_lag_lsn);
     try appendU64Line(alloc, out, "max_retention_lag_lsn", snapshot.max_retention_lag_lsn);
     try appendU64Line(alloc, out, "retention_oldest_restart_lsn", snapshot.retention_oldest_restart_lsn);
     try appendU64Line(alloc, out, "retention_retained_lsn_count", snapshot.retention_retained_lsn_count);
@@ -812,9 +818,11 @@ fn appendSlotMetricsLines(
     try appendIndexedU64Line(alloc, out, "slots", idx, "reseed_required", slot.reseed_required);
     try appendIndexedU64Line(alloc, out, "slots", idx, "received_lsn", slot.received_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "applied_lsn", slot.applied_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "safe_read_lsn", slot.safe_read_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "restart_lsn", slot.restart_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "write_lag_lsn", slot.write_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "apply_lag_lsn", slot.apply_lag_lsn);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "safe_read_lag_lsn", slot.safe_read_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "retention_lag_lsn", slot.retention_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "status_code", slot.status_code);
     try appendIndexedU64Line(alloc, out, "slots", idx, "last_error", slot.last_error);
@@ -1203,16 +1211,18 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer alloc.free(created_table);
     try expectContains(created_table, "last_error=-\n");
 
-    var ack_plan = try admin_cli.parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "1", "--received-lsn", "2", "--applied-lsn", "1" });
+    var ack_plan = try admin_cli.parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "1", "--received-lsn", "2", "--applied-lsn", "1", "--safe-read-lsn", "1" });
     defer ack_plan.deinit(alloc);
     var acked = try execute(alloc, .{ .primary = &primary }, ack_plan);
     defer acked.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), acked.standby_status_update.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), acked.standby_status_update.safe_read_lsn);
     try std.testing.expect(acked.standby_status_update.active);
     try std.testing.expect(!acked.standby_status_update.reseed_required);
     const acked_table = try renderTableAlloc(alloc, acked);
     defer alloc.free(acked_table);
     try expectContains(acked_table, "active=true\n");
+    try expectContains(acked_table, "safe_read_lsn=1\n");
     try expectContains(acked_table, "reseed_required=false\n");
     try expectContains(acked_table, "last_error=-\n");
     try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");

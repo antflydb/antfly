@@ -45,9 +45,11 @@ pub const SlotMetrics = struct {
     reseed_required: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: u64,
     restart_lsn: u64,
     write_lag_lsn: u64,
     apply_lag_lsn: u64,
+    safe_read_lag_lsn: u64,
     retention_lag_lsn: u64,
     status_code: u64,
     last_error: u64,
@@ -60,6 +62,7 @@ pub const PrimaryMetrics = struct {
     reseed_required_slots: u64,
     max_write_lag_lsn: u64,
     max_apply_lag_lsn: u64,
+    max_safe_read_lag_lsn: u64,
     max_retention_lag_lsn: u64,
     retention_oldest_restart_lsn: u64,
     retention_retained_lsn_count: u64,
@@ -122,6 +125,7 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
     var reseed_required_slots: u64 = 0;
     var max_write_lag_lsn: u64 = 0;
     var max_apply_lag_lsn: u64 = 0;
+    var max_safe_read_lag_lsn: u64 = 0;
     var max_retention_lag_lsn: u64 = 0;
 
     for (snapshot.slots, 0..) |slot, idx| {
@@ -129,6 +133,7 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
         if (slot.reseed_required) reseed_required_slots += 1;
         max_write_lag_lsn = @max(max_write_lag_lsn, slot.write_lag_lsn);
         max_apply_lag_lsn = @max(max_apply_lag_lsn, slot.apply_lag_lsn);
+        max_safe_read_lag_lsn = @max(max_safe_read_lag_lsn, slot.safe_read_lag_lsn);
         max_retention_lag_lsn = @max(max_retention_lag_lsn, slot.retention_lag_lsn);
 
         slots[idx] = .{
@@ -137,9 +142,11 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
             .reseed_required = boolGauge(slot.reseed_required),
             .received_lsn = slot.received_lsn,
             .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
             .restart_lsn = slot.restart_lsn,
             .write_lag_lsn = slot.write_lag_lsn,
             .apply_lag_lsn = slot.apply_lag_lsn,
+            .safe_read_lag_lsn = slot.safe_read_lag_lsn,
             .retention_lag_lsn = slot.retention_lag_lsn,
             .status_code = @intFromEnum(slotStatusCode(slot.status)),
             .last_error = boolGauge(slot.last_error != null),
@@ -168,6 +175,7 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
         .reseed_required_slots = reseed_required_slots,
         .max_write_lag_lsn = max_write_lag_lsn,
         .max_apply_lag_lsn = max_apply_lag_lsn,
+        .max_safe_read_lag_lsn = max_safe_read_lag_lsn,
         .max_retention_lag_lsn = max_retention_lag_lsn,
         .retention_oldest_restart_lsn = snapshot.retention.oldest_restart_lsn,
         .retention_retained_lsn_count = snapshot.retention.retained_lsn_count,
@@ -245,6 +253,7 @@ pub fn renderPrimaryPrometheusAlloc(alloc: Allocator, metrics: PrimaryMetrics) !
     try appendGauge(alloc, &out, "antfly_ha_primary_reseed_required_slots", metrics.reseed_required_slots);
     try appendGauge(alloc, &out, "antfly_ha_primary_max_write_lag_lsn", metrics.max_write_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_primary_max_apply_lag_lsn", metrics.max_apply_lag_lsn);
+    try appendGauge(alloc, &out, "antfly_ha_primary_max_safe_read_lag_lsn", metrics.max_safe_read_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_primary_max_retention_lag_lsn", metrics.max_retention_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_primary_retention_oldest_restart_lsn", metrics.retention_oldest_restart_lsn);
     try appendGauge(alloc, &out, "antfly_ha_primary_retention_retained_lsn_count", metrics.retention_retained_lsn_count);
@@ -265,9 +274,11 @@ pub fn renderPrimaryPrometheusAlloc(alloc: Allocator, metrics: PrimaryMetrics) !
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_reseed_required", metrics.slots, .reseed_required);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_received_lsn", metrics.slots, .received_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_applied_lsn", metrics.slots, .applied_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_ha_slot_safe_read_lsn", metrics.slots, .safe_read_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_restart_lsn", metrics.slots, .restart_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_write_lag_lsn", metrics.slots, .write_lag_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_apply_lag_lsn", metrics.slots, .apply_lag_lsn);
+    try appendSlotGauges(alloc, &out, "antfly_ha_slot_safe_read_lag_lsn", metrics.slots, .safe_read_lag_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_retention_lag_lsn", metrics.slots, .retention_lag_lsn);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_status_code", metrics.slots, .status_code);
     try appendSlotGauges(alloc, &out, "antfly_ha_slot_last_error", metrics.slots, .last_error);
@@ -317,9 +328,11 @@ const SlotMetricField = enum {
     reseed_required,
     received_lsn,
     applied_lsn,
+    safe_read_lsn,
     restart_lsn,
     write_lag_lsn,
     apply_lag_lsn,
+    safe_read_lag_lsn,
     retention_lag_lsn,
     status_code,
     last_error,
@@ -384,9 +397,11 @@ fn slotMetricValue(slot: SlotMetrics, field: SlotMetricField) u64 {
         .reseed_required => slot.reseed_required,
         .received_lsn => slot.received_lsn,
         .applied_lsn => slot.applied_lsn,
+        .safe_read_lsn => slot.safe_read_lsn,
         .restart_lsn => slot.restart_lsn,
         .write_lag_lsn => slot.write_lag_lsn,
         .apply_lag_lsn => slot.apply_lag_lsn,
+        .safe_read_lag_lsn => slot.safe_read_lag_lsn,
         .retention_lag_lsn => slot.retention_lag_lsn,
         .status_code => slot.status_code,
         .last_error => slot.last_error,
@@ -409,8 +424,10 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
             .restart_lsn = 8,
             .received_lsn = 18,
             .applied_lsn = 17,
+            .safe_read_lsn = 16,
             .write_lag_lsn = 2,
             .apply_lag_lsn = 3,
+            .safe_read_lag_lsn = 4,
             .retention_lag_lsn = 12,
             .status = .healthy,
         },
@@ -422,8 +439,10 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
             .restart_lsn = 3,
             .received_lsn = 9,
             .applied_lsn = 6,
+            .safe_read_lsn = 5,
             .write_lag_lsn = 11,
             .apply_lag_lsn = 14,
+            .safe_read_lag_lsn = 15,
             .retention_lag_lsn = 17,
             .status = .reseed_required,
             .last_error = "IntentionalApplyFailure",
@@ -468,6 +487,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqual(@as(u64, 1), metrics.reseed_required_slots);
     try std.testing.expectEqual(@as(u64, 11), metrics.max_write_lag_lsn);
     try std.testing.expectEqual(@as(u64, 14), metrics.max_apply_lag_lsn);
+    try std.testing.expectEqual(@as(u64, 15), metrics.max_safe_read_lag_lsn);
     try std.testing.expectEqual(@as(u64, 17), metrics.max_retention_lag_lsn);
     try std.testing.expectEqual(@as(u64, 3), metrics.retention_oldest_restart_lsn);
     try std.testing.expectEqual(@as(u64, 17), metrics.retention_retained_lsn_count);
@@ -484,6 +504,8 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqual(@as(u64, 0), metrics.durability_satisfied_count);
     try std.testing.expectEqual(@as(u64, 2), metrics.durability_candidate_count);
     try std.testing.expectEqualStrings("standby-b", metrics.slots[1].name);
+    try std.testing.expectEqual(@as(u64, 5), metrics.slots[1].safe_read_lsn);
+    try std.testing.expectEqual(@as(u64, 15), metrics.slots[1].safe_read_lag_lsn);
     try std.testing.expectEqual(@as(u64, @intFromEnum(SlotStatusCode.reseed_required)), metrics.slots[1].status_code);
     try std.testing.expectEqual(@as(u64, 1), metrics.slots[1].last_error);
 }
@@ -547,9 +569,11 @@ test "storage.ha metrics renders prometheus text" {
             .reseed_required = 0,
             .received_lsn = 18,
             .applied_lsn = 17,
+            .safe_read_lsn = 16,
             .restart_lsn = 8,
             .write_lag_lsn = 2,
             .apply_lag_lsn = 3,
+            .safe_read_lag_lsn = 4,
             .retention_lag_lsn = 12,
             .status_code = @intFromEnum(SlotStatusCode.healthy),
             .last_error = 0,
@@ -562,6 +586,7 @@ test "storage.ha metrics renders prometheus text" {
         .reseed_required_slots = 0,
         .max_write_lag_lsn = 2,
         .max_apply_lag_lsn = 3,
+        .max_safe_read_lag_lsn = 4,
         .max_retention_lag_lsn = 12,
         .retention_oldest_restart_lsn = 8,
         .retention_retained_lsn_count = 12,
@@ -589,6 +614,7 @@ test "storage.ha metrics renders prometheus text" {
     try expectContains(primary_text, "antfly_ha_primary_durability_missing_lsn_count 0\n");
     try expectContains(primary_text, "# TYPE antfly_ha_slot_apply_lag_lsn gauge\n");
     try expectContains(primary_text, "antfly_ha_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n");
+    try expectContains(primary_text, "antfly_ha_slot_safe_read_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 4\n");
     try expectContains(primary_text, "antfly_ha_slot_last_error{slot=\"standby\\\"a\\\\b\\nc\"} 0\n");
 
     const standby_text = try renderStandbyPrometheusAlloc(alloc, .{

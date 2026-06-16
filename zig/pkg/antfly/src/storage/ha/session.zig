@@ -83,11 +83,12 @@ fn reportProgress(
     standby: *const standby_mod.Standby,
 ) !void {
     const progress = standby.currentProgress();
-    try primary.standbyStatusUpdate(
+    try primary.standbyStatusUpdateWithSafeRead(
         slot_name,
         standby.identity.timeline_id,
         progress.received_lsn,
         progress.applied_lsn,
+        progress.safe_read_lsn,
     );
 }
 
@@ -181,6 +182,7 @@ const SlotTimelineChanger = struct {
             .restart_lsn = record.lsn,
             .received_lsn = record.lsn,
             .applied_lsn = record.lsn,
+            .safe_read_lsn = record.lsn,
         });
     }
 };

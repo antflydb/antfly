@@ -57,6 +57,7 @@ pub const CreateReplicationSlotResponse = struct {
     restart_lsn: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: ?[]const u8 = null,
@@ -73,6 +74,7 @@ pub const SlotLifecycleResponse = struct {
     restart_lsn: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: ?[]const u8 = null,
@@ -123,6 +125,7 @@ pub const StandbyStatusUpdateRequest = struct {
     timeline_id: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: ?u64 = null,
 };
 
 pub const StandbyStatusUpdateResponse = struct {
@@ -130,6 +133,7 @@ pub const StandbyStatusUpdateResponse = struct {
     timeline_id: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: u64,
     restart_lsn: u64,
     active: bool,
     reseed_required: bool,
@@ -161,6 +165,7 @@ pub fn createReplicationSlot(
         .restart_lsn = slot.restart_lsn,
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
+        .safe_read_lsn = slot.safe_read_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
         .last_error = slot.last_error,
@@ -198,6 +203,7 @@ pub fn dropReplicationSlot(
         .restart_lsn = slot.restart_lsn,
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
+        .safe_read_lsn = slot.safe_read_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
         .last_error = null,
@@ -277,6 +283,7 @@ fn lifecycleResponse(primary: *const primary_mod.Primary, slot_name: []const u8,
         .restart_lsn = slot.restart_lsn,
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
+        .safe_read_lsn = slot.safe_read_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
         .last_error = slot.last_error,
@@ -289,11 +296,12 @@ pub fn standbyStatusUpdate(
     primary: *primary_mod.Primary,
     request: StandbyStatusUpdateRequest,
 ) !StandbyStatusUpdateResponse {
-    try primary.standbyStatusUpdate(
+    try primary.standbyStatusUpdateWithSafeRead(
         request.slot_name,
         request.timeline_id,
         request.received_lsn,
         request.applied_lsn,
+        request.safe_read_lsn orelse request.applied_lsn,
     );
     const slot = primary.slot(request.slot_name) orelse return error.SlotNotFound;
     return .{
@@ -301,6 +309,7 @@ pub fn standbyStatusUpdate(
         .timeline_id = slot.timeline_id,
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
+        .safe_read_lsn = slot.safe_read_lsn,
         .restart_lsn = slot.restart_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
@@ -379,6 +388,7 @@ test "storage.ha replication api identifies primary and creates restartable slot
     try std.testing.expectEqual(@as(u64, 2), created.restart_lsn);
     try std.testing.expectEqual(@as(u64, 2), created.received_lsn);
     try std.testing.expectEqual(@as(u64, 2), created.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 2), created.safe_read_lsn);
     try std.testing.expect(created.last_error == null);
     try std.testing.expectError(error.InitialLsnAheadOfPrimary, createReplicationSlot(&primary, .{
         .slot_name = "bad",
@@ -522,9 +532,11 @@ test "storage.ha replication api persists standby status updates" {
             .timeline_id = identity.timeline_id,
             .received_lsn = 2,
             .applied_lsn = 1,
+            .safe_read_lsn = 0,
         });
         try std.testing.expectEqual(@as(u64, 2), updated.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), updated.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 0), updated.safe_read_lsn);
         try std.testing.expectEqual(@as(u64, 2), updated.restart_lsn);
         try std.testing.expect(updated.active);
         try std.testing.expect(!updated.reseed_required);
@@ -543,5 +555,6 @@ test "storage.ha replication api persists standby status updates" {
         const slot = reopened.slot("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 0), slot.safe_read_lsn);
     }
 }

@@ -197,6 +197,7 @@ pub const Primary = struct {
             .restart_lsn = initial_lsn,
             .received_lsn = initial_lsn,
             .applied_lsn = initial_lsn,
+            .safe_read_lsn = initial_lsn,
         });
     }
 
@@ -274,13 +275,24 @@ pub const Primary = struct {
         received_lsn: u64,
         applied_lsn: u64,
     ) !void {
+        try self.standbyStatusUpdateWithSafeRead(slot_name, timeline_id, received_lsn, applied_lsn, applied_lsn);
+    }
+
+    pub fn standbyStatusUpdateWithSafeRead(
+        self: *Primary,
+        slot_name: []const u8,
+        timeline_id: u64,
+        received_lsn: u64,
+        applied_lsn: u64,
+        safe_read_lsn: u64,
+    ) !void {
         if (timeline_id != self.identity.timeline_id) return error.WrongTimeline;
         const state = self.slots.get(slot_name) orelse return error.SlotNotFound;
         if (!state.active) return error.SlotInactive;
         if (state.reseed_required) return error.SlotRequiresReseed;
         if (state.timeline_id != timeline_id) return error.WrongTimeline;
         if (received_lsn > self.lastLsn()) return error.StandbyAheadOfPrimary;
-        try self.slots.updateProgress(slot_name, received_lsn, applied_lsn);
+        try self.slots.updateProgress(slot_name, received_lsn, applied_lsn, safe_read_lsn);
     }
 
     pub fn reportReplicationError(self: *Primary, slot_name: []const u8, last_error: []const u8) !void {
@@ -424,6 +436,7 @@ pub const Primary = struct {
             .restart_lsn = backup_lsn,
             .received_lsn = previous_lsn,
             .applied_lsn = previous_lsn,
+            .safe_read_lsn = previous_lsn,
         });
     }
 
@@ -1208,6 +1221,7 @@ test "storage.ha primary scopes retention to the current timeline" {
         .restart_lsn = 1,
         .received_lsn = 1,
         .applied_lsn = 1,
+        .safe_read_lsn = 1,
     });
 
     const retention = try primary.retentionSnapshot(.{});
@@ -1238,6 +1252,7 @@ test "storage.ha primary rejects status updates for old timeline slots" {
         .restart_lsn = 1,
         .received_lsn = 1,
         .applied_lsn = 1,
+        .safe_read_lsn = 1,
     });
 
     try std.testing.expectError(

@@ -15,9 +15,10 @@
 //! Durable HA replication slot registry.
 //!
 //! Slots are primary-local retention contracts. They track how far each standby
-//! can restart, how much WAL it has received, and how much it has applied. The
-//! store is WAL-backed so primary restart preserves retention state before the
-//! streaming transport and base-backup layers exist.
+//! can restart, how much WAL it has received, how much it has applied, and the
+//! highest LSN safe for standby read snapshots. The store is WAL-backed so
+//! primary restart preserves retention state before the streaming transport and
+//! base-backup layers exist.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -25,9 +26,10 @@ const Crc32 = std.hash.Crc32;
 const wal_mod = @import("../wal.zig");
 
 const magic = [8]u8{ 'A', 'F', 'H', 'A', 'S', 'L', 'T', '\n' };
-const version: u16 = 2;
+const version: u16 = 3;
 const header_len: usize = 60;
 const v2_error_len_size: usize = 4;
+const v3_body_prefix_len: usize = 12;
 
 const version_offset: usize = 8;
 const event_type_offset: usize = 10;
@@ -58,6 +60,7 @@ pub const SlotState = struct {
     restart_lsn: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool = true,
     reseed_required: bool = false,
     last_error: ?[]const u8 = null,
@@ -149,14 +152,18 @@ pub const SlotStore = struct {
         name: []const u8,
         received_lsn: u64,
         applied_lsn: u64,
+        safe_read_lsn: u64,
     ) !void {
         const current = self.get(name) orelse return error.SlotNotFound;
         if (received_lsn < current.received_lsn) return error.InvalidSlotProgress;
         if (applied_lsn < current.applied_lsn) return error.InvalidSlotProgress;
+        if (safe_read_lsn < current.safe_read_lsn) return error.InvalidSlotProgress;
         if (applied_lsn > received_lsn) return error.InvalidSlotProgress;
+        if (safe_read_lsn > applied_lsn) return error.InvalidSlotProgress;
         var next = current;
         next.received_lsn = received_lsn;
         next.applied_lsn = applied_lsn;
+        next.safe_read_lsn = safe_read_lsn;
         next.restart_lsn = received_lsn;
         next.reseed_required = false;
         next.last_error = null;
@@ -385,6 +392,7 @@ pub const SlotStore = struct {
 fn validateSlotState(state: SlotState) !void {
     if (state.name.len == 0) return error.InvalidSlotName;
     if (state.applied_lsn > state.received_lsn) return error.InvalidSlotProgress;
+    if (state.safe_read_lsn > state.applied_lsn) return error.InvalidSlotProgress;
     if (state.last_error) |last_error| {
         if (last_error.len == 0) return error.InvalidReplicationError;
     }
@@ -402,7 +410,7 @@ fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     if (event.state.name.len > std.math.maxInt(u32)) return error.SlotNameTooLong;
     const last_error = event.state.last_error orelse "";
     if (last_error.len > std.math.maxInt(u32)) return error.ReplicationErrorTooLong;
-    const body_len = v2_error_len_size + event.state.name.len + last_error.len;
+    const body_len = v3_body_prefix_len + event.state.name.len + last_error.len;
     const total_len = header_len + body_len;
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
@@ -421,8 +429,9 @@ fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     if (event.state.reseed_required) flags |= 1 << 1;
     std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
     std.mem.writeInt(u32, out[header_len..][0..4], @intCast(last_error.len), .little);
-    @memcpy(out[header_len + v2_error_len_size ..][0..event.state.name.len], event.state.name);
-    @memcpy(out[header_len + v2_error_len_size + event.state.name.len ..][0..last_error.len], last_error);
+    std.mem.writeInt(u64, out[header_len + v2_error_len_size ..][0..8], event.state.safe_read_lsn, .little);
+    @memcpy(out[header_len + v3_body_prefix_len ..][0..event.state.name.len], event.state.name);
+    @memcpy(out[header_len + v3_body_prefix_len + event.state.name.len ..][0..last_error.len], last_error);
     std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..total_len]), .little);
     std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
     return out;
@@ -453,6 +462,7 @@ fn decodeEvent(bytes: []const u8) !EventView {
             .restart_lsn = std.mem.readInt(u64, bytes[restart_lsn_offset..][0..8], .little),
             .received_lsn = std.mem.readInt(u64, bytes[received_lsn_offset..][0..8], .little),
             .applied_lsn = std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
+            .safe_read_lsn = body.safe_read_lsn orelse std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
             .active = (flags & (1 << 0)) != 0,
             .reseed_required = (flags & (1 << 1)) != 0,
             .last_error = body.last_error,
@@ -464,6 +474,7 @@ const EventBodyView = struct {
     total_len: usize,
     name: []const u8,
     last_error: ?[]const u8,
+    safe_read_lsn: ?u64 = null,
 };
 
 fn decodeEventBody(bytes: []const u8, decoded_version: u16, name_len: usize) !EventBodyView {
@@ -491,6 +502,22 @@ fn decodeEventBody(bytes: []const u8, decoded_version: u16, name_len: usize) !Ev
                 .last_error = last_error,
             };
         },
+        3 => blk: {
+            if (bytes.len < header_len + v3_body_prefix_len) return error.EndOfStream;
+            const error_len: usize = @intCast(std.mem.readInt(u32, bytes[header_len..][0..4], .little));
+            const safe_read_lsn = std.mem.readInt(u64, bytes[header_len + v2_error_len_size ..][0..8], .little);
+            const name_start = header_len + v3_body_prefix_len;
+            const error_start = try std.math.add(usize, name_start, name_len);
+            const total_len = try std.math.add(usize, error_start, error_len);
+            if (bytes.len < total_len) return error.EndOfStream;
+            const last_error = if (error_len > 0) bytes[error_start..total_len] else null;
+            break :blk .{
+                .total_len = total_len,
+                .name = bytes[name_start..error_start],
+                .last_error = last_error,
+                .safe_read_lsn = safe_read_lsn,
+            };
+        },
         else => error.UnsupportedVersion,
     };
 }
@@ -515,6 +542,36 @@ fn encodeV1TestEvent(alloc: Allocator, event: EventView) ![]u8 {
     if (event.state.reseed_required) flags |= 1 << 1;
     std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
     @memcpy(out[header_len..], event.state.name);
+    std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..]), .little);
+    std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
+    return out;
+}
+
+fn encodeV2TestEvent(alloc: Allocator, event: EventView) ![]u8 {
+    if (event.state.name.len > std.math.maxInt(u32)) return error.SlotNameTooLong;
+    const last_error = event.state.last_error orelse "";
+    if (last_error.len > std.math.maxInt(u32)) return error.ReplicationErrorTooLong;
+    const body_len = v2_error_len_size + event.state.name.len + last_error.len;
+    const total_len = header_len + body_len;
+    const out = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(out);
+
+    @memset(out[0..header_len], 0);
+    @memcpy(out[0..8], &magic);
+    std.mem.writeInt(u16, out[version_offset..][0..2], 2, .little);
+    std.mem.writeInt(u16, out[event_type_offset..][0..2], @intFromEnum(event.event_type), .little);
+    std.mem.writeInt(u32, out[name_len_offset..][0..4], @intCast(event.state.name.len), .little);
+    std.mem.writeInt(u64, out[timeline_id_offset..][0..8], event.state.timeline_id, .little);
+    std.mem.writeInt(u64, out[restart_lsn_offset..][0..8], event.state.restart_lsn, .little);
+    std.mem.writeInt(u64, out[received_lsn_offset..][0..8], event.state.received_lsn, .little);
+    std.mem.writeInt(u64, out[applied_lsn_offset..][0..8], event.state.applied_lsn, .little);
+    var flags: u32 = 0;
+    if (event.state.active) flags |= 1 << 0;
+    if (event.state.reseed_required) flags |= 1 << 1;
+    std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
+    std.mem.writeInt(u32, out[header_len..][0..4], @intCast(last_error.len), .little);
+    @memcpy(out[header_len + v2_error_len_size ..][0..event.state.name.len], event.state.name);
+    @memcpy(out[header_len + v2_error_len_size + event.state.name.len ..][0..last_error.len], last_error);
     std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..]), .little);
     std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
     return out;
@@ -548,8 +605,9 @@ test "storage.ha slot store persists slot progress across reopen" {
             .restart_lsn = 1,
             .received_lsn = 5,
             .applied_lsn = 3,
+            .safe_read_lsn = 3,
         });
-        try store.updateProgress("standby-a", 8, 7);
+        try store.updateProgress("standby-a", 8, 7, 6);
     }
 
     {
@@ -561,6 +619,7 @@ test "storage.ha slot store persists slot progress across reopen" {
         try std.testing.expectEqual(@as(u64, 8), slot.restart_lsn);
         try std.testing.expectEqual(@as(u64, 8), slot.received_lsn);
         try std.testing.expectEqual(@as(u64, 7), slot.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 6), slot.safe_read_lsn);
     }
 }
 
@@ -578,6 +637,7 @@ test "storage.ha slot store tracks transient replication error until progress" {
             .restart_lsn = 1,
             .received_lsn = 1,
             .applied_lsn = 1,
+            .safe_read_lsn = 1,
         });
         try store.setLastError("standby-a", "IntentionalApplyFailure");
 
@@ -592,7 +652,7 @@ test "storage.ha slot store tracks transient replication error until progress" {
         var slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
 
-        try reopened.updateProgress("standby-a", 2, 2);
+        try reopened.updateProgress("standby-a", 2, 2, 2);
         slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expect(slot.last_error == null);
 
@@ -621,6 +681,7 @@ test "storage.ha slot store decodes v1 slot events without last error" {
             .restart_lsn = 2,
             .received_lsn = 3,
             .applied_lsn = 2,
+            .safe_read_lsn = 2,
         },
     });
     defer alloc.free(encoded);
@@ -628,7 +689,31 @@ test "storage.ha slot store decodes v1 slot events without last error" {
     const event = try decodeEvent(encoded);
     try std.testing.expectEqual(EventType.upsert, event.event_type);
     try std.testing.expectEqualStrings("standby-a", event.state.name);
+    try std.testing.expectEqual(@as(u64, 2), event.state.safe_read_lsn);
     try std.testing.expect(event.state.last_error == null);
+}
+
+test "storage.ha slot store decodes v2 slot events with safe reads at applied lsn" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeV2TestEvent(alloc, .{
+        .event_type = .upsert,
+        .state = .{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .restart_lsn = 2,
+            .received_lsn = 5,
+            .applied_lsn = 4,
+            .safe_read_lsn = 4,
+            .last_error = "TransientLag",
+        },
+    });
+    defer alloc.free(encoded);
+
+    const event = try decodeEvent(encoded);
+    try std.testing.expectEqual(EventType.upsert, event.event_type);
+    try std.testing.expectEqualStrings("standby-a", event.state.name);
+    try std.testing.expectEqual(@as(u64, 4), event.state.safe_read_lsn);
+    try std.testing.expectEqualStrings("TransientLag", event.state.last_error.?);
 }
 
 test "storage.ha slot store rejects invalid slot state on replay" {
@@ -646,6 +731,7 @@ test "storage.ha slot store rejects invalid slot state on replay" {
                 .restart_lsn = 4,
                 .received_lsn = 3,
                 .applied_lsn = 4,
+                .safe_read_lsn = 4,
             },
         });
         defer alloc.free(encoded);
@@ -666,6 +752,7 @@ test "storage.ha slot store rejects invalid slot state on replay" {
                 .restart_lsn = 1,
                 .received_lsn = 1,
                 .applied_lsn = 1,
+                .safe_read_lsn = 1,
             },
         });
         defer alloc.free(encoded);
@@ -681,8 +768,8 @@ test "storage.ha slot store computes retention floor from active slots" {
 
     var store = try SlotStore.open(alloc, path.ptr, .{});
     defer store.close();
-    try store.createOrUpdate(.{ .name = "a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4 });
-    try store.createOrUpdate(.{ .name = "b", .timeline_id = 1, .restart_lsn = 7, .received_lsn = 9, .applied_lsn = 7 });
+    try store.createOrUpdate(.{ .name = "a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
+    try store.createOrUpdate(.{ .name = "b", .timeline_id = 1, .restart_lsn = 7, .received_lsn = 9, .applied_lsn = 7, .safe_read_lsn = 7 });
 
     const snapshot = try store.retentionSnapshot(10, .{});
     try std.testing.expectEqual(@as(u64, 4), snapshot.oldest_restart_lsn);
@@ -698,8 +785,8 @@ test "storage.ha slot store marks slots for reseed when lag cap is exceeded" {
 
     var store = try SlotStore.open(alloc, path.ptr, .{});
     defer store.close();
-    try store.createOrUpdate(.{ .name = "slow", .timeline_id = 1, .restart_lsn = 2, .received_lsn = 3, .applied_lsn = 2 });
-    try store.createOrUpdate(.{ .name = "fast", .timeline_id = 1, .restart_lsn = 9, .received_lsn = 10, .applied_lsn = 9 });
+    try store.createOrUpdate(.{ .name = "slow", .timeline_id = 1, .restart_lsn = 2, .received_lsn = 3, .applied_lsn = 2, .safe_read_lsn = 2 });
+    try store.createOrUpdate(.{ .name = "fast", .timeline_id = 1, .restart_lsn = 9, .received_lsn = 10, .applied_lsn = 9, .safe_read_lsn = 9 });
 
     const snapshot = try store.retentionSnapshot(12, .{ .max_lag_lsn = 5 });
     try std.testing.expectEqual(@as(usize, 1), snapshot.reseed_recommended);
@@ -721,7 +808,7 @@ test "storage.ha slot store drops slots and releases retention" {
 
     var store = try SlotStore.open(alloc, path.ptr, .{});
     defer store.close();
-    try store.createOrUpdate(.{ .name = "a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4 });
+    try store.createOrUpdate(.{ .name = "a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
     try store.drop("a");
     try std.testing.expectEqual(@as(usize, 0), store.count());
     const snapshot = try store.retentionSnapshot(10, .{});
@@ -737,7 +824,7 @@ test "storage.ha slot store persists pause and resume state" {
     {
         var store = try SlotStore.open(alloc, path.ptr, .{});
         defer store.close();
-        try store.createOrUpdate(.{ .name = "standby-a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4 });
+        try store.createOrUpdate(.{ .name = "standby-a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4, .safe_read_lsn = 4 });
         try store.pause("standby-a");
         const paused = store.get("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expect(!paused.active);
@@ -777,6 +864,7 @@ test "storage.ha slot store allows backup pin ahead of standby progress" {
         .restart_lsn = 10,
         .received_lsn = 9,
         .applied_lsn = 9,
+        .safe_read_lsn = 9,
     });
 
     const snapshot = try store.retentionSnapshot(12, .{});
@@ -785,4 +873,5 @@ test "storage.ha slot store allows backup pin ahead of standby progress" {
     const slot = store.get("standby-seeding") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 9), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 9), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 9), slot.safe_read_lsn);
 }
