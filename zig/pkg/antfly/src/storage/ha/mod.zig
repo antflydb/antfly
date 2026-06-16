@@ -18,6 +18,7 @@ pub const slot_store = @import("slot_store.zig");
 pub const standby = @import("standby.zig");
 pub const primary = @import("primary.zig");
 pub const session = @import("session.zig");
+pub const backup_manifest = @import("backup_manifest.zig");
 
 test {
     _ = replication_record;
@@ -26,4 +27,5 @@ test {
     _ = standby;
     _ = primary;
     _ = session;
+    _ = backup_manifest;
 }
