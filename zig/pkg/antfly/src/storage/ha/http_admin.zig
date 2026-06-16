@@ -30,6 +30,7 @@ const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const rejoin = @import("rejoin.zig");
 const standby_mod = @import("standby.zig");
+const status_mod = @import("status.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -150,6 +151,7 @@ pub const Server = struct {
     }
 
     fn handleAdminPrimaryStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         const query = requestQuery(req.uri);
         const max_lag_lsn = if (queryValue(query, "max_lag_lsn")) |raw|
             uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA primary status request")
@@ -158,52 +160,44 @@ pub const Server = struct {
         var sync = buildSyncPolicyFromQuery(self.alloc, query) catch
             return try textResponse(self.alloc, 400, "invalid HA primary status request");
         errdefer sync.deinit(self.alloc);
+        defer sync.deinit(self.alloc);
 
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .primary_status = .{
-                .retention_policy = .{ .max_lag_lsn = max_lag_lsn },
-                .sync_policy = sync.policy,
-            } },
-            .owned_standby_names = sync.owned_standby_names,
+        var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{ .max_lag_lsn = max_lag_lsn }, sync.policy) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        sync.owned_standby_names = &.{};
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        defer snapshot.deinit(self.alloc);
+        return try self.handleTypedJson(status_mod.primaryStatusDocument(snapshot));
     }
 
     fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
         const query = requestQuery(req.uri);
         const upstream_lsn = if (queryValue(query, "upstream_lsn")) |raw|
             uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA standby status request")
         else
             null;
 
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .standby_status = .{ .upstream_lsn = upstream_lsn } },
-        };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        return try self.handleTypedJson(status_mod.standbyStatusDocument(
+            ha_admin.standbyStatus(standby, upstream_lsn),
+        ));
     }
 
     fn handleAdminReplicationSlots(self: *Server) !http_common.HttpResponse {
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .slot_list = .{} },
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        var snapshot = ha_admin.primaryStatus(self.alloc, primary, .{}, null) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        defer snapshot.deinit(self.alloc);
+        return try self.handleTypedJson(status_mod.primaryStatusDocument(snapshot));
     }
 
     fn handleAdminCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
 
-        var parsed = std.json.parseFromSlice(
-            admin_api.ReplicationSlotCreateRequest,
+        var parsed = admin_api.openapi.server.parseCreateHAReplicationSlotBody(
             self.alloc,
             req.body,
-            .{ .ignore_unknown_fields = true },
         ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");
         defer parsed.deinit();
 
@@ -212,18 +206,16 @@ pub const Server = struct {
             break :blk @intCast(value);
         } else null;
 
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .slot = .{
-                .action = .create,
-                .request = ha_admin.SlotRequest{
-                    .slot_name = parsed.value.slot_name,
-                    .initial_lsn = initial_lsn,
-                },
-            } },
+        const result = ha_admin.applySlotAction(primary, .create, .{
+            .slot_name = parsed.value.slot_name,
+            .initial_lsn = initial_lsn,
+        }) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        return switch (result) {
+            .create => |slot| try self.handleTypedJson(slotActionDocument("create", slot, null)),
+            else => unreachable,
+        };
     }
 
     fn handleAdminReplicationSlotLifecycle(
@@ -231,17 +223,18 @@ pub const Server = struct {
         slot_name: []const u8,
         action: ha_admin.SlotAction,
     ) !http_common.HttpResponse {
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .slot = .{
-                .action = action,
-                .request = ha_admin.SlotRequest{
-                    .slot_name = slot_name,
-                },
-            } },
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        const result = ha_admin.applySlotAction(primary, action, .{
+            .slot_name = slot_name,
+        }) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        return switch (result) {
+            .create => unreachable,
+            .pause => |slot| try self.handleTypedJson(slotActionDocument("pause", slot, slot.dropped)),
+            .@"resume" => |slot| try self.handleTypedJson(slotActionDocument("resume", slot, slot.dropped)),
+            .drop => |slot| try self.handleTypedJson(slotActionDocument("drop", slot, slot.dropped)),
+        };
     }
 
     fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -461,6 +454,14 @@ pub const Server = struct {
         };
     }
 
+    fn handleTypedJson(self: *Server, value: anytype) !http_common.HttpResponse {
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .body = try std.json.Stringify.valueAlloc(self.alloc, value, .{}),
+        };
+    }
+
     fn execute(ptr: *anyopaque, _: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *Server = @ptrCast(@alignCast(ptr));
         return try self.handle(req);
@@ -470,6 +471,45 @@ pub const Server = struct {
         return self.ctx.primary != null or self.ctx.standby != null or self.ctx.fence_store != null;
     }
 };
+
+const SlotActionDocument = struct {
+    schema_version: u32 = 1,
+    slot_action: []const u8,
+    slot: SlotDocument,
+};
+
+const SlotDocument = struct {
+    slot_name: []const u8,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
+    active: bool,
+    reseed_required: bool,
+    last_error: ?[]const u8,
+    current_lsn: u64,
+    dropped: ?bool = null,
+};
+
+fn slotActionDocument(action: []const u8, slot: anytype, dropped: ?bool) SlotActionDocument {
+    return .{
+        .slot_action = action,
+        .slot = .{
+            .slot_name = slot.slot_name,
+            .timeline_id = slot.timeline_id,
+            .restart_lsn = slot.restart_lsn,
+            .received_lsn = slot.received_lsn,
+            .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
+            .active = slot.active,
+            .reseed_required = slot.reseed_required,
+            .last_error = slot.last_error,
+            .current_lsn = slot.current_lsn,
+            .dropped = dropped,
+        },
+    };
+}
 
 fn requestPath(uri: []const u8) []const u8 {
     const path_with_query = if (std.mem.indexOf(u8, uri, "://")) |scheme_index| blk: {
@@ -863,7 +903,9 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_status.status);
     try std.testing.expectEqualStrings("application/json", typed_status.content_type.?);
-    try expectContains(typed_status.body, "\"primary_status\"");
+    try expectContains(typed_status.body, "\"schema_version\":1");
+    try expectContains(typed_status.body, "\"snapshot\"");
+    try expectContains(typed_status.body, "\"role\":\"primary\"");
     try expectContains(typed_status.body, "\"current_lsn\":0");
 
     var typed_create = try server.handle(.{
@@ -875,6 +917,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_create.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_create.status);
     try std.testing.expectEqualStrings("application/json", typed_create.content_type.?);
+    try expectContains(typed_create.body, "\"slot_action\":\"create\"");
     try expectContains(typed_create.body, "\"slot_name\":\"standby-b\"");
 
     var typed_slots = try server.handle(.{
@@ -884,7 +927,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_slots.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_slots.status);
     try std.testing.expectEqualStrings("application/json", typed_slots.content_type.?);
-    try expectContains(typed_slots.body, "\"slot_list\"");
+    try expectContains(typed_slots.body, "\"snapshot\"");
+    try expectContains(typed_slots.body, "\"slots\"");
     try expectContains(typed_slots.body, "\"name\":\"standby-a\"");
     try expectContains(typed_slots.body, "\"name\":\"standby-b\"");
 
@@ -897,6 +941,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_pause.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_pause.status);
     try std.testing.expectEqualStrings("application/json", typed_pause.content_type.?);
+    try expectContains(typed_pause.body, "\"slot_action\":\"pause\"");
     try expectContains(typed_pause.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_pause.body, "\"active\":false");
 
@@ -909,6 +954,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_resume.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_resume.status);
     try std.testing.expectEqualStrings("application/json", typed_resume.content_type.?);
+    try expectContains(typed_resume.body, "\"slot_action\":\"resume\"");
     try expectContains(typed_resume.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_resume.body, "\"active\":true");
 
@@ -921,7 +967,9 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_drop.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_drop.status);
     try std.testing.expectEqualStrings("application/json", typed_drop.content_type.?);
+    try expectContains(typed_drop.body, "\"slot_action\":\"drop\"");
     try expectContains(typed_drop.body, "\"slot_name\":\"standby-b\"");
+    try expectContains(typed_drop.body, "\"dropped\":true");
 
     var invalid_typed_create = try server.handle(.{
         .method = .POST,
@@ -964,7 +1012,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_standby_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_standby_status.status);
     try std.testing.expectEqualStrings("application/json", typed_standby_status.content_type.?);
-    try expectContains(typed_standby_status.body, "\"standby_status\"");
+    try expectContains(typed_standby_status.body, "\"snapshot\"");
+    try expectContains(typed_standby_status.body, "\"role\":\"standby\"");
     try expectContains(typed_standby_status.body, "\"received_lsn\":1");
     try expectContains(typed_standby_status.body, "\"applied_lsn\":1");
 
@@ -980,7 +1029,7 @@ test "storage.ha http admin serves health and command endpoint" {
     });
     defer typed_primary_policy_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_primary_policy_status.status);
-    try expectContains(typed_primary_policy_status.body, "\"primary_status\"");
+    try expectContains(typed_primary_policy_status.body, "\"snapshot\"");
     try expectContains(typed_primary_policy_status.body, "\"durability\"");
     try expectContains(typed_primary_policy_status.body, "\"mode\":\"remote_apply\"");
     try expectContains(typed_primary_policy_status.body, "\"status\":\"satisfied\"");
@@ -997,7 +1046,7 @@ test "storage.ha http admin serves health and command endpoint" {
     });
     defer typed_standby_upstream_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_standby_upstream_status.status);
-    try expectContains(typed_standby_upstream_status.body, "\"standby_status\"");
+    try expectContains(typed_standby_upstream_status.body, "\"snapshot\"");
     try expectContains(typed_standby_upstream_status.body, "\"upstream_lsn\":2");
     try expectContains(typed_standby_upstream_status.body, "\"write_lag_lsn\":1");
 

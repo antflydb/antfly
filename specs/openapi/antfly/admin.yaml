@@ -76,7 +76,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAPrimaryStatusResponse"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/standby/status:
@@ -99,7 +99,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAStandbyStatusResponse"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/replication-slots:
@@ -113,7 +113,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAPrimaryStatusResponse"
         "409":
           $ref: "#/components/responses/Conflict"
     post:
@@ -132,7 +132,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -150,7 +150,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -168,7 +168,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -186,7 +186,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -635,6 +635,311 @@ components:
         use_current_fence:
           type: boolean
           default: false
+    HAPrimaryStatusResponse:
+      type: object
+      required: [schema_version, snapshot]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        snapshot:
+          $ref: "#/components/schemas/HAPrimarySnapshot"
+    HAStandbyStatusResponse:
+      type: object
+      required: [schema_version, snapshot]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        snapshot:
+          $ref: "#/components/schemas/HAStandbySnapshot"
+    HAReplicationSlotActionResponse:
+      type: object
+      required: [schema_version, slot_action, slot]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        slot_action:
+          type: string
+          enum: [create, pause, resume, drop]
+        slot:
+          $ref: "#/components/schemas/HAReplicationSlot"
+    HAPrimarySnapshot:
+      type: object
+      required: [role, identity, current_lsn, slots, retention]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary]
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        slots:
+          type: array
+          items:
+            $ref: "#/components/schemas/HASlotSnapshot"
+        retention:
+          $ref: "#/components/schemas/HARetentionSnapshot"
+        durability:
+          nullable: true
+          $ref: "#/components/schemas/HADurabilityDecision"
+    HAStandbySnapshot:
+      type: object
+      required:
+        - role
+        - identity
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - unapplied_lsn_count
+        - caught_up_to_received
+        - can_serve_safe_reads
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [standby]
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        upstream_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        write_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        receive_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        apply_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        unapplied_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        caught_up_to_received:
+          type: boolean
+        can_serve_safe_reads:
+          type: boolean
+    HASlotSnapshot:
+      type: object
+      required:
+        - name
+        - timeline_id
+        - active
+        - reseed_required
+        - restart_lsn
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - write_lag_lsn
+        - apply_lag_lsn
+        - safe_read_lag_lsn
+        - retention_lag_lsn
+        - status
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        active:
+          type: boolean
+        reseed_required:
+          type: boolean
+        restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        write_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        apply_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        retention_lag_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        status:
+          type: string
+          enum: [healthy, lagging, reseed_required]
+        last_error:
+          type: string
+          nullable: true
+    HARetentionSnapshot:
+      type: object
+      required: [primary_lsn, oldest_restart_lsn, retained_lsn_count, active_slots, reseed_recommended]
+      additionalProperties: false
+      properties:
+        primary_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        oldest_restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        active_slots:
+          type: integer
+          format: uint64
+          minimum: 0
+        reseed_recommended:
+          type: integer
+          format: uint64
+          minimum: 0
+    HADurabilityDecision:
+      type: object
+      required:
+        - status
+        - mode
+        - selection
+        - target_lsn
+        - progress_lsn
+        - missing_lsn_count
+        - satisfied_count
+        - required_count
+        - candidate_count
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [satisfied, would_block, fail_closed, degraded_to_async]
+        mode:
+          type: string
+          enum: [async, remote_write, remote_apply]
+        selection:
+          type: string
+          enum: [any, first, all]
+        target_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        progress_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        missing_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        satisfied_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        required_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        candidate_count:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAReplicationSlot:
+      type: object
+      required:
+        - slot_name
+        - timeline_id
+        - restart_lsn
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - active
+        - reseed_required
+        - current_lsn
+      additionalProperties: false
+      properties:
+        slot_name:
+          type: string
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        active:
+          type: boolean
+        reseed_required:
+          type: boolean
+        last_error:
+          type: string
+          nullable: true
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        dropped:
+          type: boolean
+          nullable: true
     HACommandResult:
       type: object
       description: |

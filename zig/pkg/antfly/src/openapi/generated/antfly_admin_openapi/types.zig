@@ -44,6 +44,57 @@ pub const PromotionAssessRequest = struct {
     use_current_fence: ?bool = null,
 };
 
+pub const HASlotSnapshot = struct {
+    name: []const u8,
+    timeline_id: i64,
+    active: bool,
+    reseed_required: bool,
+    restart_lsn: i64,
+    received_lsn: i64,
+    applied_lsn: i64,
+    safe_read_lsn: i64,
+    write_lag_lsn: i64,
+    apply_lag_lsn: i64,
+    safe_read_lag_lsn: i64,
+    retention_lag_lsn: i64,
+    status: []const u8,
+    last_error: ?[]const u8 = null,
+};
+
+pub const HARetentionSnapshot = struct {
+    primary_lsn: i64,
+    oldest_restart_lsn: i64,
+    retained_lsn_count: i64,
+    active_slots: i64,
+    reseed_recommended: i64,
+};
+
+pub const HADurabilityDecision = struct {
+    status: []const u8,
+    mode: []const u8,
+    selection: []const u8,
+    target_lsn: i64,
+    progress_lsn: i64,
+    missing_lsn_count: i64,
+    satisfied_count: i64,
+    required_count: i64,
+    candidate_count: i64,
+};
+
+pub const HAReplicationSlot = struct {
+    slot_name: []const u8,
+    timeline_id: i64,
+    restart_lsn: i64,
+    received_lsn: i64,
+    applied_lsn: i64,
+    safe_read_lsn: i64,
+    active: bool,
+    reseed_required: bool,
+    last_error: ?[]const u8 = null,
+    current_lsn: i64,
+    dropped: ?bool = null,
+};
+
 /// JSON rendering of the underlying HA admin command result. This envelope remains intentionally tolerant while the hot-standby API graduates from operator integration to a fully typed response schema.
 pub const HACommandResult = struct {};
 
@@ -75,6 +126,36 @@ pub const HAFenceReceipt = struct {
     reason: []const u8,
 };
 
+pub const HAStandbySnapshot = struct {
+    role: []const u8,
+    identity: HAIdentity,
+    received_lsn: i64,
+    applied_lsn: i64,
+    safe_read_lsn: i64,
+    upstream_lsn: ?i64 = null,
+    write_lag_lsn: ?i64 = null,
+    receive_lag_lsn: ?i64 = null,
+    apply_lag_lsn: ?i64 = null,
+    unapplied_lsn_count: i64,
+    caught_up_to_received: bool,
+    can_serve_safe_reads: bool,
+};
+
+pub const HAPrimarySnapshot = struct {
+    role: []const u8,
+    identity: HAIdentity,
+    current_lsn: i64,
+    slots: []const HASlotSnapshot,
+    retention: HARetentionSnapshot,
+    durability: ?HADurabilityDecision = null,
+};
+
+pub const HAReplicationSlotActionResponse = struct {
+    schema_version: i64,
+    slot_action: []const u8,
+    slot: HAReplicationSlot,
+};
+
 pub const RejoinAssessRequest = struct {
     /// Former primary node id that is attempting to rejoin.
     node_id: []const u8,
@@ -86,4 +167,14 @@ pub const RejoinAssessRequest = struct {
     allow_rewind_after_forced_promotion: ?bool = null,
     /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     receipt: ?HAFenceReceipt = null,
+};
+
+pub const HAStandbyStatusResponse = struct {
+    schema_version: i64,
+    snapshot: HAStandbySnapshot,
+};
+
+pub const HAPrimaryStatusResponse = struct {
+    schema_version: i64,
+    snapshot: HAPrimarySnapshot,
 };
