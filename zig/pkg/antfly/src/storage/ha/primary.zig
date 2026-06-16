@@ -280,6 +280,15 @@ pub const Primary = struct {
 
     pub fn evaluateDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
         if (target_lsn > self.lastLsn()) return error.TargetAheadOfPrimary;
+        return self.evaluateDurabilityAt(target_lsn, policy);
+    }
+
+    pub fn evaluateAppendDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
+        if (target_lsn != self.nextLsn()) return error.TargetAheadOfPrimary;
+        return self.evaluateDurabilityAt(target_lsn, policy);
+    }
+
+    fn evaluateDurabilityAt(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
         if (policy.mode == .async) {
             return .{
                 .status = .satisfied,

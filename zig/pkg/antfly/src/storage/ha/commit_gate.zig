@@ -64,6 +64,11 @@ pub fn appendAndEvaluate(
     append_options: primary_mod.AppendOptions,
     policy: primary_mod.SyncPolicy,
 ) !AppendResult {
+    if (policy.mode != .async and policy.failure_policy == .fail_closed) {
+        const preflight = try primary.evaluateAppendDurability(primary.nextLsn(), policy);
+        if (preflight.status == .fail_closed) return error.SyncPolicyUnsatisfied;
+    }
+
     const lsn = try primary.append(append_options);
     return .{
         .lsn = lsn,
@@ -200,6 +205,25 @@ test "storage.ha commit gate waits rejects or degrades by failure policy" {
     try std.testing.expectEqual(Action.acknowledge, gate.action);
     try std.testing.expectEqual(@as(u64, 1), gate.decision.progress_lsn);
     try std.testing.expectEqual(@as(u64, 0), gate.decision.missing_lsn_count);
+}
+
+test "storage.ha commit gate fail closed append rejects before local wal" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "fail-closed-append");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    const names = [_][]const u8{"standby-a"};
+
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, appendAndEvaluate(&primary, .{ .payload = "one" }, .{
+        .mode = .remote_write,
+        .standby_names = &names,
+        .failure_policy = .fail_closed,
+    }));
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
 }
 
 test "storage.ha commit gate ignores paused or reseed-required slots" {

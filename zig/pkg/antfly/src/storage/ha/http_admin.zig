@@ -142,6 +142,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.MissingReceivedRecord,
         error.RecordAlreadyReceived,
         error.StandbyAlreadyBootstrapped,
+        error.SyncPolicyUnsatisfied,
         => 409,
         error.SlotNotFound,
         error.BackupStartNotFound,
@@ -344,6 +345,17 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 409), inactive_stream.status);
     try expectContains(inactive_stream.body, "SlotInactive");
     try primary.resumeSlot("standby-a");
+
+    var fail_closed_append = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"commit\",\"append\",\"--payload\",\"two\",\"--sync-mode\",\"remote-write\",\"--sync-standby\",\"standby-a\",\"--sync-failure\",\"fail-closed\"]}",
+    });
+    defer fail_closed_append.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), fail_closed_append.status);
+    try expectContains(fail_closed_append.body, "SyncPolicyUnsatisfied");
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 
     var fence = try server.handle(.{
         .method = .POST,
