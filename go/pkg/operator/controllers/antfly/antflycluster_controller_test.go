@@ -412,9 +412,11 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 		AdminCommand: []string{"seed", "begin"},
 	}}
 
+	dependentHash := haAdminActionHash(actions[2])
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeTrue())
 
 	actions[2].DependsOn = ""
+	g.Expect(haAdminActionHash(actions[2])).NotTo(Equal(dependentHash))
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeFalse())
 
 	actions[2].DependsOn = string(haActionDropSlot)

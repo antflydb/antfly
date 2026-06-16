@@ -4152,6 +4152,7 @@ func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedAc
 func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 	rendered, err := json.Marshal(struct {
 		Kind         string   `json:"kind"`
+		DependsOn    string   `json:"dependsOn,omitempty"`
 		StandbyName  string   `json:"standbyName,omitempty"`
 		SlotName     string   `json:"slotName,omitempty"`
 		TargetLSN    uint64   `json:"targetLSN,omitempty"`
@@ -4165,6 +4166,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		Reason       string   `json:"reason,omitempty"`
 	}{
 		Kind:         action.Kind,
+		DependsOn:    action.DependsOn,
 		StandbyName:  action.StandbyName,
 		SlotName:     action.SlotName,
 		TargetLSN:    action.TargetLSN,
