@@ -77,10 +77,11 @@ const (
 	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
 	haPrimaryRouteSelectorAnnotation        = "antfly.io/ha-primary-route-selector-applied"
 
-	haAdminJobPhasePending   = "Pending"
-	haAdminJobPhaseRunning   = "Running"
-	haAdminJobPhaseSucceeded = "Succeeded"
-	haAdminJobPhaseFailed    = "Failed"
+	haAdminJobPhaseWaitingDependency = "WaitingDependency"
+	haAdminJobPhasePending           = "Pending"
+	haAdminJobPhaseRunning           = "Running"
+	haAdminJobPhaseSucceeded         = "Succeeded"
+	haAdminJobPhaseFailed            = "Failed"
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -3257,6 +3258,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+			if action.AdminJobName == "" && action.AdminJobPhase == "" {
+				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
+			}
 			continue
 		}
 
