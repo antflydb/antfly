@@ -8446,6 +8446,19 @@
       "sql": "UPDATE usage_records SET tags = array_append(source.tags, 'joined') FROM source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'hot') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags"
     },
     {
+      "name": "joined update source json expression assignment",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "patch_expressions": 1,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:patch_expr=1:right_expr_pred=1",
+      "sql": "UPDATE usage_records SET metadata = jsonb_build_object('status', source.status, 'tags', to_jsonb(source.tags)) FROM source_records AS source WHERE usage_records.id = source.id AND jsonb_extract_path_text(source.metadata, 'source') = 'api' FOR UPDATE RETURNING id, jsonb_extract_path_text(source.metadata, 'source') AS source_name"
+    },
+    {
       "name": "joined delete source returning field",
       "family": "delete_joined_source",
       "summary": {
@@ -8490,6 +8503,18 @@
       },
       "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
       "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'stale') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags"
+    },
+    {
+      "name": "joined delete source json returning expression",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
+      "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND jsonb_extract_path_text(source.metadata, 'source') = 'stale' FOR UPDATE RETURNING id, jsonb_build_object('source', jsonb_extract_path_text(source.metadata, 'source'), 'tags', to_jsonb(source.tags)) AS source_doc"
     },
     {
       "name": "distinct on ordered query",

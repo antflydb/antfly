@@ -25878,6 +25878,11 @@ const Parser = struct {
             sqlKeywordIsDateTruncFunction(token.text) or
             sqlKeywordIsDateBinFunction(token.text) or
             sqlKeywordIsDatePartFunction(token.text) or
+            (sqlKeywordIsJsonExtractPathFunction(token.text) and index + 1 < self.tokens.len and self.tokens[index + 1].kind == .lparen) or
+            (sqlKeywordIsJsonTypeofFunction(token.text) and index + 1 < self.tokens.len and self.tokens[index + 1].kind == .lparen) or
+            (sqlKeywordIsJsonArrayLengthFunction(token.text) and index + 1 < self.tokens.len and self.tokens[index + 1].kind == .lparen) or
+            (sqlKeywordIsJsonBuildObjectFunction(token.text) and index + 1 < self.tokens.len and self.tokens[index + 1].kind == .lparen) or
+            (std.ascii.eqlIgnoreCase(token.text, "to_jsonb") and index + 1 < self.tokens.len and self.tokens[index + 1].kind == .lparen) or
             sqlKeywordIsRegexpMatchFunction(token.text) or
             sqlKeywordIsRegexpCountFunction(token.text) or
             sqlKeywordIsRegexpSubstrFunction(token.text) or
@@ -61845,6 +61850,8 @@ const AppParityCorpusCoverage = struct {
     delete_joined_source_regexp_expression: bool = false,
     update_joined_source_array_expression: bool = false,
     delete_joined_source_array_expression: bool = false,
+    update_joined_source_json_expression: bool = false,
+    delete_joined_source_json_expression: bool = false,
     update_joined_source_row_assignment: bool = false,
     update_source_patch_expression: bool = false,
     update_source_increment_expression: bool = false,
@@ -62355,6 +62362,19 @@ const AppParityCorpusCoverage = struct {
         self.delete_joined_source_array_expression = self.delete_joined_source_array_expression or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
             std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
+            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.update_joined_source_json_expression = self.update_joined_source_json_expression or (is_update_joined_source and
+            std.mem.indexOf(u8, entry.sql, "jsonb_build_object('status', source.status") != null and
+            std.mem.indexOf(u8, entry.sql, "to_jsonb(source.tags") != null and
+            std.mem.indexOf(u8, entry.sql, "jsonb_extract_path_text(source.metadata") != null and
+            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
+        self.delete_joined_source_json_expression = self.delete_joined_source_json_expression or (is_delete_joined_source and
+            std.mem.indexOf(u8, entry.sql, "jsonb_build_object('source'") != null and
+            std.mem.indexOf(u8, entry.sql, "to_jsonb(source.tags") != null and
+            std.mem.indexOf(u8, entry.sql, "jsonb_extract_path_text(source.metadata") != null and
             appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
             appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
@@ -63879,6 +63899,15 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.insert_source_conflict_json_set_expression);
         try std.testing.expect(self.update_source_json_set_expression);
         try std.testing.expect(self.update_joined_source_json_set_expression);
+    }
+
+    fn expectJsonExpressionCoverage(self: @This()) !void {
+        try std.testing.expect(self.query_json_build_object_expression);
+        try std.testing.expect(self.query_to_jsonb_expression);
+        try std.testing.expect(self.to_jsonb_value_wrapper);
+        try std.testing.expect(self.to_jsonb_dynamic_expression);
+        try std.testing.expect(self.update_joined_source_json_expression);
+        try std.testing.expect(self.delete_joined_source_json_expression);
     }
 
     fn expectConflictBooleanGuardCoverage(self: @This()) !void {
@@ -69641,6 +69670,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE usage_records SET tags = array_append(source.tags, 'joined') FROM source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'hot') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags",
         },
         .{
+            .name = "joined update source json expression assignment",
+            .family = .update_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .patch_expressions = 1, .returning = 1 },
+            .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:patch_expr=1:right_expr_pred=1",
+            .sql = "UPDATE usage_records SET metadata = jsonb_build_object('status', source.status, 'tags', to_jsonb(source.tags)) FROM source_records AS source WHERE usage_records.id = source.id AND jsonb_extract_path_text(source.metadata, 'source') = 'api' FOR UPDATE RETURNING id, jsonb_extract_path_text(source.metadata, 'source') AS source_name",
+        },
+        .{
             .name = "joined delete source returning field",
             .family = .delete_joined_source,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .returning = 1 },
@@ -69667,6 +69703,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
             .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
             .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND array_position(source.tags, 'stale') > 0 FOR UPDATE RETURNING id, array_to_string(source.tags, ',') AS source_tags",
+        },
+        .{
+            .name = "joined delete source json returning expression",
+            .family = .delete_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
+            .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
+            .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND jsonb_extract_path_text(source.metadata, 'source') = 'stale' FOR UPDATE RETURNING id, jsonb_build_object('source', jsonb_extract_path_text(source.metadata, 'source'), 'tags', to_jsonb(source.tags)) AS source_doc",
         },
         .{
             .name = "distinct on ordered query",
@@ -69889,6 +69932,7 @@ test "postgres sql adapter classifies application parity corpus" {
     try coverage.expectRowAssignmentCoverage();
     try coverage.expectSeededBooleanAssignmentCoverage();
     try coverage.expectJsonSetCoverage();
+    try coverage.expectJsonExpressionCoverage();
     try coverage.expectConflictBooleanGuardCoverage();
     try coverage.expectMixedIntervalExpression();
     try coverage.expectCurrentTimestampPrecision();
