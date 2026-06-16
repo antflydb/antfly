@@ -1581,12 +1581,37 @@ pub const RelationalRowsMutationSourceResult = struct {
     staged: u32 = 0,
     returning_rows: [][]const u8 = &.{},
     participant_predicates: []TransactionVersionPredicate = &.{},
+    participant_preimages: []TransactionWrite = &.{},
+    participant_writes: []TransactionWrite = &.{},
+    participant_deletes: [][]const u8 = &.{},
+    participant_transforms: []DocumentTransform = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.returning_rows) |row| alloc.free(@constCast(row));
         if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
         for (self.participant_predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (self.participant_predicates.len > 0) alloc.free(self.participant_predicates);
+        for (self.participant_preimages) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.participant_preimages.len > 0) alloc.free(self.participant_preimages);
+        for (self.participant_writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.participant_writes.len > 0) alloc.free(self.participant_writes);
+        for (self.participant_deletes) |key| alloc.free(key);
+        if (self.participant_deletes.len > 0) alloc.free(self.participant_deletes);
+        for (self.participant_transforms) |transform| {
+            alloc.free(@constCast(transform.key));
+            for (transform.operations) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (transform.operations.len > 0) alloc.free(transform.operations);
+        }
+        if (self.participant_transforms.len > 0) alloc.free(self.participant_transforms);
         self.* = undefined;
     }
 };

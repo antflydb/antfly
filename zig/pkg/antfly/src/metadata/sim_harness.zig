@@ -10207,6 +10207,18 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     defer temporal_fragment_query.deinit(std.heap.page_allocator);
     try expectBodyContainsAll(temporal_fragment_query.body, &.{ "\"total\":4", "\"valid_from\":0", "\"valid_to\":10", "\"price\":10", "\"valid_from\":10", "\"valid_to\":12", "\"price\":13", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15", "\"valid_from\":16", "\"valid_to\":20" });
 
+    var split_temporal_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"price\":15", "\"physical_key\"" },
+        32,
+    );
+    defer split_temporal_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(split_temporal_get.body, &.{ "\"found\":true", "\"price\":15", "\"physical_key\"" });
+
     var updated_adjustment_get = try waitForPublicRowsGetContains(
         &cluster,
         &rig.client,

@@ -2245,6 +2245,21 @@ fn periodBoundLessThan(left: PeriodBound, right: PeriodBound) bool {
     };
 }
 
+fn periodBoundsEqual(left: PeriodBound, right: PeriodBound) bool {
+    return switch (left) {
+        .neg_infinity => right == .neg_infinity,
+        .f64_val => |value| switch (right) {
+            .f64_val => |other| value == other,
+            else => false,
+        },
+        .i64_val => |value| switch (right) {
+            .i64_val => |other| value == other,
+            else => false,
+        },
+        .pos_infinity => right == .pos_infinity,
+    };
+}
+
 fn periodSpansOverlap(left: PeriodSpan, right: PeriodSpan) bool {
     return periodBoundLessThan(left.start, right.end) and periodBoundLessThan(right.start, left.end);
 }
@@ -2529,6 +2544,13 @@ pub fn temporalPeriodSpanBytesValid(encoded_start: []const u8, encoded_end: []co
         .end = try periodBoundFromBytes(encoded_end),
     };
     return periodBoundLessThan(query.start, query.end);
+}
+
+pub fn temporalPeriodBoundBytesOrder(left_bytes: []const u8, right_bytes: []const u8) !std.math.Order {
+    const left = try periodBoundFromBytes(left_bytes);
+    const right = try periodBoundFromBytes(right_bytes);
+    if (periodBoundsEqual(left, right)) return .eq;
+    return if (periodBoundLessThan(left, right)) .lt else .gt;
 }
 
 pub fn temporalPeriodSpanBytesOverlap(

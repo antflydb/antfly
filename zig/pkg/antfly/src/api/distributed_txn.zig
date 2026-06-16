@@ -94,6 +94,7 @@ pub const TableCommitRequest = struct {
     deletes: []const []const u8 = &.{},
     transforms: []const db_mod.types.DocumentTransform = &.{},
     predicates: []const db_mod.types.TransactionVersionPredicate = &.{},
+    preimages: []const db_mod.types.TransactionWrite = &.{},
     foreign_key_constraint_timing_overrides: []const db_mod.types.ForeignKeyConstraintTimingOverride = &.{},
 };
 
@@ -560,6 +561,8 @@ pub fn executeCrossGroup(
         worker,
         &participants,
         table_name,
+        req.writes,
+        &.{},
         req.deletes,
         req.predicates,
         &constraint_timing_overrides,
@@ -801,6 +804,8 @@ pub fn executeForeignKeyActionPage(
             worker,
             &participants,
             child_table_name,
+            &.{},
+            &.{},
             cascade_parent_keys,
             &.{},
             &.{},
@@ -1041,6 +1046,8 @@ fn executeMultiTableCommitOnce(
             worker,
             &participants,
             table.table_name,
+            table.writes,
+            table.preimages,
             table.deletes,
             table.predicates,
             constraint_timing_overrides,
@@ -2492,6 +2499,8 @@ fn addForeignKeyParentDeleteParticipants(
     worker: ParticipantWorker,
     participants: *std.ArrayListUnmanaged(ParticipantTxn),
     parent_table_name: []const u8,
+    parent_writes: []const db_mod.types.TransactionWrite,
+    parent_preimages: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     predicates: []const db_mod.types.TransactionVersionPredicate,
     constraint_timing_overrides: []const TableForeignKeyConstraintTimingOverrides,
@@ -2522,6 +2531,18 @@ fn addForeignKeyParentDeleteParticipants(
             if (!foreignKeyIsEnforced(foreign_key)) continue;
             if (!std.mem.eql(u8, foreignKeyParentCatalogTableName(table.name, runtime_schema.default_type, foreign_key), parent_table_name)) continue;
             for (deletes) |parent_key| {
+                if (try temporalParentDeleteCoveredByTransactionWrites(
+                    alloc,
+                    catalog,
+                    worker,
+                    participants,
+                    parent_table_name,
+                    parent_key,
+                    parent_writes,
+                    parent_preimages,
+                    predicates,
+                    foreign_key,
+                )) continue;
                 if (foreignKeyReferencesPrimaryKey(foreign_key)) {
                     if (!foreignKeySupportsDistributedParentDeleteCheck(foreign_key)) return error.UnsupportedOperation;
                     if (try addRoutedForeignKeyParentDeleteParticipants(alloc, catalog, worker, participants, table.name, runtime_schema.default_type, foreign_key, parent_key, constraint_timing_overrides, cascade_depth, cascade_max_depth)) continue;
@@ -2533,6 +2554,75 @@ fn addForeignKeyParentDeleteParticipants(
             }
         }
     }
+}
+
+fn temporalParentDeleteCoveredByTransactionWrites(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    participants: *std.ArrayListUnmanaged(ParticipantTxn),
+    parent_table_name: []const u8,
+    parent_doc_key: []const u8,
+    parent_writes: []const db_mod.types.TransactionWrite,
+    parent_preimages: []const db_mod.types.TransactionWrite,
+    predicates: []const db_mod.types.TransactionVersionPredicate,
+    foreign_key: storage_schema.ForeignKey,
+) !bool {
+    _ = worker;
+    _ = participants;
+    _ = predicates;
+    const parent_period_name = foreign_key.parent_period orelse return false;
+    if (parent_writes.len == 0) return false;
+
+    const parent_schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, parent_table_name)) orelse return error.TableNotFound;
+    defer alloc.free(parent_schema_json);
+    var parsed_parent_schema = try schema_mod.parseValidatedTableSchema(alloc, parent_schema_json);
+    defer parsed_parent_schema.deinit(alloc);
+    const parent_runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_parent_schema);
+    defer storage_schema.freeSchema(alloc, parent_runtime_schema);
+    if (parent_runtime_schema.storage_mode != .relational) return error.UnsupportedOperation;
+    _ = relationalPeriodByName(parent_runtime_schema.periods, parent_period_name) orelse return error.UnsupportedOperation;
+    const parent_constraint = findParentTupleConstraintByColumns(parent_runtime_schema, foreign_key.parent_columns) orelse return error.UnsupportedOperation;
+
+    const old_parent_json = findWriteValueForKey(parent_preimages, parent_doc_key) orelse return false;
+    var old_span = try temporalUniquePeriodSpanBytesFromJsonAlloc(alloc, parent_runtime_schema, old_parent_json, parent_period_name);
+    defer old_span.deinit(alloc);
+    const old_row = try document_mapper.buildRelationalRowValueAlloc(alloc, old_parent_json, parent_runtime_schema.relational_columns);
+    defer alloc.free(old_row);
+    const old_parent_tuple = try parentTupleValueAlloc(alloc, old_row, parent_runtime_schema, parent_constraint);
+    defer alloc.free(old_parent_tuple);
+
+    var spans = std.ArrayListUnmanaged(TemporalUniquePeriodSpanBytes).empty;
+    defer {
+        for (spans.items) |*span| span.deinit(alloc);
+        spans.deinit(alloc);
+    }
+
+    for (parent_writes) |write| {
+        const row = document_mapper.buildRelationalRowValueAlloc(alloc, write.value, parent_runtime_schema.relational_columns) catch continue;
+        defer alloc.free(row);
+        const tuple = (parentTupleValueAlloc(alloc, row, parent_runtime_schema, parent_constraint) catch continue);
+        defer alloc.free(tuple);
+        if (!std.mem.eql(u8, old_parent_tuple, tuple)) continue;
+        var span = temporalUniquePeriodSpanBytesFromJsonAlloc(alloc, parent_runtime_schema, write.value, parent_period_name) catch continue;
+        errdefer span.deinit(alloc);
+        try spans.append(alloc, span);
+    }
+    if (spans.items.len == 0) return false;
+
+    std.mem.sort(TemporalUniquePeriodSpanBytes, spans.items, {}, temporalUniquePeriodSpanLessThan);
+    var covered_end = old_span.start;
+    for (spans.items) |span| {
+        if ((try relational_store.temporalPeriodBoundBytesOrder(span.end, covered_end)) != .gt) continue;
+        if ((try relational_store.temporalPeriodBoundBytesOrder(span.start, covered_end)) == .gt) return false;
+        if ((try relational_store.temporalPeriodBoundBytesOrder(span.end, covered_end)) == .gt) covered_end = span.end;
+        if ((try relational_store.temporalPeriodBoundBytesOrder(covered_end, old_span.end)) != .lt) return true;
+    }
+    return false;
+}
+
+fn temporalUniquePeriodSpanLessThan(_: void, left: TemporalUniquePeriodSpanBytes, right: TemporalUniquePeriodSpanBytes) bool {
+    return (relational_store.temporalPeriodBoundBytesOrder(left.start, right.start) catch .gt) == .lt;
 }
 
 fn tableHasMutatingForeignKeyDeleteDependents(

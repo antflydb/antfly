@@ -16154,6 +16154,8 @@ pub const DB = struct {
         }
         var predicates = std.ArrayListUnmanaged(types.TransactionVersionPredicate).empty;
         defer predicates.deinit(alloc);
+        var preimages = std.ArrayListUnmanaged(types.TransactionWrite).empty;
+        defer preimages.deinit(alloc);
         var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (returning_rows.items) |row| alloc.free(@constCast(row));
@@ -16164,6 +16166,10 @@ pub const DB = struct {
         for (selected_indexes.items) |row_index| {
             const row = candidates[row_index];
             if (row.version == 0) return error.InvalidQueryRequest;
+            try preimages.append(alloc, .{
+                .key = row.doc_key,
+                .value = row.json,
+            });
 
             if (req.temporal_portion) |portion| {
                 const staged = try self.stageRelationalRowsTemporalPortionMutationAlloc(
@@ -16277,12 +16283,24 @@ pub const DB = struct {
 
         const participant_predicates = try cloneRelationalRowsMutationParticipantPredicatesAlloc(alloc, predicates.items);
         errdefer freeRelationalRowsMutationParticipantPredicates(alloc, participant_predicates);
+        const participant_preimages = try cloneRelationalRowsMutationParticipantWritesAlloc(alloc, preimages.items);
+        errdefer freeRelationalRowsMutationParticipantWrites(alloc, participant_preimages);
+        const participant_writes = try cloneRelationalRowsMutationParticipantWritesAlloc(alloc, writes.items);
+        errdefer freeRelationalRowsMutationParticipantWrites(alloc, participant_writes);
+        const participant_deletes = try cloneRelationalRowsMutationParticipantDeletesAlloc(alloc, deletes.items);
+        errdefer freeRelationalRowsMutationParticipantDeletes(alloc, participant_deletes);
+        const participant_transforms = try cloneRelationalRowsMutationParticipantTransformsAlloc(alloc, transforms.items);
+        errdefer freeRelationalRowsMutationParticipantTransforms(alloc, participant_transforms);
 
         return .{
             .matched = matched,
             .staged = staged_count,
             .returning_rows = try returning_rows.toOwnedSlice(alloc),
             .participant_predicates = participant_predicates,
+            .participant_preimages = participant_preimages,
+            .participant_writes = participant_writes,
+            .participant_deletes = participant_deletes,
+            .participant_transforms = participant_transforms,
         };
     }
 
@@ -16764,6 +16782,8 @@ pub const DB = struct {
         defer deletes.deinit(alloc);
         var predicates = std.ArrayListUnmanaged(types.TransactionVersionPredicate).empty;
         defer predicates.deinit(alloc);
+        var preimages = std.ArrayListUnmanaged(types.TransactionWrite).empty;
+        defer preimages.deinit(alloc);
         var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
             for (returning_rows.items) |row| alloc.free(@constCast(row));
@@ -16773,6 +16793,10 @@ pub const DB = struct {
         for (selected_indexes.items) |row_index| {
             const row = candidates[row_index];
             if (row.target.version == 0) return error.InvalidQueryRequest;
+            try preimages.append(alloc, .{
+                .key = row.target.doc_key,
+                .value = row.target.json,
+            });
             try predicates.append(alloc, .{
                 .key = row.target.doc_key,
                 .expected_version = row.target.version,
@@ -16856,12 +16880,24 @@ pub const DB = struct {
 
         const participant_predicates = try cloneRelationalRowsMutationParticipantPredicatesAlloc(alloc, predicates.items);
         errdefer freeRelationalRowsMutationParticipantPredicates(alloc, participant_predicates);
+        const participant_preimages = try cloneRelationalRowsMutationParticipantWritesAlloc(alloc, preimages.items);
+        errdefer freeRelationalRowsMutationParticipantWrites(alloc, participant_preimages);
+        const participant_writes = try cloneRelationalRowsMutationParticipantWritesAlloc(alloc, &.{});
+        errdefer freeRelationalRowsMutationParticipantWrites(alloc, participant_writes);
+        const participant_deletes = try cloneRelationalRowsMutationParticipantDeletesAlloc(alloc, deletes.items);
+        errdefer freeRelationalRowsMutationParticipantDeletes(alloc, participant_deletes);
+        const participant_transforms = try cloneRelationalRowsMutationParticipantTransformsAlloc(alloc, transforms.items);
+        errdefer freeRelationalRowsMutationParticipantTransforms(alloc, participant_transforms);
 
         return .{
             .matched = matched,
             .staged = @intCast(selected_indexes.items.len),
             .returning_rows = try returning_rows.toOwnedSlice(alloc),
             .participant_predicates = participant_predicates,
+            .participant_preimages = participant_preimages,
+            .participant_writes = participant_writes,
+            .participant_deletes = participant_deletes,
+            .participant_transforms = participant_transforms,
         };
     }
 
@@ -16892,6 +16928,128 @@ pub const DB = struct {
     ) void {
         for (predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (predicates.len > 0) alloc.free(predicates);
+    }
+
+    fn cloneRelationalRowsMutationParticipantWritesAlloc(
+        alloc: Allocator,
+        writes: []const types.TransactionWrite,
+    ) ![]types.TransactionWrite {
+        if (writes.len == 0) return &.{};
+        var out = try alloc.alloc(types.TransactionWrite, writes.len);
+        var count: usize = 0;
+        errdefer {
+            for (out[0..count]) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(out);
+        }
+        for (writes) |write| {
+            out[count] = .{
+                .key = try alloc.dupe(u8, write.key),
+                .value = try alloc.dupe(u8, write.value),
+            };
+            count += 1;
+        }
+        return out;
+    }
+
+    fn freeRelationalRowsMutationParticipantWrites(
+        alloc: Allocator,
+        writes: []types.TransactionWrite,
+    ) void {
+        for (writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (writes.len > 0) alloc.free(writes);
+    }
+
+    fn cloneRelationalRowsMutationParticipantDeletesAlloc(
+        alloc: Allocator,
+        deletes: []const []const u8,
+    ) ![][]const u8 {
+        if (deletes.len == 0) return &.{};
+        var out = try alloc.alloc([]const u8, deletes.len);
+        var count: usize = 0;
+        errdefer {
+            for (out[0..count]) |key| alloc.free(@constCast(key));
+            alloc.free(out);
+        }
+        for (deletes) |key| {
+            out[count] = try alloc.dupe(u8, key);
+            count += 1;
+        }
+        return out;
+    }
+
+    fn freeRelationalRowsMutationParticipantDeletes(
+        alloc: Allocator,
+        deletes: [][]const u8,
+    ) void {
+        for (deletes) |key| alloc.free(@constCast(key));
+        if (deletes.len > 0) alloc.free(deletes);
+    }
+
+    fn cloneRelationalRowsMutationParticipantTransformsAlloc(
+        alloc: Allocator,
+        transforms: []const types.DocumentTransform,
+    ) ![]types.DocumentTransform {
+        if (transforms.len == 0) return &.{};
+        var out = try alloc.alloc(types.DocumentTransform, transforms.len);
+        var count: usize = 0;
+        errdefer {
+            for (out[0..count]) |transform| {
+                alloc.free(@constCast(transform.key));
+                for (transform.operations) |op| {
+                    alloc.free(@constCast(op.path));
+                    if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+                }
+                if (transform.operations.len > 0) alloc.free(transform.operations);
+            }
+            alloc.free(out);
+        }
+        for (transforms) |transform| {
+            const operations = try alloc.alloc(types.TransformOp, transform.operations.len);
+            var op_count: usize = 0;
+            errdefer {
+                for (operations[0..op_count]) |op| {
+                    alloc.free(@constCast(op.path));
+                    if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+                }
+                if (operations.len > 0) alloc.free(operations);
+            }
+            for (transform.operations) |op| {
+                operations[op_count] = .{
+                    .op = op.op,
+                    .path = try alloc.dupe(u8, op.path),
+                    .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+                };
+                op_count += 1;
+            }
+            out[count] = .{
+                .key = try alloc.dupe(u8, transform.key),
+                .operations = operations,
+                .upsert = transform.upsert,
+            };
+            count += 1;
+        }
+        return out;
+    }
+
+    fn freeRelationalRowsMutationParticipantTransforms(
+        alloc: Allocator,
+        transforms: []types.DocumentTransform,
+    ) void {
+        for (transforms) |transform| {
+            alloc.free(@constCast(transform.key));
+            for (transform.operations) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (transform.operations.len > 0) alloc.free(transform.operations);
+        }
+        if (transforms.len > 0) alloc.free(transforms);
     }
 
     const RelationalTemporalBound = union(enum) {
@@ -73878,6 +74036,59 @@ fn expectRelationalTemporalPriceRow(
     try expectJsonNumberEqual(price, object.get("price").?);
 }
 
+fn expectRelationalTemporalPrimarySelectorPriceRow(
+    alloc: Allocator,
+    db: *DB,
+    runtime_schema: schema_mod.TableSchema,
+    sku: []const u8,
+    point_json: []const u8,
+    valid_from: f64,
+    valid_to: f64,
+    price: f64,
+) !void {
+    const primary_key = runtime_schema.primary_key orelse return error.TestExpectedEqual;
+    const period_name = primary_key.without_overlaps_period orelse return error.TestExpectedEqual;
+    var period: ?schema_mod.RelationalPeriod = null;
+    for (runtime_schema.periods) |candidate| {
+        if (std.mem.eql(u8, candidate.name, period_name)) {
+            period = candidate;
+            break;
+        }
+    }
+    const resolved_period = period orelse return error.TestExpectedEqual;
+    var start_column: ?schema_mod.RelationalColumn = null;
+    for (runtime_schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.path, resolved_period.start_column)) {
+            start_column = column;
+            break;
+        }
+    }
+    const resolved_start_column = start_column orelse return error.TestExpectedEqual;
+
+    const tuple_row_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sku\":{f},\"valid_from\":0,\"valid_to\":1}}",
+        .{std.json.fmt(sku, .{})},
+    );
+    defer alloc.free(tuple_row_json);
+    const tuple_row = try mapper.buildRelationalRowValueAlloc(alloc, tuple_row_json, runtime_schema.relational_columns);
+    defer alloc.free(tuple_row);
+    const tuple = try relational_store_mod.primaryKeyTupleValueAlloc(alloc, tuple_row, primary_key);
+    defer alloc.free(tuple);
+    const point = try relational_store_mod.temporalPeriodBoundBytesFromJsonAlloc(alloc, point_json, resolved_start_column);
+    defer alloc.free(point);
+    const owner = (try db.lookupRelationalTemporalUniqueOwner(
+        alloc,
+        relational_store_mod.primary_key_constraint_name,
+        tuple,
+        point,
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(owner);
+    const row = (try db.get(alloc, owner)) orelse return error.TestExpectedEqual;
+    defer alloc.free(row);
+    try expectRelationalTemporalPriceRow(alloc, row, sku, valid_from, valid_to, price);
+}
+
 fn expectJsonNumberEqual(expected: f64, actual: std.json.Value) !void {
     switch (actual) {
         .integer => |value| try std.testing.expectEqual(expected, @as(f64, @floatFromInt(value))),
@@ -73967,6 +74178,9 @@ test "db relational temporal mutation source splits portions transactionally" {
     try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[0], "sku:a", 0, 3, 10);
     try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[1], "sku:a", 3, 7, 99);
     try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[2], "sku:a", 7, 10, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "2", 0, 3, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "5", 3, 7, 99);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8", 7, 10, 10);
 
     const repeat_update_txn = try db.beginTransaction(2_012);
     const repeat_update_operations = [_]types.TransformOp{.{
@@ -74012,6 +74226,7 @@ test "db relational temporal mutation source splits portions transactionally" {
     try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[2], "sku:a", 7, 8, 10);
     try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[3], "sku:a", 8, 9, 77);
     try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[4], "sku:a", 9, 10, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 77);
 
     const multi_row_update_txn = try db.beginTransaction(2_019);
     const multi_row_update_operations = [_]types.TransformOp{.{
@@ -74059,6 +74274,9 @@ test "db relational temporal mutation source splits portions transactionally" {
     try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[2], "sku:a", 7, 8, 55);
     try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[3], "sku:a", 8, 9, 55);
     try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[4], "sku:a", 9, 10, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "4", 3, 7, 55);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "7.5", 7, 8, 55);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 55);
 
     const scanned_rows = try relational_store_mod.scanRowsAlloc(alloc, db.core.store, "", "");
     defer relational_store_mod.freeRows(alloc, scanned_rows);

@@ -5858,7 +5858,7 @@ pub const ApiHttpServer = struct {
         defer result.deinit(self.alloc);
 
         if (result.staged > 0) {
-            self.stageRowsMutationSourceSessionParticipant(table_name, rows_req.req.source.row_claim, result.participant_predicates) catch |err| switch (err) {
+            self.stageRowsMutationSourceSessionParticipant(table_name, rows_req.req.source.row_claim, result) catch |err| switch (err) {
                 error.SessionLeaseLost => return try textResponse(self.alloc, 409, "version conflict"),
                 else => return err,
             };
@@ -5873,11 +5873,15 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         row_claim: ?db_mod.types.RowClaimRequest,
-        participant_predicates: []const db_mod.types.TransactionVersionPredicate,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
     ) !void {
         const claim = row_claim orelse return;
         const txn_id = claim.txn_id orelse return;
-        if (participant_predicates.len == 0) return;
+        if (result.participant_predicates.len == 0 and
+            result.participant_preimages.len == 0 and
+            result.participant_writes.len == 0 and
+            result.participant_deletes.len == 0 and
+            result.participant_transforms.len == 0) return;
         const owned_table_name = try self.alloc.dupe(u8, table_name);
         var req = transactions_api.OwnedTransactionCommitRequest{};
         req.tables = self.alloc.alloc(transactions_api.TableCommitRequest, 1) catch |err| {
@@ -5888,8 +5892,17 @@ pub const ApiHttpServer = struct {
             .table_name = owned_table_name,
         };
         defer req.deinit(self.alloc);
-        try req.tables[0].predicates.ensureUnusedCapacity(self.alloc, participant_predicates.len);
-        for (participant_predicates) |predicate| {
+        try cloneRowsMutationSourceParticipantPreimages(self.alloc, &req.tables[0], result.participant_preimages);
+        try cloneRowsMutationSourceParticipantWrites(self.alloc, &req.tables[0].batch, result.participant_writes);
+        try cloneRowsMutationSourceParticipantDeletes(self.alloc, &req.tables[0].batch, result.participant_deletes);
+        try cloneRowsMutationSourceParticipantTransforms(self.alloc, &req.tables[0].batch, result.participant_transforms);
+        req.tables[0].batch.req = .{
+            .writes = req.tables[0].batch.writes,
+            .deletes = req.tables[0].batch.deletes,
+            .transforms = req.tables[0].batch.transforms,
+        };
+        try req.tables[0].predicates.ensureUnusedCapacity(self.alloc, result.participant_predicates.len);
+        for (result.participant_predicates) |predicate| {
             const owned_key = try self.alloc.dupe(u8, predicate.key);
             req.tables[0].predicates.appendAssumeCapacity(.{
                 .key = owned_key,
@@ -5897,6 +5910,134 @@ pub const ApiHttpServer = struct {
             });
         }
         _ = try self.txn_sessions.stage(self.alloc, txn_id, &req) orelse return;
+    }
+
+    fn cloneRowsMutationSourceParticipantPreimages(
+        alloc: std.mem.Allocator,
+        table: *transactions_api.TableCommitRequest,
+        preimages: []const db_mod.types.TransactionWrite,
+    ) !void {
+        if (preimages.len == 0) return;
+        table.preimages = try alloc.alloc(db_mod.types.TransactionWrite, preimages.len);
+        var count: usize = 0;
+        errdefer {
+            for (table.preimages[0..count]) |preimage| {
+                alloc.free(@constCast(preimage.key));
+                alloc.free(@constCast(preimage.value));
+            }
+            alloc.free(table.preimages);
+            table.preimages = &.{};
+        }
+        for (preimages) |preimage| {
+            table.preimages[count] = .{
+                .key = try alloc.dupe(u8, preimage.key),
+                .value = try alloc.dupe(u8, preimage.value),
+            };
+            count += 1;
+        }
+    }
+
+    fn cloneRowsMutationSourceParticipantWrites(
+        alloc: std.mem.Allocator,
+        batch: *batch_api.OwnedBatchRequest,
+        writes: []const db_mod.types.TransactionWrite,
+    ) !void {
+        if (writes.len == 0) return;
+        batch.writes = try alloc.alloc(db_mod.types.BatchWrite, writes.len);
+        var count: usize = 0;
+        errdefer {
+            for (batch.writes[0..count]) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(batch.writes);
+            batch.writes = &.{};
+        }
+        for (writes) |write| {
+            batch.writes[count] = .{
+                .key = try alloc.dupe(u8, write.key),
+                .value = try alloc.dupe(u8, write.value),
+            };
+            count += 1;
+        }
+    }
+
+    fn cloneRowsMutationSourceParticipantDeletes(
+        alloc: std.mem.Allocator,
+        batch: *batch_api.OwnedBatchRequest,
+        deletes: []const []const u8,
+    ) !void {
+        if (deletes.len == 0) return;
+        batch.deletes = try alloc.alloc([]const u8, deletes.len);
+        var count: usize = 0;
+        errdefer {
+            for (batch.deletes[0..count]) |key| alloc.free(@constCast(key));
+            alloc.free(batch.deletes);
+            batch.deletes = &.{};
+        }
+        for (deletes) |key| {
+            batch.deletes[count] = try alloc.dupe(u8, key);
+            count += 1;
+        }
+    }
+
+    fn cloneRowsMutationSourceParticipantTransforms(
+        alloc: std.mem.Allocator,
+        batch: *batch_api.OwnedBatchRequest,
+        transforms: []const db_mod.types.DocumentTransform,
+    ) !void {
+        if (transforms.len == 0) return;
+        batch.transforms = try alloc.alloc(db_mod.types.DocumentTransform, transforms.len);
+        var count: usize = 0;
+        errdefer {
+            for (batch.transforms[0..count]) |transform| freeRowsMutationSourceParticipantTransform(alloc, transform);
+            alloc.free(batch.transforms);
+            batch.transforms = &.{};
+        }
+        for (transforms) |transform| {
+            batch.transforms[count] = try cloneRowsMutationSourceParticipantTransform(alloc, transform);
+            count += 1;
+        }
+    }
+
+    fn cloneRowsMutationSourceParticipantTransform(
+        alloc: std.mem.Allocator,
+        transform: db_mod.types.DocumentTransform,
+    ) !db_mod.types.DocumentTransform {
+        const operations = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
+        var op_count: usize = 0;
+        errdefer {
+            for (operations[0..op_count]) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (operations.len > 0) alloc.free(operations);
+        }
+        for (transform.operations) |op| {
+            operations[op_count] = .{
+                .op = op.op,
+                .path = try alloc.dupe(u8, op.path),
+                .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+            };
+            op_count += 1;
+        }
+        return .{
+            .key = try alloc.dupe(u8, transform.key),
+            .operations = operations,
+            .upsert = transform.upsert,
+        };
+    }
+
+    fn freeRowsMutationSourceParticipantTransform(
+        alloc: std.mem.Allocator,
+        transform: db_mod.types.DocumentTransform,
+    ) void {
+        alloc.free(@constCast(transform.key));
+        for (transform.operations) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        if (transform.operations.len > 0) alloc.free(transform.operations);
     }
 
     pub fn handlePublicTableRowsGet(

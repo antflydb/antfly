@@ -61,10 +61,16 @@ pub const TableCommitRequest = struct {
     batch: batch_api.OwnedBatchRequest = .{},
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
     txn_writes: []db_mod.types.TransactionWrite = &.{},
+    preimages: []db_mod.types.TransactionWrite = &.{},
 
     pub fn deinit(self: *TableCommitRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         if (self.txn_writes.len > 0) alloc.free(self.txn_writes);
+        for (self.preimages) |preimage| {
+            alloc.free(@constCast(preimage.key));
+            alloc.free(@constCast(preimage.value));
+        }
+        if (self.preimages.len > 0) alloc.free(self.preimages);
         for (self.predicates.items) |predicate| alloc.free(@constCast(predicate.key));
         self.predicates.deinit(alloc);
         self.batch.deinit(alloc);
@@ -78,6 +84,7 @@ pub const TableCommitRequest = struct {
         errdefer out.deinit(alloc);
         out.batch = try cloneBatchRequest(alloc, self.batch);
         try clonePredicatesInto(alloc, &out.predicates, self.predicates.items);
+        try appendTransactionWrites(alloc, &out.preimages, self.preimages);
         return out;
     }
 
@@ -86,6 +93,7 @@ pub const TableCommitRequest = struct {
         try appendBatchDeletes(alloc, &self.batch, other.batch.deletes);
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
+        try appendTransactionWrites(alloc, &self.preimages, other.preimages);
         syncAndClear(self, alloc);
     }
 
@@ -170,6 +178,7 @@ pub const OwnedTransactionCommitRequest = struct {
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
                 .predicates = table.predicates.items,
+                .preimages = table.preimages,
             };
         }
         return out;
@@ -2180,6 +2189,44 @@ fn appendBatchWrites(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchReque
     }
     if (batch.writes.len > 0) alloc.free(batch.writes);
     batch.writes = next;
+}
+
+fn appendTransactionWrites(
+    alloc: std.mem.Allocator,
+    target: *[]db_mod.types.TransactionWrite,
+    writes: []const db_mod.types.TransactionWrite,
+) !void {
+    if (writes.len == 0) return;
+    const old = target.*;
+    var next = try alloc.alloc(db_mod.types.TransactionWrite, old.len + writes.len);
+    var copied: usize = 0;
+    errdefer {
+        for (next[0..copied]) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(next);
+    }
+    for (old) |write| {
+        next[copied] = .{
+            .key = try alloc.dupe(u8, write.key),
+            .value = try alloc.dupe(u8, write.value),
+        };
+        copied += 1;
+    }
+    for (writes) |write| {
+        next[copied] = .{
+            .key = try alloc.dupe(u8, write.key),
+            .value = try alloc.dupe(u8, write.value),
+        };
+        copied += 1;
+    }
+    for (old) |write| {
+        alloc.free(@constCast(write.key));
+        alloc.free(@constCast(write.value));
+    }
+    if (old.len > 0) alloc.free(old);
+    target.* = next;
 }
 
 fn appendBatchDeletes(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchRequest, deletes: []const []const u8) !void {
