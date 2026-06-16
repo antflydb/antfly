@@ -31,6 +31,7 @@ var test_path_counter: u64 = 0;
 
 pub const Routes = struct {
     pub const health = "/ha/v1/health";
+    pub const ready = "/ha/v1/ready";
     pub const command = "/ha/v1/admin/command";
 };
 
@@ -68,6 +69,10 @@ pub const Server = struct {
             .GET => {
                 if (std.mem.eql(u8, path, Routes.health)) {
                     return try textResponse(self.alloc, 200, "ok");
+                }
+                if (std.mem.eql(u8, path, Routes.ready)) {
+                    if (self.ready()) return try textResponse(self.alloc, 200, "ready");
+                    return try textResponse(self.alloc, 503, "not ready");
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
@@ -110,6 +115,10 @@ pub const Server = struct {
     fn execute(ptr: *anyopaque, _: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *Server = @ptrCast(@alignCast(ptr));
         return try self.handle(req);
+    }
+
+    fn ready(self: *const Server) bool {
+        return self.ctx.primary != null or self.ctx.standby != null or self.ctx.fence_store != null;
     }
 };
 
@@ -246,6 +255,11 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), health.status);
     try std.testing.expectEqualStrings("ok", health.body);
 
+    var ready = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ready.status);
+    try std.testing.expectEqualStrings("ready", ready.body);
+
     var create = try server.handle(.{
         .method = .POST,
         .uri = Routes.command,
@@ -326,6 +340,11 @@ test "storage.ha http admin returns route method and command errors" {
     defer missing.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 404), missing.status);
 
+    var not_ready = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer not_ready.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), not_ready.status);
+    try std.testing.expectEqualStrings("not ready", not_ready.body);
+
     var wrong_method = try server.handle(.{ .method = .PUT, .uri = Routes.command });
     defer wrong_method.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 405), wrong_method.status);
@@ -368,6 +387,10 @@ test "storage.ha http admin accepts absolute URIs" {
     var health = try server.handle(.{ .method = .GET, .uri = "http://ha-admin.test/ha/v1/health" });
     defer health.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), health.status);
+
+    var ready = try server.handle(.{ .method = .GET, .uri = "http://ha-admin.test/ha/v1/ready" });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), ready.status);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

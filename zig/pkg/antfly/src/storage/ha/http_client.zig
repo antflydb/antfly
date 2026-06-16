@@ -56,6 +56,15 @@ pub const Client = struct {
         try mapStatus(resp.status);
     }
 
+    pub fn checkReady(self: *Client, base_uri: []const u8) !void {
+        const uri = try join(self.alloc, base_uri, http_admin.Routes.ready);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetry(.{ .method = .GET, .uri = uri });
+        defer resp.deinit(self.alloc);
+        try mapStatus(resp.status);
+    }
+
     pub fn executeCommand(self: *Client, base_uri: []const u8, argv: []const []const u8) !RenderedOutput {
         const uri = try join(self.alloc, base_uri, http_admin.Routes.command);
         defer self.alloc.free(uri);
@@ -110,6 +119,7 @@ pub const Client = struct {
         if (status == 404) return error.HaEndpointNotFound;
         if (status == 405) return error.UnsupportedOperation;
         if (status == 409) return error.HaCommandConflict;
+        if (status == 503) return error.HaEndpointNotReady;
         return error.UnexpectedHttpStatus;
     }
 };
@@ -200,6 +210,7 @@ test "storage.ha http client round trips admin commands" {
     var client = Client.init(alloc, server.executor());
 
     try client.checkHealth("http://ha-admin.test");
+    try client.checkReady("http://ha-admin.test");
 
     var created = try client.executeCommand("http://ha-admin.test/", &.{ "slot", "create", "standby-a", "--initial-lsn", "0" });
     defer created.deinit(alloc);
@@ -278,6 +289,7 @@ test "storage.ha http client maps admin errors" {
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
+    try std.testing.expectError(error.HaEndpointNotReady, client.checkReady("http://ha-admin.test"));
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{"identify"}));
     try std.testing.expectError(error.InvalidHaCommand, client.executeCommand("http://ha-admin.test", &.{"unknown"}));
 }
