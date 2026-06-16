@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
 const routes = @import("../../raft/transport/routes.zig");
+const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
@@ -170,7 +171,7 @@ pub const Client = struct {
             self.alloc,
             admin_api.openapi.ReplicationSlotCreateRequest{
                 .slot_name = slot_name,
-                .initial_lsn = if (initial_lsn) |lsn| @intCast(lsn) else null,
+                .initial_lsn = if (initial_lsn) |lsn| try i64FromU64(lsn) else null,
             },
             .{},
         );
@@ -206,6 +207,121 @@ pub const Client = struct {
         slot_name: []const u8,
     ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
         return try self.replicationSlotLifecycle(base_uri, slot_name, .drop);
+    }
+
+    pub fn beginBaseBackup(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.BaseBackupStartRequest,
+    ) !ParsedOutput(admin_api.openapi.HABaseBackupBeginResponse) {
+        return try self.postJson(
+            admin_api.openapi.HABaseBackupBeginResponse,
+            base_uri,
+            admin_api.routes.ha_base_backups,
+            request,
+        );
+    }
+
+    pub fn finishBaseBackup(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.BaseBackupManifestPathRequest,
+    ) !ParsedOutput(admin_api.openapi.HABaseBackupFinishResponse) {
+        return try self.postJson(
+            admin_api.openapi.HABaseBackupFinishResponse,
+            base_uri,
+            admin_api.routes.ha_base_backups_finish,
+            request,
+        );
+    }
+
+    pub fn bootstrapStandby(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.StandbyBootstrapRequest,
+    ) !ParsedOutput(admin_api.openapi.HAStandbyBootstrapResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAStandbyBootstrapResponse,
+            base_uri,
+            admin_api.routes.ha_standby_bootstrap,
+            request,
+        );
+    }
+
+    pub fn acquireFence(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.FenceAcquireRequest,
+    ) !ParsedOutput(admin_api.openapi.HAFenceResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAFenceResponse,
+            base_uri,
+            admin_api.routes.ha_fence,
+            request,
+        );
+    }
+
+    pub fn currentFence(
+        self: *Client,
+        base_uri: []const u8,
+    ) !ParsedOutput(admin_api.openapi.HACurrentFenceResponse) {
+        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_fence_current);
+        defer self.alloc.free(uri);
+        return try self.executeJson(admin_api.openapi.HACurrentFenceResponse, .{
+            .method = .GET,
+            .uri = uri,
+        });
+    }
+
+    pub fn assessPromotion(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.PromotionAssessRequest,
+    ) !ParsedOutput(admin_api.openapi.HAPromotionAssessResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAPromotionAssessResponse,
+            base_uri,
+            admin_api.routes.ha_promotion_assess,
+            request,
+        );
+    }
+
+    pub fn promoteWithCurrentFence(
+        self: *Client,
+        base_uri: []const u8,
+    ) !ParsedOutput(admin_api.openapi.HAPromotionResponse) {
+        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_promotion_current_fence);
+        defer self.alloc.free(uri);
+        return try self.executeJson(admin_api.openapi.HAPromotionResponse, .{
+            .method = .POST,
+            .uri = uri,
+        });
+    }
+
+    pub fn promote(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.FenceAcquireRequest,
+    ) !ParsedOutput(admin_api.openapi.HAPromotionResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAPromotionResponse,
+            base_uri,
+            admin_api.routes.ha_promotion,
+            request,
+        );
+    }
+
+    pub fn assessRejoin(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.RejoinAssessRequest,
+    ) !ParsedOutput(admin_api.openapi.HARejoinAssessResponse) {
+        return try self.postJson(
+            admin_api.openapi.HARejoinAssessResponse,
+            base_uri,
+            admin_api.routes.ha_rejoin_assess,
+            request,
+        );
     }
 
     fn replicationSlotLifecycle(
@@ -262,6 +378,25 @@ pub const Client = struct {
         };
     }
 
+    fn postJson(
+        self: *Client,
+        comptime T: type,
+        base_uri: []const u8,
+        path: []const u8,
+        value: anytype,
+    ) !ParsedOutput(T) {
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+        defer self.alloc.free(body);
+        return try self.executeJson(T, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+    }
+
     fn executeWithRetry(self: *Client, req: http_common.HttpRequest) !http_common.HttpResponse {
         var attempt: usize = 0;
         while (true) {
@@ -303,12 +438,18 @@ fn appendQueryU64(alloc: Allocator, old_uri: []u8, key: []const u8, value: u64) 
     return next;
 }
 
+fn i64FromU64(value: u64) !i64 {
+    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidHaCommand;
+    return @intCast(value);
+}
+
 const TestPaths = struct {
     primary_log: [:0]u8,
     primary_slots: [:0]u8,
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
     fence_wal: [:0]u8,
+    backup_root: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
@@ -316,6 +457,7 @@ const TestPaths = struct {
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
         alloc.free(self.fence_wal);
+        alloc.free(self.backup_root);
     }
 };
 
@@ -331,6 +473,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_progress);
     const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
     defer alloc.free(fence_wal);
+    const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -339,6 +483,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
@@ -346,6 +491,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
         .fence_wal = try alloc.dupeZ(u8, fence_wal),
+        .backup_root = try alloc.dupeZ(u8, backup_root),
     };
 }
 
@@ -365,6 +511,34 @@ fn testIdentity() standby_mod.Identity {
         .timeline_id = 1,
         .epoch = 1,
     };
+}
+
+fn testAdminIdentity() admin_api.openapi.HAIdentity {
+    const identity = testIdentity();
+    return .{
+        .cluster_id = @intCast(identity.cluster_id),
+        .shard_id = @intCast(identity.shard_id),
+        .table_id = @intCast(identity.table_id),
+        .timeline_id = @intCast(identity.timeline_id),
+        .epoch = @intCast(identity.epoch),
+    };
+}
+
+fn seedFiles() [2]backup_manifest.FileEntry {
+    return .{
+        .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+        .{ .path = "sst/0001", .kind = .sstable, .size_bytes = 7, .crc32 = backup_manifest.crc32("sstable") },
+    };
+}
+
+fn writeTestFile(path: []const u8, bytes: []const u8) !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = path,
+        .data = bytes,
+    });
 }
 
 test "storage.ha http client round trips admin commands" {
@@ -577,6 +751,140 @@ test "storage.ha http client round trips admin commands" {
     try expectContains(rejoin_plan.body, "result=operator_plan\n");
     try expectContains(rejoin_plan.body, "former_primary.action=rewind\n");
     try expectContains(rejoin_plan.body, "former_primary.fork_lsn=1\n");
+}
+
+test "storage.ha http client round trips typed seed operations" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "typed-seed");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    defer server.deinit();
+    var client = Client.init(alloc, server.executor());
+
+    var begin = try client.beginBaseBackup("http://ha-admin.test", .{
+        .slot_name = "standby-seed",
+        .manifest_id = "base-http-client",
+    });
+    defer begin.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.schema_version);
+    try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.backup_lsn);
+    try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.start_record_lsn);
+
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
+
+    const files = seedFiles();
+    const encoded_manifest = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = identity,
+        .manifest_id = "base-http-client",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 2,
+        .files = &files,
+    });
+    defer alloc.free(encoded_manifest);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "backup.afha" });
+    defer alloc.free(manifest_path);
+    const manifest_file_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "manifest" });
+    defer alloc.free(manifest_file_path);
+    const sstable_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "sst/0001" });
+    defer alloc.free(sstable_path);
+    try writeTestFile(manifest_path, encoded_manifest);
+    try writeTestFile(manifest_file_path, "manifest");
+    try writeTestFile(sstable_path, "sstable");
+
+    var finish = try client.finishBaseBackup("http://ha-admin.test", .{
+        .manifest_path = manifest_path,
+    });
+    defer finish.deinit(alloc);
+    try std.testing.expectEqualStrings("base-http-client", finish.parsed.value.manifest_id);
+    try std.testing.expectEqual(@as(i64, 1), finish.parsed.value.backup_lsn);
+    try std.testing.expectEqual(@as(i64, 3), finish.parsed.value.end_record_lsn);
+
+    var bootstrap = try client.bootstrapStandby("http://ha-admin.test", .{
+        .manifest_path = manifest_path,
+        .content_root = paths.backup_root,
+    });
+    defer bootstrap.deinit(alloc);
+    try std.testing.expectEqualStrings("base-http-client", bootstrap.parsed.value.manifest_id);
+    try std.testing.expectEqual(@as(i64, 2), bootstrap.parsed.value.checkpoint_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
+}
+
+test "storage.ha http client round trips typed safety operations" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "typed-safety");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+
+    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby, .fence_store = &fence_store });
+    defer server.deinit();
+    var client = Client.init(alloc, server.executor());
+
+    var slot = try client.createReplicationSlot("http://ha-admin.test", "standby-a", 0);
+    defer slot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), try primary.append(.{ .payload = "one" }));
+
+    var streamed = try client.executeCommand("http://ha-admin.test", &.{ "--table", "stream", "once", "--slot", "standby-a" });
+    defer streamed.deinit(alloc);
+    try expectContains(streamed.body, "applied_lsn=1\n");
+
+    const fence_request = admin_api.openapi.FenceAcquireRequest{
+        .identity = testAdminIdentity(),
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "typed-client-test",
+    };
+    var fence = try client.acquireFence("http://ha-admin.test", fence_request);
+    defer fence.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), fence.parsed.value.schema_version);
+    try std.testing.expectEqualStrings("standby-a", fence.parsed.value.receipt.promoted_node_id);
+    try std.testing.expectEqual(@as(i64, 2), fence.parsed.value.receipt.new_timeline_id);
+
+    var current = try client.currentFence("http://ha-admin.test");
+    defer current.deinit(alloc);
+    try std.testing.expect(current.parsed.value.held);
+    try std.testing.expectEqualStrings("primary-a", current.parsed.value.receipt.?.old_primary_id);
+
+    var assessment = try client.assessPromotion("http://ha-admin.test", .{
+        .use_current_fence = true,
+    });
+    defer assessment.deinit(alloc);
+    try std.testing.expect(assessment.parsed.value.assessment.can_promote);
+    try std.testing.expect(assessment.parsed.value.assessment.fencing_confirmed);
+
+    var promoted = try client.promoteWithCurrentFence("http://ha-admin.test");
+    defer promoted.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 2), promoted.parsed.value.promotion.new_identity.timeline_id);
+    try std.testing.expectEqual(@as(i64, 1), promoted.parsed.value.fence_generation);
+
+    var rejoin = try client.assessRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 2,
+        .retained_from_lsn = 0,
+        .receipt = fence.parsed.value.receipt,
+    });
+    defer rejoin.deinit(alloc);
+    try std.testing.expectEqualStrings("rewind", rejoin.parsed.value.assessment.action);
+    try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
 }
 
 test "storage.ha http client maps admin errors" {
