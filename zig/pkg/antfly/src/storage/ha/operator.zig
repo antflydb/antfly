@@ -510,7 +510,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
 
     const former_primary_assessment = if (observed.former_primary) |former| blk: {
         const assessment = rejoin.assessFormerPrimary(former, observed.promotion_receipt, observed.rejoin_policy);
-        try appendFormerPrimaryAction(alloc, &actions, assessment);
+        try appendFormerPrimaryAction(alloc, &actions, assessment, rejoinFencingPrecondition(observed));
         break :blk assessment;
     } else null;
 
@@ -725,6 +725,7 @@ fn appendFormerPrimaryAction(
     alloc: Allocator,
     actions: *std.ArrayListUnmanaged(Action),
     assessment: rejoin.Assessment,
+    fence_precondition: ?FencingPrecondition,
 ) !void {
     switch (assessment.action) {
         .reject_unfenced => try actions.append(alloc, .{
@@ -738,6 +739,7 @@ fn appendFormerPrimaryAction(
         .rewind => try actions.append(alloc, .{
             .kind = .rewind_former_primary,
             .phase = .rejoin,
+            .fencing_precondition = fence_precondition,
             .standby_name = assessment.former_node_id,
             .target_lsn = assessment.fork_lsn,
             .reason = "FormerPrimaryCanRewind",
@@ -745,11 +747,30 @@ fn appendFormerPrimaryAction(
         .reseed => try actions.append(alloc, .{
             .kind = .reseed_former_primary,
             .phase = .rejoin,
+            .fencing_precondition = fence_precondition,
             .standby_name = assessment.former_node_id,
             .target_lsn = assessment.fork_lsn,
             .reason = "FormerPrimaryRequiresReseed",
         }),
     }
+}
+
+fn rejoinFencingPrecondition(observed: Observed) ?FencingPrecondition {
+    const receipt = observed.promotion_receipt orelse return null;
+    const authority = observed.fencing.authority;
+    if (authority == .none) return null;
+    if (observed.fencing.holder) |holder| {
+        if (!std.mem.eql(u8, holder, receipt.promoted_node_id)) return null;
+    }
+    if (observed.fencing.generation) |generation| {
+        if (generation < receipt.generation) return null;
+    }
+    return .{
+        .authority = authority,
+        .holder = receipt.promoted_node_id,
+        .generation = receipt.generation,
+        .reason = if (receipt.reason.len > 0) receipt.reason else observed.fencing.reason,
+    };
 }
 
 fn findSlot(slots: []const status.SlotSnapshot, name: []const u8) ?status.SlotSnapshot {
@@ -2079,6 +2100,13 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
             .last_lsn = 12,
         },
         .promotion_receipt = receipt,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-b",
+            .generation = 1,
+            .reason = "LeaseHeld",
+        },
         .rejoin_policy = .{ .retained_from_lsn = 8 },
     });
     defer rewind.deinit(alloc);
@@ -2086,6 +2114,11 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     try std.testing.expectEqual(ActionKind.rewind_former_primary, rewind.actions[0].kind);
     try std.testing.expectEqual(ActionPhase.rejoin, rewind.actions[0].phase);
     try std.testing.expectEqual(@as(?u64, 10), rewind.actions[0].target_lsn);
+    const rewind_fence = rewind.actions[0].fencing_precondition orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(FencingAuthority.kubernetes_lease, rewind_fence.authority);
+    try std.testing.expectEqualStrings("standby-b", rewind_fence.holder);
+    try std.testing.expectEqual(@as(u64, 1), rewind_fence.generation);
+    try std.testing.expectEqualStrings("manual", rewind_fence.reason);
 
     var rewind_command = (try adminCommandForAction(alloc, rewind.actions[0], parent_identity.identity, .{
         .old_primary_id = receipt.old_primary_id,
@@ -2120,12 +2153,23 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
             .last_lsn = 12,
         },
         .promotion_receipt = receipt,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-b",
+            .generation = 1,
+            .reason = "LeaseHeld",
+        },
         .rejoin_policy = .{ .retained_from_lsn = 11 },
     });
     defer reseed.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.reseed, reseed.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.reseed_former_primary, reseed.actions[0].kind);
     try std.testing.expectEqualStrings("FormerPrimaryRequiresReseed", reseed.actions[0].reason);
+    const reseed_fence = reseed.actions[0].fencing_precondition orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(FencingAuthority.kubernetes_lease, reseed_fence.authority);
+    try std.testing.expectEqualStrings("standby-b", reseed_fence.holder);
+    try std.testing.expectEqual(@as(u64, 1), reseed_fence.generation);
 
     var reseed_command = (try adminCommandForAction(alloc, reseed.actions[0], parent_identity.identity, .{
         .old_primary_id = receipt.old_primary_id,
