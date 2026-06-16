@@ -2,17 +2,11 @@ import { Badge, Button, Skeleton } from "@antfly/design-system";
 import { Cpu, Settings, Wifi, WifiOff } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SettingsDialog } from "@/components/SettingsDialog";
+import type { Backend } from "@/data/inference-models";
 import { useApiConfig } from "@/hooks/use-api-config";
 
-interface RuntimeInfo {
-  native?: boolean;
-  onnx?: boolean;
-  metal?: boolean;
-  mlx?: boolean;
-  cuda?: boolean;
-  xla?: boolean;
-  wasm?: boolean;
-}
+type RuntimeInfo = Partial<Record<Backend, boolean>>;
+const RUNTIME_BACKEND_ORDER: Backend[] = ["native", "onnx", "metal", "cuda", "xla", "wasm"];
 
 type ConnectionState = "connected" | "disconnected" | "checking";
 
@@ -22,9 +16,7 @@ export function BackendInfoBar() {
   const [status, setStatus] = useState<ConnectionState>("checking");
   const isMountedRef = useRef(true);
   const enabledBackends = runtime
-    ? Object.entries(runtime)
-        .filter(([, enabled]) => enabled)
-        .map(([name]) => name)
+    ? RUNTIME_BACKEND_ORDER.filter((backend) => runtime[backend] === true)
     : [];
 
   const fetchInfo = useCallback(

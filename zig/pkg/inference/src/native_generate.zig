@@ -22,7 +22,6 @@ const ops = @import("ops/ops.zig");
 const gpt_arch = @import("architectures/gpt.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
-const tool_parser_mod = @import("pipelines/tool_parser.zig");
 const graph_mod = @import("graph/root.zig");
 const onnx_decoder_only_vlm = @import("pipelines/onnx_decoder_only_vlm.zig");
 const model_manager_mod = @import("server/model_manager.zig");
@@ -92,15 +91,12 @@ const Options = struct {
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
-    tools_path: ?[]const u8 = null,
-    tool_choice: ?[]const u8 = null,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
     try native_backend_choice.validate(opts.backend);
     if (opts.draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
-    if (opts.tools_path == null and opts.tool_choice != null) return error.ToolsRequiredForToolChoice;
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -156,23 +152,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer if (content_part_slice) |slice| allocator.free(slice);
 
-    var messages = std.ArrayListUnmanaged(generation.Message).empty;
-    defer messages.deinit(allocator);
-    var owned_message_contents = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (owned_message_contents.items) |content| allocator.free(content);
-        owned_message_contents.deinit(allocator);
-    }
-    try messages.append(allocator, .{
-        .role = "user",
-        .content = opts.prompt,
-        .image_bytes = message_image_slice,
-        .audio_bytes = message_audio_slice,
-        .content_parts = content_part_slice,
-    });
-
-    var cli_tooling = try prepareCliTooling(allocator, io, opts, &messages, &owned_message_contents);
-    defer cli_tooling.deinit();
+    const messages = [_]generation.Message{
+        .{
+            .role = "user",
+            .content = opts.prompt,
+            .image_bytes = message_image_slice,
+            .audio_bytes = message_audio_slice,
+            .content_parts = content_part_slice,
+        },
+    };
 
     var config = generation.GenerationConfig{
         .max_tokens = opts.max_tokens,
@@ -215,9 +203,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         const rendered_prompt = if (opts.raw_prompt)
             try allocator.dupe(u8, opts.prompt)
         else if (apply_chat_template)
-            try pipeline.chat_tmpl.?.apply(allocator, messages.items, true)
+            try pipeline.chat_tmpl.?.apply(allocator, &messages, true)
         else
-            try generation.formatMessages(allocator, messages.items);
+            try generation.formatMessages(allocator, &messages);
         defer allocator.free(rendered_prompt);
         pipeline.prompt_override = rendered_prompt;
 
@@ -246,7 +234,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             print("\n", .{});
         }
 
-        if (artifact_backend != null and !cli_tooling.enabled and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+        if (artifact_backend != null and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
             if (try tryRunArtifactForPromptShape(
                 allocator,
                 io,
@@ -259,14 +247,10 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             )) return;
         }
 
-        var result = try generateMaybeStopOnTool(&pipeline, messages.items, config, cli_tooling.parserPtr());
+        var result = try pipeline.generate(&messages, config);
         defer result.deinit();
         const finished_generate_at = std.Io.Timestamp.now(io, .awake);
 
-        if (cli_tooling.enabled) {
-            try emitCliToolAwareJsonResult(allocator, io, opts.model_dir, &result, cli_tooling.parserPtr().?, cli_tooling.parsed_choice);
-            return;
-        }
         print("{s}\n", .{result.text});
         if (opts.print_token_ids) {
             if (result.token_ids) |ids| {
@@ -306,7 +290,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
-    if (artifact_backend != null and !cli_tooling.enabled and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
         defer artifact_arena.deinit();
         const artifact_allocator = artifact_arena.allocator();
@@ -332,7 +316,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             allocator,
             io,
             &opts,
-            messages.items,
+            messages[0..],
             config,
             resolved_artifact_dir.?,
             started_at,
@@ -362,9 +346,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const rendered_prompt = if (opts.raw_prompt)
         try allocator.dupe(u8, opts.prompt)
     else if (apply_chat_template)
-        try model.chat_tmpl.?.apply(allocator, messages.items, true)
+        try model.chat_tmpl.?.apply(allocator, &messages, true)
     else
-        try generation.formatMessages(allocator, messages.items);
+        try generation.formatMessages(allocator, &messages);
     defer allocator.free(rendered_prompt);
     var prompt_encoded = try generation.encodePromptForGeneration(
         tokenizer,
@@ -379,7 +363,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const prompt_tokens = countPromptTokens(prompt_encoded.attention_mask) +
         opts.image_count * (@as(usize, gpt_config.mm_tokens_per_image) + 1);
 
-    if (artifact_backend != null and !cli_tooling.enabled and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
+    if (artifact_backend != null and opts.draft_model == null and !route_onnx_whole_model_graph and opts.max_tokens == 1 and opts.image_count == 0 and opts.audio_count == 0) {
         if (try tryRunArtifactForPromptShape(
             allocator,
             io,
@@ -445,7 +429,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         };
     }
 
-    var live_result = try tryRunLiveWholeModelExecutorGenerate(
+    if (try tryRunLiveWholeModelExecutorGenerate(
         allocator,
         io,
         &opts,
@@ -455,32 +439,16 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         config,
         prompt_encoded.ids[0..countPromptTokens(prompt_encoded.attention_mask)],
         prompt_tokens,
-        cli_tooling.parserPtr(),
         started_at,
         loaded_model_at,
         encoded_prompt_at,
-    );
-    if (live_result) |*result| {
-        defer result.deinit();
-        if (cli_tooling.enabled) {
-            if (std.mem.eql(u8, result.finish_reason, "tool_calls")) {
-                try emitCliToolAwareJsonResult(allocator, io, opts.model_dir, result, cli_tooling.parserPtr().?, cli_tooling.parsed_choice);
-                return;
-            }
-            if (opts.print_timing) {
-                print("live_whole_model_executor_tool_fallback=true finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
-            }
-        } else {
-            emitLiveWholeModelExecutorResult(result, &opts);
-            return;
-        }
-    }
+    )) return;
 
     if (!graph_mode) {
         graph_mod.executor_stats.printBypass("inference.generate", "native_generation_direct_decoder_runtime");
     }
 
-    const decoder_runtime_scheduler_override = model.session.backend().usesGpuHostedSession() and enableMlxRawMetalWholeTokenDebug();
+    const decoder_runtime_scheduler_override = false;
     var native_generate_lease: ?runtime.scheduler.native_generate.Lease = null;
     defer if (native_generate_lease) |lease| {
         if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
@@ -502,7 +470,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -514,7 +481,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
-        .metal, .mlx, .cuda => .gpu,
+        else => .gpu,
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
@@ -674,27 +641,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .pjrt_client = if (pjrt_client) |*client| client else null,
     };
 
-    if ((build_options.enable_mlx or build_options.enable_metal) and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
-        debug_timing.resetLiveMlxTimingStats(&cb);
-        generation.resetDecoderRuntimeDebugStats();
+    if (build_options.enable_metal and opts.print_timing and model.session.backend().usesGpuHostedSession()) {
+        debug_timing.resetLiveGpuTimingStats(&cb);
     }
     gpt_arch.resetDebugTimingStats();
 
-    var result = generateMaybeStopOnTool(&pipeline, messages.items, config, cli_tooling.parserPtr()) catch |err| {
+    var result = pipeline.generate(&messages, config) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
-        } else if (err == error.AudioInputTooLong) {
-            print("error: {s}\n", .{generation.userFacingErrorMessage(err)});
         }
         return err;
     };
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
     defer result.deinit();
 
-    if (cli_tooling.enabled) {
-        try emitCliToolAwareJsonResult(allocator, io, opts.model_dir, &result, cli_tooling.parserPtr().?, cli_tooling.parsed_choice);
-        return;
-    }
     print("{s}\n", .{result.text});
     if (opts.print_token_ids) {
         if (result.token_ids) |ids| {
@@ -731,62 +691,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 durationMillis(started_at, finished_generate_at),
             },
         );
-        if ((build_options.enable_mlx or build_options.enable_metal) and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
+        if (build_options.enable_metal and model.session.backend().usesGpuHostedSession() and detailedGpuTimingEnabled()) {
             printGpuHostedTimingDetails(&cb);
-            const quant_stats = cb.debugTimingSnapshot().quant;
-            const decoder_runtime_stats = generation.getDecoderRuntimeDebugStats();
-            if (build_options.enable_mlx) {
-                print(
-                    "mlx_decoder_runtime: forward_attempts={d} flag_disabled={d} backend_not_mlx={d} scheduler_blocked={d} graph_blocked={d} first_token_blocked={d} kv_missing={d} non_greedy={d} grammar_blocked={d} prepare_attempts={d} prepare_calls={d} prepare_flag_disabled={d} prepare_backend_not_mlx={d} prepare_kv_missing={d} prepare_scheduler_blocked={d} prepare_graph_blocked={d} prepare_arch_blocked={d} prepare_model_blocked={d} input_attempts={d} input_successes={d} input_flag_disabled={d} input_backend_not_mlx={d} input_kv_missing={d} input_arch_blocked={d} input_model_blocked={d} input_seq_empty={d}\n",
-                    .{
-                        decoder_runtime_stats.forward_attempts,
-                        decoder_runtime_stats.flag_disabled,
-                        decoder_runtime_stats.backend_not_mlx,
-                        decoder_runtime_stats.scheduler_blocked,
-                        decoder_runtime_stats.graph_blocked,
-                        decoder_runtime_stats.first_token_blocked,
-                        decoder_runtime_stats.kv_missing,
-                        decoder_runtime_stats.non_greedy,
-                        decoder_runtime_stats.grammar_blocked,
-                        decoder_runtime_stats.prepare_attempts,
-                        decoder_runtime_stats.prepare_calls,
-                        decoder_runtime_stats.prepare_flag_disabled,
-                        decoder_runtime_stats.prepare_backend_not_mlx,
-                        decoder_runtime_stats.prepare_kv_missing,
-                        decoder_runtime_stats.prepare_scheduler_blocked,
-                        decoder_runtime_stats.prepare_graph_blocked,
-                        decoder_runtime_stats.prepare_arch_blocked,
-                        decoder_runtime_stats.prepare_model_blocked,
-                        decoder_runtime_stats.input_attempts,
-                        decoder_runtime_stats.input_successes,
-                        decoder_runtime_stats.input_flag_disabled,
-                        decoder_runtime_stats.input_backend_not_mlx,
-                        decoder_runtime_stats.input_kv_missing,
-                        decoder_runtime_stats.input_arch_blocked,
-                        decoder_runtime_stats.input_model_blocked,
-                        decoder_runtime_stats.input_seq_empty,
-                    },
-                );
-                print(
-                    "mlx_moe_grouped_failures: recovered_packed_metadata={d} not_device_native={d} missing_quant_storage={d} not_packed={d} provider_null={d}\n",
-                    .{
-                        quant_stats.moe_grouped_recovered_packed_metadata,
-                        quant_stats.moe_grouped_fail_not_device_native,
-                        quant_stats.moe_grouped_fail_missing_quant_storage,
-                        quant_stats.moe_grouped_fail_not_packed,
-                        quant_stats.moe_grouped_fail_provider_null,
-                    },
-                );
-                print(
-                    "mlx_moe_grouped_staging: calls={d} bytes={d} experts={d} ms={d}\n",
-                    .{
-                        quant_stats.moe_grouped_stage_calls,
-                        quant_stats.moe_grouped_stage_bytes,
-                        quant_stats.moe_grouped_stage_experts,
-                        @divTrunc(quant_stats.moe_grouped_stage_nanos, std.time.ns_per_ms),
-                    },
-                );
-            }
         }
         if (build_options.enable_metal and cb.kind() == .metal) {
             const metal_snapshot = cb.debugTimingSnapshot();
@@ -1066,11 +972,11 @@ fn durationMillis(from: std.Io.Timestamp, to: std.Io.Timestamp) u64 {
 }
 
 fn printGpuHostedTimingDetails(cb_opt: ?*const ops.ComputeBackend) void {
-    if (!build_options.enable_mlx and !build_options.enable_metal) {
+    if (!build_options.enable_metal) {
         return;
     }
-    const backend_stats = if (cb_opt) |cb| cb.debugTimingSnapshot() else debug_timing.fallbackMlxTimingSnapshot();
-    const backend_kind: ops.BackendKind = if (cb_opt) |cb| cb.kind() else .mlx;
+    const backend_stats = if (cb_opt) |cb| cb.debugTimingSnapshot() else debug_timing.fallbackGpuTimingSnapshot();
+    const backend_kind: ops.BackendKind = if (cb_opt) |cb| cb.kind() else .metal;
     const decoder_runtime_runtime_ready = if (cb_opt) |cb| cb.decoderRuntimeReady() else false;
     const decoder_runtime_embeddings_prepared = if (cb_opt) |cb| cb.decoderRuntimeAbsoluteEmbeddingsPrepared() else false;
     debug_timing.printBackendTimingDetails(
@@ -1110,9 +1016,9 @@ fn liveWholeModelExecutorRequested(opts: *const Options) bool {
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
     if (explicit_whole_model) return false;
-    if (!explicit_whole_model and opts.backend != .metal and !enableMlxRawMetalWholeTokenDebug()) return false;
+    if (!explicit_whole_model and opts.backend != .metal) return false;
     return switch (opts.backend) {
-        .auto, .native, .metal, .mlx => true,
+        .auto, .native, .metal => true,
         else => false,
     };
 }
@@ -1175,21 +1081,19 @@ fn tryRunLiveWholeModelExecutorGenerate(
     config: generation.GenerationConfig,
     prompt_token_ids: []const i32,
     prompt_tokens: usize,
-    tool_parser: ?*tool_parser_mod.Parser,
     started_at: std.Io.Timestamp,
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
-) !?generation.GenerationResult {
-    if (!liveWholeModelExecutorRequested(opts)) return null;
-    if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return null;
-    if (opts.draft_model != null) return null;
-    if (opts.image_count > 0 or opts.audio_count > 0) return null;
+) !bool {
+    if (!liveWholeModelExecutorRequested(opts)) return false;
+    if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
+    if (opts.draft_model != null) return false;
+    if (opts.image_count > 0 or opts.audio_count > 0) return false;
 
     gpt_arch.resetDebugTimingStats();
 
     const kv_backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .metal => .metal,
-        .mlx => .mlx,
         .native => .native,
         else => .native,
     };
@@ -1197,7 +1101,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDType
     else
         session_factory.recommendedKvDTypeForSession(model.session, kv_backend_kind);
-    var executor = (try model.wholeModelExecutor(allocator, kv_dtype)) orelse return null;
+    var executor = (try model.wholeModelExecutor(allocator, kv_dtype)) orelse return false;
     defer executor.deinit();
 
     var runtime_model = try executor.createRuntime(allocator);
@@ -1220,10 +1124,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer generated_token_ids.deinit(allocator);
 
     var finish_reason: []const u8 = "length";
-    var emitted_text = try allocator.dupe(u8, "");
-    defer allocator.free(emitted_text);
-    if (tool_parser) |parser| parser.reset();
-
     const max_tokens: usize = if (opts.max_tokens > 0) @intCast(opts.max_tokens) else 0;
     const sampling_config: graph_mod.model_runtime.SamplingConfig = .{
         .temperature = config.temperature,
@@ -1253,7 +1153,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 .seq_len = chunk_end,
                 .query_seq_len = chunk_end - processed,
                 .attention_mode = .paged_prefill,
-                .force_host_logits = tool_parser != null,
             });
             processed = chunk_end;
         }
@@ -1264,6 +1163,9 @@ fn tryRunLiveWholeModelExecutorGenerate(
     var generated: usize = 0;
     while (generated < max_tokens) {
         const next_token_i32: i32 = if (generated == 0) blk: {
+            if (use_greedy_decode) {
+                break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
+            }
             const output_logits = try output.hostLogits(allocator);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
@@ -1303,13 +1205,6 @@ fn tryRunLiveWholeModelExecutorGenerate(
         try all_token_ids.append(allocator, next_token_i64);
         generated += 1;
 
-        if (tool_parser) |parser| {
-            const keep_generating = try feedToolParserDeltaForFastPath(allocator, tokenizer, generated_token_ids.items, &emitted_text, parser);
-            if (!keep_generating) {
-                finish_reason = "tool_calls";
-                break;
-            }
-        }
         if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
             finish_reason = "stop";
             break;
@@ -1327,16 +1222,30 @@ fn tryRunLiveWholeModelExecutorGenerate(
     }
 
     const result_token_ids = try allocator.dupe(i32, generated_token_ids.items);
-    errdefer allocator.free(result_token_ids);
+    defer allocator.free(result_token_ids);
     const result_text = if (result_token_ids.len > 0)
         try tokenizer.decode(allocator, result_token_ids)
     else
         try allocator.dupe(u8, "");
-    errdefer allocator.free(result_text);
+    defer allocator.free(result_text);
 
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
+    print("{s}\n", .{result_text});
+    if (opts.print_token_ids) {
+        print("token_ids:", .{});
+        for (result_token_ids) |id| print(" {d}", .{id});
+        print("\n", .{});
+    }
+    if (opts.print_finish_reason or opts.print_token_count) {
+        if (opts.print_finish_reason and opts.print_token_count) {
+            print("finish_reason={s} tokens={d}\n", .{ finish_reason, result_token_ids.len });
+        } else if (opts.print_finish_reason) {
+            print("finish_reason={s}\n", .{finish_reason});
+        } else {
+            print("tokens={d}\n", .{result_token_ids.len});
+        }
+    }
     if (opts.print_timing) {
-        print("live_whole_model_executor=true\n", .{});
         print(
             "timing_ms: load_model={d} prompt_prep={d} scheduler=0 backend_setup={d} decode_setup=0 generate={d} total={d}\n",
             .{
@@ -1592,57 +1501,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
             );
         }
     }
-    return .{
-        .text = result_text,
-        .token_ids = result_token_ids,
-        .prompt_tokens = prompt_tokens,
-        .tokens_used = result_token_ids.len,
-        .finish_reason = finish_reason,
-        .allocator = allocator,
-    };
-}
-
-fn emitLiveWholeModelExecutorResult(result: *const generation.GenerationResult, opts: *const Options) void {
-    print("{s}\n", .{result.text});
-    if (opts.print_token_ids) {
-        if (result.token_ids) |ids| {
-            print("token_ids:", .{});
-            for (ids) |id| print(" {d}", .{id});
-            print("\n", .{});
-        } else {
-            print("token_ids=unavailable\n", .{});
-        }
-    }
-    if (opts.print_finish_reason or opts.print_token_count) {
-        if (opts.print_finish_reason and opts.print_token_count) {
-            print("finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
-        } else if (opts.print_finish_reason) {
-            print("finish_reason={s}\n", .{result.finish_reason});
-        } else {
-            print("tokens={d}\n", .{result.tokens_used});
-        }
-    }
-}
-
-fn feedToolParserDeltaForFastPath(
-    allocator: std.mem.Allocator,
-    tokenizer: tokenizer_mod.Tokenizer,
-    generated_token_ids: []const i32,
-    emitted_text: *[]u8,
-    parser: *tool_parser_mod.Parser,
-) !bool {
-    const decoded_text = try tokenizer.decode(allocator, generated_token_ids);
-    defer allocator.free(decoded_text);
-
-    const prefix_len = std.mem.indexOfDiff(u8, emitted_text.*, decoded_text) orelse @min(emitted_text.*.len, decoded_text.len);
-    const delta = decoded_text[prefix_len..];
-
-    const next_emitted_text = try allocator.dupe(u8, decoded_text);
-    allocator.free(emitted_text.*);
-    emitted_text.* = next_emitted_text;
-    if (delta.len == 0) return true;
-    _ = try parser.feed(delta);
-    return parser.toolCalls().len == 0;
+    return true;
 }
 
 fn runOnnxWholeModelGraphGenerate(
@@ -1708,7 +1567,6 @@ fn runOnnxWholeModelGraphGenerate(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -1720,7 +1578,7 @@ fn runOnnxWholeModelGraphGenerate(
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
-        .metal, .mlx, .cuda => .gpu,
+        else => .gpu,
     };
     var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
     budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
@@ -1931,286 +1789,6 @@ fn validateDraftTokenizerCompatibility(
     }
 }
 
-const CliTooling = struct {
-    parser: ?tool_parser_mod.Parser = null,
-    parsed_choice: tool_parser_mod.ParsedToolChoice = .auto,
-    enabled: bool = false,
-
-    fn parserPtr(self: *CliTooling) ?*tool_parser_mod.Parser {
-        if (self.parser) |*parser| return parser;
-        return null;
-    }
-
-    fn deinit(self: *CliTooling) void {
-        if (self.parser) |*parser| parser.deinit();
-        self.* = undefined;
-    }
-};
-
-fn prepareCliTooling(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    opts: Options,
-    messages: *std.ArrayListUnmanaged(generation.Message),
-    owned_message_contents: *std.ArrayListUnmanaged([]u8),
-) !CliTooling {
-    const tools_path = opts.tools_path orelse return .{};
-    const tools_json = try std.Io.Dir.cwd().readFileAlloc(io, tools_path, allocator, .limited(4 * 1024 * 1024));
-    defer allocator.free(tools_json);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidToolsFile;
-
-    const parsed_choice = try parseCliToolChoice(opts.tool_choice);
-    if (!tool_parser_mod.toolCallsEnabled(parsed_choice)) {
-        return .{ .parsed_choice = parsed_choice };
-    }
-    if (opts.raw_prompt) return error.RawPromptToolCallingUnsupported;
-
-    var selected_tools = std.ArrayListUnmanaged(tool_parser_mod.ToolDefinition).empty;
-    defer selected_tools.deinit(allocator);
-    const forced_function = tool_parser_mod.forcedFunctionName(parsed_choice);
-    for (parsed.value.array.items) |tool_value| {
-        try appendCliToolDefinition(allocator, tool_value, forced_function, &selected_tools);
-    }
-    if (forced_function != null and selected_tools.items.len == 0) return error.ForcedFunctionNotFound;
-    if (selected_tools.items.len == 0) return error.NoFunctionTools;
-
-    var parser = (try tool_parser_mod.loadParser(allocator, opts.model_dir)) orelse return error.ModelDoesNotSupportToolCalling;
-    errdefer parser.deinit();
-
-    const tools_prompt = try parser.formatToolsPrompt(allocator, selected_tools.items);
-    defer allocator.free(tools_prompt);
-    const prompt = if (forced_function) |forced|
-        try std.fmt.allocPrint(allocator, "{s}\nYou MUST call the {s} function. Do not respond with text, only call the function.\n", .{ tools_prompt, forced })
-    else
-        try allocator.dupe(u8, tools_prompt);
-    defer allocator.free(prompt);
-    try prependCliSystemPrompt(allocator, messages, owned_message_contents, prompt);
-
-    return .{
-        .parser = parser,
-        .parsed_choice = parsed_choice,
-        .enabled = true,
-    };
-}
-
-fn appendCliToolDefinition(
-    allocator: std.mem.Allocator,
-    tool_value: std.json.Value,
-    forced_function: ?[]const u8,
-    selected_tools: *std.ArrayListUnmanaged(tool_parser_mod.ToolDefinition),
-) !void {
-    if (tool_value != .object) return error.InvalidToolsFile;
-    const tool_obj = tool_value.object;
-    const type_val = tool_obj.get("type") orelse return error.InvalidToolsFile;
-    if (type_val != .string or !std.mem.eql(u8, type_val.string, "function")) return error.InvalidToolsFile;
-    const function_val = tool_obj.get("function") orelse return error.InvalidToolsFile;
-    if (function_val != .object) return error.InvalidToolsFile;
-    const function_obj = function_val.object;
-    const name_val = function_obj.get("name") orelse return error.InvalidToolsFile;
-    if (name_val != .string or name_val.string.len == 0) return error.InvalidToolsFile;
-    if (forced_function) |forced| {
-        if (!std.mem.eql(u8, name_val.string, forced)) return;
-    }
-    const description = if (function_obj.get("description")) |desc_val| blk: {
-        if (desc_val != .string) return error.InvalidToolsFile;
-        break :blk desc_val.string;
-    } else "";
-    const strict = if (function_obj.get("strict")) |strict_val| blk: {
-        if (strict_val != .bool) return error.InvalidToolsFile;
-        break :blk strict_val.bool;
-    } else false;
-
-    try selected_tools.append(allocator, .{
-        .type = type_val.string,
-        .function = .{
-            .name = name_val.string,
-            .description = description,
-            .parameters = function_obj.get("parameters"),
-            .strict = strict,
-        },
-    });
-}
-
-fn prependCliSystemPrompt(
-    allocator: std.mem.Allocator,
-    messages: *std.ArrayListUnmanaged(generation.Message),
-    owned_message_contents: *std.ArrayListUnmanaged([]u8),
-    prompt: []const u8,
-) !void {
-    const owned = try allocator.dupe(u8, prompt);
-    errdefer allocator.free(owned);
-    if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
-        const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ prompt, messages.items[0].content });
-        errdefer allocator.free(merged);
-        messages.items[0].content = merged;
-        try owned_message_contents.append(allocator, merged);
-        allocator.free(owned);
-        return;
-    }
-    try messages.insert(allocator, 0, .{
-        .role = "system",
-        .content = owned,
-    });
-    try owned_message_contents.append(allocator, owned);
-}
-
-fn parseCliToolChoice(choice: ?[]const u8) !tool_parser_mod.ParsedToolChoice {
-    const value = choice orelse return .auto;
-    if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "none")) return .none;
-    if (std.mem.eql(u8, value, "required")) return .required;
-    if (value.len == 0) return error.InvalidToolChoice;
-    return .{ .function = value };
-}
-
-const ToolStopCtx = struct {
-    parser: *tool_parser_mod.Parser,
-    errored: ?anyerror = null,
-
-    fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
-        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-        _ = self.parser.feed(token_text) catch |err| {
-            self.errored = err;
-            return false;
-        };
-        return self.parser.toolCalls().len == 0;
-    }
-};
-
-fn generateMaybeStopOnTool(
-    pipeline: anytype,
-    messages: []const generation.Message,
-    config: generation.GenerationConfig,
-    tool_parser: ?*tool_parser_mod.Parser,
-) !generation.GenerationResult {
-    var tool_stop_ctx: ?ToolStopCtx = if (tool_parser) |parser| blk: {
-        parser.reset();
-        break :blk .{ .parser = parser };
-    } else null;
-
-    var result = if (tool_stop_ctx) |*stop_ctx|
-        try pipeline.generateStreaming(messages, config, @ptrCast(stop_ctx), ToolStopCtx.onToken)
-    else
-        try pipeline.generate(messages, config);
-    errdefer result.deinit();
-
-    if (tool_stop_ctx) |stop_ctx| {
-        if (stop_ctx.errored) |err| return err;
-    }
-    return result;
-}
-
-fn emitCliToolAwareJsonResult(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model_name: []const u8,
-    result: *const generation.GenerationResult,
-    parser: *tool_parser_mod.Parser,
-    parsed_choice: tool_parser_mod.ParsedToolChoice,
-) !void {
-    parser.reset();
-    _ = try parser.feed(result.text);
-    const finished_text = try parser.finishText(allocator);
-    defer allocator.free(finished_text);
-    const response_text = if (finished_text.len > 0) finished_text else result.text;
-
-    var fallback_tool_calls: ?[]tool_parser_mod.ToolCall = null;
-    defer if (fallback_tool_calls) |calls| tool_parser_mod.freeToolCalls(allocator, calls);
-
-    const parsed_tool_calls = if (parser.toolCalls().len > 0)
-        parser.toolCalls()
-    else blk: {
-        fallback_tool_calls = try tool_parser_mod.synthesizeForcedFunctionToolCallFromJsonContent(allocator, response_text, parsed_choice);
-        break :blk if (fallback_tool_calls) |calls| calls else &.{};
-    };
-    const finish_reason = if (parsed_tool_calls.len > 0) "tool_calls" else result.finish_reason;
-    try emitCliGenerateJson(
-        allocator,
-        io,
-        model_name,
-        response_text,
-        finish_reason,
-        result.prompt_tokens,
-        result.tokens_used,
-        if (parsed_tool_calls.len > 0) parsed_tool_calls else null,
-    );
-}
-
-fn emitCliGenerateJson(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model_name: []const u8,
-    response_text: []const u8,
-    finish_reason: []const u8,
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    tool_calls: ?[]const tool_parser_mod.ToolCall,
-) !void {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-
-    try out.appendSlice(allocator, "{\"object\":\"chat.completion\",\"model\":");
-    try appendCliJsonString(&out, allocator, model_name);
-    try out.appendSlice(allocator, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",");
-    if (tool_calls) |calls| {
-        try out.appendSlice(allocator, "\"content\":null,\"tool_calls\":[");
-        for (calls, 0..) |call, idx| {
-            if (idx > 0) try out.append(allocator, ',');
-            try out.appendSlice(allocator, "{\"id\":");
-            try appendCliJsonString(&out, allocator, call.id);
-            try out.appendSlice(allocator, ",\"type\":");
-            try appendCliJsonString(&out, allocator, call.type);
-            try out.appendSlice(allocator, ",\"function\":{\"name\":");
-            try appendCliJsonString(&out, allocator, call.function.name);
-            try out.appendSlice(allocator, ",\"arguments\":");
-            try appendCliJsonString(&out, allocator, call.function.arguments);
-            try out.appendSlice(allocator, "}}");
-        }
-        try out.appendSlice(allocator, "]");
-    } else {
-        try out.appendSlice(allocator, "\"content\":");
-        try appendCliJsonString(&out, allocator, response_text);
-    }
-    try out.appendSlice(allocator, "},\"finish_reason\":");
-    try appendCliJsonString(&out, allocator, finish_reason);
-    try out.appendSlice(allocator, "}],\"usage\":{\"prompt_tokens\":");
-    try appendCliUnsigned(&out, allocator, prompt_tokens);
-    try out.appendSlice(allocator, ",\"completion_tokens\":");
-    try appendCliUnsigned(&out, allocator, completion_tokens);
-    try out.appendSlice(allocator, ",\"total_tokens\":");
-    try appendCliUnsigned(&out, allocator, prompt_tokens + completion_tokens);
-    try out.appendSlice(allocator, "}}\n");
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-    try stdout_writer.interface.writeAll(out.items);
-    try stdout_writer.interface.flush();
-}
-
-fn appendCliJsonString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (text) |ch| {
-        switch (ch) {
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, ch),
-        }
-    }
-    try buf.append(allocator, '"');
-}
-
-fn appendCliUnsigned(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: usize) !void {
-    var scratch: [32]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&scratch, "{d}", .{value});
-    try buf.appendSlice(allocator, rendered);
-}
-
 fn parseArgs(args: []const []const u8) !Options {
     if (args.len < 2) {
         printUsage();
@@ -2229,20 +1807,6 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
-        } else if (std.mem.eql(u8, arg, "--tools")) {
-            i += 1;
-            if (i >= args.len) return error.MissingToolsPath;
-            opts.tools_path = args[i];
-        } else if (std.mem.startsWith(u8, arg, "--tools=")) {
-            opts.tools_path = arg["--tools=".len..];
-            if (opts.tools_path.?.len == 0) return error.MissingToolsPath;
-        } else if (std.mem.eql(u8, arg, "--tool-choice")) {
-            i += 1;
-            if (i >= args.len) return error.MissingToolChoice;
-            opts.tool_choice = args[i];
-        } else if (std.mem.startsWith(u8, arg, "--tool-choice=")) {
-            opts.tool_choice = arg["--tool-choice=".len..];
-            if (opts.tool_choice.?.len == 0) return error.MissingToolChoice;
         } else if (std.mem.eql(u8, arg, "--artifact-dir")) {
             i += 1;
             if (i >= args.len) return error.MissingArtifactDir;
@@ -2426,7 +1990,7 @@ fn preflightModelLoadBudget(
     });
     const predicted_backend_type: backends.BackendType = switch (reservation_tier) {
         .host => .native,
-        .backend => if (opts.backend == .metal) .metal else .mlx,
+        .backend => .metal,
         .disk => unreachable,
     };
     limits = try session_factory.widenBudgetLimitsForModelPath(
@@ -2461,28 +2025,24 @@ fn predictedWeightTier(
             if (!build_options.enable_metal) return .host;
             return .backend;
         },
-        .mlx => {
-            if (!build_options.enable_mlx) return .host;
-            return .backend;
-        },
         .cuda => {
             if (!build_options.enable_cuda) return .host;
             return .backend;
         },
         .auto => {
-            if (build_options.enable_mlx and !shouldPreferNativeAheadOfMlx(allocator, manifest)) return .backend;
+            if (build_options.enable_metal and !shouldPreferNativeAheadOfMetal(allocator, manifest)) return .backend;
             return .host;
         },
         .onnx, .xla, .webgpu => return .host,
     }
 }
 
-fn shouldPreferNativeAheadOfMlx(
+fn shouldPreferNativeAheadOfMetal(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
 ) bool {
     const total_bytes = estimateModelArtifactBytes(allocator, manifest) catch return true;
-    return total_bytes == 0 or total_bytes > mlxEagerDenseMaxBytes();
+    return total_bytes == 0 or total_bytes > metalEagerDenseMaxBytes();
 }
 
 fn estimateModelArtifactBytes(
@@ -2494,21 +2054,15 @@ fn estimateModelArtifactBytes(
     return 0;
 }
 
-fn mlxEagerDenseMaxBytes() u64 {
-    const mb = platform.env.getenvUsize("TERMITE_MLX_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
+fn metalEagerDenseMaxBytes() u64 {
+    const mb = platform.env.getenvUsize("TERMITE_METAL_EAGER_DENSE_MAX_MB") orelse return 1024 * 1024 * 1024;
     return mb * 1024 * 1024;
-}
-
-fn enableMlxRawMetalWholeTokenDebug() bool {
-    return platform.env.getenvBool("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN");
 }
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|mlx|xla|webgpu] [--tools path.json] [--tool-choice auto|none|required|function_name] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
-        \\  tools enables tool-call prompting and prints an OpenAI chat-completion-style JSON response.
-        \\  tool-choice=none skips tool prompting and preserves plain generation semantics.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
         \\  artifact-dir overrides that lookup root.
@@ -2562,77 +2116,6 @@ test "parseArgs accepts artifact dir" {
     try std.testing.expectEqualStrings("/tmp/artifacts", opts.artifact_dir.?);
     try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
     try std.testing.expect(opts.raw_prompt);
-}
-
-test "parseArgs accepts tool flags" {
-    const opts = try parseArgs(&.{
-        "/tmp/model",
-        "hello",
-        "--backend",
-        "metal",
-        "--tools",
-        "/tmp/tools.json",
-        "--tool-choice",
-        "lookup_order",
-    });
-    try std.testing.expectEqual(BackendChoice.metal, opts.backend);
-    try std.testing.expectEqualStrings("/tmp/tools.json", opts.tools_path.?);
-    try std.testing.expectEqualStrings("lookup_order", opts.tool_choice.?);
-}
-
-test "parseArgs preserves defaults when tools are absent" {
-    const opts = try parseArgs(&.{ "/tmp/model", "hello" });
-    try std.testing.expectEqual(@as(?[]const u8, null), opts.tools_path);
-    try std.testing.expectEqual(@as(?[]const u8, null), opts.tool_choice);
-}
-
-test "parseCliToolChoice variants" {
-    try std.testing.expectEqual(tool_parser_mod.ParsedToolChoice.auto, try parseCliToolChoice(null));
-    try std.testing.expectEqual(tool_parser_mod.ParsedToolChoice.auto, try parseCliToolChoice("auto"));
-    try std.testing.expectEqual(tool_parser_mod.ParsedToolChoice.required, try parseCliToolChoice("required"));
-    try std.testing.expectEqual(tool_parser_mod.ParsedToolChoice.none, try parseCliToolChoice("none"));
-    const forced = try parseCliToolChoice("lookup_order");
-    try std.testing.expectEqualStrings("lookup_order", tool_parser_mod.forcedFunctionName(forced).?);
-}
-
-test "tool flags keep Metal live whole-model executor eligible" {
-    const opts = try parseArgs(&.{
-        "/tmp/model",
-        "hello",
-        "--backend",
-        "metal",
-        "--tools",
-        "/tmp/tools.json",
-        "--tool-choice",
-        "lookup_order",
-    });
-    try std.testing.expect(liveWholeModelExecutorRequested(&opts));
-}
-
-test "tool-choice none remains disabled for tool prompting" {
-    const parsed = try parseCliToolChoice("none");
-    try std.testing.expect(!tool_parser_mod.toolCallsEnabled(parsed));
-}
-
-test "CLI forced tool selection rejects missing function" {
-    const allocator = std.testing.allocator;
-    const parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        \\[
-        \\  {"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{}}}}
-        \\]
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-
-    var selected_tools = std.ArrayListUnmanaged(tool_parser_mod.ToolDefinition).empty;
-    defer selected_tools.deinit(allocator);
-    for (parsed.value.array.items) |tool_value| {
-        try appendCliToolDefinition(allocator, tool_value, "lookup_order", &selected_tools);
-    }
-    try std.testing.expectEqual(@as(usize, 0), selected_tools.items.len);
 }
 
 test "parseArgs accepts compiled target" {

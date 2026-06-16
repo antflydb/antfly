@@ -17,7 +17,6 @@ const block = @import("block.zig");
 const turboquant = @import("turboquant.zig");
 
 pub const BackendKind = enum {
-    mlx,
     metal,
     native,
     cuda,
@@ -904,7 +903,7 @@ pub fn parseKvDType(name: []const u8) ?KvDType {
 test "pool reuses released blocks" {
     const allocator = std.testing.allocator;
     var pool = KvPool.init(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 16,
         .num_kv_heads = 8,
@@ -965,7 +964,7 @@ test "pool f16 round-trip" {
 test "pool retain and releaseRef tracks block ownership" {
     const allocator = std.testing.allocator;
     var pool = KvPool.init(.{
-        .backend = .mlx,
+        .backend = .metal,
         .dtype = .f16,
         .page_size_tokens = 4,
         .num_kv_heads = 1,

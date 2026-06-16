@@ -665,7 +665,6 @@ def main() -> int:
             "bench-clipclap-kernels",
             "-Dskip-openapi=true",
             "-Donnx=false",
-            "-Dmlx=false",
             "-Dmetal=false",
         ]
         if args.native_dispatch_stats:
@@ -686,7 +685,6 @@ def main() -> int:
             "bench-clipclap-native",
             "-Dskip-openapi=true",
             "-Donnx=false",
-            "-Dmlx=false",
             "-Dmetal=false",
             "--",
             *shlex.split(args.native_model_args),
@@ -705,7 +703,6 @@ def main() -> int:
             "bench-gliner2-native",
             "-Dskip-openapi=true",
             "-Donnx=false",
-            "-Dmlx=false",
             "-Dmetal=false",
             "--",
             *shlex.split(args.native_gliner_args),

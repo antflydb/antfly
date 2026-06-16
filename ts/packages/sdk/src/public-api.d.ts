@@ -9845,7 +9845,7 @@ export interface components {
              * @description Optional backend override for this request.
              *     `auto` keeps the node default behavior.
              *     `onnx` forces ONNX generation when the model/package supports it.
-             *     `native`, `metal`, and `mlx` force the native host backend choice.
+             *     `native` and `metal` force the native host backend choice.
              *     `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
              *     requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
              *     `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
@@ -9853,7 +9853,7 @@ export interface components {
              *     `mode: "compiled"` to request WebGPU graph partition execution.
              * @enum {string}
              */
-            backend?: "auto" | "onnx" | "native" | "metal" | "mlx" | "xla" | "webgpu";
+            backend?: "auto" | "onnx" | "native" | "metal" | "xla" | "webgpu";
             /**
              * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
              *     `compiled` runs inference graph planning, partitioning, and backend executor attachment.
@@ -10040,7 +10040,6 @@ export interface components {
              *     - `native` - Native CPU backend
              *     - `onnx` - ONNX Runtime backend
              *     - `metal` - Apple Metal backend
-             *     - `mlx` - MLX backend
              *     - `cuda` - NVIDIA CUDA backend
              *     - `xla` - PJRT/XLA compiled backend
              *
@@ -10156,11 +10155,6 @@ export interface components {
              * @example true
              */
             metal?: boolean;
-            /**
-             * @description Whether the MLX backend is built into this runtime
-             * @example true
-             */
-            mlx?: boolean;
             /**
              * @description Whether the CUDA backend is built into this runtime
              * @example false

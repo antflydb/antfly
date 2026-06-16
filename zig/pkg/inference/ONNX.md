@@ -108,7 +108,7 @@ That composition is still conservative: resident values only cross sessions
 when the backend identity matches exactly. Imported ONNX sessions now make that
 possible for GPU sidecars by using a ref-counted backend context. `LoadedModel`
 loads compatible ONNX sidecars with the main imported session's context, so
-Metal/MLX encoder outputs can be passed to projection sidecars without
+Metal encoder outputs can be passed to projection sidecars without
 constructing a second unrelated backend owner. This is shared graph/session
 composition, not a separate ONNX runtime path.
 

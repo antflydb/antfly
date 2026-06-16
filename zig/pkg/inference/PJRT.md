@@ -198,7 +198,7 @@ Import `pjrt` module when enabled. Link libc (for `dlopen`).
 
 **Modify `src/ops/ops.zig:17`** — Add `tpu` to `BackendKind`:
 ```zig
-pub const BackendKind = enum { native, mlx, wasm, tpu, graph };
+pub const BackendKind = enum { native, metal, wasm, tpu, graph };
 ```
 
 **Modify `src/backends/backends.zig`** — Add `tpu` to `BackendType` with priority 35 and `available()` returning `build_options.enable_tpu`.
@@ -325,7 +325,7 @@ pub fn supportsTPU(op: OpCode) bool {
         .fused_conv1d, .fused_conv2d,
         .fused_from_float32, .fused_to_float32,
         => true,
-        // Paged KV cache stays on host (BLAS fallback)
+        // Paged KV cache stays on host (native CPU fallback)
         else => false,
     };
 }
@@ -343,7 +343,7 @@ const caps = [_]Capability{
 
 **Modify `src/graph/root.zig`** — Export TPU modules.
 
-**Test:** End-to-end: load a small model, run inference via TPU backend, verify outputs match BLAS-only within tolerance (1e-4 f32, 1e-2 bf16).
+**Test:** End-to-end: load a small model, run inference via TPU backend, verify outputs match native-only within tolerance (1e-4 f32, 1e-2 bf16).
 
 ---
 
@@ -354,10 +354,10 @@ const caps = [_]Capability{
 pub fn createTpuMesh(
     allocator: std.mem.Allocator,
     client: *pjrt.Client,
-    blas_backend: *const ComputeBackend,
+    native_backend: *const ComputeBackend,
 ) !DeviceMesh
 ```
-Creates one `DeviceEntry` per addressable TPU chip + BLAS fallback. For v4-8 (4 chips): `[tpu:0, tpu:1, tpu:2, tpu:3, native:cpu]`.
+Creates one `DeviceEntry` per addressable TPU chip + native CPU fallback. For v4-8 (4 chips): `[tpu:0, tpu:1, tpu:2, tpu:3, native:cpu]`.
 
 **Modify `src/graph/tpu_executor.zig`** — Multi-device execution:
 - One `DeviceEntry` per chip in `DeviceMesh`
@@ -450,6 +450,6 @@ All TPU code behind `if (build_options.enable_tpu)`. Non-Linux CI skips entirely
 
 1. `zig build -Dtpu=true` compiles on Linux
 2. `zig build -Dtpu=false` compiles everywhere (no TPU code included)
-3. PJRT CPU plugin: end-to-end inference matches BLAS-only within tolerance
+3. PJRT CPU plugin: end-to-end inference matches native-only within tolerance
 4. TPU hardware: real model inference produces correct outputs
 5. Multi-chip: tensor-parallel inference matches single-chip results

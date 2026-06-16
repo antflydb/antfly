@@ -302,7 +302,7 @@ fn normalizeGemma4MultimodalPilotArgs(allocator: std.mem.Allocator, args: []cons
 
 fn runCommand(init: std.process.Init, argv0: []const u8, main_fn: CommandMain, args: []const []const u8) !void {
     if (builtin.os.tag == .windows) {
-        @compileError("termite finetune command dispatch needs Windows Args vector construction");
+        @compileError("antfly inference finetune command dispatch needs Windows Args vector construction");
     }
 
     const allocator = init.gpa;
@@ -358,7 +358,7 @@ fn usage() void {
         \\  antfly inference finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
         \\  antfly inference finetune adapter bootstrap gemma4 /models/gemma4 /tmp/adapter --rank 16 --alpha 32 --target-preset all-linear
         \\  antfly inference finetune train gemma4-lora /models/gemma4 /tmp/adapter /tmp/prepared.json /tmp/out --trainer autodiff
-        \\  antfly inference finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend mlx
+        \\  antfly inference finetune workflow gemma4-pilot text /models/gemma4 /tmp/pilot-run --count 1000 --backend native
         \\
     , .{});
 }

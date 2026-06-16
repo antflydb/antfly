@@ -16,7 +16,7 @@
 //
 // Accepts a batch of text strings and returns [batch][hidden_dim] f32 embeddings.
 // Uses the unified Tokenizer interface (HuggingFace or SentencePiece) and any
-// backend Session (ONNX, native, MLX).
+// backend Session (ONNX, native).
 
 const std = @import("std");
 const platform = @import("antfly_platform");
@@ -1654,17 +1654,17 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     if (start_ns == 0) return;
     const now = embedTimingNowNs();
     const elapsed_us = if (now > start_ns) @divTrunc(now - start_ns, 1000) else 0;
-    std.log.info("termite embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
+    std.log.info("antfly inference embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
 }
 
 fn logEmbedFallback(explicit: bool, phase: []const u8, count: usize) void {
     if (!embedTimingEnabled(explicit)) return;
-    std.log.info("termite embed fallback phase={s} count={d}", .{ phase, count });
+    std.log.info("antfly inference embed fallback phase={s} count={d}", .{ phase, count });
 }
 
 fn logEmbedResidentSuccess(modality: ResidentProjectionModality, phase: []const u8, count: usize) void {
     if (!embedTimingEnabled(false) and !embedResidentFailClosedEnabled()) return;
-    std.log.info("termite embed resident outcome=success modality={s} phase={s} count={d}", .{
+    std.log.info("antfly inference embed resident outcome=success modality={s} phase={s} count={d}", .{
         @tagName(modality),
         phase,
         count,
@@ -1673,7 +1673,7 @@ fn logEmbedResidentSuccess(modality: ResidentProjectionModality, phase: []const 
 
 fn logEmbedResidentFallback(modality: ResidentProjectionModality, phase: []const u8, count: usize, reason: []const u8) void {
     if (!embedTimingEnabled(false) and !embedResidentFailClosedEnabled()) return;
-    std.log.warn("termite embed resident outcome=fallback modality={s} phase={s} count={d} reason={s}", .{
+    std.log.warn("antfly inference embed resident outcome=fallback modality={s} phase={s} count={d} reason={s}", .{
         @tagName(modality),
         phase,
         count,
@@ -1717,7 +1717,7 @@ fn envFlagEnabled(value: []const u8) bool {
 fn logEmbedTensorShapes(explicit: bool, label: []const u8, tensors: []const Tensor) void {
     if (!embedTimingEnabled(explicit)) return;
     for (tensors, 0..) |tensor, i| {
-        std.log.info("termite embed tensor label={s} index={d} name={s} shape={any} data_len={d}", .{
+        std.log.info("antfly inference embed tensor label={s} index={d} name={s} shape={any} data_len={d}", .{
             label,
             i,
             tensor.name,
@@ -1729,7 +1729,7 @@ fn logEmbedTensorShapes(explicit: bool, label: []const u8, tensors: []const Tens
 
 fn logEmbedSelectedTensor(explicit: bool, label: []const u8, tensor: *const Tensor) void {
     if (!embedTimingEnabled(explicit)) return;
-    std.log.info("termite embed selected label={s} name={s} shape={any} data_len={d}", .{
+    std.log.info("antfly inference embed selected label={s} name={s} shape={any} data_len={d}", .{
         label,
         tensor.name,
         tensor.shape,

@@ -30292,8 +30292,9 @@ test "db async asset producer mention edges come from resolution artifacts" {
             .key = "doc:a",
             .value = "{\"body\":\"Ada mention\"}",
         }},
-        .sync_level = .write,
+        .sync_level = .enrichments,
     });
+    try db.runUntilIdle();
     try db.runUntilIdle();
 
     try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
@@ -44305,6 +44306,7 @@ test "db search filters expired documents when ttl schema is configured" {
         .kind = .full_text,
         .config_json = "{}",
     });
+    try db.runUntilIdle();
 
     var text = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -44360,6 +44362,7 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
         .kind = .full_text,
         .config_json = "{}",
     });
+    try db.runUntilIdle();
 
     var text = try db.search(alloc, .{
         .index_name = "ft_v1",

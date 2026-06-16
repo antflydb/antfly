@@ -17905,7 +17905,6 @@ components:
             - onnx
             - native
             - metal
-            - mlx
             - xla
             - webgpu
           description: >
@@ -17915,7 +17914,7 @@ components:
 
             `onnx` forces ONNX generation when the model/package supports it.
 
-            `native`, `metal`, and `mlx` force the native host backend choice.
+            `native` and `metal` force the native host backend choice.
 
             `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
 
@@ -18238,8 +18237,6 @@ components:
 
             - `metal` - Apple Metal backend
 
-            - `mlx` - MLX backend
-
             - `cuda` - NVIDIA CUDA backend
 
             - `xla` - PJRT/XLA compiled backend
@@ -18384,10 +18381,6 @@ components:
         metal:
           type: boolean
           description: Whether the Metal backend is built into this runtime
-          example: true
-        mlx:
-          type: boolean
-          description: Whether the MLX backend is built into this runtime
           example: true
         cuda:
           type: boolean

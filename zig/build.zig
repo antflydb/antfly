@@ -87,13 +87,6 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
     module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
 }
 
-fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
-    if (target.result.os.tag != .macos) return false;
-    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
-    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
-    return pathExists(b, header) and pathExists(b, library);
-}
-
 fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
         "uv",
@@ -200,8 +193,6 @@ fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
 fn addDelegatedInferenceOptions(
     b: *std.Build,
     run: *std.Build.Step.Run,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
     enable_metal: bool,
     enable_onnx: bool,
     onnx_root: []const u8,
@@ -211,12 +202,6 @@ fn addDelegatedInferenceOptions(
     blas_root: ?[]const u8,
 ) void {
     run.addArg("-Dshared-lib-root=../..");
-    if (enable_mlx) {
-        run.addArg("-Dmlx=true");
-        if (mlx_root) |root| run.addArg(b.fmt("-Dmlx-root={s}", .{root}));
-    } else {
-        run.addArg("-Dmlx=false");
-    }
     run.addArg(if (enable_metal) "-Dmetal=true" else "-Dmetal=false");
     run.addArg(if (enable_onnx) "-Donnx=true" else "-Donnx=false");
     if (enable_onnx) {
@@ -239,8 +224,6 @@ fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
 
 fn addDelegatedInferenceBuildSteps(
     b: *std.Build,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
     enable_metal: bool,
     enable_onnx: bool,
     onnx_root: []const u8,
@@ -254,7 +237,7 @@ fn addDelegatedInferenceBuildSteps(
     for (inference_delegated_steps) |step_name| {
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
+        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
@@ -277,21 +260,6 @@ const SpngPaths = struct {
     include_dir: []const u8,
     lib_dir: []const u8,
 };
-
-fn detectMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
-    if (target.result.os.tag != .macos) return null;
-
-    const candidates = [_][]const u8{
-        "/opt/homebrew",
-        "/opt/homebrew/opt/mlx-c",
-        "/usr/local",
-        "/usr/local/opt/mlx-c",
-    };
-    for (candidates) |root| {
-        if (mlxRootAvailable(b, target, root)) return root;
-    }
-    return null;
-}
 
 fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     const platform_str = switch (target.result.os.tag) {
@@ -1105,12 +1073,6 @@ pub fn build(b: *std.Build) void {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX inference support when available");
-    const termite_mlx_requested = if (link_libc)
-        termite_mlx_option orelse false
-    else
-        false;
-    const termite_mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with include/ and lib/");
     const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
     const termite_enable_onnx = if (link_libc)
         termite_onnx_option orelse false
@@ -1119,14 +1081,9 @@ pub fn build(b: *std.Build) void {
     const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
     const termite_onnx_root = termite_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
     const termite_enable_metal = if (link_libc)
-        b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
+        b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse (target.result.os.tag == .macos)
     else
         false;
-    const termite_enable_mlx = termite_enable_metal and termite_mlx_requested;
-    const termite_mlx_root = if (termite_enable_mlx)
-        termite_mlx_root_opt orelse detectMlxRoot(b, target)
-    else
-        termite_mlx_root_opt;
     const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
     const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
@@ -1143,12 +1100,6 @@ pub fn build(b: *std.Build) void {
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
-    if (termite_enable_mlx) {
-        const root = termite_mlx_root orelse @panic("-Dmlx=true requires an MLX C install; pass -Dmlx-root=<path>");
-        if (!mlxRootAvailable(b, target, root)) {
-            @panic("-Dmlx=true requires an MLX C install with include/mlx/c/mlx.h and lib/libmlxc.dylib");
-        }
-    }
     if (termite_enable_onnx) {
         const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
             pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
@@ -1158,8 +1109,6 @@ pub fn build(b: *std.Build) void {
     }
     const delegated_inference_steps = addDelegatedInferenceBuildSteps(
         b,
-        termite_enable_mlx,
-        termite_mlx_root,
         termite_enable_metal,
         termite_enable_onnx,
         termite_onnx_root,
@@ -1557,8 +1506,6 @@ pub fn build(b: *std.Build) void {
         .backend = .{
             .enable_onnx = termite_enable_onnx,
             .onnx_root = termite_onnx_root,
-            .enable_mlx = termite_enable_mlx,
-            .mlx_root = termite_mlx_root,
             .enable_metal = termite_enable_metal,
             .enable_cuda = termite_enable_cuda,
             .cuda_artifacts = termite_cuda_artifacts,
@@ -1895,7 +1842,6 @@ pub fn build(b: *std.Build) void {
     // --- Inference WASM modules for unified antfly.wasm ---
     const inference_wasm_build_options = b.addOptions();
     inference_wasm_build_options.addOption(bool, "enable_onnx", false);
-    inference_wasm_build_options.addOption(bool, "enable_mlx", false);
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");

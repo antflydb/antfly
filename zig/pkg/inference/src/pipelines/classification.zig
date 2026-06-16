@@ -45,14 +45,14 @@ pub const ClassificationPipeline = struct {
     tok: Tokenizer,
     config: ClassificationConfig,
 
-    pub fn usesDistributedMlx(self: *const ClassificationPipeline) bool {
+    pub fn usesDistributedGpuHosted(self: *const ClassificationPipeline) bool {
         return self.config.distributed.enabled and
             self.config.distributed.world_size > 1 and
             self.session.backend().usesGpuHostedSession();
     }
 
-    pub fn usesTensorParallelMlx(self: *const ClassificationPipeline) bool {
-        return self.usesDistributedMlx() and self.config.distributed.mode == .tensor_parallel;
+    pub fn usesTensorParallelGpuHosted(self: *const ClassificationPipeline) bool {
+        return self.usesDistributedGpuHosted() and self.config.distributed.mode == .tensor_parallel;
     }
 
     pub fn init(

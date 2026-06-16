@@ -22,8 +22,8 @@ An ordered set of `(DeviceId, ComputeBackend)` pairs representing physical or lo
 
 ```
 DeviceMesh { devices: [
-    (0, mlx_backend,  .mlx,  "gpu:0"),
-    (1, blas_backend, .native, "cpu:0"),
+    (0, mlx_backend,  .metal,  "gpu:0"),
+    (1, native_backend, .native, "cpu:0"),
 ] }
 ```
 
@@ -96,7 +96,7 @@ Multi-device inference is opt-in. `NativeGenerationPipeline` has optional `devic
 - If `device_mesh` is set and `parallel_config` requests a real non-`single` strategy across multiple devices: build a `DevicePartitionPlan` via `planParallel`, then execute through `multi_executor.executeMultiDevice`
 - Otherwise: stay on the normal single-device path through `interpreter.execute`
 
-Single-device `--backend mlx` runs do not opportunistically partition the graph.
+Single-device `--backend metal` runs do not opportunistically partition the graph.
 
 The output is transferred to f32 from whichever device produced it, then the last-position logits are sliced and returned.
 
@@ -114,7 +114,7 @@ The output is transferred to f32 from whichever device produced it, then the las
 
 ## Future Work
 
-- **Native MLX multi-device**: Replace CPU-mediated transfers with MLX's native multi-device primitives when available.
+- **Native Metal multi-device**: Replace CPU-mediated transfers with Metal's native multi-device primitives when available.
 - **Pipeline overlap**: Run consecutive pipeline stages concurrently via `std.Thread` for true pipeline parallelism.
 - **Graph-level collective nodes**: Currently collectives are executor-boundary operations. Promoting them to graph nodes would enable the compiler passes to optimize around them.
 - **Distributed training**: Compose collective ops with gradient all-reduce for data-parallel training (see [TRAINING.md](TRAINING.md)).
