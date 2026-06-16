@@ -774,6 +774,11 @@ fn parseOperator(
                 .name = try cursor.value("--standby-disabled"),
                 .desired = false,
             });
+        } else if (std.mem.eql(u8, arg, "--standby-drop-slot")) {
+            _ = cursor.next();
+            if (standbys.items.len == 0) return error.StandbyNameMissing;
+            if (standbys.items[standbys.items.len - 1].desired) return error.DropSlotRequiresDisabledStandby;
+            standbys.items[standbys.items.len - 1].drop_slot_on_removal = true;
         } else if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
             _ = cursor.next();
             command.spec.retention_policy.max_lag_lsn = try parseU64(try cursor.value("--max-lag-lsn"));
@@ -1462,41 +1467,41 @@ test "storage.ha admin cli parses primary status with sync policy" {
 test "storage.ha admin cli parses operator plan command" {
     const alloc = std.testing.allocator;
     var plan = try parse(alloc, &.{
-        "operator",              "plan",
-        "--standby",             "standby-a",
-        "--standby-initial-lsn", "3",
-        "--standby-disabled",    "standby-b",
-        "--max-lag-lsn",         "50",
-        "--sync-mode",           "remote-apply",
-        "--sync-standby",        "standby-a",
-        "--auto-failover",       "--fencing-authority",
-        "kubernetes-lease",      "--auto-max-lag-lsn",
-        "2",                     "--current-primary-id",
-        "primary-a",             "--primary-admin-unavailable",
-        "--fence-authority",     "kubernetes_lease",
-        "--fence-ready",         "--fence-holder",
-        "standby-a",             "--fence-generation",
-        "7",                     "--fence-reason",
-        "LeaseAcquired",         "--former-primary-id",
-        "primary-a",             "--former-cluster-id",
-        "100",                   "--former-shard-id",
-        "10",                    "--former-table-id",
-        "20",                    "--former-timeline-id",
-        "1",                     "--former-epoch",
-        "1",                     "--former-last-lsn",
-        "12",                    "--retained-from-lsn",
-        "8",                     "--receipt-old-primary-id",
-        "primary-a",             "--receipt-promoted-node-id",
-        "standby-a",             "--receipt-parent-timeline-id",
-        "1",                     "--receipt-parent-epoch",
-        "1",                     "--receipt-new-timeline-id",
-        "2",                     "--receipt-new-epoch",
-        "2",                     "--receipt-required-lsn",
-        "10",                    "--receipt-observed-lsn",
-        "10",                    "--receipt-generation",
-        "3",                     "--receipt-token",
-        "token",                 "--receipt-reason",
-        "operator-approved",
+        "operator",                     "plan",
+        "--standby",                    "standby-a",
+        "--standby-initial-lsn",        "3",
+        "--standby-disabled",           "standby-b",
+        "--standby-drop-slot",          "--max-lag-lsn",
+        "50",                           "--sync-mode",
+        "remote-apply",                 "--sync-standby",
+        "standby-a",                    "--auto-failover",
+        "--fencing-authority",          "kubernetes-lease",
+        "--auto-max-lag-lsn",           "2",
+        "--current-primary-id",         "primary-a",
+        "--primary-admin-unavailable",  "--fence-authority",
+        "kubernetes_lease",             "--fence-ready",
+        "--fence-holder",               "standby-a",
+        "--fence-generation",           "7",
+        "--fence-reason",               "LeaseAcquired",
+        "--former-primary-id",          "primary-a",
+        "--former-cluster-id",          "100",
+        "--former-shard-id",            "10",
+        "--former-table-id",            "20",
+        "--former-timeline-id",         "1",
+        "--former-epoch",               "1",
+        "--former-last-lsn",            "12",
+        "--retained-from-lsn",          "8",
+        "--receipt-old-primary-id",     "primary-a",
+        "--receipt-promoted-node-id",   "standby-a",
+        "--receipt-parent-timeline-id", "1",
+        "--receipt-parent-epoch",       "1",
+        "--receipt-new-timeline-id",    "2",
+        "--receipt-new-epoch",          "2",
+        "--receipt-required-lsn",       "10",
+        "--receipt-observed-lsn",       "10",
+        "--receipt-generation",         "3",
+        "--receipt-token",              "token",
+        "--receipt-reason",             "operator-approved",
     });
     defer plan.deinit(alloc);
 
@@ -1507,6 +1512,7 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqual(@as(?u64, 3), command.spec.standbys[0].initial_lsn);
     try std.testing.expectEqualStrings("standby-b", command.spec.standbys[1].name);
     try std.testing.expect(!command.spec.standbys[1].desired);
+    try std.testing.expect(command.spec.standbys[1].drop_slot_on_removal);
     try std.testing.expectEqual(@as(u64, 50), command.spec.retention_policy.max_lag_lsn);
     try std.testing.expect(command.spec.auto_failover.enabled);
     try std.testing.expectEqual(operator.FencingAuthority.kubernetes_lease, command.spec.auto_failover.fencing_authority);
@@ -1528,6 +1534,8 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqual(@as(u64, 2), command.promotion_receipt.?.new_timeline_id);
     try std.testing.expectEqual(@as(u64, 10), command.promotion_receipt.?.observed_lsn);
     try std.testing.expectEqual(@as(u64, 3), command.promotion_receipt.?.generation);
+
+    try std.testing.expectError(error.DropSlotRequiresDisabledStandby, parse(alloc, &.{ "operator", "plan", "--standby", "standby-a", "--standby-drop-slot" }));
 }
 
 test "storage.ha admin cli renders versioned json command plan" {

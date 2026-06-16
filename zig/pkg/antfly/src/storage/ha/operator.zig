@@ -60,6 +60,7 @@ pub const FencingObservation = struct {
 pub const StandbySpec = struct {
     name: []const u8,
     desired: bool = true,
+    drop_slot_on_removal: bool = false,
     initial_lsn: ?u64 = null,
 };
 
@@ -275,13 +276,25 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
 
     for (spec.standbys) |standby| {
         if (!standby.desired) {
-            if (findSlot(observed.primary.slots, standby.name) != null) {
-                try actions.append(alloc, .{
-                    .kind = .pause_slot,
-                    .standby_name = standby.name,
-                    .slot_name = standby.name,
-                    .reason = "StandbyRemovedFromSpec",
-                });
+            if (findSlot(observed.primary.slots, standby.name)) |slot| {
+                const active = slot.active and !slot.reseed_required;
+                if (active) {
+                    try actions.append(alloc, .{
+                        .kind = .pause_slot,
+                        .standby_name = standby.name,
+                        .slot_name = standby.name,
+                        .reason = "StandbyRemovedFromSpec",
+                    });
+                }
+                if (standby.drop_slot_on_removal) {
+                    try actions.append(alloc, .{
+                        .kind = .drop_slot,
+                        .depends_on = if (active) .pause_slot else null,
+                        .standby_name = standby.name,
+                        .slot_name = standby.name,
+                        .reason = "StandbyMarkedForSlotDrop",
+                    });
+                }
             }
             continue;
         }
@@ -905,6 +918,57 @@ test "storage.ha operator plans slots and standby bootstrap" {
     try std.testing.expect(unhealthy.status);
     try std.testing.expectEqual(ConditionSeverity.warning, unhealthy.severity);
     try std.testing.expect(!plan.automatic_promotion_allowed);
+}
+
+test "storage.ha operator plans explicit slot drop for removed standby" {
+    const alloc = std.testing.allocator;
+    const slots = [_]status.SlotSnapshot{
+        .{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .active = true,
+            .reseed_required = false,
+            .restart_lsn = 7,
+            .received_lsn = 10,
+            .applied_lsn = 10,
+            .safe_read_lsn = 10,
+            .write_lag_lsn = 0,
+            .apply_lag_lsn = 0,
+            .safe_read_lag_lsn = 0,
+            .retention_lag_lsn = 3,
+            .status = .healthy,
+        },
+    };
+    const primary = status.PrimarySnapshot{
+        .identity = .{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 },
+        .current_lsn = 10,
+        .slots = @constCast(slots[0..]),
+        .retention = .{
+            .primary_lsn = 10,
+            .oldest_restart_lsn = 7,
+            .retained_lsn_count = 3,
+            .active_slots = 1,
+            .reseed_recommended = 0,
+        },
+    };
+    const standbys = [_]StandbySpec{
+        .{ .name = "standby-a", .desired = false, .drop_slot_on_removal = true },
+    };
+
+    var plan = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+    }, .{ .primary = primary });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.pause_slot, plan.actions[0].kind);
+    try std.testing.expectEqual(ActionKind.drop_slot, plan.actions[1].kind);
+    try std.testing.expectEqual(@as(?ActionKind, null), plan.actions[0].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .pause_slot), plan.actions[1].depends_on);
+    try std.testing.expectEqualStrings("StandbyRemovedFromSpec", plan.actions[0].reason);
+    try std.testing.expectEqualStrings("StandbyMarkedForSlotDrop", plan.actions[1].reason);
+    try std.testing.expectEqual(@as(usize, 0), plan.desired_standby_count);
 }
 
 test "storage.ha operator reports retention pressure degraded sync and reseed" {
