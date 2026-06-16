@@ -62135,6 +62135,23 @@ fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFami
     };
 }
 
+fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .insert,
+        .insert_source,
+        .update,
+        .delete,
+        .update_source,
+        .delete_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => true,
+        .explain => std.mem.startsWith(u8, entry.plan, "explain:kind=write:"),
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62341,6 +62358,11 @@ fn validateAppParityFixtureMetadata(
     if (entry.summary.operations != null and !appParityFixtureFamilyAllowsOperationsSummary(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if ((entry.summary.returning != null or entry.summary.returning_all != null) and
+        !appParityFixtureAllowsReturningSummary(entry))
+    {
+        return error.TestUnexpectedResult;
+    }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
         return error.TestUnexpectedResult;
     }
@@ -62453,6 +62475,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "price_intervals", .operations = 2 },
         .plan = "query:table=price_intervals:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=0:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "ignored returning summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "truncate returning summary",
+        .sql = "TRUNCATE usage_records",
+        .family = .truncate_source,
+        .summary = .{ .table_name = "usage_records", .returning = 0 },
+        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
