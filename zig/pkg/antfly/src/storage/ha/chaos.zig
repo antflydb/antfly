@@ -36,12 +36,14 @@ const TestPaths = struct {
     primary_slots: [:0]u8,
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
+    fence_wal: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
+        alloc.free(self.fence_wal);
     }
 };
 
@@ -55,6 +57,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_log);
     const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
     defer alloc.free(standby_progress);
+    const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
+    defer alloc.free(fence_wal);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -62,12 +66,14 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
         .primary_slots = try alloc.dupeZ(u8, primary_slots),
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
+        .fence_wal = try alloc.dupeZ(u8, fence_wal),
     };
 }
 
@@ -325,4 +331,92 @@ test "storage.ha chaos lag retention forces reseed and former primary cannot rew
     }, receipt, .{ .retained_from_lsn = 5 });
     try std.testing.expectEqual(rejoin.Action.reseed, assessment.action);
     try std.testing.expectEqual(rejoin.Reason.parent_timeline_wal_expired, assessment.reason);
+}
+
+test "storage.ha chaos network partition requires fence before standby promotion" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "network-partition");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "before-partition" });
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const replicated = try session.replicateAvailable(alloc, &primary, "standby-a", &standby, &capture, ApplyCapture.apply);
+    try std.testing.expectEqual(@as(u64, 1), replicated.progress.applied_lsn);
+
+    const sync_names = [_][]const u8{"standby-a"};
+    _ = try primary.append(.{ .payload = "partitioned-primary-write" });
+    var decision = try primary.evaluateDurability(2, .{
+        .mode = .remote_apply,
+        .standby_names = &sync_names,
+        .failure_policy = .block,
+    });
+    try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, decision.status);
+
+    decision = try primary.evaluateDurability(2, .{
+        .mode = .remote_apply,
+        .standby_names = &sync_names,
+        .failure_policy = .degrade_to_async,
+    });
+    try std.testing.expectEqual(primary_mod.DurabilityStatus.degraded_to_async, decision.status);
+
+    try std.testing.expectError(error.FencingRequired, standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+    }));
+    try std.testing.expectError(error.PromotionRequiresForce, standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+        .fencing_confirmed = true,
+    }));
+
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    const receipt = try fence_store.acquirePromotionFence(.{
+        .identity = identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+        .observed_lsn = standby.currentProgress().applied_lsn,
+        .force = true,
+        .reason = "network-partition",
+    });
+    defer fencing.freeReceipt(alloc, receipt);
+
+    const promoted = try standby.promote(receipt.promotionRequest());
+    try std.testing.expect(promoted.forced);
+    try std.testing.expect(promoted.data_loss_possible);
+    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().applied_lsn);
+
+    const rejoin_blocked = rejoin.assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = identity,
+        .last_lsn = primary.lastLsn(),
+    }, receipt, .{ .retained_from_lsn = 1 });
+    try std.testing.expectEqual(rejoin.Action.reseed, rejoin_blocked.action);
+    try std.testing.expectEqual(rejoin.Reason.parent_timeline_retained, rejoin_blocked.reason);
+
+    const rejoin_allowed = rejoin.assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = identity,
+        .last_lsn = primary.lastLsn(),
+    }, receipt, .{
+        .retained_from_lsn = 1,
+        .allow_rewind_after_forced_promotion = true,
+    });
+    try std.testing.expectEqual(rejoin.Action.rewind, rejoin_allowed.action);
+    try std.testing.expect(rejoin_allowed.data_loss_discarded);
 }
