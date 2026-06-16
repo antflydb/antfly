@@ -1106,6 +1106,15 @@ fn fetchPublicRowsGet(
     return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_get_suffix, body, 200);
 }
 
+fn fetchPublicRowsQuery(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_query_suffix, body, 200);
+}
+
 fn waitForPublicRowsGetContains(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
@@ -1120,7 +1129,60 @@ fn waitForPublicRowsGetContains(
 
     var round: usize = 0;
     while (round < rounds) : (round += 1) {
-        var resp = try fetchPublicRowsGet(client, base_uri, table_name, body);
+        var resp = fetchPublicRowsGet(client, base_uri, table_name, body) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => {
+                try cluster.stepAll();
+                continue;
+            },
+            else => return err,
+        };
+        var matched = true;
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, resp.body, needle) == null) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            if (last_body) |body_copy| {
+                client.alloc.free(body_copy);
+                last_body = null;
+            }
+            return resp;
+        }
+        if (last_body) |body_copy| client.alloc.free(body_copy);
+        last_body = try client.alloc.dupe(u8, resp.body);
+        resp.deinit(std.heap.page_allocator);
+        try cluster.stepAll();
+    }
+
+    if (last_body) |body_copy| {
+        try expectBodyContainsAll(body_copy, needles);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn waitForPublicRowsQueryContains(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    needles: []const []const u8,
+    rounds: usize,
+) !api_http_client.QueryResponse {
+    var last_body: ?[]u8 = null;
+    defer if (last_body) |body_copy| client.alloc.free(body_copy);
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        var resp = fetchPublicRowsQuery(client, base_uri, table_name, body) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => {
+                try cluster.stepAll();
+                continue;
+            },
+            else => return err,
+        };
         var matched = true;
         for (needles) |needle| {
             if (std.mem.indexOf(u8, resp.body, needle) == null) {
@@ -1155,6 +1217,60 @@ fn fetchPublicRowsBatchExpectStatus(
     expected_status: u16,
 ) !api_http_client.QueryResponse {
     return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_batch_suffix, body, expected_status);
+}
+
+fn fetchPublicRowsMutationSourceExpectStatus(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    expected_status: u16,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_mutation_source_suffix, body, expected_status);
+}
+
+fn fetchPublicTransactionBegin(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+) !api_http_client.TransactionResponse {
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, api_http_routes.Routes.transactions_begin);
+    defer client.alloc.free(uri);
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = "{\"sync_level\":\"write\"}",
+    });
+    defer resp.deinit(client.alloc);
+    return .{
+        .status = resp.status,
+        .body = try client.alloc.dupe(u8, resp.body),
+    };
+}
+
+fn fetchPublicTransactionSessionCommitRaw(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    txn_id_hex: []const u8,
+) !api_http_client.TransactionResponse {
+    const path = try std.fmt.allocPrint(client.alloc, "{s}{s}{s}", .{
+        api_http_routes.Routes.transactions_prefix,
+        txn_id_hex,
+        api_http_routes.Routes.transactions_commit_suffix,
+    });
+    defer client.alloc.free(path);
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, path);
+    defer client.alloc.free(uri);
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .body = "",
+    });
+    defer resp.deinit(client.alloc);
+    return .{
+        .status = resp.status,
+        .body = try client.alloc.dupe(u8, resp.body),
+    };
 }
 
 fn fetchPublicTransactionCommitRaw(
@@ -9918,6 +10034,7 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     const adjustment_client_index = (adjustment_row_host + 1) % 3;
     const client_base = rig.api_base_uris[client_index];
     const temporal_client_base = rig.api_base_uris[temporal_client_index];
+    const temporal_owner_base = rig.api_base_uris[temporal_row_host];
     const adjustment_client_base = rig.api_base_uris[adjustment_client_index];
     try std.testing.expect(cluster.node(client_index).status(row_group) != .active);
     try std.testing.expect(cluster.node(temporal_client_index).status(temporal_row_group) != .active);
@@ -10044,6 +10161,51 @@ test "metadata http cluster simulation resolves relational unique selectors acro
     );
     defer updated_temporal_get.deinit(std.heap.page_allocator);
     try expectBodyContainsAll(updated_temporal_get.body, &.{ "\"found\":true", "\"price\":13" });
+
+    var temporal_begin = try fetchPublicTransactionBegin(&rig.client, temporal_owner_base);
+    defer temporal_begin.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 201), temporal_begin.status);
+    var parsed_temporal_begin = try std.json.parseFromSlice(std.json.Value, alloc, temporal_begin.body, .{ .allocate = .alloc_always });
+    defer parsed_temporal_begin.deinit();
+    const temporal_txn_value = parsed_temporal_begin.value.object.get("transaction_id") orelse return error.TestUnexpectedResult;
+    if (temporal_txn_value != .string) return error.TestUnexpectedResult;
+    const temporal_txn_id = temporal_txn_value.string;
+
+    const temporal_portion_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"op\":\"update\",\"source\":{{\"where\":{{\"field\":\"sku\",\"op\":\"eq\",\"value\":\"sku:a\"}},\"row_claim\":{{\"mode\":\"for_update\",\"owner_id\":\"metadata-temporal-chaos\",\"transaction_id\":\"{s}\"}}}},\"patch\":{{\"price\":15}},\"temporal_portion\":{{\"period\":\"valid_time\",\"from\":12,\"to\":16}},\"returning\":[\"*\"]}}",
+        .{temporal_txn_id},
+    );
+    defer alloc.free(temporal_portion_body);
+    var temporal_portion_update = try fetchPublicRowsMutationSourceExpectStatus(
+        &rig.client,
+        temporal_owner_base,
+        "prices",
+        temporal_portion_body,
+        200,
+    );
+    defer temporal_portion_update.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(temporal_portion_update.body, &.{ "\"matched\":2", "\"staged\":1", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15" });
+
+    var temporal_commit = try fetchPublicTransactionSessionCommitRaw(&rig.client, temporal_owner_base, temporal_txn_id);
+    defer temporal_commit.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 200), temporal_commit.status);
+    try expectBodyContainsAll(temporal_commit.body, &.{"\"status\":\"committed\""});
+
+    _ = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
+    try cluster.stepAll();
+
+    var temporal_fragment_query = try waitForPublicRowsQueryContains(
+        &cluster,
+        &rig.client,
+        temporal_owner_base,
+        "prices",
+        "{\"query\":{\"where\":{\"field\":\"sku\",\"op\":\"eq\",\"value\":\"sku:a\"},\"select\":[\"sku\",\"valid_from\",\"valid_to\",\"price\"],\"order_by\":[{\"field\":\"valid_from\",\"direction\":\"asc\"}]}}",
+        &.{ "\"total\":4", "\"valid_from\":0", "\"valid_to\":10", "\"price\":10", "\"valid_from\":10", "\"valid_to\":12", "\"price\":13", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15", "\"valid_from\":16", "\"valid_to\":20" },
+        32,
+    );
+    defer temporal_fragment_query.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(temporal_fragment_query.body, &.{ "\"total\":4", "\"valid_from\":0", "\"valid_to\":10", "\"price\":10", "\"valid_from\":10", "\"valid_to\":12", "\"price\":13", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15", "\"valid_from\":16", "\"valid_to\":20" });
 
     var updated_adjustment_get = try waitForPublicRowsGetContains(
         &cluster,

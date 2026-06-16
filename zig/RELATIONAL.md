@@ -1219,9 +1219,14 @@ coverage scan after repair. Metadata
 public-chaos coverage also creates hosted temporal tables, writes parent
 intervals plus a same-table period-covering FK child interval, restarts hosted
 row owners, and resolves both parent and child rows through period-qualified
-selectors from non-owner API nodes. Remaining production work is expanded chaos
-coverage that combines `FOR PORTION OF` DML, temporal FK checks, range movement,
-repair, and catalog promotion in one generated workload.
+selectors from non-owner API nodes. It also drives an owner-routed public
+`rows:mutation-source` `FOR PORTION OF` update through a transaction session,
+records the staged row predicates as the session participant set, commits
+through the normal hosted transaction path, and verifies the split timeline
+fragments through public `rows:query`. Remaining production work is expanded
+chaos coverage that combines `FOR PORTION OF` DML, period-selector refresh after
+splits, temporal FK checks, range movement, repair, and catalog promotion in one
+generated workload.
 System-time / transaction-time history is intentionally not part of this
 application-time feature. If Antfly adds bitemporal tables later, system-time
 must be modeled as a separate catalog/runtime dimension with its own history

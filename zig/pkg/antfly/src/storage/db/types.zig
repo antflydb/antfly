@@ -1580,10 +1580,13 @@ pub const RelationalRowsMutationSourceResult = struct {
     matched: u32 = 0,
     staged: u32 = 0,
     returning_rows: [][]const u8 = &.{},
+    participant_predicates: []TransactionVersionPredicate = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.returning_rows) |row| alloc.free(@constCast(row));
         if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
+        for (self.participant_predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (self.participant_predicates.len > 0) alloc.free(self.participant_predicates);
         self.* = undefined;
     }
 };

@@ -5857,9 +5857,46 @@ pub const ApiHttpServer = struct {
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
 
+        if (result.staged > 0) {
+            self.stageRowsMutationSourceSessionParticipant(table_name, rows_req.req.source.row_claim, result.participant_predicates) catch |err| switch (err) {
+                error.SessionLeaseLost => return try textResponse(self.alloc, 409, "version conflict"),
+                else => return err,
+            };
+        }
+
         const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    fn stageRowsMutationSourceSessionParticipant(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        row_claim: ?db_mod.types.RowClaimRequest,
+        participant_predicates: []const db_mod.types.TransactionVersionPredicate,
+    ) !void {
+        const claim = row_claim orelse return;
+        const txn_id = claim.txn_id orelse return;
+        if (participant_predicates.len == 0) return;
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        var req = transactions_api.OwnedTransactionCommitRequest{};
+        req.tables = self.alloc.alloc(transactions_api.TableCommitRequest, 1) catch |err| {
+            self.alloc.free(owned_table_name);
+            return err;
+        };
+        req.tables[0] = .{
+            .table_name = owned_table_name,
+        };
+        defer req.deinit(self.alloc);
+        try req.tables[0].predicates.ensureUnusedCapacity(self.alloc, participant_predicates.len);
+        for (participant_predicates) |predicate| {
+            const owned_key = try self.alloc.dupe(u8, predicate.key);
+            req.tables[0].predicates.appendAssumeCapacity(.{
+                .key = owned_key,
+                .expected_version = predicate.expected_version,
+            });
+        }
+        _ = try self.txn_sessions.stage(self.alloc, txn_id, &req) orelse return;
     }
 
     pub fn handlePublicTableRowsGet(

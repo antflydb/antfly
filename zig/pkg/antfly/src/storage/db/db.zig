@@ -16275,10 +16275,14 @@ pub const DB = struct {
             .predicates = predicates.items,
         });
 
+        const participant_predicates = try cloneRelationalRowsMutationParticipantPredicatesAlloc(alloc, predicates.items);
+        errdefer freeRelationalRowsMutationParticipantPredicates(alloc, participant_predicates);
+
         return .{
             .matched = matched,
             .staged = staged_count,
             .returning_rows = try returning_rows.toOwnedSlice(alloc),
+            .participant_predicates = participant_predicates,
         };
     }
 
@@ -16850,11 +16854,44 @@ pub const DB = struct {
             .predicates = predicates.items,
         });
 
+        const participant_predicates = try cloneRelationalRowsMutationParticipantPredicatesAlloc(alloc, predicates.items);
+        errdefer freeRelationalRowsMutationParticipantPredicates(alloc, participant_predicates);
+
         return .{
             .matched = matched,
             .staged = @intCast(selected_indexes.items.len),
             .returning_rows = try returning_rows.toOwnedSlice(alloc),
+            .participant_predicates = participant_predicates,
         };
+    }
+
+    fn cloneRelationalRowsMutationParticipantPredicatesAlloc(
+        alloc: Allocator,
+        predicates: []const types.TransactionVersionPredicate,
+    ) ![]types.TransactionVersionPredicate {
+        if (predicates.len == 0) return &.{};
+        var out = try alloc.alloc(types.TransactionVersionPredicate, predicates.len);
+        var count: usize = 0;
+        errdefer {
+            for (out[0..count]) |predicate| alloc.free(@constCast(predicate.key));
+            alloc.free(out);
+        }
+        for (predicates) |predicate| {
+            out[count] = .{
+                .key = try alloc.dupe(u8, predicate.key),
+                .expected_version = predicate.expected_version,
+            };
+            count += 1;
+        }
+        return out;
+    }
+
+    fn freeRelationalRowsMutationParticipantPredicates(
+        alloc: Allocator,
+        predicates: []types.TransactionVersionPredicate,
+    ) void {
+        for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
     }
 
     const RelationalTemporalBound = union(enum) {

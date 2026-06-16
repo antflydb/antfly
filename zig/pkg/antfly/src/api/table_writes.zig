@@ -14077,6 +14077,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .batch = batch,
+                .mutate_rows_from_source = mutateRowsFromSource,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -14390,6 +14391,66 @@ pub const HostedProvisionedTableWriteSource = struct {
                 if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
             }
         }
+    }
+
+    fn mutateRowsFromSource(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len != 1) return error.UnsupportedOperation;
+
+        const group_id = ranges[0].group_id;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try self.mutateRowsFromSourceGroupLocal(alloc, group_id, table_name, schema, req),
+                .remote => return error.UnsupportedOperation,
+            }
+        }
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try self.mutateRowsFromSourceGroupLocal(alloc, group_id, table_name, schema, req);
+    }
+
+    fn mutateRowsFromSourceGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        return cached.db.mutateRelationalRowsFromSource(alloc, schema, req) catch |err| switch (err) {
+            error.TxnNotFound => {
+                const claim = req.source.row_claim orelse return err;
+                _ = try cached.db.beginTransactionWithIdAndParticipants(claim.txn_id orelse return err, nextTxnTimestamp(), &.{});
+                return try cached.db.mutateRelationalRowsFromSource(alloc, schema, req);
+            },
+            else => return err,
+        };
     }
 
     fn commitTransaction(
