@@ -4726,6 +4726,20 @@
       "sql": "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = length(excluded.next_status) RETURNING id, amount"
     },
     {
+      "name": "schema-derived unique conflict bit length update",
+      "family": "insert",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1
+      },
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+      "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);", "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);", "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"],
+      "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
+      "resolver_version": 25,
+      "sql": "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = bit_length(excluded.next_status) RETURNING id, amount"
+    },
+    {
       "name": "schema-derived unique conflict nested text expression update",
       "family": "insert",
       "summary": {

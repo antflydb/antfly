@@ -63944,7 +63944,8 @@ const AppParityCorpusCoverage = struct {
             self.conflict_text_expression_update = self.conflict_text_expression_update or
                 std.mem.indexOf(u8, entry.sql, "length(excluded.next_status)") != null or
                 std.mem.indexOf(u8, entry.sql, "char_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "character_length(excluded.next_status)") != null;
+                std.mem.indexOf(u8, entry.sql, "character_length(excluded.next_status)") != null or
+                std.mem.indexOf(u8, entry.sql, "bit_length(excluded.next_status)") != null;
             self.conflict_regexp_replace_expression_update = self.conflict_regexp_replace_expression_update or
                 std.mem.indexOf(u8, entry.sql, "regexp_replace(excluded.status") != null and
                     appParityPlanHasNonZeroToken(entry.plan, "transforms=");
@@ -67776,6 +67777,20 @@ test "postgres sql adapter classifies application parity corpus" {
             .resolver_row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
             .resolver_version = 25,
             .sql = "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = length(excluded.next_status) RETURNING id, amount",
+        },
+        .{
+            .name = "schema-derived unique conflict bit length update",
+            .family = .insert,
+            .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+            .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0",
+            .apply_setup_sql = &.{
+                "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, next_status text, amount numeric);",
+                "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email);",
+                "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;",
+            },
+            .resolver_row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}",
+            .resolver_version = 25,
+            .sql = "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = bit_length(excluded.next_status) RETURNING id, amount",
         },
         .{
             .name = "schema-derived unique conflict nested text expression update",
@@ -75997,6 +76012,22 @@ test "postgres sql adapter lowers cross-column excluded conflict values" {
     try std.testing.expectEqualStrings("6", length_patch.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 14), length_patch.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":6}", length_patch.batch.returning_rows[0]);
+
+    var bit_length_patch = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = bit_length(excluded.next_status) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer bit_length_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), bit_length_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), bit_length_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", bit_length_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("48", bit_length_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), bit_length_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":48}", bit_length_patch.batch.returning_rows[0]);
 
     var regexp_count_patch = try lowerInsertWithResolverAlloc(
         alloc,
