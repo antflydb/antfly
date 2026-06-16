@@ -1062,6 +1062,15 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  4,
+					NewTimelineID:     5,
+					SwitchLSN:         10,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   3,
+				},
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:          string(haActionPromoteStandby),
 					AdminCommand:  []string{"promote", "--current-fence"},
@@ -1093,6 +1102,8 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.NewTimelineID).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.SwitchLSN).To(Equal(uint64(12)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.ObservedLSN).To(Equal(uint64(11)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.RetainedFromLSN).To(Equal(uint64(8)))

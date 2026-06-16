@@ -3371,7 +3371,7 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 		if cluster.Status.HAStatus.FormerPrimary == nil {
 			cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: action.StandbyName}
 		}
-		applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, action)
+		applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, action, cluster.Status.HAStatus.LastPromotion)
 		r.updateHAFormerPrimaryStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.FormerPrimary)
 		return
 	}
@@ -3398,7 +3398,7 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryStatusFromAdminJobLogs(ct
 	applyHARejoinJobResult(former, result)
 }
 
-func applyHAFormerPrimaryActionStatus(former *antflyv1.HAFormerPrimaryStatus, action antflyv1.HAPlannedActionStatus) {
+func applyHAFormerPrimaryActionStatus(former *antflyv1.HAFormerPrimaryStatus, action antflyv1.HAPlannedActionStatus, promotion *antflyv1.HAPromotionStatus) {
 	if former == nil {
 		return
 	}
@@ -3417,6 +3417,29 @@ func applyHAFormerPrimaryActionStatus(former *antflyv1.HAFormerPrimaryStatus, ac
 	former.FenceAuthority = action.FenceAuthority
 	former.FenceHolder = action.FenceHolder
 	former.FenceGeneration = action.FenceGeneration
+	if promotion != nil {
+		if former.NodeID == "" {
+			former.NodeID = promotion.OldPrimaryID
+		}
+		if former.ParentTimelineID == 0 {
+			former.ParentTimelineID = promotion.ParentTimelineID
+		}
+		if former.NewTimelineID == 0 {
+			former.NewTimelineID = promotion.NewTimelineID
+		}
+		if former.SwitchLSN == 0 {
+			former.SwitchLSN = promotion.SwitchLSN
+		}
+		if former.FenceAuthority == "" {
+			former.FenceAuthority = promotion.FenceAuthority
+		}
+		if former.FenceHolder == "" {
+			former.FenceHolder = promotion.PromotedStandbyID
+		}
+		if former.FenceGeneration == 0 {
+			former.FenceGeneration = promotion.FenceGeneration
+		}
+	}
 	if former.Action == "" {
 		former.Action = action.Kind
 	}
