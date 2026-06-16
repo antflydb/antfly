@@ -75,6 +75,7 @@ pub const ConditionType = enum {
     available,
     degraded,
     unhealthy,
+    lagging,
     retention_pressure,
     reseed_required,
     automatic_failover_ready,
@@ -177,6 +178,7 @@ pub const Plan = struct {
     desired_standby_count: usize,
     healthy_standby_count: usize,
     unhealthy_standby_count: usize,
+    lagging_standby_count: usize,
     reseed_required_count: usize,
 
     pub fn deinit(self: *Plan, alloc: Allocator) void {
@@ -193,6 +195,7 @@ pub const PlanDocument = struct {
     desired_standby_count: usize,
     healthy_standby_count: usize,
     unhealthy_standby_count: usize,
+    lagging_standby_count: usize,
     reseed_required_count: usize,
     actions: []const Action,
     conditions: []const Condition,
@@ -206,6 +209,7 @@ pub fn planDocument(plan: Plan) PlanDocument {
         .desired_standby_count = plan.desired_standby_count,
         .healthy_standby_count = plan.healthy_standby_count,
         .unhealthy_standby_count = plan.unhealthy_standby_count,
+        .lagging_standby_count = plan.lagging_standby_count,
         .reseed_required_count = plan.reseed_required_count,
         .actions = plan.actions,
         .conditions = plan.conditions,
@@ -239,6 +243,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .desired_standby_count = 0,
             .healthy_standby_count = 0,
             .unhealthy_standby_count = 0,
+            .lagging_standby_count = 0,
             .reseed_required_count = 0,
         };
     }
@@ -248,6 +253,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     var unhealthy_count: usize = 0;
     var inactive_count: usize = 0;
     var replication_error_count: usize = 0;
+    var lagging_count: usize = 0;
     var reseed_count: usize = 0;
 
     for (spec.standbys) |standby| {
@@ -311,6 +317,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             continue;
         }
 
+        if (slot.status == .lagging) lagging_count += 1;
         if (slot.active and slot.apply_lag_lsn == 0) healthy_count += 1;
     }
 
@@ -351,6 +358,13 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         .severity = if (retention_pressure) .warning else .info,
         .reason = if (retention_pressure) "RetentionCapExceeded" else "RetentionWithinPolicy",
         .message = if (retention_pressure) "One or more slots are forcing WAL retention beyond policy" else "WAL retention is within configured policy",
+    });
+    try conditions.append(alloc, .{
+        .type = .lagging,
+        .status = lagging_count > 0,
+        .severity = if (lagging_count > 0) .warning else .info,
+        .reason = if (lagging_count > 0) "StandbyLagExceedsPolicy" else "NoLaggingStandby",
+        .message = if (lagging_count > 0) "One or more desired standbys exceed configured lag policy" else "No desired standby exceeds configured lag policy",
     });
     try conditions.append(alloc, .{
         .type = .reseed_required,
@@ -418,6 +432,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         .desired_standby_count = desired_count,
         .healthy_standby_count = healthy_count,
         .unhealthy_standby_count = unhealthy_count,
+        .lagging_standby_count = lagging_count,
         .reseed_required_count = reseed_count,
     };
 }
@@ -1082,6 +1097,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     receive_lag_slots[0].applied_lsn = 11;
     receive_lag_slots[0].write_lag_lsn = 1;
     receive_lag_slots[0].apply_lag_lsn = 1;
+    receive_lag_slots[0].status = .lagging;
     var receive_lag_primary = primary;
     receive_lag_primary.slots = receive_lag_slots[0..];
     var receive_lag = try reconcile(alloc, .{
@@ -1108,6 +1124,11 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         "StandbyReceiveLagExceedsPolicy",
         (condition(receive_lag, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
+    try std.testing.expectEqual(@as(usize, 1), receive_lag.lagging_standby_count);
+    const lagging_condition = condition(receive_lag, .lagging) orelse return error.TestExpectedEqual;
+    try std.testing.expect(lagging_condition.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, lagging_condition.severity);
+    try std.testing.expectEqualStrings("StandbyLagExceedsPolicy", lagging_condition.reason);
 
     var apply_lag_slots = slots;
     apply_lag_slots[0].applied_lsn = 11;
@@ -1252,6 +1273,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"desired_standby_count\":1");
     try expectContains(rendered, "\"healthy_standby_count\":1");
     try expectContains(rendered, "\"unhealthy_standby_count\":0");
+    try expectContains(rendered, "\"lagging_standby_count\":0");
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
