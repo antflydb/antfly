@@ -62368,6 +62368,9 @@ fn validateAppParityFixtureMetadata(
     if (appParityFixtureFamilyNeedsTableSummary(entry.family) and entry.summary.table_name == null) {
         return error.TestUnexpectedResult;
     }
+    if (entry.applied_plan.len > 0 and entry.family != .ddl) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.applied_plan.len > 0 and !appParityAppliedPlanIsStructured(entry.applied_plan)) {
         return error.TestUnexpectedResult;
     }
@@ -62444,6 +62447,15 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
         .applied_plan = "applied:rebuild=true:rewrite=false",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "non-ddl applied plan",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
