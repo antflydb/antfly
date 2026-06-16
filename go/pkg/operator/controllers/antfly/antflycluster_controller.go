@@ -3257,7 +3257,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
-			return nil
+			continue
 		}
 
 		job := buildHAAdminJob(cluster, ha.Admin, *action)
@@ -3277,7 +3277,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 		action.AdminJobPhase = haAdminJobPhase(existing)
 		if !haAdminJobComplete(existing) {
-			return nil
+			continue
 		}
 	}
 	return nil

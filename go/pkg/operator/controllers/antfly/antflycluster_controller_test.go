@@ -436,6 +436,81 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
 }
 
+func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	admin := &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image:           "antfly:test",
+			ImagePullPolicy: "IfNotPresent",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: admin,
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPauseSlot),
+					AdminCommand:  []string{"slot", "pause", "--slot", "old-standby"},
+					AdminURL:      "http://primary-ha.default.svc:8081",
+					AdminJobPhase: haAdminJobPhaseFailed,
+				}, {
+					Kind:          string(haActionCreateSlot),
+					AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
+					AdminURL:      "http://primary-ha.default.svc:8081",
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}, {
+					Kind:         string(haActionSeedStandby),
+					DependsOn:    string(haActionCreateSlot),
+					AdminCommand: []string{"seed", "begin", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+	failedPauseJob := buildHAAdminJob(cluster, admin, cluster.Status.HAStatus.PlannedActions[0])
+	failedPauseJob.Status.Conditions = []batchv1.JobCondition{{
+		Type:   batchv1.JobFailed,
+		Status: corev1.ConditionTrue,
+	}}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, failedPauseJob).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(2))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobName).NotTo(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+
+	seedJob := &batchv1.Job{}
+	g.Expect(reconciler.Get(
+		context.Background(),
+		types.NamespacedName{Name: cluster.Status.HAStatus.PlannedActions[2].AdminJobName, Namespace: cluster.Namespace},
+		seedJob,
+	)).To(Succeed())
+	g.Expect(seedJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-action-depends-on", string(haActionCreateSlot)))
+}
+
 func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g := NewWithT(t)
 
