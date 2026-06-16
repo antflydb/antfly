@@ -1402,11 +1402,21 @@ type HAStandbyStatus struct {
 
 	SafeReadLSN uint64 `json:"safeReadLSN,omitempty"`
 
+	UpstreamLSN uint64 `json:"upstreamLSN,omitempty"`
+
 	WriteLagLSN uint64 `json:"writeLagLSN,omitempty"`
+
+	ReceiveLagLSN uint64 `json:"receiveLagLSN,omitempty"`
 
 	ApplyLagLSN uint64 `json:"applyLagLSN,omitempty"`
 
 	SafeReadLagLSN uint64 `json:"safeReadLagLSN,omitempty"`
+
+	UnappliedLSNCount uint64 `json:"unappliedLSNCount,omitempty"`
+
+	CaughtUpToReceived bool `json:"caughtUpToReceived,omitempty"`
+
+	CanServeSafeReads bool `json:"canServeSafeReads,omitempty"`
 
 	Status string `json:"status,omitempty"`
 

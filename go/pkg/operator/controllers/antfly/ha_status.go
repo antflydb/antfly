@@ -1201,6 +1201,7 @@ func standbySyncEligible(standby antflyv1.HAStandbyStatus) bool {
 func standbyLagging(standby antflyv1.HAStandbyStatus) bool {
 	return standby.Status == "lagging" ||
 		standby.WriteLagLSN > 0 ||
+		standby.ReceiveLagLSN > 0 ||
 		standby.ApplyLagLSN > 0 ||
 		standby.SafeReadLagLSN > 0
 }

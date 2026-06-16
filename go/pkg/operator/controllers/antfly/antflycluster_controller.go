@@ -3095,6 +3095,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			return err
 		}
 		haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+		if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
+			haAdminStatusErr = standbyErr
+		}
 		r.updateHAStatusAndConditions(cluster)
 		if haAdminStatusErr != nil {
 			setHACondition(
@@ -3102,7 +3105,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				antflyv1.TypeHADegraded,
 				metav1.ConditionTrue,
 				"HAAdminStatusUnavailable",
-				fmt.Sprintf("Unable to observe HA primary admin status: %v", haAdminStatusErr),
+				fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 			)
 		}
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
@@ -3183,6 +3186,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		return err
 	}
 	haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+	if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
+		haAdminStatusErr = standbyErr
+	}
 	r.updateHAStatusAndConditions(cluster)
 	if haAdminStatusErr != nil {
 		setHACondition(
@@ -3190,7 +3196,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
 			"HAAdminStatusUnavailable",
-			fmt.Sprintf("Unable to observe HA primary admin status: %v", haAdminStatusErr),
+			fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 		)
 	}
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
@@ -3482,6 +3488,39 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	return nil
 }
 
+func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled {
+		return nil
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
+
+	var observedErr error
+	for _, standby := range ha.Standbys {
+		if !standbyDesired(standby) || strings.TrimSpace(standby.AdminURL) == "" {
+			continue
+		}
+		body, err := r.executeHAAdminTableCommand(ctx, standby.AdminURL, haStandbyStatusCommand(cluster.Status.HAStatus.PrimaryLSN))
+		if err != nil {
+			if observedErr == nil {
+				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
+			}
+			continue
+		}
+		status, err := parseHAStandbyStatusTable(body, standby.Name, standbySlotName(standby))
+		if err != nil {
+			if observedErr == nil {
+				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
+			}
+			continue
+		}
+		mergeHAStandbyStatus(cluster.Status.HAStatus, status)
+	}
+	return observedErr
+}
+
 func (r *AntflyClusterReconciler) executeHAAdminTableCommand(ctx context.Context, baseURL string, argv []string) (string, error) {
 	requestBody, err := json.Marshal(struct {
 		Argv []string `json:"argv"`
@@ -3536,6 +3575,14 @@ func haPrimaryStatusCommand(ha *antflyv1.HighAvailabilitySpec) []string {
 		if ha.SyncPolicy.FailurePolicy != "" {
 			argv = append(argv, "--sync-failure", haFailurePolicyCLI(ha.SyncPolicy.FailurePolicy))
 		}
+	}
+	return argv
+}
+
+func haStandbyStatusCommand(upstreamLSN uint64) []string {
+	argv := []string{"--table", "status", "standby"}
+	if upstreamLSN > 0 {
+		argv = append(argv, "--upstream-lsn", strconv.FormatUint(upstreamLSN, 10))
 	}
 	return argv
 }
@@ -3622,6 +3669,81 @@ func parseHAPrimaryStatusTable(body string) (haObservedPrimaryStatus, error) {
 		status.Standbys = append(status.Standbys, slot)
 	}
 	return status, nil
+}
+
+func parseHAStandbyStatusTable(body string, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {
+	lines := parseHATableLines(body)
+	if result := lines["result"]; result != "" && result != "standby_status" {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("unexpected HA standby status result %q", result)
+	}
+	if role := lines["role"]; role != "" && role != "standby" {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("unexpected HA standby role %q", role)
+	}
+
+	status := antflyv1.HAStandbyStatus{
+		Name:     standbyName,
+		SlotName: slotName,
+		Active:   true,
+	}
+	var ok bool
+	status.TimelineID, _ = parseHAResultUint(lines, "identity.timeline_id")
+	if status.ReceivedLSN, ok = parseHAResultUint(lines, "received_lsn"); !ok {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing received_lsn")
+	}
+	if status.AppliedLSN, ok = parseHAResultUint(lines, "applied_lsn"); !ok {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing applied_lsn")
+	}
+	status.SafeReadLSN, _ = parseHAResultUint(lines, "safe_read_lsn")
+	status.UpstreamLSN, _ = parseHAResultUint(lines, "upstream_lsn")
+	status.ReceiveLagLSN, _ = parseHAResultUint(lines, "receive_lag_lsn")
+	status.ApplyLagLSN, _ = parseHAResultUint(lines, "apply_lag_lsn")
+	status.UnappliedLSNCount, _ = parseHAResultUint(lines, "unapplied_lsn_count")
+	status.CaughtUpToReceived, _ = parseHAResultBool(lines, "caught_up_to_received")
+	status.CanServeSafeReads, _ = parseHAResultBool(lines, "can_serve_safe_reads")
+	if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
+		status.Status = "lagging"
+	} else if status.CanServeSafeReads && status.Status == "" {
+		status.Status = "healthy"
+	}
+	return status, nil
+}
+
+func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandbyStatus) {
+	if status == nil || observed.Name == "" {
+		return
+	}
+	for i := range status.Standbys {
+		existing := &status.Standbys[i]
+		if existing.Name != observed.Name && existing.SlotName != observed.SlotName {
+			continue
+		}
+		if observed.TimelineID != 0 {
+			existing.TimelineID = observed.TimelineID
+		}
+		existing.Active = existing.Active || observed.Active
+		if observed.ReceivedLSN != 0 {
+			existing.ReceivedLSN = observed.ReceivedLSN
+		}
+		if observed.AppliedLSN != 0 {
+			existing.AppliedLSN = observed.AppliedLSN
+		}
+		if observed.SafeReadLSN != 0 {
+			existing.SafeReadLSN = observed.SafeReadLSN
+		}
+		if observed.UpstreamLSN != 0 {
+			existing.UpstreamLSN = observed.UpstreamLSN
+		}
+		existing.ReceiveLagLSN = observed.ReceiveLagLSN
+		existing.ApplyLagLSN = observed.ApplyLagLSN
+		existing.UnappliedLSNCount = observed.UnappliedLSNCount
+		existing.CaughtUpToReceived = observed.CaughtUpToReceived
+		existing.CanServeSafeReads = observed.CanServeSafeReads
+		if observed.Status != "" {
+			existing.Status = observed.Status
+		}
+		return
+	}
+	status.Standbys = append(status.Standbys, observed)
 }
 
 func parseHATableLines(body string) map[string]string {

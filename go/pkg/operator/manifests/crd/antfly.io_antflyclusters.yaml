@@ -8828,10 +8828,17 @@ spec:
                         applyLagLSN:
                           format: int64
                           type: integer
+                        canServeSafeReads:
+                          type: boolean
+                        caughtUpToReceived:
+                          type: boolean
                         lastError:
                           type: string
                         name:
                           type: string
+                        receiveLagLSN:
+                          format: int64
+                          type: integer
                         receivedLSN:
                           format: int64
                           type: integer
@@ -8851,6 +8858,12 @@ spec:
                         status:
                           type: string
                         timelineID:
+                          format: int64
+                          type: integer
+                        unappliedLSNCount:
+                          format: int64
+                          type: integer
+                        upstreamLSN:
                           format: int64
                           type: integer
                         writeLagLSN:

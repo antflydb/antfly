@@ -658,6 +658,86 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(standby.Status).To(Equal("healthy"))
 }
 
+func TestObserveHAStandbyAdminStatuses(t *testing.T) {
+	g := NewWithT(t)
+
+	var observedArgv []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodPost))
+			g.Expect(req.URL.String()).To(Equal("http://standby-a-ha.default.svc:8081/ha/v1/admin/command"))
+			var payload struct {
+				Argv []string `json:"argv"`
+			}
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			observedArgv = append([]string{}, payload.Argv...)
+			body := strings.Join([]string{
+				"result=standby_status",
+				"role=standby",
+				"identity.timeline_id=4",
+				"received_lsn=12",
+				"applied_lsn=11",
+				"safe_read_lsn=11",
+				"upstream_lsn=13",
+				"receive_lag_lsn=1",
+				"apply_lag_lsn=2",
+				"unapplied_lsn_count=1",
+				"caught_up_to_received=true",
+				"can_serve_safe_reads=true",
+				"",
+			}, "\n")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					SlotName: "slot-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode:       antflyv1.HAModeHotStandby,
+				PrimaryLSN: 13,
+				Standbys: []antflyv1.HAStandbyStatus{{
+					Name:       "standby-a",
+					SlotName:   "slot-a",
+					Active:     true,
+					RestartLSN: 7,
+				}},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)).To(Succeed())
+	g.Expect(observedArgv).To(Equal([]string{"--table", "status", "standby", "--upstream-lsn", "13"}))
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	standby := cluster.Status.HAStatus.Standbys[0]
+	g.Expect(standby.Name).To(Equal("standby-a"))
+	g.Expect(standby.SlotName).To(Equal("slot-a"))
+	g.Expect(standby.RestartLSN).To(Equal(uint64(7)))
+	g.Expect(standby.TimelineID).To(Equal(uint64(4)))
+	g.Expect(standby.ReceivedLSN).To(Equal(uint64(12)))
+	g.Expect(standby.AppliedLSN).To(Equal(uint64(11)))
+	g.Expect(standby.SafeReadLSN).To(Equal(uint64(11)))
+	g.Expect(standby.UpstreamLSN).To(Equal(uint64(13)))
+	g.Expect(standby.ReceiveLagLSN).To(Equal(uint64(1)))
+	g.Expect(standby.ApplyLagLSN).To(Equal(uint64(2)))
+	g.Expect(standby.UnappliedLSNCount).To(Equal(uint64(1)))
+	g.Expect(standby.CaughtUpToReceived).To(BeTrue())
+	g.Expect(standby.CanServeSafeReads).To(BeTrue())
+	g.Expect(standby.Status).To(Equal("lagging"))
+}
+
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false
 func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	g := NewWithT(t)
