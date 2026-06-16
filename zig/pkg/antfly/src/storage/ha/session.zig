@@ -252,7 +252,7 @@ test "storage.ha session reports durable receive progress when apply fails" {
     var slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
-    try std.testing.expectEqual(@as(u64, 1), slot.restart_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.restart_lsn);
     try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
 
     const names = [_][]const u8{"standby-a"};

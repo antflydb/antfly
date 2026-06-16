@@ -525,7 +525,7 @@ test "storage.ha replication api persists standby status updates" {
         });
         try std.testing.expectEqual(@as(u64, 2), updated.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), updated.applied_lsn);
-        try std.testing.expectEqual(@as(u64, 1), updated.restart_lsn);
+        try std.testing.expectEqual(@as(u64, 2), updated.restart_lsn);
         try std.testing.expect(updated.active);
         try std.testing.expect(!updated.reseed_required);
         try std.testing.expect(updated.last_error == null);

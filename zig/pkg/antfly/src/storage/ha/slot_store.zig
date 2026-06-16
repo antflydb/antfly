@@ -158,7 +158,7 @@ pub const SlotStore = struct {
         var next = current;
         next.received_lsn = received_lsn;
         next.applied_lsn = applied_lsn;
-        next.restart_lsn = applied_lsn;
+        next.restart_lsn = received_lsn;
         next.reseed_required = false;
         next.last_error = null;
         try self.createOrUpdate(next);
@@ -550,7 +550,7 @@ test "storage.ha slot store persists slot progress across reopen" {
         try std.testing.expectEqual(@as(usize, 1), reopened.count());
         const slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 1), slot.timeline_id);
-        try std.testing.expectEqual(@as(u64, 7), slot.restart_lsn);
+        try std.testing.expectEqual(@as(u64, 8), slot.restart_lsn);
         try std.testing.expectEqual(@as(u64, 8), slot.received_lsn);
         try std.testing.expectEqual(@as(u64, 7), slot.applied_lsn);
     }

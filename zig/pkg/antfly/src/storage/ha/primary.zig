@@ -593,7 +593,7 @@ test "storage.ha primary appends streams and persists standby status" {
         const slot = reopened.slot("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
-        try std.testing.expectEqual(@as(u64, 1), slot.restart_lsn);
+        try std.testing.expectEqual(@as(u64, 2), slot.restart_lsn);
     }
 }
 
