@@ -63,7 +63,7 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	if plan.Actions[0].Kind != haActionCreateSlot || plan.Actions[0].TargetLSN != initial {
 		t.Fatalf("unexpected first action: %#v", plan.Actions[0])
 	}
-	if plan.Actions[1].Kind != haActionSeedStandby || plan.Actions[1].TargetLSN != initial {
+	if plan.Actions[1].Kind != haActionSeedStandby || plan.Actions[1].DependsOn != haActionCreateSlot || plan.Actions[1].TargetLSN != initial {
 		t.Fatalf("unexpected second action: %#v", plan.Actions[1])
 	}
 
@@ -82,6 +82,9 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "base-standby-a-5"}) {
 		t.Fatalf("unexpected seed admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
+	}
+	if cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionCreateSlot) {
+		t.Fatalf("expected seed action to depend on create-slot, got %#v", cluster.Status.HAStatus.PlannedActions[1])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
 		cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://primary-ha.default.svc:8081" {
@@ -110,11 +113,13 @@ func TestPlanHAPlansSeedFinishAndBootstrapWhenManifestPathConfigured(t *testing.
 		t.Fatalf("expected create-slot, seed begin, finish, and bootstrap actions, got %#v", actions)
 	}
 	if actions[2].Kind != string(haActionFinishStandbySeed) ||
+		actions[2].DependsOn != string(haActionSeedStandby) ||
 		!reflect.DeepEqual(actions[2].AdminCommand, []string{"seed", "finish", "--manifest", "/backup/base-standby-a-5.afha"}) ||
 		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
 		t.Fatalf("unexpected seed finish action: %#v", actions[2])
 	}
 	if actions[3].Kind != string(haActionBootstrapStandbySeed) ||
+		actions[3].DependsOn != string(haActionFinishStandbySeed) ||
 		!reflect.DeepEqual(actions[3].AdminCommand, []string{"seed", "bootstrap", "--manifest", "/backup/base-standby-a-5.afha", "--content-root", "/backup/base-standby-a-5"}) ||
 		actions[3].AdminURL != "http://standby-a-ha.default.svc:8081" {
 		t.Fatalf("unexpected seed bootstrap action: %#v", actions[3])
@@ -159,6 +164,7 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 		t.Fatalf("unexpected pause action: %#v", actions[0])
 	}
 	if actions[1].Kind != string(haActionDropSlot) ||
+		actions[1].DependsOn != string(haActionPauseSlot) ||
 		!reflect.DeepEqual(actions[1].AdminCommand, []string{"slot", "drop", "--slot", "standby-a"}) ||
 		actions[1].AdminURL != "http://primary-ha.default.svc:8081" {
 		t.Fatalf("unexpected drop action: %#v", actions[1])
@@ -438,6 +444,9 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		t.Fatalf("unexpected promotion action status: %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionAcquireFence) ||
+		cluster.Status.HAStatus.PlannedActions[2].DependsOn != string(haActionPromoteStandby) ||
+		cluster.Status.HAStatus.PlannedActions[3].DependsOn != string(haActionPromoteStandby) ||
 		cluster.Status.HAStatus.PlannedActions[2].RouteTo != "standby-a" {
 		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}

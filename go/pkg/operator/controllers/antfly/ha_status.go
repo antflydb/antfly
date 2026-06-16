@@ -55,6 +55,7 @@ func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
 
 type haPlannedAction struct {
 	Kind             haActionKind
+	DependsOn        haActionKind
 	StandbyName      string
 	SlotName         string
 	TargetLSN        uint64
@@ -351,8 +352,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				})
 			}
 			if ok && standby.DropSlotOnRemoval {
+				dependsOn := haActionKind("")
+				if observed.Active {
+					dependsOn = haActionPauseSlot
+				}
 				plan.Actions = append(plan.Actions, haPlannedAction{
 					Kind:        haActionDropSlot,
+					DependsOn:   dependsOn,
 					StandbyName: standby.Name,
 					SlotName:    slotName,
 					Reason:      "StandbyMarkedForSlotDrop",
@@ -371,12 +377,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Reason:      "SlotMissing",
 			}, haPlannedAction{
 				Kind:        haActionSeedStandby,
+				DependsOn:   haActionCreateSlot,
 				StandbyName: standby.Name,
 				SlotName:    slotName,
 				TargetLSN:   initialStandbyLSN(standby, status.PrimaryLSN),
 				Reason:      "StandbyNeedsBaseBackup",
 			})
-			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, initialStandbyLSN(standby, status.PrimaryLSN), "StandbyNeedsBaseBackup")...)
+			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, initialStandbyLSN(standby, status.PrimaryLSN), "StandbyNeedsBaseBackup", haActionSeedStandby)...)
 			continue
 		}
 		if !observed.Active && !observed.ReseedRequired {
@@ -404,7 +411,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				TargetLSN:   status.PrimaryLSN,
 				Reason:      "SlotRequiresReseed",
 			})
-			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "SlotRequiresReseed")...)
+			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "SlotRequiresReseed", haActionMarkReseed)...)
 			continue
 		}
 		if observed.Active && observed.ApplyLagLSN == 0 {
@@ -437,6 +444,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 			haPlannedAction{
 				Kind:            haActionPromoteStandby,
+				DependsOn:       haActionAcquireFence,
 				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       status.PrimaryLSN,
 				FenceAuthority:  fence.Authority,
@@ -446,6 +454,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 			haPlannedAction{
 				Kind:            haActionUpdatePrimaryRoute,
+				DependsOn:       haActionPromoteStandby,
 				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       status.PrimaryLSN,
 				RouteTo:         plan.PromotionStandbyName,
@@ -456,6 +465,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 			haPlannedAction{
 				Kind:            haActionDemoteFormerPrimary,
+				DependsOn:       haActionPromoteStandby,
 				StandbyName:     haAutomaticFailoverFormerPrimaryID(ha),
 				TargetLSN:       status.PrimaryLSN,
 				ObservedLSN:     status.PrimaryLSN,
@@ -525,6 +535,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	for _, action := range actions {
 		out = append(out, antflyv1.HAPlannedActionStatus{
 			Kind:             string(action.Kind),
+			DependsOn:        string(action.DependsOn),
 			StandbyName:      action.StandbyName,
 			SlotName:         action.SlotName,
 			TargetLSN:        action.TargetLSN,
@@ -759,13 +770,14 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 	return identity
 }
 
-func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64, reason string) []haPlannedAction {
+func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, targetLSN uint64, reason string, dependsOn haActionKind) []haPlannedAction {
 	if standby.SeedManifestPath == "" {
 		return nil
 	}
 	return []haPlannedAction{
 		{
 			Kind:             haActionFinishStandbySeed,
+			DependsOn:        dependsOn,
 			StandbyName:      standby.Name,
 			SlotName:         slotName,
 			TargetLSN:        targetLSN,
@@ -775,6 +787,7 @@ func haSeedCompletionActions(standby antflyv1.HAStandbySpec, slotName string, ta
 		},
 		{
 			Kind:             haActionBootstrapStandbySeed,
+			DependsOn:        haActionFinishStandbySeed,
 			StandbyName:      standby.Name,
 			SlotName:         slotName,
 			TargetLSN:        targetLSN,

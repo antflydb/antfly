@@ -1488,6 +1488,10 @@ type HAFencingStatus struct {
 type HAPlannedActionStatus struct {
 	Kind string `json:"kind,omitempty"`
 
+	// DependsOn names the action kind that must complete before this action runs.
+	// +optional
+	DependsOn string `json:"dependsOn,omitempty"`
+
 	StandbyName string `json:"standbyName,omitempty"`
 
 	SlotName string `json:"slotName,omitempty"`

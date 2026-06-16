@@ -8748,6 +8748,10 @@ spec:
                           description: AdminURL is the HA admin endpoint that should
                             execute AdminCommand.
                           type: string
+                        dependsOn:
+                          description: DependsOn names the action kind that must complete
+                            before this action runs.
+                          type: string
                         fenceAuthority:
                           description: HAFencingAuthority selects the authority used
                             before automatic promotion.
