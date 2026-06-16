@@ -1211,10 +1211,12 @@ collapsing multiple intervals onto a scalar key. Hosted remote period-qualified 
 group read routes rather than exposing internal key scans to callers; the
 resolved owner group performs the temporal owner-prefix scan locally and returns
 only the matching owner row key. SQL `FOR PORTION OF` update/delete coverage
-executes through the same adapter-to-typed-plan-to-storage path: the lowerer
-emits a temporal mutation-source request, DB staging splits or trims the matched
-owner interval transactionally, `RETURNING *` is projected from the affected
-portion, and committed queries observe the surviving fragments. The temporal gate includes combined
+executes through the same adapter-to-typed-plan-to-storage path without
+requiring SQL row-lock syntax on the statement: the lowerer emits a temporal
+mutation-source request carrying the adapter-supplied typed row claim, DB
+staging splits or trims the matched owner interval transactionally,
+`RETURNING *` is projected from the affected portion, and committed queries
+observe the surviving fragments. The temporal gate includes combined
 `FOR PORTION OF` + temporal-FK cases that split a child row, revalidate period
 coverage through the FK proof path, validate the temporal unique-owner rows,
 repair missing temporal FK reverse-reference rows from live child fragments, and
@@ -1242,6 +1244,15 @@ retention, visibility, replay, and repair rules instead of being inferred from
 application-period rows or transaction metadata. The SQL/API parity corpus pins
 `CREATE TABLE ... WITH SYSTEM VERSIONING` as an explicit unsupported DDL shape
 until that first-class system-time catalog and storage model exists.
+
+For SQL DML, row locking remains a typed backend contract rather than required
+surface syntax. The adapter receives the mutation-source row-claim owner,
+transaction id, lease, mode, and wait policy from its execution context; plain
+`UPDATE` / `DELETE` statements, including temporal `FOR PORTION OF` statements,
+can lower into claimed mutation-source plans without spelling `FOR UPDATE`.
+Optional SQL `FOR [NO KEY] UPDATE [NOWAIT|SKIP LOCKED]` clauses only override
+the typed claim mode or wait policy when a statement intentionally needs those
+queue-style semantics.
 
 | Track | Current model shape | Long-term production plan |
 | --- | --- | --- |

@@ -69063,7 +69063,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .apply_setup_sql = &.{
                 "CREATE TABLE prices (sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS));",
             },
-            .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' FOR UPDATE RETURNING *",
+            .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *",
         },
         .{
             .name = "temporal range-column portion price update",
@@ -69073,7 +69073,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .apply_setup_sql = &.{
                 "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
             },
-            .sql = "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 FOR UPDATE RETURNING *",
+            .sql = "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 RETURNING *",
         },
         .{
             .name = "claimed cleanup delete",
@@ -69135,7 +69135,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .apply_setup_sql = &.{
                 "CREATE TABLE prices (sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS));",
             },
-            .sql = "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' FOR UPDATE RETURNING *",
+            .sql = "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING *",
         },
         .{
             .name = "temporal range-column portion price delete",
@@ -69145,7 +69145,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .apply_setup_sql = &.{
                 "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
             },
-            .sql = "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 FOR UPDATE RETURNING *",
+            .sql = "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 RETURNING *",
         },
         .{
             .name = "claimed cleanup delete alias qualified returning fields",
@@ -72834,7 +72834,7 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
 
     var update = try lowerUpdateMutationSourceAlloc(
         alloc,
-        "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' FOR UPDATE RETURNING *",
+        "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *",
         schema,
         &.{},
         claim,
@@ -72849,11 +72849,14 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
     try std.testing.expectEqual(@as(usize, 1), update.mutation.req.operations.len);
     try std.testing.expectEqualStrings("price", update.mutation.req.operations[0].path);
     try std.testing.expectEqualStrings("99", update.mutation.req.operations[0].value_json.?);
+    try std.testing.expect(update.mutation.req.source.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, update.mutation.req.source.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, update.mutation.req.source.row_claim.?.effectiveWaitPolicy());
     try std.testing.expect(update.mutation.req.returning_all);
 
     var delete = try lowerDeleteMutationSourceAlloc(
         alloc,
-        "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' FOR UPDATE RETURNING *",
+        "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING *",
         schema,
         &.{},
         claim,
@@ -72865,6 +72868,9 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
     try std.testing.expectEqualStrings("valid_time", delete.mutation.req.temporal_portion.?.period);
     try std.testing.expectEqualStrings("2", delete.mutation.req.temporal_portion.?.from_json);
     try std.testing.expectEqualStrings("8", delete.mutation.req.temporal_portion.?.to_json);
+    try std.testing.expect(delete.mutation.req.source.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, delete.mutation.req.source.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, delete.mutation.req.source.row_claim.?.effectiveWaitPolicy());
     try std.testing.expect(delete.mutation.req.returning_all);
 
     const range_schema_json =
@@ -72877,7 +72883,7 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
 
     var range_update = try lowerUpdateMutationSourceAlloc(
         alloc,
-        "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 FOR UPDATE RETURNING *",
+        "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 RETURNING *",
         range_schema,
         &.{},
         claim,
@@ -72896,7 +72902,7 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
 
     var range_delete = try lowerDeleteMutationSourceAlloc(
         alloc,
-        "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 FOR UPDATE RETURNING *",
+        "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 RETURNING *",
         range_schema,
         &.{},
         claim,

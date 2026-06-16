@@ -6511,7 +6511,7 @@
       },
       "plan": "update_source:table=prices:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=1:temporal=1",
       "apply_setup_sql": ["CREATE TABLE prices (sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS));"],
-      "sql": "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' FOR UPDATE RETURNING *"
+      "sql": "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *"
     },
     {
       "name": "temporal range-column portion price update",
@@ -6526,7 +6526,7 @@
       },
       "plan": "update_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=1:temporal=1",
       "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
-      "sql": "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 FOR UPDATE RETURNING *"
+      "sql": "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 RETURNING *"
     },
     {
       "name": "claimed cleanup delete",
@@ -6642,7 +6642,7 @@
       },
       "plan": "delete_source:table=prices:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
       "apply_setup_sql": ["CREATE TABLE prices (sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), PRIMARY KEY (sku, valid_time WITHOUT OVERLAPS));"],
-      "sql": "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' FOR UPDATE RETURNING *"
+      "sql": "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING *"
     },
     {
       "name": "temporal range-column portion price delete",
@@ -6656,7 +6656,7 @@
       },
       "plan": "delete_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
       "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
-      "sql": "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 FOR UPDATE RETURNING *"
+      "sql": "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 RETURNING *"
     },
     {
       "name": "claimed cleanup delete alias qualified returning fields",
