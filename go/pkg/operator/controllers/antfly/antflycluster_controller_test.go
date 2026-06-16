@@ -470,6 +470,92 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(promotion.DataLossPossible).To(BeTrue())
 }
 
+func TestObserveHAPrimaryAdminStatus(t *testing.T) {
+	g := NewWithT(t)
+
+	var observedArgv []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodPost))
+			g.Expect(req.URL.String()).To(Equal("http://primary-ha.default.svc:8081/ha/v1/admin/command"))
+			var payload struct {
+				Argv []string `json:"argv"`
+			}
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			observedArgv = append([]string{}, payload.Argv...)
+			body := strings.Join([]string{
+				"result=primary_status",
+				"role=primary",
+				"current_lsn=12",
+				"slot_count=1",
+				"retention.oldest_restart_lsn=7",
+				"retention.retained_lsn_count=5",
+				"retention.active_slots=1",
+				"retention.reseed_recommended=0",
+				"slots.0.name=standby-a",
+				"slots.0.timeline_id=4",
+				"slots.0.active=true",
+				"slots.0.reseed_required=false",
+				"slots.0.restart_lsn=7",
+				"slots.0.received_lsn=12",
+				"slots.0.applied_lsn=11",
+				"slots.0.safe_read_lsn=11",
+				"slots.0.write_lag_lsn=0",
+				"slots.0.apply_lag_lsn=1",
+				"slots.0.safe_read_lag_lsn=1",
+				"slots.0.status=healthy",
+				"",
+			}, "\n")
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL: "http://primary-ha.default.svc:8081",
+				},
+				Retention: &antflyv1.HARetentionPolicy{MaxLagLSN: 50},
+				SyncPolicy: &antflyv1.HASyncPolicy{
+					Mode:          antflyv1.HADurabilityModeRemoteApply,
+					Selection:     antflyv1.HAStandbySelectionFirst,
+					Required:      1,
+					StandbyNames:  []string{"standby-a"},
+					FailurePolicy: antflyv1.HAFailurePolicyFailClosed,
+				},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(observedArgv).To(Equal([]string{
+		"--table", "status", "primary",
+		"--max-lag-lsn", "50",
+		"--sync-mode", "remote-apply",
+		"--sync-selection", "first",
+		"--sync-required", "1",
+		"--sync-standby", "standby-a",
+		"--sync-failure", "fail-closed",
+	}))
+	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.Retention.OldestRestartLSN).To(Equal(uint64(7)))
+	g.Expect(cluster.Status.HAStatus.Retention.RetainedLSNCount).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.Retention.ActiveSlots).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	standby := cluster.Status.HAStatus.Standbys[0]
+	g.Expect(standby.Name).To(Equal("standby-a"))
+	g.Expect(standby.TimelineID).To(Equal(uint64(4)))
+	g.Expect(standby.ReceivedLSN).To(Equal(uint64(12)))
+	g.Expect(standby.AppliedLSN).To(Equal(uint64(11)))
+	g.Expect(standby.ApplyLagLSN).To(Equal(uint64(1)))
+	g.Expect(standby.Status).To(Equal("healthy"))
+}
+
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false
 func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	g := NewWithT(t)

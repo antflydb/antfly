@@ -3094,7 +3094,17 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 			return err
 		}
+		haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
 		r.updateHAStatusAndConditions(cluster)
+		if haAdminStatusErr != nil {
+			setHACondition(
+				cluster,
+				antflyv1.TypeHADegraded,
+				metav1.ConditionTrue,
+				"HAAdminStatusUnavailable",
+				fmt.Sprintf("Unable to observe HA primary admin status: %v", haAdminStatusErr),
+			)
+		}
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 			return err
 		}
@@ -3172,7 +3182,17 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 		return err
 	}
+	haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
 	r.updateHAStatusAndConditions(cluster)
+	if haAdminStatusErr != nil {
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			"HAAdminStatusUnavailable",
+			fmt.Sprintf("Unable to observe HA primary admin status: %v", haAdminStatusErr),
+		)
+	}
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 		return err
 	}
@@ -3328,14 +3348,7 @@ type haPromotionJobResult struct {
 }
 
 func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
-	lines := map[string]string{}
-	for _, line := range strings.Split(body, "\n") {
-		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if !ok || key == "" {
-			continue
-		}
-		lines[key] = value
-	}
+	lines := parseHATableLines(body)
 	resultName := lines["result"]
 	if resultName != "promote_current_fence" && resultName != "promote" {
 		return haPromotionJobResult{}, false
@@ -3444,6 +3457,183 @@ func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Contex
 	}
 	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = target
 	return nil
+}
+
+func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		ha.Admin == nil || strings.TrimSpace(ha.Admin.PrimaryURL) == "" {
+		return nil
+	}
+	body, err := r.executeHAAdminTableCommand(ctx, ha.Admin.PrimaryURL, haPrimaryStatusCommand(ha))
+	if err != nil {
+		return err
+	}
+	status, err := parseHAPrimaryStatusTable(body)
+	if err != nil {
+		return err
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
+	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
+	cluster.Status.HAStatus.Retention = status.Retention
+	cluster.Status.HAStatus.Standbys = status.Standbys
+	return nil
+}
+
+func (r *AntflyClusterReconciler) executeHAAdminTableCommand(ctx context.Context, baseURL string, argv []string) (string, error) {
+	requestBody, err := json.Marshal(struct {
+		Argv []string `json:"argv"`
+	}{Argv: argv})
+	if err != nil {
+		return "", err
+	}
+	endpoint := strings.TrimRight(baseURL, "/") + "/ha/v1/admin/command"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(requestBody)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/plain")
+
+	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HA admin command returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return string(raw), nil
+}
+
+func haPrimaryStatusCommand(ha *antflyv1.HighAvailabilitySpec) []string {
+	argv := []string{"--table", "status", "primary"}
+	if ha == nil {
+		return argv
+	}
+	if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
+		argv = append(argv, "--max-lag-lsn", strconv.FormatUint(ha.Retention.MaxLagLSN, 10))
+	}
+	if ha.SyncPolicy != nil && ha.SyncPolicy.Mode != "" && ha.SyncPolicy.Mode != antflyv1.HADurabilityModeAsync {
+		argv = append(argv, "--sync-mode", haDurabilityModeCLI(ha.SyncPolicy.Mode))
+		if ha.SyncPolicy.Selection != "" {
+			argv = append(argv, "--sync-selection", haStandbySelectionCLI(ha.SyncPolicy.Selection))
+		}
+		if ha.SyncPolicy.Required > 0 {
+			argv = append(argv, "--sync-required", strconv.FormatInt(int64(ha.SyncPolicy.Required), 10))
+		}
+		for _, name := range ha.SyncPolicy.StandbyNames {
+			if strings.TrimSpace(name) != "" {
+				argv = append(argv, "--sync-standby", name)
+			}
+		}
+		if ha.SyncPolicy.FailurePolicy != "" {
+			argv = append(argv, "--sync-failure", haFailurePolicyCLI(ha.SyncPolicy.FailurePolicy))
+		}
+	}
+	return argv
+}
+
+func haDurabilityModeCLI(mode antflyv1.HADurabilityMode) string {
+	switch mode {
+	case antflyv1.HADurabilityModeRemoteWrite:
+		return "remote-write"
+	case antflyv1.HADurabilityModeRemoteApply:
+		return "remote-apply"
+	default:
+		return "async"
+	}
+}
+
+func haStandbySelectionCLI(selection antflyv1.HAStandbySelection) string {
+	switch selection {
+	case antflyv1.HAStandbySelectionFirst:
+		return "first"
+	case antflyv1.HAStandbySelectionAll:
+		return "all"
+	default:
+		return "any"
+	}
+}
+
+func haFailurePolicyCLI(policy antflyv1.HAFailurePolicy) string {
+	switch policy {
+	case antflyv1.HAFailurePolicyFailClosed:
+		return "fail-closed"
+	case antflyv1.HAFailurePolicyDegradeToAsync:
+		return "degrade-to-async"
+	default:
+		return "block"
+	}
+}
+
+type haObservedPrimaryStatus struct {
+	PrimaryLSN uint64
+	Retention  antflyv1.HARetentionStatus
+	Standbys   []antflyv1.HAStandbyStatus
+}
+
+func parseHAPrimaryStatusTable(body string) (haObservedPrimaryStatus, error) {
+	lines := parseHATableLines(body)
+	if result := lines["result"]; result != "" && result != "primary_status" {
+		return haObservedPrimaryStatus{}, fmt.Errorf("unexpected HA status result %q", result)
+	}
+
+	var status haObservedPrimaryStatus
+	var ok bool
+	if status.PrimaryLSN, ok = parseHAResultUint(lines, "current_lsn"); !ok {
+		return haObservedPrimaryStatus{}, fmt.Errorf("missing current_lsn")
+	}
+	status.Retention.OldestRestartLSN, _ = parseHAResultUint(lines, "retention.oldest_restart_lsn")
+	status.Retention.RetainedLSNCount, _ = parseHAResultUint(lines, "retention.retained_lsn_count")
+	if activeSlots, ok := parseHAResultUint(lines, "retention.active_slots"); ok {
+		status.Retention.ActiveSlots = int32(activeSlots)
+	}
+	if reseedRecommended, ok := parseHAResultUint(lines, "retention.reseed_recommended"); ok {
+		status.Retention.ReseedRecommended = int32(reseedRecommended)
+	}
+
+	slotCount, _ := parseHAResultUint(lines, "slot_count")
+	for i := uint64(0); i < slotCount; i++ {
+		prefix := fmt.Sprintf("slots.%d.", i)
+		name := strings.TrimSpace(lines[prefix+"name"])
+		if name == "" {
+			continue
+		}
+		slot := antflyv1.HAStandbyStatus{Name: name, SlotName: name}
+		slot.TimelineID, _ = parseHAResultUint(lines, prefix+"timeline_id")
+		slot.Active, _ = parseHAResultBool(lines, prefix+"active")
+		slot.ReseedRequired, _ = parseHAResultBool(lines, prefix+"reseed_required")
+		slot.RestartLSN, _ = parseHAResultUint(lines, prefix+"restart_lsn")
+		slot.ReceivedLSN, _ = parseHAResultUint(lines, prefix+"received_lsn")
+		slot.AppliedLSN, _ = parseHAResultUint(lines, prefix+"applied_lsn")
+		slot.SafeReadLSN, _ = parseHAResultUint(lines, prefix+"safe_read_lsn")
+		slot.WriteLagLSN, _ = parseHAResultUint(lines, prefix+"write_lag_lsn")
+		slot.ApplyLagLSN, _ = parseHAResultUint(lines, prefix+"apply_lag_lsn")
+		slot.SafeReadLagLSN, _ = parseHAResultUint(lines, prefix+"safe_read_lag_lsn")
+		slot.Status = strings.TrimSpace(lines[prefix+"status"])
+		slot.LastError = strings.TrimSpace(lines[prefix+"last_error"])
+		status.Standbys = append(status.Standbys, slot)
+	}
+	return status, nil
+}
+
+func parseHATableLines(body string) map[string]string {
+	lines := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || key == "" {
+			continue
+		}
+		lines[key] = value
+	}
+	return lines
 }
 
 func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
