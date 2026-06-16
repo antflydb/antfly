@@ -62370,6 +62370,20 @@ fn appParityFixtureAllowsJoinOnSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureJoinOnSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    return switch (entry.family) {
+        .merge_mutation => appParityPlanHasExactUsizeToken(entry.plan, ":match=", expected),
+        .join,
+        .update_joined_source,
+        .delete_joined_source,
+        .read,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":on=", expected),
+        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":on=", expected) or
+            appParityPlanHasExactUsizeToken(entry.plan, ":match=", expected),
+        else => false,
+    };
+}
+
 fn appParityFixtureAllowsLateralSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .lateral => true,
@@ -62778,6 +62792,11 @@ fn validateAppParityFixtureMetadata(
     }
     if (entry.summary.join_on != null and !appParityFixtureAllowsJoinOnSummary(entry)) {
         return error.TestUnexpectedResult;
+    }
+    if (entry.summary.join_on) |join_on| {
+        if (!appParityFixtureJoinOnSummaryMatchesPlan(entry, join_on)) {
+            return error.TestUnexpectedResult;
+        }
     }
     if ((entry.summary.lateral_correlations != null or entry.summary.right_offset != null) and
         !appParityFixtureAllowsLateralSummary(entry))
@@ -63258,6 +63277,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .right_offset = 1 },
         .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale join on summary",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records", .join_on = 1 },
+        .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=0:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale merge join on summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1 },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=0:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid join on summary",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records", .join_on = 1 },
+        .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "lateral window summary",

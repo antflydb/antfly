@@ -5237,7 +5237,9 @@ field.
 Join predicate summaries are scoped separately. `join_on` is valid only on join
 read plans, joined mutation-source update/delete plans, merge mutation match
 keys, generic read fingerprints whose resolved inner plan is a join, or
-`EXPLAIN` wrappers around those plans. Plain row queries, lateral correlations,
+`EXPLAIN` wrappers around those plans. The summary must match the exact `on`
+fingerprint token for join and joined mutation-source plans, or the `match`
+token for merge mutation plans. Plain row queries, lateral correlations,
 aggregate/window stages, and point writes reject it.
 
 Full query-output summaries are separate from derived-stage output summaries.
