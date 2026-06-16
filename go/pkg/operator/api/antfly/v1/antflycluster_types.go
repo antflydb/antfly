@@ -1542,6 +1542,10 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminPath string `json:"adminPath,omitempty"`
 
+	// AdminResult records stable identifiers returned by a successful typed /admin/v1 HA operation.
+	// +optional
+	AdminResult *HAAdminActionResultStatus `json:"adminResult,omitempty"`
+
 	// SeedManifestPath is the base-backup manifest path used by seed finish/bootstrap actions.
 	// +optional
 	SeedManifestPath string `json:"seedManifestPath,omitempty"`
@@ -1559,6 +1563,41 @@ type HAPlannedActionStatus struct {
 	AdminJobPhase string `json:"adminJobPhase,omitempty"`
 
 	Reason string `json:"reason,omitempty"`
+}
+
+// HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
+type HAAdminActionResultStatus struct {
+	// SchemaVersion is the response schema version returned by the HA admin API.
+	// +optional
+	SchemaVersion uint32 `json:"schemaVersion,omitempty"`
+
+	// SlotAction is the executed replication slot action.
+	// +optional
+	SlotAction string `json:"slotAction,omitempty"`
+
+	// SlotName is the affected replication slot or base-backup standby slot.
+	// +optional
+	SlotName string `json:"slotName,omitempty"`
+
+	// ManifestID is the base-backup manifest/action id returned by seed operations.
+	// +optional
+	ManifestID string `json:"manifestID,omitempty"`
+
+	// BackupLSN is the base-backup stream boundary returned by seed operations.
+	// +optional
+	BackupLSN uint64 `json:"backupLSN,omitempty"`
+
+	// StartRecordLSN is the durable backup_start record LSN returned by seed begin.
+	// +optional
+	StartRecordLSN uint64 `json:"startRecordLSN,omitempty"`
+
+	// FenceGeneration is the promotion fence generation returned by fence operations.
+	// +optional
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	// FenceToken is the opaque promotion fence receipt token returned by fence operations.
+	// +optional
+	FenceToken string `json:"fenceToken,omitempty"`
 }
 
 // HAPrimaryRouteStatus reports the operator-facing primary endpoint target.

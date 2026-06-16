@@ -231,7 +231,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
 			}, nil
 		})},
 	}
@@ -447,7 +447,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{"fence_acquire":{"receipt":{"generation":3,"token":"ha-fence-token"}}}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"receipt":{"generation":3,"token":"ha-fence-token"}}`)),
 				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -470,6 +470,9 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 
@@ -644,11 +647,17 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.Path {
-			case "/admin/v1/ha/replication-slots", "/admin/v1/ha/base-backups":
+			case "/admin/v1/ha/replication-slots":
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+				}, nil
+			case "/admin/v1/ha/base-backups":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request before seed file jobs: %s", req.URL.Path)
@@ -662,6 +671,13 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
 	finishJob := &batchv1.Job{}
 	g.Expect(reconciler.Get(
 		context.Background(),
@@ -831,7 +847,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
 			}, nil
 		})},
 	}
@@ -846,6 +862,9 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.ManifestID).To(Equal("operator-base-standby-a-7"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.BackupLSN).To(Equal(uint64(7)))
 }
 
 func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
@@ -1336,6 +1355,29 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(legacyResult.FenceToken).To(Equal("legacy-token"))
 	g.Expect(legacyResult.Forced).To(BeTrue())
 	g.Expect(legacyResult.DataLossPossible).To(BeTrue())
+}
+
+func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
+	g := NewWithT(t)
+
+	seed, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(seed.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(seed.SlotName).To(Equal("standby-a"))
+	g.Expect(seed.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(seed.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(seed.StartRecordLSN).To(Equal(uint64(5)))
+
+	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(slot.SlotAction).To(Equal("pause"))
+	g.Expect(slot.SlotName).To(Equal("standby-a"))
+
+	fence, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"fence_acquire":{"receipt":{"generation":3,"token":"legacy-token"}}}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(fence.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(fence.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(fence.FenceToken).To(Equal("legacy-token"))
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {

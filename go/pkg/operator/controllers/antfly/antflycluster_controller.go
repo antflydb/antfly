@@ -3323,25 +3323,41 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if action.TargetLSN > 0 {
 			body["initial_lsn"] = action.TargetLSN
 		}
-		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/replication-slots", body)
+		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/replication-slots", body)
+		if err == nil {
+			applyHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionPauseSlot):
 		slotName := haActionSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
-		return true, r.requestHAAdminNoBody(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/pause")
+		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/pause", nil)
+		if err == nil {
+			applyHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionResumeSlot):
 		slotName := haActionSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
-		return true, r.requestHAAdminNoBody(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/resume")
+		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/resume", nil)
+		if err == nil {
+			applyHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionDropSlot):
 		slotName := haActionSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
-		return true, r.requestHAAdminNoBody(ctx, http.MethodDelete, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName))
+		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodDelete, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName), nil)
+		if err == nil {
+			applyHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionSeedStandby), string(haActionMarkReseed):
 		slotName := haActionSlotName(*action)
 		if slotName == "" {
@@ -3351,13 +3367,21 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			"slot_name":   slotName,
 			"manifest_id": haSeedBeginManifestID(*action, slotName),
 		}
-		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
+		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
+		if err == nil {
+			applyHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionAcquireFence):
 		body, ok := haFenceAcquireBody(cluster, *action)
 		if !ok {
 			return false, nil
 		}
-		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/fence", body)
+		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/fence", body)
+		if err == nil {
+			applyHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionPromoteStandby):
 		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPost, action.AdminURL, "/admin/v1/ha/promotion/current-fence", nil)
 		if err == nil {
@@ -3540,6 +3564,102 @@ func haSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName strin
 		}
 	}
 	return fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)
+}
+
+type haDirectAdminActionResultJSON struct {
+	SchemaVersion uint32 `json:"schema_version"`
+	SlotAction    string `json:"slot_action"`
+	Slot          struct {
+		SlotName string `json:"slot_name"`
+	} `json:"slot"`
+	SlotName       string `json:"slot_name"`
+	ManifestID     string `json:"manifest_id"`
+	BackupLSN      uint64 `json:"backup_lsn"`
+	StartRecordLSN uint64 `json:"start_record_lsn"`
+	Receipt        struct {
+		Generation uint64 `json:"generation"`
+		Token      string `json:"token"`
+	} `json:"receipt"`
+}
+
+type haDirectAdminActionResultEnvelope struct {
+	Result struct {
+		Slot         *haDirectAdminActionResultJSON `json:"slot,omitempty"`
+		SeedBegin    *haDirectAdminActionResultJSON `json:"seed_begin,omitempty"`
+		FenceAcquire *haDirectAdminActionResultJSON `json:"fence_acquire,omitempty"`
+	} `json:"result"`
+}
+
+func applyHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) {
+	if action == nil {
+		return
+	}
+	result, ok := parseHADirectAdminActionResult(raw)
+	if !ok {
+		return
+	}
+	action.AdminResult = result
+}
+
+func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultStatus, bool) {
+	var direct haDirectAdminActionResultJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		return nil, false
+	}
+	result := &direct
+	if !haDirectAdminActionResultHasCorrelationFields(direct) {
+		var envelope haDirectAdminActionResultEnvelope
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return nil, false
+		}
+		switch {
+		case envelope.Result.Slot != nil:
+			result = envelope.Result.Slot
+		case envelope.Result.SeedBegin != nil:
+			result = envelope.Result.SeedBegin
+		case envelope.Result.FenceAcquire != nil:
+			result = envelope.Result.FenceAcquire
+		default:
+			return nil, false
+		}
+		if result.SchemaVersion == 0 {
+			result.SchemaVersion = direct.SchemaVersion
+		}
+	}
+	status := &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:   result.SchemaVersion,
+		SlotAction:      strings.TrimSpace(result.SlotAction),
+		SlotName:        strings.TrimSpace(result.SlotName),
+		ManifestID:      strings.TrimSpace(result.ManifestID),
+		BackupLSN:       result.BackupLSN,
+		StartRecordLSN:  result.StartRecordLSN,
+		FenceGeneration: result.Receipt.Generation,
+		FenceToken:      strings.TrimSpace(result.Receipt.Token),
+	}
+	if status.SlotName == "" {
+		status.SlotName = strings.TrimSpace(result.Slot.SlotName)
+	}
+	if status.SlotAction == "" &&
+		status.SlotName == "" &&
+		status.ManifestID == "" &&
+		status.BackupLSN == 0 &&
+		status.StartRecordLSN == 0 &&
+		status.FenceGeneration == 0 &&
+		status.FenceToken == "" {
+		return nil, false
+	}
+	return status, true
+}
+
+func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionResultJSON) bool {
+	return strings.TrimSpace(result.SlotAction) != "" ||
+		strings.TrimSpace(result.Slot.SlotName) != "" ||
+		strings.TrimSpace(result.SlotName) != "" ||
+		strings.TrimSpace(result.ManifestID) != "" ||
+		result.BackupLSN != 0 ||
+		result.StartRecordLSN != 0 ||
+		result.Receipt.Generation != 0 ||
+		strings.TrimSpace(result.Receipt.Token) != ""
 }
 
 func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, raw []byte) {
@@ -4218,12 +4338,16 @@ func (r *AntflyClusterReconciler) getHAAdminJSON(ctx context.Context, baseURL st
 }
 
 func (r *AntflyClusterReconciler) postHAAdminJSON(ctx context.Context, baseURL string, apiPath string, body any) error {
+	_, err := r.postHAAdminJSONRaw(ctx, baseURL, apiPath, body)
+	return err
+}
+
+func (r *AntflyClusterReconciler) postHAAdminJSONRaw(ctx context.Context, baseURL string, apiPath string, body any) ([]byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = r.requestHAAdminJSONRaw(ctx, http.MethodPost, baseURL, apiPath, raw)
-	return err
+	return r.requestHAAdminJSONRaw(ctx, http.MethodPost, baseURL, apiPath, raw)
 }
 
 func (r *AntflyClusterReconciler) requestHAAdminNoBody(ctx context.Context, method string, baseURL string, apiPath string) error {
