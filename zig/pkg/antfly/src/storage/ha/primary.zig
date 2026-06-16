@@ -256,6 +256,8 @@ pub const Primary = struct {
     ) !void {
         if (timeline_id != self.identity.timeline_id) return error.WrongTimeline;
         const state = self.slots.get(slot_name) orelse return error.SlotNotFound;
+        if (!state.active) return error.SlotInactive;
+        if (state.reseed_required) return error.SlotRequiresReseed;
         if (state.timeline_id != timeline_id) return error.WrongTimeline;
         if (received_lsn > self.lastLsn()) return error.StandbyAheadOfPrimary;
         try self.slots.updateProgress(slot_name, received_lsn, applied_lsn);
@@ -790,7 +792,6 @@ test "storage.ha primary rejects status updates for old timeline slots" {
         .restart_lsn = 1,
         .received_lsn = 1,
         .applied_lsn = 1,
-        .reseed_required = true,
     });
 
     try std.testing.expectError(
@@ -799,7 +800,40 @@ test "storage.ha primary rejects status updates for old timeline slots" {
     );
     const old = primary.slot("old-timeline") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), old.timeline_id);
-    try std.testing.expect(old.reseed_required);
+    try std.testing.expect(!old.reseed_required);
+}
+
+test "storage.ha primary rejects status updates for inactive or reseed slots" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "inactive-ack");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("paused", 0);
+    try primary.createSlot("reseed", 0);
+    _ = try primary.append(.{ .payload = "one" });
+
+    try primary.pauseSlot("paused");
+    try std.testing.expectError(
+        error.SlotInactive,
+        primary.standbyStatusUpdate("paused", identity.timeline_id, 1, 1),
+    );
+
+    try primary.slots.markReseedRequired("reseed");
+    try std.testing.expectError(
+        error.SlotRequiresReseed,
+        primary.standbyStatusUpdate("reseed", identity.timeline_id, 1, 1),
+    );
+
+    const paused = primary.slot("paused") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!paused.active);
+    try std.testing.expectEqual(@as(u64, 0), paused.received_lsn);
+
+    const reseed = primary.slot("reseed") orelse return error.TestExpectedEqual;
+    try std.testing.expect(reseed.reseed_required);
+    try std.testing.expectEqual(@as(u64, 0), reseed.received_lsn);
 }
 
 test "storage.ha primary pauses and resumes slot streaming across reopen" {
