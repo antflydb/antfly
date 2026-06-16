@@ -76,6 +76,17 @@ pub const ReplicationLog = struct {
         return wal_lsn;
     }
 
+    pub fn bootstrapAt(self: *ReplicationLog, alloc: Allocator, record: replication_record.Record) !u64 {
+        if (self.lastLsn() != 0) return error.ReplicationLogNotEmpty;
+        if (record.lsn == 0) return error.InvalidBootstrapLsn;
+        if (record.previous_lsn != record.lsn - 1) return error.UnexpectedPreviousLsn;
+
+        const original_next_lsn = self.wal.next_lsn;
+        self.wal.next_lsn = record.lsn;
+        errdefer self.wal.next_lsn = original_next_lsn;
+        return try self.append(alloc, record);
+    }
+
     pub fn iterateFrom(self: *ReplicationLog, alloc: Allocator, from_lsn: u64) ![]Entry {
         const wal_entries = try self.wal.iterateFrom(alloc, from_lsn);
         defer {
@@ -239,4 +250,32 @@ test "storage.ha replication log truncates acknowledged entries" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 3), entries[0].record.lsn);
     try std.testing.expectEqualStrings("three", entries[0].record.payload);
+}
+
+test "storage.ha replication log bootstraps an empty log at a checkpoint lsn" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "bootstrap");
+    defer alloc.free(path);
+
+    {
+        var log = try ReplicationLog.open(path.ptr, .{});
+        defer log.close();
+        var record = baseRecord(10, "checkpoint");
+        record.kind = .checkpoint;
+        try std.testing.expectEqual(@as(u64, 10), try log.bootstrapAt(alloc, record));
+        try std.testing.expectEqual(@as(u64, 11), log.nextLsn());
+        try std.testing.expectError(error.ReplicationLogNotEmpty, log.bootstrapAt(alloc, record));
+    }
+
+    {
+        var reopened = try ReplicationLog.open(path.ptr, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 10), reopened.lastLsn());
+        try std.testing.expectEqual(@as(u64, 11), reopened.nextLsn());
+        const entries = try reopened.iterateFrom(alloc, 1);
+        defer freeEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqual(@as(u64, 10), entries[0].record.lsn);
+        try std.testing.expectEqual(replication_record.RecordKind.checkpoint, entries[0].record.kind);
+    }
 }

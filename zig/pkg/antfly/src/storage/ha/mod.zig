@@ -19,6 +19,7 @@ pub const standby = @import("standby.zig");
 pub const primary = @import("primary.zig");
 pub const session = @import("session.zig");
 pub const backup_manifest = @import("backup_manifest.zig");
+pub const bootstrap = @import("bootstrap.zig");
 
 test {
     _ = replication_record;
@@ -28,4 +29,5 @@ test {
     _ = primary;
     _ = session;
     _ = backup_manifest;
+    _ = bootstrap;
 }

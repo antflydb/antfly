@@ -130,13 +130,19 @@ pub const Standby = struct {
         try standby.validateReceivedLog();
 
         const durable_received_lsn = standby.receive_log.lastLsn();
-        const replayed_received_lsn = standby.progress.received_lsn;
+        const replayed_progress = standby.progress;
         if (standby.progress.received_lsn > durable_received_lsn) return error.ProgressAheadOfReceivedWal;
         standby.progress.received_lsn = durable_received_lsn;
+        if (try standby.recoverBootstrapCheckpoint(replayed_progress)) |checkpoint_progress| {
+            standby.progress = checkpoint_progress;
+        }
         if (standby.progress.applied_lsn > standby.progress.received_lsn) return error.AppliedAheadOfReceived;
         if (standby.progress.safe_read_lsn > standby.progress.applied_lsn) return error.SafeReadAheadOfApplied;
 
-        if (replayed_received_lsn != durable_received_lsn) {
+        if (standby.progress.received_lsn != replayed_progress.received_lsn or
+            standby.progress.applied_lsn != replayed_progress.applied_lsn or
+            standby.progress.safe_read_lsn != replayed_progress.safe_read_lsn)
+        {
             try standby.persistProgress(standby.progress);
         }
 
@@ -172,6 +178,35 @@ pub const Standby = struct {
         try self.persistProgress(next);
         self.progress = next;
         return lsn;
+    }
+
+    pub fn bootstrapCheckpoint(self: *Standby, checkpoint_lsn: u64, payload: []const u8) !void {
+        if (checkpoint_lsn == 0) return error.InvalidCheckpointLsn;
+        if (self.progress.received_lsn != 0 or
+            self.progress.applied_lsn != 0 or
+            self.progress.safe_read_lsn != 0 or
+            self.receive_log.lastLsn() != 0) return error.StandbyAlreadyBootstrapped;
+
+        _ = try self.receive_log.bootstrapAt(self.alloc, .{
+            .kind = .checkpoint,
+            .payload_codec = .json,
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = self.identity.shard_id,
+            .table_id = self.identity.table_id,
+            .timeline_id = self.identity.timeline_id,
+            .epoch = self.identity.epoch,
+            .lsn = checkpoint_lsn,
+            .previous_lsn = checkpoint_lsn - 1,
+            .payload = payload,
+        });
+
+        const next = Progress{
+            .received_lsn = checkpoint_lsn,
+            .applied_lsn = checkpoint_lsn,
+            .safe_read_lsn = checkpoint_lsn,
+        };
+        try self.persistProgress(next);
+        self.progress = next;
     }
 
     pub fn applyAvailable(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
@@ -261,17 +296,21 @@ pub const Standby = struct {
         const entries = try self.receive_log.iterateFrom(self.alloc, 1);
         defer replication_log.freeEntries(self.alloc, entries);
 
-        var expected_lsn: u64 = 1;
+        var expected_lsn: ?u64 = null;
         var current_identity: ?Identity = null;
         for (entries) |entry| {
-            if (entry.record.lsn != expected_lsn) return error.MissingReceivedRecord;
+            if (expected_lsn) |expected| {
+                if (entry.record.lsn != expected) return error.MissingReceivedRecord;
+            } else {
+                expected_lsn = entry.record.lsn;
+            }
             if (entry.record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
             if (entry.record.shard_id != self.identity.shard_id) return error.WrongShard;
             if (entry.record.table_id != self.identity.table_id) return error.WrongTable;
 
             if (current_identity) |current| {
                 if (recordMatchesIdentity(entry.record, current)) {
-                    expected_lsn += 1;
+                    expected_lsn.? += 1;
                     continue;
                 }
                 if (entry.record.kind != .timeline_switch) return error.WrongTimeline;
@@ -286,12 +325,35 @@ pub const Standby = struct {
                 .timeline_id = entry.record.timeline_id,
                 .epoch = entry.record.epoch,
             };
-            expected_lsn += 1;
+            expected_lsn.? += 1;
         }
 
         if (current_identity) |current| {
             try validateIdentityMatches(current, self.identity);
         }
+    }
+
+    fn recoverBootstrapCheckpoint(self: *Standby, replayed_progress: Progress) !?Progress {
+        if (replayed_progress.received_lsn != 0 or
+            replayed_progress.applied_lsn != 0 or
+            replayed_progress.safe_read_lsn != 0) return null;
+
+        const durable_received_lsn = self.receive_log.lastLsn();
+        if (durable_received_lsn == 0) return null;
+
+        const entries = try self.receive_log.iterateFrom(self.alloc, 1);
+        defer replication_log.freeEntries(self.alloc, entries);
+        if (entries.len != 1) return null;
+
+        const checkpoint = entries[0].record;
+        if (checkpoint.kind != .checkpoint) return null;
+        try self.validateRecord(checkpoint);
+        if (checkpoint.lsn != durable_received_lsn) return error.MissingReceivedRecord;
+        return Progress{
+            .received_lsn = checkpoint.lsn,
+            .applied_lsn = checkpoint.lsn,
+            .safe_read_lsn = checkpoint.lsn,
+        };
     }
 
     fn validateRecord(self: *const Standby, record: replication_record.RecordView) !void {
