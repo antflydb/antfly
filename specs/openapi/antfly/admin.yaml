@@ -1,0 +1,177 @@
+openapi: "3.0.3"
+info:
+  title: Antfly Admin API
+  version: v1alpha1
+  description: |
+    Stable operator-facing administration API for Antfly nodes.
+
+    This API is separate from the public `/db/v1` API and from node-to-node
+    `/internal/v1` RPCs. Kubernetes operators, automation, and CLIs should use
+    this surface for typed HA control-plane operations.
+servers:
+  - url: /admin/v1
+    description: Node-local admin API
+tags:
+  - name: ha
+    x-displayName: High Availability
+    description: Hot-standby HA status and replication-slot management.
+paths:
+  /ha/primary/status:
+    get:
+      tags: [ha]
+      operationId: getHAPrimaryStatus
+      summary: Get primary HA status
+      responses:
+        "200":
+          description: Primary status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots:
+    get:
+      tags: [ha]
+      operationId: listHAReplicationSlots
+      summary: List HA replication slots
+      responses:
+        "200":
+          description: Replication slot list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    post:
+      tags: [ha]
+      operationId: createHAReplicationSlot
+      summary: Create an HA replication slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplicationSlotCreateRequest"
+      responses:
+        "200":
+          description: Created slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots/{slot_name}:
+    delete:
+      tags: [ha]
+      operationId: dropHAReplicationSlot
+      summary: Drop an HA replication slot
+      parameters:
+        - $ref: "#/components/parameters/SlotName"
+      responses:
+        "200":
+          description: Dropped slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots/{slot_name}/pause:
+    put:
+      tags: [ha]
+      operationId: pauseHAReplicationSlot
+      summary: Pause an HA replication slot
+      parameters:
+        - $ref: "#/components/parameters/SlotName"
+      responses:
+        "200":
+          description: Paused slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication-slots/{slot_name}/resume:
+    put:
+      tags: [ha]
+      operationId: resumeHAReplicationSlot
+      summary: Resume an HA replication slot
+      parameters:
+        - $ref: "#/components/parameters/SlotName"
+      responses:
+        "200":
+          description: Resumed slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+components:
+  parameters:
+    SlotName:
+      name: slot_name
+      in: path
+      required: true
+      description: Stable standby replication slot name.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9._-]+$"
+  responses:
+    BadRequest:
+      description: Invalid admin request.
+      content:
+        text/plain:
+          schema:
+            type: string
+    Conflict:
+      description: HA operation cannot be completed in the current state.
+      content:
+        text/plain:
+          schema:
+            type: string
+    NotFound:
+      description: HA resource was not found.
+      content:
+        text/plain:
+          schema:
+            type: string
+  schemas:
+    ReplicationSlotCreateRequest:
+      type: object
+      required: [slot_name]
+      additionalProperties: false
+      properties:
+        slot_name:
+          type: string
+          description: Stable standby replication slot name.
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9._-]+$"
+        initial_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+          description: Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    HACommandResult:
+      type: object
+      description: |
+        JSON rendering of the underlying HA admin command result. This envelope
+        remains intentionally tolerant while the hot-standby API graduates from
+        operator integration to a fully typed response schema.
+      additionalProperties: true

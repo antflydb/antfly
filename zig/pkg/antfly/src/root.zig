@@ -93,6 +93,7 @@ pub const tracing = @import("tracing/mod.zig");
 
 // Raft integration
 pub const raft = @import("raft/mod.zig");
+pub const admin = @import("admin/mod.zig");
 pub const public_api = @import("api/mod.zig");
 pub const metadata = @import("metadata/mod.zig");
 pub const metadata_api = @import("metadata/api.zig");

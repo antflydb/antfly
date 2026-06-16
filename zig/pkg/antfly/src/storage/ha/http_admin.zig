@@ -20,8 +20,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("../../common/http/http_common.zig");
-const admin = @import("admin.zig");
+const ha_admin = @import("admin.zig");
 const admin_cli = @import("admin_cli.zig");
 const admin_exec = @import("admin_exec.zig");
 const fencing = @import("fencing.zig");
@@ -34,17 +35,10 @@ pub const Routes = struct {
     pub const health = "/ha/v1/health";
     pub const ready = "/ha/v1/ready";
     pub const command = "/ha/v1/admin/command";
-    pub const admin_ha_primary_status = "/admin/v1/ha/primary/status";
-    pub const admin_ha_replication_slots = "/admin/v1/ha/replication-slots";
 };
 
 pub const CommandRequest = struct {
     argv: []const []const u8,
-};
-
-pub const ReplicationSlotCreateRequest = struct {
-    slotName: []const u8,
-    initialLSN: ?u64 = null,
 };
 
 pub const Server = struct {
@@ -82,10 +76,10 @@ pub const Server = struct {
                     if (self.ready()) return try textResponse(self.alloc, 200, "ready");
                     return try textResponse(self.alloc, 503, "not ready");
                 }
-                if (std.mem.eql(u8, path, Routes.admin_ha_primary_status)) {
+                if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
                     return try self.handleAdminPrimaryStatus();
                 }
-                if (std.mem.eql(u8, path, Routes.admin_ha_replication_slots)) {
+                if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminReplicationSlots();
                 }
                 return try textResponse(self.alloc, 404, "not found");
@@ -94,12 +88,32 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, Routes.command)) {
                     return try self.handleCommand(req);
                 }
-                if (std.mem.eql(u8, path, Routes.admin_ha_replication_slots)) {
+                if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminCreateReplicationSlot(req);
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
-            else => return try textResponse(self.alloc, 405, "method not allowed"),
+            .PUT => {
+                if (admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix)) |slot_name| {
+                    return try self.handleAdminReplicationSlotLifecycle(slot_name, .pause);
+                }
+                if (admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix)) |slot_name| {
+                    return try self.handleAdminReplicationSlotLifecycle(slot_name, .@"resume");
+                }
+                if (knownFixedRoute(path)) {
+                    return try textResponse(self.alloc, 405, "method not allowed");
+                }
+                return try textResponse(self.alloc, 404, "not found");
+            },
+            .DELETE => {
+                if (admin_api.routes.replicationSlotNameFromPath(path, "")) |slot_name| {
+                    return try self.handleAdminReplicationSlotLifecycle(slot_name, .drop);
+                }
+                if (knownFixedRoute(path)) {
+                    return try textResponse(self.alloc, 405, "method not allowed");
+                }
+                return try textResponse(self.alloc, 404, "not found");
+            },
         }
     }
 
@@ -125,20 +139,43 @@ pub const Server = struct {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
 
         var parsed = std.json.parseFromSlice(
-            ReplicationSlotCreateRequest,
+            admin_api.ReplicationSlotCreateRequest,
             self.alloc,
             req.body,
             .{ .ignore_unknown_fields = true },
         ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");
         defer parsed.deinit();
 
+        const initial_lsn: ?u64 = if (parsed.value.initial_lsn) |value| blk: {
+            if (value < 0) return try textResponse(self.alloc, 400, "invalid HA replication slot request");
+            break :blk @intCast(value);
+        } else null;
+
         var plan = admin_cli.Plan{
             .output = .json,
             .command = .{ .slot = .{
                 .action = .create,
-                .request = admin.SlotRequest{
-                    .slot_name = parsed.value.slotName,
-                    .initial_lsn = parsed.value.initialLSN,
+                .request = ha_admin.SlotRequest{
+                    .slot_name = parsed.value.slot_name,
+                    .initial_lsn = initial_lsn,
+                },
+            } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminReplicationSlotLifecycle(
+        self: *Server,
+        slot_name: []const u8,
+        action: ha_admin.SlotAction,
+    ) !http_common.HttpResponse {
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .slot = .{
+                .action = action,
+                .request = ha_admin.SlotRequest{
+                    .slot_name = slot_name,
                 },
             } },
         };
@@ -200,6 +237,14 @@ fn requestPath(uri: []const u8) []const u8 {
     const authority_start = scheme_index + 3;
     const path_index = std.mem.indexOfScalarPos(u8, uri, authority_start, '/') orelse return "/";
     return uri[path_index..];
+}
+
+fn knownFixedRoute(path: []const u8) bool {
+    return std.mem.eql(u8, path, Routes.health) or
+        std.mem.eql(u8, path, Routes.ready) or
+        std.mem.eql(u8, path, Routes.command) or
+        std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
+        std.mem.eql(u8, path, admin_api.routes.ha_replication_slots);
 }
 
 fn commandErrorStatus(err: anyerror) u16 {
@@ -382,7 +427,7 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var typed_status = try server.handle(.{
         .method = .GET,
-        .uri = Routes.admin_ha_primary_status,
+        .uri = admin_api.routes.ha_primary_status,
     });
     defer typed_status.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_status.status);
@@ -392,9 +437,9 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var typed_create = try server.handle(.{
         .method = .POST,
-        .uri = Routes.admin_ha_replication_slots,
+        .uri = admin_api.routes.ha_replication_slots,
         .content_type = "application/json",
-        .body = "{\"slotName\":\"standby-b\",\"initialLSN\":0}",
+        .body = "{\"slot_name\":\"standby-b\",\"initial_lsn\":0}",
     });
     defer typed_create.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_create.status);
@@ -403,7 +448,7 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var typed_slots = try server.handle(.{
         .method = .GET,
-        .uri = Routes.admin_ha_replication_slots,
+        .uri = admin_api.routes.ha_replication_slots,
     });
     defer typed_slots.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_slots.status);
@@ -412,9 +457,44 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_slots.body, "\"name\":\"standby-a\"");
     try expectContains(typed_slots.body, "\"name\":\"standby-b\"");
 
+    const typed_pause_uri = try admin_api.routes.replicationSlotPausePathAlloc(alloc, "standby-b");
+    defer alloc.free(typed_pause_uri);
+    var typed_pause = try server.handle(.{
+        .method = .PUT,
+        .uri = typed_pause_uri,
+    });
+    defer typed_pause.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_pause.status);
+    try std.testing.expectEqualStrings("application/json", typed_pause.content_type.?);
+    try expectContains(typed_pause.body, "\"slot_name\":\"standby-b\"");
+    try expectContains(typed_pause.body, "\"active\":false");
+
+    const typed_resume_uri = try admin_api.routes.replicationSlotResumePathAlloc(alloc, "standby-b");
+    defer alloc.free(typed_resume_uri);
+    var typed_resume = try server.handle(.{
+        .method = .PUT,
+        .uri = typed_resume_uri,
+    });
+    defer typed_resume.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_resume.status);
+    try std.testing.expectEqualStrings("application/json", typed_resume.content_type.?);
+    try expectContains(typed_resume.body, "\"slot_name\":\"standby-b\"");
+    try expectContains(typed_resume.body, "\"active\":true");
+
+    const typed_drop_uri = try admin_api.routes.replicationSlotPathAlloc(alloc, "standby-b");
+    defer alloc.free(typed_drop_uri);
+    var typed_drop = try server.handle(.{
+        .method = .DELETE,
+        .uri = typed_drop_uri,
+    });
+    defer typed_drop.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_drop.status);
+    try std.testing.expectEqualStrings("application/json", typed_drop.content_type.?);
+    try expectContains(typed_drop.body, "\"slot_name\":\"standby-b\"");
+
     var invalid_typed_create = try server.handle(.{
         .method = .POST,
-        .uri = Routes.admin_ha_replication_slots,
+        .uri = admin_api.routes.ha_replication_slots,
         .content_type = "application/json",
         .body = "{}",
     });

@@ -21,6 +21,7 @@ pub const indexes_generated = @import("antfly_indexes_openapi");
 pub const generating_api_generated = @import("antfly_generating_api_openapi");
 pub const eval_generated = @import("antfly_eval_openapi");
 pub const query_generated = @import("antfly_query_openapi");
+pub const admin_generated = @import("antfly_admin_openapi");
 pub const metadata_generated = @import("antfly_metadata_openapi");
 pub const usermgr_generated = @import("antfly_usermgr_openapi");
 pub const chunking_generated = @import("antfly_chunking_openapi");
@@ -45,6 +46,14 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "ClusterRestoreRequest"));
     try std.testing.expect(@hasDecl(generated, "ClusterRestoreResponse"));
     try std.testing.expect(@hasDecl(generated, "BackupListResponse"));
+}
+
+test "admin openapi contract module is generated and wired" {
+    try std.testing.expect(@hasDecl(admin_generated, "ReplicationSlotCreateRequest"));
+    try std.testing.expect(@hasField(admin_generated.ReplicationSlotCreateRequest, "slot_name"));
+    try std.testing.expect(@hasField(admin_generated.ReplicationSlotCreateRequest, "initial_lsn"));
+    try std.testing.expect(@hasDecl(admin_generated.server, "PauseHAReplicationSlotPathParams"));
+    try std.testing.expect(@hasField(admin_generated.server.PauseHAReplicationSlotPathParams, "slot_name"));
 }
 
 test "public table contract exposes migration metadata" {
