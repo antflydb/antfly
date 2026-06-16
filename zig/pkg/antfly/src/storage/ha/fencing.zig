@@ -216,6 +216,7 @@ pub const Store = struct {
     }
 
     fn applyReceipt(self: *Store, receipt: Receipt) !void {
+        try validateReceipt(receipt);
         var owned = try ownedReceiptFromReceipt(self.alloc, receipt);
         errdefer owned.deinit(self.alloc);
         if (self.current_receipt) |*held| {
@@ -225,6 +226,7 @@ pub const Store = struct {
                 owned.deinit(self.alloc);
                 return;
             }
+            if (!receiptChainsFromHeld(held.receipt, owned.receipt)) return error.FenceAlreadyHeld;
             held.deinit(self.alloc);
         }
         self.current_receipt = owned;
@@ -253,6 +255,18 @@ fn validateFenceRequest(request: FenceRequest) !void {
     }
 }
 
+fn validateReceipt(receipt: Receipt) !void {
+    if (receipt.old_primary_id.len == 0) return error.InvalidOldPrimaryId;
+    if (receipt.promoted_node_id.len == 0) return error.InvalidPromotedNodeId;
+    if (std.mem.eql(u8, receipt.old_primary_id, receipt.promoted_node_id)) return error.InvalidPromotedNodeId;
+    if (receipt.identity.timeline_id != receipt.new_timeline_id) return error.InvalidTimelineSwitch;
+    if (receipt.identity.epoch != receipt.new_epoch) return error.InvalidTimelineSwitch;
+    if (receipt.new_timeline_id <= receipt.parent_timeline_id) return error.InvalidTimelineSwitch;
+    if (receipt.new_epoch <= receipt.parent_epoch) return error.InvalidTimelineSwitch;
+    if (receipt.required_lsn == 0) return error.InvalidFenceLsn;
+    if (receipt.observed_lsn < receipt.required_lsn and !receipt.forced) return error.FenceRequiresForce;
+}
+
 fn sameFence(receipt: Receipt, request: FenceRequest) bool {
     return receipt.parent_timeline_id == request.identity.timeline_id and
         receipt.parent_epoch == request.identity.epoch and
@@ -272,6 +286,15 @@ fn chainsFromHeldFence(receipt: Receipt, request: FenceRequest) bool {
         receipt.new_timeline_id == request.identity.timeline_id and
         receipt.new_epoch == request.identity.epoch and
         std.mem.eql(u8, receipt.promoted_node_id, request.old_primary_id);
+}
+
+fn receiptChainsFromHeld(held: Receipt, next: Receipt) bool {
+    return held.identity.cluster_id == next.identity.cluster_id and
+        held.identity.shard_id == next.identity.shard_id and
+        held.identity.table_id == next.identity.table_id and
+        held.new_timeline_id == next.parent_timeline_id and
+        held.new_epoch == next.parent_epoch and
+        std.mem.eql(u8, held.promoted_node_id, next.old_primary_id);
 }
 
 fn sameReceipt(a: Receipt, b: Receipt) bool {
@@ -649,6 +672,34 @@ test "storage.ha fencing rejects conflicting duplicate generations on replay" {
     }
 
     try std.testing.expectError(error.NonMonotonicFenceGeneration, Store.open(alloc, path.ptr, .{}));
+}
+
+test "storage.ha fencing rejects stale parent generation on replay" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "stale-parent-generation");
+    defer alloc.free(path);
+
+    {
+        var store = try Store.open(alloc, path.ptr, .{});
+        defer store.close();
+
+        const receipt = try store.acquirePromotionFence(baseRequest());
+        defer freeReceipt(alloc, receipt);
+
+        var stale_parent = receipt;
+        stale_parent.promoted_node_id = "standby-c";
+        stale_parent.new_timeline_id = 3;
+        stale_parent.new_epoch = 3;
+        stale_parent.identity.timeline_id = 3;
+        stale_parent.identity.epoch = 3;
+        stale_parent.generation = 2;
+        stale_parent.token = "stale-parent-token";
+        const encoded = try encodeReceipt(alloc, .promotion_fence, stale_parent);
+        defer alloc.free(encoded);
+        _ = try store.wal.append(encoded);
+    }
+
+    try std.testing.expectError(error.FenceAlreadyHeld, Store.open(alloc, path.ptr, .{}));
 }
 
 test "storage.ha fencing receipt drives standby promotion" {
