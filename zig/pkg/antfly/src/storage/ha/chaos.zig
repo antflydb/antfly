@@ -300,6 +300,8 @@ test "storage.ha chaos lag retention forces reseed and former primary cannot rew
 
     const snapshot = try primary.retentionSnapshot(.{ .max_lag_lsn = 3 });
     try std.testing.expectEqual(@as(usize, 1), snapshot.reseed_recommended);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active_slots);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.retained_lsn_count);
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expect(slot.reseed_required);
 

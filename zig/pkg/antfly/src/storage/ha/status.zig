@@ -357,6 +357,7 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     try std.testing.expectEqual(Role.primary, snapshot.role);
     try std.testing.expectEqual(@as(u64, 3), snapshot.current_lsn);
     try std.testing.expectEqual(@as(usize, 2), snapshot.slots.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.retention.active_slots);
     try std.testing.expectEqual(@as(usize, 1), snapshot.retention.reseed_recommended);
     try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, snapshot.durability.?.status);
     try std.testing.expectEqual(@as(usize, 1), snapshot.durability.?.candidate_count);

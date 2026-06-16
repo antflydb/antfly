@@ -288,7 +288,6 @@ pub const SlotStore = struct {
                     continue;
                 }
             }
-            active += 1;
             if (slot.state.reseed_required or
                 (policy.max_lag_lsn > 0 and primary_lsn -| slot.state.restart_lsn > policy.max_lag_lsn))
             {
@@ -300,6 +299,7 @@ pub const SlotStore = struct {
                 reseed += 1;
                 continue;
             }
+            active += 1;
             oldest = @min(oldest, slot.state.restart_lsn);
         }
 
@@ -652,9 +652,15 @@ test "storage.ha slot store marks slots for reseed when lag cap is exceeded" {
 
     const snapshot = try store.retentionSnapshot(12, .{ .max_lag_lsn = 5 });
     try std.testing.expectEqual(@as(usize, 1), snapshot.reseed_recommended);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.active_slots);
     try std.testing.expectEqual(@as(u64, 9), snapshot.oldest_restart_lsn);
     const slow = store.get("slow") orelse return error.TestExpectedEqual;
     try std.testing.expect(slow.reseed_required);
+
+    const after_mark = try store.retentionSnapshot(12, .{ .max_lag_lsn = 5 });
+    try std.testing.expectEqual(@as(usize, 1), after_mark.reseed_recommended);
+    try std.testing.expectEqual(@as(usize, 1), after_mark.active_slots);
+    try std.testing.expectEqual(@as(u64, 9), after_mark.oldest_restart_lsn);
 }
 
 test "storage.ha slot store drops slots and releases retention" {
