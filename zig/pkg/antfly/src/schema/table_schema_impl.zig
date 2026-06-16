@@ -514,6 +514,7 @@ pub const DocumentProperty = struct {
     index_lifecycle: ?RelationalIndexLifecycle = null,
     index_generation: ?u64 = null,
     index_name: ?[]const u8 = null,
+    index_include_columns: [][]const u8 = &.{},
     integer_only: bool = false,
     format: ?[]const u8 = null,
     allows_null: bool = false,
@@ -575,6 +576,8 @@ pub const DocumentProperty = struct {
         if (self.analyzer) |analyzer| alloc.free(analyzer);
         if (self.collation) |collation| alloc.free(collation);
         if (self.index_name) |index_name| alloc.free(index_name);
+        for (self.index_include_columns) |field_name| alloc.free(field_name);
+        if (self.index_include_columns.len > 0) alloc.free(self.index_include_columns);
         if (self.format) |format| alloc.free(format);
         if (self.const_value) |const_value| alloc.free(const_value);
         if (self.pattern) |pattern| alloc.free(pattern);
@@ -1614,6 +1617,9 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     if (object.get("x-antfly-index-name")) |index_name| {
         if (index_name != .null and index_name != .string) return error.InvalidSchemaUpdateRequest;
         if (index_name == .string and index_name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-include")) |index_include| {
+        if (index_include != .null) try validateAntflyIncludeInAllDefinition(index_include);
     }
     if (object.get("x-antfly-index-where")) |index_where| {
         if (index_where != .null) try validateUniquePredicateDefinition(index_where);
@@ -2917,6 +2923,16 @@ fn validateRelationalPartialIndexProperty(schema: TableSchema, property: Documen
         if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
         if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
     }
+    if (property.index_include_columns.len > 0) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+        if (property.index_name == null) return error.InvalidSchemaUpdateRequest;
+        for (property.index_include_columns) |field_name| {
+            if (std.mem.eql(u8, field_name, property.name)) return error.InvalidSchemaUpdateRequest;
+            const source = findDocumentProperty(schema.document_schemas[0].properties, field_name) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalStorageProperty(source)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
     if (property.index_where.len == 0 and property.index_where_expressions.len == 0) return;
     if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
     if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
@@ -3410,6 +3426,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     else
         null;
     errdefer if (index_name) |value| alloc.free(value);
+    const index_include_columns: [][]const u8 = if (object.get("x-antfly-index-include")) |include_value| switch (include_value) {
+        .array => |array| try parseRequiredFields(alloc, array),
+        .null => &[_][]const u8{},
+        else => return error.InvalidSchemaUpdateRequest,
+    } else &[_][]const u8{};
+    errdefer {
+        for (index_include_columns) |field_name| alloc.free(field_name);
+        if (index_include_columns.len > 0) alloc.free(index_include_columns);
+    }
     const include_in_all_fields: [][]const u8 = if (object.get("x-antfly-include-in-all")) |include_value|
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
@@ -3718,6 +3743,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .index_lifecycle = index_lifecycle,
         .index_generation = index_generation,
         .index_name = index_name,
+        .index_include_columns = index_include_columns,
         .integer_only = type_spec.integer_only,
         .format = format,
         .allows_null = allows_null,

@@ -139,6 +139,7 @@ pub const RelationalColumn = struct {
     index_lifecycle: RelationalIndexLifecycle = .ready,
     index_generation: u64 = 0,
     index_name: ?[]const u8 = null,
+    index_include_columns: []const []const u8 = &.{},
     default_value: ?RelationalDefaultValue = null,
     on_update_value: ?RelationalDefaultValue = null,
     generated: ?RelationalGeneratedValue = null,
@@ -464,6 +465,7 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
         if (a.index_lifecycle != b.index_lifecycle) return false;
         if (a.index_generation != b.index_generation) return false;
         if (!optionalBytesEqual(a.index_name, b.index_name)) return false;
+        if (!stringSlicesEqual(a.index_include_columns, b.index_include_columns)) return false;
         if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
         if (!relationalDefaultsEqual(a.on_update_value, b.on_update_value)) return false;
         if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
@@ -690,7 +692,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 34); // format version
+    try appendU32(&buf, alloc, 35); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -761,6 +763,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, @intFromEnum(column.index_lifecycle));
         try appendU64(&buf, alloc, column.index_generation);
         try appendOptStr(&buf, alloc, column.index_name);
+        try appendStringSlice(&buf, alloc, column.index_include_columns);
         if (column.default_value) |default_value| {
             try buf.append(alloc, 1);
             try buf.append(alloc, @intFromEnum(default_value.kind));
@@ -889,7 +892,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 34) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 35) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1151,6 +1154,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 alloc.free(column.name);
                 alloc.free(column.path);
                 if (column.collation) |collation| alloc.free(collation);
+                freeStringSlice(alloc, column.index_include_columns);
                 if (column.default_value) |value| alloc.free(value.value_json);
                 if (column.on_update_value) |value| alloc.free(value.value_json);
                 if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
@@ -1192,6 +1196,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             const index_generation: u64 = if (fmt_version >= 26) readU64(data, &pos) else 0;
             const index_name: ?[]const u8 = if (fmt_version >= 28) try readOptStrAlloc(alloc, data, &pos) else null;
             errdefer if (index_name) |value| alloc.free(value);
+            const index_include_columns = if (fmt_version >= 35) try readStringSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeStringSlice(alloc, index_include_columns);
             const default_value: ?RelationalDefaultValue = if (fmt_version >= 20 and data[pos] == 1) default_blk: {
                 pos += 1;
                 const kind: RelationalDefaultKind = @enumFromInt(data[pos]);
@@ -1234,7 +1240,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeUniquePredicateSlice(alloc, index_where);
             const index_where_expressions = if (fmt_version >= 31) try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeRelationalRowsExpressionConditionSlice(alloc, index_where_expressions);
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .collation = collation, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .index_name = index_name, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where, .index_where_expressions = index_where_expressions };
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .collation = collation, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .index_name = index_name, .index_include_columns = index_include_columns, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where, .index_where_expressions = index_where_expressions };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -1483,6 +1489,7 @@ fn freeRelationalColumnsSlice(alloc: Allocator, columns: []const RelationalColum
         alloc.free(column.path);
         if (column.collation) |collation| alloc.free(collation);
         if (column.index_name) |index_name| alloc.free(index_name);
+        freeStringSlice(alloc, column.index_include_columns);
         if (column.default_value) |value| alloc.free(value.value_json);
         if (column.on_update_value) |value| alloc.free(value.value_json);
         if (column.generated) |value| freeRelationalGeneratedValue(alloc, value);
@@ -2076,6 +2083,11 @@ fn appendOptStr(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, s: ?[]const 
     }
 }
 
+fn appendStringSlice(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const []const u8) !void {
+    try appendU32(buf, alloc, @intCast(values.len));
+    for (values) |value| try appendStr(buf, alloc, value);
+}
+
 fn appendRelationalRowsExpressionCondition(
     buf: *std.ArrayListUnmanaged(u8),
     alloc: Allocator,
@@ -2512,6 +2524,8 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .nullable = false,
                 .index_lifecycle = .building,
                 .index_generation = 12345,
+                .index_name = "amount_cover_idx",
+                .index_include_columns = &.{ "tenant_id", "created_at" },
                 .default_value = .{ .value_json = "1" },
                 .index_where = &.{.{ .field = "tenant_id", .op = .is_not_null }},
                 .index_where_expressions = &.{.{
@@ -2660,6 +2674,10 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(loaded.relational_columns[2].default_value != null);
     try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded.relational_columns[2].index_lifecycle);
     try std.testing.expectEqual(@as(u64, 12345), loaded.relational_columns[2].index_generation);
+    try std.testing.expectEqualStrings("amount_cover_idx", loaded.relational_columns[2].index_name.?);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_columns[2].index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[2].index_include_columns[0]);
+    try std.testing.expectEqualStrings("created_at", loaded.relational_columns[2].index_include_columns[1]);
     try std.testing.expectEqualStrings("1", loaded.relational_columns[2].default_value.?.value_json);
     try std.testing.expectEqual(@as(usize, 1), loaded.relational_columns[2].index_where.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.relational_columns[2].index_where[0].field);

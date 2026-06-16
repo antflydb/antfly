@@ -227,6 +227,7 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
             var column_owned = true;
             errdefer if (column_owned) freeRuntimeRelationalColumn(alloc, column);
             column.index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
+            column.index_include_columns = try cloneStringSlice(alloc, property.index_include_columns);
             column.default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null;
             column.on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null;
             column.generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null;
@@ -320,6 +321,8 @@ fn freeRuntimeRelationalColumn(alloc: std.mem.Allocator, column: storage_schema.
     alloc.free(column.path);
     if (column.collation) |collation| alloc.free(collation);
     if (column.index_name) |index_name| alloc.free(index_name);
+    for (column.index_include_columns) |field_name| alloc.free(field_name);
+    if (column.index_include_columns.len > 0) alloc.free(column.index_include_columns);
     if (column.default_value) |value| alloc.free(value.value_json);
     if (column.on_update_value) |value| alloc.free(value.value_json);
     if (column.generated) |value| freeRuntimeRelationalGeneratedValue(alloc, value);

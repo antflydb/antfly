@@ -2527,6 +2527,7 @@ pub const CreateIndexPlan = struct {
     method: DdlIndexMethod = .btree,
     opclass: DdlIndexOpClass = .default,
     columns: []const []const u8 = &.{},
+    include_columns: []const []const u8 = &.{},
     expressions: []const runtime_schema.UniqueExpression = &.{},
     generated_expression: ?runtime_schema.RelationalGeneratedValue = null,
     without_overlaps_period: ?[]const u8 = null,
@@ -2537,6 +2538,7 @@ pub const CreateIndexPlan = struct {
         alloc.free(self.index_name);
         alloc.free(self.table_name);
         freeStringSlice(alloc, self.columns);
+        freeStringSlice(alloc, self.include_columns);
         freeDdlUniqueExpressions(alloc, self.expressions);
         if (self.generated_expression) |generated| freeDdlGeneratedValue(alloc, generated);
         if (self.without_overlaps_period) |period| alloc.free(period);
@@ -4433,6 +4435,8 @@ fn clearClonedColumnUpdatePolicy(alloc: std.mem.Allocator, column: *runtime_sche
 fn clearClonedColumnIndexMetadata(alloc: std.mem.Allocator, column: *runtime_schema.RelationalColumn) void {
     if (column.index_name) |index_name| alloc.free(index_name);
     column.index_name = null;
+    freeStringSlice(alloc, column.index_include_columns);
+    column.index_include_columns = &.{};
     column.indexed = false;
     column.index_lifecycle = .ready;
     column.index_generation = 0;
@@ -4792,7 +4796,7 @@ fn applyCreateIndexPlanAlloc(
     }
 
     if (plan.method == .gin) {
-        if (plan.unique or plan.columns.len != 1 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
+        if (plan.unique or plan.columns.len != 1 or plan.include_columns.len != 0 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
         const column = relationalColumnForDdl(schema.relational_columns, plan.columns[0]) orelse return error.InvalidSqlCatalog;
         switch (column.field_type) {
             .json => if (plan.opclass == .array_ops) return error.InvalidSqlCatalog,
@@ -4802,6 +4806,7 @@ fn applyCreateIndexPlanAlloc(
     }
 
     if (plan.unique) {
+        if (plan.include_columns.len != 0) return error.UnsupportedSqlShape;
         const constraint: runtime_schema.UniqueConstraint = .{
             .name = plan.index_name,
             .columns = plan.columns,
@@ -4818,7 +4823,7 @@ fn applyCreateIndexPlanAlloc(
 
     const index_generation = stableSecondaryIndexGeneration(plan);
     if (plan.generated_expression) |generated_expression| {
-        if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+        if (plan.columns.len != 0 or plan.include_columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
         if (relationalColumnIndex(schema.relational_columns, plan.index_name) != null) return error.InvalidSqlCatalog;
         const column: runtime_schema.RelationalColumn = .{
             .name = plan.index_name,
@@ -4841,9 +4846,10 @@ fn applyCreateIndexPlanAlloc(
     }
 
     if (plan.columns.len == 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+    try validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
     try validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
     try validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
-    try markColumnsIndexedAlloc(alloc, &schema, plan.index_name, plan.columns, plan.where, plan.where_expressions, index_generation);
+    try markColumnsIndexedAlloc(alloc, &schema, plan.index_name, plan.columns, plan.include_columns, plan.where, plan.where_expressions, index_generation);
     return schema;
 }
 
@@ -8559,6 +8565,16 @@ const Parser = struct {
         try validateSqlIdentifierListUnique(columns.items);
         try validateSqlUniqueExpressionListUnique(expressions.items);
 
+        var include_columns: []const []const u8 = &.{};
+        var include_columns_owned = false;
+        errdefer if (include_columns_owned) freeStringSlice(self.alloc, include_columns);
+        if (self.matchKeyword("include")) {
+            if (unique or method == .gin or generated_expression != null) return error.UnsupportedSqlShape;
+            include_columns = try self.parseDdlColumnListAlloc();
+            include_columns_owned = true;
+            try validateSqlIdentifierListsDisjoint(columns.items, include_columns);
+        }
+
         var predicates: []const runtime_schema.UniquePredicate = &.{};
         errdefer freeDdlUniquePredicates(self.alloc, predicates);
         var where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{};
@@ -8589,6 +8605,7 @@ const Parser = struct {
         const owned_columns = try columns.toOwnedSlice(self.alloc);
         var columns_transferred = false;
         errdefer if (!columns_transferred) freeStringSlice(self.alloc, owned_columns);
+        const owned_include_columns = include_columns;
         const owned_expressions = try expressions.toOwnedSlice(self.alloc);
         var expressions_transferred = false;
         errdefer if (!expressions_transferred) freeDdlUniqueExpressions(self.alloc, owned_expressions);
@@ -8598,6 +8615,7 @@ const Parser = struct {
         index_name_transferred = true;
         table_name_transferred = true;
         columns_transferred = true;
+        include_columns_owned = false;
         expressions_transferred = true;
         return .{
             .index_name = index_name,
@@ -8607,6 +8625,7 @@ const Parser = struct {
             .method = method,
             .opclass = opclass,
             .columns = owned_columns,
+            .include_columns = owned_include_columns,
             .expressions = owned_expressions,
             .generated_expression = generated_expression,
             .without_overlaps_period = period,
@@ -19807,6 +19826,14 @@ const Parser = struct {
     fn validateSqlIdentifierListUnique(columns: []const []const u8) !void {
         for (columns, 0..) |lhs, i| {
             for (columns[i + 1 ..]) |rhs| {
+                if (std.ascii.eqlIgnoreCase(lhs, rhs)) return error.UnsupportedSqlShape;
+            }
+        }
+    }
+
+    fn validateSqlIdentifierListsDisjoint(left: []const []const u8, right: []const []const u8) !void {
+        for (left) |lhs| {
+            for (right) |rhs| {
                 if (std.ascii.eqlIgnoreCase(lhs, rhs)) return error.UnsupportedSqlShape;
             }
         }
@@ -38779,7 +38806,7 @@ fn applyCreateIndexPlanToSchemaJsonValue(
         return error.InvalidSqlCatalog;
     }
     if (plan.method == .gin) {
-        if (plan.unique or plan.columns.len != 1 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
+        if (plan.unique or plan.columns.len != 1 or plan.include_columns.len != 0 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
         const property_type = try schemaJsonPropertyType(schema_parts.properties, plan.columns[0]);
         if (std.mem.eql(u8, property_type, "json")) {
             if (plan.opclass == .array_ops) return error.InvalidSqlCatalog;
@@ -38788,6 +38815,7 @@ fn applyCreateIndexPlanToSchemaJsonValue(
         } else return error.InvalidSqlCatalog;
     }
     if (plan.unique) {
+        if (plan.include_columns.len != 0) return error.UnsupportedSqlShape;
         const constraint: runtime_schema.UniqueConstraint = .{
             .name = plan.index_name,
             .columns = plan.columns,
@@ -38804,7 +38832,7 @@ fn applyCreateIndexPlanToSchemaJsonValue(
 
     const index_generation = stableSecondaryIndexGeneration(plan);
     if (plan.generated_expression) |generated_expression| {
-        if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+        if (plan.columns.len != 0 or plan.include_columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
         try validateGeneratedExpressionForSchemaJsonProperties(schema_parts.properties, plan.index_name, generated_expression);
         const column: runtime_schema.RelationalColumn = .{
             .name = plan.index_name,
@@ -38824,6 +38852,7 @@ fn applyCreateIndexPlanToSchemaJsonValue(
     }
 
     if (plan.columns.len == 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
+    try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, plan.columns, plan.include_columns);
     for (plan.columns) |column| {
         const property = schema_parts.properties.getPtr(column) orelse return error.InvalidSqlCatalog;
         if (property.* != .object) return error.InvalidSqlCatalog;
@@ -38838,6 +38867,7 @@ fn applyCreateIndexPlanToSchemaJsonValue(
         try putJsonString(alloc, &property.object, "x-antfly-index-lifecycle", "building");
         try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-generation"), .{ .integer = @intCast(index_generation) });
         try putJsonString(alloc, &property.object, "x-antfly-index-name", plan.index_name);
+        if (plan.include_columns.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, plan.include_columns));
         if (plan.where.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, plan.where));
         if (plan.where_expressions.len > 0) try property.object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where-expressions"), try schemaJsonExpressionConditionsAlloc(alloc, plan.where_expressions));
     }
@@ -38873,6 +38903,7 @@ fn applyDropIndexPlanToSchemaJsonValue(
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-lifecycle");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-generation");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-name");
+        _ = entry.value_ptr.object.orderedRemove("x-antfly-index-include");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-where");
         _ = entry.value_ptr.object.orderedRemove("x-antfly-index-where-expressions");
         removed = true;
@@ -39243,6 +39274,11 @@ fn schemaJsonHasDropDependencies(root: *std.json.ObjectMap, dropped: []const []c
     if (try jsonConstraintArrayReferencesAny(root.getPtr("unique_constraints"), dropped, .unique)) return true;
     if (try jsonConstraintArrayReferencesAny(root.getPtr("foreign_keys"), dropped, .foreign_key)) return true;
     if (try jsonConstraintArrayReferencesAny(root.getPtr("checks"), dropped, .check)) return true;
+    const schema_parts = try relationalSchemaJsonParts(root);
+    var it = schema_parts.properties.iterator();
+    while (it.next()) |entry| {
+        if (schemaJsonSecondaryIndexReferencesAny(entry.value_ptr.*, dropped)) return true;
+    }
     return false;
 }
 
@@ -39490,6 +39526,7 @@ fn renameSchemaPropertyReferences(
 ) !void {
     if (property.* != .object) return;
     if (property.object.getPtr("generated")) |generated| try renameGeneratedJsonFields(alloc, generated, old_name, new_name);
+    try renameStringInJsonArray(alloc, property.object.getPtr("x-antfly-index-include"), old_name, new_name);
     if (property.object.getPtr("x-antfly-index-where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
     if (property.object.getPtr("x-antfly-index-where-expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
 }
@@ -39742,6 +39779,20 @@ fn schemaJsonPropertyType(
     return property_type.string;
 }
 
+fn validateCreateIndexIncludeColumnsForSchemaJsonProperties(
+    properties: *std.json.ObjectMap,
+    key_columns: []const []const u8,
+    include_columns: []const []const u8,
+) !void {
+    for (include_columns) |column| {
+        if (stringSlicesContains(key_columns, column)) return error.InvalidSqlCatalog;
+        const property = properties.get(column) orelse return error.InvalidSqlCatalog;
+        if (property != .object) return error.InvalidSqlCatalog;
+        const property_type = property.object.get("type") orelse return error.InvalidSqlCatalog;
+        if (property_type != .string) return error.InvalidSqlCatalog;
+    }
+}
+
 fn schemaJsonIndexNameExists(
     properties: *std.json.ObjectMap,
     unique_constraints: ?*std.json.Value,
@@ -39769,6 +39820,42 @@ fn propertyGeneratedReferencesAny(property: std.json.Value, fields: []const []co
     }
     if (generated.object.get("fields")) |fields_value| {
         if (jsonStringArrayReferencesAny(fields_value, fields)) return true;
+    }
+    return false;
+}
+
+fn schemaJsonSecondaryIndexReferencesAny(property: std.json.Value, fields: []const []const u8) bool {
+    if (property != .object) return false;
+    if (property.object.get("x-antfly-index-name") == null) return false;
+    if (property.object.get("x-antfly-index-include")) |include| {
+        if (jsonStringArrayReferencesAny(include, fields)) return true;
+    }
+    if (property.object.get("x-antfly-index-where")) |where| {
+        if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
+    }
+    if (property.object.get("x-antfly-index-where-expressions")) |where_expressions| {
+        if (jsonExpressionReferencesAny(where_expressions, fields)) return true;
+    }
+    return false;
+}
+
+fn jsonExpressionReferencesAny(value: std.json.Value, fields: []const []const u8) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("field")) |field| {
+                if (field == .string and stringSlicesContains(fields, field.string)) return true;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (jsonExpressionReferencesAny(entry.value_ptr.*, fields)) return true;
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (jsonExpressionReferencesAny(item, fields)) return true;
+            }
+        },
+        else => {},
     }
     return false;
 }
@@ -39881,6 +39968,7 @@ fn schemaJsonPropertyFromColumnAlloc(alloc: std.mem.Allocator, column: runtime_s
     if (column.index_lifecycle != .ready) try putJsonString(alloc, &object, "x-antfly-index-lifecycle", relationalIndexLifecycleName(column.index_lifecycle));
     if (column.index_generation != 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-generation"), .{ .integer = @intCast(column.index_generation) });
     if (column.index_name) |index_name| try putJsonString(alloc, &object, "x-antfly-index-name", index_name);
+    if (column.index_include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, column.index_include_columns));
     if (column.collation) |collation| try putJsonString(alloc, &object, "collation", collation);
     if (column.index_where.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, column.index_where));
     if (column.index_where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where-expressions"), try schemaJsonExpressionConditionsAlloc(alloc, column.index_where_expressions));
@@ -40245,6 +40333,7 @@ fn cloneDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.Rel
     errdefer freeDdlRelationalColumn(alloc, out);
     out.collation = if (column.collation) |collation| try alloc.dupe(u8, collation) else null;
     out.index_name = if (column.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
+    out.index_include_columns = try cloneStringSlice(alloc, column.index_include_columns);
     out.default_value = if (column.default_value) |value| try cloneDdlDefaultValue(alloc, value) else null;
     out.on_update_value = if (column.on_update_value) |value| try cloneDdlDefaultValue(alloc, value) else null;
     out.generated = if (column.generated) |generated| try cloneDdlGeneratedValue(alloc, generated) else null;
@@ -40879,6 +40968,8 @@ fn dropSecondaryIndexByNameAlloc(
             alloc.free(existing);
             column.index_name = null;
         }
+        freeStringSlice(alloc, column.index_include_columns);
+        column.index_include_columns = &.{};
         freeDdlUniquePredicates(alloc, column.index_where);
         column.index_where = &.{};
         freeExpressionConditions(alloc, column.index_where_expressions);
@@ -41229,6 +41320,7 @@ fn markColumnIndexedAlloc(
     schema: *runtime_schema.TableSchema,
     index_name: []const u8,
     column_name: []const u8,
+    include_columns: []const []const u8,
     predicates: []const runtime_schema.UniquePredicate,
     expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
     index_generation: u64,
@@ -41247,14 +41339,18 @@ fn markColumnIndexedAlloc(
     }
     const cloned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(cloned_index_name);
+    const cloned_include_columns = try cloneStringSlice(alloc, include_columns);
+    errdefer freeStringSlice(alloc, cloned_include_columns);
     freeDdlUniquePredicates(alloc, columns[index].index_where);
     freeExpressionConditions(alloc, columns[index].index_where_expressions);
     if (columns[index].index_where_expressions.len > 0) alloc.free(columns[index].index_where_expressions);
     if (columns[index].index_name) |existing| alloc.free(existing);
+    freeStringSlice(alloc, columns[index].index_include_columns);
     columns[index].indexed = true;
     columns[index].index_lifecycle = .building;
     columns[index].index_generation = index_generation;
     columns[index].index_name = cloned_index_name;
+    columns[index].index_include_columns = cloned_include_columns;
     columns[index].index_where = cloned_predicates;
     columns[index].index_where_expressions = cloned_expression_predicates;
 }
@@ -41264,6 +41360,7 @@ fn markColumnsIndexedAlloc(
     schema: *runtime_schema.TableSchema,
     index_name: []const u8,
     column_names: []const []const u8,
+    include_columns: []const []const u8,
     predicates: []const runtime_schema.UniquePredicate,
     expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
     index_generation: u64,
@@ -41275,7 +41372,7 @@ fn markColumnsIndexedAlloc(
         }
     }
     for (column_names) |column_name| {
-        try markColumnIndexedAlloc(alloc, schema, index_name, column_name, predicates, expression_predicates, index_generation);
+        try markColumnIndexedAlloc(alloc, schema, index_name, column_name, include_columns, predicates, expression_predicates, index_generation);
     }
 }
 
@@ -41286,6 +41383,8 @@ fn stableSecondaryIndexGeneration(plan: CreateIndexPlan) u64 {
     hashPlanU64(&hasher, @intFromEnum(plan.method));
     hashPlanU64(&hasher, @intCast(plan.columns.len));
     for (plan.columns) |column| hashPlanField(&hasher, column);
+    hashPlanU64(&hasher, @intCast(plan.include_columns.len));
+    for (plan.include_columns) |column| hashPlanField(&hasher, column);
     hashPlanU64(&hasher, @intCast(plan.expressions.len));
     for (plan.expressions) |expression| {
         hashPlanU64(&hasher, @intFromEnum(expression.op));
@@ -41406,9 +41505,24 @@ fn validateRelationalColumnCatalog(columns: []const runtime_schema.RelationalCol
         if (column.generated) |_| try validateGeneratedColumnForColumns(columns, column);
         try validateUniquePredicatesForColumns(columns, column.index_where);
         try validateUniquePredicateExpressionsForColumns(columns, column.index_where_expressions);
+        try validateRelationalColumnIndexIncludes(columns, column);
         if (column.on_update_value) |_| {
             if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         }
+    }
+}
+
+fn validateRelationalColumnIndexIncludes(columns: []const runtime_schema.RelationalColumn, column: runtime_schema.RelationalColumn) !void {
+    if (column.index_include_columns.len == 0) return;
+    if (!column.indexed or column.index_name == null) return error.InvalidSqlCatalog;
+    for (column.index_include_columns) |field| {
+        _ = relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+    }
+    const index_name = column.index_name.?;
+    for (columns) |peer| {
+        if (!relationalColumnHasDeclaredIndexName(peer, index_name)) continue;
+        if (!stringSlicesEqual(peer.index_include_columns, column.index_include_columns)) return error.InvalidSqlCatalog;
+        if (stringSlicesContains(column.index_include_columns, peer.name)) return error.InvalidSqlCatalog;
     }
 }
 
@@ -41906,6 +42020,17 @@ fn validateGeneratedColumnForColumns(columns: []const runtime_schema.RelationalC
     }
 }
 
+fn validateCreateIndexIncludeColumns(
+    columns: []const runtime_schema.RelationalColumn,
+    key_columns: []const []const u8,
+    include_columns: []const []const u8,
+) !void {
+    for (include_columns) |column| {
+        if (stringSlicesContains(key_columns, column)) return error.InvalidSqlCatalog;
+        _ = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+    }
+}
+
 fn validateUniquePredicatesForColumns(columns: []const runtime_schema.RelationalColumn, predicates: []const runtime_schema.UniquePredicate) !void {
     for (predicates) |predicate| {
         const found = relationalColumnForDdl(columns, predicate.field) orelse return error.InvalidSqlCatalog;
@@ -41969,6 +42094,11 @@ fn relationalColumnIndexForIndexName(columns: []const runtime_schema.RelationalC
         if (relationalColumnHasIndexName(column, index_name)) return i;
     }
     return null;
+}
+
+fn relationalColumnHasDeclaredIndexName(column: runtime_schema.RelationalColumn, index_name: []const u8) bool {
+    const declared_index_name = column.index_name orelse return false;
+    return std.mem.eql(u8, declared_index_name, index_name);
 }
 
 fn relationalColumnHasIndexName(column: runtime_schema.RelationalColumn, index_name: []const u8) bool {
@@ -42181,6 +42311,7 @@ fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.Rela
     alloc.free(column.path);
     if (column.collation) |collation| alloc.free(collation);
     if (column.index_name) |index_name| alloc.free(index_name);
+    freeStringSlice(alloc, column.index_include_columns);
     if (column.default_value) |value| alloc.free(value.value_json);
     if (column.on_update_value) |value| alloc.free(value.value_json);
     if (column.generated) |generated| {
@@ -44717,8 +44848,33 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
             try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
             try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
             try std.testing.expectEqualStrings("status", plan.columns[1]);
+            try std.testing.expectEqual(@as(usize, 0), plan.include_columns.len);
             try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
             try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var covering = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount);",
+    );
+    defer covering.deinit(alloc);
+    switch (covering) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_cover_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+            try std.testing.expectEqualStrings("amount", plan.include_columns[1]);
         },
         .create_table => return error.TestUnexpectedResult,
         .drop_index => return error.TestUnexpectedResult,
@@ -45102,6 +45258,18 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_duplicate_expr_key ON usage_records (lower(email), lower(email));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (tenant_id);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_metadata_gin_cover ON usage_records USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_lower_email_cover ON usage_records (lower(email)) INCLUDE (tenant_id);",
     ));
 
     var casted_not_null = try lowerDdlPlanAlloc(
@@ -46255,7 +46423,7 @@ test "postgres sql adapter applies create index ddl plan to runtime schema" {
     const alloc = std.testing.allocator;
     var create = try lowerDdlPlanAlloc(
         alloc,
-        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, status text, deleted_at timestamptz, metadata jsonb, tags text[]);",
+        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, amount numeric, status text, deleted_at timestamptz, metadata jsonb, tags text[]);",
     );
     defer create.deinit(alloc);
     const schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
@@ -46295,6 +46463,34 @@ test "postgres sql adapter applies create index ddl plan to runtime schema" {
     defer runtime_schema.freeSchema(alloc, indexed_again);
     const status_again = relationalColumnForField(indexed_again, "status", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(status.index_generation, status_again.index_generation);
+
+    var covering_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX users_email_cover_idx ON users (email) INCLUDE (tenant_id, amount);",
+    );
+    defer covering_index.deinit(alloc);
+    const covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, covering_index);
+    defer runtime_schema.freeSchema(alloc, covering_schema);
+    const covered_email = relationalColumnForField(covering_schema, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(covered_email.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, covered_email.index_lifecycle);
+    try std.testing.expect(covered_email.index_generation != 0);
+    try std.testing.expect(covered_email.index_name != null);
+    try std.testing.expectEqualStrings("users_email_cover_idx", covered_email.index_name.?);
+    try std.testing.expectEqual(@as(usize, 2), covered_email.index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", covered_email.index_include_columns[0]);
+    try std.testing.expectEqualStrings("amount", covered_email.index_include_columns[1]);
+    const covered_tenant = relationalColumnForField(covering_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), covered_tenant.index_include_columns.len);
+
+    var drop_covering_index = try lowerDdlPlanAlloc(alloc, "DROP INDEX users_email_cover_idx;");
+    defer drop_covering_index.deinit(alloc);
+    const covering_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, covering_schema, drop_covering_index);
+    defer runtime_schema.freeSchema(alloc, covering_dropped);
+    const dropped_email_cover = relationalColumnForField(covering_dropped, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!dropped_email_cover.indexed);
+    try std.testing.expect(dropped_email_cover.index_name == null);
+    try std.testing.expectEqual(@as(usize, 0), dropped_email_cover.index_include_columns.len);
 
     var generated_index = try lowerDdlPlanAlloc(
         alloc,
@@ -58426,7 +58622,8 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     "ddl:create_index:table={s}:columns={d}:expr={d}:generated_expr={d}:where={d}:unique={}:if_not_exists={}",
                     .{ plan.table_name, plan.columns.len, plan.expressions.len, appParityGeneratedExpressionCount(plan), plan.where.len, plan.unique, plan.if_not_exists },
                 );
-            const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "where_expr", plan.where_expressions.len);
+            const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "include", plan.include_columns.len);
+            const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "where_expr", plan.where_expressions.len);
             break :blk try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
         },
         .drop_index => |plan| try std.fmt.allocPrint(
@@ -62162,6 +62359,7 @@ const AppParityCorpusCoverage = struct {
     ddl_temporal_table: bool = false,
     ddl_replace_table: bool = false,
     ddl_create_index: bool = false,
+    ddl_create_covering_index: bool = false,
     ddl_drop_index: bool = false,
     ddl_drop_table: bool = false,
     ddl_drop_table_cascade: bool = false,
@@ -63055,7 +63253,10 @@ const AppParityCorpusCoverage = struct {
                     self.ddl_advisory_lock = self.ddl_advisory_lock or std.mem.indexOf(u8, entry.plan, "action=lock") != null;
                     self.ddl_advisory_unlock = self.ddl_advisory_unlock or std.mem.indexOf(u8, entry.plan, "action=unlock") != null;
                 },
-                .create_index => self.ddl_create_index = true,
+                .create_index => {
+                    self.ddl_create_index = true;
+                    self.ddl_create_covering_index = self.ddl_create_covering_index or appParityPlanHasNonZeroToken(entry.plan, ":include=");
+                },
                 .drop_index => self.ddl_drop_index = true,
                 .drop_table => {
                     self.ddl_drop_table = true;
@@ -63982,6 +64183,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_temporal_table);
         try std.testing.expect(self.ddl_replace_table);
         try std.testing.expect(self.ddl_create_index);
+        try std.testing.expect(self.ddl_create_covering_index);
         try std.testing.expect(self.ddl_drop_index);
         try std.testing.expect(self.ddl_drop_table);
         try std.testing.expect(self.ddl_drop_table_cascade);
@@ -64453,6 +64655,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false",
             .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status) WHERE status = 'pending';",
+        },
+        .{
+            .name = "schema covering partial index",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1, .predicates = 1 },
+            .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false:include=2",
+            .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE status = 'pending';",
         },
         .{
             .name = "schema concurrent partial index",
