@@ -61225,168 +61225,17 @@ fn expectAppParityCorpusEntry(
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
         },
-        .insert => {
-            var lowered = try lowerInsertWithResolverAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.operations, transformOperationCount(lowered.batch.transforms));
-            try expectOptionalUsize(entry.summary.returning, lowered.batch.returning_rows.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.returning_all);
-            if (entry.summary.conflict_where) |expected| try std.testing.expectEqual(expected, lowered.conflict_where);
-            const fingerprint = try writePlanFingerprintAlloc(alloc, .{ .insert = lowered });
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-            try expectAppParityReturningRows(entry.returning_rows, lowered.batch.returning_rows);
-        },
-        .insert_source => {
-            var lowered = try lowerInsertSourceWithResolverAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.ctes, lowered.ctes.len);
-            try expectQuerySummary(entry.summary, lowered.insert_source.req.source);
-            try expectOptionalUsize(entry.summary.operations, lowered.insert_source.req.assignments.len);
-            const conflict_patch_expressions = if (lowered.insert_source.req.on_conflict) |conflict| conflict.patch_expressions.len else 0;
-            const conflict_increment_expressions = if (lowered.insert_source.req.on_conflict) |conflict| conflict.increment_expressions.len else 0;
-            const conflict_json_set_expressions = if (lowered.insert_source.req.on_conflict) |conflict| conflict.json_set_expressions.len else 0;
-            try expectOptionalUsize(entry.summary.patch_expressions, conflict_patch_expressions);
-            try expectOptionalUsize(entry.summary.increment_expressions, conflict_increment_expressions);
-            try expectOptionalUsize(entry.summary.json_set_expressions, conflict_json_set_expressions);
-            try expectOptionalUsize(entry.summary.returning, lowered.insert_source.req.returning.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.insert_source.req.returning_all);
-            if (entry.summary.conflict_where) |expected| try std.testing.expectEqual(expected, lowered.conflict_where);
-            var fingerprint = try insertSourceFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_offset", lowered.insert_source.req.source.offset);
-            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", lowered.conflict_where);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .update => {
-            var lowered = try lowerUpdateAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.operations, transformOperationCount(lowered.batch.transforms));
-            try expectOptionalUsize(entry.summary.returning, lowered.batch.returning_rows.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.returning_all);
-            const fingerprint = try writePlanFingerprintAlloc(alloc, .{ .update = lowered });
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-            try expectAppParityReturningRows(entry.returning_rows, lowered.batch.returning_rows);
-        },
-        .delete => {
-            var lowered = try lowerDeleteAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.returning, lowered.batch.returning_rows.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.returning_all);
-            var fingerprint = try std.fmt.allocPrint(
-                alloc,
-                "delete:table={s}:deletes={d}:returning_rows={d}:returning_expr={d}",
-                .{ lowered.table_name, lowered.batch.deletes.len, lowered.batch.returning_rows.len, lowered.returning_expression_count },
-            );
-            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", lowered.returning_all);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-            try expectAppParityReturningRows(entry.returning_rows, lowered.batch.returning_rows);
-        },
-        .update_source => {
-            var lowered = try lowerUpdateMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectQuerySummary(entry.summary, lowered.mutation.req.source);
-            try expectOptionalUsize(entry.summary.operations, lowered.mutation.req.operations.len);
-            try expectOptionalUsize(entry.summary.patch_expressions, lowered.mutation.req.patch_expressions.len);
-            try expectOptionalUsize(entry.summary.increment_expressions, lowered.mutation.req.increment_expressions.len);
-            try expectOptionalUsize(entry.summary.json_set_expressions, lowered.mutation.req.json_set_expressions.len);
-            try expectOptionalUsize(entry.summary.returning, lowered.mutation.req.returning.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.mutation.req.returning_all);
-            var fingerprint = try updateSourceFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_offset", lowered.mutation.req.source.offset);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .delete_source => {
-            var lowered = try lowerDeleteMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectQuerySummary(entry.summary, lowered.mutation.req.source);
-            try expectOptionalUsize(entry.summary.returning, lowered.mutation.req.returning.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.mutation.req.returning_all);
-            var fingerprint = try deleteSourceFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_offset", lowered.mutation.req.source.offset);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .truncate_source => {
-            var lowered = try lowerTruncateMutationSourceAlloc(alloc, entry.sql, effective_schema, row_claim);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectQuerySummary(entry.summary, lowered.mutation.req.source);
-            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, lowered.mutation.req.kind);
-            try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.returning.len);
-            try std.testing.expect(!lowered.mutation.req.returning_all);
-            var fingerprint = try deleteSourceFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_offset", lowered.mutation.req.source.offset);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .update_joined_source => {
-            var lowered = try lowerUpdateJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.target_table_name);
-            try expectCombinedQuerySourceSummary(entry.summary, lowered.mutation.req.join.left, lowered.mutation.req.join.right);
-            try expectOptionalUsize(entry.summary.join_on, lowered.mutation.req.join.on.len);
-            try expectOptionalUsize(entry.summary.order_by, lowered.mutation.req.join.order_by.len);
-            try expectOptionalU32(entry.summary.limit, lowered.mutation.req.join.limit);
-            try expectOptionalU32(entry.summary.offset, lowered.mutation.req.join.offset);
-            try expectOptionalUsize(entry.summary.operations, lowered.mutation.req.operations.len);
-            try expectOptionalUsize(entry.summary.source_assignments, lowered.mutation.req.source_assignments.len);
-            try expectOptionalUsize(entry.summary.patch_expressions, lowered.mutation.req.patch_expressions.len);
-            try expectOptionalUsize(entry.summary.increment_expressions, lowered.mutation.req.increment_expressions.len);
-            try expectOptionalUsize(entry.summary.json_set_expressions, lowered.mutation.req.json_set_expressions.len);
-            try expectOptionalUsize(entry.summary.returning, lowered.mutation.req.returning.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.mutation.req.returning_all);
-            const fingerprint = try joinedSourceFingerprintAlloc(alloc, "update_joined_source", lowered);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .delete_joined_source => {
-            var lowered = try lowerDeleteJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.target_table_name);
-            try expectCombinedQuerySourceSummary(entry.summary, lowered.mutation.req.join.left, lowered.mutation.req.join.right);
-            try expectOptionalUsize(entry.summary.join_on, lowered.mutation.req.join.on.len);
-            try expectOptionalUsize(entry.summary.order_by, lowered.mutation.req.join.order_by.len);
-            try expectOptionalU32(entry.summary.limit, lowered.mutation.req.join.limit);
-            try expectOptionalU32(entry.summary.offset, lowered.mutation.req.join.offset);
-            try expectOptionalUsize(entry.summary.returning, lowered.mutation.req.returning.len);
-            if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, lowered.mutation.req.returning_all);
-            const fingerprint = try joinedSourceFingerprintAlloc(alloc, "delete_joined_source", lowered);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .merge_mutation => {
-            var lowered = try lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
-            defer lowered.deinit(alloc);
-            switch (lowered) {
-                .merge_mutation => |merge_mutation| {
-                    try expectOptionalTableName(entry.summary.table_name, merge_mutation.target_table_name);
-                    try expectOptionalUsize(entry.summary.join_on, merge_mutation.match_fields.len);
-                    try expectOptionalUsize(entry.summary.matched_predicates, mergeMatchedPredicateCount(merge_mutation.matched_arms));
-                    try expectOptionalUsize(entry.summary.operations, mergeMatchedUpdateCount(merge_mutation.matched_arms));
-                    if (entry.summary.matched_delete) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDelete(merge_mutation.matched_arms));
-                    if (entry.summary.matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDoNothing(merge_mutation.matched_arms));
-                    try expectOptionalUsize(entry.summary.not_matched_predicates, mergeNotMatchedPredicateCount(merge_mutation.not_matched_arms));
-                    try expectOptionalUsize(entry.summary.select, mergeNotMatchedInsertCount(merge_mutation.not_matched_arms));
-                    if (entry.summary.not_matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeNotMatchedHasDoNothing(merge_mutation.not_matched_arms));
-                    try expectOptionalUsize(entry.summary.returning, merge_mutation.returning.fields.len);
-                    if (entry.summary.returning_all) |expected| try std.testing.expectEqual(expected, merge_mutation.returning.returnsAll());
-                    const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
-                    defer alloc.free(fingerprint);
-                    try expectAppParityPlan(entry.plan, fingerprint);
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        },
+        .insert,
+        .insert_source,
+        .update,
+        .delete,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
             if (lowerDdlPlanAlloc(alloc, entry.sql)) |lowered_value| {
                 var lowered = lowered_value;
