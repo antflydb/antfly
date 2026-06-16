@@ -62,6 +62,8 @@ pub const StandbySpec = struct {
     desired: bool = true,
     drop_slot_on_removal: bool = false,
     initial_lsn: ?u64 = null,
+    seed_manifest_path: ?[]const u8 = null,
+    seed_content_root: ?[]const u8 = null,
 };
 
 pub const Spec = struct {
@@ -102,6 +104,8 @@ pub const ActionKind = enum {
     pause_slot,
     drop_slot,
     seed_standby,
+    finish_standby_seed,
+    bootstrap_standby_seed,
     mark_reseed,
     acquire_fence,
     promote_standby,
@@ -140,6 +144,8 @@ pub const Action = struct {
     standby_name: ?[]const u8 = null,
     slot_name: ?[]const u8 = null,
     target_lsn: ?u64 = null,
+    seed_manifest_path: ?[]const u8 = null,
+    seed_content_root: ?[]const u8 = null,
     route_from: ?[]const u8 = null,
     route_to: ?[]const u8 = null,
     reason: []const u8,
@@ -318,6 +324,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
                 .target_lsn = initial_lsn,
                 .reason = "StandbyNeedsBaseBackup",
             });
+            try appendSeedCompletionActions(alloc, &actions, standby, initial_lsn, "StandbyNeedsBaseBackup", .seed_standby);
             continue;
         };
 
@@ -347,6 +354,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
                 .target_lsn = observed.primary.current_lsn,
                 .reason = "SlotRequiresReseed",
             });
+            try appendSeedCompletionActions(alloc, &actions, standby, observed.primary.current_lsn, "SlotRequiresReseed", .mark_reseed);
             continue;
         }
 
@@ -524,6 +532,24 @@ pub fn adminCommandForAction(
                 "{s}-{s}-{d}",
                 .{ options.manifest_id_prefix, standby_name, action.target_lsn orelse 0 },
             );
+        },
+        .finish_standby_seed => {
+            const manifest_path = action.seed_manifest_path orelse return error.SeedManifestPathMissing;
+            try appendArg(alloc, &argv, "seed");
+            try appendArg(alloc, &argv, "finish");
+            try appendArg(alloc, &argv, "--manifest");
+            try appendArg(alloc, &argv, manifest_path);
+        },
+        .bootstrap_standby_seed => {
+            const manifest_path = action.seed_manifest_path orelse return error.SeedManifestPathMissing;
+            try appendArg(alloc, &argv, "seed");
+            try appendArg(alloc, &argv, "bootstrap");
+            try appendArg(alloc, &argv, "--manifest");
+            try appendArg(alloc, &argv, manifest_path);
+            if (action.seed_content_root) |content_root| {
+                try appendArg(alloc, &argv, "--content-root");
+                try appendArg(alloc, &argv, content_root);
+            }
         },
         .acquire_fence => {
             const promoted_node_id = options.promoted_node_id orelse action.standby_name orelse return error.PromotedNodeIdMissing;
@@ -782,6 +808,37 @@ fn appendSlotLifecycleCommand(
     try appendArg(alloc, argv, slot_name);
 }
 
+fn appendSeedCompletionActions(
+    alloc: Allocator,
+    actions: *std.ArrayListUnmanaged(Action),
+    standby: StandbySpec,
+    target_lsn: u64,
+    reason: []const u8,
+    depends_on: ActionKind,
+) !void {
+    const manifest_path = standby.seed_manifest_path orelse return;
+    try actions.append(alloc, .{
+        .kind = .finish_standby_seed,
+        .depends_on = depends_on,
+        .standby_name = standby.name,
+        .slot_name = standby.name,
+        .target_lsn = target_lsn,
+        .seed_manifest_path = manifest_path,
+        .seed_content_root = standby.seed_content_root,
+        .reason = reason,
+    });
+    try actions.append(alloc, .{
+        .kind = .bootstrap_standby_seed,
+        .depends_on = .finish_standby_seed,
+        .standby_name = standby.name,
+        .slot_name = standby.name,
+        .target_lsn = target_lsn,
+        .seed_manifest_path = manifest_path,
+        .seed_content_root = standby.seed_content_root,
+        .reason = reason,
+    });
+}
+
 fn appendIdentityArgs(
     alloc: Allocator,
     argv: *std.ArrayListUnmanaged([]const u8),
@@ -918,6 +975,61 @@ test "storage.ha operator plans slots and standby bootstrap" {
     try std.testing.expect(unhealthy.status);
     try std.testing.expectEqual(ConditionSeverity.warning, unhealthy.severity);
     try std.testing.expect(!plan.automatic_promotion_allowed);
+}
+
+test "storage.ha operator plans seed finish and bootstrap with manifest paths" {
+    const alloc = std.testing.allocator;
+    const slots = [_]status.SlotSnapshot{};
+    const primary = status.PrimarySnapshot{
+        .identity = .{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 },
+        .current_lsn = 7,
+        .slots = @constCast(slots[0..]),
+        .retention = .{
+            .primary_lsn = 7,
+            .oldest_restart_lsn = 8,
+            .retained_lsn_count = 0,
+            .active_slots = 0,
+            .reseed_recommended = 0,
+        },
+    };
+    const standbys = [_]StandbySpec{
+        .{
+            .name = "standby-a",
+            .initial_lsn = 3,
+            .seed_manifest_path = "/backup/base-standby-a-3.afha",
+            .seed_content_root = "/backup/base-standby-a-3",
+        },
+    };
+
+    var plan = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+    }, .{ .primary = primary });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 4), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.create_slot, plan.actions[0].kind);
+    try std.testing.expectEqual(ActionKind.seed_standby, plan.actions[1].kind);
+    try std.testing.expectEqual(ActionKind.finish_standby_seed, plan.actions[2].kind);
+    try std.testing.expectEqual(ActionKind.bootstrap_standby_seed, plan.actions[3].kind);
+    try std.testing.expectEqual(@as(?ActionKind, .create_slot), plan.actions[1].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .seed_standby), plan.actions[2].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .finish_standby_seed), plan.actions[3].depends_on);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", plan.actions[2].seed_manifest_path.?);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3", plan.actions[3].seed_content_root.?);
+
+    var finish = (try adminCommandForAction(alloc, plan.actions[2], primary.identity, .{})) orelse return error.TestExpectedEqual;
+    defer finish.deinit(alloc);
+    var finish_plan = try finish.parsePlan(alloc);
+    defer finish_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", finish_plan.command.seed.finish.manifest_path);
+
+    var bootstrap = (try adminCommandForAction(alloc, plan.actions[3], primary.identity, .{})) orelse return error.TestExpectedEqual;
+    defer bootstrap.deinit(alloc);
+    var bootstrap_plan = try bootstrap.parsePlan(alloc);
+    defer bootstrap_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", bootstrap_plan.command.seed.bootstrap.manifest_path);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3", bootstrap_plan.command.seed.bootstrap.content_root.?);
 }
 
 test "storage.ha operator plans explicit slot drop for removed standby" {

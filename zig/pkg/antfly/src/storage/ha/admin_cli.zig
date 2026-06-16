@@ -768,6 +768,14 @@ fn parseOperator(
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
             standbys.items[standbys.items.len - 1].initial_lsn = try parseU64(try cursor.value("--standby-initial-lsn"));
+        } else if (std.mem.eql(u8, arg, "--standby-seed-manifest")) {
+            _ = cursor.next();
+            if (standbys.items.len == 0) return error.StandbyNameMissing;
+            standbys.items[standbys.items.len - 1].seed_manifest_path = try cursor.value("--standby-seed-manifest");
+        } else if (std.mem.eql(u8, arg, "--standby-seed-content-root")) {
+            _ = cursor.next();
+            if (standbys.items.len == 0) return error.StandbyNameMissing;
+            standbys.items[standbys.items.len - 1].seed_content_root = try cursor.value("--standby-seed-content-root");
         } else if (std.mem.eql(u8, arg, "--standby-disabled")) {
             _ = cursor.next();
             try standbys.append(alloc, .{
@@ -1470,6 +1478,8 @@ test "storage.ha admin cli parses operator plan command" {
         "operator",                     "plan",
         "--standby",                    "standby-a",
         "--standby-initial-lsn",        "3",
+        "--standby-seed-manifest",      "/backup/base-standby-a-3.afha",
+        "--standby-seed-content-root",  "/backup/base-standby-a-3",
         "--standby-disabled",           "standby-b",
         "--standby-drop-slot",          "--max-lag-lsn",
         "50",                           "--sync-mode",
@@ -1510,6 +1520,8 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqual(@as(usize, 2), command.spec.standbys.len);
     try std.testing.expectEqualStrings("standby-a", command.spec.standbys[0].name);
     try std.testing.expectEqual(@as(?u64, 3), command.spec.standbys[0].initial_lsn);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", command.spec.standbys[0].seed_manifest_path.?);
+    try std.testing.expectEqualStrings("/backup/base-standby-a-3", command.spec.standbys[0].seed_content_root.?);
     try std.testing.expectEqualStrings("standby-b", command.spec.standbys[1].name);
     try std.testing.expect(!command.spec.standbys[1].desired);
     try std.testing.expect(command.spec.standbys[1].drop_slot_on_removal);
