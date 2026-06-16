@@ -645,6 +645,8 @@ fn appendPrimarySnapshotLines(
         try appendLine(alloc, out, "durability.mode", @tagName(decision.mode));
         try appendLine(alloc, out, "durability.selection", @tagName(decision.selection));
         try appendU64Line(alloc, out, "durability.target_lsn", decision.target_lsn);
+        try appendU64Line(alloc, out, "durability.progress_lsn", decision.progress_lsn);
+        try appendU64Line(alloc, out, "durability.missing_lsn_count", decision.missing_lsn_count);
         try appendUsizeLine(alloc, out, "durability.satisfied_count", decision.satisfied_count);
         try appendUsizeLine(alloc, out, "durability.required_count", decision.required_count);
         try appendUsizeLine(alloc, out, "durability.candidate_count", decision.candidate_count);
@@ -713,6 +715,9 @@ fn appendPrimaryMetricsLines(
     try appendU64Line(alloc, out, "durability_satisfied", snapshot.durability_satisfied);
     try appendU64Line(alloc, out, "durability_degraded", snapshot.durability_degraded);
     try appendU64Line(alloc, out, "durability_status_code", snapshot.durability_status_code);
+    try appendU64Line(alloc, out, "durability_target_lsn", snapshot.durability_target_lsn);
+    try appendU64Line(alloc, out, "durability_progress_lsn", snapshot.durability_progress_lsn);
+    try appendU64Line(alloc, out, "durability_missing_lsn_count", snapshot.durability_missing_lsn_count);
     try appendU64Line(alloc, out, "durability_required_count", snapshot.durability_required_count);
     try appendU64Line(alloc, out, "durability_satisfied_count", snapshot.durability_satisfied_count);
     try appendU64Line(alloc, out, "durability_candidate_count", snapshot.durability_candidate_count);
@@ -736,6 +741,7 @@ fn appendSlotMetricsLines(
     try appendIndexedU64Line(alloc, out, "slots", idx, "apply_lag_lsn", slot.apply_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "retention_lag_lsn", slot.retention_lag_lsn);
     try appendIndexedU64Line(alloc, out, "slots", idx, "status_code", slot.status_code);
+    try appendIndexedU64Line(alloc, out, "slots", idx, "last_error", slot.last_error);
 }
 
 fn appendStandbyMetricsLines(
@@ -1084,7 +1090,16 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try std.testing.expectEqual(@as(u64, 2), acked.standby_status_update.received_lsn);
     try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");
 
-    var primary_status_plan = try admin_cli.parse(alloc, &.{ "status", "primary", "--max-lag-lsn", "10" });
+    var primary_status_plan = try admin_cli.parse(alloc, &.{
+        "status",
+        "primary",
+        "--max-lag-lsn",
+        "10",
+        "--sync-mode",
+        "remote-apply",
+        "--sync-standby",
+        "standby-a",
+    });
     defer primary_status_plan.deinit(alloc);
     var primary_status = try execute(alloc, .{ .primary = &primary }, primary_status_plan);
     defer primary_status.deinit(alloc);
@@ -1092,15 +1107,32 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
 
     const status_table = try renderTableAlloc(alloc, primary_status);
     defer alloc.free(status_table);
+    try expectContains(status_table, "durability.target_lsn=2\n");
+    try expectContains(status_table, "durability.progress_lsn=1\n");
+    try expectContains(status_table, "durability.missing_lsn_count=1\n");
     try expectContains(status_table, "slots.0.last_error=IntentionalApplyFailure\n");
 
-    var status_plan = try admin_cli.parse(alloc, &.{ "status", "primary", "--view", "metrics", "--max-lag-lsn", "10" });
+    var status_plan = try admin_cli.parse(alloc, &.{
+        "status",
+        "primary",
+        "--view",
+        "metrics",
+        "--max-lag-lsn",
+        "10",
+        "--sync-mode",
+        "remote-apply",
+        "--sync-standby",
+        "standby-a",
+    });
     defer status_plan.deinit(alloc);
     var primary_metrics = try execute(alloc, .{ .primary = &primary }, status_plan);
     defer primary_metrics.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), primary_metrics.primary_metrics.current_lsn);
     try std.testing.expectEqual(@as(u64, 1), primary_metrics.primary_metrics.slot_count);
     try std.testing.expectEqual(@as(u64, 1), primary_metrics.primary_metrics.max_apply_lag_lsn);
+    try std.testing.expectEqual(@as(u64, 2), primary_metrics.primary_metrics.durability_target_lsn);
+    try std.testing.expectEqual(@as(u64, 1), primary_metrics.primary_metrics.durability_progress_lsn);
+    try std.testing.expectEqual(@as(u64, 1), primary_metrics.primary_metrics.durability_missing_lsn_count);
 
     const json_body = try renderJsonAlloc(alloc, primary_metrics);
     defer alloc.free(json_body);
@@ -1118,7 +1150,11 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(table_body, "result=primary_metrics\n");
     try expectContains(table_body, "current_lsn=2\n");
     try expectContains(table_body, "slot_count=1\n");
+    try expectContains(table_body, "durability_target_lsn=2\n");
+    try expectContains(table_body, "durability_progress_lsn=1\n");
+    try expectContains(table_body, "durability_missing_lsn_count=1\n");
     try expectContains(table_body, "slots.0.name=standby-a\n");
+    try expectContains(table_body, "slots.0.last_error=1\n");
 
     var rendered_plan = try admin_cli.parse(alloc, &.{ "--prometheus", "status", "primary", "--view", "metrics", "--max-lag-lsn", "10" });
     defer rendered_plan.deinit(alloc);
