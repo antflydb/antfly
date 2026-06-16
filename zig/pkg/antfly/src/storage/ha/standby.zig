@@ -86,6 +86,12 @@ pub const PromotionResult = struct {
     data_loss_possible: bool,
 };
 
+pub const PromotionHandoff = struct {
+    identity: Identity,
+    switch_lsn: u64,
+    next_lsn: u64,
+};
+
 const ProgressRecord = struct {
     identity: Identity,
     progress: Progress,
@@ -314,6 +320,23 @@ pub const Standby = struct {
             .new_identity = new_identity,
             .forced = request.force,
             .data_loss_possible = data_loss_possible,
+        };
+    }
+
+    pub fn promotedPrimaryHandoff(self: *Standby) !PromotionHandoff {
+        if (self.progress.received_lsn == 0) return error.StandbyNotPromoted;
+        if (self.progress.applied_lsn != self.progress.received_lsn or
+            self.progress.safe_read_lsn != self.progress.received_lsn) return error.PromotionNotApplied;
+
+        var entry = (try self.receive_log.entryAt(self.alloc, self.progress.received_lsn)) orelse return error.MissingReceivedRecord;
+        defer entry.deinit(self.alloc);
+        if (entry.record.kind != .timeline_switch) return error.StandbyNotPromoted;
+        try self.validateRecord(entry.record);
+
+        return .{
+            .identity = self.identity,
+            .switch_lsn = self.progress.received_lsn,
+            .next_lsn = self.progress.received_lsn + 1,
         };
     }
 

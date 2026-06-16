@@ -133,6 +133,29 @@ pub const Primary = struct {
         };
     }
 
+    pub fn openPromotedFromStandby(
+        alloc: Allocator,
+        log_path: [*:0]const u8,
+        slot_store_path: [*:0]const u8,
+        handoff: standby_mod.PromotionHandoff,
+        options: OpenOptions,
+    ) !Primary {
+        if (handoff.switch_lsn == 0) return error.InvalidPromotionHandoff;
+        if (handoff.next_lsn != handoff.switch_lsn + 1) return error.InvalidPromotionHandoff;
+
+        var primary = try Primary.open(alloc, log_path, slot_store_path, handoff.identity, options);
+        errdefer primary.close();
+
+        if (primary.lastLsn() != handoff.switch_lsn) return error.PromotedLogMismatch;
+        var switch_entry = (try primary.log.entryAt(alloc, handoff.switch_lsn)) orelse return error.MissingPromotionSwitch;
+        defer switch_entry.deinit(alloc);
+        if (switch_entry.record.kind != .timeline_switch) return error.MissingPromotionSwitch;
+        try validateRecordIdentity(handoff.identity, switch_entry.record);
+        if (primary.nextLsn() != handoff.next_lsn) return error.PromotedLogMismatch;
+
+        return primary;
+    }
+
     pub fn close(self: *Primary) void {
         self.slots.close();
         self.log.close();
@@ -453,6 +476,14 @@ fn validateBackupManifestIdentity(expected: Identity, actual: Identity) !void {
     if (actual.epoch != expected.epoch) return error.WrongEpoch;
 }
 
+fn validateRecordIdentity(expected: Identity, actual: replication_record.RecordView) !void {
+    if (actual.cluster_id != expected.cluster_id) return error.WrongCluster;
+    if (actual.shard_id != expected.shard_id) return error.WrongShard;
+    if (actual.table_id != expected.table_id) return error.WrongTable;
+    if (actual.timeline_id != expected.timeline_id) return error.WrongTimeline;
+    if (actual.epoch != expected.epoch) return error.WrongEpoch;
+}
+
 fn backupStartPayload(
     alloc: Allocator,
     identity: Identity,
@@ -535,10 +566,12 @@ fn decisionForUnsatisfied(
 const TestPaths = struct {
     log: [:0]u8,
     slots: [:0]u8,
+    standby_progress: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.log);
         alloc.free(self.slots);
+        alloc.free(self.standby_progress);
     }
 };
 
@@ -556,15 +589,23 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
         .{ std.testing.random_seed, nonce },
     );
     defer alloc.free(slots_raw);
+    const standby_progress_raw = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/ha-primary-" ++ name ++ "-standby-progress-{d}-{d}",
+        .{ std.testing.random_seed, nonce },
+    );
+    defer alloc.free(standby_progress_raw);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), log_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), slots_raw) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress_raw) catch {};
 
     return .{
         .log = try alloc.dupeZ(u8, log_raw),
         .slots = try alloc.dupeZ(u8, slots_raw),
+        .standby_progress = try alloc.dupeZ(u8, standby_progress_raw),
     };
 }
 
@@ -577,6 +618,8 @@ fn testIdentity() Identity {
         .epoch = 1,
     };
 }
+
+fn noOpApply(_: *anyopaque, _: replication_record.RecordView) anyerror!void {}
 
 test "storage.ha primary appends streams and persists standby status" {
     const alloc = std.testing.allocator;
@@ -609,6 +652,64 @@ test "storage.ha primary appends streams and persists standby status" {
         try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
         try std.testing.expectEqual(@as(u64, 2), slot.restart_lsn);
     }
+}
+
+test "storage.ha primary opens from promoted standby handoff and continues writes" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "promoted-handoff");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    const promoted_identity = Identity{
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = 2,
+        .epoch = 2,
+    };
+
+    var ctx: u8 = 0;
+    const handoff = blk: {
+        var standby = try standby_mod.Standby.open(alloc, paths.log.ptr, paths.standby_progress.ptr, identity, .{});
+        defer standby.close();
+        try std.testing.expectError(error.StandbyNotPromoted, standby.promotedPrimaryHandoff());
+
+        _ = try standby.receive(.{
+            .kind = .batch_mutation,
+            .cluster_id = identity.cluster_id,
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+            .timeline_id = identity.timeline_id,
+            .epoch = identity.epoch,
+            .lsn = 1,
+            .previous_lsn = 0,
+            .payload = "before-promotion",
+        });
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&ctx, noOpApply));
+
+        const promotion = try standby.promote(.{
+            .new_timeline_id = promoted_identity.timeline_id,
+            .new_epoch = promoted_identity.epoch,
+            .required_lsn = 1,
+            .fencing_confirmed = true,
+        });
+        try std.testing.expectEqual(@as(u64, 2), promotion.switch_lsn);
+
+        break :blk try standby.promotedPrimaryHandoff();
+    };
+
+    var primary = try Primary.openPromotedFromStandby(alloc, paths.log.ptr, paths.slots.ptr, handoff, .{});
+    defer primary.close();
+    try std.testing.expectEqual(promoted_identity, primary.identity);
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 3), primary.nextLsn());
+
+    const appended_lsn = try primary.append(.{ .payload = "after-promotion" });
+    try std.testing.expectEqual(@as(u64, 3), appended_lsn);
+    var appended = (try primary.log.entryAt(alloc, appended_lsn)) orelse return error.TestExpectedEqual;
+    defer appended.deinit(alloc);
+    try validateRecordIdentity(promoted_identity, appended.record);
+    try std.testing.expectEqual(@as(u64, 2), appended.record.previous_lsn);
+    try std.testing.expectEqualStrings("after-promotion", appended.record.payload);
 }
 
 test "storage.ha primary rejects duplicate slot creation without regressing progress" {
