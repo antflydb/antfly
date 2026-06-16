@@ -136,6 +136,12 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.FenceStoreUnavailable,
         error.FenceAlreadyHeld,
         error.FenceReceiptMissing,
+        error.SlotInactive,
+        error.SlotRequiresReseed,
+        error.WalNoLongerRetained,
+        error.MissingReceivedRecord,
+        error.RecordAlreadyReceived,
+        error.StandbyAlreadyBootstrapped,
         => 409,
         error.SlotNotFound,
         error.BackupStartNotFound,
@@ -156,7 +162,17 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.InvalidFenceLsn,
         error.FenceRequiresForce,
         error.FenceFieldTooLong,
+        error.FencingRequired,
+        error.PromotionRequiresForce,
         error.PromotionNotAllowed,
+        error.StandbyAheadOfPrimary,
+        error.TargetAheadOfPrimary,
+        error.InvalidSyncPolicy,
+        error.WrongCluster,
+        error.WrongShard,
+        error.WrongTable,
+        error.WrongTimeline,
+        error.WrongEpoch,
         => 400,
         else => 500,
     };
@@ -284,6 +300,18 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(stream.body, "result=stream_once\n");
     try expectContains(stream.body, "received_count=1\n");
     try expectContains(stream.body, "applied_lsn=1\n");
+
+    try primary.pauseSlot("standby-a");
+    var inactive_stream = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"stream\",\"--slot\",\"standby-a\",\"--from-lsn\",\"1\"]}",
+    });
+    defer inactive_stream.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), inactive_stream.status);
+    try expectContains(inactive_stream.body, "SlotInactive");
+    try primary.resumeSlot("standby-a");
 
     var fence = try server.handle(.{
         .method = .POST,
