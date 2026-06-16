@@ -1569,6 +1569,22 @@ type HAFormerPrimaryStatus struct {
 
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
 
+	TargetTimelineID uint64 `json:"targetTimelineID,omitempty"`
+
+	TargetEpoch uint64 `json:"targetEpoch,omitempty"`
+
+	ForkLSN uint64 `json:"forkLSN,omitempty"`
+
+	FormerLastLSN uint64 `json:"formerLastLSN,omitempty"`
+
+	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
+
+	DataLossDiscarded bool `json:"dataLossDiscarded,omitempty"`
+
+	AssessedAction string `json:"assessedAction,omitempty"`
+
+	AssessedReason string `json:"assessedReason,omitempty"`
+
 	Action string `json:"action,omitempty"`
 
 	Reason string `json:"reason,omitempty"`

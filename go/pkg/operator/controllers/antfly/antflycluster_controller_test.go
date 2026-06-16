@@ -572,6 +572,62 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(promotion.DataLossPossible).To(BeTrue())
 }
 
+func TestParseHARejoinJobResult(t *testing.T) {
+	g := NewWithT(t)
+
+	result, ok := parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_assess",
+		"action=rewind",
+		"reason=parent_timeline_retained",
+		"former_node_id=primary-a",
+		"target_timeline_id=5",
+		"target_epoch=7",
+		"fork_lsn=12",
+		"former_last_lsn=13",
+		"retained_from_lsn=8",
+		"data_loss_discarded=true",
+		"",
+	}, "\n"))
+
+	g.Expect(ok).To(BeTrue())
+	g.Expect(result.Action).To(Equal("rewind"))
+	g.Expect(result.Reason).To(Equal("parent_timeline_retained"))
+	g.Expect(result.FormerNodeID).To(Equal("primary-a"))
+	g.Expect(result.TargetTimelineID).To(Equal(uint64(5)))
+	g.Expect(result.TargetEpoch).To(Equal(uint64(7)))
+	g.Expect(result.ForkLSN).To(Equal(uint64(12)))
+	g.Expect(result.FormerLastLSN).To(Equal(uint64(13)))
+	g.Expect(result.RetainedFromLSN).To(Equal(uint64(8)))
+	g.Expect(result.DataLossDiscarded).To(BeTrue())
+
+	former := &antflyv1.HAFormerPrimaryStatus{}
+	applyHARejoinJobResult(former, result)
+	g.Expect(former.NodeID).To(Equal("primary-a"))
+	g.Expect(former.AssessedAction).To(Equal("rewind"))
+	g.Expect(former.AssessedReason).To(Equal("parent_timeline_retained"))
+	g.Expect(former.Action).To(Equal(string(haActionRewindFormerPrimary)))
+	g.Expect(former.Reason).To(Equal("parent_timeline_retained"))
+	g.Expect(former.RejoinRequired).To(BeTrue())
+	g.Expect(former.RewindPossible).To(BeTrue())
+	g.Expect(former.ReseedRequired).To(BeFalse())
+	g.Expect(former.TargetTimelineID).To(Equal(uint64(5)))
+	g.Expect(former.TargetEpoch).To(Equal(uint64(7)))
+	g.Expect(former.ForkLSN).To(Equal(uint64(12)))
+	g.Expect(former.FormerLastLSN).To(Equal(uint64(13)))
+	g.Expect(former.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(former.RetainedFromLSN).To(Equal(uint64(8)))
+	g.Expect(former.DataLossDiscarded).To(BeTrue())
+
+	result.Action = "reseed"
+	result.Reason = "parent_timeline_wal_expired"
+	applyHARejoinJobResult(former, result)
+	g.Expect(former.Action).To(Equal(string(haActionReseedFormerPrimary)))
+	g.Expect(former.RewindPossible).To(BeFalse())
+	g.Expect(former.ReseedRequired).To(BeTrue())
+	g.Expect(former.Diverged).To(BeTrue())
+	g.Expect(former.Reason).To(Equal("parent_timeline_wal_expired"))
+}
+
 func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g := NewWithT(t)
 

@@ -8613,6 +8613,12 @@ spec:
                     properties:
                       action:
                         type: string
+                      assessedAction:
+                        type: string
+                      assessedReason:
+                        type: string
+                      dataLossDiscarded:
+                        type: boolean
                       diverged:
                         type: boolean
                       fenceGeneration:
@@ -8620,6 +8626,12 @@ spec:
                         type: integer
                       fenced:
                         type: boolean
+                      forkLSN:
+                        format: int64
+                        type: integer
+                      formerLastLSN:
+                        format: int64
+                        type: integer
                       newTimelineID:
                         format: int64
                         type: integer
@@ -8640,9 +8652,18 @@ spec:
                         type: boolean
                       reseedRequired:
                         type: boolean
+                      retainedFromLSN:
+                        format: int64
+                        type: integer
                       rewindPossible:
                         type: boolean
                       switchLSN:
+                        format: int64
+                        type: integer
+                      targetEpoch:
+                        format: int64
+                        type: integer
+                      targetTimelineID:
                         format: int64
                         type: integer
                     type: object
