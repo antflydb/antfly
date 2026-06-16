@@ -619,6 +619,59 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceGeneration).To(Equal(uint64(7)))
+
+	observed.Annotations[haPrimaryRouteFenceGenerationAnnotation] = "not-a-generation"
+	g.Expect(client.Update(context.Background(), observed)).To(Succeed())
+	g.Expect(reconciler.observeHAPrimaryRouteStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceGeneration).To(Equal(uint64(0)))
+}
+
+func TestUpdateHAPrimaryRouteServiceClearsFenceAnnotationsWithoutFence(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{Mode: antflyv1.HAModeHotStandby},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{Mode: antflyv1.HAModeHotStandby},
+		},
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-public-api",
+			Namespace: "default",
+			Annotations: map[string]string{
+				haPrimaryRouteTargetAnnotation:          "standby-a",
+				haPrimaryRouteFenceAuthorityAnnotation:  string(antflyv1.HAFencingAuthorityKubernetesLease),
+				haPrimaryRouteFenceGenerationAnnotation: "7",
+			},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, service).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.updateHAPrimaryRouteService(context.Background(), cluster, antflyv1.HAPlannedActionStatus{
+		Kind:    string(haActionUpdatePrimaryRoute),
+		RouteTo: "primary",
+	})).To(Succeed())
+
+	observed := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "primary"))
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteFenceAuthorityAnnotation))
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteFenceGenerationAnnotation))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceAuthority).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceGeneration).To(Equal(uint64(0)))
 }
 
 func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {

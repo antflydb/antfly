@@ -3645,12 +3645,11 @@ func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Contex
 	}
 	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = target
 	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = antflyv1.HAFencingAuthority(strings.TrimSpace(service.Annotations[haPrimaryRouteFenceAuthorityAnnotation]))
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 0
 	if raw := strings.TrimSpace(service.Annotations[haPrimaryRouteFenceGenerationAnnotation]); raw != "" {
 		if fenceGeneration, err := strconv.ParseUint(raw, 10, 64); err == nil {
 			cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = fenceGeneration
 		}
-	} else {
-		cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 0
 	}
 	return nil
 }
@@ -3997,6 +3996,8 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 	}
 	if action.FenceGeneration > 0 {
 		service.Annotations[haPrimaryRouteFenceGenerationAnnotation] = strconv.FormatUint(action.FenceGeneration, 10)
+	} else {
+		delete(service.Annotations, haPrimaryRouteFenceGenerationAnnotation)
 	}
 	if selector, ok := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeSwarm, action.RouteTo); ok {
 		service.Spec.Selector = selector
