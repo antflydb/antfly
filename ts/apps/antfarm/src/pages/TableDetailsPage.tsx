@@ -1064,7 +1064,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                                   rel="noreferrer"
                                   className="underline"
                                 >
-                                  Learn more
+                                  Learn more about RRF ranking
                                 </a>
                               </AlertDescription>
                             </Alert>

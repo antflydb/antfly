@@ -36,19 +36,20 @@
     "react-dom": "^18 || ^19"
   },
   "dependencies": {
-    "@xyflow/react": "^12.10.2",
+    "@xyflow/react": "^12.11.0",
     "d3-force": "^3.0.0",
-    "lucide-react": "^0.555.0"
+    "lucide-react": "^1.18.0"
   },
   "devDependencies": {
+    "@antfly/design-system": "workspace:*",
     "@types/d3-force": "^3.0.10",
-    "@types/react": "^19.2.14",
+    "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^4.4.1",
+    "@vitejs/plugin-react": "^6.0.2",
     "rollup-plugin-preserve-directives": "^0.4.0",
     "typescript": "5.9.3",
-    "vite": "^6.3.5",
-    "vite-plugin-dts": "^4.5.4",
-    "vite-tsconfig-paths": "^4.3.2"
+    "vite": "^8.0.16",
+    "vite-plugin-dts": "^5.0.2",
+    "vite-tsconfig-paths": "^6.1.1"
   }
 }
