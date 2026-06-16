@@ -3270,13 +3270,19 @@
     {
       "name": "read classifier equality join",
       "family": "read",
-      "plan": "read:join:join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+      "plan": "read:join:join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
+    },
+    {
+      "name": "read classifier inner equality join",
+      "family": "read",
+      "plan": "read:join:join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
     },
     {
       "name": "read classifier catalog-backed equality join",
       "family": "read",
-      "plan": "read:join:join:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+      "plan": "read:join:join:type=left:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
     },
@@ -3851,8 +3857,22 @@
         "join_on": 2,
         "join_select": 3
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
+    },
+    {
+      "name": "inner equality join",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 2,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 2,
+        "join_select": 2
+      },
+      "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
     },
     {
       "name": "left join on side predicate",
@@ -3865,7 +3885,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND c.kind = 'customer' WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
     },
     {
@@ -3878,7 +3898,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
     },
     {
@@ -3891,7 +3911,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND lower(o.kind) = lower(c.kind) ORDER BY order_id ASC LIMIT 5"
     },
     {
@@ -3906,7 +3926,7 @@
         "join_on": 2,
         "join_select": 3
       },
-      "plan": "join:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+      "plan": "join:type=left:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
     },
@@ -3922,7 +3942,7 @@
         "join_on": 2,
         "join_select": 3
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM public.usage_records AS o LEFT JOIN public.usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
     },
     {
@@ -3936,7 +3956,7 @@
         "join_on": 2,
         "join_select": 3
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=1:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=1:limit=5",
       "sql": "SELECT o.id AS order_id, o.amount AS order_amount, c.amount AS customer_amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY (order_amount - customer_amount) DESC LIMIT 5"
     },
     {
@@ -3950,7 +3970,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=1:on=1:select=2:order=1:order_expr=0:limit=5:right_text_pattern=1",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=1:on=1:select=2:order=1:order_expr=0:limit=5:right_text_pattern=1",
       "params": [{"string": "bot!_%"}, {"string": "!"}],
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE c.name NOT ILIKE $1 ESCAPE $2 ORDER BY 1 ASC LIMIT 5"
     },
@@ -3966,7 +3986,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:left_json_contains=1:right_json_exists=1",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:left_json_contains=1:right_json_exists=1",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.metadata @> '{\"source\":\"orders\"}'::jsonb AND c.metadata ? 'flags' ORDER BY 1 ASC LIMIT 5"
     },
     {
@@ -3980,7 +4000,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, customer_id uuid, name text, enabled boolean);"],
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.enabled IS TRUE AND c.enabled IS UNKNOWN ORDER BY 1 ASC LIMIT 5"
     },
@@ -3995,7 +4015,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=2:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=2:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, customer_id uuid, name text, enabled boolean);"],
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE c.enabled IS NOT TRUE ORDER BY 1 ASC LIMIT 5"
     },
@@ -4010,7 +4030,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) = 'ada' ORDER BY 1 ASC LIMIT 5"
     },
     {
@@ -4024,7 +4044,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE 'ad!_%' ESCAPE '!' ORDER BY 1 ASC LIMIT 5"
     },
     {
@@ -4038,7 +4058,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=2:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=2:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "params": [{"string": "ada"}],
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) IS NOT DISTINCT FROM $1 AND c.metadata->>'source' IS DISTINCT FROM 'internal' ORDER BY 1 ASC LIMIT 5"
     },
@@ -4054,7 +4074,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=1:right_expr_array=1:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=1:right_expr_array=1:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, customer_id uuid, name text, scope text);"],
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE NOT (lower(c.name) = 'bot') AND string_to_array(c.scope, ' ') @> ARRAY['read'] ORDER BY 1 ASC LIMIT 5"
     },
@@ -4069,7 +4089,7 @@
         "join_on": 2,
         "join_select": 3
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=0:limit=5",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=0:limit=5",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 USING > LIMIT 5"
     },
     {
@@ -4083,7 +4103,7 @@
         "join_on": 1,
         "join_select": 2
       },
-      "plan": "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:match_expr_pred=1",
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:match_expr_pred=1",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' AND lower(o.customer_id) = lower(c.id) ORDER BY 1 ASC LIMIT 5"
     },
     {

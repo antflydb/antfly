@@ -4897,6 +4897,9 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    Equality `INNER` and `LEFT` joins lower to `RelationalRowsJoinPlan` with
    declared sources, equality keys, join type, output projection, optional
    `left_table`/`right_table` routing metadata, and bounded execution strategy.
+   SQL/API parity fingerprints include the typed join kind, so `INNER` and
+   `LEFT` joins cannot collapse to the same golden plan when the adapter or
+   routed executor changes.
    Local, CTE-backed, declared multi-range, and catalog cross-table joins share
    the same reducer; the scan-backed routed form gathers left and right row
    streams through the typed range-source contract before joining. SQL join and

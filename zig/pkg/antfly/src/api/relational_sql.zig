@@ -53089,6 +53089,19 @@ test "postgres sql adapter lowers equality join queries" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.join.order_by[0].direction);
     try std.testing.expectEqual(@as(u32, 5), lowered.join.limit.?);
 
+    var inner_lowered = try lowerJoinAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer inner_lowered.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, inner_lowered.join.join_type);
+    try std.testing.expectEqual(@as(usize, 2), inner_lowered.join.on.len);
+    try std.testing.expectEqual(@as(usize, 1), inner_lowered.join.left.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), inner_lowered.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), inner_lowered.join.select.len);
+
     var public_qualified = try lowerJoinAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM public.usage_records AS o LEFT JOIN public.usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' ORDER BY 1 ASC LIMIT 2",
@@ -57915,6 +57928,13 @@ fn sqlRowClaimFingerprintName(claim: db_mod.types.RowClaimRequest) []const u8 {
     };
 }
 
+fn sqlJoinTypeFingerprintName(join_type: db_mod.types.RelationalRowsJoinType) []const u8 {
+    return switch (join_type) {
+        .inner => "inner",
+        .left => "left",
+    };
+}
+
 fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_name: []const u8, query: db_mod.types.RelationalRowsQueryRequest, ctes: usize) ![]u8 {
     const claim = if (query.row_claim) |claim_value| sqlRowClaimFingerprintName(claim_value) else "none";
     const order_expr = expressionOrderCount(query.order_by);
@@ -60057,8 +60077,9 @@ fn joinFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredJoin) ![]u8 {
     const right = lowered.join.right;
     var fingerprint = try std.fmt.allocPrint(
         alloc,
-        "join:left={s}:right={s}:left_pred={d}:left_array_any={d}:left_expr_pred={d}:left_expr_or={d}:left_expr_not={d}:left_expr_array={d}:left_json_eq={d}:left_text={d}:right_pred={d}:right_array_any={d}:right_expr_pred={d}:right_expr_or={d}:right_expr_not={d}:right_expr_array={d}:right_json_eq={d}:right_text={d}:on={d}:select={d}:order={d}:order_expr={d}:limit={d}",
+        "join:type={s}:left={s}:right={s}:left_pred={d}:left_array_any={d}:left_expr_pred={d}:left_expr_or={d}:left_expr_not={d}:left_expr_array={d}:left_json_eq={d}:left_text={d}:right_pred={d}:right_array_any={d}:right_expr_pred={d}:right_expr_or={d}:right_expr_not={d}:right_expr_array={d}:right_json_eq={d}:right_text={d}:on={d}:select={d}:order={d}:order_expr={d}:limit={d}",
         .{
+            sqlJoinTypeFingerprintName(lowered.join.join_type),
             lowered.left_table_name,
             lowered.right_table_name,
             left.predicates.len,
@@ -67067,13 +67088,19 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "read classifier equality join",
             .family = .read,
-            .plan = "read:join:join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+            .plan = "read:join:join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4",
+        },
+        .{
+            .name = "read classifier inner equality join",
+            .family = .read,
+            .plan = "read:join:join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
         },
         .{
             .name = "read classifier catalog-backed equality join",
             .family = .read,
-            .plan = "read:join:join:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+            .plan = "read:join:join:type=left:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
             .source_schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"kind":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
             ,
@@ -67391,35 +67418,42 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "equality join",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 3, .order_by = 2, .limit = 5, .offset = 4 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4",
+        },
+        .{
+            .name = "inner equality join",
+            .family = .join,
+            .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 2, .order_by = 1, .limit = 5 },
+            .plan = "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
         },
         .{
             .name = "left join on side predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND c.kind = 'customer' WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5",
         },
         .{
             .name = "left join preserved-side on predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND o.kind = 'order' ORDER BY order_id ASC LIMIT 5",
         },
         .{
             .name = "left join computed on predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:on_expr_pred=1",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND lower(o.kind) = lower(c.kind) ORDER BY order_id ASC LIMIT 5",
         },
         .{
             .name = "catalog-backed equality join",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 3, .order_by = 2, .limit = 5, .offset = 4 },
-            .plan = "join:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+            .plan = "join:type=left:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
             .source_schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"kind":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
             ,
@@ -67429,21 +67463,21 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema-qualified equality join",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 3, .order_by = 2, .limit = 5, .offset = 4 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM public.usage_records AS o LEFT JOIN public.usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4",
         },
         .{
             .name = "join output expression order",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 3, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=1:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=1:limit=5",
             .sql = "SELECT o.id AS order_id, o.amount AS order_amount, c.amount AS customer_amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY (order_amount - customer_amount) DESC LIMIT 5",
         },
         .{
             .name = "equality join negated text pattern side predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .text_patterns = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=1:on=1:select=2:order=1:order_expr=0:limit=5:right_text_pattern=1",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=1:on=1:select=2:order=1:order_expr=0:limit=5:right_text_pattern=1",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE c.name NOT ILIKE $1 ESCAPE $2 ORDER BY 1 ASC LIMIT 5",
             .params = &.{ .{ .string = "bot!_%" }, .{ .string = "!" } },
         },
@@ -67451,14 +67485,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "equality join structured side predicates",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .json_contains = 1, .json_path_exists = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:left_json_contains=1:right_json_exists=1",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:left_json_contains=1:right_json_exists=1",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.metadata @> '{\"source\":\"orders\"}'::jsonb AND c.metadata ? 'flags' ORDER BY 1 ASC LIMIT 5",
         },
         .{
             .name = "equality join boolean side predicates",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, customer_id uuid, name text, enabled boolean);",
             },
@@ -67468,7 +67502,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "equality join null-inclusive boolean side predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=2:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=2:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, customer_id uuid, name text, enabled boolean);",
             },
@@ -67478,21 +67512,21 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "equality join expression side predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) = 'ada' ORDER BY 1 ASC LIMIT 5",
         },
         .{
             .name = "equality join computed pattern side predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE 'ad!_%' ESCAPE '!' ORDER BY 1 ASC LIMIT 5",
         },
         .{
             .name = "equality join expression null-safe distinct side predicates",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 2, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=2:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=2:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) IS NOT DISTINCT FROM $1 AND c.metadata->>'source' IS DISTINCT FROM 'internal' ORDER BY 1 ASC LIMIT 5",
             .params = &.{.{ .string = "ada" }},
         },
@@ -67500,7 +67534,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "equality join expression not and computed array side predicates",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .expression_not_predicates = 1, .expression_array_contains = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=1:right_expr_array=1:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=1:right_expr_array=1:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, customer_id uuid, name text, scope text);",
             },
@@ -67510,14 +67544,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "equality join using operator order",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 2, .join_select = 3, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=0:limit=5",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=1:order_expr=0:limit=5",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 USING > LIMIT 5",
         },
         .{
             .name = "equality join mixed-side match expression",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
-            .plan = "join:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:match_expr_pred=1",
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:match_expr_pred=1",
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' AND lower(o.customer_id) = lower(c.id) ORDER BY 1 ASC LIMIT 5",
         },
         .{
