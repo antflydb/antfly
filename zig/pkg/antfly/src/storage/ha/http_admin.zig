@@ -396,6 +396,8 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         return try self.handleTypedJson(BaseBackupBeginDocument{
+            .slot_name = result.slot_name,
+            .manifest_id = result.manifest_id,
             .backup_lsn = result.backup_lsn,
             .start_record_lsn = result.start_record_lsn,
         });
@@ -661,6 +663,8 @@ const SlotActionDocument = struct {
 
 const BaseBackupBeginDocument = struct {
     schema_version: u32 = 1,
+    slot_name: []const u8,
+    manifest_id: []const u8,
     backup_lsn: u64,
     start_record_lsn: u64,
 };
@@ -1624,6 +1628,8 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try std.testing.expectEqual(@as(u16, 200), typed_begin.status);
     try std.testing.expectEqualStrings("application/json", typed_begin.content_type.?);
     try expectContains(typed_begin.body, "\"schema_version\":1");
+    try expectContains(typed_begin.body, "\"slot_name\":\"standby-seed\"");
+    try expectContains(typed_begin.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_begin.body, "\"backup_lsn\":1");
     try expectContains(typed_begin.body, "\"start_record_lsn\":1");
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));

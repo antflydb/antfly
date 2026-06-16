@@ -66,6 +66,10 @@ pub const PromotionAssessRequest = struct {
 
 pub const HABaseBackupBeginResponse = struct {
     schema_version: i64,
+    /// Stable standby replication slot reserved for the base backup.
+    slot_name: []const u8,
+    /// Stable base-backup manifest id for retry and action correlation.
+    manifest_id: []const u8,
     /// LSN reserved as the base-backup start boundary.
     backup_lsn: i64,
     /// Durable `backup_start` record LSN.

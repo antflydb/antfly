@@ -987,13 +987,21 @@ components:
             $ref: "#/components/schemas/HAReplicationSlot"
     HABaseBackupBeginResponse:
       type: object
-      required: [schema_version, backup_lsn, start_record_lsn]
+      required: [schema_version, slot_name, manifest_id, backup_lsn, start_record_lsn]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        slot_name:
+          type: string
+          minLength: 1
+          description: Stable standby replication slot reserved for the base backup.
+        manifest_id:
+          type: string
+          minLength: 1
+          description: Stable base-backup manifest id for retry and action correlation.
         backup_lsn:
           type: integer
           format: uint64

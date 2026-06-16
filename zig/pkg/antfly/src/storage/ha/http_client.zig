@@ -1025,6 +1025,8 @@ test "storage.ha http client round trips typed seed operations" {
     });
     defer begin.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.schema_version);
+    try std.testing.expectEqualStrings("standby-seed", begin.parsed.value.slot_name);
+    try std.testing.expectEqualStrings("base-http-client", begin.parsed.value.manifest_id);
     try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.backup_lsn);
     try std.testing.expectEqual(@as(i64, 1), begin.parsed.value.start_record_lsn);
 

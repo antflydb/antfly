@@ -52,6 +52,8 @@ pub const BaseBackupStart = struct {
 };
 
 pub const BaseBackupStartResult = struct {
+    slot_name: []const u8,
+    manifest_id: []const u8,
     backup_lsn: u64,
     start_record_lsn: u64,
 };
@@ -218,6 +220,8 @@ pub const Primary = struct {
         });
         std.debug.assert(start_lsn == backup_lsn);
         return .{
+            .slot_name = request.slot_name,
+            .manifest_id = request.manifest_id,
             .backup_lsn = backup_lsn,
             .start_record_lsn = start_lsn,
         };
@@ -784,6 +788,8 @@ test "storage.ha primary begins base backup with slot retention pin" {
         .slot_name = "standby-a",
         .manifest_id = "manifest-1",
     });
+    try std.testing.expectEqualStrings("standby-a", started.slot_name);
+    try std.testing.expectEqualStrings("manifest-1", started.manifest_id);
     try std.testing.expectEqual(@as(u64, 2), started.backup_lsn);
     try std.testing.expectEqual(@as(u64, 2), started.start_record_lsn);
 

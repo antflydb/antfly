@@ -183,6 +183,8 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .slot => |slot_result| try appendSlotResultLines(alloc, &out, slot_result),
         .slot_list => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
         .seed_begin => |response| {
+            try appendLine(alloc, &out, "slot_name", response.slot_name);
+            try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "start_record_lsn", response.start_record_lsn);
         },
@@ -1485,6 +1487,10 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     var begun = try execute(alloc, .{ .primary = &primary }, begin_plan);
     defer begun.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), begun.seed_begin.backup_lsn);
+    const begin_table = try renderTableAlloc(alloc, begun);
+    defer alloc.free(begin_table);
+    try expectContains(begin_table, "slot_name=standby-a\n");
+    try expectContains(begin_table, "manifest_id=base-0001\n");
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
 
     const files = seedFiles();
