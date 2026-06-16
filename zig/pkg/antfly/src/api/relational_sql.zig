@@ -74603,6 +74603,93 @@ test "postgres sql adapter mutation source jsonb_set executes through relational
     try std.testing.expect(std.mem.indexOf(u8, untouched.json, "status_key") == null);
 }
 
+test "postgres sql adapter mutation source expression transforms execute through relational storage" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-mutation-source-expression-transforms", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:u1", .value = "{\"id\":\"u1\",\"status\":\"QUEUED\",\"amount\":2,\"organization_id\":\"o1\"}" },
+            .{ .key = "row:u2", .value = "{\"id\":\"u2\",\"status\":\"READY\",\"amount\":4,\"organization_id\":\"o1\"}" },
+            .{ .key = "row:u3", .value = "{\"id\":\"u3\",\"status\":\"SKIP\",\"amount\":8,\"organization_id\":\"o2\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const txn_id = try db.beginTransaction(4_101);
+    var committed = false;
+    defer if (!committed) db.abortTransaction(txn_id, 4_102) catch {};
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-expression-update",
+        .txn_id = txn_id,
+    };
+
+    var plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(status) || ':' || id, amount = amount + coalesce(amount, 1) WHERE organization_id = 'o1' ORDER BY id ASC FOR UPDATE RETURNING id, status, amount, lower(status) AS status_key",
+        schema,
+        &.{},
+        .{ .row_claim = claim },
+    );
+    defer plan.deinit(alloc);
+
+    switch (plan) {
+        .update_source => |update_source| {
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.patch_expressions.len);
+            try std.testing.expectEqualStrings("status", update_source.mutation.req.patch_expressions[0].field);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.increment_expressions.len);
+            try std.testing.expectEqualStrings("amount", update_source.mutation.req.increment_expressions[0].field);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.returning_expressions.len);
+
+            var result = try db.mutateRelationalRowsFromSource(alloc, schema, update_source.mutation.req);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), result.matched);
+            try std.testing.expectEqual(@as(u32, 2), result.staged);
+            try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued:u1\",\"amount\":4,\"status_key\":\"queued:u1\"}", result.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"ready:u2\",\"amount\":8,\"status_key\":\"ready:u2\"}", result.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.commitTransaction(txn_id, 4_110);
+    committed = true;
+
+    const select = [_][]const u8{ "id", "status", "amount" };
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var rows = try db.queryRelationalRows(alloc, schema, .{
+        .select = select[0..],
+        .order_by = order_by[0..],
+    });
+    defer rows.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), rows.total);
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued:u1\",\"amount\":4}", rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"ready:u2\",\"amount\":8}", rows.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"SKIP\",\"amount\":8}", rows.rows[2]);
+}
+
 test "postgres sql adapter insert source unique conflict executes through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =

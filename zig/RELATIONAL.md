@@ -3867,6 +3867,12 @@ planned as model-owned Antfly capabilities in this order:
 | Routed stream composition | Equality joins, `LEFT JOIN`, bounded local, CTE-backed, declared multi-range, provisioned, and hosted `LEFT JOIN LATERAL`, grouped rollups, aggregate `FILTER`/`DISTINCT`, `HAVING`, CTEs, and local, provisioned, or hosted row/aggregate/window stages including `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile()`, `lag()`, `lead()`, `first_value()`, `last_value()`, `nth_value()`, `count()`, `sum()`, `avg()`, `min()`, and `max()`. Hosted remote owners serve typed row-source requests with topology-epoch validation, and hosted plans coordinate static source-row reductions even when every owner range is remote. Join and lateral direct range executors enforce paired left/right range families just like plan envelopes, so routed execution cannot mix an owner-clipped side with a full-table side. CTE and derived-stage consumers validate emitted field names, and source-backed result columns report catalog collation metadata. | Add lookup/hash/merge join strategy choice, collation-aware comparison/index semantics, coordinator merge ordering over spillable streams, bounded spill-backed materialization, and topology-change retry loops around the fail-closed epoch boundary. |
 | Parity evidence | Representative SQL, migration-equivalent schema/data changes, representative execution flows, and failure modes under repair/routing. | Gate parity with harvested SQL and native migration-equivalence golden plans, execution tests for row/identity/constraint/queue/JSON/usage flows, and chaos/sim workloads that combine live writes, FK checks/actions, unique-owner repair, secondary and embedded-JSON rebuilds, row claims, joins, aggregates, range movement, catalog promotion, and rewrite/rebuild jobs. |
 
+Claimed mutation-source execution tests pin the shared expression-tree path for
+final-image row writes: SQL `SET` expressions lower to native `patch_expr` and
+`increment_expr` assignments, storage stages those transforms in the claiming
+transaction, and `RETURNING` field plus expression outputs are projected from
+the same final row image that will commit.
+
 Owner-injected lockable mutation-source ranges are a storage-side planning
 contract, not public request syntax. The planner collects each sorted,
 non-overlapping owner span with per-range pagination cleared, merges the
