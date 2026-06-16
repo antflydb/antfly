@@ -5187,6 +5187,11 @@ public summary metadata and the typed-plan fingerprint before row JSON is
 compared. This keeps returning coverage bound to the native mutation plan instead
 of accepting stale or hand-edited fixture metadata.
 
+`ddl_tag` is valid only on DDL fixtures, where it selects the typed catalog-plan
+assertion path. Read, write, unsupported, and adapter-no-op fixtures reject it so
+catalog-plan metadata cannot be carried by entries whose runners would ignore
+it.
+
 Cross-table source-schema fixtures must resolve a source table that is distinct
 from the summarized target table. Same-table reads and writes use the target
 schema directly, so a fixture-provided `source_schema_json` for the target table

@@ -62437,6 +62437,7 @@ fn validateAppParityFixtureMetadata(
         return error.TestUnexpectedResult;
     }
     if (entry.family == .ddl and entry.summary.ddl_tag == null) return error.TestUnexpectedResult;
+    if (entry.summary.ddl_tag != null and entry.family != .ddl) return error.TestUnexpectedResult;
     if (appParityFixtureFamilyNeedsTableSummary(entry.family) and entry.summary.table_name == null) {
         return error.TestUnexpectedResult;
     }
@@ -62600,6 +62601,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "usage_records" },
         .plan = "read:query:query:table=usage_records",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "non ddl ddl tag",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
