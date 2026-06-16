@@ -62304,19 +62304,26 @@ fn appParityFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) bo
 
 fn appParityFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
-        .adapter_noop_ddl,
-        .unsupported,
-        .unsupported_read,
-        .unsupported_ddl,
-        .unsupported_write,
-        .unsupported_insert,
-        .unsupported_update,
-        .unsupported_update_source,
-        .unsupported_delete,
-        .unsupported_update_joined_source,
-        .unsupported_delete_joined_source,
-        => false,
-        else => true,
+        .ddl,
+        .read,
+        .query,
+        .aggregate,
+        .join,
+        .lateral,
+        .window,
+        .relation_population,
+        .insert,
+        .insert_source,
+        .update,
+        .delete,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => true,
+        else => false,
     };
 }
 
@@ -62706,6 +62713,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "client_encoding" },
         .classification_reason = "session_setting",
         .plan = "adapter_noop:ddl:reason=session_setting",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "explain summary without assertion path",
+        .sql = "EXPLAIN SELECT id FROM usage_records WHERE status = 'active'",
+        .family = .explain,
+        .summary = .{ .table_name = "usage_records", .predicates = 1 },
+        .plan = "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
