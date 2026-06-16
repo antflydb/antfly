@@ -58,12 +58,18 @@ pub fn replicateAvailable(
     }
 
     const applied_count = standby.applyAvailable(apply_ctx, apply_fn) catch |err| {
-        try reportProgress(primary, slot_name, standby);
+        reportProgress(primary, slot_name, standby) catch |progress_err| {
+            primary.reportReplicationError(slot_name, @errorName(progress_err)) catch {};
+            return progress_err;
+        };
         primary.reportReplicationError(slot_name, @errorName(err)) catch {};
         return err;
     };
 
-    try reportProgress(primary, slot_name, standby);
+    reportProgress(primary, slot_name, standby) catch |err| {
+        primary.reportReplicationError(slot_name, @errorName(err)) catch {};
+        return err;
+    };
     return .{
         .received_count = received_count,
         .applied_count = applied_count,
@@ -163,6 +169,22 @@ const ApplyCapture = struct {
     }
 };
 
+const SlotTimelineChanger = struct {
+    primary: *primary_mod.Primary,
+    slot_name: []const u8,
+
+    fn apply(ctx: *anyopaque, record: replication_record.RecordView) !void {
+        const self: *SlotTimelineChanger = @ptrCast(@alignCast(ctx));
+        try self.primary.slots.createOrUpdate(.{
+            .name = self.slot_name,
+            .timeline_id = record.timeline_id + 1,
+            .restart_lsn = record.lsn,
+            .received_lsn = record.lsn,
+            .applied_lsn = record.lsn,
+        });
+    }
+};
+
 test "storage.ha session replicates primary records to standby and updates slot progress" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "basic");
@@ -258,6 +280,34 @@ test "storage.ha session reports durable receive progress when apply fails" {
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
     try std.testing.expect(slot.last_error == null);
+}
+
+test "storage.ha session records progress update failures" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "progress-fail");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+
+    var changer = SlotTimelineChanger{
+        .primary = &primary,
+        .slot_name = "standby-a",
+    };
+    try std.testing.expectError(
+        error.WrongTimeline,
+        replicateAvailable(alloc, &primary, "standby-a", &standby, &changer, SlotTimelineChanger.apply),
+    );
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, identity.timeline_id + 1), slot.timeline_id);
+    try std.testing.expectEqualStrings("WrongTimeline", slot.last_error.?);
 }
 
 test "storage.ha session resumes after primary and standby reopen" {
