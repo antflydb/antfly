@@ -1457,6 +1457,9 @@ func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAProm
 	if promotion.FenceGeneration == 0 {
 		return false
 	}
+	if promotion.FenceAuthority != "" && status.Fencing.Authority != promotion.FenceAuthority {
+		return false
+	}
 	if status.Fencing.Generation < promotion.FenceGeneration {
 		return false
 	}

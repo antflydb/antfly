@@ -3305,6 +3305,9 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			continue
 		}
 		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+			if cluster.Status.HAStatus.LastPromotion.FenceAuthority == "" {
+				cluster.Status.HAStatus.LastPromotion.FenceAuthority = action.FenceAuthority
+			}
 			r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
 			return
 		}
@@ -3320,6 +3323,7 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			RequiredLSN:       action.TargetLSN,
 			ObservedLSN:       action.TargetLSN,
 			FenceGeneration:   action.FenceGeneration,
+			FenceAuthority:    action.FenceAuthority,
 			FenceReason:       haPromotionFenceReason(action),
 			CompletionTime:    &now,
 		}
@@ -3424,6 +3428,7 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 		status.NewTimelineID == identity.TimelineID+1 &&
 		status.NewEpoch == identity.Epoch+1 &&
 		status.SwitchLSN == action.TargetLSN &&
+		(status.FenceAuthority == "" || status.FenceAuthority == action.FenceAuthority) &&
 		status.FenceGeneration == action.FenceGeneration
 }
 

@@ -689,6 +689,7 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 			ParentTimelineID:  1,
 			NewTimelineID:     2,
 			SwitchLSN:         10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 			FenceGeneration:   4,
 		},
 		Standbys: []antflyv1.HAStandbyStatus{{
@@ -733,6 +734,18 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		t.Fatalf("expected rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
+	cluster.Status.HAStatus.Fencing.Authority = antflyv1.HAFencingAuthorityStorageFence
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former = cluster.Status.HAStatus.FormerPrimary
+	if former == nil ||
+		former.Fenced ||
+		former.Action != string(haActionDemoteFormerPrimary) ||
+		former.Reason != "FormerPrimaryFenceNotObserved" {
+		t.Fatalf("expected authority-mismatched fence to block former-primary rejoin, got %#v", former)
+	}
+
+	cluster.Status.HAStatus.Fencing.Authority = antflyv1.HAFencingAuthorityKubernetesLease
 	cluster.Status.HAStatus.Standbys[0].ReceivedLSN = 11
 	reconciler.updateHAStatusAndConditions(cluster)
 

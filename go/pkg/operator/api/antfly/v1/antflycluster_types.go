@@ -1646,6 +1646,8 @@ type HAPromotionStatus struct {
 
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
 
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
 	FenceToken string `json:"fenceToken,omitempty"`
 
 	FenceReason string `json:"fenceReason,omitempty"`

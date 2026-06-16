@@ -713,6 +713,7 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 					Kind:            string(haActionPromoteStandby),
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 					FenceGeneration: 3,
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "--current-fence"},
@@ -733,12 +734,18 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
 	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(promotion.FenceReason).To(Equal("LeaseAcquired"))
 	g.Expect(promotion.CompletionTime).NotTo(BeNil())
 	firstCompletion := promotion.CompletionTime
 
 	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
+
+	cluster.Status.HAStatus.LastPromotion.FenceAuthority = ""
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
 	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
 
 	cluster.Status.HAStatus.LastPromotion.FenceToken = "token"

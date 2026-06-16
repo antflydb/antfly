@@ -8685,6 +8685,10 @@ spec:
                         type: string
                       dataLossPossible:
                         type: boolean
+                      fenceAuthority:
+                        description: HAFencingAuthority selects the authority used
+                          before automatic promotion.
+                        type: string
                       fenceGeneration:
                         format: int64
                         type: integer
