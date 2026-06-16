@@ -152,6 +152,16 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.InvalidReplicationError,
         error.InvalidReplicationStartLsn,
         error.InvalidCheckpointLsn,
+        error.InvalidBackupLsn,
+        error.InvalidManifestId,
+        error.ManifestIdTooLong,
+        error.EmptyManifest,
+        error.TooManyManifestFiles,
+        error.InvalidManifestPath,
+        error.ManifestPathTooLong,
+        error.DuplicateManifestPath,
+        error.ManifestFileSetMismatch,
+        error.BackupStartNotDurable,
         error.InitialLsnAheadOfPrimary,
         error.ManifestPathMissing,
         error.ManifestFileTooLarge,
@@ -312,6 +322,16 @@ test "storage.ha http admin serves health and command endpoint" {
     defer invalid_progress.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_progress.status);
     try expectContains(invalid_progress.body, "InvalidSlotProgress");
+
+    var invalid_seed = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"seed\",\"begin\",\"--slot\",\"standby-a\",\"--manifest-id\",\"\"]}",
+    });
+    defer invalid_seed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_seed.status);
+    try expectContains(invalid_seed.body, "InvalidManifestId");
 
     try primary.pauseSlot("standby-a");
     var inactive_stream = try server.handle(.{
