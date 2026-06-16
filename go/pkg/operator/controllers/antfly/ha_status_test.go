@@ -105,6 +105,55 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	}
 }
 
+func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+	}
+	actions := []haPlannedAction{{
+		Kind:        haActionCreateSlot,
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		TargetLSN:   5,
+		Reason:      "SlotMissing",
+	}}
+
+	initial := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{})
+	if len(initial) != 1 {
+		t.Fatalf("expected one planned action, got %#v", initial)
+	}
+	previous := initial[0]
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1,
+		SlotAction:    "create",
+		SlotName:      "standby-a",
+	}
+
+	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
+	preserved := haPlannedActionStatuses(actions, ha, status)
+	if preserved[0].AdminJobName != haAdminDirectAPIName ||
+		preserved[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+		preserved[0].AdminResult == nil ||
+		preserved[0].AdminResult.SlotAction != "create" {
+		t.Fatalf("expected execution state to survive identical replan, got %#v", preserved[0])
+	}
+
+	changed := []haPlannedAction{{
+		Kind:        haActionCreateSlot,
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		TargetLSN:   6,
+		Reason:      "SlotMissing",
+	}}
+	notPreserved := haPlannedActionStatuses(changed, ha, status)
+	if notPreserved[0].AdminJobName != "" ||
+		notPreserved[0].AdminJobPhase != "" ||
+		notPreserved[0].AdminResult != nil {
+		t.Fatalf("expected changed action to drop stale execution state, got %#v", notPreserved[0])
+	}
+}
+
 func TestParseHAOperatorPlanTableActions(t *testing.T) {
 	plan, err := parseHAOperatorPlanTable(strings.Join([]string{
 		"result=operator_plan",

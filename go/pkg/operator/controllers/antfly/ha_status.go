@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -573,7 +574,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	out := make([]antflyv1.HAPlannedActionStatus, 0, len(actions))
 	for _, action := range actions {
 		adminMethod, adminPath := haAdminOperation(action)
-		out = append(out, antflyv1.HAPlannedActionStatus{
+		statusAction := antflyv1.HAPlannedActionStatus{
 			Kind:             string(action.Kind),
 			Phase:            string(haPlannedActionPhase(action.Kind)),
 			Executor:         string(haPlannedActionExecutor(action.Kind)),
@@ -596,9 +597,54 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			AdminMethod:      adminMethod,
 			AdminPath:        adminPath,
 			Reason:           action.Reason,
-		})
+		}
+		statusAction = haPreservePlannedActionExecution(statusAction, status)
+		out = append(out, statusAction)
 	}
 	return out
+}
+
+func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, status *antflyv1.HAStatus) antflyv1.HAPlannedActionStatus {
+	if status == nil {
+		return action
+	}
+	for _, previous := range status.PlannedActions {
+		if !haSamePlannedActionOperation(action, previous) {
+			continue
+		}
+		action.AdminJobName = previous.AdminJobName
+		action.AdminJobPhase = previous.AdminJobPhase
+		if previous.AdminResult != nil {
+			action.AdminResult = previous.AdminResult.DeepCopy()
+		}
+		return action
+	}
+	return action
+}
+
+func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.HAPlannedActionStatus) bool {
+	return a.Kind == b.Kind &&
+		a.Phase == b.Phase &&
+		a.Executor == b.Executor &&
+		a.DependsOn == b.DependsOn &&
+		a.StandbyName == b.StandbyName &&
+		a.SlotName == b.SlotName &&
+		a.TargetLSN == b.TargetLSN &&
+		a.ObservedLSN == b.ObservedLSN &&
+		a.RetainedFromLSN == b.RetainedFromLSN &&
+		a.RouteFrom == b.RouteFrom &&
+		a.RouteTo == b.RouteTo &&
+		a.FenceAuthority == b.FenceAuthority &&
+		a.FenceHolder == b.FenceHolder &&
+		a.FenceGeneration == b.FenceGeneration &&
+		a.FenceReason == b.FenceReason &&
+		a.AdminURL == b.AdminURL &&
+		a.AdminMethod == b.AdminMethod &&
+		a.AdminPath == b.AdminPath &&
+		a.SeedManifestPath == b.SeedManifestPath &&
+		a.SeedContentRoot == b.SeedContentRoot &&
+		a.Reason == b.Reason &&
+		slices.Equal(a.AdminCommand, b.AdminCommand)
 }
 
 func parseHAOperatorPlanTable(body string) (haOperatorPlanTable, error) {
