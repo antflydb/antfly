@@ -25,8 +25,9 @@ const Crc32 = std.hash.Crc32;
 const wal_mod = @import("../wal.zig");
 
 const magic = [8]u8{ 'A', 'F', 'H', 'A', 'S', 'L', 'T', '\n' };
-const version: u16 = 1;
+const version: u16 = 2;
 const header_len: usize = 60;
+const v2_error_len_size: usize = 4;
 
 const version_offset: usize = 8;
 const event_type_offset: usize = 10;
@@ -165,19 +166,16 @@ pub const SlotStore = struct {
 
     pub fn setLastError(self: *SlotStore, name: []const u8, last_error: []const u8) !void {
         if (last_error.len == 0) return error.InvalidReplicationError;
-        const idx = self.findIndex(name) orelse return error.SlotNotFound;
-        const owned = try self.alloc.dupe(u8, last_error);
-        errdefer self.alloc.free(owned);
-        if (self.slots.items[idx].state.last_error) |previous| self.alloc.free(previous);
-        self.slots.items[idx].state.last_error = owned;
+        var next = self.get(name) orelse return error.SlotNotFound;
+        next.last_error = last_error;
+        try self.createOrUpdate(next);
     }
 
     pub fn clearLastError(self: *SlotStore, name: []const u8) !void {
-        const idx = self.findIndex(name) orelse return error.SlotNotFound;
-        if (self.slots.items[idx].state.last_error) |previous| {
-            self.alloc.free(previous);
-            self.slots.items[idx].state.last_error = null;
-        }
+        var next = self.get(name) orelse return error.SlotNotFound;
+        if (next.last_error == null) return;
+        next.last_error = null;
+        try self.createOrUpdate(next);
     }
 
     pub fn markReseedRequired(self: *SlotStore, name: []const u8) !void {
@@ -365,7 +363,10 @@ pub fn freeSlotList(alloc: Allocator, slots: []SlotState) void {
 
 fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     if (event.state.name.len > std.math.maxInt(u32)) return error.SlotNameTooLong;
-    const total_len = header_len + event.state.name.len;
+    const last_error = event.state.last_error orelse "";
+    if (last_error.len > std.math.maxInt(u32)) return error.ReplicationErrorTooLong;
+    const body_len = v2_error_len_size + event.state.name.len + last_error.len;
+    const total_len = header_len + body_len;
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
 
@@ -382,8 +383,10 @@ fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     if (event.state.active) flags |= 1 << 0;
     if (event.state.reseed_required) flags |= 1 << 1;
     std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
-    @memcpy(out[header_len..], event.state.name);
-    std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..]), .little);
+    std.mem.writeInt(u32, out[header_len..][0..4], @intCast(last_error.len), .little);
+    @memcpy(out[header_len + v2_error_len_size ..][0..event.state.name.len], event.state.name);
+    @memcpy(out[header_len + v2_error_len_size + event.state.name.len ..][0..last_error.len], last_error);
+    std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..total_len]), .little);
     std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
     return out;
 }
@@ -396,27 +399,88 @@ fn decodeEvent(bytes: []const u8) !EventView {
     const decoded_version = std.mem.readInt(u16, bytes[version_offset..][0..2], .little);
     if (decoded_version == 0 or decoded_version > version) return error.UnsupportedVersion;
 
-    const name_len = std.mem.readInt(u32, bytes[name_len_offset..][0..4], .little);
-    const total_len = header_len + @as(usize, @intCast(name_len));
+    const name_len: usize = @intCast(std.mem.readInt(u32, bytes[name_len_offset..][0..4], .little));
+    const body = try decodeEventBody(bytes, decoded_version, name_len);
+    const total_len = body.total_len;
     if (bytes.len < total_len) return error.EndOfStream;
     if (bytes.len != total_len) return error.TrailingBytes;
-    const name = bytes[header_len..total_len];
     const stored_body_crc = std.mem.readInt(u32, bytes[body_crc_offset..][0..4], .little);
-    if (stored_body_crc != Crc32.hash(name)) return error.BodyCrcMismatch;
+    if (stored_body_crc != Crc32.hash(bytes[header_len..total_len])) return error.BodyCrcMismatch;
 
     const flags = std.mem.readInt(u32, bytes[flags_offset..][0..4], .little);
     return .{
         .event_type = @enumFromInt(std.mem.readInt(u16, bytes[event_type_offset..][0..2], .little)),
         .state = .{
-            .name = name,
+            .name = body.name,
             .timeline_id = std.mem.readInt(u64, bytes[timeline_id_offset..][0..8], .little),
             .restart_lsn = std.mem.readInt(u64, bytes[restart_lsn_offset..][0..8], .little),
             .received_lsn = std.mem.readInt(u64, bytes[received_lsn_offset..][0..8], .little),
             .applied_lsn = std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
             .active = (flags & (1 << 0)) != 0,
             .reseed_required = (flags & (1 << 1)) != 0,
+            .last_error = body.last_error,
         },
     };
+}
+
+const EventBodyView = struct {
+    total_len: usize,
+    name: []const u8,
+    last_error: ?[]const u8,
+};
+
+fn decodeEventBody(bytes: []const u8, decoded_version: u16, name_len: usize) !EventBodyView {
+    return switch (decoded_version) {
+        1 => blk: {
+            const total_len = header_len + name_len;
+            if (bytes.len < total_len) return error.EndOfStream;
+            break :blk .{
+                .total_len = total_len,
+                .name = bytes[header_len..total_len],
+                .last_error = null,
+            };
+        },
+        2 => blk: {
+            if (bytes.len < header_len + v2_error_len_size) return error.EndOfStream;
+            const error_len: usize = @intCast(std.mem.readInt(u32, bytes[header_len..][0..4], .little));
+            const name_start = header_len + v2_error_len_size;
+            const error_start = try std.math.add(usize, name_start, name_len);
+            const total_len = try std.math.add(usize, error_start, error_len);
+            if (bytes.len < total_len) return error.EndOfStream;
+            const last_error = if (error_len > 0) bytes[error_start..total_len] else null;
+            break :blk .{
+                .total_len = total_len,
+                .name = bytes[name_start..error_start],
+                .last_error = last_error,
+            };
+        },
+        else => error.UnsupportedVersion,
+    };
+}
+
+fn encodeV1TestEvent(alloc: Allocator, event: EventView) ![]u8 {
+    if (event.state.name.len > std.math.maxInt(u32)) return error.SlotNameTooLong;
+    const total_len = header_len + event.state.name.len;
+    const out = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(out);
+
+    @memset(out[0..header_len], 0);
+    @memcpy(out[0..8], &magic);
+    std.mem.writeInt(u16, out[version_offset..][0..2], 1, .little);
+    std.mem.writeInt(u16, out[event_type_offset..][0..2], @intFromEnum(event.event_type), .little);
+    std.mem.writeInt(u32, out[name_len_offset..][0..4], @intCast(event.state.name.len), .little);
+    std.mem.writeInt(u64, out[timeline_id_offset..][0..8], event.state.timeline_id, .little);
+    std.mem.writeInt(u64, out[restart_lsn_offset..][0..8], event.state.restart_lsn, .little);
+    std.mem.writeInt(u64, out[received_lsn_offset..][0..8], event.state.received_lsn, .little);
+    std.mem.writeInt(u64, out[applied_lsn_offset..][0..8], event.state.applied_lsn, .little);
+    var flags: u32 = 0;
+    if (event.state.active) flags |= 1 << 0;
+    if (event.state.reseed_required) flags |= 1 << 1;
+    std.mem.writeInt(u32, out[flags_offset..][0..4], flags, .little);
+    @memcpy(out[header_len..], event.state.name);
+    std.mem.writeInt(u32, out[body_crc_offset..][0..4], Crc32.hash(out[header_len..]), .little);
+    std.mem.writeInt(u32, out[header_crc_offset..][0..4], Crc32.hash(out[0..header_crc_offset]), .little);
+    return out;
 }
 
 fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
@@ -468,29 +532,66 @@ test "storage.ha slot store tracks transient replication error until progress" {
     const path = try testPath(alloc, "last-error");
     defer alloc.free(path);
 
-    var store = try SlotStore.open(alloc, path.ptr, .{});
-    defer store.close();
-    try store.createOrUpdate(.{
-        .name = "standby-a",
-        .timeline_id = 1,
-        .restart_lsn = 1,
-        .received_lsn = 1,
-        .applied_lsn = 1,
+    {
+        var store = try SlotStore.open(alloc, path.ptr, .{});
+        defer store.close();
+        try store.createOrUpdate(.{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .restart_lsn = 1,
+            .received_lsn = 1,
+            .applied_lsn = 1,
+        });
+        try store.setLastError("standby-a", "IntentionalApplyFailure");
+
+        const listed = try store.listAlloc(alloc);
+        defer freeSlotList(alloc, listed);
+        try std.testing.expectEqualStrings("IntentionalApplyFailure", listed[0].last_error.?);
+    }
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        var slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
+
+        try reopened.updateProgress("standby-a", 2, 2);
+        slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(slot.last_error == null);
+
+        try reopened.setLastError("standby-a", "SlotInactive");
+        try reopened.clearLastError("standby-a");
+        slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(slot.last_error == null);
+    }
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        const slot = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(slot.last_error == null);
+        try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
+    }
+}
+
+test "storage.ha slot store decodes v1 slot events without last error" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeV1TestEvent(alloc, .{
+        .event_type = .upsert,
+        .state = .{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .restart_lsn = 2,
+            .received_lsn = 3,
+            .applied_lsn = 2,
+        },
     });
-    try store.setLastError("standby-a", "IntentionalApplyFailure");
+    defer alloc.free(encoded);
 
-    const listed = try store.listAlloc(alloc);
-    defer freeSlotList(alloc, listed);
-    try std.testing.expectEqualStrings("IntentionalApplyFailure", listed[0].last_error.?);
-
-    try store.updateProgress("standby-a", 2, 2);
-    const progressed = store.get("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expect(progressed.last_error == null);
-
-    try store.setLastError("standby-a", "SlotInactive");
-    try store.clearLastError("standby-a");
-    const cleared = store.get("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expect(cleared.last_error == null);
+    const event = try decodeEvent(encoded);
+    try std.testing.expectEqual(EventType.upsert, event.event_type);
+    try std.testing.expectEqualStrings("standby-a", event.state.name);
+    try std.testing.expect(event.state.last_error == null);
 }
 
 test "storage.ha slot store computes retention floor from active slots" {
