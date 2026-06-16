@@ -202,7 +202,7 @@ fn executeTypedRemote(
     remote_url: []const u8,
     plan: ha.admin_cli.Plan,
 ) !bool {
-    if (plan.output != .json) return false;
+    if (plan.output == .prometheus) return false;
 
     switch (plan.command) {
         .slot => |command| switch (command.action) {
@@ -213,25 +213,25 @@ fn executeTypedRemote(
                     command.request.initial_lsn,
                 );
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
             .pause => {
                 var out = try client.pauseReplicationSlot(remote_url, command.request.slot_name);
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
             .@"resume" => {
                 var out = try client.resumeReplicationSlot(remote_url, command.request.slot_name);
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
             .drop => {
                 var out = try client.dropReplicationSlot(remote_url, command.request.slot_name);
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
         },
@@ -243,7 +243,7 @@ fn executeTypedRemote(
                     .max_lag_lsn = command.retention_policy.max_lag_lsn,
                 });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .seed => |command| switch (command) {
@@ -253,7 +253,7 @@ fn executeTypedRemote(
                     .manifest_id = request.manifest_id,
                 });
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
             .finish => |request| {
@@ -261,7 +261,7 @@ fn executeTypedRemote(
                     .manifest_path = request.manifest_path,
                 });
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
             .bootstrap => |request| {
@@ -270,7 +270,7 @@ fn executeTypedRemote(
                     .content_root = request.content_root,
                 });
                 defer out.deinit(alloc);
-                writeRemoteBody(io, out.body);
+                try writeTypedRemoteBody(alloc, io, plan.output, out.body);
                 return true;
             },
         },
@@ -281,14 +281,14 @@ fn executeTypedRemote(
                 .sync_policy = command.sync_policy,
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .standby_status => |command| {
             if (command.view != .status) return false;
             var out = try client.getStandbyStatus(remote_url, command.upstream_lsn);
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .commit_check => |command| {
@@ -297,7 +297,7 @@ fn executeTypedRemote(
                 .sync_policy = try syncPolicyOpenApi(command.policy),
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .commit_append => |command| {
@@ -311,7 +311,7 @@ fn executeTypedRemote(
                 .sync_policy = try syncPolicyOpenApi(command.policy),
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .read_check => |request| {
@@ -322,7 +322,7 @@ fn executeTypedRemote(
                 .metadata_applied_lsn = if (request.metadata_applied_lsn) |raw| try i64FromU64(raw) else null,
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .write_check => |command| {
@@ -331,7 +331,7 @@ fn executeTypedRemote(
                 .expected_identity = if (command.request.expected_identity) |identity| try adminIdentity(identity) else null,
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .owner_job_check => |command| {
@@ -341,19 +341,19 @@ fn executeTypedRemote(
                 .expected_identity = if (command.request.expected_identity) |identity| try adminIdentity(identity) else null,
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .fence_acquire => |request| {
             var out = try client.acquireFence(remote_url, try fenceRequestOpenApi(request));
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .fence_current => {
             var out = try client.currentFence(remote_url);
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .promote_assess => |command| {
@@ -364,19 +364,19 @@ fn executeTypedRemote(
                 .use_current_fence = command.use_current_fence,
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .promote_current_fence => {
             var out = try client.promoteWithCurrentFence(remote_url);
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .promote => |command| {
             var out = try client.promote(remote_url, try fenceRequestOpenApi(command.fence));
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .rejoin_assess => |command| {
@@ -389,7 +389,7 @@ fn executeTypedRemote(
                 .receipt = if (command.receipt) |receipt| try fenceReceiptOpenApi(receipt) else null,
             });
             defer out.deinit(alloc);
-            writeRemoteBody(io, out.body);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
         },
         .identify_system,
@@ -404,6 +404,95 @@ fn executeTypedRemote(
 fn writeRemoteBody(io: std.Io, body: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io, body) catch {};
     std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+}
+
+fn writeTypedRemoteBody(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    output: ha.admin_cli.OutputFormat,
+    body: []const u8,
+) !void {
+    switch (output) {
+        .json => writeRemoteBody(io, body),
+        .table => {
+            const table = try renderJsonTableAlloc(alloc, body);
+            defer alloc.free(table);
+            writeRemoteBody(io, table);
+        },
+        .prometheus => unreachable,
+    }
+}
+
+fn renderJsonTableAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendJsonTableValue(alloc, &out, "", parsed.value);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonTableValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    path: []const u8,
+    json_value: std.json.Value,
+) !void {
+    switch (json_value) {
+        .object => |object| {
+            var iter = object.iterator();
+            while (iter.next()) |entry| {
+                const next_path = if (path.len == 0)
+                    try alloc.dupe(u8, entry.key_ptr.*)
+                else
+                    try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
+                defer alloc.free(next_path);
+                try appendJsonTableValue(alloc, out, next_path, entry.value_ptr.*);
+            }
+        },
+        .array => |array| {
+            for (array.items, 0..) |item, idx| {
+                const next_path = try std.fmt.allocPrint(alloc, "{s}[{d}]", .{ path, idx });
+                defer alloc.free(next_path);
+                try appendJsonTableValue(alloc, out, next_path, item);
+            }
+            if (array.items.len == 0) try appendJsonTableLine(alloc, out, path, "[]");
+        },
+        .string => |text| try appendJsonTableLine(alloc, out, path, text),
+        .number_string => |text| try appendJsonTableLine(alloc, out, path, text),
+        .integer => |number| try appendJsonTableLineFmt(alloc, out, path, "{d}", .{number}),
+        .float => |number| try appendJsonTableLineFmt(alloc, out, path, "{d}", .{number}),
+        .bool => |flag| try appendJsonTableLine(alloc, out, path, if (flag) "true" else "false"),
+        .null => try appendJsonTableLine(alloc, out, path, "null"),
+    }
+}
+
+fn appendJsonTableLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    key: []const u8,
+    value_text: []const u8,
+) !void {
+    try out.appendSlice(alloc, key);
+    try out.append(alloc, '=');
+    try out.appendSlice(alloc, value_text);
+    try out.append(alloc, '\n');
+}
+
+fn appendJsonTableLineFmt(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    key: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    try out.appendSlice(alloc, key);
+    try out.append(alloc, '=');
+    const rendered = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+    try out.append(alloc, '\n');
 }
 
 fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPolicy {
@@ -667,7 +756,22 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     }, recorder.executor());
 
     try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
-    try expectContains(recorder.last_uri.?, ha.http_admin.Routes.command);
+    try expectContains(recorder.last_uri.?, admin_api.routes.ha_replication_slots);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
+}
+
+test "ha cmd renders typed JSON responses as dotted table fields" {
+    const alloc = std.testing.allocator;
+    const table = try renderJsonTableAlloc(alloc,
+        \\{"schema_version":1,"slot":{"slot_name":"standby-a","active":true,"restart_lsn":4},"empty":[]}
+    );
+    defer alloc.free(table);
+
+    try expectContains(table, "schema_version=1\n");
+    try expectContains(table, "slot.slot_name=standby-a\n");
+    try expectContains(table, "slot.active=true\n");
+    try expectContains(table, "slot.restart_lsn=4\n");
+    try expectContains(table, "empty=[]\n");
 }
 
 test "ha cmd keeps promotion identity flags in admin command" {
