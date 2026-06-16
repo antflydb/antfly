@@ -62283,6 +62283,20 @@ fn appParityFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) b
     };
 }
 
+fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFamily) bool {
+    return switch (family) {
+        .ddl,
+        .insert,
+        .insert_source,
+        .update,
+        .update_source,
+        .update_joined_source,
+        .merge_mutation,
+        => true,
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62480,6 +62494,9 @@ fn validateAppParityFixtureMetadata(
     if (appParityFixtureFamilyNeedsTableSummary(entry.family) and entry.summary.table_name == null) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.operations != null and !appParityFixtureFamilyAllowsOperationsSummary(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
         return error.TestUnexpectedResult;
     }
@@ -62562,6 +62579,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "usage_records" },
         .plan = "read:query:query:table=usage_records",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "ignored operations summary",
+        .sql = "SELECT lower(valid_at) AS valid_start, upper(valid_at) AS valid_end FROM price_intervals",
+        .family = .query,
+        .summary = .{ .table_name = "price_intervals", .operations = 2 },
+        .plan = "query:table=price_intervals:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=0:order=0:limit=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -68932,7 +68957,7 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "schema temporal range-column boundary query",
             .family = .query,
-            .summary = .{ .table_name = "price_intervals", .expression_predicates = 2, .operations = 2, .order_by = 1, .limit = 5 },
+            .summary = .{ .table_name = "price_intervals", .expression_predicates = 2, .order_by = 1, .limit = 5 },
             .plan = "query:table=price_intervals:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none",
             .apply_setup_sql = &.{
                 "CREATE TABLE price_intervals (sku text NOT NULL, valid_at numrange NOT NULL, price numeric, PRIMARY KEY (sku, valid_at WITHOUT OVERLAPS));",

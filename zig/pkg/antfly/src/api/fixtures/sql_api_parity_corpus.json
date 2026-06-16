@@ -5145,8 +5145,7 @@
         "table_name": "price_intervals",
         "expression_predicates": 2,
         "order_by": 1,
-        "limit": 5,
-        "operations": 2
+        "limit": 5
       },
       "plan": "query:table=price_intervals:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none",
       "apply_setup_sql": ["CREATE TABLE price_intervals (sku text NOT NULL, valid_at numrange NOT NULL, price numeric, PRIMARY KEY (sku, valid_at WITHOUT OVERLAPS));"],
