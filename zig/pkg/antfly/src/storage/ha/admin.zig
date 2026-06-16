@@ -27,6 +27,7 @@ const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
+const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
@@ -175,6 +176,14 @@ pub fn promoteWithFence(
         .fence_token = token,
         .forced = receipt.forced,
     };
+}
+
+pub fn assessFormerPrimaryRejoin(
+    former: rejoin.FormerPrimaryState,
+    receipt: ?fencing.Receipt,
+    policy: rejoin.RejoinPolicy,
+) rejoin.Assessment {
+    return rejoin.assessFormerPrimary(former, receipt, policy);
 }
 
 const TestPaths = struct {
@@ -438,4 +447,43 @@ test "storage.ha admin acquires fence and promotes standby" {
     try std.testing.expectEqual(@as(u64, 3), result.promotion.switch_lsn);
     try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
     try std.testing.expect(!result.forced);
+}
+
+test "storage.ha admin assesses former primary rejoin workflow" {
+    const identity = testIdentity();
+    const former = rejoin.FormerPrimaryState{
+        .node_id = "primary-a",
+        .identity = identity,
+        .last_lsn = 12,
+    };
+    const receipt = fencing.Receipt{
+        .identity = .{
+            .cluster_id = identity.cluster_id,
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+            .timeline_id = 2,
+            .epoch = 2,
+        },
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-b",
+        .parent_timeline_id = identity.timeline_id,
+        .parent_epoch = identity.epoch,
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 10,
+        .observed_lsn = 10,
+        .generation = 1,
+        .forced = false,
+        .token = "token",
+        .reason = "manual",
+    };
+
+    const rewind = assessFormerPrimaryRejoin(former, receipt, .{ .retained_from_lsn = 8 });
+    try std.testing.expectEqual(rejoin.Action.rewind, rewind.action);
+    try std.testing.expectEqual(@as(u64, 10), rewind.fork_lsn);
+    try std.testing.expect(rewind.data_loss_discarded);
+
+    const reseed = assessFormerPrimaryRejoin(former, receipt, .{ .retained_from_lsn = 11 });
+    try std.testing.expectEqual(rejoin.Action.reseed, reseed.action);
+    try std.testing.expectEqual(rejoin.Reason.parent_timeline_wal_expired, reseed.reason);
 }

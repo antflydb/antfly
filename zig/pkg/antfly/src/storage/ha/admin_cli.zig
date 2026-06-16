@@ -25,6 +25,7 @@ const admin = @import("admin.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
+const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
@@ -80,6 +81,12 @@ pub const CommitCheckCommand = struct {
     policy: primary_mod.SyncPolicy,
 };
 
+pub const RejoinAssessCommand = struct {
+    former: rejoin.FormerPrimaryState,
+    receipt: ?fencing.Receipt = null,
+    policy: rejoin.RejoinPolicy,
+};
+
 pub const Command = union(enum) {
     identify_system,
     slot: SlotCommand,
@@ -92,6 +99,7 @@ pub const Command = union(enum) {
     commit_check: CommitCheckCommand,
     read_check: read_gate.Request,
     promote: admin.FencedPromotionRequest,
+    rejoin_assess: RejoinAssessCommand,
 };
 
 pub const Plan = struct {
@@ -176,6 +184,11 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     }
     if (std.mem.eql(u8, root, "promote")) {
         plan.command = .{ .promote = try parsePromote(&cursor) };
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "rejoin")) {
+        plan.command = .{ .rejoin_assess = try parseRejoin(&cursor) };
         try cursor.expectEnd();
         return plan;
     }
@@ -535,6 +548,155 @@ fn parsePromote(cursor: *Cursor) !admin.FencedPromotionRequest {
     };
 }
 
+fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
+    const subcommand = cursor.next() orelse return error.RejoinSubcommandMissing;
+    if (!std.mem.eql(u8, subcommand, "assess")) return error.UnknownRejoinSubcommand;
+
+    var identity = standby_mod.Identity{
+        .cluster_id = 0,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 0,
+        .epoch = 0,
+    };
+    var node_id: ?[]const u8 = null;
+    var last_lsn: ?u64 = null;
+    var policy = rejoin.RejoinPolicy{ .retained_from_lsn = 0 };
+
+    var has_fence = false;
+    var fence_old_primary_id: ?[]const u8 = null;
+    var fence_promoted_node_id: ?[]const u8 = null;
+    var fence_parent_timeline_id: ?u64 = null;
+    var fence_parent_epoch: ?u64 = null;
+    var fence_new_timeline_id: ?u64 = null;
+    var fence_new_epoch: ?u64 = null;
+    var fence_required_lsn: ?u64 = null;
+    var fence_observed_lsn: ?u64 = null;
+    var fence_generation: ?u64 = null;
+    var fence_forced = false;
+    var fence_token: ?[]const u8 = null;
+    var fence_reason: []const u8 = &.{};
+
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--node-id")) {
+            _ = cursor.next();
+            node_id = try cursor.value("--node-id");
+        } else if (std.mem.eql(u8, arg, "--cluster-id")) {
+            _ = cursor.next();
+            identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
+        } else if (std.mem.eql(u8, arg, "--shard-id")) {
+            _ = cursor.next();
+            identity.shard_id = try parseU64(try cursor.value("--shard-id"));
+        } else if (std.mem.eql(u8, arg, "--table-id")) {
+            _ = cursor.next();
+            identity.table_id = try parseU64(try cursor.value("--table-id"));
+        } else if (std.mem.eql(u8, arg, "--timeline-id")) {
+            _ = cursor.next();
+            identity.timeline_id = try parseU64(try cursor.value("--timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--epoch")) {
+            _ = cursor.next();
+            identity.epoch = try parseU64(try cursor.value("--epoch"));
+        } else if (std.mem.eql(u8, arg, "--last-lsn")) {
+            _ = cursor.next();
+            last_lsn = try parseU64(try cursor.value("--last-lsn"));
+        } else if (std.mem.eql(u8, arg, "--retained-from-lsn")) {
+            _ = cursor.next();
+            policy.retained_from_lsn = try parseU64(try cursor.value("--retained-from-lsn"));
+        } else if (std.mem.eql(u8, arg, "--allow-forced-rewind")) {
+            _ = cursor.next();
+            policy.allow_rewind_after_forced_promotion = true;
+        } else if (std.mem.eql(u8, arg, "--fence-old-primary-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_old_primary_id = try cursor.value("--fence-old-primary-id");
+        } else if (std.mem.eql(u8, arg, "--fence-promoted-node-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_promoted_node_id = try cursor.value("--fence-promoted-node-id");
+        } else if (std.mem.eql(u8, arg, "--fence-parent-timeline-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_parent_timeline_id = try parseU64(try cursor.value("--fence-parent-timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--fence-parent-epoch")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_parent_epoch = try parseU64(try cursor.value("--fence-parent-epoch"));
+        } else if (std.mem.eql(u8, arg, "--fence-new-timeline-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_new_timeline_id = try parseU64(try cursor.value("--fence-new-timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--fence-new-epoch")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_new_epoch = try parseU64(try cursor.value("--fence-new-epoch"));
+        } else if (std.mem.eql(u8, arg, "--fence-required-lsn")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_required_lsn = try parseU64(try cursor.value("--fence-required-lsn"));
+        } else if (std.mem.eql(u8, arg, "--fence-observed-lsn")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_observed_lsn = try parseU64(try cursor.value("--fence-observed-lsn"));
+        } else if (std.mem.eql(u8, arg, "--fence-generation")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_generation = try parseU64(try cursor.value("--fence-generation"));
+        } else if (std.mem.eql(u8, arg, "--fence-token")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_token = try cursor.value("--fence-token");
+        } else if (std.mem.eql(u8, arg, "--fence-reason")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_reason = try cursor.value("--fence-reason");
+        } else if (std.mem.eql(u8, arg, "--fence-forced")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_forced = true;
+        } else {
+            break;
+        }
+    }
+
+    if (identity.cluster_id == 0) return error.ClusterIdMissing;
+    if (identity.shard_id == 0) return error.ShardIdMissing;
+    if (identity.table_id == 0) return error.TableIdMissing;
+    if (identity.timeline_id == 0) return error.TimelineIdMissing;
+    if (identity.epoch == 0) return error.EpochMissing;
+
+    const receipt = if (has_fence) fencing.Receipt{
+        .identity = .{
+            .cluster_id = identity.cluster_id,
+            .shard_id = identity.shard_id,
+            .table_id = identity.table_id,
+            .timeline_id = fence_new_timeline_id orelse return error.FenceNewTimelineIdMissing,
+            .epoch = fence_new_epoch orelse return error.FenceNewEpochMissing,
+        },
+        .old_primary_id = fence_old_primary_id orelse return error.FenceOldPrimaryIdMissing,
+        .promoted_node_id = fence_promoted_node_id orelse return error.FencePromotedNodeIdMissing,
+        .parent_timeline_id = fence_parent_timeline_id orelse return error.FenceParentTimelineIdMissing,
+        .parent_epoch = fence_parent_epoch orelse return error.FenceParentEpochMissing,
+        .new_timeline_id = fence_new_timeline_id.?,
+        .new_epoch = fence_new_epoch.?,
+        .required_lsn = fence_required_lsn orelse return error.FenceRequiredLsnMissing,
+        .observed_lsn = fence_observed_lsn orelse return error.FenceObservedLsnMissing,
+        .generation = fence_generation orelse return error.FenceGenerationMissing,
+        .forced = fence_forced,
+        .token = fence_token orelse return error.FenceTokenMissing,
+        .reason = fence_reason,
+    } else null;
+
+    return .{
+        .former = .{
+            .node_id = node_id orelse return error.NodeIdMissing,
+            .identity = identity,
+            .last_lsn = last_lsn orelse return error.LastLsnMissing,
+        },
+        .receipt = receipt,
+        .policy = policy,
+    };
+}
+
 const SyncPolicyBuilder = struct {
     mode: ?primary_mod.DurabilityMode = null,
     selection: primary_mod.StandbySelection = .any,
@@ -822,4 +984,61 @@ test "storage.ha admin cli parses fenced promotion request" {
     try std.testing.expectEqual(@as(u64, 99), fence.observed_lsn);
     try std.testing.expect(fence.force);
     try std.testing.expectEqualStrings("operator-approved", fence.reason);
+}
+
+test "storage.ha admin cli parses former primary rejoin assessment" {
+    const alloc = std.testing.allocator;
+
+    var no_fence = try parse(alloc, &.{
+        "rejoin",              "assess",
+        "--node-id",           "primary-a",
+        "--cluster-id",        "1",
+        "--shard-id",          "2",
+        "--table-id",          "3",
+        "--timeline-id",       "4",
+        "--epoch",             "5",
+        "--last-lsn",          "12",
+        "--retained-from-lsn", "8",
+    });
+    defer no_fence.deinit(alloc);
+    try std.testing.expectEqualStrings("primary-a", no_fence.command.rejoin_assess.former.node_id);
+    try std.testing.expectEqual(@as(u64, 4), no_fence.command.rejoin_assess.former.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), no_fence.command.rejoin_assess.former.last_lsn);
+    try std.testing.expectEqual(@as(u64, 8), no_fence.command.rejoin_assess.policy.retained_from_lsn);
+    try std.testing.expect(no_fence.command.rejoin_assess.receipt == null);
+
+    var fenced = try parse(alloc, &.{
+        "rejoin",                "assess",
+        "--node-id",             "primary-a",
+        "--cluster-id",          "1",
+        "--shard-id",            "2",
+        "--table-id",            "3",
+        "--timeline-id",         "4",
+        "--epoch",               "5",
+        "--last-lsn",            "12",
+        "--retained-from-lsn",   "8",
+        "--allow-forced-rewind", "--fence-old-primary-id",
+        "primary-a",             "--fence-promoted-node-id",
+        "standby-b",             "--fence-parent-timeline-id",
+        "4",                     "--fence-parent-epoch",
+        "5",                     "--fence-new-timeline-id",
+        "6",                     "--fence-new-epoch",
+        "7",                     "--fence-required-lsn",
+        "10",                    "--fence-observed-lsn",
+        "10",                    "--fence-generation",
+        "2",                     "--fence-token",
+        "token",                 "--fence-reason",
+        "operator-approved",     "--fence-forced",
+    });
+    defer fenced.deinit(alloc);
+    const receipt = fenced.command.rejoin_assess.receipt.?;
+    try std.testing.expect(fenced.command.rejoin_assess.policy.allow_rewind_after_forced_promotion);
+    try std.testing.expectEqualStrings("primary-a", receipt.old_primary_id);
+    try std.testing.expectEqualStrings("standby-b", receipt.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 4), receipt.parent_timeline_id);
+    try std.testing.expectEqual(@as(u64, 6), receipt.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 10), receipt.observed_lsn);
+    try std.testing.expectEqual(@as(u64, 2), receipt.generation);
+    try std.testing.expect(receipt.forced);
+    try std.testing.expectEqualStrings("operator-approved", receipt.reason);
 }
