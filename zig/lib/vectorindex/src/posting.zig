@@ -3051,12 +3051,10 @@ pub const PostingStore = struct {
         if (comptime can_use_delta_record_scratch) {
             scratch.resetDeltaRecords();
             var result = DeltaReplayResult{};
+            var use_overlay_plan = false;
             var i: usize = 0;
             while (i < cached.ids.len) : (i += 1) {
                 if (PostingFormat.deltaSequenceGeneration(cached.sequences[i]) <= base_generation) continue;
-                if (scratch.deltaRecordCount() >= compact_sorted_delta_scratch_max_records) {
-                    return try applyCachedDeltaTailIntoScratch(alloc, scratch, member_count, base_generation, cached);
-                }
                 const record = PostingDeltaRecord{
                     .sequence = cached.sequences[i],
                     .op = try cachedPostingDeltaOp(cached.ops[i]),
@@ -3064,29 +3062,54 @@ pub const PostingStore = struct {
                 };
                 result.records += 1;
                 result.max_sequence = @max(result.max_sequence, record.sequence);
-                try ensureDeltaRecordSpareCapacity(alloc, scratch, compact_sorted_delta_scratch_max_records);
-                scratch.appendDeltaRecordAssumeCapacity(record);
+                if (use_overlay_plan) {
+                    try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+                } else if (scratch.deltaRecordCount() < compact_sorted_delta_scratch_max_records) {
+                    try ensureDeltaRecordSpareCapacity(alloc, scratch, compact_sorted_delta_scratch_max_records);
+                    scratch.appendDeltaRecordAssumeCapacity(record);
+                } else {
+                    use_overlay_plan = true;
+                    try applyDeltaRecordsToOverlayPlan(alloc, scratch, scratch.deltaRecordsMut());
+                    try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+                }
             }
-            member_count.* = try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
+            member_count.* = if (use_overlay_plan)
+                try compactMembersWithOverlayPlan(alloc, scratch, member_count.*)
+            else
+                try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, scratch, member_count.*, scratch.deltaRecordsMut());
             return result;
         }
         var compact_ids: [compact_sorted_delta_max_records]VectorId = undefined;
         var compact_ops: [compact_sorted_delta_max_records]PostingDeltaOp = undefined;
         var compact_count: usize = 0;
         var result = DeltaReplayResult{};
+        var use_overlay_plan = false;
         var i: usize = 0;
         while (i < cached.ids.len) : (i += 1) {
             if (PostingFormat.deltaSequenceGeneration(cached.sequences[i]) <= base_generation) continue;
+            const record = PostingDeltaRecord{
+                .sequence = cached.sequences[i],
+                .op = try cachedPostingDeltaOp(cached.ops[i]),
+                .vector_id = cached.ids[i],
+            };
             result.records += 1;
-            result.max_sequence = @max(result.max_sequence, cached.sequences[i]);
-            if (compact_count >= compact_ids.len) {
-                return try applyCachedDeltaTailIntoScratch(alloc, scratch, member_count, base_generation, cached);
+            result.max_sequence = @max(result.max_sequence, record.sequence);
+            if (use_overlay_plan) {
+                try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
+            } else if (compact_count < compact_ids.len) {
+                compact_ids[compact_count] = record.vector_id;
+                compact_ops[compact_count] = record.op;
+                compact_count += 1;
+            } else {
+                use_overlay_plan = true;
+                try applyCompactOpsToOverlayPlan(alloc, scratch, compact_ids[0..compact_count], compact_ops[0..compact_count]);
+                try PostingFormat.applyPostingOverlayRecord(alloc, scratch, record);
             }
-            compact_ids[compact_count] = cached.ids[i];
-            compact_ops[compact_count] = try cachedPostingDeltaOp(cached.ops[i]);
-            compact_count += 1;
         }
-        member_count.* = try applySortedCompactOpsToSortedScratch(alloc, scratch, member_count.*, compact_ids[0..compact_count], compact_ops[0..compact_count]);
+        member_count.* = if (use_overlay_plan)
+            try compactMembersWithOverlayPlan(alloc, scratch, member_count.*)
+        else
+            try applySortedCompactOpsToSortedScratch(alloc, scratch, member_count.*, compact_ids[0..compact_count], compact_ops[0..compact_count]);
         return result;
     }
 
@@ -6276,4 +6299,48 @@ test "posting store canonical query replay uses sorted scratch records for mediu
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_removed_members.count());
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_positions.count());
     try std.testing.expectEqual(@as(u64, records.len), profile.posting_delta_replay_records);
+}
+
+test "posting store cached sorted replay continues with overlay plan after compact threshold" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    var base_members = [_]VectorId{ 1, 2, 3 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+    var member_count: usize = base_members.len;
+
+    const record_count = PostingStore.compact_sorted_delta_scratch_max_records + 8;
+    const sequences = try alloc.alloc(u64, record_count);
+    defer alloc.free(sequences);
+    const ids = try alloc.alloc(VectorId, record_count);
+    defer alloc.free(ids);
+    const ops = try alloc.alloc(u8, record_count);
+    defer alloc.free(ops);
+    for (sequences, ids, ops, 0..) |*sequence, *id, *op, i| {
+        sequence.* = (@as(u64, 2) << 32) | @as(u64, @intCast(i + 1));
+        id.* = @as(VectorId, @intCast(1000 + i));
+        op.* = @intFromEnum(PostingDeltaOp.insert);
+    }
+
+    const result = try PostingStore.applyCachedDeltaTailIntoSortedScratch(
+        alloc,
+        &scratch,
+        &member_count,
+        1,
+        .{
+            .sequences = sequences,
+            .ids = ids,
+            .ops = ops,
+        },
+    );
+
+    try std.testing.expectEqual(@as(usize, record_count), result.records);
+    try std.testing.expectEqual(@as(usize, base_members.len + record_count), member_count);
+    try std.testing.expectEqual(@as(usize, PostingStore.compact_sorted_delta_scratch_max_records), scratch.deltaRecordCount());
+    try std.testing.expectEqual(@as(usize, record_count), scratch.posting_overlay_appended_count);
+    try std.testing.expectEqualSlices(VectorId, base_members[0..], scratch.member_ids[0..base_members.len]);
+    try std.testing.expectEqual(ids[0], scratch.member_ids[base_members.len]);
+    try std.testing.expectEqual(ids[record_count - 1], scratch.member_ids[member_count - 1]);
 }
