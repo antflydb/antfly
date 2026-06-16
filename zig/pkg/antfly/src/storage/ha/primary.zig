@@ -182,13 +182,7 @@ pub const Primary = struct {
 
         const backup_lsn = self.nextLsn();
         const previous_lsn = backup_lsn - 1;
-        try self.slots.createOrUpdate(.{
-            .name = request.slot_name,
-            .timeline_id = self.identity.timeline_id,
-            .restart_lsn = backup_lsn,
-            .received_lsn = previous_lsn,
-            .applied_lsn = previous_lsn,
-        });
+        try self.reserveBaseBackupSlot(request.slot_name, backup_lsn, previous_lsn);
 
         const payload = try backupStartPayload(self.alloc, self.identity, request.slot_name, request.manifest_id, backup_lsn);
         defer self.alloc.free(payload);
@@ -372,6 +366,21 @@ pub const Primary = struct {
         if (!state.active or state.reseed_required) return null;
         if (state.timeline_id != self.identity.timeline_id) return null;
         return state;
+    }
+
+    fn reserveBaseBackupSlot(self: *Primary, slot_name: []const u8, backup_lsn: u64, previous_lsn: u64) !void {
+        if (self.slots.get(slot_name)) |state| {
+            if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
+            if (!state.reseed_required) return error.BaseBackupSlotInUse;
+        }
+
+        try self.slots.createOrUpdate(.{
+            .name = slot_name,
+            .timeline_id = self.identity.timeline_id,
+            .restart_lsn = backup_lsn,
+            .received_lsn = previous_lsn,
+            .applied_lsn = previous_lsn,
+        });
     }
 };
 
@@ -597,6 +606,54 @@ test "storage.ha primary begins base backup with slot retention pin" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(replication_record.RecordKind.backup_start, entries[0].record.kind);
     try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"manifest_id\":\"manifest-1\"") != null);
+}
+
+test "storage.ha primary rejects base backup over healthy existing slot" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-slot-in-use");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    try std.testing.expectError(error.BaseBackupSlotInUse, primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    }));
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), slot.restart_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+}
+
+test "storage.ha primary allows base backup to reset reseed-required slot" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-reseed");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+    try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 2, 2);
+    try primary.slots.markReseedRequired("standby-a");
+
+    const started = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectEqual(@as(u64, 3), started.backup_lsn);
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expect(!slot.reseed_required);
+    try std.testing.expectEqual(@as(u64, 3), slot.restart_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
 }
 
 test "storage.ha primary escapes backup start json payload fields" {

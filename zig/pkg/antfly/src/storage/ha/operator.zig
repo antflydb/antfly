@@ -278,13 +278,6 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         desired_count += 1;
         const slot = findSlot(observed.primary.slots, standby.name) orelse {
             try actions.append(alloc, .{
-                .kind = .create_slot,
-                .standby_name = standby.name,
-                .slot_name = standby.name,
-                .target_lsn = standby.initial_lsn orelse observed.primary.current_lsn,
-                .reason = "SlotMissing",
-            });
-            try actions.append(alloc, .{
                 .kind = .seed_standby,
                 .standby_name = standby.name,
                 .slot_name = standby.name,
@@ -823,10 +816,9 @@ test "storage.ha operator plans slots and standby bootstrap" {
     }, .{ .primary = primary });
     defer plan.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), plan.actions.len);
-    try std.testing.expectEqual(ActionKind.create_slot, plan.actions[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.seed_standby, plan.actions[0].kind);
     try std.testing.expectEqual(@as(?u64, 3), plan.actions[0].target_lsn);
-    try std.testing.expectEqual(ActionKind.seed_standby, plan.actions[1].kind);
     try std.testing.expectEqual(@as(usize, 1), plan.desired_standby_count);
     try std.testing.expectEqual(@as(usize, 0), plan.healthy_standby_count);
     const available = condition(plan, .available) orelse return error.TestExpectedEqual;

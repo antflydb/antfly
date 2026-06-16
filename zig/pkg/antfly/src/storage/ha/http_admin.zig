@@ -136,6 +136,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.FenceStoreUnavailable,
         error.FenceAlreadyHeld,
         error.FenceReceiptMissing,
+        error.BaseBackupSlotInUse,
         error.SlotAlreadyExists,
         error.SlotInactive,
         error.SlotRequiresReseed,
