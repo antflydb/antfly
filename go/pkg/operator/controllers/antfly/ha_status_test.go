@@ -1012,6 +1012,27 @@ func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
 	}
 }
 
+func TestReconcileHAFencingLeaseSkipsWhilePrimaryAdminReachable(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:         antflyv1.HADurabilityModeRemoteApply,
+		Required:     1,
+		StandbyNames: []string{"standby-a"},
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no fencing lease while primary admin remains observable, got lease=%#v err=%v", lease, err)
+	}
+}
+
 func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
@@ -1020,6 +1041,8 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 		StandbyNames: []string{"standby-a"},
 	}
 	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
 	reconciler := testHAReconciler(t, cluster)
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
@@ -1053,12 +1076,6 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 		t.Fatalf("observe fencing status: %v", err)
 	}
 	reconciler.updateHAStatusAndConditions(cluster)
-	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
-		t.Fatal("expected reconciled Kubernetes lease to be insufficient while primary admin has not failed")
-	}
-	cluster.Status.HAStatus.PrimaryAdminReachable = false
-	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
-	reconciler.updateHAStatusAndConditions(cluster)
 	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
 		t.Fatal("expected reconciled Kubernetes lease and primary admin failure to satisfy automatic promotion fencing gate")
 	}
@@ -1068,7 +1085,9 @@ func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{Name: "standby-b"})
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
-		PrimaryLSN: 12,
+		PrimaryLSN:            12,
+		PrimaryAdminReachable: false,
+		PrimaryAdminLastError: "primary admin timeout",
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "standby-a",
 			SlotName:    "standby-a",
@@ -1116,7 +1135,9 @@ func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 func TestReconcileHAFencingLeaseSkipsWithoutSafeCandidate(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
-		PrimaryLSN: 12,
+		PrimaryLSN:            12,
+		PrimaryAdminReachable: false,
+		PrimaryAdminLastError: "primary admin timeout",
 		Standbys: []antflyv1.HAStandbyStatus{{
 			Name:        "standby-a",
 			SlotName:    "standby-a",
@@ -1144,6 +1165,8 @@ func TestReconcileHAFencingLeaseSkipsWithoutPromotionBoundary(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Status.HAStatus = caughtUpHAStatus()
 	cluster.Status.HAStatus.PrimaryLSN = 0
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
 	reconciler := testHAReconciler(t, cluster)
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {

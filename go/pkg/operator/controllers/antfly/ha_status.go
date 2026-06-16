@@ -1111,6 +1111,9 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 	if ha == nil || ha.AutomaticFailover == nil || status == nil {
 		return ""
 	}
+	if !haPrimaryAdminUnavailable(status) {
+		return ""
+	}
 	if !haPromotionBoundaryReady(status) {
 		return ""
 	}
