@@ -170,6 +170,22 @@ pub const Standby = struct {
     pub fn receive(self: *Standby, record: replication_record.Record) !u64 {
         try self.validateRecord(record);
         if (record.lsn <= self.progress.received_lsn) return error.RecordAlreadyReceived;
+
+        const durable_received_lsn = self.receive_log.lastLsn();
+        if (record.lsn <= durable_received_lsn) {
+            if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
+            var existing = (try self.receive_log.entryAt(self.alloc, record.lsn)) orelse return error.MissingReceivedRecord;
+            defer existing.deinit(self.alloc);
+            try self.validateRecord(existing.record);
+            if (!recordsEqual(existing.record, record)) return error.ConflictingReceivedRecord;
+
+            var next = self.progress;
+            next.received_lsn = record.lsn;
+            try self.persistProgress(next);
+            self.progress = next;
+            return record.lsn;
+        }
+
         if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
 
         const lsn = try self.receive_log.append(self.alloc, record);
@@ -417,6 +433,21 @@ fn recordMatchesIdentity(record: replication_record.RecordView, identity: Identi
         record.epoch == identity.epoch;
 }
 
+fn recordsEqual(left: replication_record.RecordView, right: replication_record.RecordView) bool {
+    return left.kind == right.kind and
+        left.payload_codec == right.payload_codec and
+        left.flags == right.flags and
+        left.cluster_id == right.cluster_id and
+        left.shard_id == right.shard_id and
+        left.table_id == right.table_id and
+        left.timeline_id == right.timeline_id and
+        left.epoch == right.epoch and
+        left.lsn == right.lsn and
+        left.previous_lsn == right.previous_lsn and
+        left.commit_timestamp_ns == right.commit_timestamp_ns and
+        std.mem.eql(u8, left.payload, right.payload);
+}
+
 fn validateIdentityMatches(actual: Identity, expected: Identity) !void {
     if (actual.cluster_id != expected.cluster_id) return error.WrongCluster;
     if (actual.shard_id != expected.shard_id) return error.WrongShard;
@@ -660,6 +691,29 @@ test "storage.ha standby rejects wrong identity and receive gaps" {
     try std.testing.expectError(error.UnexpectedRecordLsn, standby.receive(baseRecord(identity, 2, "gap")));
     _ = try standby.receive(baseRecord(identity, 1, "one"));
     try std.testing.expectError(error.RecordAlreadyReceived, standby.receive(baseRecord(identity, 1, "duplicate")));
+}
+
+test "storage.ha standby receive retry reconciles durable record when progress lags" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "receive-retry");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+
+    const first = baseRecord(identity, 1, "one");
+    _ = try standby.receive(first);
+    standby.progress = .{};
+
+    try std.testing.expectEqual(@as(u64, 1), try standby.receive(first));
+    try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(u64, 1), standby.receive_log.lastLsn());
+
+    standby.progress = .{};
+    try std.testing.expectError(error.ConflictingReceivedRecord, standby.receive(baseRecord(identity, 1, "different")));
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
 }
 
 test "storage.ha standby does not advance applied lsn when apply fails" {
