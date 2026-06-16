@@ -125,6 +125,9 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
         .{ std.testing.random_seed, nonce },
     );
     defer alloc.free(raw);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
     return try alloc.dupeZ(u8, raw);
 }
 

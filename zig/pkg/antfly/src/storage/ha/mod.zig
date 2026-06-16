@@ -14,8 +14,10 @@
 
 pub const replication_record = @import("replication_record.zig");
 pub const replication_log = @import("replication_log.zig");
+pub const slot_store = @import("slot_store.zig");
 
 test {
     _ = replication_record;
     _ = replication_log;
+    _ = slot_store;
 }
