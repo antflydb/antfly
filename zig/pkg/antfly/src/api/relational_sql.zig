@@ -62222,6 +62222,10 @@ fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool 
     };
 }
 
+fn appParityFixtureConflictWhereSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
+    return expected and appParityPlanHasExactUsizeToken(entry.plan, ":conflict_where=", 1);
+}
+
 fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
     return entry.family == .explain and
         std.mem.startsWith(u8, entry.plan, "explain:kind=write:") and
@@ -62650,6 +62654,11 @@ fn validateAppParityFixtureMetadata(
     if (entry.summary.conflict_where != null and !appParityFixtureAllowsConflictWhereSummary(entry)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.conflict_where) |conflict_where| {
+        if (!appParityFixtureConflictWhereSummaryMatchesPlan(entry, conflict_where)) {
+            return error.TestUnexpectedResult;
+        }
+    }
     if ((entry.summary.patch_expressions != null or
         entry.summary.increment_expressions != null or
         entry.summary.json_set_expressions != null) and
@@ -63046,6 +63055,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .conflict_where = true },
         .plan = "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale insert conflict guard summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .conflict_where = true },
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=0:returning_expr=0:op_set=1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "explicit false conflict guard summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .conflict_where = false },
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=0:returning_expr=0:op_set=1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid insert conflict guard summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE usage_records.status = 'old'",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .conflict_where = true },
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=0:returning_expr=0:op_set=1:conflict_where=1",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "query aggregate summary",

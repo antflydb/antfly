@@ -5259,6 +5259,12 @@ match `returning_rows`, source-query writes and merge mutations must match
 image contract instead of allowing stale fixture metadata to claim result-shape
 coverage.
 
+Conflict guard summaries are also positive evidence. A fixture may carry
+`conflict_where` only for insert or insert-source plans whose fingerprint
+contains `conflict_where=1`; absence of the summary is the only representation
+for unguarded conflict actions. This keeps `ON CONFLICT ... WHERE` coverage tied
+to the typed proposed/existing-row predicate contract.
+
 Row-claim summaries are tied to lockable query sources. `row_claim_skip_locked`
 is valid only on row-query plans, join/lateral plans that assert the left
 lockable source, mutation-source write plans, joined mutation-source write plans,
