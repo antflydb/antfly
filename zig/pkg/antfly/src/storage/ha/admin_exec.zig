@@ -87,6 +87,8 @@ pub const Result = union(enum) {
     commit_check: commit_gate.GateResult,
     commit_append: commit_gate.AppendResult,
     read_check: read_gate.Decision,
+    fence_acquire: admin.FenceReceiptResult,
+    fence_current: ?admin.FenceReceiptResult,
     promote: admin.FencedPromotionResult,
     rejoin_assess: rejoin.Assessment,
 
@@ -98,6 +100,8 @@ pub const Result = union(enum) {
             .seed_bootstrap => |*result| result.deinit(alloc),
             .primary_status => |*snapshot| snapshot.deinit(alloc),
             .primary_metrics => |*snapshot| snapshot.deinit(alloc),
+            .fence_acquire => |*result| result.deinit(alloc),
+            .fence_current => |*maybe_result| if (maybe_result.*) |*result| result.deinit(alloc),
             .promote => |*result| result.deinit(alloc),
             else => {},
         }
@@ -225,6 +229,17 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendOptionalU64Line(alloc, &out, "serve_lsn", decision.serve_lsn);
             try appendU64Line(alloc, &out, "missing_lsn_count", decision.missing_lsn_count);
         },
+        .fence_acquire => |fence_result| {
+            try appendFenceReceiptLines(alloc, &out, fence_result.receipt);
+        },
+        .fence_current => |maybe_fence_result| {
+            if (maybe_fence_result) |fence_result| {
+                try appendBoolLine(alloc, &out, "held", true);
+                try appendFenceReceiptLines(alloc, &out, fence_result.receipt);
+            } else {
+                try appendBoolLine(alloc, &out, "held", false);
+            }
+        },
         .promote => |promotion_result| {
             try appendPromotionAssessmentLines(alloc, &out, "assessment", promotion_result.assessment);
             try appendU64Line(alloc, &out, "promotion.switch_lsn", promotion_result.promotion.switch_lsn);
@@ -309,6 +324,12 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         },
         .read_check => |request| .{
             .read_check = try admin.evaluateStandbyRead(try requireStandby(ctx), request),
+        },
+        .fence_acquire => |request| .{
+            .fence_acquire = try admin.acquirePromotionFence(alloc, try requireFenceStore(ctx), request),
+        },
+        .fence_current => .{
+            .fence_current = try admin.currentPromotionFence(alloc, try requireFenceStore(ctx)),
         },
         .promote => |request| .{
             .promote = try admin.promoteWithFence(alloc, try requireFenceStore(ctx), try requireStandby(ctx), request),
@@ -517,6 +538,8 @@ fn resultName(result: Result) []const u8 {
         .commit_check => "commit_check",
         .commit_append => "commit_append",
         .read_check => "read_check",
+        .fence_acquire => "fence_acquire",
+        .fence_current => "fence_current",
         .promote => "promote",
         .rejoin_assess => "rejoin_assess",
     };
@@ -737,6 +760,26 @@ fn appendPromotionAssessmentLines(
     try appendPrefixedBoolLine(alloc, out, prefix, "requires_fencing", assessment.requires_fencing);
     try appendPrefixedBoolLine(alloc, out, prefix, "requires_force", assessment.requires_force);
     try appendPrefixedBoolLine(alloc, out, prefix, "can_promote", assessment.can_promote);
+}
+
+fn appendFenceReceiptLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    receipt: fencing.Receipt,
+) !void {
+    try appendIdentityLines(alloc, out, "identity", receipt.identity);
+    try appendLine(alloc, out, "old_primary_id", receipt.old_primary_id);
+    try appendLine(alloc, out, "promoted_node_id", receipt.promoted_node_id);
+    try appendU64Line(alloc, out, "parent_timeline_id", receipt.parent_timeline_id);
+    try appendU64Line(alloc, out, "parent_epoch", receipt.parent_epoch);
+    try appendU64Line(alloc, out, "new_timeline_id", receipt.new_timeline_id);
+    try appendU64Line(alloc, out, "new_epoch", receipt.new_epoch);
+    try appendU64Line(alloc, out, "required_lsn", receipt.required_lsn);
+    try appendU64Line(alloc, out, "observed_lsn", receipt.observed_lsn);
+    try appendU64Line(alloc, out, "generation", receipt.generation);
+    try appendBoolLine(alloc, out, "forced", receipt.forced);
+    try appendLine(alloc, out, "token", receipt.token);
+    try appendLine(alloc, out, "reason", receipt.reason);
 }
 
 fn appendIdentityLines(
@@ -1177,6 +1220,58 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var read = try execute(alloc, .{ .standby = &standby }, read_plan);
     defer read.deinit(alloc);
     try std.testing.expectEqual(read_gate.Action.serve_standby, read.read_check.action);
+
+    var fence_plan = try admin_cli.parse(alloc, &.{
+        "--table",
+        "fence",
+        "acquire",
+        "--cluster-id",
+        "100",
+        "--shard-id",
+        "10",
+        "--table-id",
+        "20",
+        "--timeline-id",
+        "1",
+        "--epoch",
+        "1",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-a",
+        "--new-timeline-id",
+        "2",
+        "--new-epoch",
+        "2",
+        "--required-lsn",
+        "1",
+        "--observed-lsn",
+        "1",
+        "--reason",
+        "operator-approved",
+    });
+    defer fence_plan.deinit(alloc);
+    var fenced = try execute(alloc, .{ .fence_store = &fence_store }, fence_plan);
+    defer fenced.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), fenced.fence_acquire.receipt.generation);
+    try std.testing.expectEqualStrings("standby-a", fenced.fence_acquire.receipt.promoted_node_id);
+
+    const fence_table = try renderTableAlloc(alloc, fenced);
+    defer alloc.free(fence_table);
+    try expectContains(fence_table, "result=fence_acquire\n");
+    try expectContains(fence_table, "promoted_node_id=standby-a\n");
+    try expectContains(fence_table, "generation=1\n");
+
+    var current_fence_plan = try admin_cli.parse(alloc, &.{ "--table", "fence", "current" });
+    defer current_fence_plan.deinit(alloc);
+    var current_fence = try execute(alloc, .{ .fence_store = &fence_store }, current_fence_plan);
+    defer current_fence.deinit(alloc);
+    try std.testing.expect(current_fence.fence_current != null);
+    const current_fence_table = try renderTableAlloc(alloc, current_fence);
+    defer alloc.free(current_fence_table);
+    try expectContains(current_fence_table, "result=fence_current\n");
+    try expectContains(current_fence_table, "held=true\n");
+    try expectContains(current_fence_table, "old_primary_id=primary-a\n");
 
     var promote_plan = try admin_cli.parse(alloc, &.{
         "promote",

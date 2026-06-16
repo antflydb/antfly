@@ -125,6 +125,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.PrimaryUnavailable,
         error.StandbyUnavailable,
         error.FenceStoreUnavailable,
+        error.FenceAlreadyHeld,
         => 409,
         error.SlotNotFound,
         error.BackupStartNotFound,
@@ -139,6 +140,13 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.ManifestFileMissing,
         error.ManifestFileCrcMismatch,
         error.ManifestFileSizeMismatch,
+        error.InvalidOldPrimaryId,
+        error.InvalidPromotedNodeId,
+        error.InvalidTimelineSwitch,
+        error.InvalidFenceLsn,
+        error.FenceRequiresForce,
+        error.FenceFieldTooLong,
+        error.PromotionNotAllowed,
         => 400,
         else => 500,
     };
@@ -157,12 +165,14 @@ const TestPaths = struct {
     primary_slots: [:0]u8,
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
+    fence_wal: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
+        alloc.free(self.fence_wal);
     }
 };
 
@@ -176,6 +186,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_log);
     const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
     defer alloc.free(standby_progress);
+    const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
+    defer alloc.free(fence_wal);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -183,12 +195,14 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
         .primary_slots = try alloc.dupeZ(u8, primary_slots),
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
+        .fence_wal = try alloc.dupeZ(u8, fence_wal),
     };
 }
 
@@ -220,8 +234,10 @@ test "storage.ha http admin serves health and command endpoint" {
     defer primary.close();
     var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
     defer standby.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
 
-    var server = Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    var server = Server.init(alloc, .{ .primary = &primary, .standby = &standby, .fence_store = &fence_store });
     defer server.deinit();
 
     var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
@@ -253,6 +269,29 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(stream.body, "result=stream_once\n");
     try expectContains(stream.body, "received_count=1\n");
     try expectContains(stream.body, "applied_lsn=1\n");
+
+    var fence = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"fence\",\"acquire\",\"--cluster-id\",\"100\",\"--shard-id\",\"10\",\"--table-id\",\"20\",\"--timeline-id\",\"1\",\"--epoch\",\"1\",\"--old-primary-id\",\"primary-a\",\"--promoted-node-id\",\"standby-a\",\"--new-timeline-id\",\"2\",\"--new-epoch\",\"2\",\"--required-lsn\",\"1\",\"--observed-lsn\",\"1\",\"--reason\",\"http-admin-test\"]}",
+    });
+    defer fence.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), fence.status);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", fence.content_type.?);
+    try expectContains(fence.body, "result=fence_acquire\n");
+    try expectContains(fence.body, "promoted_node_id=standby-a\n");
+
+    var current_fence = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"fence\",\"current\"]}",
+    });
+    defer current_fence.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), current_fence.status);
+    try expectContains(current_fence.body, "result=fence_current\n");
+    try expectContains(current_fence.body, "held=true\n");
 }
 
 test "storage.ha http admin returns route method and command errors" {

@@ -382,6 +382,28 @@ pub fn adminCommandForAction(
                 .{ options.manifest_id_prefix, standby_name, action.target_lsn orelse 0 },
             );
         },
+        .acquire_fence => {
+            const promoted_node_id = options.promoted_node_id orelse action.standby_name orelse return error.PromotedNodeIdMissing;
+            const old_primary_id = options.old_primary_id orelse return error.OldPrimaryIdMissing;
+            try appendArg(alloc, &argv, "fence");
+            try appendArg(alloc, &argv, "acquire");
+            try appendIdentityArgs(alloc, &argv, &owned_args, identity);
+            try appendArg(alloc, &argv, "--old-primary-id");
+            try appendArg(alloc, &argv, old_primary_id);
+            try appendArg(alloc, &argv, "--promoted-node-id");
+            try appendArg(alloc, &argv, promoted_node_id);
+            try appendArg(alloc, &argv, "--new-timeline-id");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_timeline_id orelse return error.NewTimelineIdMissing});
+            try appendArg(alloc, &argv, "--new-epoch");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_epoch orelse return error.NewEpochMissing});
+            try appendArg(alloc, &argv, "--required-lsn");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.RequiredLsnMissing});
+            try appendArg(alloc, &argv, "--observed-lsn");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.ObservedLsnMissing});
+            if (options.force) try appendArg(alloc, &argv, "--force");
+            try appendArg(alloc, &argv, "--reason");
+            try appendArg(alloc, &argv, options.reason);
+        },
         .promote_standby => {
             const promoted_node_id = options.promoted_node_id orelse action.standby_name orelse return error.PromotedNodeIdMissing;
             const old_primary_id = options.old_primary_id orelse return error.OldPrimaryIdMissing;
@@ -403,7 +425,6 @@ pub fn adminCommandForAction(
             try appendArg(alloc, &argv, "--reason");
             try appendArg(alloc, &argv, options.reason);
         },
-        .acquire_fence,
         .update_primary_endpoint,
         .demote_former_primary,
         .rewind_former_primary,
@@ -822,6 +843,30 @@ test "storage.ha operator renders executable admin commands for slot and seed ac
 test "storage.ha operator renders executable admin command for fenced promotion" {
     const alloc = std.testing.allocator;
     const identity = primary_mod.Identity{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 };
+
+    var acquire = (try adminCommandForAction(alloc, .{
+        .kind = .acquire_fence,
+        .standby_name = "standby-a",
+        .target_lsn = 12,
+        .reason = "AutomaticFailoverReady",
+    }, identity, .{
+        .old_primary_id = "primary-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .reason = "operator-approved",
+    })).?;
+    defer acquire.deinit(alloc);
+
+    var acquire_plan = try acquire.parsePlan(alloc);
+    defer acquire_plan.deinit(alloc);
+    const acquire_fence = acquire_plan.command.fence_acquire;
+    try std.testing.expectEqual(@as(u64, 100), acquire_fence.identity.cluster_id);
+    try std.testing.expectEqualStrings("primary-a", acquire_fence.old_primary_id);
+    try std.testing.expectEqualStrings("standby-a", acquire_fence.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 2), acquire_fence.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), acquire_fence.required_lsn);
+    try std.testing.expectEqual(@as(u64, 12), acquire_fence.observed_lsn);
+    try std.testing.expectEqualStrings("operator-approved", acquire_fence.reason);
 
     var command = (try adminCommandForAction(alloc, .{
         .kind = .promote_standby,

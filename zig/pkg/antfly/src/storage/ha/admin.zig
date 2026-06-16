@@ -59,6 +59,15 @@ pub const FencedPromotionRequest = struct {
     fence: fencing.FenceRequest,
 };
 
+pub const FenceReceiptResult = struct {
+    receipt: fencing.Receipt,
+
+    pub fn deinit(self: *FenceReceiptResult, alloc: Allocator) void {
+        fencing.freeReceipt(alloc, self.receipt);
+        self.* = undefined;
+    }
+};
+
 pub const FencedPromotionResult = struct {
     assessment: status.PromotionAssessment,
     promotion: standby_mod.PromotionResult,
@@ -153,6 +162,25 @@ pub fn assessPromotion(
     return status.assessPromotion(standby, check);
 }
 
+pub fn acquirePromotionFence(
+    alloc: Allocator,
+    fence_store: *fencing.Store,
+    request: fencing.FenceRequest,
+) !FenceReceiptResult {
+    const receipt = try fence_store.acquirePromotionFence(request);
+    defer fencing.freeReceipt(fence_store.alloc, receipt);
+    return .{ .receipt = try cloneReceiptAlloc(alloc, receipt) };
+}
+
+pub fn currentPromotionFence(
+    alloc: Allocator,
+    fence_store: *const fencing.Store,
+) !?FenceReceiptResult {
+    const receipt = (try fence_store.current(fence_store.alloc)) orelse return null;
+    defer fencing.freeReceipt(fence_store.alloc, receipt);
+    return .{ .receipt = try cloneReceiptAlloc(alloc, receipt) };
+}
+
 pub fn promoteWithFence(
     alloc: Allocator,
     fence_store: *fencing.Store,
@@ -184,6 +212,29 @@ pub fn assessFormerPrimaryRejoin(
     policy: rejoin.RejoinPolicy,
 ) rejoin.Assessment {
     return rejoin.assessFormerPrimary(former, receipt, policy);
+}
+
+fn cloneReceiptAlloc(alloc: Allocator, receipt: fencing.Receipt) !fencing.Receipt {
+    var cloned = fencing.Receipt{
+        .identity = receipt.identity,
+        .old_primary_id = try alloc.dupe(u8, receipt.old_primary_id),
+        .promoted_node_id = &.{},
+        .parent_timeline_id = receipt.parent_timeline_id,
+        .parent_epoch = receipt.parent_epoch,
+        .new_timeline_id = receipt.new_timeline_id,
+        .new_epoch = receipt.new_epoch,
+        .required_lsn = receipt.required_lsn,
+        .observed_lsn = receipt.observed_lsn,
+        .generation = receipt.generation,
+        .forced = receipt.forced,
+        .token = &.{},
+        .reason = &.{},
+    };
+    errdefer fencing.freeReceipt(alloc, cloned);
+    cloned.promoted_node_id = try alloc.dupe(u8, receipt.promoted_node_id);
+    cloned.token = try alloc.dupe(u8, receipt.token);
+    cloned.reason = try alloc.dupe(u8, receipt.reason);
+    return cloned;
 }
 
 const TestPaths = struct {

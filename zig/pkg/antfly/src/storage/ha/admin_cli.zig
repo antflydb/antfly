@@ -110,6 +110,8 @@ pub const Command = union(enum) {
     commit_check: CommitCheckCommand,
     commit_append: CommitAppendCommand,
     read_check: read_gate.Request,
+    fence_acquire: fencing.FenceRequest,
+    fence_current,
     promote: admin.FencedPromotionRequest,
     rejoin_assess: RejoinAssessCommand,
 };
@@ -208,6 +210,11 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     }
     if (std.mem.eql(u8, root, "read")) {
         plan.command = .{ .read_check = try parseReadCheck(&cursor) };
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "fence")) {
+        plan.command = try parseFence(&cursor);
         try cursor.expectEnd();
         return plan;
     }
@@ -574,7 +581,22 @@ fn parseReadCheck(cursor: *Cursor) !read_gate.Request {
     return request;
 }
 
+fn parseFence(cursor: *Cursor) !Command {
+    const subcommand = cursor.next() orelse return error.FenceSubcommandMissing;
+    if (std.mem.eql(u8, subcommand, "acquire")) {
+        return .{ .fence_acquire = try parseFenceRequest(cursor) };
+    }
+    if (std.mem.eql(u8, subcommand, "current") or std.mem.eql(u8, subcommand, "status")) {
+        return .fence_current;
+    }
+    return error.UnknownFenceSubcommand;
+}
+
 fn parsePromote(cursor: *Cursor) !admin.FencedPromotionRequest {
+    return .{ .fence = try parseFenceRequest(cursor) };
+}
+
+fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
     var identity = standby_mod.Identity{
         .cluster_id = 0,
         .shard_id = 0,
@@ -643,17 +665,15 @@ fn parsePromote(cursor: *Cursor) !admin.FencedPromotionRequest {
     if (identity.epoch == 0) return error.EpochMissing;
 
     return .{
-        .fence = fencing.FenceRequest{
-            .identity = identity,
-            .old_primary_id = old_primary_id orelse return error.OldPrimaryIdMissing,
-            .promoted_node_id = promoted_node_id orelse return error.PromotedNodeIdMissing,
-            .new_timeline_id = new_timeline_id orelse return error.NewTimelineIdMissing,
-            .new_epoch = new_epoch orelse return error.NewEpochMissing,
-            .required_lsn = required_lsn orelse return error.RequiredLsnMissing,
-            .observed_lsn = observed_lsn orelse return error.ObservedLsnMissing,
-            .force = force,
-            .reason = reason,
-        },
+        .identity = identity,
+        .old_primary_id = old_primary_id orelse return error.OldPrimaryIdMissing,
+        .promoted_node_id = promoted_node_id orelse return error.PromotedNodeIdMissing,
+        .new_timeline_id = new_timeline_id orelse return error.NewTimelineIdMissing,
+        .new_epoch = new_epoch orelse return error.NewEpochMissing,
+        .required_lsn = required_lsn orelse return error.RequiredLsnMissing,
+        .observed_lsn = observed_lsn orelse return error.ObservedLsnMissing,
+        .force = force,
+        .reason = reason,
     };
 }
 
@@ -1135,6 +1155,49 @@ test "storage.ha admin cli parses stream ack commit and read checks" {
 
 test "storage.ha admin cli parses fenced promotion request" {
     const alloc = std.testing.allocator;
+    var acquired = try parse(alloc, &.{
+        "fence",
+        "acquire",
+        "--cluster-id",
+        "1",
+        "--shard-id",
+        "2",
+        "--table-id",
+        "3",
+        "--timeline-id",
+        "4",
+        "--epoch",
+        "5",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-b",
+        "--new-timeline-id",
+        "6",
+        "--new-epoch",
+        "7",
+        "--required-lsn",
+        "100",
+        "--observed-lsn",
+        "99",
+        "--force",
+        "--reason",
+        "operator-approved",
+    });
+    defer acquired.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), acquired.command.fence_acquire.identity.cluster_id);
+    try std.testing.expectEqualStrings("primary-a", acquired.command.fence_acquire.old_primary_id);
+    try std.testing.expectEqualStrings("standby-b", acquired.command.fence_acquire.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 6), acquired.command.fence_acquire.new_timeline_id);
+    try std.testing.expect(acquired.command.fence_acquire.force);
+
+    var current = try parse(alloc, &.{ "fence", "current" });
+    defer current.deinit(alloc);
+    switch (current.command) {
+        .fence_current => {},
+        else => return error.TestExpectedEqual,
+    }
+
     var plan = try parse(alloc, &.{
         "promote",
         "--cluster-id",
