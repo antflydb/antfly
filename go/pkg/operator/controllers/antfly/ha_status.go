@@ -30,6 +30,7 @@ type haPlannedAction struct {
 	StandbyName     string
 	SlotName        string
 	TargetLSN       uint64
+	RouteTo         string
 	FenceAuthority  antflyv1.HAFencingAuthority
 	FenceHolder     string
 	FenceGeneration uint64
@@ -44,6 +45,7 @@ type haPlan struct {
 	ReadSafeStandbyCount      int32
 	ReseedRequiredCount       int32
 	FencingReady              bool
+	PromotionStandbyName      string
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -194,12 +196,14 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	}
 
 	plan.FencingReady = haFencingReady(ha, status)
-	plan.AutomaticPromotionAllowed = haAutomaticPromotionAllowed(ha, status, plan)
+	plan.PromotionStandbyName = haAutomaticPromotionStandby(ha, status, plan)
+	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
 	if plan.AutomaticPromotionAllowed {
 		fence := status.Fencing
 		plan.Actions = append(plan.Actions,
 			haPlannedAction{
 				Kind:            haActionAcquireFence,
+				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       status.PrimaryLSN,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
@@ -208,6 +212,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 			haPlannedAction{
 				Kind:            haActionPromoteStandby,
+				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       status.PrimaryLSN,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
@@ -216,7 +221,9 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 			haPlannedAction{
 				Kind:            haActionUpdatePrimaryRoute,
+				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       status.PrimaryLSN,
+				RouteTo:         plan.PromotionStandbyName,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
@@ -267,6 +274,7 @@ func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActi
 			StandbyName:     action.StandbyName,
 			SlotName:        action.SlotName,
 			TargetLSN:       action.TargetLSN,
+			RouteTo:         action.RouteTo,
 			FenceAuthority:  action.FenceAuthority,
 			FenceHolder:     action.FenceHolder,
 			FenceGeneration: action.FenceGeneration,
@@ -360,25 +368,32 @@ func setHACondition(cluster *antflyv1.AntflyCluster, conditionType string, statu
 	})
 }
 
-func haAutomaticPromotionAllowed(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, plan haPlan) bool {
+func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, plan haPlan) string {
 	if ha == nil || ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled {
-		return false
+		return ""
 	}
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
-		return false
+		return ""
 	}
 	if !plan.FencingReady {
-		return false
+		return ""
 	}
 	if haSyncPolicyDegraded(ha, plan) {
-		return false
+		return ""
 	}
 	if status == nil {
-		return false
+		return ""
+	}
+	fenceHolder := status.Fencing.Holder
+	if !desiredStandbyNamed(ha, fenceHolder) {
+		return ""
 	}
 	maxLag := ha.AutomaticFailover.MaximumLagLSN
 	requireApply := ha.AutomaticFailover.RequireRemoteApply == nil || *ha.AutomaticFailover.RequireRemoteApply
 	for _, standby := range status.Standbys {
+		if standby.Name != fenceHolder && standby.SlotName != fenceHolder {
+			continue
+		}
 		if !standby.Active || standby.ReseedRequired {
 			continue
 		}
@@ -391,9 +406,9 @@ func haAutomaticPromotionAllowed(ha *antflyv1.HighAvailabilitySpec, status *antf
 		if standbySafeReadLSN(standby)+maxLag < status.PrimaryLSN {
 			continue
 		}
-		return true
+		return fenceHolder
 	}
-	return false
+	return ""
 }
 
 func standbyReadSafe(status *antflyv1.HAStatus, standby antflyv1.HAStandbyStatus) bool {
@@ -431,6 +446,9 @@ func haFencingReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus
 	if fencing.Holder == "" || fencing.Generation == 0 {
 		return false
 	}
+	if !desiredStandbyNamed(ha, fencing.Holder) {
+		return false
+	}
 	return true
 }
 
@@ -466,6 +484,18 @@ func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {
 
 func standbyDesired(standby antflyv1.HAStandbySpec) bool {
 	return standby.Desired == nil || *standby.Desired
+}
+
+func desiredStandbyNamed(ha *antflyv1.HighAvailabilitySpec, name string) bool {
+	if ha == nil || name == "" {
+		return false
+	}
+	for _, standby := range ha.Standbys {
+		if standbyDesired(standby) && standby.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func standbySlotName(standby antflyv1.HAStandbySpec) string {

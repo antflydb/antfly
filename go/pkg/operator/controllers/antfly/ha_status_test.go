@@ -170,6 +170,23 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		t.Fatalf("expected fence-not-ready condition for mismatched authority, got %#v", failover)
 	}
 
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		Ready:      true,
+		Holder:     "standby-b",
+		Generation: 1,
+		Reason:     "WrongHolder",
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked with undesired fence holder")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAFencingNotReady {
+		t.Fatalf("expected fence-not-ready condition for undesired holder, got %#v", failover)
+	}
+
 	cluster.Status.HAStatus.Fencing = readyFencingStatus()
 	reconciler.updateHAStatusAndConditions(cluster)
 
@@ -184,8 +201,14 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if len(plan.Actions) != 4 {
 		t.Fatalf("expected fenced promotion action chain, got %#v", plan.Actions)
 	}
+	if plan.PromotionStandbyName != "standby-a" {
+		t.Fatalf("expected promotion standby standby-a, got %q", plan.PromotionStandbyName)
+	}
 	if plan.Actions[0].Kind != haActionAcquireFence || plan.Actions[1].Kind != haActionPromoteStandby {
 		t.Fatalf("unexpected promotion actions: %#v", plan.Actions)
+	}
+	if plan.Actions[1].StandbyName != "standby-a" || plan.Actions[2].RouteTo != "standby-a" {
+		t.Fatalf("expected promotion and route actions to target standby-a, got %#v", plan.Actions)
 	}
 	if len(cluster.Status.HAStatus.PlannedActions) != 4 {
 		t.Fatalf("expected fenced promotion action chain in status, got %#v", cluster.Status.HAStatus.PlannedActions)
@@ -193,6 +216,10 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionAcquireFence) ||
 		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionPromoteStandby) {
 		t.Fatalf("unexpected promotion action status: %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[2].RouteTo != "standby-a" {
+		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||

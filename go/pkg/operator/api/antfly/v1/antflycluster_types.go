@@ -1328,6 +1328,8 @@ type HAPlannedActionStatus struct {
 
 	TargetLSN uint64 `json:"targetLSN,omitempty"`
 
+	RouteTo string `json:"routeTo,omitempty"`
+
 	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
 
 	FenceHolder string `json:"fenceHolder,omitempty"`
