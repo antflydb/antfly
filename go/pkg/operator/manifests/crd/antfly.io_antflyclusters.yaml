@@ -8829,6 +8829,10 @@ spec:
                         type: string
                       desiredTarget:
                         type: string
+                      fenceAuthority:
+                        description: HAFencingAuthority selects the authority used
+                          before automatic promotion.
+                        type: string
                       fenceGeneration:
                         format: int64
                         type: integer

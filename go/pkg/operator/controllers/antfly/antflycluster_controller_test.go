@@ -582,6 +582,7 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 					StandbyName:     "standby-a",
 					RouteFrom:       "primary",
 					RouteTo:         "standby-a",
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 					FenceGeneration: 7,
 				}},
 			},
@@ -606,6 +607,7 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteSelectorAnnotation, "true"))
 	g.Expect(observed.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "standby-a"))
@@ -615,6 +617,7 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 
 	g.Expect(reconciler.observeHAPrimaryRouteStatus(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceGeneration).To(Equal(uint64(7)))
 }
 
@@ -667,6 +670,7 @@ func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t 
 					StandbyName:     "standby-a",
 					RouteFrom:       "primary",
 					RouteTo:         "standby-a",
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 					FenceGeneration: 7,
 				}},
 			},
@@ -686,6 +690,7 @@ func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t 
 	observed := &corev1.Service{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
+	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Stale).To(BeFalse())
 }

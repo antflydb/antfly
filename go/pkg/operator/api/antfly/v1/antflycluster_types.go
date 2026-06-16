@@ -1557,6 +1557,8 @@ type HAPrimaryRouteStatus struct {
 
 	DesiredTarget string `json:"desiredTarget,omitempty"`
 
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
 
 	Stale bool `json:"stale,omitempty"`

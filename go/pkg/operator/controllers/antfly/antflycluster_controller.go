@@ -74,6 +74,7 @@ const (
 	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
+	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
 	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
 	haPrimaryRouteSelectorAnnotation        = "antfly.io/ha-primary-route-selector-applied"
 
@@ -3643,6 +3644,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Contex
 		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
 	}
 	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = target
+	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = antflyv1.HAFencingAuthority(strings.TrimSpace(service.Annotations[haPrimaryRouteFenceAuthorityAnnotation]))
 	if raw := strings.TrimSpace(service.Annotations[haPrimaryRouteFenceGenerationAnnotation]); raw != "" {
 		if fenceGeneration, err := strconv.ParseUint(raw, 10, 64); err == nil {
 			cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = fenceGeneration
@@ -3988,6 +3990,11 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 		service.Annotations = map[string]string{}
 	}
 	service.Annotations[haPrimaryRouteTargetAnnotation] = action.RouteTo
+	if action.FenceAuthority != "" {
+		service.Annotations[haPrimaryRouteFenceAuthorityAnnotation] = string(action.FenceAuthority)
+	} else {
+		delete(service.Annotations, haPrimaryRouteFenceAuthorityAnnotation)
+	}
 	if action.FenceGeneration > 0 {
 		service.Annotations[haPrimaryRouteFenceGenerationAnnotation] = strconv.FormatUint(action.FenceGeneration, 10)
 	}
@@ -4001,6 +4008,8 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 		return err
 	}
 	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = action.RouteTo
+	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = action.FenceAuthority
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = action.FenceGeneration
 	cluster.Status.HAStatus.PrimaryRoute.Stale = false
 	cluster.Status.HAStatus.PrimaryRoute.Action = "None"
 	cluster.Status.HAStatus.PrimaryRoute.Reason = "PrimaryRouteCurrent"
