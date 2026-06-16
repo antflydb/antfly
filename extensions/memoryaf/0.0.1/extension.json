@@ -1,0 +1,118 @@
+{
+  "manifest_api_version": "extensions/v1",
+  "name": "memoryaf",
+  "version": "0.0.1",
+  "kind": "extension",
+  "description": "Reference MemoryAF extension package with MCP tool handlers compiled to WASM.",
+  "digest": "sha256:memoryaf-0.0.1-reference",
+  "trusted": false,
+  "relocatable": true,
+  "capabilities_requested": [
+    {
+      "name": "db:read",
+      "scope": "memoryaf"
+    },
+    {
+      "name": "db:write",
+      "scope": "memoryaf"
+    },
+    {
+      "name": "ai:embed",
+      "scope": "memoryaf"
+    },
+    {
+      "name": "mcp:tool",
+      "scope": "memoryaf"
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "wasm",
+      "path": "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+      "digest": "sha256:build-memoryaf-0.0.1-wasm"
+    },
+    {
+      "kind": "asset",
+      "path": "wit/antfly-extension.wit",
+      "digest": "sha256:source-memoryaf-0.0.1-wit"
+    }
+  ],
+  "install": {
+    "scopes_supported": [
+      "cluster",
+      "table"
+    ],
+    "shapes": [
+      {
+        "name": "memory_record",
+        "kind": "document",
+        "version": "1",
+        "schema_json": "{\"default_type\":\"memory\",\"enforce_types\":true,\"document_schemas\":{\"memory\":{\"schema\":{\"type\":\"object\",\"required\":[\"content\",\"memory_type\"],\"properties\":{\"id\":{\"type\":\"keyword\"},\"content\":{\"type\":\"text\"},\"memory_type\":{\"type\":\"keyword\"},\"project\":{\"type\":\"keyword\"},\"tags\":{\"type\":\"keyword\"},\"visibility\":{\"type\":\"keyword\"},\"created_by\":{\"type\":\"keyword\"},\"source_backend\":{\"type\":\"keyword\"},\"source_id\":{\"type\":\"keyword\"},\"session_id\":{\"type\":\"keyword\"},\"agent_id\":{\"type\":\"keyword\"},\"device_id\":{\"type\":\"keyword\"},\"created_at\":{\"type\":\"keyword\"},\"updated_at\":{\"type\":\"keyword\"}}}}}}"
+      },
+      {
+        "name": "memory_embedding",
+        "kind": "generated_artifact",
+        "version": "1",
+        "schema_json": "{\"type\":\"object\",\"properties\":{\"vector\":{\"type\":\"array\",\"items\":{\"type\":\"number\"}},\"model\":{\"type\":\"string\"}}}"
+      },
+      {
+        "name": "store_memory_request",
+        "kind": "tool_schema",
+        "version": "1",
+        "schema_json": "{\"type\":\"object\",\"required\":[\"content\"],\"properties\":{\"content\":{\"type\":\"string\"},\"memory_type\":{\"type\":\"string\",\"enum\":[\"episodic\",\"semantic\",\"procedural\"]},\"project\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"visibility\":{\"type\":\"string\",\"enum\":[\"team\",\"private\"]},\"source_backend\":{\"type\":\"string\"},\"source_id\":{\"type\":\"string\"},\"session_id\":{\"type\":\"string\"},\"agent_id\":{\"type\":\"string\"},\"device_id\":{\"type\":\"string\"},\"ephemeral\":{\"type\":\"boolean\"}}}"
+      },
+      {
+        "name": "search_memories_request",
+        "kind": "tool_schema",
+        "version": "1",
+        "schema_json": "{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\"},\"project\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"memory_type\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"expand_graph\":{\"type\":\"boolean\"},\"scope\":{\"type\":\"string\",\"enum\":[\"session\",\"agent\",\"device\"]},\"session_id\":{\"type\":\"string\"},\"agent_id\":{\"type\":\"string\"},\"device_id\":{\"type\":\"string\"},\"ephemeral\":{\"type\":\"boolean\"}}}"
+      },
+      {
+        "name": "list_memories_request",
+        "kind": "tool_schema",
+        "version": "1",
+        "schema_json": "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"memory_type\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"session_id\":{\"type\":\"string\"},\"agent_id\":{\"type\":\"string\"},\"device_id\":{\"type\":\"string\"},\"ephemeral\":{\"type\":\"boolean\"}}}"
+      }
+    ],
+    "objects": [
+      {
+        "kind": "generated_artifact",
+        "name": "memory_embedding",
+        "shape": "memory_embedding",
+        "config_json": "{\"kind\":\"embedding\",\"source_shape\":\"memory_record\",\"source_field\":\"content\",\"model\":\"antfly/default-embedding\"}"
+      },
+      {
+        "kind": "index",
+        "name": "memory_text",
+        "config_json": "{\"type\":\"full_text\",\"fields\":[\"content\",\"project\",\"tags\"]}"
+      },
+      {
+        "kind": "mcp_tool",
+        "name": "store_memory",
+        "shape": "store_memory_request",
+        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/store_memory\"}"
+      },
+      {
+        "kind": "mcp_tool",
+        "name": "search_memories",
+        "shape": "search_memories_request",
+        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/search_memories\"}"
+      },
+      {
+        "kind": "mcp_tool",
+        "name": "list_memories",
+        "shape": "list_memories_request",
+        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/list_memories\"}"
+      }
+    ],
+    "runtimes": [
+      {
+        "name": "memoryaf_wasm",
+        "mode": "wasm",
+        "artifact": "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        "config_json": "{\"abi\":\"antfly-extension/v1\",\"entrypoint\":\"call-tool\",\"wit\":\"wit/antfly-extension.wit\"}"
+      }
+    ],
+    "config_schema_json": "{\"type\":\"object\",\"properties\":{\"default_project\":{\"type\":\"string\"},\"default_visibility\":{\"type\":\"string\",\"enum\":[\"team\",\"private\"]},\"embedding_model\":{\"type\":\"string\"},\"ephemeral_ttl\":{\"type\":\"string\"}}}"
+  }
+}

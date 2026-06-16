@@ -3602,6 +3602,209 @@ pub const InferenceEmbeddingUsage = struct {
     total_tokens: i64,
 };
 
+pub const PackageKind = enum {
+    extension,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .extension => "extension",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "extension", .extension },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Path-safe extension or package identifier.
+pub const ExtensionIdentifier = []const u8;
+
+/// Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
+pub const CapabilityName = []const u8;
+
+pub const ExtensionScopeKind = enum {
+    cluster,
+    table,
+    embedded_db,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .cluster => "cluster",
+            .table => "table",
+            .embedded_db => "embedded_db",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "cluster", .cluster },
+            .{ "table", .table },
+            .{ "embedded_db", .embedded_db },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const PackageArtifact = struct {
+    kind: []const u8,
+    path: []const u8,
+    digest: ?[]const u8 = null,
+};
+
+pub const DataShapeKind = enum {
+    document,
+    row,
+    generated_artifact,
+    extension_relation,
+    endpoint_schema,
+    tool_schema,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document => "document",
+            .row => "row",
+            .generated_artifact => "generated_artifact",
+            .extension_relation => "extension_relation",
+            .endpoint_schema => "endpoint_schema",
+            .tool_schema => "tool_schema",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document", .document },
+            .{ "row", .row },
+            .{ "generated_artifact", .generated_artifact },
+            .{ "extension_relation", .extension_relation },
+            .{ "endpoint_schema", .endpoint_schema },
+            .{ "tool_schema", .tool_schema },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ExtensionObjectKind = enum {
+    data_shape,
+    table_schema,
+    extension_relation,
+    generated_artifact,
+    index,
+    enrichment,
+    resolver,
+    mcp_tool,
+    query_function,
+    api_endpoint,
+    a2a_agent,
+    auth_policy,
+    workflow,
+    maintenance_task,
+    provider_config,
+    text_analyzer,
+    text_tokenizer,
+    provider_adapter,
+    connector,
+    index_backend,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .data_shape => "data_shape",
+            .table_schema => "table_schema",
+            .extension_relation => "extension_relation",
+            .generated_artifact => "generated_artifact",
+            .index => "index",
+            .enrichment => "enrichment",
+            .resolver => "resolver",
+            .mcp_tool => "mcp_tool",
+            .query_function => "query_function",
+            .api_endpoint => "api_endpoint",
+            .a2a_agent => "a2a_agent",
+            .auth_policy => "auth_policy",
+            .workflow => "workflow",
+            .maintenance_task => "maintenance_task",
+            .provider_config => "provider_config",
+            .text_analyzer => "text_analyzer",
+            .text_tokenizer => "text_tokenizer",
+            .provider_adapter => "provider_adapter",
+            .connector => "connector",
+            .index_backend => "index_backend",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "data_shape", .data_shape },
+            .{ "table_schema", .table_schema },
+            .{ "extension_relation", .extension_relation },
+            .{ "generated_artifact", .generated_artifact },
+            .{ "index", .index },
+            .{ "enrichment", .enrichment },
+            .{ "resolver", .resolver },
+            .{ "mcp_tool", .mcp_tool },
+            .{ "query_function", .query_function },
+            .{ "api_endpoint", .api_endpoint },
+            .{ "a2a_agent", .a2a_agent },
+            .{ "auth_policy", .auth_policy },
+            .{ "workflow", .workflow },
+            .{ "maintenance_task", .maintenance_task },
+            .{ "provider_config", .provider_config },
+            .{ "text_analyzer", .text_analyzer },
+            .{ "text_tokenizer", .text_tokenizer },
+            .{ "provider_adapter", .provider_adapter },
+            .{ "connector", .connector },
+            .{ "index_backend", .index_backend },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const UpdateManifestRef = struct {
+    from_version: []const u8,
+    to_version: []const u8,
+    path: []const u8,
+    digest: ?[]const u8 = null,
+};
+
+pub const UpdateExtensionRequest = struct {
+    target_version: ?[]const u8 = null,
+    dry_run: ?bool = null,
+};
+
+pub const DropExtensionRequest = struct {
+    mode: ?[]const u8 = null,
+    dry_run: ?bool = null,
+};
+
+pub const ConfigureExtensionRequest = struct {
+    config_json: []const u8,
+};
+
+pub const ExtensionError = struct {
+    @"error": []const u8,
+};
+
 pub const ExtractionToken = struct {
     text: []const u8,
     box: ?[]const i64 = null,
@@ -4874,6 +5077,51 @@ pub const InferenceschemasConfig = struct {
     style: ?InferenceStyle = null,
 };
 
+pub const PackageDependency = struct {
+    name: ExtensionIdentifier,
+    version_requirement: ?[]const u8 = null,
+    optional: ?bool = null,
+};
+
+pub const RuntimeDecl = struct {
+    name: ExtensionIdentifier,
+    mode: ?[]const u8 = null,
+    artifact: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
+
+pub const DropExtensionResponse = struct {
+    dropped: ExtensionIdentifier,
+    dry_run: bool,
+};
+
+pub const Capability = struct {
+    name: CapabilityName,
+    scope: ?[]const u8 = null,
+};
+
+pub const ExtensionScope = struct {
+    kind: ExtensionScopeKind,
+    /// Required when kind is table.
+    table_name: ?[]const u8 = null,
+};
+
+pub const DataShapeDecl = struct {
+    name: ExtensionIdentifier,
+    kind: DataShapeKind,
+    version: ?[]const u8 = null,
+    /// JSON object encoded as a string until the public shape language is finalized.
+    schema_json: ?[]const u8 = null,
+};
+
+pub const ExtensionObjectDecl = struct {
+    kind: ExtensionObjectKind,
+    name: ExtensionIdentifier,
+    shape: ?[]const u8 = null,
+    table_name: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
+
 pub const ExtractionStructureSchema = struct {
     fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
 };
@@ -5654,6 +5902,46 @@ pub const InferenceConfig = struct {
     log: ?InferenceschemasConfig = null,
 };
 
+pub const InstalledExtension = struct {
+    name: ExtensionIdentifier,
+    package_name: ExtensionIdentifier,
+    package_version: []const u8,
+    package_digest: []const u8,
+    scope: ExtensionScope,
+    config_json: ?[]const u8 = null,
+    granted_capabilities: ?[]const Capability = null,
+    installed_at_epoch_ms: ?i64 = null,
+    status: []const u8,
+};
+
+pub const ExtensionMember = struct {
+    extension_name: ExtensionIdentifier,
+    scope: ExtensionScope,
+    object_kind: ExtensionObjectKind,
+    object_name: ExtensionIdentifier,
+    table_name: ?[]const u8 = null,
+    shape_kind: ?DataShapeKind = null,
+    shape_name: ?[]const u8 = null,
+    shape_version: ?[]const u8 = null,
+    owner_metadata_json: ?[]const u8 = null,
+};
+
+pub const InstallExtensionRequest = struct {
+    version: ?[]const u8 = null,
+    scope: ExtensionScope,
+    config_json: ?[]const u8 = null,
+    grants: ?[]const Capability = null,
+    dry_run: ?bool = null,
+};
+
+pub const InstallManifest = struct {
+    scopes_supported: []const ExtensionScopeKind,
+    shapes: ?[]const DataShapeDecl = null,
+    objects: ?[]const ExtensionObjectDecl = null,
+    runtimes: ?[]const RuntimeDecl = null,
+    config_schema_json: ?[]const u8 = null,
+};
+
 pub const ExtractionSchema = struct {
     entities: ?[]const []const u8 = null,
     relations: ?[]const ExtractionRelationSchema = null,
@@ -5903,6 +6191,24 @@ pub const InferenceChunkResponse = struct {
     usage: InferenceGenerateUsage,
     /// Whether result was served from cache
     cache_hit: bool,
+};
+
+pub const PackageManifest = struct {
+    manifest_api_version: []const u8,
+    name: ExtensionIdentifier,
+    version: []const u8,
+    kind: PackageKind,
+    description: ?[]const u8 = null,
+    digest: []const u8,
+    antfly_min_version: ?[]const u8 = null,
+    antfly_max_version: ?[]const u8 = null,
+    trusted: ?bool = null,
+    relocatable: ?bool = null,
+    capabilities_requested: ?[]const Capability = null,
+    dependencies: ?[]const PackageDependency = null,
+    artifacts: ?[]const PackageArtifact = null,
+    install: InstallManifest,
+    updates: ?[]const UpdateManifestRef = null,
 };
 
 pub const ExtractionResponse = struct {

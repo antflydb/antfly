@@ -1,0 +1,669 @@
+openapi: 3.0.3
+info:
+  version: v1
+  title: Antfly Extensions API
+  description: Package catalog and installed extension lifecycle API.
+  contact:
+    name: Antfly
+    url: https://github.com/antflydb/antfly
+servers:
+  - url: /
+    description: Antfly server root; extension routes are served under /extensions/v1
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+tags:
+  - name: Packages
+    x-displayName: Packages
+    description: Signed installable artifacts known to Antfly.
+  - name: Installed
+    x-displayName: Installed Extensions
+    description: PostgreSQL-style installed extension lifecycle.
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    PackageKind:
+      type: string
+      enum: ["extension"]
+
+    ExtensionIdentifier:
+      type: string
+      pattern: "^[A-Za-z0-9_.-]+$"
+      description: Path-safe extension or package identifier.
+
+    CapabilityName:
+      type: string
+      pattern: "^[A-Za-z0-9_.:-]+$"
+      description: Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
+
+    ExtensionScopeKind:
+      type: string
+      enum: ["cluster", "table", "embedded_db"]
+
+    ExtensionScope:
+      type: object
+      properties:
+        kind:
+          $ref: "#/components/schemas/ExtensionScopeKind"
+        table_name:
+          type: string
+          description: Required when kind is table.
+      required:
+        - kind
+
+    Capability:
+      type: object
+      properties:
+        name:
+          $ref: "#/components/schemas/CapabilityName"
+          example: "read:table"
+        scope:
+          type: string
+          example: "memoryaf.memories"
+      required:
+        - name
+
+    PackageDependency:
+      type: object
+      properties:
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+          example: "antfly_core"
+        version_requirement:
+          type: string
+          example: ">=1.0.0"
+        optional:
+          type: boolean
+          default: false
+      required:
+        - name
+
+    PackageArtifact:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: ["manifest", "wasm", "native_library", "asset"]
+        path:
+          type: string
+          example: "extension.json"
+        digest:
+          type: string
+          example: "sha256:abc123"
+      required:
+        - kind
+        - path
+
+    DataShapeKind:
+      type: string
+      enum: ["document", "row", "generated_artifact", "extension_relation", "endpoint_schema", "tool_schema"]
+
+    DataShapeDecl:
+      type: object
+      properties:
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+          example: "memory_record"
+        kind:
+          $ref: "#/components/schemas/DataShapeKind"
+        version:
+          type: string
+          default: "1"
+        schema_json:
+          type: string
+          description: JSON object encoded as a string until the public shape language is finalized.
+          default: "{}"
+      required:
+        - name
+        - kind
+
+    ExtensionObjectKind:
+      type: string
+      enum:
+        - data_shape
+        - table_schema
+        - extension_relation
+        - generated_artifact
+        - index
+        - enrichment
+        - resolver
+        - mcp_tool
+        - query_function
+        - api_endpoint
+        - a2a_agent
+        - auth_policy
+        - workflow
+        - maintenance_task
+        - provider_config
+        - text_analyzer
+        - text_tokenizer
+        - provider_adapter
+        - connector
+        - index_backend
+
+    ExtensionObjectDecl:
+      type: object
+      properties:
+        kind:
+          $ref: "#/components/schemas/ExtensionObjectKind"
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        shape:
+          type: string
+        table_name:
+          type: string
+        config_json:
+          type: string
+          default: "{}"
+      required:
+        - kind
+        - name
+
+    RuntimeDecl:
+      type: object
+      properties:
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        mode:
+          type: string
+          enum: ["manifest_only", "antfly_api_template", "workflow", "wasm", "sidecar", "native"]
+          default: "manifest_only"
+        artifact:
+          type: string
+        config_json:
+          type: string
+          default: "{}"
+      required:
+        - name
+
+    UpdateManifestRef:
+      type: object
+      properties:
+        from_version:
+          type: string
+          example: "1.0.0"
+        to_version:
+          type: string
+          example: "1.1.0"
+        path:
+          type: string
+          example: "updates/1.0.0-1.1.0.json"
+        digest:
+          type: string
+          example: "sha256:def456"
+      required:
+        - from_version
+        - to_version
+        - path
+
+    InstallManifest:
+      type: object
+      properties:
+        scopes_supported:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionScopeKind"
+        shapes:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataShapeDecl"
+        objects:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionObjectDecl"
+        runtimes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuntimeDecl"
+        config_schema_json:
+          type: string
+          default: "{}"
+      required:
+        - scopes_supported
+
+    PackageManifest:
+      type: object
+      properties:
+        manifest_api_version:
+          type: string
+          enum: ["extensions/v1"]
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        version:
+          type: string
+        kind:
+          $ref: "#/components/schemas/PackageKind"
+        description:
+          type: string
+        digest:
+          type: string
+        antfly_min_version:
+          type: string
+        antfly_max_version:
+          type: string
+        trusted:
+          type: boolean
+          default: false
+        relocatable:
+          type: boolean
+          default: false
+        capabilities_requested:
+          type: array
+          items:
+            $ref: "#/components/schemas/Capability"
+        dependencies:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageDependency"
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageArtifact"
+        install:
+          $ref: "#/components/schemas/InstallManifest"
+        updates:
+          type: array
+          items:
+            $ref: "#/components/schemas/UpdateManifestRef"
+      required:
+        - manifest_api_version
+        - name
+        - version
+        - kind
+        - digest
+        - install
+
+    InstalledExtension:
+      type: object
+      properties:
+        name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        package_name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        package_version:
+          type: string
+        package_digest:
+          type: string
+        scope:
+          $ref: "#/components/schemas/ExtensionScope"
+        config_json:
+          type: string
+          default: "{}"
+        granted_capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/Capability"
+        installed_at_epoch_ms:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: ["installing", "ready", "disabled", "updating", "dropping", "error_state"]
+      required:
+        - name
+        - package_name
+        - package_version
+        - package_digest
+        - scope
+        - status
+
+    ExtensionMember:
+      type: object
+      properties:
+        extension_name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        scope:
+          $ref: "#/components/schemas/ExtensionScope"
+        object_kind:
+          $ref: "#/components/schemas/ExtensionObjectKind"
+        object_name:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        table_name:
+          type: string
+        shape_kind:
+          $ref: "#/components/schemas/DataShapeKind"
+        shape_name:
+          type: string
+        shape_version:
+          type: string
+        owner_metadata_json:
+          type: string
+          default: "{}"
+      required:
+        - extension_name
+        - scope
+        - object_kind
+        - object_name
+
+    InstallExtensionRequest:
+      type: object
+      properties:
+        version:
+          type: string
+        scope:
+          $ref: "#/components/schemas/ExtensionScope"
+        config_json:
+          type: string
+          default: "{}"
+        grants:
+          type: array
+          items:
+            $ref: "#/components/schemas/Capability"
+        dry_run:
+          type: boolean
+          default: false
+      required:
+        - scope
+
+    UpdateExtensionRequest:
+      type: object
+      properties:
+        target_version:
+          type: string
+        dry_run:
+          type: boolean
+          default: false
+
+    DropExtensionRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: ["restrict", "cascade"]
+          default: "restrict"
+        dry_run:
+          type: boolean
+          default: false
+
+    DropExtensionResponse:
+      type: object
+      properties:
+        dropped:
+          $ref: "#/components/schemas/ExtensionIdentifier"
+        dry_run:
+          type: boolean
+          default: false
+      required:
+        - dropped
+        - dry_run
+
+    ConfigureExtensionRequest:
+      type: object
+      properties:
+        config_json:
+          type: string
+          default: "{}"
+      required:
+        - config_json
+
+    ExtensionError:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+paths:
+  /extensions/v1/packages:
+    get:
+      tags: ["Packages"]
+      operationId: listExtensionPackages
+      summary: List available packages.
+      responses:
+        "200":
+          description: Available package manifests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PackageManifest"
+
+  /extensions/v1/packages/{name}:
+    get:
+      tags: ["Packages"]
+      operationId: getExtensionPackage
+      summary: Get available package metadata.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      responses:
+        "200":
+          description: Package metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "404":
+          description: Package not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtensionError"
+
+  /extensions/v1/packages/{name}/versions/{version}:
+    get:
+      tags: ["Packages"]
+      operationId: getExtensionPackageVersion
+      summary: Get a specific immutable package version.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Package version metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+
+  /extensions/v1/installed:
+    get:
+      tags: ["Installed"]
+      operationId: listInstalledExtensions
+      summary: List installed extensions.
+      responses:
+        "200":
+          description: Installed extensions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/InstalledExtension"
+
+  /extensions/v1/installed/{name}:
+    post:
+      tags: ["Installed"]
+      operationId: installExtension
+      summary: Install a package as an extension.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InstallExtensionRequest"
+      responses:
+        "200":
+          description: Installed extension or dry-run result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstalledExtension"
+    get:
+      tags: ["Installed"]
+      operationId: getInstalledExtension
+      summary: Get an installed extension.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      responses:
+        "200":
+          description: Installed extension.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstalledExtension"
+
+  /extensions/v1/installed/{name}/update:
+    post:
+      tags: ["Installed"]
+      operationId: updateInstalledExtension
+      summary: Update an installed extension.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateExtensionRequest"
+      responses:
+        "200":
+          description: Updated extension or dry-run result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstalledExtension"
+
+  /extensions/v1/installed/{name}/drop:
+    post:
+      tags: ["Installed"]
+      operationId: dropInstalledExtension
+      summary: Drop an installed extension.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DropExtensionRequest"
+      responses:
+        "200":
+          description: Drop result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DropExtensionResponse"
+
+  /extensions/v1/installed/{name}/objects:
+    get:
+      tags: ["Installed"]
+      operationId: listInstalledExtensionObjects
+      summary: List objects owned by an installed extension.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      responses:
+        "200":
+          description: Extension member objects.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ExtensionMember"
+
+  /extensions/v1/installed/{name}/enable:
+    post:
+      tags: ["Installed"]
+      operationId: enableInstalledExtension
+      summary: Enable a disabled installed extension.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      responses:
+        "200":
+          description: Enabled extension.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstalledExtension"
+
+  /extensions/v1/installed/{name}/disable:
+    post:
+      tags: ["Installed"]
+      operationId: disableInstalledExtension
+      summary: Disable an installed extension without dropping owned state.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      responses:
+        "200":
+          description: Disabled extension.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstalledExtension"
+
+  /extensions/v1/installed/{name}/config:
+    put:
+      tags: ["Installed"]
+      operationId: configureInstalledExtension
+      summary: Replace installed extension configuration.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ExtensionIdentifier"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfigureExtensionRequest"
+      responses:
+        "200":
+          description: Reconfigured extension.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstalledExtension"

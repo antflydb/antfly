@@ -436,8 +436,37 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
+      - name: Set up Rust WASI target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build MemoryAF extension package
+        run: cargo build --manifest-path extensions/memoryaf/0.0.1/Cargo.toml --release --target wasm32-wasip2
+
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Install Wasmtime C API
+        env:
+          WASMTIME_VERSION: v45.0.2
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 ;;
+            aarch64|arm64) arch=aarch64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="wasmtime-${WASMTIME_VERSION}-${arch}-linux-c-api.tar.xz"
+          root="/tmp/wasmtime-c-api"
+          rm -rf "$root"
+          mkdir -p "$root"
+          curl -L "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${archive}" -o "/tmp/${archive}"
+          tar -xJf "/tmp/${archive}" -C "$root" --strip-components=1
+          lib="$(find "$root/lib" -maxdepth 1 -name 'libwasmtime.so*' | sort | head -n 1)"
+          test -n "$lib"
+          echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly full E2E
         working-directory: zig
