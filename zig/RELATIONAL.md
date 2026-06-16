@@ -4631,7 +4631,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    case-fold plus stable unary hash unique expression keys.
    Ordinary and expression secondary indexes persist their stable index identity
    separately from the indexed column name so rebuild ranges, promotion, and
-   drops do not conflate SQL index names with physical column keys. `DROP INDEX`
+   drops do not conflate SQL index names with physical column keys. SQL/API
+   parity fingerprints include the generated expression operation for
+   generated-index plans, so `lower`, `upper`, `md5`, `concat`, and `concat_ws`
+   indexes cannot collapse to the same golden plan. `DROP INDEX`
    now lowers to a typed catalog mutation for named unique indexes, generated
    expression indexes, and ordinary secondary indexes, with `IF EXISTS`
    no-op semantics for missing indexes and missing catalogs. `CREATE INDEX IF NOT EXISTS` is also represented in the

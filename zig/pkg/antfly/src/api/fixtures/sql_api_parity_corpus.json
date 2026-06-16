@@ -301,7 +301,7 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=concat",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);"],
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE INDEX usage_records_tenant_status_idx ON usage_records (concat(tenant_id, ':', status));"
@@ -314,7 +314,7 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=concat_ws",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);"],
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE INDEX usage_records_tenant_status_ws_idx ON usage_records (concat_ws(':', tenant_id, status));"
@@ -327,9 +327,33 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=lower",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));"
+    },
+    {
+      "name": "schema upper expression secondary index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=upper",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "sql": "CREATE INDEX usage_records_upper_email_idx ON usage_records (upper(email));"
+    },
+    {
+      "name": "schema md5 expression secondary index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=md5",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "sql": "CREATE INDEX usage_records_md5_email_idx ON usage_records (md5(email));"
     },
     {
       "name": "schema json gin secondary index",

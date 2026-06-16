@@ -57655,6 +57655,11 @@ fn appParityGeneratedExpressionCount(plan: CreateIndexPlan) usize {
     return if (plan.generated_expression != null) 1 else 0;
 }
 
+fn appParityGeneratedExpressionOp(plan: CreateIndexPlan) ?[]const u8 {
+    const generated = plan.generated_expression orelse return null;
+    return @tagName(generated.op);
+}
+
 fn appendNonZeroU32FingerprintAlloc(
     alloc: std.mem.Allocator,
     owned_base: []u8,
@@ -58934,7 +58939,11 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     "ddl:create_index:table={s}:columns={d}:expr={d}:generated_expr={d}:where={d}:unique={}:if_not_exists={}",
                     .{ plan.table_name, plan.columns.len, plan.expressions.len, appParityGeneratedExpressionCount(plan), plan.where.len, plan.unique, plan.if_not_exists },
                 );
-            const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "include", plan.include_columns.len);
+            const with_generated_op = if (appParityGeneratedExpressionOp(plan)) |generated_op|
+                try appendStringFingerprintAlloc(alloc, base, "generated_op", generated_op)
+            else
+                base;
+            const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, with_generated_op, "include", plan.include_columns.len);
             const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "where_expr", plan.where_expressions.len);
             break :blk try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
         },
@@ -65140,7 +65149,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema concat expression secondary index",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
-            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false",
+            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=concat",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);",
             },
@@ -65151,7 +65160,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema concat ws expression secondary index",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
-            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false",
+            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=concat_ws",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);",
             },
@@ -65162,9 +65171,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema wrapped expression secondary index",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
-            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false",
+            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=lower",
             .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));",
+        },
+        .{
+            .name = "schema upper expression secondary index",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
+            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=upper",
+            .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE INDEX usage_records_upper_email_idx ON usage_records (upper(email));",
+        },
+        .{
+            .name = "schema md5 expression secondary index",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
+            .plan = "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:generated_op=md5",
+            .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE INDEX usage_records_md5_email_idx ON usage_records (md5(email));",
         },
         .{
             .name = "schema json gin secondary index",
