@@ -62293,6 +62293,59 @@ fn appParityDdlFixtureAppliesFromEmptyCatalog(entry: AppParityCorpusEntry) !bool
     };
 }
 
+fn appParityConsumeLiteral(text: []const u8, index: *usize, literal: []const u8) bool {
+    if (index.* + literal.len > text.len) return false;
+    if (!std.mem.eql(u8, text[index.* .. index.* + literal.len], literal)) return false;
+    index.* += literal.len;
+    return true;
+}
+
+fn appParityConsumeBool(text: []const u8, index: *usize) bool {
+    if (appParityConsumeLiteral(text, index, "true")) return true;
+    if (appParityConsumeLiteral(text, index, "false")) return true;
+    return false;
+}
+
+fn appParityConsumeUsize(text: []const u8, index: *usize) bool {
+    const start = index.*;
+    while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
+    return index.* > start;
+}
+
+fn appParityAppliedPlanIsStructured(plan: []const u8) bool {
+    var index: usize = 0;
+    if (appParityConsumeLiteral(plan, &index, "applied:drop_table:rebuild=")) {
+        if (!appParityConsumeBool(plan, &index)) return false;
+        if (!appParityConsumeLiteral(plan, &index, ":validation=")) return false;
+        if (!appParityConsumeBool(plan, &index)) return false;
+        if (!appParityConsumeLiteral(plan, &index, ":rewrite=")) return false;
+        if (!appParityConsumeBool(plan, &index)) return false;
+        return index == plan.len;
+    }
+
+    index = 0;
+    if (!appParityConsumeLiteral(plan, &index, "applied:rebuild=")) return false;
+    if (!appParityConsumeBool(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":validation=")) return false;
+    if (!appParityConsumeBool(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":rewrite=")) return false;
+    if (!appParityConsumeBool(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":building_indexes=")) return false;
+    if (!appParityConsumeUsize(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":unvalidated_unique=")) return false;
+    if (!appParityConsumeUsize(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":unvalidated_fk=")) return false;
+    if (!appParityConsumeUsize(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":unvalidated_check=")) return false;
+    if (!appParityConsumeUsize(plan, &index)) return false;
+    if (!appParityConsumeLiteral(plan, &index, ":update_policy=")) return false;
+    if (!appParityConsumeUsize(plan, &index)) return false;
+    if (index == plan.len) return true;
+    if (!appParityConsumeLiteral(plan, &index, ":comments=")) return false;
+    if (!appParityConsumeUsize(plan, &index)) return false;
+    return index == plan.len;
+}
+
 fn validateAppParityFixtureMetadata(
     entry: AppParityCorpusEntry,
     seen_names: *std.StringHashMapUnmanaged(void),
@@ -62313,6 +62366,9 @@ fn validateAppParityFixtureMetadata(
     }
     if (entry.family == .ddl and entry.summary.ddl_tag == null) return error.TestUnexpectedResult;
     if (appParityFixtureFamilyNeedsTableSummary(entry.family) and entry.summary.table_name == null) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.applied_plan.len > 0 and !appParityAppliedPlanIsStructured(entry.applied_plan)) {
         return error.TestUnexpectedResult;
     }
     if (try appParityDdlFixtureRequiresAppliedPlan(entry)) {
@@ -62381,6 +62437,15 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "adapter_noop:ddl:reason=transaction_control",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed applied plan",
+        .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .applied_plan = "applied:rebuild=true:rewrite=false",
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid unsupported reason",
         .sql = "TRUNCATE usage_records CASCADE",
@@ -62395,6 +62460,24 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .adapter_noop_ddl,
         .classification_reason = "session_setting",
         .plan = "adapter_noop:ddl:reason=session_setting",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid applied plan",
+        .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid drop-table applied plan",
+        .sql = "DROP TABLE usage_records",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
+        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=false",
+        .applied_plan = "applied:drop_table:rebuild=true:validation=true:rewrite=true",
     }, &seen, alloc);
 }
 
