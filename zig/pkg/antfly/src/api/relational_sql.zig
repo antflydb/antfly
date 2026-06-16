@@ -62302,6 +62302,24 @@ fn appParityFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) bo
     };
 }
 
+fn appParityFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool {
+    return switch (family) {
+        .adapter_noop_ddl,
+        .unsupported,
+        .unsupported_read,
+        .unsupported_ddl,
+        .unsupported_write,
+        .unsupported_insert,
+        .unsupported_update,
+        .unsupported_update_source,
+        .unsupported_delete,
+        .unsupported_update_joined_source,
+        .unsupported_delete_joined_source,
+        => false,
+        else => true,
+    };
+}
+
 fn appParityFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .read,
@@ -62550,6 +62568,9 @@ fn validateAppParityFixtureMetadata(
     if (appParityFixtureFamilyNeedsTableSummary(entry.family) and entry.summary.table_name == null) {
         return error.TestUnexpectedResult;
     }
+    if (appParitySummaryHasFields(entry.summary) and !appParityFixtureFamilyAllowsSummary(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.operations != null and !appParityFixtureFamilyAllowsOperationsSummary(entry.family)) {
         return error.TestUnexpectedResult;
     }
@@ -62667,6 +62688,24 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .unsupported_write,
         .classification_reason = "multi_table_generation_barrier",
         .plan = "unsupported:write",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "unsupported summary",
+        .sql = "DELETE FROM usage_records WHERE status = 'closed'",
+        .family = .unsupported_delete,
+        .summary = .{ .table_name = "usage_records", .predicates = 1 },
+        .classification_reason = "non_unique_point_selector",
+        .plan = "unsupported:delete:requires=non_unique_point_selector",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "adapter noop summary",
+        .sql = "SET client_encoding = 'UTF8'",
+        .family = .adapter_noop_ddl,
+        .summary = .{ .table_name = "client_encoding" },
+        .classification_reason = "session_setting",
+        .plan = "adapter_noop:ddl:reason=session_setting",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
