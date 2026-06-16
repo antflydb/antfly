@@ -709,7 +709,7 @@ test "storage.ha fencing receipt drives standby promotion" {
     const identity = testIdentity();
 
     var standby = try standby_mod.Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
-    defer standby.close();
+    errdefer standby.close();
     _ = try standby.receive(baseRecord(identity, 1, "one"));
     _ = try standby.receive(baseRecord(identity, 2, "two"));
     var capture = ApplyCapture{};
@@ -728,4 +728,16 @@ test "storage.ha fencing receipt drives standby promotion" {
     try std.testing.expectEqual(@as(u64, 2), result.new_identity.timeline_id);
     try std.testing.expect(!result.forced);
     try std.testing.expect(!result.data_loss_possible);
+
+    standby.close();
+    try std.testing.expectError(
+        error.WrongTimeline,
+        standby_mod.Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{}),
+    );
+
+    var reopened = try standby_mod.Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, result.new_identity, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 3), reopened.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), reopened.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(u64, 3), reopened.currentProgress().safe_read_lsn);
 }
