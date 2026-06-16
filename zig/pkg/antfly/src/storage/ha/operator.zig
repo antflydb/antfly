@@ -107,6 +107,11 @@ pub const AdminCommandOptions = struct {
     promoted_node_id: ?[]const u8 = null,
     new_timeline_id: ?u64 = null,
     new_epoch: ?u64 = null,
+    former_last_lsn: ?u64 = null,
+    retained_from_lsn: u64 = 0,
+    allow_forced_rewind: bool = false,
+    fence_generation: ?u64 = null,
+    fence_token: ?[]const u8 = null,
     force: bool = false,
     reason: []const u8 = "operator",
 };
@@ -426,10 +431,11 @@ pub fn adminCommandForAction(
             try appendArg(alloc, &argv, options.reason);
         },
         .update_primary_endpoint,
+        => return null,
         .demote_former_primary,
         .rewind_former_primary,
         .reseed_former_primary,
-        => return null,
+        => try appendFormerPrimaryRejoinCommand(alloc, &argv, &owned_args, action, identity, options),
     }
 
     const argv_slice = try argv.toOwnedSlice(alloc);
@@ -439,6 +445,69 @@ pub fn adminCommandForAction(
         .argv = argv_slice,
         .owned_args = owned_slice,
     };
+}
+
+fn appendFormerPrimaryRejoinCommand(
+    alloc: Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    owned_args: *std.ArrayListUnmanaged([]u8),
+    action: Action,
+    identity: primary_mod.Identity,
+    options: AdminCommandOptions,
+) !void {
+    const node_id = action.standby_name orelse return error.FormerPrimaryNodeIdMissing;
+    const target_lsn = action.target_lsn orelse return error.RejoinTargetLsnMissing;
+    const last_lsn = options.former_last_lsn orelse target_lsn;
+
+    try appendArg(alloc, argv, "rejoin");
+    try appendArg(alloc, argv, "assess");
+    try appendArg(alloc, argv, "--node-id");
+    try appendArg(alloc, argv, node_id);
+    try appendIdentityArgs(alloc, argv, owned_args, identity);
+    try appendArg(alloc, argv, "--last-lsn");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{last_lsn});
+    try appendArg(alloc, argv, "--retained-from-lsn");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{options.retained_from_lsn});
+    if (options.allow_forced_rewind) try appendArg(alloc, argv, "--allow-forced-rewind");
+
+    switch (action.kind) {
+        .demote_former_primary => return,
+        .rewind_former_primary,
+        .reseed_former_primary,
+        => {},
+        else => return error.InvalidFormerPrimaryAction,
+    }
+
+    const old_primary_id = options.old_primary_id orelse node_id;
+    const promoted_node_id = options.promoted_node_id orelse return error.PromotedNodeIdMissing;
+    const new_timeline_id = options.new_timeline_id orelse return error.NewTimelineIdMissing;
+    const new_epoch = options.new_epoch orelse return error.NewEpochMissing;
+    const fence_generation = options.fence_generation orelse return error.FenceGenerationMissing;
+    const fence_token = options.fence_token orelse return error.FenceTokenMissing;
+
+    try appendArg(alloc, argv, "--fence-old-primary-id");
+    try appendArg(alloc, argv, old_primary_id);
+    try appendArg(alloc, argv, "--fence-promoted-node-id");
+    try appendArg(alloc, argv, promoted_node_id);
+    try appendArg(alloc, argv, "--fence-parent-timeline-id");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.timeline_id});
+    try appendArg(alloc, argv, "--fence-parent-epoch");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.epoch});
+    try appendArg(alloc, argv, "--fence-new-timeline-id");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{new_timeline_id});
+    try appendArg(alloc, argv, "--fence-new-epoch");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{new_epoch});
+    try appendArg(alloc, argv, "--fence-required-lsn");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{target_lsn});
+    try appendArg(alloc, argv, "--fence-observed-lsn");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{target_lsn});
+    try appendArg(alloc, argv, "--fence-generation");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{fence_generation});
+    try appendArg(alloc, argv, "--fence-token");
+    try appendArg(alloc, argv, fence_token);
+    try appendArg(alloc, argv, "--fence-reason");
+    try appendArg(alloc, argv, options.reason);
+    if (options.force) try appendArg(alloc, argv, "--fence-forced");
 }
 
 fn appendFormerPrimaryAction(
@@ -929,6 +998,18 @@ test "storage.ha operator plans former primary demotion without fence" {
     try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
     try std.testing.expectEqual(ActionKind.demote_former_primary, plan.actions[0].kind);
     try std.testing.expectEqualStrings("FormerPrimaryRejectedUnfenced", plan.actions[0].reason);
+
+    var command = (try adminCommandForAction(alloc, plan.actions[0], former_identity, .{
+        .retained_from_lsn = 10,
+    })).?;
+    defer command.deinit(alloc);
+    var command_plan = try command.parsePlan(alloc);
+    defer command_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("primary-a", command_plan.command.rejoin_assess.former.node_id);
+    try std.testing.expectEqual(@as(u64, 2), command_plan.command.rejoin_assess.former.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), command_plan.command.rejoin_assess.former.last_lsn);
+    try std.testing.expectEqual(@as(u64, 10), command_plan.command.rejoin_assess.policy.retained_from_lsn);
+    try std.testing.expect(command_plan.command.rejoin_assess.receipt == null);
 }
 
 test "storage.ha operator plans former primary rewind or reseed from fence receipt" {
@@ -982,6 +1063,29 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     try std.testing.expectEqual(ActionKind.rewind_former_primary, rewind.actions[0].kind);
     try std.testing.expectEqual(@as(?u64, 10), rewind.actions[0].target_lsn);
 
+    var rewind_command = (try adminCommandForAction(alloc, rewind.actions[0], parent_identity.identity, .{
+        .old_primary_id = receipt.old_primary_id,
+        .promoted_node_id = receipt.promoted_node_id,
+        .new_timeline_id = receipt.new_timeline_id,
+        .new_epoch = receipt.new_epoch,
+        .former_last_lsn = 12,
+        .retained_from_lsn = 8,
+        .fence_generation = receipt.generation,
+        .fence_token = receipt.token,
+        .reason = receipt.reason,
+    })).?;
+    defer rewind_command.deinit(alloc);
+    var rewind_command_plan = try rewind_command.parsePlan(alloc);
+    defer rewind_command_plan.deinit(alloc);
+    const rewind_rejoin = rewind_command_plan.command.rejoin_assess;
+    try std.testing.expectEqualStrings("primary-a", rewind_rejoin.former.node_id);
+    try std.testing.expectEqual(@as(u64, 1), rewind_rejoin.former.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), rewind_rejoin.former.last_lsn);
+    try std.testing.expectEqual(@as(u64, 8), rewind_rejoin.policy.retained_from_lsn);
+    try std.testing.expectEqualStrings("standby-b", rewind_rejoin.receipt.?.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 2), rewind_rejoin.receipt.?.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 10), rewind_rejoin.receipt.?.observed_lsn);
+
     var reseed = try reconcile(alloc, .{
         .mode = .hot_standby,
     }, .{
@@ -998,6 +1102,23 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     try std.testing.expectEqual(rejoin.Action.reseed, reseed.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.reseed_former_primary, reseed.actions[0].kind);
     try std.testing.expectEqualStrings("FormerPrimaryRequiresReseed", reseed.actions[0].reason);
+
+    var reseed_command = (try adminCommandForAction(alloc, reseed.actions[0], parent_identity.identity, .{
+        .old_primary_id = receipt.old_primary_id,
+        .promoted_node_id = receipt.promoted_node_id,
+        .new_timeline_id = receipt.new_timeline_id,
+        .new_epoch = receipt.new_epoch,
+        .former_last_lsn = 12,
+        .retained_from_lsn = 11,
+        .fence_generation = receipt.generation,
+        .fence_token = receipt.token,
+        .reason = receipt.reason,
+    })).?;
+    defer reseed_command.deinit(alloc);
+    var reseed_command_plan = try reseed_command.parsePlan(alloc);
+    defer reseed_command_plan.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 11), reseed_command_plan.command.rejoin_assess.policy.retained_from_lsn);
+    try std.testing.expectEqualStrings("standby-b", reseed_command_plan.command.rejoin_assess.receipt.?.promoted_node_id);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
