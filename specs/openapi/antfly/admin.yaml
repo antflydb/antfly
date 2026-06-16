@@ -30,6 +30,20 @@ paths:
                 $ref: "#/components/schemas/HACommandResult"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/standby/status:
+    get:
+      tags: [ha]
+      operationId: getHAStandbyStatus
+      summary: Get standby HA status
+      responses:
+        "200":
+          description: Standby status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/replication-slots:
     get:
       tags: [ha]
@@ -119,6 +133,100 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/fence:
+    post:
+      tags: [ha]
+      operationId: acquireHAFence
+      summary: Acquire a durable HA promotion fence
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FenceAcquireRequest"
+      responses:
+        "200":
+          description: Acquired or returned the current matching fence receipt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/fence/current:
+    get:
+      tags: [ha]
+      operationId: getHACurrentFence
+      summary: Get the current durable HA promotion fence
+      responses:
+        "200":
+          description: Current fence receipt, if any.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/promotion/assess:
+    post:
+      tags: [ha]
+      operationId: assessHAPromotion
+      summary: Assess whether this standby can be promoted
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PromotionAssessRequest"
+      responses:
+        "200":
+          description: Promotion safety assessment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/promotion/current-fence:
+    post:
+      tags: [ha]
+      operationId: promoteHAWithCurrentFence
+      summary: Promote this standby using the current durable fence receipt
+      responses:
+        "200":
+          description: Promotion result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/promotion:
+    post:
+      tags: [ha]
+      operationId: promoteHA
+      summary: Acquire a fence and promote this standby
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FenceAcquireRequest"
+      responses:
+        "200":
+          description: Promotion result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
 components:
   parameters:
     SlotName:
@@ -168,6 +276,91 @@ components:
           minimum: 0
           nullable: true
           description: Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    HAIdentity:
+      type: object
+      required: [cluster_id, shard_id, table_id, timeline_id, epoch]
+      additionalProperties: false
+      properties:
+        cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+    FenceAcquireRequest:
+      type: object
+      required:
+        - identity
+        - old_primary_id
+        - promoted_node_id
+        - new_timeline_id
+        - new_epoch
+        - required_lsn
+        - observed_lsn
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        old_primary_id:
+          type: string
+          minLength: 1
+        promoted_node_id:
+          type: string
+          minLength: 1
+        new_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        new_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        observed_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        force:
+          type: boolean
+          default: false
+        reason:
+          type: string
+          default: ""
+    PromotionAssessRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        fencing_confirmed:
+          type: boolean
+          default: false
+        force:
+          type: boolean
+          default: false
+        use_current_fence:
+          type: boolean
+          default: false
     HACommandResult:
       type: object
       description: |

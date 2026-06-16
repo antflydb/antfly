@@ -79,8 +79,14 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
                     return try self.handleAdminPrimaryStatus();
                 }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_standby_status)) {
+                    return try self.handleAdminStandbyStatus();
+                }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminReplicationSlots();
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_fence_current)) {
+                    return try self.handleAdminFenceCurrent();
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
@@ -90,6 +96,18 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminCreateReplicationSlot(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
+                    return try self.handleAdminAcquireFence(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess)) {
+                    return try self.handleAdminAssessPromotion(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence)) {
+                    return try self.handleAdminPromoteCurrentFence();
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_promotion)) {
+                    return try self.handleAdminPromote(req);
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
@@ -121,6 +139,15 @@ pub const Server = struct {
         var plan = admin_cli.Plan{
             .output = .json,
             .command = .{ .primary_status = .{} },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminStandbyStatus(self: *Server) !http_common.HttpResponse {
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .standby_status = .{} },
         };
         defer plan.deinit(self.alloc);
         return try self.handleJsonPlan(plan);
@@ -181,6 +208,85 @@ pub const Server = struct {
         };
         defer plan.deinit(self.alloc);
         return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminFenceCurrent(self: *Server) !http_common.HttpResponse {
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .fence_current,
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminAcquireFence(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const fence = self.parseFenceRequest(req) catch {
+            return try textResponse(self.alloc, 400, "invalid HA fence request");
+        };
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .fence_acquire = fence },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminAssessPromotion(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        var command = admin_cli.PromoteAssessCommand{ .check = .{} };
+        if (req.body.len != 0) {
+            var parsed = admin_api.openapi.server.parseAssessHAPromotionBody(
+                self.alloc,
+                req.body,
+            ) catch return try textResponse(self.alloc, 400, "invalid HA promotion assessment request");
+            defer parsed.deinit();
+
+            if (parsed.value.required_lsn) |value| {
+                command.check.required_lsn = uint64FromJson(value) catch {
+                    return try textResponse(self.alloc, 400, "invalid HA promotion assessment request");
+                };
+            }
+            command.check.fencing_confirmed = parsed.value.fencing_confirmed orelse false;
+            command.check.force = parsed.value.force orelse false;
+            command.use_current_fence = parsed.value.use_current_fence orelse false;
+        }
+
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .promote_assess = command },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminPromoteCurrentFence(self: *Server) !http_common.HttpResponse {
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .promote_current_fence,
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminPromote(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const fence = self.parseFenceRequest(req) catch {
+            return try textResponse(self.alloc, 400, "invalid HA promotion request");
+        };
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .promote = .{ .fence = fence } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
+        if (req.body.len == 0) return error.InvalidAdminRequest;
+        var parsed = admin_api.openapi.server.parseAcquireHAFenceBody(
+            self.alloc,
+            req.body,
+        ) catch return error.InvalidAdminRequest;
+        defer parsed.deinit();
+        return adminFenceRequestFromOpenApi(parsed.value) catch return error.InvalidAdminRequest;
     }
 
     fn handleCommand(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -244,7 +350,44 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, Routes.ready) or
         std.mem.eql(u8, path, Routes.command) or
         std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
-        std.mem.eql(u8, path, admin_api.routes.ha_replication_slots);
+        std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
+        std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
+        std.mem.eql(u8, path, admin_api.routes.ha_fence) or
+        std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
+        std.mem.eql(u8, path, admin_api.routes.ha_promotion) or
+        std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess) or
+        std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence);
+}
+
+fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing.FenceRequest {
+    return .{
+        .identity = .{
+            .cluster_id = try positiveUint64FromJson(request.identity.cluster_id),
+            .shard_id = try positiveUint64FromJson(request.identity.shard_id),
+            .table_id = try positiveUint64FromJson(request.identity.table_id),
+            .timeline_id = try positiveUint64FromJson(request.identity.timeline_id),
+            .epoch = try positiveUint64FromJson(request.identity.epoch),
+        },
+        .old_primary_id = request.old_primary_id,
+        .promoted_node_id = request.promoted_node_id,
+        .new_timeline_id = try positiveUint64FromJson(request.new_timeline_id),
+        .new_epoch = try positiveUint64FromJson(request.new_epoch),
+        .required_lsn = try positiveUint64FromJson(request.required_lsn),
+        .observed_lsn = try uint64FromJson(request.observed_lsn),
+        .force = request.force orelse false,
+        .reason = request.reason orelse "",
+    };
+}
+
+fn uint64FromJson(value: i64) !u64 {
+    if (value < 0) return error.InvalidAdminRequest;
+    return @intCast(value);
+}
+
+fn positiveUint64FromJson(value: i64) !u64 {
+    const parsed = try uint64FromJson(value);
+    if (parsed == 0) return error.InvalidAdminRequest;
+    return parsed;
 }
 
 fn commandErrorStatus(err: anyerror) u16 {
@@ -526,6 +669,17 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(stream.body, "received_count=1\n");
     try expectContains(stream.body, "applied_lsn=1\n");
 
+    var typed_standby_status = try server.handle(.{
+        .method = .GET,
+        .uri = admin_api.routes.ha_standby_status,
+    });
+    defer typed_standby_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_standby_status.status);
+    try std.testing.expectEqualStrings("application/json", typed_standby_status.content_type.?);
+    try expectContains(typed_standby_status.body, "\"standby_status\"");
+    try expectContains(typed_standby_status.body, "\"received_lsn\":1");
+    try expectContains(typed_standby_status.body, "\"applied_lsn\":1");
+
     var invalid_progress = try server.handle(.{
         .method = .POST,
         .uri = Routes.command,
@@ -569,50 +723,50 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(fail_closed_append.body, "SyncPolicyUnsatisfied");
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 
-    var fence = try server.handle(.{
+    var typed_fence = try server.handle(.{
         .method = .POST,
-        .uri = Routes.command,
+        .uri = admin_api.routes.ha_fence,
         .content_type = "application/json",
-        .body = "{\"argv\":[\"--table\",\"fence\",\"acquire\",\"--cluster-id\",\"100\",\"--shard-id\",\"10\",\"--table-id\",\"20\",\"--timeline-id\",\"1\",\"--epoch\",\"1\",\"--old-primary-id\",\"primary-a\",\"--promoted-node-id\",\"standby-a\",\"--new-timeline-id\",\"2\",\"--new-epoch\",\"2\",\"--required-lsn\",\"1\",\"--observed-lsn\",\"1\",\"--reason\",\"http-admin-test\"]}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"reason\":\"http-admin-test\"}",
     });
-    defer fence.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), fence.status);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", fence.content_type.?);
-    try expectContains(fence.body, "result=fence_acquire\n");
-    try expectContains(fence.body, "promoted_node_id=standby-a\n");
+    defer typed_fence.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
+    try std.testing.expectEqualStrings("application/json", typed_fence.content_type.?);
+    try expectContains(typed_fence.body, "\"fence_acquire\"");
+    try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 
-    var current_fence = try server.handle(.{
-        .method = .POST,
-        .uri = Routes.command,
-        .content_type = "application/json",
-        .body = "{\"argv\":[\"--table\",\"fence\",\"current\"]}",
+    var typed_current_fence = try server.handle(.{
+        .method = .GET,
+        .uri = admin_api.routes.ha_fence_current,
     });
-    defer current_fence.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), current_fence.status);
-    try expectContains(current_fence.body, "result=fence_current\n");
-    try expectContains(current_fence.body, "held=true\n");
+    defer typed_current_fence.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_current_fence.status);
+    try std.testing.expectEqualStrings("application/json", typed_current_fence.content_type.?);
+    try expectContains(typed_current_fence.body, "\"fence_current\"");
+    try expectContains(typed_current_fence.body, "\"old_primary_id\":\"primary-a\"");
 
-    var promote_assess = try server.handle(.{
+    var typed_promote_assess = try server.handle(.{
         .method = .POST,
-        .uri = Routes.command,
+        .uri = admin_api.routes.ha_promotion_assess,
         .content_type = "application/json",
-        .body = "{\"argv\":[\"--table\",\"promote\",\"assess\",\"--current-fence\"]}",
+        .body = "{\"use_current_fence\":true}",
     });
-    defer promote_assess.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), promote_assess.status);
-    try expectContains(promote_assess.body, "result=promote_assess\n");
-    try expectContains(promote_assess.body, "assessment.can_promote=true\n");
+    defer typed_promote_assess.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_promote_assess.status);
+    try std.testing.expectEqualStrings("application/json", typed_promote_assess.content_type.?);
+    try expectContains(typed_promote_assess.body, "\"promote_assess\"");
+    try expectContains(typed_promote_assess.body, "\"can_promote\":true");
 
-    var promote = try server.handle(.{
+    var typed_promote = try server.handle(.{
         .method = .POST,
-        .uri = Routes.command,
+        .uri = admin_api.routes.ha_promotion_current_fence,
         .content_type = "application/json",
-        .body = "{\"argv\":[\"--table\",\"promote\",\"--current-fence\"]}",
     });
-    defer promote.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), promote.status);
-    try expectContains(promote.body, "result=promote_current_fence\n");
-    try expectContains(promote.body, "promotion.new_identity.timeline_id=2\n");
+    defer typed_promote.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
+    try std.testing.expectEqualStrings("application/json", typed_promote.content_type.?);
+    try expectContains(typed_promote.body, "\"promote_current_fence\"");
+    try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
 }
 
 test "storage.ha http admin returns route method and command errors" {

@@ -16,6 +16,8 @@ pub const openapi = @import("antfly_admin_openapi");
 pub const routes = @import("routes.zig");
 
 pub const ReplicationSlotCreateRequest = openapi.ReplicationSlotCreateRequest;
+pub const FenceAcquireRequest = openapi.FenceAcquireRequest;
+pub const PromotionAssessRequest = openapi.PromotionAssessRequest;
 
 test {
     _ = openapi;

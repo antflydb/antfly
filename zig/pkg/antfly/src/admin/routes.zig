@@ -18,10 +18,16 @@ const Allocator = std.mem.Allocator;
 pub const base = "/admin/v1";
 pub const ha = base ++ "/ha";
 pub const ha_primary_status = ha ++ "/primary/status";
+pub const ha_standby_status = ha ++ "/standby/status";
 pub const ha_replication_slots = ha ++ "/replication-slots";
 pub const ha_replication_slot_prefix = ha_replication_slots ++ "/";
 pub const ha_replication_slot_pause_suffix = "/pause";
 pub const ha_replication_slot_resume_suffix = "/resume";
+pub const ha_fence = ha ++ "/fence";
+pub const ha_fence_current = ha_fence ++ "/current";
+pub const ha_promotion = ha ++ "/promotion";
+pub const ha_promotion_assess = ha_promotion ++ "/assess";
+pub const ha_promotion_current_fence = ha_promotion ++ "/current-fence";
 
 pub fn replicationSlotPathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ ha_replication_slot_prefix, slot_name });
@@ -58,7 +64,13 @@ pub fn replicationSlotNameFromPath(path: []const u8, suffix: []const u8) ?[]cons
 
 test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/primary/status", ha_primary_status);
+    try std.testing.expectEqualStrings("/admin/v1/ha/standby/status", ha_standby_status);
     try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots", ha_replication_slots);
+    try std.testing.expectEqualStrings("/admin/v1/ha/fence", ha_fence);
+    try std.testing.expectEqualStrings("/admin/v1/ha/fence/current", ha_fence_current);
+    try std.testing.expectEqualStrings("/admin/v1/ha/promotion", ha_promotion);
+    try std.testing.expectEqualStrings("/admin/v1/ha/promotion/assess", ha_promotion_assess);
+    try std.testing.expectEqualStrings("/admin/v1/ha/promotion/current-fence", ha_promotion_current_fence);
 }
 
 test "admin routes build and match replication slot lifecycle paths" {

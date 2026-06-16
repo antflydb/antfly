@@ -10,5 +10,32 @@ pub const ReplicationSlotCreateRequest = struct {
     initial_lsn: ?i64 = null,
 };
 
+pub const HAIdentity = struct {
+    cluster_id: i64,
+    shard_id: i64,
+    table_id: i64,
+    timeline_id: i64,
+    epoch: i64,
+};
+
+pub const PromotionAssessRequest = struct {
+    required_lsn: ?i64 = null,
+    fencing_confirmed: ?bool = null,
+    force: ?bool = null,
+    use_current_fence: ?bool = null,
+};
+
 /// JSON rendering of the underlying HA admin command result. This envelope remains intentionally tolerant while the hot-standby API graduates from operator integration to a fully typed response schema.
 pub const HACommandResult = struct {};
+
+pub const FenceAcquireRequest = struct {
+    identity: HAIdentity,
+    old_primary_id: []const u8,
+    promoted_node_id: []const u8,
+    new_timeline_id: i64,
+    new_epoch: i64,
+    required_lsn: i64,
+    observed_lsn: i64,
+    force: ?bool = null,
+    reason: ?[]const u8 = null,
+};

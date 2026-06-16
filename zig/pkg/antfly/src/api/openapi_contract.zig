@@ -52,6 +52,12 @@ test "admin openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(admin_generated, "ReplicationSlotCreateRequest"));
     try std.testing.expect(@hasField(admin_generated.ReplicationSlotCreateRequest, "slot_name"));
     try std.testing.expect(@hasField(admin_generated.ReplicationSlotCreateRequest, "initial_lsn"));
+    try std.testing.expect(@hasDecl(admin_generated, "FenceAcquireRequest"));
+    try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "identity"));
+    try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "old_primary_id"));
+    try std.testing.expect(@hasField(admin_generated.FenceAcquireRequest, "promoted_node_id"));
+    try std.testing.expect(@hasDecl(admin_generated, "PromotionAssessRequest"));
+    try std.testing.expect(@hasField(admin_generated.PromotionAssessRequest, "use_current_fence"));
     try std.testing.expect(@hasDecl(admin_generated.server, "PauseHAReplicationSlotPathParams"));
     try std.testing.expect(@hasField(admin_generated.server.PauseHAReplicationSlotPathParams, "slot_name"));
 }

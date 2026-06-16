@@ -29,6 +29,21 @@ pub const ResumeHAReplicationSlotPathParams = struct {
     slot_name: []const u8,
 };
 
+/// Parse the JSON request body for acquireHAFence.
+pub fn parseAcquireHAFenceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
+    return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for assessHAPromotion.
+pub fn parseAssessHAPromotionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.PromotionAssessRequest) {
+    return std.json.parseFromSlice(types.PromotionAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for promoteHA.
+pub fn parsePromoteHABody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
+    return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Route metadata for all operations.
 pub const Route = struct {
     method: []const u8,
@@ -38,11 +53,17 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "GET", .path = "/ha/primary/status", .operation_id = "getHAPrimaryStatus" },
+    .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
     .{ .method = "GET", .path = "/ha/replication-slots", .operation_id = "listHAReplicationSlots" },
     .{ .method = "POST", .path = "/ha/replication-slots", .operation_id = "createHAReplicationSlot" },
     .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/pause", .operation_id = "pauseHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/resume", .operation_id = "resumeHAReplicationSlot" },
+    .{ .method = "POST", .path = "/ha/fence", .operation_id = "acquireHAFence" },
+    .{ .method = "GET", .path = "/ha/fence/current", .operation_id = "getHACurrentFence" },
+    .{ .method = "POST", .path = "/ha/promotion/assess", .operation_id = "assessHAPromotion" },
+    .{ .method = "POST", .path = "/ha/promotion/current-fence", .operation_id = "promoteHAWithCurrentFence" },
+    .{ .method = "POST", .path = "/ha/promotion", .operation_id = "promoteHA" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -57,11 +78,17 @@ pub const routes = [_]Route{
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "getHAPrimaryStatus")) @compileError("ServerRouter: Impl missing required method 'getHAPrimaryStatus'");
+        if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
         if (!@hasDecl(Impl, "listHAReplicationSlots")) @compileError("ServerRouter: Impl missing required method 'listHAReplicationSlots'");
         if (!@hasDecl(Impl, "createHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationSlot'");
         if (!@hasDecl(Impl, "dropHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'dropHAReplicationSlot'");
         if (!@hasDecl(Impl, "pauseHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'pauseHAReplicationSlot'");
         if (!@hasDecl(Impl, "resumeHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'resumeHAReplicationSlot'");
+        if (!@hasDecl(Impl, "acquireHAFence")) @compileError("ServerRouter: Impl missing required method 'acquireHAFence'");
+        if (!@hasDecl(Impl, "getHACurrentFence")) @compileError("ServerRouter: Impl missing required method 'getHACurrentFence'");
+        if (!@hasDecl(Impl, "assessHAPromotion")) @compileError("ServerRouter: Impl missing required method 'assessHAPromotion'");
+        if (!@hasDecl(Impl, "promoteHAWithCurrentFence")) @compileError("ServerRouter: Impl missing required method 'promoteHAWithCurrentFence'");
+        if (!@hasDecl(Impl, "promoteHA")) @compileError("ServerRouter: Impl missing required method 'promoteHA'");
     }
 
     return struct {
@@ -77,11 +104,17 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             active_impl = self.impl;
             try server.get("/ha/primary/status", getHAPrimaryStatus);
+            try server.get("/ha/standby/status", getHAStandbyStatus);
             try server.get("/ha/replication-slots", listHAReplicationSlots);
             try server.post("/ha/replication-slots", createHAReplicationSlot);
             try server.delete("/ha/replication-slots/:slot_name", dropHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/pause", pauseHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/resume", resumeHAReplicationSlot);
+            try server.post("/ha/fence", acquireHAFence);
+            try server.get("/ha/fence/current", getHACurrentFence);
+            try server.post("/ha/promotion/assess", assessHAPromotion);
+            try server.post("/ha/promotion/current-fence", promoteHAWithCurrentFence);
+            try server.post("/ha/promotion", promoteHA);
         }
 
         /// Get primary HA status
@@ -89,6 +122,13 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getHAPrimaryStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.getHAPrimaryStatus(ctx);
+        }
+
+        /// Get standby HA status
+        /// GET /ha/standby/status
+        fn getHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.getHAStandbyStatus(ctx);
         }
 
         /// List HA replication slots
@@ -128,14 +168,55 @@ pub fn ServerRouter(comptime Impl: type) type {
             const slot_name = ctx.param("slot_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: slot_name" });
             return impl.resumeHAReplicationSlot(ctx, slot_name);
         }
+
+        /// Acquire a durable HA promotion fence
+        /// POST /ha/fence
+        fn acquireHAFence(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.acquireHAFence(ctx);
+        }
+
+        /// Get the current durable HA promotion fence
+        /// GET /ha/fence/current
+        fn getHACurrentFence(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.getHACurrentFence(ctx);
+        }
+
+        /// Assess whether this standby can be promoted
+        /// POST /ha/promotion/assess
+        fn assessHAPromotion(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.assessHAPromotion(ctx);
+        }
+
+        /// Promote this standby using the current durable fence receipt
+        /// POST /ha/promotion/current-fence
+        fn promoteHAWithCurrentFence(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.promoteHAWithCurrentFence(ctx);
+        }
+
+        /// Acquire a fence and promote this standby
+        /// POST /ha/promotion
+        fn promoteHA(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.promoteHA(ctx);
+        }
     };
 }
 
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn getHAPrimaryStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listHAReplicationSlots(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn pauseHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn resumeHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
+//   fn acquireHAFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getHACurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn assessHAPromotion(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn promoteHAWithCurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn promoteHA(self: *Impl, ctx: *httpx.Context) !httpx.Response
