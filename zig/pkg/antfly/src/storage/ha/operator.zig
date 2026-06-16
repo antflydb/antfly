@@ -101,8 +101,18 @@ pub const ActionKind = enum {
     reseed_former_primary,
 };
 
+pub const ActionPhase = enum {
+    reconcile,
+    fence,
+    promote,
+    route,
+    rejoin,
+};
+
 pub const Action = struct {
     kind: ActionKind,
+    phase: ActionPhase = .reconcile,
+    depends_on: ?ActionKind = null,
     standby_name: ?[]const u8 = null,
     slot_name: ?[]const u8 = null,
     target_lsn: ?u64 = null,
@@ -319,18 +329,23 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     if (automatic_allowed) {
         try actions.append(alloc, .{
             .kind = .acquire_fence,
+            .phase = .fence,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
         });
         try actions.append(alloc, .{
             .kind = .promote_standby,
+            .phase = .promote,
+            .depends_on = .acquire_fence,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
         });
         try actions.append(alloc, .{
             .kind = .update_primary_endpoint,
+            .phase = .route,
+            .depends_on = .promote_standby,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "PromotionPlanned",
@@ -338,6 +353,8 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         if (observed.current_primary_id) |current_primary_id| {
             try actions.append(alloc, .{
                 .kind = .demote_former_primary,
+                .phase = .rejoin,
+                .depends_on = .promote_standby,
                 .standby_name = current_primary_id,
                 .target_lsn = observed.primary.current_lsn,
                 .reason = "PromotionPlanned",
@@ -542,6 +559,7 @@ fn appendFormerPrimaryAction(
     switch (assessment.action) {
         .reject_unfenced => try actions.append(alloc, .{
             .kind = .demote_former_primary,
+            .phase = .rejoin,
             .standby_name = assessment.former_node_id,
             .target_lsn = assessment.former_last_lsn,
             .reason = "FormerPrimaryRejectedUnfenced",
@@ -549,12 +567,14 @@ fn appendFormerPrimaryAction(
         .already_current => {},
         .rewind => try actions.append(alloc, .{
             .kind = .rewind_former_primary,
+            .phase = .rejoin,
             .standby_name = assessment.former_node_id,
             .target_lsn = assessment.fork_lsn,
             .reason = "FormerPrimaryCanRewind",
         }),
         .reseed => try actions.append(alloc, .{
             .kind = .reseed_former_primary,
+            .phase = .rejoin,
             .standby_name = assessment.former_node_id,
             .target_lsn = assessment.fork_lsn,
             .reason = "FormerPrimaryRequiresReseed",
@@ -929,6 +949,14 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(ActionKind.promote_standby, safe.actions[1].kind);
     try std.testing.expectEqual(ActionKind.update_primary_endpoint, safe.actions[2].kind);
     try std.testing.expectEqual(ActionKind.demote_former_primary, safe.actions[3].kind);
+    try std.testing.expectEqual(ActionPhase.fence, safe.actions[0].phase);
+    try std.testing.expectEqual(ActionPhase.promote, safe.actions[1].phase);
+    try std.testing.expectEqual(ActionPhase.route, safe.actions[2].phase);
+    try std.testing.expectEqual(ActionPhase.rejoin, safe.actions[3].phase);
+    try std.testing.expectEqual(@as(?ActionKind, null), safe.actions[0].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .acquire_fence), safe.actions[1].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[2].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[3].depends_on);
     try std.testing.expectEqualStrings("standby-a", safe.actions[2].standby_name.?);
     try std.testing.expectEqualStrings("primary-a", safe.actions[3].standby_name.?);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
@@ -1006,6 +1034,8 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"desired_standby_count\":1");
     try expectContains(rendered, "\"healthy_standby_count\":1");
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
+    try expectContains(rendered, "\"phase\":\"fence\"");
+    try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
     try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
     try expectContains(rendered, "\"reason\":\"FencedPromotionReady\"");
 }
@@ -1151,6 +1181,7 @@ test "storage.ha operator plans former primary demotion without fence" {
     try std.testing.expectEqual(rejoin.Action.reject_unfenced, assessment.action);
     try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
     try std.testing.expectEqual(ActionKind.demote_former_primary, plan.actions[0].kind);
+    try std.testing.expectEqual(ActionPhase.rejoin, plan.actions[0].phase);
     try std.testing.expectEqualStrings("FormerPrimaryRejectedUnfenced", plan.actions[0].reason);
 
     var command = (try adminCommandForAction(alloc, plan.actions[0], former_identity, .{
@@ -1215,6 +1246,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     defer rewind.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.rewind, rewind.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.rewind_former_primary, rewind.actions[0].kind);
+    try std.testing.expectEqual(ActionPhase.rejoin, rewind.actions[0].phase);
     try std.testing.expectEqual(@as(?u64, 10), rewind.actions[0].target_lsn);
 
     var rewind_command = (try adminCommandForAction(alloc, rewind.actions[0], parent_identity.identity, .{
