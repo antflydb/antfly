@@ -21,6 +21,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const backup_manifest = @import("backup_manifest.zig");
+const bootstrap = @import("bootstrap.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
@@ -89,6 +91,23 @@ pub fn applySlotAction(primary: *primary_mod.Primary, action: SlotAction, reques
             .slot_name = request.slot_name,
         }) },
     };
+}
+
+pub fn beginBaseBackup(primary: *primary_mod.Primary, request: primary_mod.BaseBackupStart) !primary_mod.BaseBackupStartResult {
+    return try primary.beginBaseBackup(request);
+}
+
+pub fn endBaseBackup(primary: *primary_mod.Primary, manifest: backup_manifest.Manifest) !primary_mod.BaseBackupEndResult {
+    return try primary.endBaseBackup(manifest);
+}
+
+pub fn bootstrapStandby(
+    alloc: Allocator,
+    standby: *standby_mod.Standby,
+    manifest: backup_manifest.ManifestView,
+    contents: []const backup_manifest.FileContent,
+) !bootstrap.BootstrapResult {
+    return try bootstrap.bootstrapFromManifest(alloc, standby, manifest, contents);
 }
 
 pub fn updateStandbyProgress(
@@ -281,6 +300,61 @@ test "storage.ha admin manages slot lifecycle and status" {
     try std.testing.expect(resumed.@"resume".active);
     const dropped = try applySlotAction(&primary, .drop, .{ .slot_name = "standby-a" });
     try std.testing.expect(dropped.drop.dropped);
+}
+
+test "storage.ha admin seeds standby from base backup workflow" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "seed");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    _ = try primary.append(.{ .payload = "before-backup" });
+    const started = try beginBaseBackup(&primary, .{
+        .slot_name = "standby-a",
+        .manifest_id = "base-0001",
+    });
+    try std.testing.expectEqual(@as(u64, 2), started.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 2), started.start_record_lsn);
+
+    const files = [_]backup_manifest.FileEntry{
+        .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+        .{ .path = "sst/0001", .kind = .sstable, .size_bytes = 7, .crc32 = backup_manifest.crc32("sstable") },
+    };
+    const contents = [_]backup_manifest.FileContent{
+        .{ .path = "manifest", .bytes = "manifest" },
+        .{ .path = "sst/0001", .bytes = "sstable" },
+    };
+    const manifest = backup_manifest.Manifest{
+        .identity = identity,
+        .manifest_id = "base-0001",
+        .backup_lsn = started.backup_lsn,
+        .checkpoint_lsn = started.backup_lsn,
+        .files = &files,
+    };
+
+    const ended = try endBaseBackup(&primary, manifest);
+    try std.testing.expectEqual(started.backup_lsn, ended.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 3), ended.end_record_lsn);
+    try std.testing.expectEqualStrings("base-0001", ended.manifest_id);
+
+    const view = backup_manifest.ManifestView{
+        .identity = manifest.identity,
+        .manifest_id = manifest.manifest_id,
+        .backup_lsn = manifest.backup_lsn,
+        .checkpoint_lsn = manifest.checkpoint_lsn,
+        .files = manifest.files,
+        .flags = manifest.flags,
+    };
+    const bootstrapped = try bootstrapStandby(alloc, &standby, view, &contents);
+    try std.testing.expectEqual(started.backup_lsn, bootstrapped.backup_lsn);
+    try std.testing.expectEqual(started.backup_lsn, bootstrapped.checkpoint_lsn);
+    try std.testing.expectEqualStrings("base-0001", bootstrapped.manifest_id);
+    try std.testing.expectEqual(started.backup_lsn + 1, standby.nextReceiveLsn());
 }
 
 test "storage.ha admin exposes commit and read freshness decisions" {

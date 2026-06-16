@@ -56,6 +56,25 @@ pub const SlotCommand = struct {
     request: admin.SlotRequest,
 };
 
+pub const SlotListCommand = struct {
+    retention_policy: slot_store.RetentionPolicy = .{},
+};
+
+pub const SeedManifestPathCommand = struct {
+    manifest_path: []const u8,
+};
+
+pub const SeedBootstrapCommand = struct {
+    manifest_path: []const u8,
+    content_root: ?[]const u8 = null,
+};
+
+pub const SeedCommand = union(enum) {
+    begin: primary_mod.BaseBackupStart,
+    finish: SeedManifestPathCommand,
+    bootstrap: SeedBootstrapCommand,
+};
+
 pub const CommitCheckCommand = struct {
     target_lsn: u64,
     policy: primary_mod.SyncPolicy,
@@ -64,6 +83,8 @@ pub const CommitCheckCommand = struct {
 pub const Command = union(enum) {
     identify_system,
     slot: SlotCommand,
+    slot_list: SlotListCommand,
+    seed: SeedCommand,
     start_replication: replication_api.StartReplicationRequest,
     standby_status_update: replication_api.StandbyStatusUpdateRequest,
     primary_status: PrimaryStatusCommand,
@@ -119,7 +140,12 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
         return plan;
     }
     if (std.mem.eql(u8, root, "slot")) {
-        plan.command = .{ .slot = try parseSlot(&cursor) };
+        plan.command = try parseSlot(&cursor);
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "seed")) {
+        plan.command = .{ .seed = try parseSeed(&cursor) };
         try cursor.expectEnd();
         return plan;
     }
@@ -157,8 +183,21 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     return error.UnknownHaCommand;
 }
 
-fn parseSlot(cursor: *Cursor) !SlotCommand {
+fn parseSlot(cursor: *Cursor) !Command {
     const action_raw = cursor.next() orelse return error.SlotActionMissing;
+    if (std.mem.eql(u8, action_raw, "list")) {
+        var command = SlotListCommand{};
+        while (cursor.peek()) |arg| {
+            if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
+                _ = cursor.next();
+                command.retention_policy.max_lag_lsn = try parseU64(try cursor.value("--max-lag-lsn"));
+            } else {
+                break;
+            }
+        }
+        return .{ .slot_list = command };
+    }
+
     const action = if (std.mem.eql(u8, action_raw, "create"))
         admin.SlotAction.create
     else if (std.mem.eql(u8, action_raw, "pause"))
@@ -187,12 +226,71 @@ fn parseSlot(cursor: *Cursor) !SlotCommand {
     }
 
     return .{
-        .action = action,
-        .request = .{
-            .slot_name = slot_name orelse return error.SlotNameMissing,
-            .initial_lsn = initial_lsn,
+        .slot = .{
+            .action = action,
+            .request = .{
+                .slot_name = slot_name orelse return error.SlotNameMissing,
+                .initial_lsn = initial_lsn,
+            },
         },
     };
+}
+
+fn parseSeed(cursor: *Cursor) !SeedCommand {
+    const subcommand = cursor.next() orelse return error.SeedSubcommandMissing;
+    if (std.mem.eql(u8, subcommand, "begin")) {
+        var slot_name: ?[]const u8 = null;
+        var manifest_id: ?[]const u8 = null;
+        while (cursor.peek()) |arg| {
+            if (std.mem.eql(u8, arg, "--slot")) {
+                _ = cursor.next();
+                slot_name = try cursor.value("--slot");
+            } else if (std.mem.eql(u8, arg, "--manifest-id")) {
+                _ = cursor.next();
+                manifest_id = try cursor.value("--manifest-id");
+            } else {
+                break;
+            }
+        }
+        return .{ .begin = .{
+            .slot_name = slot_name orelse return error.SlotNameMissing,
+            .manifest_id = manifest_id orelse return error.ManifestIdMissing,
+        } };
+    }
+    if (std.mem.eql(u8, subcommand, "finish") or std.mem.eql(u8, subcommand, "end")) {
+        return .{ .finish = .{ .manifest_path = try parseManifestPath(cursor) } };
+    }
+    if (std.mem.eql(u8, subcommand, "bootstrap")) {
+        var manifest_path: ?[]const u8 = null;
+        var content_root: ?[]const u8 = null;
+        while (cursor.peek()) |arg| {
+            if (std.mem.eql(u8, arg, "--manifest")) {
+                _ = cursor.next();
+                manifest_path = try cursor.value("--manifest");
+            } else if (std.mem.eql(u8, arg, "--content-root")) {
+                _ = cursor.next();
+                content_root = try cursor.value("--content-root");
+            } else {
+                break;
+            }
+        }
+        return .{ .bootstrap = .{
+            .manifest_path = manifest_path orelse return error.ManifestPathMissing,
+            .content_root = content_root,
+        } };
+    }
+    return error.UnknownSeedSubcommand;
+}
+
+fn parseManifestPath(cursor: *Cursor) ![]const u8 {
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--manifest")) {
+            _ = cursor.next();
+            return try cursor.value("--manifest");
+        }
+        break;
+    }
+    return error.ManifestPathMissing;
 }
 
 fn parseStream(cursor: *Cursor) !replication_api.StartReplicationRequest {
@@ -603,6 +701,28 @@ test "storage.ha admin cli parses slot lifecycle commands" {
     try std.testing.expectEqual(OutputFormat.table, pause.output);
     try std.testing.expectEqual(admin.SlotAction.pause, pause.command.slot.action);
     try std.testing.expectEqualStrings("standby-a", pause.command.slot.request.slot_name);
+
+    var list = try parse(alloc, &.{ "slot", "list", "--max-lag-lsn", "50" });
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 50), list.command.slot_list.retention_policy.max_lag_lsn);
+}
+
+test "storage.ha admin cli parses standby seed commands" {
+    const alloc = std.testing.allocator;
+
+    var begin = try parse(alloc, &.{ "seed", "begin", "--slot", "standby-a", "--manifest-id", "base-0001" });
+    defer begin.deinit(alloc);
+    try std.testing.expectEqualStrings("standby-a", begin.command.seed.begin.slot_name);
+    try std.testing.expectEqualStrings("base-0001", begin.command.seed.begin.manifest_id);
+
+    var finish = try parse(alloc, &.{ "seed", "finish", "--manifest", "/tmp/base-0001.afha" });
+    defer finish.deinit(alloc);
+    try std.testing.expectEqualStrings("/tmp/base-0001.afha", finish.command.seed.finish.manifest_path);
+
+    var bootstrap = try parse(alloc, &.{ "seed", "bootstrap", "--manifest", "/tmp/base-0001.afha", "--content-root", "/tmp/base-0001" });
+    defer bootstrap.deinit(alloc);
+    try std.testing.expectEqualStrings("/tmp/base-0001.afha", bootstrap.command.seed.bootstrap.manifest_path);
+    try std.testing.expectEqualStrings("/tmp/base-0001", bootstrap.command.seed.bootstrap.content_root.?);
 }
 
 test "storage.ha admin cli parses primary status with sync policy" {
