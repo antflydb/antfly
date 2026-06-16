@@ -39,6 +39,20 @@ pub const Result = struct {
     received_count: usize,
     applied_count: usize,
     progress: standby_mod.Progress,
+    current_lsn: u64,
+    last_sent_lsn: u64,
+    next_lsn: u64,
+    end_of_wal: bool,
+};
+
+pub const LoopResult = struct {
+    iterations: usize,
+    received_count: usize,
+    applied_count: usize,
+    progress: standby_mod.Progress,
+    current_lsn: u64,
+    last_sent_lsn: u64,
+    next_lsn: u64,
 };
 
 pub const Client = struct {
@@ -117,12 +131,17 @@ pub const Client = struct {
         var response = try self.startReplication(base_uri, slot_name, standby.nextReceiveLsn(), options);
         defer response.deinit();
 
+        const current_lsn = try uint64FromJson(response.parsed.value.current_lsn);
+        const last_sent_lsn = try uint64FromJson(response.parsed.value.last_sent_lsn);
+        const next_lsn = try positiveUint64FromJson(response.parsed.value.next_lsn);
+
         var received_count: usize = 0;
         for (response.parsed.value.records) |frame| {
             const encoded = try decodeFrame(self.alloc, frame);
             defer self.alloc.free(encoded);
             const record = try replication_record.decode(encoded);
-            if (record.lsn != @as(u64, @intCast(frame.lsn))) return error.ReplicationFrameLsnMismatch;
+            const frame_lsn = try positiveUint64FromJson(frame.lsn);
+            if (record.lsn != frame_lsn) return error.ReplicationFrameLsnMismatch;
             _ = standby.receive(record) catch |err| {
                 _ = self.updateStandbyStatus(base_uri, slot_name, standby) catch {};
                 return err;
@@ -139,7 +158,63 @@ pub const Client = struct {
             .received_count = received_count,
             .applied_count = applied_count,
             .progress = standby.currentProgress(),
+            .current_lsn = current_lsn,
+            .last_sent_lsn = last_sent_lsn,
+            .next_lsn = next_lsn,
+            .end_of_wal = response.parsed.value.end_of_wal,
         };
+    }
+
+    pub fn replicateUntilCaughtUp(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+        standby: *standby_mod.Standby,
+        apply_ctx: *anyopaque,
+        apply_fn: standby_mod.ApplyFn,
+        options: ReplicateOptions,
+    ) !LoopResult {
+        var iterations: usize = 0;
+        var received_count: usize = 0;
+        var applied_count: usize = 0;
+        var progress = standby.currentProgress();
+        var current_lsn: u64 = progress.received_lsn;
+        var last_sent_lsn: u64 = progress.received_lsn;
+        var next_lsn: u64 = standby.nextReceiveLsn();
+
+        while (true) {
+            const result = try self.replicateAvailable(
+                base_uri,
+                slot_name,
+                standby,
+                apply_ctx,
+                apply_fn,
+                options,
+            );
+            iterations += 1;
+            received_count += result.received_count;
+            applied_count += result.applied_count;
+            progress = result.progress;
+            current_lsn = result.current_lsn;
+            last_sent_lsn = result.last_sent_lsn;
+            next_lsn = result.next_lsn;
+
+            if (result.end_of_wal) {
+                return .{
+                    .iterations = iterations,
+                    .received_count = received_count,
+                    .applied_count = applied_count,
+                    .progress = progress,
+                    .current_lsn = current_lsn,
+                    .last_sent_lsn = last_sent_lsn,
+                    .next_lsn = next_lsn,
+                };
+            }
+
+            if (result.received_count == 0 and result.applied_count == 0) {
+                return error.InternalReplicationDidNotAdvance;
+            }
+        }
     }
 
     fn startReplication(
@@ -286,6 +361,16 @@ fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplication
     return out;
 }
 
+fn uint64FromJson(value: i64) !u64 {
+    if (value < 0) return error.InvalidInternalReplicationResponse;
+    return @intCast(value);
+}
+
+fn positiveUint64FromJson(value: i64) !u64 {
+    if (value <= 0) return error.InvalidInternalReplicationResponse;
+    return @intCast(value);
+}
+
 fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
     return try routes.Routes.join(alloc, base_uri, path);
 }
@@ -414,6 +499,10 @@ test "storage.ha http replication client pulls applies and acknowledges standby 
     try std.testing.expectEqual(@as(usize, 2), result.applied_count);
     try std.testing.expectEqual(@as(u64, 2), result.progress.received_lsn);
     try std.testing.expectEqual(@as(u64, 2), result.progress.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 2), result.current_lsn);
+    try std.testing.expectEqual(@as(u64, 2), result.last_sent_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.next_lsn);
+    try std.testing.expect(result.end_of_wal);
     try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
     try std.testing.expectEqualStrings("two", capture.payloads.items[1]);
 
@@ -466,4 +555,51 @@ test "storage.ha http replication client reports durable receive progress when a
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
+test "storage.ha http replication client catches up over bounded batches" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "catch-up");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+
+    try client.createReplicationSlot("http://primary.internal.test", "standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+    _ = try primary.append(.{ .payload = "three" });
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const result = try client.replicateUntilCaughtUp(
+        "http://primary.internal.test",
+        "standby-a",
+        &standby,
+        &capture,
+        ApplyCapture.apply,
+        .{ .max_records = 1 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), result.iterations);
+    try std.testing.expectEqual(@as(usize, 3), result.received_count);
+    try std.testing.expectEqual(@as(usize, 3), result.applied_count);
+    try std.testing.expectEqual(@as(u64, 3), result.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.progress.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.current_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.last_sent_lsn);
+    try std.testing.expectEqual(@as(u64, 4), result.next_lsn);
+    try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
+    try std.testing.expectEqualStrings("two", capture.payloads.items[1]);
+    try std.testing.expectEqualStrings("three", capture.payloads.items[2]);
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 3), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), slot.applied_lsn);
 }
