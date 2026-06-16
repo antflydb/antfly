@@ -5296,7 +5296,11 @@ is valid only on row-query plans, join/lateral plans that assert the left
 lockable source, mutation-source write plans, joined mutation-source write plans,
 generic read fingerprints for row-query/join/lateral plans, or `EXPLAIN`
 wrappers around those plans. Aggregate/window stages, point writes, and merge
-plans reject it.
+plans reject it. The summary is fingerprint-anchored: `true` requires
+`claim=skip_locked` or `claim=no_key_update_skip_locked`, while `false` requires
+a present non-skip-locked claim such as `claim=locked`, `claim=nowait`, or
+the no-key-update `claim=no_key_update` / `claim=no_key_update_nowait` modes. A
+no-claim row stream cannot satisfy row-claim coverage.
 
 CTE summaries are self-anchored to the typed fingerprint. A fixture may carry
 `ctes` only when its golden plan includes an exact `ctes` token with the same

@@ -62555,6 +62555,18 @@ fn appParityFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureRowClaimSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    const skip_locked = entry.summary.row_claim_skip_locked orelse return true;
+    if (skip_locked) {
+        return appParityPlanHasExactStringToken(entry.plan, ":claim=", "skip_locked") or
+            appParityPlanHasExactStringToken(entry.plan, ":claim=", "no_key_update_skip_locked");
+    }
+    return appParityPlanHasExactStringToken(entry.plan, ":claim=", "locked") or
+        appParityPlanHasExactStringToken(entry.plan, ":claim=", "nowait") or
+        appParityPlanHasExactStringToken(entry.plan, ":claim=", "no_key_update") or
+        appParityPlanHasExactStringToken(entry.plan, ":claim=", "no_key_update_nowait");
+}
+
 fn appParityFixtureHasTemporalDdlSummary(entry: AppParityCorpusEntry) bool {
     return entry.summary.temporal_periods != null or
         entry.summary.temporal_primary_key != null or
@@ -62898,6 +62910,9 @@ fn validateAppParityFixtureMetadata(
         return error.TestUnexpectedResult;
     }
     if (entry.summary.row_claim_skip_locked != null and !appParityFixtureAllowsRowClaimSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
+    if (!appParityFixtureRowClaimSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
     if (appParityFixtureHasTemporalDdlSummary(entry)) {
@@ -63486,6 +63501,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .row_claim_skip_locked = false },
         .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query row claim summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1, .row_claim_skip_locked = false },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale skip locked row claim summary",
+        .sql = "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1, .row_claim_skip_locked = true },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=locked",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid nowait row claim summary",
+        .sql = "SELECT id FROM usage_records FOR UPDATE NOWAIT",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1, .row_claim_skip_locked = false },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=nowait",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "stale merge matched predicate summary",
