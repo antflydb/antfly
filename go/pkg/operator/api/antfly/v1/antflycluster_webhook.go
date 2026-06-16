@@ -1165,6 +1165,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if strings.TrimSpace(standby.SeedContentRoot) != "" && strings.TrimSpace(standby.SeedManifestPath) == "" {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedContentRoot is set", i))
 		}
+		if standby.DropSlotOnRemoval && standbyDesiredBySpec(standby) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].dropSlotOnRemoval requires desired=false", i))
+		}
 	}
 
 	if admin := ha.Admin; admin != nil {
@@ -1291,6 +1294,10 @@ func validateHARouteSelector(selector map[string]string, fieldPath string) []str
 		}
 	}
 	return errors
+}
+
+func standbyDesiredBySpec(standby HAStandbySpec) bool {
+	return standby.Desired == nil || *standby.Desired
 }
 
 func (s *HighAvailabilitySpec) modeOrDefault() HAMode {

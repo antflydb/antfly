@@ -535,6 +535,11 @@ type HAStandbySpec struct {
 	// +optional
 	Desired *bool `json:"desired,omitempty"`
 
+	// DropSlotOnRemoval lets the operator drop this standby's replication slot after desired is set false.
+	// This releases WAL retention and is destructive for the standby; keep false to pause the slot instead.
+	// +optional
+	DropSlotOnRemoval bool `json:"dropSlotOnRemoval,omitempty"`
+
 	// InitialLSN optionally pins slot creation to an existing primary LSN.
 	// +optional
 	InitialLSN *uint64 `json:"initialLSN,omitempty"`

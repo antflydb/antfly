@@ -125,8 +125,9 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
-		Name:    "standby-a",
-		Desired: &undesired,
+		Name:              "standby-a",
+		Desired:           &undesired,
+		DropSlotOnRemoval: true,
 	}, {
 		Name:     "standby-b",
 		SlotName: "slot-b",
@@ -148,18 +149,23 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	actions := cluster.Status.HAStatus.PlannedActions
-	if len(actions) != 2 {
-		t.Fatalf("expected pause and resume actions, got %#v", actions)
+	if len(actions) != 3 {
+		t.Fatalf("expected pause, drop, and resume actions, got %#v", actions)
 	}
 	if actions[0].Kind != string(haActionPauseSlot) ||
 		!reflect.DeepEqual(actions[0].AdminCommand, []string{"slot", "pause", "--slot", "standby-a"}) ||
 		actions[0].AdminURL != "http://primary-ha.default.svc:8081" {
 		t.Fatalf("unexpected pause action: %#v", actions[0])
 	}
-	if actions[1].Kind != string(haActionResumeSlot) ||
-		!reflect.DeepEqual(actions[1].AdminCommand, []string{"slot", "resume", "--slot", "slot-b"}) ||
+	if actions[1].Kind != string(haActionDropSlot) ||
+		!reflect.DeepEqual(actions[1].AdminCommand, []string{"slot", "drop", "--slot", "standby-a"}) ||
 		actions[1].AdminURL != "http://primary-ha.default.svc:8081" {
-		t.Fatalf("unexpected resume action: %#v", actions[1])
+		t.Fatalf("unexpected drop action: %#v", actions[1])
+	}
+	if actions[2].Kind != string(haActionResumeSlot) ||
+		!reflect.DeepEqual(actions[2].AdminCommand, []string{"slot", "resume", "--slot", "slot-b"}) ||
+		actions[2].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("unexpected resume action: %#v", actions[2])
 	}
 	if cluster.Status.HAStatus.DesiredStandbyCount != 1 {
 		t.Fatalf("expected only desired standby counted, got %d", cluster.Status.HAStatus.DesiredStandbyCount)
@@ -168,6 +174,36 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 		cluster.Status.HAStatus.Standbys[0].Name != "standby-b" ||
 		cluster.Status.HAStatus.Standbys[0].SlotName != "slot-b" {
 		t.Fatalf("expected slotName override to survive status merge, got %#v", cluster.Status.HAStatus.Standbys)
+	}
+}
+
+func TestPlanHALeavesUndesiredSlotPausedUnlessDropIsExplicit(t *testing.T) {
+	undesired := false
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:    "standby-a",
+		Desired: &undesired,
+	}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 10,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:     "standby-a",
+			SlotName: "standby-a",
+			Active:   true,
+		}},
+	}
+
+	reconciler := &AntflyClusterReconciler{}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	actions := cluster.Status.HAStatus.PlannedActions
+	if len(actions) != 1 {
+		t.Fatalf("expected pause-only action, got %#v", actions)
+	}
+	if actions[0].Kind != string(haActionPauseSlot) ||
+		!reflect.DeepEqual(actions[0].AdminCommand, []string{"slot", "pause", "--slot", "standby-a"}) {
+		t.Fatalf("unexpected pause-only action: %#v", actions[0])
 	}
 }
 

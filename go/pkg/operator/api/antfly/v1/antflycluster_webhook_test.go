@@ -2046,6 +2046,25 @@ func TestValidateCreate_HighAvailabilityRejectsIncompleteSeedPaths(t *testing.T)
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsArmedSlotDropForDesiredStandby(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:              "standby-a",
+			DropSlotOnRemoval: true,
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected dropSlotOnRemoval validation error")
+	}
+	if !strings.Contains(err.Error(), "dropSlotOnRemoval requires desired=false") {
+		t.Fatalf("expected dropSlotOnRemoval dependency error, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
