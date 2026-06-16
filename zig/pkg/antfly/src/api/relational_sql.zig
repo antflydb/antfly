@@ -60862,6 +60862,61 @@ fn expectAppParityReadPlanEntry(
     }
 }
 
+fn expectAppParityReadSummary(summary: AppParityPlanSummary, lowered: LoweredReadPlan) !void {
+    switch (lowered) {
+        .query => |query| {
+            try expectOptionalTableName(summary.table_name, query.table_name);
+            try expectOptionalUsize(summary.ctes, query.plan.ctes.len);
+            try expectQuerySummary(summary, query.plan.query);
+        },
+        .aggregate => |aggregate| {
+            try expectOptionalTableName(summary.table_name, aggregate.table_name);
+            try expectOptionalUsize(summary.ctes, aggregate.plan.ctes.len);
+            try expectQuerySourceSummary(summary, aggregate.plan.aggregate.source);
+            try expectOptionalUsize(summary.group_by, aggregate.plan.aggregate.group_by.len);
+            try expectOptionalUsize(summary.group_expressions, aggregate.plan.aggregate.group_expressions.len);
+            try expectOptionalUsize(summary.aggregations, aggregate.plan.aggregate.aggregations.len);
+            try expectOptionalUsize(summary.filter_groups, aggregateFilterGroupCount(aggregate.plan.aggregate.aggregations));
+            try expectOptionalUsize(summary.having, aggregate.plan.aggregate.having_predicates.len);
+            try expectOptionalUsize(summary.having_expressions, aggregate.plan.aggregate.having_expressions.len);
+            try expectOptionalUsize(summary.having_any, aggregate.plan.aggregate.having_any.len);
+            try expectOptionalUsize(summary.having_not, aggregate.plan.aggregate.having_not.len);
+            try expectOptionalUsize(summary.order_by, aggregate.plan.aggregate.order_by.len);
+            try expectOptionalU32(summary.limit, aggregate.plan.aggregate.limit);
+            if (summary.offset) |expected| try std.testing.expectEqual(expected, aggregate.plan.aggregate.offset);
+        },
+        .join => |join| {
+            try expectOptionalTableName(summary.table_name, join.left_table_name);
+            try expectCombinedQuerySourceSummary(summary, join.join.left, join.join.right);
+            try expectOptionalUsize(summary.join_on, join.join.on.len);
+            try expectOptionalUsize(summary.join_select, join.join.select.len);
+            try expectOptionalUsize(summary.order_by, join.join.order_by.len);
+            try expectOptionalU32(summary.limit, join.join.limit);
+            if (summary.offset) |expected| try std.testing.expectEqual(expected, join.join.offset);
+        },
+        .lateral => |lateral| {
+            try expectOptionalTableName(summary.table_name, lateral.left_table_name);
+            try expectCombinedQuerySourceSummary(summary, lateral.plan.lateral.left, lateral.plan.lateral.right);
+            try expectOptionalUsize(summary.lateral_correlations, lateral.plan.lateral.correlations.len);
+            try expectOptionalUsize(summary.join_select, lateral.plan.lateral.select.len);
+            try expectOptionalUsize(summary.order_by, lateral.plan.lateral.order_by.len);
+            try expectOptionalU32(summary.limit, lateral.plan.lateral.limit);
+            if (summary.offset) |expected| try std.testing.expectEqual(expected, lateral.plan.lateral.offset);
+            if (summary.right_offset) |expected| try std.testing.expectEqual(expected, lateral.plan.lateral.right.offset);
+        },
+        .window => |window| {
+            try expectOptionalTableName(summary.table_name, window.table_name);
+            try expectOptionalUsize(summary.ctes, window.plan.ctes.len);
+            try expectQuerySourceSummary(summary, window.plan.window.source);
+            try expectOptionalUsize(summary.windows, window.plan.window.windows.len);
+            try expectOptionalUsize(summary.select, window.plan.window.select.len);
+            try expectOptionalUsize(summary.order_by, window.plan.window.order_by.len);
+            try expectOptionalU32(summary.limit, window.plan.window.limit);
+            if (summary.offset) |expected| try std.testing.expectEqual(expected, window.plan.window.offset);
+        },
+    }
+}
+
 fn appParityPlanFamilyIsSupportedRead(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .query,
@@ -61143,6 +61198,7 @@ fn expectAppParityCorpusEntry(
         .read => {
             var lowered = try lowerAppParityReadPlanAlloc(alloc, effective_schema, entry);
             defer lowered.deinit(alloc);
+            try expectAppParityReadSummary(entry.summary, lowered);
             const fingerprint = try readPlanFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
