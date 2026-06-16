@@ -23,6 +23,7 @@ const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
+const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;
@@ -169,6 +170,45 @@ pub const Client = struct {
             admin_api.openapi.HACommitAppendResponse,
             base_uri,
             admin_api.routes.ha_commit_append,
+            request,
+        );
+    }
+
+    pub fn checkRead(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.ReadCheckRequest,
+    ) !ParsedOutput(admin_api.openapi.HAReadCheckResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAReadCheckResponse,
+            base_uri,
+            admin_api.routes.ha_read_check,
+            request,
+        );
+    }
+
+    pub fn checkWrite(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.WriteCheckRequest,
+    ) !ParsedOutput(admin_api.openapi.HAWriteCheckResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAWriteCheckResponse,
+            base_uri,
+            admin_api.routes.ha_write_check,
+            request,
+        );
+    }
+
+    pub fn checkOwnerJob(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.OwnerJobCheckRequest,
+    ) !ParsedOutput(admin_api.openapi.HAOwnerJobCheckResponse) {
+        return try self.postJson(
+            admin_api.openapi.HAOwnerJobCheckResponse,
+            base_uri,
+            admin_api.routes.ha_owner_job_check,
             request,
         );
     }
@@ -557,6 +597,22 @@ fn seedFiles() [2]backup_manifest.FileEntry {
     };
 }
 
+fn testRecord(identity: standby_mod.Identity, lsn: u64, payload: []const u8) replication_record.Record {
+    return .{
+        .kind = .batch_mutation,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = lsn,
+        .previous_lsn = lsn - 1,
+        .payload = payload,
+    };
+}
+
+fn noOpApply(_: *anyopaque, _: replication_record.RecordView) anyerror!void {}
+
 fn writeTestFile(path: []const u8, bytes: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -801,6 +857,8 @@ test "storage.ha http client round trips typed commit operations" {
 
     var appended = try client.appendCommit("http://ha-admin.test", .{
         .payload = "one",
+        .shard_id = @intCast(identity.shard_id),
+        .table_id = @intCast(identity.table_id),
         .sync_policy = .{ .mode = "async" },
     });
     defer appended.deinit(alloc);
@@ -839,6 +897,85 @@ test "storage.ha http client round trips typed commit operations" {
     try std.testing.expectEqual(@as(i64, 2), degraded.parsed.value.lsn);
     try std.testing.expectEqualStrings("acknowledge_degraded", degraded.parsed.value.gate.action);
     try std.testing.expectEqualStrings("degraded_to_async", degraded.parsed.value.gate.durability.status);
+}
+
+test "storage.ha http client round trips typed gate operations" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "typed-gates");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    defer server.deinit();
+    var client = Client.init(alloc, server.executor());
+
+    var primary_write = try client.checkWrite("http://ha-admin.test", .{
+        .role = "primary",
+        .expected_identity = testAdminIdentity(),
+    });
+    defer primary_write.deinit(alloc);
+    try std.testing.expectEqualStrings("allow_write", primary_write.parsed.value.decision.action);
+    try std.testing.expectEqual(@as(i64, 1), primary_write.parsed.value.decision.next_lsn);
+
+    var primary_owner_job = try client.checkOwnerJob("http://ha-admin.test", .{
+        .role = "primary",
+        .kind = "retention_advance",
+        .expected_identity = testAdminIdentity(),
+    });
+    defer primary_owner_job.deinit(alloc);
+    try std.testing.expectEqualStrings("run", primary_owner_job.parsed.value.decision.action);
+
+    var slot = try client.createReplicationSlot("http://ha-admin.test", "standby-a", 0);
+    defer slot.deinit(alloc);
+    var appended = try client.appendCommit("http://ha-admin.test", .{
+        .payload = "one",
+        .shard_id = @intCast(identity.shard_id),
+        .table_id = @intCast(identity.table_id),
+        .sync_policy = .{ .mode = "async" },
+    });
+    defer appended.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
+
+    var apply_ctx: u8 = 0;
+    _ = try standby.receive(testRecord(identity, 1, "one"));
+    try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&apply_ctx, noOpApply));
+
+    var ready_read = try client.checkRead("http://ha-admin.test", .{
+        .consistency = "at_least_lsn",
+        .required_lsn = 1,
+    });
+    defer ready_read.deinit(alloc);
+    try std.testing.expectEqualStrings("serve_standby", ready_read.parsed.value.decision.action);
+    try std.testing.expectEqual(@as(?i64, 1), ready_read.parsed.value.decision.serve_lsn);
+
+    var waiting_read = try client.checkRead("http://ha-admin.test", .{
+        .consistency = "at_least_lsn",
+        .required_lsn = 2,
+    });
+    defer waiting_read.deinit(alloc);
+    try std.testing.expectEqualStrings("wait_for_apply", waiting_read.parsed.value.decision.action);
+    try std.testing.expectEqual(@as(i64, 1), waiting_read.parsed.value.decision.missing_lsn_count);
+
+    var standby_write = try client.checkWrite("http://ha-admin.test", .{
+        .role = "standby",
+        .expected_identity = testAdminIdentity(),
+    });
+    defer standby_write.deinit(alloc);
+    try std.testing.expectEqualStrings("reject_read_only_standby", standby_write.parsed.value.decision.action);
+    try std.testing.expectEqualStrings("standby", standby_write.parsed.value.decision.role);
+
+    var standby_owner_job = try client.checkOwnerJob("http://ha-admin.test", .{
+        .role = "standby",
+        .kind = "compaction_publish",
+        .expected_identity = testAdminIdentity(),
+    });
+    defer standby_owner_job.deinit(alloc);
+    try std.testing.expectEqualStrings("disable_on_standby", standby_owner_job.parsed.value.decision.action);
 }
 
 test "storage.ha http client round trips typed seed operations" {

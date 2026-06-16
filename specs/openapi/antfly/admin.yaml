@@ -146,6 +146,72 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/read/check:
+    post:
+      tags: [ha]
+      operationId: checkHARead
+      summary: Evaluate standby read freshness and routing
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReadCheckRequest"
+      responses:
+        "200":
+          description: Read gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReadCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/write/check:
+    post:
+      tags: [ha]
+      operationId: checkHAWrite
+      summary: Evaluate whether this node can accept writes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteCheckRequest"
+      responses:
+        "200":
+          description: Write gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAWriteCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/owner-jobs/check:
+    post:
+      tags: [ha]
+      operationId: checkHAOwnerJob
+      summary: Evaluate whether an owner-only background job may run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnerJobCheckRequest"
+      responses:
+        "200":
+          description: Owner-job gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAOwnerJobCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/replication-slots:
     get:
       tags: [ha]
@@ -586,6 +652,54 @@ components:
           default: 0
         sync_policy:
           $ref: "#/components/schemas/HASyncPolicy"
+    ReadCheckRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        consistency:
+          type: string
+          enum: [stale_ok, at_least_lsn, primary]
+          default: stale_ok
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        required_metadata_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        metadata_applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+    WriteCheckRequest:
+      type: object
+      required: [role]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary, standby]
+        expected_identity:
+          nullable: true
+          $ref: "#/components/schemas/HAIdentity"
+    OwnerJobCheckRequest:
+      type: object
+      required: [role, kind]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary, standby]
+        kind:
+          type: string
+          enum: [compaction_publish, derived_effect_writer, enrichment_writer, retention_advance]
+        expected_identity:
+          nullable: true
+          $ref: "#/components/schemas/HAIdentity"
     HAIdentity:
       type: object
       required: [cluster_id, shard_id, table_id, timeline_id, epoch]
@@ -811,6 +925,39 @@ components:
           minimum: 0
         gate:
           $ref: "#/components/schemas/HACommitGate"
+    HAReadCheckResponse:
+      type: object
+      required: [schema_version, decision]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        decision:
+          $ref: "#/components/schemas/HAReadDecision"
+    HAWriteCheckResponse:
+      type: object
+      required: [schema_version, decision]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        decision:
+          $ref: "#/components/schemas/HAWriteDecision"
+    HAOwnerJobCheckResponse:
+      type: object
+      required: [schema_version, decision]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        decision:
+          $ref: "#/components/schemas/HAOwnerJobDecision"
     HAReplicationSlotActionResponse:
       type: object
       required: [schema_version, slot_action, slot]
@@ -1293,6 +1440,130 @@ components:
           type: integer
           format: uint64
           minimum: 0
+    HAReadDecision:
+      type: object
+      required:
+        - action
+        - consistency
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - missing_lsn_count
+        - metadata_missing_lsn_count
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [serve_standby, wait_for_apply, wait_for_metadata, route_to_primary]
+        consistency:
+          type: string
+          enum: [stale_ok, at_least_lsn, primary]
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        required_metadata_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        metadata_applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        serve_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          nullable: true
+        missing_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        metadata_missing_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAPromotionHandoff:
+      type: object
+      required: [identity, switch_lsn, next_lsn]
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        switch_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAWriteDecision:
+      type: object
+      required: [role, action, identity, durable_lsn, next_lsn]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [primary, standby, promoted_standby]
+        action:
+          type: string
+          enum: [allow_write, reject_read_only_standby, open_promoted_primary]
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        durable_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        promotion_handoff:
+          nullable: true
+          $ref: "#/components/schemas/HAPromotionHandoff"
+    HAOwnerJobDecision:
+      type: object
+      required: [kind, role, action, identity, durable_lsn, next_lsn]
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [compaction_publish, derived_effect_writer, enrichment_writer, retention_advance]
+        role:
+          type: string
+          enum: [primary, standby, promoted_standby]
+        action:
+          type: string
+          enum: [run, disable_on_standby, open_promoted_primary]
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        durable_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        promotion_handoff:
+          nullable: true
+          $ref: "#/components/schemas/HAPromotionHandoff"
     HACommitGate:
       type: object
       required: [target_lsn, action, durability]

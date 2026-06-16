@@ -28,11 +28,14 @@ const admin_exec = @import("admin_exec.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
+const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
+const read_gate = @import("read_gate.zig");
 const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
+const write_gate = @import("write_gate.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -107,6 +110,15 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_commit_append)) {
                     return try self.handleAdminCommitAppend(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_read_check)) {
+                    return try self.handleAdminReadCheck(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_write_check)) {
+                    return try self.handleAdminWriteCheck(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_owner_job_check)) {
+                    return try self.handleAdminOwnerJobCheck(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups)) {
                     return try self.handleAdminBeginBaseBackup(req);
@@ -290,6 +302,80 @@ pub const Server = struct {
             .lsn = result.lsn,
             .gate = commitGateDocument(result.gate),
         });
+    }
+
+    fn handleAdminReadCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
+        const request = if (req.body.len == 0)
+            read_gate.Request{}
+        else blk: {
+            var parsed = admin_api.openapi.server.parseCheckHAReadBody(
+                self.alloc,
+                req.body,
+            ) catch return try textResponse(self.alloc, 400, "invalid HA read check request");
+            defer parsed.deinit();
+            break :blk readRequestFromOpenApi(parsed.value) catch {
+                return try textResponse(self.alloc, 400, "invalid HA read check request");
+            };
+        };
+        const decision = ha_admin.evaluateStandbyRead(standby, request) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        return try self.handleTypedJson(ReadCheckDocument{ .decision = decision });
+    }
+
+    fn handleAdminWriteCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA write check request");
+        var parsed = admin_api.openapi.server.parseCheckHAWriteBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA write check request");
+        defer parsed.deinit();
+        const request = writeRequestFromOpenApi(parsed.value) catch {
+            return try textResponse(self.alloc, 400, "invalid HA write check request");
+        };
+        const decision = switch (request.role) {
+            .primary => blk: {
+                const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+                break :blk ha_admin.evaluatePrimaryWrite(primary, request.request) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+            },
+            .standby => blk: {
+                const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
+                break :blk ha_admin.evaluateStandbyWrite(standby, request.request) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+            },
+        };
+        return try self.handleTypedJson(WriteCheckDocument{ .decision = decision });
+    }
+
+    fn handleAdminOwnerJobCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA owner job check request");
+        var parsed = admin_api.openapi.server.parseCheckHAOwnerJobBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA owner job check request");
+        defer parsed.deinit();
+        const request = ownerJobRequestFromOpenApi(parsed.value) catch {
+            return try textResponse(self.alloc, 400, "invalid HA owner job check request");
+        };
+        const decision = switch (request.role) {
+            .primary => blk: {
+                const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+                break :blk ha_admin.evaluatePrimaryOwnerJob(primary, request.request) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+            },
+            .standby => blk: {
+                const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
+                break :blk ha_admin.evaluateStandbyOwnerJob(standby, request.request) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+            },
+        };
+        return try self.handleTypedJson(OwnerJobCheckDocument{ .decision = decision });
     }
 
     fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -608,6 +694,21 @@ const CommitGateDocument = struct {
     durability: primary_mod.DurabilityDecision,
 };
 
+const ReadCheckDocument = struct {
+    schema_version: u32 = 1,
+    decision: read_gate.Decision,
+};
+
+const WriteCheckDocument = struct {
+    schema_version: u32 = 1,
+    decision: write_gate.Decision,
+};
+
+const OwnerJobCheckDocument = struct {
+    schema_version: u32 = 1,
+    decision: owner_job_gate.Decision,
+};
+
 const FenceDocument = struct {
     schema_version: u32 = 1,
     receipt: fencing.Receipt,
@@ -713,6 +814,9 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
         std.mem.eql(u8, path, admin_api.routes.ha_commit_check) or
         std.mem.eql(u8, path, admin_api.routes.ha_commit_append) or
+        std.mem.eql(u8, path, admin_api.routes.ha_read_check) or
+        std.mem.eql(u8, path, admin_api.routes.ha_write_check) or
+        std.mem.eql(u8, path, admin_api.routes.ha_owner_job_check) or
         std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
@@ -724,6 +828,21 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess);
 }
+
+const GateRole = enum {
+    primary,
+    standby,
+};
+
+const WriteGateRequest = struct {
+    role: GateRole,
+    request: write_gate.Request,
+};
+
+const OwnerJobGateRequest = struct {
+    role: GateRole,
+    request: owner_job_gate.Request,
+};
 
 fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy {
     const required = if (policy.required) |value| blk: {
@@ -743,6 +862,55 @@ fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy
         .standby_names = standby_names,
         .failure_policy = if (policy.failure_policy) |raw| try parseFailurePolicyQuery(raw) else .block,
     };
+}
+
+fn readRequestFromOpenApi(request: admin_api.ReadCheckRequest) !read_gate.Request {
+    return .{
+        .consistency = if (request.consistency) |raw| try parseReadConsistency(raw) else .stale_ok,
+        .required_lsn = if (request.required_lsn) |value| try uint64FromJson(value) else null,
+        .required_metadata_lsn = if (request.required_metadata_lsn) |value| try uint64FromJson(value) else null,
+        .metadata_applied_lsn = if (request.metadata_applied_lsn) |value| try uint64FromJson(value) else null,
+    };
+}
+
+fn writeRequestFromOpenApi(request: admin_api.WriteCheckRequest) !WriteGateRequest {
+    return .{
+        .role = try parseGateRole(request.role),
+        .request = .{
+            .expected_identity = if (request.expected_identity) |identity| try adminIdentityFromOpenApi(identity) else null,
+        },
+    };
+}
+
+fn ownerJobRequestFromOpenApi(request: admin_api.OwnerJobCheckRequest) !OwnerJobGateRequest {
+    return .{
+        .role = try parseGateRole(request.role),
+        .request = .{
+            .kind = try parseOwnerJobKind(request.kind),
+            .expected_identity = if (request.expected_identity) |identity| try adminIdentityFromOpenApi(identity) else null,
+        },
+    };
+}
+
+fn parseReadConsistency(raw: []const u8) !read_gate.Consistency {
+    if (std.mem.eql(u8, raw, "stale_ok") or std.mem.eql(u8, raw, "stale-ok")) return .stale_ok;
+    if (std.mem.eql(u8, raw, "at_least_lsn") or std.mem.eql(u8, raw, "at-least-lsn")) return .at_least_lsn;
+    if (std.mem.eql(u8, raw, "primary")) return .primary;
+    return error.InvalidAdminRequest;
+}
+
+fn parseGateRole(raw: []const u8) !GateRole {
+    if (std.mem.eql(u8, raw, "primary")) return .primary;
+    if (std.mem.eql(u8, raw, "standby")) return .standby;
+    return error.InvalidAdminRequest;
+}
+
+fn parseOwnerJobKind(raw: []const u8) !owner_job_gate.JobKind {
+    if (std.mem.eql(u8, raw, "compaction_publish")) return .compaction_publish;
+    if (std.mem.eql(u8, raw, "derived_effect_writer")) return .derived_effect_writer;
+    if (std.mem.eql(u8, raw, "enrichment_writer")) return .enrichment_writer;
+    if (std.mem.eql(u8, raw, "retention_advance")) return .retention_advance;
+    return error.InvalidAdminRequest;
 }
 
 fn appendOptionsFromOpenApi(request: admin_api.CommitAppendRequest) !primary_mod.AppendOptions {
@@ -954,6 +1122,10 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.InvalidReplicationError,
         error.InvalidReplicationStartLsn,
         error.ReplicationStartAheadOfPrimary,
+        error.RequiredLsnMissing,
+        error.AppliedAheadOfReceived,
+        error.SafeReadAheadOfApplied,
+        error.MetadataAheadOfApplied,
         error.InvalidCheckpointLsn,
         error.InvalidBackupLsn,
         error.InvalidManifestId,

@@ -36,6 +36,21 @@ pub fn parseAppendHACommitBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.CommitAppendRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for checkHARead.
+pub fn parseCheckHAReadBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ReadCheckRequest) {
+    return std.json.parseFromSlice(types.ReadCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for checkHAWrite.
+pub fn parseCheckHAWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.WriteCheckRequest) {
+    return std.json.parseFromSlice(types.WriteCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for checkHAOwnerJob.
+pub fn parseCheckHAOwnerJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.OwnerJobCheckRequest) {
+    return std.json.parseFromSlice(types.OwnerJobCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationSlot.
 pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ReplicationSlotCreateRequest) {
     return std.json.parseFromSlice(types.ReplicationSlotCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -106,6 +121,9 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
     .{ .method = "POST", .path = "/ha/commit/check", .operation_id = "checkHACommit" },
     .{ .method = "POST", .path = "/ha/commit/append", .operation_id = "appendHACommit" },
+    .{ .method = "POST", .path = "/ha/read/check", .operation_id = "checkHARead" },
+    .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite" },
+    .{ .method = "POST", .path = "/ha/owner-jobs/check", .operation_id = "checkHAOwnerJob" },
     .{ .method = "GET", .path = "/ha/replication-slots", .operation_id = "listHAReplicationSlots" },
     .{ .method = "POST", .path = "/ha/replication-slots", .operation_id = "createHAReplicationSlot" },
     .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot" },
@@ -137,6 +155,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
         if (!@hasDecl(Impl, "checkHACommit")) @compileError("ServerRouter: Impl missing required method 'checkHACommit'");
         if (!@hasDecl(Impl, "appendHACommit")) @compileError("ServerRouter: Impl missing required method 'appendHACommit'");
+        if (!@hasDecl(Impl, "checkHARead")) @compileError("ServerRouter: Impl missing required method 'checkHARead'");
+        if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
+        if (!@hasDecl(Impl, "checkHAOwnerJob")) @compileError("ServerRouter: Impl missing required method 'checkHAOwnerJob'");
         if (!@hasDecl(Impl, "listHAReplicationSlots")) @compileError("ServerRouter: Impl missing required method 'listHAReplicationSlots'");
         if (!@hasDecl(Impl, "createHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationSlot'");
         if (!@hasDecl(Impl, "dropHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'dropHAReplicationSlot'");
@@ -169,6 +190,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/ha/standby/status", getHAStandbyStatus);
             try server.post("/ha/commit/check", checkHACommit);
             try server.post("/ha/commit/append", appendHACommit);
+            try server.post("/ha/read/check", checkHARead);
+            try server.post("/ha/write/check", checkHAWrite);
+            try server.post("/ha/owner-jobs/check", checkHAOwnerJob);
             try server.get("/ha/replication-slots", listHAReplicationSlots);
             try server.post("/ha/replication-slots", createHAReplicationSlot);
             try server.delete("/ha/replication-slots/:slot_name", dropHAReplicationSlot);
@@ -222,6 +246,27 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn appendHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.appendHACommit(ctx);
+        }
+
+        /// Evaluate standby read freshness and routing
+        /// POST /ha/read/check
+        fn checkHARead(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.checkHARead(ctx);
+        }
+
+        /// Evaluate whether this node can accept writes
+        /// POST /ha/write/check
+        fn checkHAWrite(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.checkHAWrite(ctx);
+        }
+
+        /// Evaluate whether an owner-only background job may run
+        /// POST /ha/owner-jobs/check
+        fn checkHAOwnerJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.checkHAOwnerJob(ctx);
         }
 
         /// List HA replication slots
@@ -333,6 +378,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
 //   fn checkHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn appendHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn checkHARead(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn checkHAOwnerJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listHAReplicationSlots(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response

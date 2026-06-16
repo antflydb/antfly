@@ -42,6 +42,13 @@ pub const HASyncPolicy = struct {
     failure_policy: ?[]const u8 = null,
 };
 
+pub const ReadCheckRequest = struct {
+    consistency: ?[]const u8 = null,
+    required_lsn: ?i64 = null,
+    required_metadata_lsn: ?i64 = null,
+    metadata_applied_lsn: ?i64 = null,
+};
+
 pub const HAIdentity = struct {
     cluster_id: i64,
     shard_id: i64,
@@ -145,6 +152,20 @@ pub const HADurabilityDecision = struct {
     candidate_count: i64,
 };
 
+pub const HAReadDecision = struct {
+    action: []const u8,
+    consistency: []const u8,
+    required_lsn: ?i64 = null,
+    required_metadata_lsn: ?i64 = null,
+    received_lsn: i64,
+    applied_lsn: i64,
+    safe_read_lsn: i64,
+    metadata_applied_lsn: ?i64 = null,
+    serve_lsn: ?i64 = null,
+    missing_lsn_count: i64,
+    metadata_missing_lsn_count: i64,
+};
+
 pub const HAReplicationSlot = struct {
     slot_name: []const u8,
     timeline_id: i64,
@@ -176,6 +197,17 @@ pub const CommitAppendRequest = struct {
     table_id: ?i64 = null,
     commit_timestamp_ns: ?i64 = null,
     sync_policy: HASyncPolicy,
+};
+
+pub const WriteCheckRequest = struct {
+    role: []const u8,
+    expected_identity: ?HAIdentity = null,
+};
+
+pub const OwnerJobCheckRequest = struct {
+    role: []const u8,
+    kind: []const u8,
+    expected_identity: ?HAIdentity = null,
 };
 
 pub const FenceAcquireRequest = struct {
@@ -229,6 +261,12 @@ pub const HAStandbySnapshot = struct {
     can_serve_safe_reads: bool,
 };
 
+pub const HAPromotionHandoff = struct {
+    identity: HAIdentity,
+    switch_lsn: i64,
+    next_lsn: i64,
+};
+
 pub const HAPromotionAssessResponse = struct {
     schema_version: i64,
     assessment: HAPromotionAssessment,
@@ -252,6 +290,11 @@ pub const HACommitGate = struct {
     target_lsn: i64,
     action: []const u8,
     durability: HADurabilityDecision,
+};
+
+pub const HAReadCheckResponse = struct {
+    schema_version: i64,
+    decision: HAReadDecision,
 };
 
 pub const HAReplicationSlotActionResponse = struct {
@@ -298,6 +341,25 @@ pub const HAStandbyStatusResponse = struct {
     snapshot: HAStandbySnapshot,
 };
 
+pub const HAWriteDecision = struct {
+    role: []const u8,
+    action: []const u8,
+    identity: HAIdentity,
+    durable_lsn: i64,
+    next_lsn: i64,
+    promotion_handoff: ?HAPromotionHandoff = null,
+};
+
+pub const HAOwnerJobDecision = struct {
+    kind: []const u8,
+    role: []const u8,
+    action: []const u8,
+    identity: HAIdentity,
+    durable_lsn: i64,
+    next_lsn: i64,
+    promotion_handoff: ?HAPromotionHandoff = null,
+};
+
 pub const HAPrimaryStatusResponse = struct {
     schema_version: i64,
     snapshot: HAPrimarySnapshot,
@@ -312,4 +374,14 @@ pub const HACommitAppendResponse = struct {
     schema_version: i64,
     lsn: i64,
     gate: HACommitGate,
+};
+
+pub const HAWriteCheckResponse = struct {
+    schema_version: i64,
+    decision: HAWriteDecision,
+};
+
+pub const HAOwnerJobCheckResponse = struct {
+    schema_version: i64,
+    decision: HAOwnerJobDecision,
 };
