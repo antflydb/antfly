@@ -76,6 +76,10 @@ pub const SeedCommand = union(enum) {
     bootstrap: SeedBootstrapCommand,
 };
 
+pub const StreamOnceCommand = struct {
+    slot_name: []const u8,
+};
+
 pub const CommitCheckCommand = struct {
     target_lsn: u64,
     policy: primary_mod.SyncPolicy,
@@ -93,6 +97,7 @@ pub const Command = union(enum) {
     slot_list: SlotListCommand,
     seed: SeedCommand,
     start_replication: replication_api.StartReplicationRequest,
+    stream_once: StreamOnceCommand,
     standby_status_update: replication_api.StandbyStatusUpdateRequest,
     primary_status: PrimaryStatusCommand,
     standby_status: StandbyStatusCommand,
@@ -175,7 +180,7 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
         return plan;
     }
     if (std.mem.eql(u8, root, "stream")) {
-        plan.command = .{ .start_replication = try parseStream(&cursor) };
+        plan.command = try parseStreamCommand(&cursor);
         try cursor.expectEnd();
         return plan;
     }
@@ -323,7 +328,38 @@ fn parseManifestPath(cursor: *Cursor) ![]const u8 {
     return error.ManifestPathMissing;
 }
 
-fn parseStream(cursor: *Cursor) !replication_api.StartReplicationRequest {
+fn parseStreamCommand(cursor: *Cursor) !Command {
+    if (cursor.peek()) |subcommand| {
+        if (std.mem.eql(u8, subcommand, "once")) {
+            _ = cursor.next();
+            return .{ .stream_once = try parseStreamOnce(cursor) };
+        }
+        if (std.mem.eql(u8, subcommand, "start")) {
+            _ = cursor.next();
+            return .{ .start_replication = try parseStreamStart(cursor) };
+        }
+    }
+    return .{ .start_replication = try parseStreamStart(cursor) };
+}
+
+fn parseStreamOnce(cursor: *Cursor) !StreamOnceCommand {
+    var slot_name: ?[]const u8 = null;
+
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--slot")) {
+            _ = cursor.next();
+            slot_name = try cursor.value("--slot");
+        } else if (slot_name == null and !isFlag(arg)) {
+            slot_name = cursor.next().?;
+        } else {
+            break;
+        }
+    }
+
+    return .{ .slot_name = slot_name orelse return error.SlotNameMissing };
+}
+
+fn parseStreamStart(cursor: *Cursor) !replication_api.StartReplicationRequest {
     var slot_name: ?[]const u8 = null;
     var from_lsn: ?u64 = null;
     var max_records: usize = 0;
@@ -975,6 +1011,14 @@ test "storage.ha admin cli parses stream ack commit and read checks" {
     try std.testing.expectEqualStrings("standby-a", stream.command.start_replication.slot_name);
     try std.testing.expectEqual(@as(u64, 7), stream.command.start_replication.from_lsn);
     try std.testing.expectEqual(@as(usize, 10), stream.command.start_replication.max_records);
+
+    var stream_start = try parse(alloc, &.{ "stream", "start", "--slot", "standby-a", "--from-lsn", "7" });
+    defer stream_start.deinit(alloc);
+    try std.testing.expectEqualStrings("standby-a", stream_start.command.start_replication.slot_name);
+
+    var stream_once = try parse(alloc, &.{ "stream", "once", "--slot", "standby-a" });
+    defer stream_once.deinit(alloc);
+    try std.testing.expectEqualStrings("standby-a", stream_once.command.stream_once.slot_name);
 
     var ack = try parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "2", "--received-lsn", "9", "--applied-lsn", "8" });
     defer ack.deinit(alloc);

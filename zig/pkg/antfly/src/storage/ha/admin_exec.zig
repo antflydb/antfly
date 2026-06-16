@@ -33,6 +33,7 @@ const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
 const replication_record = @import("replication_record.zig");
+const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
 
@@ -77,6 +78,7 @@ pub const Result = union(enum) {
     seed_finish: SeedFinishResult,
     seed_bootstrap: SeedBootstrapResult,
     start_replication: replication_api.StartReplicationResponse,
+    stream_once: session.Result,
     standby_status_update: replication_api.StandbyStatusUpdateResponse,
     primary_status: status.PrimarySnapshot,
     standby_status: status.StandbySnapshot,
@@ -186,6 +188,13 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendUsizeLine(alloc, &out, "encoded_bytes", response.encoded_bytes);
             try appendUsizeLine(alloc, &out, "record_count", response.records.len);
         },
+        .stream_once => |response| {
+            try appendUsizeLine(alloc, &out, "received_count", response.received_count);
+            try appendUsizeLine(alloc, &out, "applied_count", response.applied_count);
+            try appendU64Line(alloc, &out, "received_lsn", response.progress.received_lsn);
+            try appendU64Line(alloc, &out, "applied_lsn", response.progress.applied_lsn);
+            try appendU64Line(alloc, &out, "safe_read_lsn", response.progress.safe_read_lsn);
+        },
         .standby_status_update => |response| {
             try appendLine(alloc, &out, "slot_name", response.slot_name);
             try appendU64Line(alloc, &out, "timeline_id", response.timeline_id);
@@ -282,6 +291,14 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .start_replication => |request| .{
             .start_replication = try replication_api.startReplication(alloc, try requirePrimary(ctx), request),
         },
+        .stream_once => |command| .{
+            .stream_once = try executeStreamOnce(
+                alloc,
+                try requirePrimary(ctx),
+                try requireStandby(ctx),
+                command,
+            ),
+        },
         .standby_status_update => |request| .{
             .standby_status_update = try admin.updateStandbyProgress(try requirePrimary(ctx), request),
         },
@@ -301,6 +318,27 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         },
     };
 }
+
+fn executeStreamOnce(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    standby: *standby_mod.Standby,
+    command: admin_cli.StreamOnceCommand,
+) !session.Result {
+    var apply_ctx = NoopApply{};
+    return try session.replicateAvailable(
+        alloc,
+        primary,
+        command.slot_name,
+        standby,
+        &apply_ctx,
+        NoopApply.apply,
+    );
+}
+
+const NoopApply = struct {
+    fn apply(_: *anyopaque, _: replication_record.RecordView) !void {}
+};
 
 fn executeSeed(alloc: Allocator, ctx: Context, command: admin_cli.SeedCommand) !Result {
     return switch (command) {
@@ -470,6 +508,7 @@ fn resultName(result: Result) []const u8 {
         .seed_finish => "seed_finish",
         .seed_bootstrap => "seed_bootstrap",
         .start_replication => "start_replication",
+        .stream_once => "stream_once",
         .standby_status_update => "standby_status_update",
         .primary_status => "primary_status",
         .standby_status => "standby_status",
@@ -1019,6 +1058,49 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     try expectContains(table_body, "result=seed_bootstrap\n");
     try expectContains(table_body, "manifest_id=base-0001\n");
     try expectContains(table_body, "checkpoint_lsn=2\n");
+}
+
+test "storage.ha admin exec streams one local replication session" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "stream-once");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    try primary.createSlot("standby-a", 0);
+    try std.testing.expectEqual(@as(u64, 1), try primary.append(.{ .payload = "one" }));
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "two" }));
+
+    var stream_plan = try admin_cli.parse(alloc, &.{ "stream", "once", "--slot", "standby-a" });
+    defer stream_plan.deinit(alloc);
+    var streamed = try execute(alloc, .{ .primary = &primary, .standby = &standby }, stream_plan);
+    defer streamed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), streamed.stream_once.received_count);
+    try std.testing.expectEqual(@as(usize, 2), streamed.stream_once.applied_count);
+    try std.testing.expectEqual(@as(u64, 2), streamed.stream_once.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), streamed.stream_once.progress.applied_lsn);
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
+
+    const table_body = try renderTableAlloc(alloc, streamed);
+    defer alloc.free(table_body);
+    try expectContains(table_body, "result=stream_once\n");
+    try expectContains(table_body, "received_count=2\n");
+    try expectContains(table_body, "applied_lsn=2\n");
+
+    var rendered_plan = try admin_cli.parse(alloc, &.{ "--table", "stream", "once", "standby-a" });
+    defer rendered_plan.deinit(alloc);
+    var rendered = try executeAndRenderAlloc(alloc, .{ .primary = &primary, .standby = &standby }, rendered_plan);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", rendered.content_type);
+    try expectContains(rendered.body, "received_count=0\n");
+    try expectContains(rendered.body, "applied_count=0\n");
 }
 
 test "storage.ha admin exec runs read commit promote and rejoin commands" {
