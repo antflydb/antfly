@@ -5257,11 +5257,13 @@ Pagination summaries are scoped to typed stages that actually order or trim a
 row stream. `order_by`, `limit`, and `offset` are valid on row-query, aggregate,
 join, lateral, window, source-query mutation, joined mutation-source, generic
 read, and `EXPLAIN` wrapper plans whose runner structurally asserts those
-fields. Point writes, merge arms, and DDL reject pagination summaries. Relation
-population summaries are target-only today: they may name the populated relation,
-while source projection, predicate, CTE, and pagination evidence stays in the
-typed source-read fingerprint until the fixture runner has a dedicated source
-summary assertion path.
+fields. They must match `order`/`limit`/`offset` tokens for read stages and
+joined mutation sources, or `source_order`/`source_limit`/`source_offset` for
+source-query writes. Point writes, merge arms, and DDL reject pagination
+summaries. Relation population summaries are target-only today: they may name
+the populated relation, while source projection, predicate, CTE, and pagination
+evidence stays in the typed source-read fingerprint until the fixture runner has
+a dedicated source summary assertion path.
 
 Returning summaries are self-anchored to write fingerprints. Point writes must
 match `returning_rows`, source-query writes and merge mutations must match

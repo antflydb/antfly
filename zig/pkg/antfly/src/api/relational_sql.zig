@@ -62495,6 +62495,38 @@ fn appParityFixtureAllowsPaginationSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureUsesSourcePagination(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        => true,
+        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:"),
+        else => false,
+    };
+}
+
+fn appParityFixturePaginationSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    const source_pagination = appParityFixtureUsesSourcePagination(entry);
+    if (entry.summary.order_by) |order_by| {
+        const token = if (source_pagination) ":source_order=" else ":order=";
+        if (!appParityPlanHasExactUsizeToken(entry.plan, token, order_by)) return false;
+    }
+    if (entry.summary.limit) |limit| {
+        const token = if (source_pagination) ":source_limit=" else ":limit=";
+        if (!appParityPlanHasExactUsizeToken(entry.plan, token, limit)) return false;
+    }
+    if (entry.summary.offset) |offset| {
+        const token = if (source_pagination) ":source_offset=" else ":offset=";
+        if (!appParityPlanHasExactUsizeToken(entry.plan, token, offset)) return false;
+    }
+    return true;
+}
+
 fn appParityFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .query,
@@ -62862,6 +62894,9 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if (!appParityFixturePaginationSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.row_claim_skip_locked != null and !appParityFixtureAllowsRowClaimSummary(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -63098,6 +63133,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .update_source,
         .summary = .{ .table_name = "usage_records", .predicates = 1, .order_by = 1, .limit = 5, .offset = 2, .operations = 1 },
         .plan = "update_source:table=usage_records:source_pred=1:source_order=1:source_limit=5:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0:source_offset=2",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query pagination summary",
+        .sql = "SELECT id FROM usage_records ORDER BY id LIMIT 5",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=5:claim=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale source pagination summary",
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed' ORDER BY id LIMIT 5 OFFSET 2",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .order_by = 1, .limit = 5, .offset = 2, .operations = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=1:source_limit=5:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0:source_offset=1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid joined pagination summary",
+        .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id ORDER BY usage_records.id LIMIT 2 OFFSET 1",
+        .family = .update_joined_source,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .order_by = 1, .limit = 2, .offset = 1, .operations = 1 },
+        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=1:limit=2:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0:offset=1",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
