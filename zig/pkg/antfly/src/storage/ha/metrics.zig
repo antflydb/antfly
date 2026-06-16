@@ -68,6 +68,9 @@ pub const PrimaryMetrics = struct {
     durability_satisfied: u64,
     durability_degraded: u64,
     durability_status_code: u64,
+    durability_target_lsn: u64,
+    durability_progress_lsn: u64,
+    durability_missing_lsn_count: u64,
     durability_required_count: u64,
     durability_satisfied_count: u64,
     durability_candidate_count: u64,
@@ -172,6 +175,9 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
         .durability_satisfied = durability_satisfied,
         .durability_degraded = durability_degraded,
         .durability_status_code = durability_status_code,
+        .durability_target_lsn = if (durability) |decision| decision.target_lsn else 0,
+        .durability_progress_lsn = if (durability) |decision| decision.progress_lsn else 0,
+        .durability_missing_lsn_count = if (durability) |decision| decision.missing_lsn_count else 0,
         .durability_required_count = if (durability) |decision| @intCast(decision.required_count) else 0,
         .durability_satisfied_count = if (durability) |decision| @intCast(decision.satisfied_count) else 0,
         .durability_candidate_count = if (durability) |decision| @intCast(decision.candidate_count) else 0,
@@ -246,6 +252,9 @@ pub fn renderPrimaryPrometheusAlloc(alloc: Allocator, metrics: PrimaryMetrics) !
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_satisfied", metrics.durability_satisfied);
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_degraded", metrics.durability_degraded);
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_status_code", metrics.durability_status_code);
+    try appendGauge(alloc, &out, "antfly_ha_primary_durability_target_lsn", metrics.durability_target_lsn);
+    try appendGauge(alloc, &out, "antfly_ha_primary_durability_progress_lsn", metrics.durability_progress_lsn);
+    try appendGauge(alloc, &out, "antfly_ha_primary_durability_missing_lsn_count", metrics.durability_missing_lsn_count);
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_required_count", metrics.durability_required_count);
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_satisfied_count", metrics.durability_satisfied_count);
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_candidate_count", metrics.durability_candidate_count);
@@ -462,6 +471,9 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqual(@as(u64, 0), metrics.durability_satisfied);
     try std.testing.expectEqual(@as(u64, 1), metrics.durability_degraded);
     try std.testing.expectEqual(@as(u64, @intFromEnum(DurabilityStatusCode.would_block)), metrics.durability_status_code);
+    try std.testing.expectEqual(@as(u64, 20), metrics.durability_target_lsn);
+    try std.testing.expectEqual(@as(u64, 18), metrics.durability_progress_lsn);
+    try std.testing.expectEqual(@as(u64, 2), metrics.durability_missing_lsn_count);
     try std.testing.expectEqual(@as(u64, 1), metrics.durability_required_count);
     try std.testing.expectEqual(@as(u64, 0), metrics.durability_satisfied_count);
     try std.testing.expectEqual(@as(u64, 2), metrics.durability_candidate_count);
@@ -551,6 +563,9 @@ test "storage.ha metrics renders prometheus text" {
         .durability_satisfied = 1,
         .durability_degraded = 0,
         .durability_status_code = @intFromEnum(DurabilityStatusCode.satisfied),
+        .durability_target_lsn = 20,
+        .durability_progress_lsn = 20,
+        .durability_missing_lsn_count = 0,
         .durability_required_count = 1,
         .durability_satisfied_count = 1,
         .durability_candidate_count = 1,
@@ -562,6 +577,8 @@ test "storage.ha metrics renders prometheus text" {
     try expectContains(primary_text, "# TYPE antfly_ha_primary_current_lsn gauge\n");
     try expectContains(primary_text, "antfly_ha_primary_current_lsn 20\n");
     try expectContains(primary_text, "antfly_ha_primary_durability_satisfied 1\n");
+    try expectContains(primary_text, "antfly_ha_primary_durability_progress_lsn 20\n");
+    try expectContains(primary_text, "antfly_ha_primary_durability_missing_lsn_count 0\n");
     try expectContains(primary_text, "# TYPE antfly_ha_slot_apply_lag_lsn gauge\n");
     try expectContains(primary_text, "antfly_ha_slot_apply_lag_lsn{slot=\"standby\\\"a\\\\b\\nc\"} 3\n");
 
