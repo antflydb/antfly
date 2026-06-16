@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const backup_manifest = @import("backup_manifest.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
@@ -43,6 +44,22 @@ pub const AppendOptions = struct {
     table_id: ?u64 = null,
     commit_timestamp_ns: i64 = 0,
     payload: []const u8 = &.{},
+};
+
+pub const BaseBackupStart = struct {
+    slot_name: []const u8,
+    manifest_id: []const u8,
+};
+
+pub const BaseBackupStartResult = struct {
+    backup_lsn: u64,
+    start_record_lsn: u64,
+};
+
+pub const BaseBackupEndResult = struct {
+    backup_lsn: u64,
+    end_record_lsn: u64,
+    manifest_id: []const u8,
 };
 
 pub const DurabilityMode = enum {
@@ -154,6 +171,53 @@ pub const Primary = struct {
             .received_lsn = initial_lsn,
             .applied_lsn = initial_lsn,
         });
+    }
+
+    pub fn beginBaseBackup(self: *Primary, request: BaseBackupStart) !BaseBackupStartResult {
+        if (request.slot_name.len == 0) return error.InvalidSlotName;
+        if (request.manifest_id.len == 0) return error.InvalidManifestId;
+
+        const backup_lsn = self.nextLsn();
+        const previous_lsn = backup_lsn - 1;
+        try self.slots.createOrUpdate(.{
+            .name = request.slot_name,
+            .timeline_id = self.identity.timeline_id,
+            .restart_lsn = backup_lsn,
+            .received_lsn = previous_lsn,
+            .applied_lsn = previous_lsn,
+        });
+
+        const payload = try backupStartPayload(self.alloc, self.identity, request.slot_name, request.manifest_id, backup_lsn);
+        defer self.alloc.free(payload);
+        const start_lsn = try self.append(.{
+            .kind = .backup_start,
+            .payload_codec = .json,
+            .payload = payload,
+        });
+        std.debug.assert(start_lsn == backup_lsn);
+        return .{
+            .backup_lsn = backup_lsn,
+            .start_record_lsn = start_lsn,
+        };
+    }
+
+    pub fn endBaseBackup(self: *Primary, manifest: backup_manifest.Manifest) !BaseBackupEndResult {
+        try validateBackupManifestIdentity(self.identity, manifest.identity);
+        try backup_manifest.validateManifestInput(manifest);
+        if (manifest.backup_lsn > self.lastLsn()) return error.BackupStartNotDurable;
+
+        const encoded_manifest = try backup_manifest.encodeAlloc(self.alloc, manifest);
+        defer self.alloc.free(encoded_manifest);
+        const end_lsn = try self.append(.{
+            .kind = .backup_end,
+            .payload_codec = .binary,
+            .payload = encoded_manifest,
+        });
+        return .{
+            .backup_lsn = manifest.backup_lsn,
+            .end_record_lsn = end_lsn,
+            .manifest_id = manifest.manifest_id,
+        };
     }
 
     pub fn dropSlot(self: *Primary, name: []const u8) !void {
@@ -270,6 +334,37 @@ pub const Primary = struct {
         return state;
     }
 };
+
+fn validateBackupManifestIdentity(expected: Identity, actual: Identity) !void {
+    if (actual.cluster_id != expected.cluster_id) return error.WrongCluster;
+    if (actual.shard_id != expected.shard_id) return error.WrongShard;
+    if (actual.table_id != expected.table_id) return error.WrongTable;
+    if (actual.timeline_id != expected.timeline_id) return error.WrongTimeline;
+    if (actual.epoch != expected.epoch) return error.WrongEpoch;
+}
+
+fn backupStartPayload(
+    alloc: Allocator,
+    identity: Identity,
+    slot_name: []const u8,
+    manifest_id: []const u8,
+    backup_lsn: u64,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"cluster_id\":{d},\"shard_id\":{d},\"table_id\":{d},\"timeline_id\":{d},\"epoch\":{d},\"slot_name\":\"{s}\",\"manifest_id\":\"{s}\",\"backup_lsn\":{d}}}",
+        .{
+            identity.cluster_id,
+            identity.shard_id,
+            identity.table_id,
+            identity.timeline_id,
+            identity.epoch,
+            slot_name,
+            manifest_id,
+            backup_lsn,
+        },
+    );
+}
 
 const Counts = struct {
     satisfied_count: usize = 0,
@@ -388,6 +483,111 @@ test "storage.ha primary appends streams and persists standby status" {
         try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
         try std.testing.expectEqual(@as(u64, 1), slot.restart_lsn);
     }
+}
+
+test "storage.ha primary begins base backup with slot retention pin" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-start");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-backup" });
+
+    const started = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectEqual(@as(u64, 2), started.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 2), started.start_record_lsn);
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 2), slot.restart_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+    const snapshot = try primary.retentionSnapshot(.{});
+    try std.testing.expectEqual(@as(u64, 2), snapshot.oldest_restart_lsn);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.retained_lsn_count);
+
+    const entries = try primary.streamFrom(alloc, "standby-a", started.backup_lsn);
+    defer replication_log.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(replication_record.RecordKind.backup_start, entries[0].record.kind);
+    try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"manifest_id\":\"manifest-1\"") != null);
+}
+
+test "storage.ha primary ends base backup with decodable manifest payload" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-end");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    const started = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    _ = try primary.append(.{ .payload = "during-copy" });
+
+    const files = [_]backup_manifest.FileEntry{
+        .{ .path = "store/manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+        .{ .path = "store/sst/0001", .kind = .sstable, .size_bytes = 3, .crc32 = backup_manifest.crc32("sst") },
+    };
+    const ended = try primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-1",
+        .backup_lsn = started.backup_lsn,
+        .checkpoint_lsn = primary.lastLsn(),
+        .files = &files,
+    });
+    try std.testing.expectEqual(started.backup_lsn, ended.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 3), ended.end_record_lsn);
+    try std.testing.expectEqualStrings("manifest-1", ended.manifest_id);
+
+    const entries = try primary.streamFrom(alloc, "standby-a", ended.end_record_lsn);
+    defer replication_log.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(replication_record.RecordKind.backup_end, entries[0].record.kind);
+    try std.testing.expectEqual(replication_record.PayloadCodec.binary, entries[0].record.payload_codec);
+
+    const decoded = try backup_manifest.decodeAlloc(alloc, entries[0].record.payload);
+    defer backup_manifest.freeDecoded(alloc, decoded);
+    try std.testing.expectEqual(started.backup_lsn, decoded.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 2), decoded.checkpoint_lsn);
+    try std.testing.expectEqual(@as(usize, 2), decoded.files.len);
+}
+
+test "storage.ha primary rejects backup end from wrong identity or missing start" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-invalid");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    const files = [_]backup_manifest.FileEntry{
+        .{ .path = "store/manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+    };
+    try std.testing.expectError(error.BackupStartNotDurable, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "missing",
+        .backup_lsn = 5,
+        .checkpoint_lsn = 5,
+        .files = &files,
+    }));
+
+    var wrong_identity = identity;
+    wrong_identity.timeline_id = 2;
+    try std.testing.expectError(error.WrongTimeline, primary.endBaseBackup(.{
+        .identity = wrong_identity,
+        .manifest_id = "wrong",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 1,
+        .files = &files,
+    }));
 }
 
 test "storage.ha primary evaluates async remote write and remote apply policies" {

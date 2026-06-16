@@ -135,7 +135,6 @@ pub const SlotStore = struct {
 
     pub fn createOrUpdate(self: *SlotStore, state: SlotState) !void {
         if (state.name.len == 0) return error.InvalidSlotName;
-        if (state.restart_lsn > state.received_lsn) return error.InvalidSlotProgress;
         if (state.applied_lsn > state.received_lsn) return error.InvalidSlotProgress;
         try self.persistAndApply(.{
             .event_type = .upsert,
@@ -426,4 +425,27 @@ test "storage.ha slot store drops slots and releases retention" {
     const snapshot = try store.retentionSnapshot(10, .{});
     try std.testing.expectEqual(@as(u64, 11), snapshot.oldest_restart_lsn);
     try std.testing.expectEqual(@as(u64, 0), snapshot.retained_lsn_count);
+}
+
+test "storage.ha slot store allows backup pin ahead of standby progress" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "backup-pin");
+    defer alloc.free(path);
+
+    var store = try SlotStore.open(alloc, path.ptr, .{});
+    defer store.close();
+    try store.createOrUpdate(.{
+        .name = "standby-seeding",
+        .timeline_id = 1,
+        .restart_lsn = 10,
+        .received_lsn = 9,
+        .applied_lsn = 9,
+    });
+
+    const snapshot = try store.retentionSnapshot(12, .{});
+    try std.testing.expectEqual(@as(u64, 10), snapshot.oldest_restart_lsn);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.retained_lsn_count);
+    const slot = store.get("standby-seeding") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 9), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 9), slot.applied_lsn);
 }
