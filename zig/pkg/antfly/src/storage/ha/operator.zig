@@ -578,10 +578,12 @@ fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencin
     if (spec.auto_failover.fencing_authority == .none) return null;
     if (isDegraded(primary.durability)) return null;
     if (!fencingAuthorityReady(spec.auto_failover, fencing_observed)) return null;
+    const fence_holder = fencing_observed.holder orelse return null;
 
     const max_lag = spec.auto_failover.maximum_lag_lsn;
     for (spec.standbys) |standby| {
         if (!standby.desired) continue;
+        if (!std.mem.eql(u8, standby.name, fence_holder)) continue;
         const slot = findSlot(primary.slots, standby.name) orelse continue;
         if (!slot.active or slot.reseed_required) continue;
         if (slot.status == .reseed_required) continue;
@@ -659,7 +661,16 @@ fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, fencing_
     if (isDegraded(primary.durability)) return "SyncPolicyUnsatisfied";
     if (fencing_observed.authority != .none and fencing_observed.authority != spec.auto_failover.fencing_authority) return "FencingAuthorityMismatch";
     if (!fencing_observed.ready) return "FencingAuthorityNotReady";
+    const fence_holder = fencing_observed.holder orelse return "FencingHolderMissing";
+    if (!desiredStandbyNamed(spec, fence_holder)) return "FencingHolderNotDesired";
     return "NoEligibleStandby";
+}
+
+fn desiredStandbyNamed(spec: Spec, name: []const u8) bool {
+    for (spec.standbys) |standby| {
+        if (standby.desired and std.mem.eql(u8, standby.name, name)) return true;
+    }
+    return false;
 }
 
 fn condition(plan: Plan, condition_type: ConditionType) ?Condition {
@@ -836,6 +847,55 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqualStrings(
         "FencingAuthorityNotReady",
         (condition(unobserved, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var holder_missing = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer holder_missing.deinit(alloc);
+    try std.testing.expect(!holder_missing.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "FencingHolderMissing",
+        (condition(holder_missing, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var wrong_holder = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-b",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer wrong_holder.deinit(alloc);
+    try std.testing.expect(!wrong_holder.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "FencingHolderNotDesired",
+        (condition(wrong_holder, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
 
     var safe = try reconcile(alloc, .{
