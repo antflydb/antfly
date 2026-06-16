@@ -59,6 +59,11 @@ pub fn parsePromoteHABody(allocator: std.mem.Allocator, body: []const u8) !std.j
     return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for assessHARejoin.
+pub fn parseAssessHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
+    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Route metadata for all operations.
 pub const Route = struct {
     method: []const u8,
@@ -82,6 +87,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/ha/promotion/assess", .operation_id = "assessHAPromotion" },
     .{ .method = "POST", .path = "/ha/promotion/current-fence", .operation_id = "promoteHAWithCurrentFence" },
     .{ .method = "POST", .path = "/ha/promotion", .operation_id = "promoteHA" },
+    .{ .method = "POST", .path = "/ha/rejoin/assess", .operation_id = "assessHARejoin" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -110,6 +116,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "assessHAPromotion")) @compileError("ServerRouter: Impl missing required method 'assessHAPromotion'");
         if (!@hasDecl(Impl, "promoteHAWithCurrentFence")) @compileError("ServerRouter: Impl missing required method 'promoteHAWithCurrentFence'");
         if (!@hasDecl(Impl, "promoteHA")) @compileError("ServerRouter: Impl missing required method 'promoteHA'");
+        if (!@hasDecl(Impl, "assessHARejoin")) @compileError("ServerRouter: Impl missing required method 'assessHARejoin'");
     }
 
     return struct {
@@ -139,6 +146,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/ha/promotion/assess", assessHAPromotion);
             try server.post("/ha/promotion/current-fence", promoteHAWithCurrentFence);
             try server.post("/ha/promotion", promoteHA);
+            try server.post("/ha/rejoin/assess", assessHARejoin);
         }
 
         /// Get primary HA status
@@ -248,6 +256,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.promoteHA(ctx);
         }
+
+        /// Assess whether a former primary can safely rejoin
+        /// POST /ha/rejoin/assess
+        fn assessHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.assessHARejoin(ctx);
+        }
     };
 }
 
@@ -268,3 +283,4 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn assessHAPromotion(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn promoteHAWithCurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn promoteHA(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn assessHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response

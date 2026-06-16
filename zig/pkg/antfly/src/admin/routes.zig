@@ -31,6 +31,7 @@ pub const ha_fence_current = ha_fence ++ "/current";
 pub const ha_promotion = ha ++ "/promotion";
 pub const ha_promotion_assess = ha_promotion ++ "/assess";
 pub const ha_promotion_current_fence = ha_promotion ++ "/current-fence";
+pub const ha_rejoin_assess = ha ++ "/rejoin/assess";
 
 pub fn replicationSlotPathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ ha_replication_slot_prefix, slot_name });
@@ -77,6 +78,7 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/promotion", ha_promotion);
     try std.testing.expectEqualStrings("/admin/v1/ha/promotion/assess", ha_promotion_assess);
     try std.testing.expectEqualStrings("/admin/v1/ha/promotion/current-fence", ha_promotion_current_fence);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/assess", ha_rejoin_assess);
 }
 
 test "admin routes build and match replication slot lifecycle paths" {

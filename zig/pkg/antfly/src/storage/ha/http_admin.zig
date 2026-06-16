@@ -28,6 +28,7 @@ const admin_exec = @import("admin_exec.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
+const rejoin = @import("rejoin.zig");
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;
@@ -118,6 +119,9 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_promotion)) {
                     return try self.handleAdminPromote(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess)) {
+                    return try self.handleAdminAssessRejoin(req);
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
@@ -345,6 +349,49 @@ pub const Server = struct {
         return try self.handleJsonPlan(plan);
     }
 
+    fn handleAdminAssessRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA rejoin assessment request");
+        var parsed = admin_api.openapi.server.parseAssessHARejoinBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
+        defer parsed.deinit();
+
+        const identity = adminIdentityFromOpenApi(parsed.value.identity) catch {
+            return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
+        };
+        const last_lsn = uint64FromJson(parsed.value.last_lsn) catch {
+            return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
+        };
+        const retained_from_lsn = uint64FromJson(parsed.value.retained_from_lsn) catch {
+            return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
+        };
+        const receipt = if (parsed.value.receipt) |value|
+            adminFenceReceiptFromOpenApi(value) catch {
+                return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
+            }
+        else
+            null;
+
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .rejoin_assess = .{
+                .former = rejoin.FormerPrimaryState{
+                    .node_id = parsed.value.node_id,
+                    .identity = identity,
+                    .last_lsn = last_lsn,
+                },
+                .receipt = receipt,
+                .policy = rejoin.RejoinPolicy{
+                    .retained_from_lsn = retained_from_lsn,
+                    .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion orelse false,
+                },
+            } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
     fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
         if (req.body.len == 0) return error.InvalidAdminRequest;
         var parsed = admin_api.openapi.server.parseAcquireHAFenceBody(
@@ -425,18 +472,13 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_fence_current) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess) or
-        std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence);
+        std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence) or
+        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess);
 }
 
 fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing.FenceRequest {
     return .{
-        .identity = .{
-            .cluster_id = try positiveUint64FromJson(request.identity.cluster_id),
-            .shard_id = try positiveUint64FromJson(request.identity.shard_id),
-            .table_id = try positiveUint64FromJson(request.identity.table_id),
-            .timeline_id = try positiveUint64FromJson(request.identity.timeline_id),
-            .epoch = try positiveUint64FromJson(request.identity.epoch),
-        },
+        .identity = try adminIdentityFromOpenApi(request.identity),
         .old_primary_id = request.old_primary_id,
         .promoted_node_id = request.promoted_node_id,
         .new_timeline_id = try positiveUint64FromJson(request.new_timeline_id),
@@ -445,6 +487,34 @@ fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing
         .observed_lsn = try uint64FromJson(request.observed_lsn),
         .force = request.force orelse false,
         .reason = request.reason orelse "",
+    };
+}
+
+fn adminFenceReceiptFromOpenApi(receipt: admin_api.HAFenceReceipt) !fencing.Receipt {
+    return .{
+        .identity = try adminIdentityFromOpenApi(receipt.identity),
+        .old_primary_id = receipt.old_primary_id,
+        .promoted_node_id = receipt.promoted_node_id,
+        .parent_timeline_id = try positiveUint64FromJson(receipt.parent_timeline_id),
+        .parent_epoch = try positiveUint64FromJson(receipt.parent_epoch),
+        .new_timeline_id = try positiveUint64FromJson(receipt.new_timeline_id),
+        .new_epoch = try positiveUint64FromJson(receipt.new_epoch),
+        .required_lsn = try positiveUint64FromJson(receipt.required_lsn),
+        .observed_lsn = try uint64FromJson(receipt.observed_lsn),
+        .generation = try positiveUint64FromJson(receipt.generation),
+        .forced = receipt.forced,
+        .token = receipt.token,
+        .reason = receipt.reason,
+    };
+}
+
+fn adminIdentityFromOpenApi(identity: admin_api.openapi.HAIdentity) !standby_mod.Identity {
+    return .{
+        .cluster_id = try positiveUint64FromJson(identity.cluster_id),
+        .shard_id = try positiveUint64FromJson(identity.shard_id),
+        .table_id = try positiveUint64FromJson(identity.table_id),
+        .timeline_id = try positiveUint64FromJson(identity.timeline_id),
+        .epoch = try positiveUint64FromJson(identity.epoch),
     };
 }
 
@@ -836,6 +906,32 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqualStrings("application/json", typed_current_fence.content_type.?);
     try expectContains(typed_current_fence.body, "\"fence_current\"");
     try expectContains(typed_current_fence.body, "\"old_primary_id\":\"primary-a\"");
+
+    var typed_rejoin_unfenced = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_assess,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":1,\"retained_from_lsn\":0}",
+    });
+    defer typed_rejoin_unfenced.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_unfenced.status);
+    try std.testing.expectEqualStrings("application/json", typed_rejoin_unfenced.content_type.?);
+    try expectContains(typed_rejoin_unfenced.body, "\"rejoin_assess\"");
+    try expectContains(typed_rejoin_unfenced.body, "\"action\":\"reject_unfenced\"");
+    try expectContains(typed_rejoin_unfenced.body, "\"reason\":\"no_fence\"");
+
+    var typed_rejoin_fenced = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_assess,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer typed_rejoin_fenced.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_fenced.status);
+    try std.testing.expectEqualStrings("application/json", typed_rejoin_fenced.content_type.?);
+    try expectContains(typed_rejoin_fenced.body, "\"rejoin_assess\"");
+    try expectContains(typed_rejoin_fenced.body, "\"action\":\"rewind\"");
+    try expectContains(typed_rejoin_fenced.body, "\"target_timeline_id\":2");
 
     var typed_promote_assess = try server.handle(.{
         .method = .POST,

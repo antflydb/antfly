@@ -11,5 +11,7 @@ pub const BaseBackupManifestPathRequest = types.BaseBackupManifestPathRequest;
 pub const StandbyBootstrapRequest = types.StandbyBootstrapRequest;
 pub const HAIdentity = types.HAIdentity;
 pub const FenceAcquireRequest = types.FenceAcquireRequest;
+pub const HAFenceReceipt = types.HAFenceReceipt;
+pub const RejoinAssessRequest = types.RejoinAssessRequest;
 pub const PromotionAssessRequest = types.PromotionAssessRequest;
 pub const HACommandResult = types.HACommandResult;

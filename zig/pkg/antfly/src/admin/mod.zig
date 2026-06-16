@@ -20,7 +20,9 @@ pub const BaseBackupStartRequest = openapi.BaseBackupStartRequest;
 pub const BaseBackupManifestPathRequest = openapi.BaseBackupManifestPathRequest;
 pub const StandbyBootstrapRequest = openapi.StandbyBootstrapRequest;
 pub const FenceAcquireRequest = openapi.FenceAcquireRequest;
+pub const HAFenceReceipt = openapi.HAFenceReceipt;
 pub const PromotionAssessRequest = openapi.PromotionAssessRequest;
+pub const RejoinAssessRequest = openapi.RejoinAssessRequest;
 
 test {
     _ = openapi;

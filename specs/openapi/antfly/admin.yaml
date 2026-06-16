@@ -293,6 +293,26 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/rejoin/assess:
+    post:
+      tags: [ha]
+      operationId: assessHARejoin
+      summary: Assess whether a former primary can safely rejoin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejoinAssessRequest"
+      responses:
+        "200":
+          description: Former-primary rejoin assessment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommandResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 components:
   parameters:
     SlotName:
@@ -447,6 +467,98 @@ components:
         reason:
           type: string
           default: ""
+    HAFenceReceipt:
+      type: object
+      required:
+        - identity
+        - old_primary_id
+        - promoted_node_id
+        - parent_timeline_id
+        - parent_epoch
+        - new_timeline_id
+        - new_epoch
+        - required_lsn
+        - observed_lsn
+        - generation
+        - forced
+        - token
+        - reason
+      additionalProperties: false
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        old_primary_id:
+          type: string
+          minLength: 1
+        promoted_node_id:
+          type: string
+          minLength: 1
+        parent_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        parent_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        new_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        new_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        observed_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        forced:
+          type: boolean
+        token:
+          type: string
+          minLength: 1
+        reason:
+          type: string
+    RejoinAssessRequest:
+      type: object
+      required:
+        - node_id
+        - identity
+        - last_lsn
+        - retained_from_lsn
+      additionalProperties: false
+      properties:
+        node_id:
+          type: string
+          minLength: 1
+          description: Former primary node id that is attempting to rejoin.
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Last local LSN durably present on the former primary.
+        retained_from_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Earliest parent-timeline WAL LSN still retained for rewind.
+        allow_rewind_after_forced_promotion:
+          type: boolean
+          default: false
+        receipt:
+          $ref: "#/components/schemas/HAFenceReceipt"
+          description: Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     PromotionAssessRequest:
       type: object
       additionalProperties: false

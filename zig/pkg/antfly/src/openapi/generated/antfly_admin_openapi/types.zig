@@ -58,3 +58,32 @@ pub const FenceAcquireRequest = struct {
     force: ?bool = null,
     reason: ?[]const u8 = null,
 };
+
+pub const HAFenceReceipt = struct {
+    identity: HAIdentity,
+    old_primary_id: []const u8,
+    promoted_node_id: []const u8,
+    parent_timeline_id: i64,
+    parent_epoch: i64,
+    new_timeline_id: i64,
+    new_epoch: i64,
+    required_lsn: i64,
+    observed_lsn: i64,
+    generation: i64,
+    forced: bool,
+    token: []const u8,
+    reason: []const u8,
+};
+
+pub const RejoinAssessRequest = struct {
+    /// Former primary node id that is attempting to rejoin.
+    node_id: []const u8,
+    identity: HAIdentity,
+    /// Last local LSN durably present on the former primary.
+    last_lsn: i64,
+    /// Earliest parent-timeline WAL LSN still retained for rewind.
+    retained_from_lsn: i64,
+    allow_rewind_after_forced_promotion: ?bool = null,
+    /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
+    receipt: ?HAFenceReceipt = null,
+};
