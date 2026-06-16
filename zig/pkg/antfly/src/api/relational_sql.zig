@@ -62557,6 +62557,11 @@ fn validateAppParityFixtureMetadata(
     if (appParitySummaryHasFields(entry.summary) and !appParityFixtureFamilyAllowsSummary(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.ctes) |ctes| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", ctes)) {
+            return error.TestUnexpectedResult;
+        }
+    }
     if (entry.summary.operations != null and !appParityFixtureFamilyAllowsOperationsSummary(entry.family)) {
         return error.TestUnexpectedResult;
     }
@@ -62775,6 +62780,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "price_intervals", .operations = 2 },
         .plan = "query:table=price_intervals:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=0:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "point insert cte summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .ctes = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query cte summary",
+        .sql = "WITH active_usage AS (SELECT id FROM usage_records WHERE status = 'active') SELECT id FROM active_usage",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .ctes = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid query cte summary",
+        .sql = "WITH active_usage AS (SELECT id FROM usage_records WHERE status = 'active') SELECT id FROM active_usage",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .ctes = 1 },
+        .plan = "query:table=usage_records:ctes=1:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "ignored returning summary",

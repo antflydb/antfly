@@ -5249,6 +5249,12 @@ generic read fingerprints for row-query/join/lateral plans, or `EXPLAIN`
 wrappers around those plans. Aggregate/window stages, point writes, and merge
 plans reject it.
 
+CTE summaries are self-anchored to the typed fingerprint. A fixture may carry
+`ctes` only when its golden plan includes an exact `ctes` token with the same
+value. Point writes and other plans whose runner does not materialize CTE state
+therefore cannot claim CTE coverage through generic summary metadata, and stale
+CTE counts fail before the fixture can be used as parity evidence.
+
 Temporal DDL summaries are first-class fixture metadata instead of comments in
 SQL text. `temporal_periods`, `temporal_primary_key`, `temporal_unique`, and
 `temporal_foreign_keys` are valid only on DDL entries, and each value must match
