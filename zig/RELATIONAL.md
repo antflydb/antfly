@@ -5251,6 +5251,20 @@ the claimed total. DDL keeps its own predicate accounting because DDL
 `predicates` refers to catalog checks, index predicates, or operation-family
 state rather than row-stream filter atoms.
 
+Declared-access and expression-predicate summaries follow the same typed-stage
+ownership rule. `array_any`, `in_predicates`, `json_path_eq`, `json_contains`,
+`json_path_exists`, `array_contains`, `array_eq`, `text_patterns`,
+`access_or_predicates`, `access_not_predicates`, `expression_predicates`,
+`expression_or_predicates`, `expression_not_predicates`, and
+`expression_array_contains` must match their stage fingerprint tokens exactly:
+row-query tokens such as `in`, `json_eq`, `text_pattern`, and `expr_pred`;
+source-stream tokens such as `source_in`, `source_json_eq`,
+`source_text_pattern`, and `source_expr_pred`; or the left/right side-token sum
+for join, lateral, and joined mutation-source plans. Missing optional side
+tokens count as zero, which lets compact fingerprints omit inactive side filters
+without letting a fixture claim a nonzero count that the typed plan did not
+produce.
+
 Join predicate summaries are scoped separately. `join_on` is valid only on join
 read plans, joined mutation-source update/delete plans, merge mutation match
 keys, generic read fingerprints whose resolved inner plan is a join, or
