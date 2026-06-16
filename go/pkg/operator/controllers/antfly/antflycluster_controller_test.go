@@ -207,6 +207,10 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(createSlotJob.OwnerReferences).To(HaveLen(1))
 	g.Expect(createSlotJob.OwnerReferences[0].Name).To(Equal(cluster.Name))
 	g.Expect(createSlotJob.Spec.Template.Spec.Containers).To(HaveLen(1))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(createSlotJob.Name))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
 	container := createSlotJob.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Command).To(Equal([]string{"/antfly"}))
 	g.Expect(container.Args).To(Equal([]string{
@@ -242,6 +246,9 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 		}
 	}
 	g.Expect(seedJob).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(seedJob.Name))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	seedContainer := seedJob.Spec.Template.Spec.Containers[0]
 	g.Expect(seedContainer.Args).To(Equal([]string{
 		"ha",

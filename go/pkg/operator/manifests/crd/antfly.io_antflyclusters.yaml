@@ -6624,6 +6624,14 @@ spec:
                           items:
                             type: string
                           type: array
+                        adminJobName:
+                          description: AdminJobName is the Kubernetes Job created
+                            to execute AdminCommand.
+                          type: string
+                        adminJobPhase:
+                          description: AdminJobPhase summarizes the Kubernetes Job
+                            state for AdminCommand.
+                          type: string
                         adminURL:
                           description: AdminURL is the HA admin endpoint that should
                             execute AdminCommand.

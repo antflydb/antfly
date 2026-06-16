@@ -1425,6 +1425,14 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
 
+	// AdminJobName is the Kubernetes Job created to execute AdminCommand.
+	// +optional
+	AdminJobName string `json:"adminJobName,omitempty"`
+
+	// AdminJobPhase summarizes the Kubernetes Job state for AdminCommand.
+	// +optional
+	AdminJobPhase string `json:"adminJobPhase,omitempty"`
+
 	Reason string `json:"reason,omitempty"`
 }
 

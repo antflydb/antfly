@@ -71,6 +71,11 @@ const (
 	antflySecretStoreDefaultKey  = "secrets.json"
 	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
 	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+
+	haAdminJobPhasePending   = "Pending"
+	haAdminJobPhaseRunning   = "Running"
+	haAdminJobPhaseSucceeded = "Succeeded"
+	haAdminJobPhaseFailed    = "Failed"
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -3138,12 +3143,14 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		return nil
 	}
 
-	for _, action := range cluster.Status.HAStatus.PlannedActions {
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
 		if len(action.AdminCommand) == 0 || strings.TrimSpace(action.AdminURL) == "" {
 			continue
 		}
 
-		job := buildHAAdminJob(cluster, action)
+		job := buildHAAdminJob(cluster, *action)
+		action.AdminJobName = job.Name
 		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
 			return err
 		}
@@ -3151,11 +3158,13 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		existing := &batchv1.Job{}
 		err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
 		if errors.IsNotFound(err) {
+			action.AdminJobPhase = haAdminJobPhasePending
 			return r.Create(ctx, job)
 		}
 		if err != nil {
 			return err
 		}
+		action.AdminJobPhase = haAdminJobPhase(existing)
 		if !haAdminJobComplete(existing) {
 			return nil
 		}
@@ -3213,15 +3222,22 @@ func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlanned
 }
 
 func haAdminJobComplete(job *batchv1.Job) bool {
+	return haAdminJobPhase(job) == haAdminJobPhaseSucceeded
+}
+
+func haAdminJobPhase(job *batchv1.Job) string {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			return false
+			return haAdminJobPhaseFailed
 		}
 		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			return true
+			return haAdminJobPhaseSucceeded
 		}
 	}
-	return false
+	if job.Status.Active > 0 {
+		return haAdminJobPhaseRunning
+	}
+	return haAdminJobPhasePending
 }
 
 func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {
