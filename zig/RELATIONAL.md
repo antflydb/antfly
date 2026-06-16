@@ -396,6 +396,10 @@ evaluation, so range movement fails closed with `TopologyChanged` instead of
 merging stale owner rows. Routed materialized CTEs carry emitted-field metadata,
 and the REST/API CTE planner carries typed output-column metadata for row-query
 CTE streams, including derived expression field types and array item domains.
+Storage-backed SQL read-plan tests pin chained row-query CTE execution through
+`queryRelationalRowsPlan`, including a CTE expression output consumed by a later
+CTE before the final projection, so SQL and REST/SDK plans share the same
+materialized-row contract.
 Expression output metadata also carries conservative nullability: base fields
 inherit schema nullability, literals and engine-owned values such as `now` and
 `uuid_v4` are non-null unless explicitly `null`, null-propagating functions

@@ -5454,6 +5454,7 @@ const Parser = struct {
     joined_source_schema: ?runtime_schema.TableSchema = null,
     params: []const SqlValue = &.{},
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
+    available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
     mutation_claim: ?db_mod.types.RowClaimRequest = null,
     returning_expression_qualifiers: []const []const u8 = &.{},
     field_expression_qualifiers: []const []const u8 = &.{},
@@ -10458,6 +10459,7 @@ const Parser = struct {
                 .schema = self.schema,
                 .params = self.params,
                 .unique_resolver = self.unique_resolver,
+                .available_ctes = ctes.items,
             };
             var lowered = try sub.parseSelect();
             errdefer lowered.deinit(self.alloc);
@@ -10525,6 +10527,7 @@ const Parser = struct {
                 .schema = self.schema,
                 .params = self.params,
                 .unique_resolver = self.unique_resolver,
+                .available_ctes = ctes.items,
             };
             var lowered = try sub.parseSelect();
             errdefer lowered.deinit(self.alloc);
@@ -10541,6 +10544,10 @@ const Parser = struct {
             cte_name_transferred = true;
             if (self.match(.comma) == null) break;
         }
+
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes.items;
+        defer self.available_ctes = previous_available_ctes;
 
         var final = try self.parseSelectWithSetBoundary(true);
         errdefer final.deinit(self.alloc);
@@ -11140,6 +11147,10 @@ const Parser = struct {
             inferred_qualifiers = .{ table_ref.name, table_ref.alias };
             self.field_expression_qualifiers = inferred_qualifiers[0..];
         }
+        const source_is_cte = findCteByName(self.available_ctes, table_ref.name) != null;
+        const previous_defer_row_expression_field_validation = self.defer_row_expression_field_validation;
+        if (source_is_cte) self.defer_row_expression_field_validation = true;
+        defer self.defer_row_expression_field_validation = previous_defer_row_expression_field_validation;
 
         var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
         errdefer {
@@ -25130,6 +25141,18 @@ const Parser = struct {
 
     fn canParseExpressionWhereCondition(self: *@This()) !bool {
         if (self.peekStandaloneSqlBooleanLiteral() != null) return true;
+        if (self.defer_row_expression_field_validation and self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
+            switch (self.tokens[self.pos + 1].kind) {
+                .eq, .neq, .gt, .gte, .lt, .lte => return true,
+                else => if (std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "is") or
+                    std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "not") or
+                    std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "in") or
+                    std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "between"))
+                {
+                    return true;
+                },
+            }
+        }
         if (self.nextRowExpressionHasTopLevelPipeConcat()) return true;
         if (self.peekKind(.minus)) return true;
         if (self.peekKeyword("lower") or self.peekKeyword("upper")) return !(try self.generatedExpressionCallHasGeneratedColumn());
@@ -34643,6 +34666,20 @@ const Parser = struct {
             self.field_expression_qualifiers
         else
             self.returning_expression_qualifiers;
+        if (self.defer_row_expression_field_validation) {
+            if (qualifiers.len == 0) return try self.alloc.dupe(u8, field);
+            var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+            while (dot) |index| {
+                if (index > 0 and index + 1 < field.len) {
+                    const qualifier = field[0..index];
+                    const unqualified_field = field[index + 1 ..];
+                    if (try self.returningQualifierMatches(qualifier, qualifiers)) return try self.alloc.dupe(u8, unqualified_field);
+                }
+                dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+            }
+            if (std.mem.indexOfScalar(u8, field, '.') != null) return error.InvalidSqlCatalog;
+            return try self.alloc.dupe(u8, field);
+        }
         if (qualifiers.len == 0) {
             return try self.alloc.dupe(u8, field);
         }
@@ -62712,7 +62749,7 @@ const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.sql, " UNION ") != null and
                 appParityPlanHasNonZeroToken(entry.plan, ":ctes=") and
                 appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":or=") and
+                appParityPlanHasNonZeroToken(entry.plan, ":expr_or=") and
                 appParityPlanHasNonZeroToken(entry.plan, ":order="));
         self.set_operation_numeric_range_disjoint = self.set_operation_numeric_range_disjoint or
             ((entry.family == .query or entry.family == .read) and
@@ -67050,7 +67087,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "chained cte query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .ctes = 2, .predicates = 0, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none:cte1_expr_pred=1",
             .sql = "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2",
         },
         .{
@@ -69064,7 +69101,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "query cte union set operation ordered page",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .ctes = 1, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .plan = "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY",
         },
         .{
@@ -69232,7 +69269,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "read cte union set operation ordered page",
             .family = .read,
             .summary = .{ .table_name = "usage_records", .ctes = 1, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .plan = "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY",
         },
         .{
@@ -77743,6 +77780,35 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", result.rows[0]);
             try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", result.rows[1]);
             try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cte_query_plan = try lowerReadPlanAlloc(
+        alloc,
+        "WITH normalized_orders AS (SELECT tenant, id, amount, lower(status) AS status_key FROM usage_records WHERE kind = 'order'), open_orders AS (SELECT tenant, id, amount FROM normalized_orders WHERE status_key = 'open' AND amount > 6) SELECT tenant, id FROM open_orders ORDER BY amount DESC LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer cte_query_plan.deinit(alloc);
+
+    switch (cte_query_plan) {
+        .query => |lowered| {
+            try std.testing.expectEqual(@as(usize, 2), lowered.plan.ctes.len);
+            try std.testing.expectEqualStrings("normalized_orders", lowered.plan.ctes[0].name);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.ctes[0].query.expressions.len);
+            try std.testing.expectEqualStrings("status_key", lowered.plan.ctes[0].query.expressions[0].output);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.ctes[0].query.expressions[0].expression.kind);
+            try std.testing.expectEqualStrings("normalized_orders", lowered.plan.ctes[1].query.source_cte);
+            try std.testing.expectEqualStrings("open_orders", lowered.plan.query.source_cte);
+
+            var result = try db.queryRelationalRowsPlan(alloc, schema, lowered.plan);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 2), result.total);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o1\"}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"o3\"}", result.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }
