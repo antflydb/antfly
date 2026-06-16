@@ -57688,6 +57688,88 @@ fn createTablePlanUpdatePolicyColumnCount(plan: CreateTablePlan) usize {
     return count;
 }
 
+const AlterTablePlanFingerprintCounts = struct {
+    add_column: usize = 0,
+    add_column_if_not_exists: usize = 0,
+    add_column_default: usize = 0,
+    add_column_generated: usize = 0,
+    add_column_update_policy: usize = 0,
+    add_column_unique: usize = 0,
+    add_column_fk: usize = 0,
+    add_column_check: usize = 0,
+    add_period: usize = 0,
+    add_primary_key: usize = 0,
+    rename_column: usize = 0,
+    rename_constraint: usize = 0,
+    drop_column: usize = 0,
+    drop_column_if_exists: usize = 0,
+    drop_constraint: usize = 0,
+    drop_constraint_if_exists: usize = 0,
+    drop_update_policy: usize = 0,
+    drop_update_policy_if_exists: usize = 0,
+    set_default: usize = 0,
+    drop_default: usize = 0,
+    set_not_null: usize = 0,
+    drop_not_null: usize = 0,
+    alter_type: usize = 0,
+    add_unique: usize = 0,
+    add_foreign_key: usize = 0,
+    add_check: usize = 0,
+    validate_constraint: usize = 0,
+};
+
+fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerprintCounts {
+    var counts: AlterTablePlanFingerprintCounts = .{};
+    for (plan.operations) |operation| switch (operation) {
+        .add_column => |add| {
+            counts.add_column += 1;
+            if (add.if_not_exists) counts.add_column_if_not_exists += 1;
+            if (add.column.default_value != null) counts.add_column_default += 1;
+            if (add.column.generated != null) counts.add_column_generated += 1;
+            if (add.column.on_update_value != null) counts.add_column_update_policy += 1;
+            counts.add_column_unique += add.unique_constraints.len;
+            counts.add_column_fk += add.foreign_keys.len;
+            counts.add_column_check += add.checks.len;
+        },
+        .add_period => counts.add_period += 1,
+        .add_primary_key => counts.add_primary_key += 1,
+        .rename_column => counts.rename_column += 1,
+        .rename_constraint => counts.rename_constraint += 1,
+        .drop_column => |drop| {
+            counts.drop_column += 1;
+            if (drop.if_exists) counts.drop_column_if_exists += 1;
+        },
+        .drop_constraint => |drop| {
+            counts.drop_constraint += 1;
+            if (drop.if_exists) counts.drop_constraint_if_exists += 1;
+        },
+        .drop_update_policy => |drop| {
+            counts.drop_update_policy += 1;
+            if (drop.if_exists) counts.drop_update_policy_if_exists += 1;
+        },
+        .alter_column_default => |alter| {
+            if (alter.default_value != null) {
+                counts.set_default += 1;
+            } else {
+                counts.drop_default += 1;
+            }
+        },
+        .alter_column_nullability => |alter| {
+            if (alter.nullable) {
+                counts.drop_not_null += 1;
+            } else {
+                counts.set_not_null += 1;
+            }
+        },
+        .alter_column_type => counts.alter_type += 1,
+        .add_unique_constraint => counts.add_unique += 1,
+        .add_foreign_key => counts.add_foreign_key += 1,
+        .add_check => counts.add_check += 1,
+        .validate_constraint => counts.validate_constraint += 1,
+    };
+    return counts;
+}
+
 fn appendNonZeroU32FingerprintAlloc(
     alloc: std.mem.Allocator,
     owned_base: []u8,
@@ -58995,11 +59077,42 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 "ddl:drop_table:table={s}:if_exists={}",
                 .{ plan.table_name, plan.if_exists },
             ),
-        .alter_table => |plan| try std.fmt.allocPrint(
-            alloc,
-            "ddl:alter_table:table={s}:ops={d}:if_exists={}",
-            .{ plan.table_name, plan.operations.len, plan.if_exists },
-        ),
+        .alter_table => |plan| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "ddl:alter_table:table={s}:ops={d}:if_exists={}",
+                .{ plan.table_name, plan.operations.len, plan.if_exists },
+            );
+            const counts = alterTablePlanFingerprintCounts(plan);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col", counts.add_column);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_if_not_exists", counts.add_column_if_not_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_default", counts.add_column_default);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_generated", counts.add_column_generated);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_update_policy", counts.add_column_update_policy);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_unique", counts.add_column_unique);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_fk", counts.add_column_fk);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_check", counts.add_column_check);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_period", counts.add_period);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_pk", counts.add_primary_key);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "rename_col", counts.rename_column);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "rename_constraint", counts.rename_constraint);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_col", counts.drop_column);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_col_if_exists", counts.drop_column_if_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_constraint", counts.drop_constraint);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_constraint_if_exists", counts.drop_constraint_if_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_update_policy", counts.drop_update_policy);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_update_policy_if_exists", counts.drop_update_policy_if_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "set_default", counts.set_default);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_default", counts.drop_default);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "set_not_null", counts.set_not_null);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_not_null", counts.drop_not_null);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "alter_type", counts.alter_type);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_unique", counts.add_unique);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_fk", counts.add_foreign_key);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_check", counts.add_check);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "validate", counts.validate_constraint);
+            break :blk fingerprint;
+        },
         .create_update_policy => |plan| try std.fmt.allocPrint(
             alloc,
             "ddl:create_update_policy:table={s}:column={s}",
@@ -64905,7 +65018,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema add primary key migration",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_stage", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);",
             },
@@ -64916,7 +65029,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop primary key migration",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_stage", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:drop_constraint=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text, PRIMARY KEY (tenant_id, id));",
             },
@@ -64927,7 +65040,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop named primary key migration",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_stage", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:drop_constraint=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text, CONSTRAINT usage_stage_identity PRIMARY KEY (tenant_id, id));",
             },
@@ -64957,7 +65070,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema temporal period migration",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 4 },
-            .plan = "ddl:alter_table:table=usage_records:ops=4:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=4:if_exists=false:add_col=2:add_period=1:add_unique=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL);",
             },
@@ -65282,28 +65395,28 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema additive foreign key",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_fk=1",
             .sql = "ALTER TABLE usage_records ADD COLUMN user_id text REFERENCES users(id);",
         },
         .{
             .name = "schema upper generated column",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_generated=1",
             .sql = "ALTER TABLE usage_records ADD COLUMN email_upper_key text GENERATED ALWAYS AS (upper(email)) STORED;",
         },
         .{
             .name = "schema alter table if exists",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=true",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=true:add_col=1",
             .sql = "ALTER TABLE IF EXISTS usage_records ADD COLUMN optional_status text;",
         },
         .{
             .name = "schema add defaulted required column rewrite work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_default=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
             },
@@ -65314,7 +65427,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema additive unique validation work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);",
         },
@@ -65322,7 +65435,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema validate unique constraint",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text);",
                 "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);",
@@ -65334,7 +65447,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema additive foreign key validation work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;",
         },
@@ -65342,7 +65455,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema validate foreign key constraint",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);",
                 "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;",
@@ -65354,7 +65467,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema additive check validation work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_check=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;",
         },
@@ -65362,7 +65475,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema additive check validation work without not valid",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_check=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown');",
         },
@@ -65370,7 +65483,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema validate check constraint",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
                 "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;",
@@ -65382,7 +65495,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop check constraint",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_constraint=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
                 "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;",
@@ -65394,7 +65507,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema alter column default",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_default=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
             },
@@ -65405,7 +65518,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema alter column casted primitive default",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_default=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, amount numeric);",
             },
@@ -65416,7 +65529,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop column default metadata",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_default=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT 'pending');",
             },
@@ -65427,7 +65540,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema alter column not null validation work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_not_null=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
             },
@@ -65438,7 +65551,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop column not-null metadata",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_not_null=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text NOT NULL);",
             },
@@ -65449,7 +65562,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema rename column rewrite work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_col=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, tenant_status_key text GENERATED ALWAYS AS (concat(id, ':', status)) STORED, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));",
             },
@@ -65460,7 +65573,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema rename constraint metadata",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_constraint=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));",
             },
@@ -65471,7 +65584,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema alter column type rewrite work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);",
             },
@@ -65498,7 +65611,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop updated-at policy",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_update_policy=1:drop_update_policy_if_exists=1",
             .apply_setup_sql = &.{
                 "CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);",
                 "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
@@ -66070,7 +66183,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "schema drop column rewrite work",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
-            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_col=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records DROP COLUMN metadata;",
         },

@@ -4652,6 +4652,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    boundary. Inline unique/FK/check clauses are owned by the add-column
    operation, so catalog apply either adds the row cell and its inline
    constraints together or skips the whole group for duplicate `IF NOT EXISTS`.
+   SQL/API parity fingerprints for `ALTER TABLE` include native operation-family
+   suffixes for add/drop/rename/type/default/nullability/validation/period/update-policy
+   mutations and nested add-column artifacts, so migration-equivalent catalog
+   intent cannot collapse by operation count alone.
    Stored generated-column DDL for
    `lower(field)`, `upper(field)`, and simple `concat(field, separator, field...)` expressions now
    lowers to durable generated-column metadata in both `CREATE TABLE` and

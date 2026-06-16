@@ -46,7 +46,7 @@
         "table_name": "usage_stage",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id);"
@@ -59,7 +59,7 @@
         "table_name": "usage_stage",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:drop_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text, PRIMARY KEY (tenant_id, id));"],
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_stage DROP CONSTRAINT usage_stage_pkey;"
@@ -72,7 +72,7 @@
         "table_name": "usage_stage",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:drop_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text, CONSTRAINT usage_stage_identity PRIMARY KEY (tenant_id, id));"],
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_stage DROP CONSTRAINT usage_stage_identity;"
@@ -97,7 +97,7 @@
         "table_name": "usage_records",
         "operations": 4
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=4:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=4:if_exists=false:add_col=2:add_period=1:add_unique=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records\n  ADD COLUMN valid_from numeric NOT NULL,\n  ADD COLUMN valid_to numeric NOT NULL,\n  ADD PERIOD FOR valid_time (valid_from, valid_to),\n  ADD CONSTRAINT usage_records_tenant_valid_key UNIQUE (tenant_id, valid_time WITHOUT OVERLAPS);"
@@ -435,7 +435,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_generated=1",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD COLUMN email_upper_key text GENERATED ALWAYS AS (upper(email)) STORED;"
     },
@@ -447,7 +447,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=true",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=true:add_col=1",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE IF EXISTS usage_records ADD COLUMN optional_status text;"
     },
@@ -459,7 +459,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD COLUMN billing_status text DEFAULT 'active' NOT NULL;"
@@ -472,7 +472,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);"
     },
@@ -484,7 +484,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_email_key;"
@@ -497,7 +497,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"
     },
@@ -509,7 +509,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_user_id_fkey;"
@@ -522,7 +522,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_check=1",
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;"
     },
@@ -534,7 +534,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_check=1",
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=1:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown');"
     },
@@ -546,7 +546,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:validate=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_status_known_check;"
@@ -559,7 +559,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_known_check CHECK (status != 'unknown') NOT VALID;"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_known_check;"
@@ -572,7 +572,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'pending';"
@@ -585,7 +585,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, amount numeric);"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ALTER COLUMN amount SET DEFAULT '7'::numeric;"
@@ -598,7 +598,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT 'pending');"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status DROP DEFAULT;"
@@ -611,7 +611,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:set_not_null=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
       "applied_plan": "applied:rebuild=false:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL;"
@@ -624,7 +624,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_not_null=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text NOT NULL);"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL;"
@@ -637,7 +637,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_col=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, tenant_status_key text GENERATED ALWAYS AS (concat(id, ':', status)) STORED, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records RENAME COLUMN status TO state;"
@@ -650,7 +650,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_constraint=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_state_check;"
@@ -663,7 +663,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
@@ -698,7 +698,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_update_policy=1:drop_update_policy_if_exists=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);", "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;"
@@ -1463,7 +1463,7 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false",
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_col=1",
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
