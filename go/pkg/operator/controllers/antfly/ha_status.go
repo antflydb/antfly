@@ -351,6 +351,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			FenceHolder:     action.FenceHolder,
 			FenceGeneration: action.FenceGeneration,
 			AdminCommand:    haAdminCommand(action, haReplicationIdentity(ha)),
+			AdminURL:        haAdminURL(action, ha),
 			Reason:          action.Reason,
 		})
 	}
@@ -401,6 +402,35 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 	default:
 		return nil
 	}
+}
+
+func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) string {
+	if ha == nil {
+		return ""
+	}
+	switch action.Kind {
+	case haActionCreateSlot, haActionSeedStandby, haActionMarkReseed, haActionAcquireFence:
+		if ha.Admin == nil {
+			return ""
+		}
+		return ha.Admin.PrimaryURL
+	case haActionPromoteStandby:
+		return haStandbyAdminURL(ha, action.StandbyName)
+	default:
+		return ""
+	}
+}
+
+func haStandbyAdminURL(ha *antflyv1.HighAvailabilitySpec, standbyName string) string {
+	if ha == nil || standbyName == "" {
+		return ""
+	}
+	for _, standby := range ha.Standbys {
+		if standby.Name == standbyName {
+			return standby.AdminURL
+		}
+	}
+	return ""
 }
 
 func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplicationIdentitySpec {

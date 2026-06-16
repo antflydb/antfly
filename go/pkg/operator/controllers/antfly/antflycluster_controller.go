@@ -19,6 +19,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -85,6 +86,7 @@ const (
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/finalizers,verbs=update
@@ -3048,6 +3050,9 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			return err
 		}
 		r.updateHAStatusAndConditions(cluster)
+		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+			return err
+		}
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -3115,11 +3120,137 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		return err
 	}
 	r.updateHAStatusAndConditions(cluster)
+	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+		return err
+	}
 
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
 
 	return r.Status().Update(ctx, cluster)
+}
+
+func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Admin == nil || !ha.Admin.ExecutePlannedActions ||
+		ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		cluster.Status.HAStatus == nil {
+		return nil
+	}
+
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if len(action.AdminCommand) == 0 || strings.TrimSpace(action.AdminURL) == "" {
+			continue
+		}
+
+		job := buildHAAdminJob(cluster, action)
+		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+			return err
+		}
+
+		existing := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
+		if errors.IsNotFound(err) {
+			if err := r.Create(ctx, job); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildHAAdminJob(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
+	args := append([]string{"ha", "--ha-url", action.AdminURL, "--"}, action.AdminCommand...)
+	labels := haAdminJobLabels(cluster, action)
+	deadlineSeconds := int64(600)
+	backoffLimit := int32(3)
+	ttlSecondsAfterFinished := int32(86400)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      haAdminJobName(cluster, action),
+			Namespace: cluster.Namespace,
+			Labels:    labels,
+			Annotations: map[string]string{
+				"antfly.io/ha-action-kind":  action.Kind,
+				"antfly.io/ha-admin-url":    action.AdminURL,
+				"antfly.io/ha-command-hash": haAdminActionHash(action),
+			},
+		},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds:   &deadlineSeconds,
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					RestartPolicy:   corev1.RestartPolicyOnFailure,
+					SecurityContext: antflyPodSecurityContext(),
+					Containers: []corev1.Container{{
+						Name:            "ha-admin",
+						Image:           cluster.Spec.Image,
+						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
+						Command:         []string{"/antfly"},
+						Args:            args,
+					}},
+				},
+			},
+		},
+	}
+}
+
+func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) map[string]string {
+	labels := podLabels(cluster, "ha-admin")
+	labels["antfly.io/ha-action-kind"] = strings.ToLower(action.Kind)
+	if action.StandbyName != "" {
+		labels["antfly.io/ha-standby"] = action.StandbyName
+	}
+	return labels
+}
+
+func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {
+	hash := haAdminActionHash(action)[:10]
+	kind := strings.ToLower(action.Kind)
+	base := fmt.Sprintf("%s-ha-%s", cluster.Name, kind)
+	maxBaseLen := 63 - len(hash) - 1
+	if len(base) > maxBaseLen {
+		base = strings.TrimRight(base[:maxBaseLen], "-")
+	}
+	if base == "" {
+		base = "ha"
+	}
+	return fmt.Sprintf("%s-%s", base, hash)
+}
+
+func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
+	rendered, err := json.Marshal(struct {
+		Kind         string   `json:"kind"`
+		StandbyName  string   `json:"standbyName,omitempty"`
+		SlotName     string   `json:"slotName,omitempty"`
+		TargetLSN    uint64   `json:"targetLSN,omitempty"`
+		RouteTo      string   `json:"routeTo,omitempty"`
+		AdminURL     string   `json:"adminURL,omitempty"`
+		AdminCommand []string `json:"adminCommand,omitempty"`
+		Reason       string   `json:"reason,omitempty"`
+	}{
+		Kind:         action.Kind,
+		StandbyName:  action.StandbyName,
+		SlotName:     action.SlotName,
+		TargetLSN:    action.TargetLSN,
+		RouteTo:      action.RouteTo,
+		AdminURL:     action.AdminURL,
+		AdminCommand: action.AdminCommand,
+		Reason:       action.Reason,
+	})
+	if err != nil {
+		rendered = []byte(fmt.Sprintf("%s/%s/%s/%d/%s/%v/%s", action.Kind, action.StandbyName, action.SlotName, action.TargetLSN, action.AdminURL, action.AdminCommand, action.Reason))
+	}
+	sum := sha256.Sum256(rendered)
+	return fmt.Sprintf("%x", sum)
 }
 
 func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.AntflyCluster, statefulSets ...*appsv1.StatefulSet) {
@@ -4272,6 +4403,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&batchv1.Job{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod))
 	if r.ManageInferencePools {

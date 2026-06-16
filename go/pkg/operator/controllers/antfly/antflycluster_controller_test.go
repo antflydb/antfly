@@ -16,6 +16,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -146,6 +147,80 @@ func TestApplyDefaults_ServiceMeshDefaults(t *testing.T) {
 
 	// Verify Enabled remains true
 	g.Expect(clusterEnabled.Spec.ServiceMesh.Enabled).To(BeTrue())
+}
+
+func TestReconcileHAAdminJobsCreatesRemoteCommandJobs(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	initial := uint64(5)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image:           "antfly:test",
+			ImagePullPolicy: "IfNotPresent",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:       "standby-a",
+					InitialLSN: &initial,
+					AdminURL:   "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{PrimaryLSN: 9},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(2))
+
+	var createSlotJob *batchv1.Job
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if job.Annotations["antfly.io/ha-action-kind"] == string(haActionCreateSlot) {
+			createSlotJob = job
+			break
+		}
+	}
+	g.Expect(createSlotJob).NotTo(BeNil())
+	g.Expect(createSlotJob.OwnerReferences).To(HaveLen(1))
+	g.Expect(createSlotJob.OwnerReferences[0].Name).To(Equal(cluster.Name))
+	g.Expect(createSlotJob.Spec.Template.Spec.Containers).To(HaveLen(1))
+	container := createSlotJob.Spec.Template.Spec.Containers[0]
+	g.Expect(container.Command).To(Equal([]string{"/antfly"}))
+	g.Expect(container.Args).To(Equal([]string{
+		"ha",
+		"--ha-url",
+		"http://primary-ha.default.svc:8081",
+		"--",
+		"slot",
+		"create",
+		"--slot",
+		"standby-a",
+		"--initial-lsn",
+		"5",
+	}))
 }
 
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false

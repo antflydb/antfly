@@ -1153,6 +1153,21 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			}
 			slotNames[slotName] = i
 		}
+		errors = append(errors, validateHAAdminURL(standby.AdminURL, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL", i))...)
+	}
+
+	if admin := ha.Admin; admin != nil {
+		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		if admin.ExecutePlannedActions {
+			if strings.TrimSpace(admin.PrimaryURL) == "" {
+				errors = append(errors, "spec.highAvailability.admin.primaryURL is required when executePlannedActions is true")
+			}
+			for i, standby := range ha.Standbys {
+				if strings.TrimSpace(standby.AdminURL) == "" {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL is required when executePlannedActions is true", i))
+				}
+			}
+		}
 	}
 
 	if identity := ha.Identity; identity != nil {
@@ -1221,6 +1236,23 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	if len(errors) > 0 {
 		return fmt.Errorf("high availability validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func validateHAAdminURL(raw string, fieldPath string) []string {
+	if strings.TrimSpace(raw) == "" {
+		if raw != "" {
+			return []string{fmt.Sprintf("%s must not be whitespace", fieldPath)}
+		}
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return []string{fmt.Sprintf("%s must be an absolute http or https URL", fieldPath)}
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return []string{fmt.Sprintf("%s must use http or https", fieldPath)}
 	}
 	return nil
 }

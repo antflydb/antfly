@@ -46,6 +46,7 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	initial := uint64(5)
 	cluster := haCluster()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 9}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
 		{Name: "standby-a", InitialLSN: &initial},
 	}
@@ -80,6 +81,10 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "base-standby-a-5"}) {
 		t.Fatalf("unexpected seed admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
+		cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("expected slot and seed actions to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 }
 
@@ -127,6 +132,8 @@ func TestUpdateHAStatusReportsReseedAndDegradedSync(t *testing.T) {
 
 func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t *testing.T) {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
 		ShardID:          10,
@@ -257,8 +264,17 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "--current-fence"}) {
 		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
 	}
+	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("expected acquire-fence action to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
+	}
+	if cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		t.Fatalf("expected promote action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1])
+	}
 	if cluster.Status.HAStatus.PlannedActions[2].AdminCommand != nil {
 		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
+	}
+	if cluster.Status.HAStatus.PlannedActions[2].AdminURL != "" {
+		t.Fatalf("route action should not publish an HA admin URL without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[2].AdminURL)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||

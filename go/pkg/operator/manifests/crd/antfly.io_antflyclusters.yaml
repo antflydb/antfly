@@ -1520,6 +1520,19 @@ spec:
                   HighAvailability configures Postgres-style hot-standby HA for the Zig runtime.
                   This mode is separate from Raft-backed distributed write ownership.
                 properties:
+                  admin:
+                    description: Admin configures HA admin endpoints and optional
+                      operator execution.
+                    properties:
+                      executePlannedActions:
+                        description: ExecutePlannedActions lets the operator create
+                          Kubernetes Jobs for executable HA planned actions.
+                        type: boolean
+                      primaryURL:
+                        description: PrimaryURL is the primary HA admin endpoint used
+                          for slot, seed, and fence commands.
+                        type: string
+                    type: object
                   automaticFailover:
                     description: AutomaticFailover configures fenced automatic promotion.
                     properties:
@@ -1602,6 +1615,10 @@ spec:
                     items:
                       description: HAStandbySpec declares one desired hot standby.
                       properties:
+                        adminURL:
+                          description: AdminURL is the standby HA admin endpoint used
+                            for promotion commands.
+                          type: string
                         desired:
                           default: true
                           description: Desired controls whether the operator should
@@ -6607,6 +6624,10 @@ spec:
                           items:
                             type: string
                           type: array
+                        adminURL:
+                          description: AdminURL is the HA admin endpoint that should
+                            execute AdminCommand.
+                          type: string
                         fenceAuthority:
                           description: HAFencingAuthority selects the authority used
                             before automatic promotion.

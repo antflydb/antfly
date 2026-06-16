@@ -497,6 +497,10 @@ type HighAvailabilitySpec struct {
 	// +optional
 	Identity *HAReplicationIdentitySpec `json:"identity,omitempty"`
 
+	// Admin configures HA admin endpoints and optional operator execution.
+	// +optional
+	Admin *HAAdminSpec `json:"admin,omitempty"`
+
 	// SyncPolicy configures async, remote-write, or remote-apply durability.
 	// +optional
 	SyncPolicy *HASyncPolicy `json:"syncPolicy,omitempty"`
@@ -528,6 +532,21 @@ type HAStandbySpec struct {
 	// InitialLSN optionally pins slot creation to an existing primary LSN.
 	// +optional
 	InitialLSN *uint64 `json:"initialLSN,omitempty"`
+
+	// AdminURL is the standby HA admin endpoint used for promotion commands.
+	// +optional
+	AdminURL string `json:"adminURL,omitempty"`
+}
+
+// HAAdminSpec configures operator access to HA admin endpoints.
+type HAAdminSpec struct {
+	// PrimaryURL is the primary HA admin endpoint used for slot, seed, and fence commands.
+	// +optional
+	PrimaryURL string `json:"primaryURL,omitempty"`
+
+	// ExecutePlannedActions lets the operator create Kubernetes Jobs for executable HA planned actions.
+	// +optional
+	ExecutePlannedActions bool `json:"executePlannedActions,omitempty"`
 }
 
 // HAReplicationIdentitySpec identifies one replicated HA unit.
@@ -1401,6 +1420,10 @@ type HAPlannedActionStatus struct {
 	// AdminCommand is an antfly HA admin argv for executable planned actions.
 	// +optional
 	AdminCommand []string `json:"adminCommand,omitempty"`
+
+	// AdminURL is the HA admin endpoint that should execute AdminCommand.
+	// +optional
+	AdminURL string `json:"adminURL,omitempty"`
 
 	Reason string `json:"reason,omitempty"`
 }

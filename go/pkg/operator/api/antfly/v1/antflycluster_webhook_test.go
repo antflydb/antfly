@@ -1806,9 +1806,13 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
 		Standbys: []HAStandbySpec{
-			{Name: "standby-a"},
-			{Name: "standby-b"},
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b", AdminURL: "http://standby-b-ha.default.svc:8081"},
 		},
 		SyncPolicy: &HASyncPolicy{
 			Mode:          HADurabilityModeRemoteApply,
@@ -1825,6 +1829,31 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected valid hot-standby HA config, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "grpc://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA admin endpoint configuration to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.primaryURL") ||
+		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
+		!strings.Contains(err.Error(), "standbys[1].adminURL is required") {
+		t.Fatalf("expected invalid and missing HA admin URL errors, got: %v", err)
 	}
 }
 
