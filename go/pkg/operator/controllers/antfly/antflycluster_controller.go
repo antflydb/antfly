@@ -3151,7 +3151,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 
-		job := buildHAAdminJob(cluster, *action)
+		job := buildHAAdminJob(cluster, ha.Admin, *action)
 		action.AdminJobName = job.Name
 		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
 			return err
@@ -3197,12 +3197,12 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	}
 }
 
-func buildHAAdminJob(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
+func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
 	args := append([]string{"ha", "--ha-url", action.AdminURL, "--"}, action.AdminCommand...)
 	labels := haAdminJobLabels(cluster, action)
-	deadlineSeconds := int64(600)
-	backoffLimit := int32(3)
-	ttlSecondsAfterFinished := int32(86400)
+	deadlineSeconds := haAdminJobTimeoutSeconds(admin)
+	backoffLimit := haAdminJobBackoffLimit(admin)
+	ttlSecondsAfterFinished := haAdminJobTTLSecondsAfterFinished(admin)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3235,6 +3235,27 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedA
 			},
 		},
 	}
+}
+
+func haAdminJobBackoffLimit(admin *antflyv1.HAAdminSpec) int32 {
+	if admin != nil && admin.JobBackoffLimit != nil {
+		return *admin.JobBackoffLimit
+	}
+	return 3
+}
+
+func haAdminJobTimeoutSeconds(admin *antflyv1.HAAdminSpec) int64 {
+	if admin != nil && admin.JobTimeoutSeconds != nil {
+		return *admin.JobTimeoutSeconds
+	}
+	return 600
+}
+
+func haAdminJobTTLSecondsAfterFinished(admin *antflyv1.HAAdminSpec) int32 {
+	if admin != nil && admin.JobTTLSecondsAfterFinished != nil {
+		return *admin.JobTTLSecondsAfterFinished
+	}
+	return 86400
 }
 
 func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) map[string]string {

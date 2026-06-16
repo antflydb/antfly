@@ -1158,6 +1158,15 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	if admin := ha.Admin; admin != nil {
 		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		if admin.JobBackoffLimit != nil && *admin.JobBackoffLimit < 0 {
+			errors = append(errors, "spec.highAvailability.admin.jobBackoffLimit must not be negative")
+		}
+		if admin.JobTimeoutSeconds != nil && *admin.JobTimeoutSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.jobTimeoutSeconds must be greater than 0")
+		}
+		if admin.JobTTLSecondsAfterFinished != nil && *admin.JobTTLSecondsAfterFinished < 0 {
+			errors = append(errors, "spec.highAvailability.admin.jobTTLSecondsAfterFinished must not be negative")
+		}
 		if admin.ExecutePlannedActions {
 			if strings.TrimSpace(admin.PrimaryURL) == "" {
 				errors = append(errors, "spec.highAvailability.admin.primaryURL is required when executePlannedActions is true")

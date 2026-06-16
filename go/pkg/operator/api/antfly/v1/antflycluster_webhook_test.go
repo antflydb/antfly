@@ -1834,11 +1834,17 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	cluster := baseSwarmCluster()
+	backoffLimit := int32(-1)
+	timeoutSeconds := int64(0)
+	ttlSecondsAfterFinished := int32(-10)
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
 		Mode: HAModeHotStandby,
 		Admin: &HAAdminSpec{
-			PrimaryURL:            "primary-ha.default.svc:8081",
-			ExecutePlannedActions: true,
+			PrimaryURL:                 "primary-ha.default.svc:8081",
+			ExecutePlannedActions:      true,
+			JobBackoffLimit:            &backoffLimit,
+			JobTimeoutSeconds:          &timeoutSeconds,
+			JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
 		},
 		Standbys: []HAStandbySpec{
 			{Name: "standby-a", AdminURL: "grpc://standby-a-ha.default.svc:8081"},
@@ -1852,7 +1858,10 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "admin.primaryURL") ||
 		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
-		!strings.Contains(err.Error(), "standbys[1].adminURL is required") {
+		!strings.Contains(err.Error(), "standbys[1].adminURL is required") ||
+		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
+		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
+		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") {
 		t.Fatalf("expected invalid and missing HA admin URL errors, got: %v", err)
 	}
 }

@@ -1528,6 +1528,21 @@ spec:
                         description: ExecutePlannedActions lets the operator create
                           Kubernetes Jobs for executable HA planned actions.
                         type: boolean
+                      jobBackoffLimit:
+                        description: JobBackoffLimit is the HA admin Job retry count
+                          before Kubernetes marks it failed.
+                        format: int32
+                        type: integer
+                      jobTTLSecondsAfterFinished:
+                        description: JobTTLSecondsAfterFinished controls how long
+                          completed HA admin Jobs are retained.
+                        format: int32
+                        type: integer
+                      jobTimeoutSeconds:
+                        description: JobTimeoutSeconds is the HA admin Job active
+                          deadline.
+                        format: int64
+                        type: integer
                       primaryURL:
                         description: PrimaryURL is the primary HA admin endpoint used
                           for slot, seed, and fence commands.

@@ -547,6 +547,18 @@ type HAAdminSpec struct {
 	// ExecutePlannedActions lets the operator create Kubernetes Jobs for executable HA planned actions.
 	// +optional
 	ExecutePlannedActions bool `json:"executePlannedActions,omitempty"`
+
+	// JobBackoffLimit is the HA admin Job retry count before Kubernetes marks it failed.
+	// +optional
+	JobBackoffLimit *int32 `json:"jobBackoffLimit,omitempty"`
+
+	// JobTimeoutSeconds is the HA admin Job active deadline.
+	// +optional
+	JobTimeoutSeconds *int64 `json:"jobTimeoutSeconds,omitempty"`
+
+	// JobTTLSecondsAfterFinished controls how long completed HA admin Jobs are retained.
+	// +optional
+	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
 }
 
 // HAReplicationIdentitySpec identifies one replicated HA unit.

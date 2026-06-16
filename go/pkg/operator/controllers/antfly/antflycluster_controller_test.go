@@ -157,6 +157,9 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
 
 	initial := uint64(5)
+	backoffLimit := int32(1)
+	timeoutSeconds := int64(120)
+	ttlSecondsAfterFinished := int32(3600)
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-cluster",
@@ -168,8 +171,11 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
 				Mode: antflyv1.HAModeHotStandby,
 				Admin: &antflyv1.HAAdminSpec{
-					PrimaryURL:            "http://primary-ha.default.svc:8081",
-					ExecutePlannedActions: true,
+					PrimaryURL:                 "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions:      true,
+					JobBackoffLimit:            &backoffLimit,
+					JobTimeoutSeconds:          &timeoutSeconds,
+					JobTTLSecondsAfterFinished: &ttlSecondsAfterFinished,
 				},
 				Standbys: []antflyv1.HAStandbySpec{{
 					Name:       "standby-a",
@@ -206,6 +212,9 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(createSlotJob).NotTo(BeNil())
 	g.Expect(createSlotJob.OwnerReferences).To(HaveLen(1))
 	g.Expect(createSlotJob.OwnerReferences[0].Name).To(Equal(cluster.Name))
+	g.Expect(*createSlotJob.Spec.BackoffLimit).To(Equal(backoffLimit))
+	g.Expect(*createSlotJob.Spec.ActiveDeadlineSeconds).To(Equal(timeoutSeconds))
+	g.Expect(*createSlotJob.Spec.TTLSecondsAfterFinished).To(Equal(ttlSecondsAfterFinished))
 	g.Expect(createSlotJob.Spec.Template.Spec.Containers).To(HaveLen(1))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(createSlotJob.Name))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
