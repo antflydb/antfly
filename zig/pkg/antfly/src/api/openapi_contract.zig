@@ -22,6 +22,7 @@ pub const generating_api_generated = @import("antfly_generating_api_openapi");
 pub const eval_generated = @import("antfly_eval_openapi");
 pub const query_generated = @import("antfly_query_openapi");
 pub const admin_generated = @import("antfly_admin_openapi");
+pub const internal_generated = @import("antfly_internal_openapi");
 pub const metadata_generated = @import("antfly_metadata_openapi");
 pub const usermgr_generated = @import("antfly_usermgr_openapi");
 pub const chunking_generated = @import("antfly_chunking_openapi");
@@ -69,6 +70,21 @@ test "admin openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(admin_generated.RejoinAssessRequest, "receipt"));
     try std.testing.expect(@hasDecl(admin_generated.server, "PauseHAReplicationSlotPathParams"));
     try std.testing.expect(@hasField(admin_generated.server.PauseHAReplicationSlotPathParams, "slot_name"));
+}
+
+test "internal openapi contract module is generated and wired" {
+    try std.testing.expect(@hasDecl(internal_generated, "HAIdentifySystemResponse"));
+    try std.testing.expect(@hasField(internal_generated.HAIdentifySystemResponse, "identity"));
+    try std.testing.expect(@hasField(internal_generated.HAIdentifySystemResponse, "record_format_version"));
+    try std.testing.expect(@hasDecl(internal_generated, "HACreateReplicationSlotRequest"));
+    try std.testing.expect(@hasField(internal_generated.HACreateReplicationSlotRequest, "slot_name"));
+    try std.testing.expect(@hasDecl(internal_generated, "HAStartReplicationRequest"));
+    try std.testing.expect(@hasField(internal_generated.HAStartReplicationRequest, "from_lsn"));
+    try std.testing.expect(@hasDecl(internal_generated, "HAReplicationFrame"));
+    try std.testing.expect(@hasField(internal_generated.HAReplicationFrame, "encoded"));
+    try std.testing.expect(@hasDecl(internal_generated, "HAStandbyStatusUpdateRequest"));
+    try std.testing.expect(@hasField(internal_generated.HAStandbyStatusUpdateRequest, "safe_read_lsn"));
+    try std.testing.expect(@hasDecl(internal_generated.server, "ServerRouter"));
 }
 
 test "public table contract exposes migration metadata" {

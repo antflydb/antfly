@@ -87,6 +87,7 @@ pub const serverless = @import("serverless/mod.zig");
 pub const serverless_server = @import("serverless/server.zig");
 pub const serverless_http_server = @import("serverless_http_server.zig");
 pub const serverless_http_client = @import("serverless_http_client.zig");
+pub const internal = @import("internal/mod.zig");
 
 // Tracing (TLA+ trace validation)
 pub const tracing = @import("tracing/mod.zig");

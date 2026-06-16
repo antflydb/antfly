@@ -444,6 +444,7 @@ const AntflyRootImports = struct {
     eval_openapi: *std.Build.Module,
     query_openapi: *std.Build.Module,
     admin_openapi: *std.Build.Module,
+    internal_openapi: *std.Build.Module,
     metadata_openapi: *std.Build.Module,
     usermgr_openapi: *std.Build.Module,
     logging_openapi: *std.Build.Module,
@@ -508,6 +509,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
         .{ .name = "antfly_query_openapi", .field = "query_openapi" },
         .{ .name = "antfly_admin_openapi", .field = "admin_openapi" },
+        .{ .name = "antfly_internal_openapi", .field = "internal_openapi" },
         .{ .name = "antfly_metadata_openapi", .field = "metadata_openapi" },
         .{ .name = "antfly_usermgr_openapi", .field = "usermgr_openapi" },
         .{ .name = "antfly_logging_openapi", .field = "logging_openapi" },
@@ -1007,6 +1009,7 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
@@ -1206,6 +1209,7 @@ pub fn build(b: *std.Build) void {
     const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
     const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
     const admin_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", httpx_mod);
+    const internal_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", httpx_mod);
     const usermgr_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", httpx_mod);
     const metadata_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", httpx_mod);
     const logging_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi");
@@ -1651,6 +1655,7 @@ pub fn build(b: *std.Build) void {
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
         .admin_openapi = admin_openapi_mod,
+        .internal_openapi = internal_openapi_mod,
         .metadata_openapi = metadata_openapi_mod,
         .usermgr_openapi = usermgr_openapi_mod,
         .logging_openapi = logging_openapi_mod,
@@ -3262,6 +3267,7 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_default_filters = [_][]const u8{
         "public openapi contract module is generated and wired",
         "admin openapi contract module is generated and wired",
+        "internal openapi contract module is generated and wired",
         "metadata openapi module generates extractor surface for routed endpoints",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
