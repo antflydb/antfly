@@ -62152,6 +62152,17 @@ fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .insert,
+        .insert_source,
+        => true,
+        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=insert:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"),
+        else => false,
+    };
+}
+
 fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
     return entry.family == .explain and
         std.mem.startsWith(u8, entry.plan, "explain:kind=write:") and
@@ -62440,6 +62451,9 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.conflict_where != null and !appParityFixtureAllowsConflictWhereSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if ((entry.summary.patch_expressions != null or
         entry.summary.increment_expressions != null or
         entry.summary.json_set_expressions != null) and
@@ -62650,6 +62664,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .update_source,
         .summary = .{ .table_name = "usage_records", .matched_predicates = 1 },
         .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "update conflict guard summary",
+        .sql = "UPDATE usage_records SET status = 'active' WHERE id = 'u1'",
+        .family = .update,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .conflict_where = true },
+        .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=0:returning_expr=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "delete source conflict guard summary",
+        .sql = "DELETE FROM usage_records WHERE status = 'closed'",
+        .family = .delete_source,
+        .summary = .{ .table_name = "usage_records", .conflict_where = true },
+        .plan = "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
