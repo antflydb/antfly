@@ -5252,6 +5252,13 @@ while source projection, predicate, CTE, and pagination evidence stays in the
 typed source-read fingerprint until the fixture runner has a dedicated source
 summary assertion path.
 
+Returning summaries are self-anchored to write fingerprints. Point writes must
+match `returning_rows`, source-query writes and merge mutations must match
+`returning`, and any explicit `returning_all` summary must match an explicit
+`returning_all` token. This keeps `RETURNING` coverage tied to the committed row
+image contract instead of allowing stale fixture metadata to claim result-shape
+coverage.
+
 Row-claim summaries are tied to lockable query sources. `row_claim_skip_locked`
 is valid only on row-query plans, join/lateral plans that assert the left
 lockable source, mutation-source write plans, joined mutation-source write plans,

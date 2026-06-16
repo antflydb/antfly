@@ -62187,6 +62187,30 @@ fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureReturningSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    return switch (entry.family) {
+        .insert,
+        .update,
+        .delete,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", expected),
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":returning=", expected),
+        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", expected) or
+            appParityPlanHasExactUsizeToken(entry.plan, ":returning=", expected),
+        else => false,
+    };
+}
+
+fn appParityFixtureReturningAllSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
+    return appParityPlanHasExactUsizeToken(entry.plan, ":returning_all=", @intFromBool(expected));
+}
+
 fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .insert,
@@ -62613,6 +62637,16 @@ fn validateAppParityFixtureMetadata(
     {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.returning) |returning| {
+        if (!appParityFixtureReturningSummaryMatchesPlan(entry, returning)) {
+            return error.TestUnexpectedResult;
+        }
+    }
+    if (entry.summary.returning_all) |returning_all| {
+        if (!appParityFixtureReturningAllSummaryMatchesPlan(entry, returning_all)) {
+            return error.TestUnexpectedResult;
+        }
+    }
     if (entry.summary.conflict_where != null and !appParityFixtureAllowsConflictWhereSummary(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -62916,6 +62950,38 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .returning = 1 },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale point returning summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale source returning summary",
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed' RETURNING id",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 1, .returning = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale returning all summary",
+        .sql = "DELETE FROM usage_records WHERE status = 'closed' RETURNING *",
+        .family = .delete_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .returning = 0, .returning_all = true },
+        .plan = "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid merge returning all false summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING target.id",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .returning = 1, .returning_all = false },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=1:returning_expr=0:returning_all=0",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "truncate returning summary",
