@@ -658,6 +658,9 @@ test "storage.ha http client round trips admin commands" {
     try expectContains(operator_plan.body, "\"automatic_promotion_allowed\":true");
     try expectContains(operator_plan.body, "\"fencing_precondition\"");
     try expectContains(operator_plan.body, "\"generation\":4");
+    try expectContains(operator_plan.body, "\"admin_method\":\"POST\"");
+    try expectContains(operator_plan.body, "\"admin_path\":\"/admin/v1/ha/fence\"");
+    try expectContains(operator_plan.body, "\"admin_path\":\"/admin/v1/ha/promotion/current-fence\"");
 
     var fenced = try client.executeCommand("http://ha-admin.test", &.{
         "--table",

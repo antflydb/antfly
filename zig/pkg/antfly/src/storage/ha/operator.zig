@@ -151,6 +151,8 @@ pub const Action = struct {
     route_from: ?[]const u8 = null,
     route_to: ?[]const u8 = null,
     admin_url: ?[]const u8 = null,
+    admin_method: ?[]const u8 = null,
+    admin_path: ?[]const u8 = null,
     reason: []const u8,
 };
 
@@ -209,11 +211,18 @@ pub const Plan = struct {
     reseed_required_count: usize,
 
     pub fn deinit(self: *Plan, alloc: Allocator) void {
+        freeActionAdminPaths(alloc, self.actions);
         alloc.free(self.actions);
         alloc.free(self.conditions);
         self.* = undefined;
     }
 };
+
+fn freeActionAdminPaths(alloc: Allocator, actions: []const Action) void {
+    for (actions) |action| {
+        if (action.admin_path) |admin_path| alloc.free(admin_path);
+    }
+}
 
 pub const PlanDocument = struct {
     schema_version: u32 = 1,
@@ -248,8 +257,22 @@ pub fn renderJsonAlloc(alloc: Allocator, plan: Plan) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, planDocument(plan), .{});
 }
 
-fn assignActionAdminUrls(spec: Spec, actions: []Action) void {
-    for (actions) |*action| action.admin_url = adminUrlForAction(spec, action.*);
+fn assignActionAdminMetadata(alloc: Allocator, spec: Spec, actions: []Action) !void {
+    errdefer {
+        for (actions) |*action| {
+            if (action.admin_path) |admin_path| {
+                alloc.free(admin_path);
+                action.admin_path = null;
+            }
+            action.admin_method = null;
+        }
+    }
+    for (actions) |*action| {
+        action.admin_url = adminUrlForAction(spec, action.*);
+        const operation = try adminOperationForAction(alloc, action.*);
+        action.admin_method = operation.method;
+        action.admin_path = operation.path;
+    }
 }
 
 fn adminUrlForAction(spec: Spec, action: Action) ?[]const u8 {
@@ -276,6 +299,65 @@ fn adminUrlForAction(spec: Spec, action: Action) ?[]const u8 {
 
         .update_primary_endpoint => null,
     };
+}
+
+const AdminOperation = struct {
+    method: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+};
+
+fn adminOperationForAction(alloc: Allocator, action: Action) !AdminOperation {
+    return switch (action.kind) {
+        .create_slot => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/replication-slots") },
+        .resume_slot => try slotAdminOperation(alloc, action, "PUT", "resume"),
+        .pause_slot => try slotAdminOperation(alloc, action, "PUT", "pause"),
+        .drop_slot => try slotAdminOperation(alloc, action, "DELETE", null),
+        .seed_standby,
+        .mark_reseed,
+        => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/base-backups") },
+        .finish_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/base-backups/finish") },
+        .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/standby/bootstrap") },
+        .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/fence") },
+        .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/promotion/current-fence") },
+        .demote_former_primary,
+        .rewind_former_primary,
+        .reseed_former_primary,
+        => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/rejoin/assess") },
+        .update_primary_endpoint => .{},
+    };
+}
+
+fn slotAdminOperation(alloc: Allocator, action: Action, method: []const u8, suffix: ?[]const u8) !AdminOperation {
+    const slot_name = action.slot_name orelse action.standby_name orelse return .{};
+    const escaped_slot = try percentEncodePathSegmentAlloc(alloc, slot_name);
+    defer alloc.free(escaped_slot);
+    const path = if (suffix) |value|
+        try std.fmt.allocPrint(alloc, "/admin/v1/ha/replication-slots/{s}/{s}", .{ escaped_slot, value })
+    else
+        try std.fmt.allocPrint(alloc, "/admin/v1/ha/replication-slots/{s}", .{escaped_slot});
+    return .{ .method = method, .path = path };
+}
+
+fn percentEncodePathSegmentAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (raw) |byte| {
+        if (isPathSegmentUnreserved(byte)) {
+            try out.append(alloc, byte);
+        } else {
+            var buf: [3]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{byte});
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn isPathSegmentUnreserved(byte: u8) bool {
+    return (byte >= 'A' and byte <= 'Z') or
+        (byte >= 'a' and byte <= 'z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '-' or byte == '.' or byte == '_' or byte == '~';
 }
 
 fn standbyAdminUrl(spec: Spec, standby_name: ?[]const u8) ?[]const u8 {
@@ -514,11 +596,19 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         break :blk assessment;
     } else null;
 
-    assignActionAdminUrls(spec, actions.items);
+    try assignActionAdminMetadata(alloc, spec, actions.items);
+
+    errdefer freeActionAdminPaths(alloc, actions.items);
+    const owned_actions = try actions.toOwnedSlice(alloc);
+    errdefer {
+        freeActionAdminPaths(alloc, owned_actions);
+        alloc.free(owned_actions);
+    }
+    const owned_conditions = try conditions.toOwnedSlice(alloc);
 
     return .{
-        .actions = try actions.toOwnedSlice(alloc),
-        .conditions = try conditions.toOwnedSlice(alloc),
+        .actions = owned_actions,
+        .conditions = owned_conditions,
         .fencing = observed.fencing,
         .former_primary_assessment = former_primary_assessment,
         .automatic_promotion_allowed = automatic_allowed,
@@ -1027,6 +1117,10 @@ test "storage.ha operator plans slots and standby bootstrap" {
     try std.testing.expectEqual(@as(?u64, 3), plan.actions[1].target_lsn);
     try std.testing.expectEqual(@as(?ActionKind, null), plan.actions[0].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .create_slot), plan.actions[1].depends_on);
+    try std.testing.expectEqualStrings("POST", plan.actions[0].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots", plan.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings("POST", plan.actions[1].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/base-backups", plan.actions[1].admin_path.?);
     try std.testing.expectEqualStrings("SlotMissing", plan.actions[0].reason);
     try std.testing.expectEqualStrings("StandbyNeedsBaseBackup", plan.actions[1].reason);
     try std.testing.expectEqual(@as(usize, 1), plan.desired_standby_count);
@@ -1087,6 +1181,10 @@ test "storage.ha operator plans seed finish and bootstrap with manifest paths" {
     try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[1].admin_url.?);
     try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[2].admin_url.?);
     try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", plan.actions[3].admin_url.?);
+    try std.testing.expectEqualStrings("POST", plan.actions[2].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/finish", plan.actions[2].admin_path.?);
+    try std.testing.expectEqualStrings("POST", plan.actions[3].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/standby/bootstrap", plan.actions[3].admin_path.?);
 
     var finish = (try adminCommandForAction(alloc, plan.actions[2], primary.identity, .{})) orelse return error.TestExpectedEqual;
     defer finish.deinit(alloc);
@@ -1148,9 +1246,26 @@ test "storage.ha operator plans explicit slot drop for removed standby" {
     try std.testing.expectEqual(ActionKind.drop_slot, plan.actions[1].kind);
     try std.testing.expectEqual(@as(?ActionKind, null), plan.actions[0].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .pause_slot), plan.actions[1].depends_on);
+    try std.testing.expectEqualStrings("PUT", plan.actions[0].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots/standby-a/pause", plan.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings("DELETE", plan.actions[1].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots/standby-a", plan.actions[1].admin_path.?);
     try std.testing.expectEqualStrings("StandbyRemovedFromSpec", plan.actions[0].reason);
     try std.testing.expectEqualStrings("StandbyMarkedForSlotDrop", plan.actions[1].reason);
     try std.testing.expectEqual(@as(usize, 0), plan.desired_standby_count);
+}
+
+test "storage.ha operator percent-encodes slot admin paths" {
+    const alloc = std.testing.allocator;
+    const operation = try adminOperationForAction(alloc, .{
+        .kind = .pause_slot,
+        .slot_name = "standby/a b",
+        .reason = "test",
+    });
+    defer alloc.free(operation.path.?);
+
+    try std.testing.expectEqualStrings("PUT", operation.method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots/standby%2Fa%20b/pause", operation.path.?);
 }
 
 test "storage.ha operator reports retention pressure degraded sync and reseed" {
@@ -1787,6 +1902,14 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", safe.actions[1].admin_url.?);
     try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_url);
     try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", safe.actions[3].admin_url.?);
+    try std.testing.expectEqualStrings("POST", safe.actions[0].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/fence", safe.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings("POST", safe.actions[1].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/promotion/current-fence", safe.actions[1].admin_path.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_method);
+    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_path);
+    try std.testing.expectEqualStrings("POST", safe.actions[3].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/assess", safe.actions[3].admin_path.?);
     for (safe.actions) |action| {
         const precondition = action.fencing_precondition orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(FencingAuthority.kubernetes_lease, precondition.authority);
@@ -1886,8 +2009,12 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"executor\":\"admin_command\"");
     try expectContains(rendered, "\"admin_url\":\"http://standby-a-ha.default.svc:8081\"");
+    try expectContains(rendered, "\"admin_method\":\"POST\"");
+    try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/fence\"");
+    try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/promotion/current-fence\"");
     try expectContains(rendered, "\"executor\":\"controller_action\"");
     try expectContains(rendered, "\"admin_url\":\"http://primary-ha.default.svc:8081\"");
+    try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/rejoin/assess\"");
     try expectContains(rendered, "\"route_from\":\"primary-a\"");
     try expectContains(rendered, "\"route_to\":\"standby-a\"");
     try expectContains(rendered, "\"fencing_precondition\"");

@@ -965,6 +965,8 @@ fn appendOperatorActionLines(
     if (action.route_from) |route_from| try appendIndexedLine(alloc, out, "actions", idx, "route_from", route_from);
     if (action.route_to) |route_to| try appendIndexedLine(alloc, out, "actions", idx, "route_to", route_to);
     if (action.admin_url) |admin_url| try appendIndexedLine(alloc, out, "actions", idx, "admin_url", admin_url);
+    if (action.admin_method) |admin_method| try appendIndexedLine(alloc, out, "actions", idx, "admin_method", admin_method);
+    if (action.admin_path) |admin_path| try appendIndexedLine(alloc, out, "actions", idx, "admin_path", admin_path);
 }
 
 fn appendFenceReceiptLines(
@@ -1402,12 +1404,16 @@ test "storage.ha admin exec renders operator plan command" {
     try expectContains(table_body, "actions.0.phase=fence\n");
     try expectContains(table_body, "actions.0.executor=admin_command\n");
     try expectContains(table_body, "actions.0.fence_authority=kubernetes_lease\n");
+    try expectContains(table_body, "actions.0.admin_method=POST\n");
+    try expectContains(table_body, "actions.0.admin_path=/admin/v1/ha/fence\n");
     try expectContains(table_body, "actions.1.kind=promote_standby\n");
     try expectContains(table_body, "actions.1.depends_on=acquire_fence\n");
+    try expectContains(table_body, "actions.1.admin_path=/admin/v1/ha/promotion/current-fence\n");
     try expectContains(table_body, "actions.2.kind=update_primary_endpoint\n");
     try expectContains(table_body, "actions.2.executor=controller_action\n");
     try expectContains(table_body, "actions.2.route_to=standby-a\n");
     try expectContains(table_body, "actions.3.kind=demote_former_primary\n");
+    try expectContains(table_body, "actions.3.admin_path=/admin/v1/ha/rejoin/assess\n");
 }
 
 test "storage.ha admin exec operator plan assesses former primary rejoin" {
