@@ -1321,7 +1321,8 @@ updates also have fixture-backed evidence for expression binding across
 proposed `excluded` values and the committed row, including `coalesce` fallback
 to an existing row field, numeric function updates such as `greatest` over
 existing/proposed values, text-derived updates such as
-`length(excluded.next_status)`, `bit_length(excluded.next_status)`, and searched `CASE` updates whose conditions
+`length(excluded.next_status)`, `octet_length(excluded.next_status)`,
+`bit_length(excluded.next_status)`, and searched `CASE` updates whose conditions
 compare proposed and existing row values. Joined mutation-source selector fixtures now pin
 single-output computed target-dependent subqueries as typed `match_expression`
 residuals, while multi-output subqueries remain explicit fail-closed
