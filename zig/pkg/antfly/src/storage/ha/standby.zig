@@ -86,6 +86,11 @@ pub const PromotionResult = struct {
     data_loss_possible: bool,
 };
 
+const ProgressRecord = struct {
+    identity: Identity,
+    progress: Progress,
+};
+
 pub const OpenOptions = struct {
     receive_log_options: replication_log.OpenOptions = .{},
     progress_wal_options: wal_mod.WalOptions = .{},
@@ -257,10 +262,35 @@ pub const Standby = struct {
         defer replication_log.freeEntries(self.alloc, entries);
 
         var expected_lsn: u64 = 1;
+        var current_identity: ?Identity = null;
         for (entries) |entry| {
             if (entry.record.lsn != expected_lsn) return error.MissingReceivedRecord;
-            try self.validateRecord(entry.record);
+            if (entry.record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
+            if (entry.record.shard_id != self.identity.shard_id) return error.WrongShard;
+            if (entry.record.table_id != self.identity.table_id) return error.WrongTable;
+
+            if (current_identity) |current| {
+                if (recordMatchesIdentity(entry.record, current)) {
+                    expected_lsn += 1;
+                    continue;
+                }
+                if (entry.record.kind != .timeline_switch) return error.WrongTimeline;
+                if (entry.record.timeline_id <= current.timeline_id) return error.InvalidTimelineSwitch;
+                if (entry.record.epoch <= current.epoch) return error.InvalidTimelineSwitch;
+            }
+
+            current_identity = .{
+                .cluster_id = entry.record.cluster_id,
+                .shard_id = entry.record.shard_id,
+                .table_id = entry.record.table_id,
+                .timeline_id = entry.record.timeline_id,
+                .epoch = entry.record.epoch,
+            };
             expected_lsn += 1;
+        }
+
+        if (current_identity) |current| {
+            try validateIdentityMatches(current, self.identity);
         }
     }
 
@@ -280,14 +310,30 @@ pub const Standby = struct {
         }
 
         var progress: Progress = .{};
+        var current_identity: ?Identity = null;
         for (entries) |entry| {
-            const decoded = try decodeProgress(entry.data, self.identity);
-            if (decoded.received_lsn < progress.received_lsn) return error.NonMonotonicProgress;
-            if (decoded.applied_lsn < progress.applied_lsn) return error.NonMonotonicProgress;
-            if (decoded.safe_read_lsn < progress.safe_read_lsn) return error.NonMonotonicProgress;
-            if (decoded.applied_lsn > decoded.received_lsn) return error.AppliedAheadOfReceived;
-            if (decoded.safe_read_lsn > decoded.applied_lsn) return error.SafeReadAheadOfApplied;
-            progress = decoded;
+            const decoded = try decodeProgressRecord(entry.data);
+            if (decoded.identity.cluster_id != self.identity.cluster_id) return error.WrongCluster;
+            if (decoded.identity.shard_id != self.identity.shard_id) return error.WrongShard;
+            if (decoded.identity.table_id != self.identity.table_id) return error.WrongTable;
+
+            if (current_identity) |current| {
+                if (decoded.identity.timeline_id < current.timeline_id) return error.NonMonotonicTimeline;
+                if (decoded.identity.timeline_id == current.timeline_id and decoded.identity.epoch != current.epoch) return error.WrongEpoch;
+                if (decoded.identity.timeline_id > current.timeline_id and decoded.identity.epoch <= current.epoch) return error.InvalidTimelineSwitch;
+            }
+
+            if (decoded.progress.received_lsn < progress.received_lsn) return error.NonMonotonicProgress;
+            if (decoded.progress.applied_lsn < progress.applied_lsn) return error.NonMonotonicProgress;
+            if (decoded.progress.safe_read_lsn < progress.safe_read_lsn) return error.NonMonotonicProgress;
+            if (decoded.progress.applied_lsn > decoded.progress.received_lsn) return error.AppliedAheadOfReceived;
+            if (decoded.progress.safe_read_lsn > decoded.progress.applied_lsn) return error.SafeReadAheadOfApplied;
+            current_identity = decoded.identity;
+            progress = decoded.progress;
+        }
+
+        if (current_identity) |current| {
+            try validateIdentityMatches(current, self.identity);
         }
         return progress;
     }
@@ -300,6 +346,22 @@ pub const Standby = struct {
         _ = try self.progress_wal.append(&encoded);
     }
 };
+
+fn recordMatchesIdentity(record: replication_record.RecordView, identity: Identity) bool {
+    return record.cluster_id == identity.cluster_id and
+        record.shard_id == identity.shard_id and
+        record.table_id == identity.table_id and
+        record.timeline_id == identity.timeline_id and
+        record.epoch == identity.epoch;
+}
+
+fn validateIdentityMatches(actual: Identity, expected: Identity) !void {
+    if (actual.cluster_id != expected.cluster_id) return error.WrongCluster;
+    if (actual.shard_id != expected.shard_id) return error.WrongShard;
+    if (actual.table_id != expected.table_id) return error.WrongTable;
+    if (actual.timeline_id != expected.timeline_id) return error.WrongTimeline;
+    if (actual.epoch != expected.epoch) return error.WrongEpoch;
+}
 
 fn promotionPayload(
     alloc: Allocator,
@@ -341,6 +403,12 @@ fn encodeProgress(identity: Identity, progress: Progress) [progress_header_len]u
 }
 
 fn decodeProgress(bytes: []const u8, expected_identity: Identity) !Progress {
+    const record = try decodeProgressRecord(bytes);
+    try validateIdentityMatches(record.identity, expected_identity);
+    return record.progress;
+}
+
+fn decodeProgressRecord(bytes: []const u8) !ProgressRecord {
     if (bytes.len < progress_header_len) return error.EndOfStream;
     if (bytes.len != progress_header_len) return error.TrailingBytes;
     if (!std.mem.eql(u8, bytes[0..8], &progress_magic)) return error.InvalidMagic;
@@ -358,16 +426,14 @@ fn decodeProgress(bytes: []const u8, expected_identity: Identity) !Progress {
         .timeline_id = std.mem.readInt(u64, bytes[timeline_id_offset..][0..8], .little),
         .epoch = std.mem.readInt(u64, bytes[epoch_offset..][0..8], .little),
     };
-    if (decoded_identity.cluster_id != expected_identity.cluster_id) return error.WrongCluster;
-    if (decoded_identity.shard_id != expected_identity.shard_id) return error.WrongShard;
-    if (decoded_identity.table_id != expected_identity.table_id) return error.WrongTable;
-    if (decoded_identity.timeline_id != expected_identity.timeline_id) return error.WrongTimeline;
-    if (decoded_identity.epoch != expected_identity.epoch) return error.WrongEpoch;
 
     return .{
-        .received_lsn = std.mem.readInt(u64, bytes[received_lsn_offset..][0..8], .little),
-        .applied_lsn = std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
-        .safe_read_lsn = std.mem.readInt(u64, bytes[safe_read_lsn_offset..][0..8], .little),
+        .identity = decoded_identity,
+        .progress = .{
+            .received_lsn = std.mem.readInt(u64, bytes[received_lsn_offset..][0..8], .little),
+            .applied_lsn = std.mem.readInt(u64, bytes[applied_lsn_offset..][0..8], .little),
+            .safe_read_lsn = std.mem.readInt(u64, bytes[safe_read_lsn_offset..][0..8], .little),
+        },
     };
 }
 
@@ -640,4 +706,43 @@ test "storage.ha standby forced promotion records possible data loss" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(replication_record.RecordKind.timeline_switch, entries[0].record.kind);
     try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"data_loss_possible\":true") != null);
+}
+
+test "storage.ha promoted standby reopens on new timeline and rejects old timeline" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 1, .epoch = 1 };
+    const promoted_identity = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 2, .epoch = 2 };
+    const paths = try testPaths(alloc, "promote-reopen");
+    defer paths.deinit(alloc);
+
+    {
+        var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer standby.close();
+        _ = try standby.receive(baseRecord(identity, 1, "one"));
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&capture, ApplyCapture.apply));
+        _ = try standby.promote(.{
+            .new_timeline_id = promoted_identity.timeline_id,
+            .new_epoch = promoted_identity.epoch,
+            .required_lsn = 1,
+            .fencing_confirmed = true,
+        });
+    }
+
+    try std.testing.expectError(error.WrongTimeline, Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{}));
+
+    {
+        var reopened = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, promoted_identity, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 2), reopened.identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().applied_lsn);
+        try std.testing.expectError(error.WrongTimeline, reopened.receive(baseRecord(identity, 3, "old-timeline")));
+
+        var new_record = baseRecord(promoted_identity, 3, "new-timeline");
+        new_record.previous_lsn = 2;
+        try std.testing.expectEqual(@as(u64, 3), try reopened.receive(new_record));
+    }
 }
