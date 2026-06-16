@@ -62363,6 +62363,9 @@ fn validateAppParityFixtureMetadata(
         const source_table_name = (appParitySourceTableNameAlloc(alloc, entry) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
         defer alloc.free(@constCast(source_table_name));
         if (source_table_name.len == 0) return error.TestUnexpectedResult;
+        if (entry.summary.table_name) |target_table_name| {
+            if (std.mem.eql(u8, source_table_name, target_table_name)) return error.TestUnexpectedResult;
+        }
     }
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
         return error.TestUnexpectedResult;
@@ -62585,6 +62588,17 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .join,
         .summary = .{ .table_name = "usage_records" },
         .plan = "join:left=usage_records:right=archived_records:on=1",
+        .source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "source schema matches target table",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM usage_records",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "insert_source:target=usage_records:source=usage_records:assignments=1:source_pred=0:returning=0:returning_expr=0:returning_all=0",
         .source_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ,
