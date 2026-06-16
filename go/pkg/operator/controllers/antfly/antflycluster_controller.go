@@ -3064,6 +3064,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 			return err
 		}
+		r.updateHALastPromotionFromAdminJobs(cluster)
 		if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
 			return err
 		}
@@ -3141,6 +3142,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 		return err
 	}
+	r.updateHALastPromotionFromAdminJobs(cluster)
 	if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
 		return err
 	}
@@ -3187,6 +3189,47 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(cluster *antflyv1.AntflyCluster) {
+	if cluster.Status.HAStatus == nil {
+		return
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil {
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind != string(haActionPromoteStandby) ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			action.StandbyName == "" {
+			continue
+		}
+		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+			return
+		}
+		now := metav1.Now()
+		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      identity.CurrentPrimaryID,
+			PromotedStandbyID: action.StandbyName,
+			ParentTimelineID:  identity.TimelineID,
+			NewTimelineID:     identity.TimelineID + 1,
+			SwitchLSN:         action.TargetLSN,
+			FenceGeneration:   action.FenceGeneration,
+			CompletionTime:    &now,
+		}
+		return
+	}
+}
+
+func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
+	return status != nil &&
+		status.OldPrimaryID == identity.CurrentPrimaryID &&
+		status.PromotedStandbyID == action.StandbyName &&
+		status.ParentTimelineID == identity.TimelineID &&
+		status.NewTimelineID == identity.TimelineID+1 &&
+		status.SwitchLSN == action.TargetLSN &&
+		status.FenceGeneration == action.FenceGeneration
 }
 
 func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {

@@ -357,6 +357,56 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
 }
 
+func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionPromoteStandby),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceGeneration: 3,
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminJobName:    "promote-job",
+					AdminJobPhase:   haAdminJobPhaseSucceeded,
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHALastPromotionFromAdminJobs(cluster)
+
+	promotion := cluster.Status.HAStatus.LastPromotion
+	g.Expect(promotion).NotTo(BeNil())
+	g.Expect(promotion.OldPrimaryID).To(Equal("primary-a"))
+	g.Expect(promotion.PromotedStandbyID).To(Equal("standby-a"))
+	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
+	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(promotion.CompletionTime).NotTo(BeNil())
+	firstCompletion := promotion.CompletionTime
+
+	reconciler.updateHALastPromotionFromAdminJobs(cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
+}
+
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false
 func TestApplyDefaults_PublicAPIDefaultsFalse(t *testing.T) {
 	g := NewWithT(t)
