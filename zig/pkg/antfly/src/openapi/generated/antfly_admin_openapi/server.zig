@@ -26,6 +26,16 @@ pub const GetHAStandbyStatusParams = struct {
     upstream_lsn: ?[]const u8 = null,
 };
 
+/// Parse the JSON request body for checkHACommit.
+pub fn parseCheckHACommitBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CommitCheckRequest) {
+    return std.json.parseFromSlice(types.CommitCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for appendHACommit.
+pub fn parseAppendHACommitBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CommitAppendRequest) {
+    return std.json.parseFromSlice(types.CommitAppendRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationSlot.
 pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ReplicationSlotCreateRequest) {
     return std.json.parseFromSlice(types.ReplicationSlotCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -94,6 +104,8 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "GET", .path = "/ha/primary/status", .operation_id = "getHAPrimaryStatus" },
     .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
+    .{ .method = "POST", .path = "/ha/commit/check", .operation_id = "checkHACommit" },
+    .{ .method = "POST", .path = "/ha/commit/append", .operation_id = "appendHACommit" },
     .{ .method = "GET", .path = "/ha/replication-slots", .operation_id = "listHAReplicationSlots" },
     .{ .method = "POST", .path = "/ha/replication-slots", .operation_id = "createHAReplicationSlot" },
     .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot" },
@@ -123,6 +135,8 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "getHAPrimaryStatus")) @compileError("ServerRouter: Impl missing required method 'getHAPrimaryStatus'");
         if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
+        if (!@hasDecl(Impl, "checkHACommit")) @compileError("ServerRouter: Impl missing required method 'checkHACommit'");
+        if (!@hasDecl(Impl, "appendHACommit")) @compileError("ServerRouter: Impl missing required method 'appendHACommit'");
         if (!@hasDecl(Impl, "listHAReplicationSlots")) @compileError("ServerRouter: Impl missing required method 'listHAReplicationSlots'");
         if (!@hasDecl(Impl, "createHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationSlot'");
         if (!@hasDecl(Impl, "dropHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'dropHAReplicationSlot'");
@@ -153,6 +167,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             active_impl = self.impl;
             try server.get("/ha/primary/status", getHAPrimaryStatus);
             try server.get("/ha/standby/status", getHAStandbyStatus);
+            try server.post("/ha/commit/check", checkHACommit);
+            try server.post("/ha/commit/append", appendHACommit);
             try server.get("/ha/replication-slots", listHAReplicationSlots);
             try server.post("/ha/replication-slots", createHAReplicationSlot);
             try server.delete("/ha/replication-slots/:slot_name", dropHAReplicationSlot);
@@ -192,6 +208,20 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .upstream_lsn = ctx.query("upstream_lsn"),
             };
             return impl.getHAStandbyStatus(ctx, query_params);
+        }
+
+        /// Evaluate synchronous commit durability for an existing LSN
+        /// POST /ha/commit/check
+        fn checkHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.checkHACommit(ctx);
+        }
+
+        /// Append a primary WAL/effects record and evaluate synchronous commit durability
+        /// POST /ha/commit/append
+        fn appendHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.appendHACommit(ctx);
         }
 
         /// List HA replication slots
@@ -301,6 +331,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn getHAPrimaryStatus(self: *Impl, ctx: *httpx.Context, params: GetHAPrimaryStatusParams) !httpx.Response
 //   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
+//   fn checkHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn appendHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listHAReplicationSlots(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response

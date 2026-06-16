@@ -26,8 +26,10 @@ const ha_admin = @import("admin.zig");
 const admin_cli = @import("admin_cli.zig");
 const admin_exec = @import("admin_exec.zig");
 const backup_manifest = @import("backup_manifest.zig");
+const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
+const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
@@ -99,6 +101,12 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminCreateReplicationSlot(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_commit_check)) {
+                    return try self.handleAdminCommitCheck(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_commit_append)) {
+                    return try self.handleAdminCommitAppend(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_base_backups)) {
                     return try self.handleAdminBeginBaseBackup(req);
@@ -235,6 +243,53 @@ pub const Server = struct {
             .@"resume" => |slot| try self.handleTypedJson(slotActionDocument("resume", slot, slot.dropped)),
             .drop => |slot| try self.handleTypedJson(slotActionDocument("drop", slot, slot.dropped)),
         };
+    }
+
+    fn handleAdminCommitCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA commit check request");
+        var parsed = admin_api.openapi.server.parseCheckHACommitBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA commit check request");
+        defer parsed.deinit();
+
+        const target_lsn = uint64FromJson(parsed.value.target_lsn) catch {
+            return try textResponse(self.alloc, 400, "invalid HA commit check request");
+        };
+        const policy = syncPolicyFromOpenApi(parsed.value.sync_policy) catch {
+            return try textResponse(self.alloc, 400, "invalid HA commit check request");
+        };
+        const gate = ha_admin.evaluateCommit(primary, target_lsn, policy) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        return try self.handleTypedJson(CommitCheckDocument{
+            .gate = commitGateDocument(gate),
+        });
+    }
+
+    fn handleAdminCommitAppend(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA commit append request");
+        var parsed = admin_api.openapi.server.parseAppendHACommitBody(
+            self.alloc,
+            req.body,
+        ) catch return try textResponse(self.alloc, 400, "invalid HA commit append request");
+        defer parsed.deinit();
+
+        const append = appendOptionsFromOpenApi(parsed.value) catch {
+            return try textResponse(self.alloc, 400, "invalid HA commit append request");
+        };
+        const policy = syncPolicyFromOpenApi(parsed.value.sync_policy) catch {
+            return try textResponse(self.alloc, 400, "invalid HA commit append request");
+        };
+        const result = commit_gate.appendAndEvaluate(primary, append, policy) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        return try self.handleTypedJson(CommitAppendDocument{
+            .lsn = result.lsn,
+            .gate = commitGateDocument(result.gate),
+        });
     }
 
     fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -536,6 +591,23 @@ const StandbyBootstrapDocument = struct {
     checkpoint_lsn: u64,
 };
 
+const CommitCheckDocument = struct {
+    schema_version: u32 = 1,
+    gate: CommitGateDocument,
+};
+
+const CommitAppendDocument = struct {
+    schema_version: u32 = 1,
+    lsn: u64,
+    gate: CommitGateDocument,
+};
+
+const CommitGateDocument = struct {
+    target_lsn: u64,
+    action: commit_gate.Action,
+    durability: primary_mod.DurabilityDecision,
+};
+
 const FenceDocument = struct {
     schema_version: u32 = 1,
     receipt: fencing.Receipt,
@@ -573,6 +645,14 @@ fn promotionDocument(result: ha_admin.FencedPromotionResult) PromotionDocument {
         .fence_generation = result.fence_generation,
         .fence_token = result.fence_token,
         .forced = result.forced,
+    };
+}
+
+fn commitGateDocument(gate: commit_gate.GateResult) CommitGateDocument {
+    return .{
+        .target_lsn = gate.target_lsn,
+        .action = gate.action,
+        .durability = gate.decision,
     };
 }
 
@@ -631,6 +711,8 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, Routes.command) or
         std.mem.eql(u8, path, admin_api.routes.ha_primary_status) or
         std.mem.eql(u8, path, admin_api.routes.ha_standby_status) or
+        std.mem.eql(u8, path, admin_api.routes.ha_commit_check) or
+        std.mem.eql(u8, path, admin_api.routes.ha_commit_append) or
         std.mem.eql(u8, path, admin_api.routes.ha_replication_slots) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups) or
         std.mem.eql(u8, path, admin_api.routes.ha_base_backups_finish) or
@@ -641,6 +723,57 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence) or
         std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess);
+}
+
+fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy {
+    const required = if (policy.required) |value| blk: {
+        const parsed = try positiveUint64FromJson(value);
+        if (parsed > std.math.maxInt(usize)) return error.InvalidAdminRequest;
+        break :blk @as(usize, @intCast(parsed));
+    } else 1;
+    const standby_names = policy.standby_names orelse &.{};
+    for (standby_names) |name| {
+        if (name.len == 0) return error.InvalidAdminRequest;
+    }
+
+    return .{
+        .mode = try parseDurabilityModeQuery(policy.mode),
+        .selection = if (policy.selection) |raw| try parseStandbySelectionQuery(raw) else .any,
+        .required = required,
+        .standby_names = standby_names,
+        .failure_policy = if (policy.failure_policy) |raw| try parseFailurePolicyQuery(raw) else .block,
+    };
+}
+
+fn appendOptionsFromOpenApi(request: admin_api.CommitAppendRequest) !primary_mod.AppendOptions {
+    return .{
+        .kind = if (request.kind) |raw| try parseRecordKind(raw) else .batch_mutation,
+        .payload_codec = if (request.payload_codec) |raw| try parsePayloadCodec(raw) else .raw,
+        .shard_id = if (request.shard_id) |value| try uint64FromJson(value) else 0,
+        .table_id = if (request.table_id) |value| try uint64FromJson(value) else 0,
+        .commit_timestamp_ns = request.commit_timestamp_ns orelse 0,
+        .payload = request.payload,
+    };
+}
+
+fn parseRecordKind(raw: []const u8) !replication_record.RecordKind {
+    if (std.mem.eql(u8, raw, "batch_mutation")) return .batch_mutation;
+    if (std.mem.eql(u8, raw, "metadata_mutation")) return .metadata_mutation;
+    if (std.mem.eql(u8, raw, "derived_effect")) return .derived_effect;
+    if (std.mem.eql(u8, raw, "backup_start")) return .backup_start;
+    if (std.mem.eql(u8, raw, "backup_end")) return .backup_end;
+    if (std.mem.eql(u8, raw, "checkpoint")) return .checkpoint;
+    if (std.mem.eql(u8, raw, "manifest")) return .manifest;
+    if (std.mem.eql(u8, raw, "truncate")) return .truncate;
+    if (std.mem.eql(u8, raw, "timeline_switch")) return .timeline_switch;
+    return error.InvalidAdminRequest;
+}
+
+fn parsePayloadCodec(raw: []const u8) !replication_record.PayloadCodec {
+    if (std.mem.eql(u8, raw, "raw")) return .raw;
+    if (std.mem.eql(u8, raw, "json")) return .json;
+    if (std.mem.eql(u8, raw, "binary")) return .binary;
+    return error.InvalidAdminRequest;
 }
 
 fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing.FenceRequest {

@@ -102,6 +102,50 @@ paths:
                 $ref: "#/components/schemas/HAStandbyStatusResponse"
         "409":
           $ref: "#/components/responses/Conflict"
+  /ha/commit/check:
+    post:
+      tags: [ha]
+      operationId: checkHACommit
+      summary: Evaluate synchronous commit durability for an existing LSN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitCheckRequest"
+      responses:
+        "200":
+          description: Commit gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommitCheckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/commit/append:
+    post:
+      tags: [ha]
+      operationId: appendHACommit
+      summary: Append a primary WAL/effects record and evaluate synchronous commit durability
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitAppendRequest"
+      responses:
+        "200":
+          description: Appended LSN and commit gate decision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HACommitAppendResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /ha/replication-slots:
     get:
       tags: [ha]
@@ -458,6 +502,90 @@ components:
           type: string
           nullable: true
           description: Optional pod-local directory containing files referenced by the manifest.
+    HASyncPolicy:
+      type: object
+      required: [mode]
+      additionalProperties: false
+      properties:
+        mode:
+          type: string
+          enum: [async, remote_write, remote_apply]
+          description: Durability mode to require before acknowledging the commit.
+        selection:
+          type: string
+          enum: [any, first, all]
+          default: any
+          description: How named standbys are selected to satisfy the policy.
+        required:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 1
+          description: Number of eligible standbys required for `any` selection.
+        standby_names:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          default: []
+          description: Ordered candidate standby names for synchronous commit.
+        failure_policy:
+          type: string
+          enum: [block, fail_closed, degrade_to_async]
+          default: block
+          description: Caller-visible action when synchronous durability is not currently satisfied.
+    CommitCheckRequest:
+      type: object
+      required: [target_lsn, sync_policy]
+      additionalProperties: false
+      properties:
+        target_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        sync_policy:
+          $ref: "#/components/schemas/HASyncPolicy"
+    CommitAppendRequest:
+      type: object
+      required: [payload, sync_policy]
+      additionalProperties: false
+      properties:
+        payload:
+          type: string
+          description: Logical WAL/effects payload to append.
+        kind:
+          type: string
+          enum:
+            - batch_mutation
+            - metadata_mutation
+            - derived_effect
+            - backup_start
+            - backup_end
+            - checkpoint
+            - manifest
+            - truncate
+            - timeline_switch
+          default: batch_mutation
+        payload_codec:
+          type: string
+          enum: [raw, json, binary]
+          default: raw
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+        commit_timestamp_ns:
+          type: integer
+          format: int64
+          default: 0
+        sync_policy:
+          $ref: "#/components/schemas/HASyncPolicy"
     HAIdentity:
       type: object
       required: [cluster_id, shard_id, table_id, timeline_id, epoch]
@@ -657,6 +785,32 @@ components:
           minimum: 1
         snapshot:
           $ref: "#/components/schemas/HAStandbySnapshot"
+    HACommitCheckResponse:
+      type: object
+      required: [schema_version, gate]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        gate:
+          $ref: "#/components/schemas/HACommitGate"
+    HACommitAppendResponse:
+      type: object
+      required: [schema_version, lsn, gate]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        gate:
+          $ref: "#/components/schemas/HACommitGate"
     HAReplicationSlotActionResponse:
       type: object
       required: [schema_version, slot_action, slot]
@@ -1139,6 +1293,20 @@ components:
           type: integer
           format: uint64
           minimum: 0
+    HACommitGate:
+      type: object
+      required: [target_lsn, action, durability]
+      additionalProperties: false
+      properties:
+        target_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        action:
+          type: string
+          enum: [acknowledge, wait_for_standby, reject, acknowledge_degraded]
+        durability:
+          $ref: "#/components/schemas/HADurabilityDecision"
     HAReplicationSlot:
       type: object
       required:

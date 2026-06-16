@@ -147,6 +147,32 @@ pub const Client = struct {
         });
     }
 
+    pub fn checkCommit(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.CommitCheckRequest,
+    ) !ParsedOutput(admin_api.openapi.HACommitCheckResponse) {
+        return try self.postJson(
+            admin_api.openapi.HACommitCheckResponse,
+            base_uri,
+            admin_api.routes.ha_commit_check,
+            request,
+        );
+    }
+
+    pub fn appendCommit(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.CommitAppendRequest,
+    ) !ParsedOutput(admin_api.openapi.HACommitAppendResponse) {
+        return try self.postJson(
+            admin_api.openapi.HACommitAppendResponse,
+            base_uri,
+            admin_api.routes.ha_commit_append,
+            request,
+        );
+    }
+
     pub fn listReplicationSlots(
         self: *Client,
         base_uri: []const u8,
@@ -754,6 +780,65 @@ test "storage.ha http client round trips admin commands" {
     try expectContains(rejoin_plan.body, "result=operator_plan\n");
     try expectContains(rejoin_plan.body, "former_primary.action=rewind\n");
     try expectContains(rejoin_plan.body, "former_primary.fork_lsn=1\n");
+}
+
+test "storage.ha http client round trips typed commit operations" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "typed-commit");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+
+    var server = http_admin.Server.init(alloc, .{ .primary = &primary });
+    defer server.deinit();
+    var client = Client.init(alloc, server.executor());
+
+    var slot = try client.createReplicationSlot("http://ha-admin.test", "standby-a", 0);
+    defer slot.deinit(alloc);
+    try std.testing.expectEqualStrings("standby-a", slot.parsed.value.slot.slot_name);
+
+    var appended = try client.appendCommit("http://ha-admin.test", .{
+        .payload = "one",
+        .sync_policy = .{ .mode = "async" },
+    });
+    defer appended.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
+    try std.testing.expectEqualStrings("acknowledge", appended.parsed.value.gate.action);
+    try std.testing.expectEqualStrings("async", appended.parsed.value.gate.durability.mode);
+
+    const standby_names = [_][]const u8{"standby-a"};
+    try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 0);
+    var checked = try client.checkCommit("http://ha-admin.test", .{
+        .target_lsn = 1,
+        .sync_policy = .{
+            .mode = "remote_write",
+            .standby_names = &standby_names,
+        },
+    });
+    defer checked.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 1), checked.parsed.value.gate.target_lsn);
+    try std.testing.expectEqualStrings("acknowledge", checked.parsed.value.gate.action);
+    try std.testing.expectEqualStrings("remote_write", checked.parsed.value.gate.durability.mode);
+    try std.testing.expectEqual(@as(i64, 1), checked.parsed.value.gate.durability.progress_lsn);
+
+    var degraded = try client.appendCommit("http://ha-admin.test", .{
+        .payload = "two",
+        .kind = "metadata_mutation",
+        .payload_codec = "json",
+        .shard_id = 10,
+        .table_id = 20,
+        .sync_policy = .{
+            .mode = "remote_apply",
+            .standby_names = &standby_names,
+            .failure_policy = "degrade_to_async",
+        },
+    });
+    defer degraded.deinit(alloc);
+    try std.testing.expectEqual(@as(i64, 2), degraded.parsed.value.lsn);
+    try std.testing.expectEqualStrings("acknowledge_degraded", degraded.parsed.value.gate.action);
+    try std.testing.expectEqualStrings("degraded_to_async", degraded.parsed.value.gate.durability.status);
 }
 
 test "storage.ha http client round trips typed seed operations" {

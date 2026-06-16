@@ -29,6 +29,19 @@ pub const StandbyBootstrapRequest = struct {
     content_root: ?[]const u8 = null,
 };
 
+pub const HASyncPolicy = struct {
+    /// Durability mode to require before acknowledging the commit.
+    mode: []const u8,
+    /// How named standbys are selected to satisfy the policy.
+    selection: ?[]const u8 = null,
+    /// Number of eligible standbys required for `any` selection.
+    required: ?i64 = null,
+    /// Ordered candidate standby names for synchronous commit.
+    standby_names: ?[]const []const u8 = null,
+    /// Caller-visible action when synchronous durability is not currently satisfied.
+    failure_policy: ?[]const u8 = null,
+};
+
 pub const HAIdentity = struct {
     cluster_id: i64,
     shard_id: i64,
@@ -149,6 +162,22 @@ pub const HAReplicationSlot = struct {
 /// JSON rendering of the underlying HA admin command result. This envelope remains intentionally tolerant while the hot-standby API graduates from operator integration to a fully typed response schema.
 pub const HACommandResult = struct {};
 
+pub const CommitCheckRequest = struct {
+    target_lsn: i64,
+    sync_policy: HASyncPolicy,
+};
+
+pub const CommitAppendRequest = struct {
+    /// Logical WAL/effects payload to append.
+    payload: []const u8,
+    kind: ?[]const u8 = null,
+    payload_codec: ?[]const u8 = null,
+    shard_id: ?i64 = null,
+    table_id: ?i64 = null,
+    commit_timestamp_ns: ?i64 = null,
+    sync_policy: HASyncPolicy,
+};
+
 pub const FenceAcquireRequest = struct {
     identity: HAIdentity,
     old_primary_id: []const u8,
@@ -219,6 +248,12 @@ pub const HAPrimarySnapshot = struct {
     durability: ?HADurabilityDecision = null,
 };
 
+pub const HACommitGate = struct {
+    target_lsn: i64,
+    action: []const u8,
+    durability: HADurabilityDecision,
+};
+
 pub const HAReplicationSlotActionResponse = struct {
     schema_version: i64,
     slot_action: []const u8,
@@ -266,4 +301,15 @@ pub const HAStandbyStatusResponse = struct {
 pub const HAPrimaryStatusResponse = struct {
     schema_version: i64,
     snapshot: HAPrimarySnapshot,
+};
+
+pub const HACommitCheckResponse = struct {
+    schema_version: i64,
+    gate: HACommitGate,
+};
+
+pub const HACommitAppendResponse = struct {
+    schema_version: i64,
+    lsn: i64,
+    gate: HACommitGate,
 };

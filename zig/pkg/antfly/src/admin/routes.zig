@@ -19,6 +19,8 @@ pub const base = "/admin/v1";
 pub const ha = base ++ "/ha";
 pub const ha_primary_status = ha ++ "/primary/status";
 pub const ha_standby_status = ha ++ "/standby/status";
+pub const ha_commit_check = ha ++ "/commit/check";
+pub const ha_commit_append = ha ++ "/commit/append";
 pub const ha_replication_slots = ha ++ "/replication-slots";
 pub const ha_replication_slot_prefix = ha_replication_slots ++ "/";
 pub const ha_replication_slot_pause_suffix = "/pause";
@@ -69,6 +71,8 @@ pub fn replicationSlotNameFromPath(path: []const u8, suffix: []const u8) ?[]cons
 test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/primary/status", ha_primary_status);
     try std.testing.expectEqualStrings("/admin/v1/ha/standby/status", ha_standby_status);
+    try std.testing.expectEqualStrings("/admin/v1/ha/commit/check", ha_commit_check);
+    try std.testing.expectEqualStrings("/admin/v1/ha/commit/append", ha_commit_append);
     try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots", ha_replication_slots);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups", ha_base_backups);
     try std.testing.expectEqualStrings("/admin/v1/ha/base-backups/finish", ha_base_backups_finish);
