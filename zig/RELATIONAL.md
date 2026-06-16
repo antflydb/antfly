@@ -1959,8 +1959,9 @@ Claims are transaction-bound. The query/API contract carries `mode`,
 as `transaction_id` hex at the API boundary. The row-claim object is exact:
 unknown keys fail request validation. `mode` is `for_update` or
 `for_no_key_update`, `wait_policy` is `wait`, `nowait`, or `skip_locked`,
-`lease_ms` defaults to `30000`, and the selected transaction id must be 32
-hexadecimal characters.
+`lease_ms` defaults to `30000` and must be positive, executable claims require a
+non-empty `owner_id`, and the selected transaction id must be 32 hexadecimal
+characters.
 Storage lowers each claimed base row to a metadata key under
 `txn_row_claim:<row-key>` and writes a pending 2PC intent for that key. The
 intent payload records a version, `mode`, `wait_policy`, `skip_locked`,

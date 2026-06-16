@@ -7067,6 +7067,7 @@ pub const DB = struct {
         claim: types.RowClaimRequest,
     ) !void {
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+        if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
         if (row_keys.len == 0) return;
 
         const claim_now_ns = monotonicTimeNs();
@@ -75516,6 +75517,16 @@ test "db row claims block transactional and direct mutations until resolution" {
     });
 
     const claim_txn = try db.beginTransaction(2_000);
+    try std.testing.expectError(error.InvalidQueryRequest, db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .txn_id = claim_txn,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:claim",
+        .lease_ms = 0,
+        .txn_id = claim_txn,
+    }));
     try db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
         .mode = .for_update,
         .owner_id = "session:claim",
@@ -75561,9 +75572,10 @@ test "db row claim lease expiry aborts stale owner and lets next claimer proceed
     try db.claimRowsForTransaction(stale_txn, &.{"doc:claim"}, .{
         .mode = .for_update,
         .owner_id = "session:stale",
-        .lease_ms = 0,
+        .lease_ms = 1,
         .txn_id = stale_txn,
     });
+    sleepNs(10 * std.time.ns_per_ms);
 
     const next_txn = try db.beginTransaction(2_001);
     try db.claimRowsForTransaction(next_txn, &.{"doc:claim"}, .{
@@ -75612,9 +75624,10 @@ test "db row claim lease expiry lets direct mutation reclaim stale owner" {
     try db.claimRowsForTransaction(stale_txn, &.{"doc:claim"}, .{
         .mode = .for_update,
         .owner_id = "session:stale",
-        .lease_ms = 0,
+        .lease_ms = 1,
         .txn_id = stale_txn,
     });
+    sleepNs(10 * std.time.ns_per_ms);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"direct\"}" }},

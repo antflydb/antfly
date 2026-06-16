@@ -1928,6 +1928,7 @@ pub fn parseRowsMutationSourceRequest(
     var source = try parseRowsQueryRequest(alloc, source_json, schema);
     errdefer source.deinit(alloc);
     if (source.row_claim == null) return error.InvalidRowsRequest;
+    if (source.row_claim.?.owner_id.len == 0 or source.row_claim.?.lease_ms == 0) return error.InvalidRowsRequest;
     if (source.source_cte.len != 0) return error.InvalidRowsRequest;
 
     var operations: []db_mod.types.TransformOp = &.{};
@@ -5345,6 +5346,7 @@ fn parseRowsJoinedMutationJoinAllocWithSchemas(
     const target = if (target_side == .left) left else right;
     const other = if (target_side == .left) right else left;
     if (target.row_claim == null) return error.InvalidRowsRequest;
+    if (target.row_claim.?.owner_id.len == 0 or target.row_claim.?.lease_ms == 0) return error.InvalidRowsRequest;
     if (other.row_claim != null) return error.InvalidRowsRequest;
 
     const on = try parseRowsJoinOnAllocWithSchemas(alloc, left_schema, right_schema, value.object.get("on"));
@@ -9465,7 +9467,7 @@ fn parseRowsQueryRowClaimAlloc(
     if (maybe_skip_locked != null and skip_locked != (wait_policy == .skip_locked)) return error.InvalidRowsRequest;
 
     const lease_ms = if (claim.object.get("lease_ms")) |lease_value| blk: {
-        if (lease_value != .integer or lease_value.integer < 0) return error.InvalidRowsRequest;
+        if (lease_value != .integer or lease_value.integer <= 0) return error.InvalidRowsRequest;
         break :blk @as(u64, @intCast(lease_value.integer));
     } else @as(u64, 30_000);
 
@@ -21262,6 +21264,11 @@ test "relational rows api query contract parses typed row claim request" {
         "{\"row_claim\":{\"wait_policy\":\"later\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"row_claim\":{\"lease_ms\":0,\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        schema,
+    ));
 
     var no_key_update_request = try parseRowsQueryRequest(
         std.testing.allocator,
@@ -21319,6 +21326,17 @@ test "relational rows mutation source contract parses claimed update plans" {
     try std.testing.expectEqualStrings("amount_plus_one", request.req.returning_expressions[0].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, request.req.returning_expressions[0].expression.kind);
     try std.testing.expectEqual(@as(usize, 2), request.req.returning_expressions[0].expression.operands.len);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}",
+        schema,
+    ));
 
     var expression_request = try parseRowsMutationSourceRequest(
         std.testing.allocator,
@@ -21788,6 +21806,11 @@ test "relational rows joined mutation source contract parses lockable join plans
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinedMutationSourceRequest(
         std.testing.allocator,
         "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinedMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}]}",
         schema,
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinedMutationSourceRequest(
