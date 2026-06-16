@@ -330,10 +330,29 @@ pub const Primary = struct {
         for (policy.standby_names) |name| {
             const state = self.eligibleSlot(name) orelse continue;
             counts.candidate_count += 1;
-            counts.progress_lsn = counts.progressForAny(policy.required, progressForMode(state, policy.mode));
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
         }
+        counts.progress_lsn = self.anyProgressLsn(policy);
         return counts;
+    }
+
+    fn anyProgressLsn(self: *const Primary, policy: SyncPolicy) u64 {
+        if (policy.required == 0) return 0;
+
+        var best: u64 = 0;
+        for (policy.standby_names) |candidate_name| {
+            const candidate = self.eligibleSlot(candidate_name) orelse continue;
+            const candidate_progress = progressForMode(candidate, policy.mode);
+            var at_or_above: usize = 0;
+
+            for (policy.standby_names) |name| {
+                const state = self.eligibleSlot(name) orelse continue;
+                if (progressForMode(state, policy.mode) >= candidate_progress) at_or_above += 1;
+            }
+
+            if (at_or_above >= policy.required) best = @max(best, candidate_progress);
+        }
+        return best;
     }
 
     fn evaluateFirst(self: *const Primary, target_lsn: u64, policy: SyncPolicy) Counts {
@@ -458,11 +477,6 @@ const Counts = struct {
     required_count: usize = 0,
     candidate_count: usize = 0,
     progress_lsn: u64 = 0,
-
-    fn progressForAny(self: Counts, required: usize, progress_lsn: u64) u64 {
-        if (required == 1) return @max(self.progress_lsn, progress_lsn);
-        return self.progressFloor(progress_lsn);
-    }
 
     fn progressFloor(self: Counts, progress_lsn: u64) u64 {
         if (self.candidate_count == 1) return progress_lsn;
@@ -961,6 +975,39 @@ test "storage.ha primary evaluates async remote write and remote apply policies"
     try std.testing.expectEqual(DurabilityStatus.fail_closed, decision.status);
     try std.testing.expectEqual(@as(usize, 1), decision.satisfied_count);
     try std.testing.expectEqual(@as(usize, 2), decision.required_count);
+}
+
+test "storage.ha primary any policy reports nth standby progress" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "any-progress");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    try primary.createSlot("standby-b", 0);
+    try primary.createSlot("standby-c", 0);
+    try std.testing.expectEqual(@as(u64, 1), try primary.append(.{ .payload = "one" }));
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "two" }));
+    try std.testing.expectEqual(@as(u64, 3), try primary.append(.{ .payload = "three" }));
+    try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 3, 3);
+    try primary.standbyStatusUpdate("standby-b", identity.timeline_id, 2, 2);
+    try primary.standbyStatusUpdate("standby-c", identity.timeline_id, 1, 1);
+
+    const names = [_][]const u8{ "standby-a", "standby-b", "standby-c" };
+    const decision = try primary.evaluateDurability(3, .{
+        .mode = .remote_apply,
+        .selection = .any,
+        .required = 2,
+        .standby_names = &names,
+    });
+    try std.testing.expectEqual(DurabilityStatus.would_block, decision.status);
+    try std.testing.expectEqual(@as(usize, 1), decision.satisfied_count);
+    try std.testing.expectEqual(@as(usize, 2), decision.required_count);
+    try std.testing.expectEqual(@as(usize, 3), decision.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), decision.progress_lsn);
+    try std.testing.expectEqual(@as(u64, 1), decision.missing_lsn_count);
 }
 
 test "storage.ha primary first priority policy waits for the first eligible standby" {
