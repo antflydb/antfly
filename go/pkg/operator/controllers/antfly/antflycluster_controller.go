@@ -3043,6 +3043,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
+		r.updateHAStatusAndConditions(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -3106,6 +3107,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
 	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
+	r.updateHAStatusAndConditions(cluster)
 
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
