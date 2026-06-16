@@ -4514,6 +4514,18 @@
       "sql": "SELECT tenant_id, id, sum(amount % quantity) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_remainder, avg(MOD(amount + quantity, quantity)) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS average_shifted_remainder FROM usage_records WHERE status = 'open' ORDER BY running_remainder DESC LIMIT 5"
     },
     {
+      "name": "window scalar min max inputs",
+      "family": "window",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 0,
+        "select": 2,
+        "windows": 2
+      },
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=0:limit=-1",
+      "sql": "SELECT tenant_id, id, min(status) OVER (PARTITION BY tenant_id) AS first_status, max(lower(status)) OVER (PARTITION BY tenant_id) AS last_status_key FROM usage_records"
+    },
+    {
       "name": "window aggregate filters",
       "family": "window",
       "summary": {

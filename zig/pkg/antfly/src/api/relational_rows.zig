@@ -5048,10 +5048,15 @@ fn parseRowsWindowSpecAlloc(
         .count => {
             if (offset != 1 or default_json.len > 0) return error.InvalidRowsRequest;
         },
-        .sum, .avg, .min, .max => {
+        .sum, .avg => {
             const expression = value_expression orelse return error.InvalidRowsRequest;
             if (offset != 1 or default_json.len > 0) return error.InvalidRowsRequest;
             try validateRowsQueryNumericExpression(alloc, schema, expression);
+        },
+        .min, .max => {
+            const expression = value_expression orelse return error.InvalidRowsRequest;
+            if (offset != 1 or default_json.len > 0) return error.InvalidRowsRequest;
+            try validateRowsAggregateMinMaxExpressionInput(alloc, schema, expression);
         },
         .bool_or, .bool_and => {
             const expression = value_expression orelse return error.InvalidRowsRequest;
@@ -17886,6 +17891,23 @@ test "relational rows window contract accepts typed row number plans" {
     try std.testing.expect(!findRelationalColumn(rank_output_columns, "partition_count").?.nullable);
     try std.testing.expect(findRelationalColumn(rank_output_columns, "partition_sum").?.nullable);
 
+    var scalar_extrema_window_request = try parseRowsWindowRequest(
+        std.testing.allocator,
+        "{\"windows\":[{\"as\":\"first_status\",\"function\":\"min\",\"expr\":{\"field\":\"status\"},\"partition_by\":[\"tenant\"]},{\"as\":\"last_status_key\",\"function\":\"max\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"partition_by\":[\"tenant\"]}],\"select\":[\"tenant\",\"id\"]}",
+        schema,
+    );
+    defer scalar_extrema_window_request.deinit(std.testing.allocator);
+    const scalar_extrema_window_output_columns = try rowsWindowOutputColumnsAlloc(
+        std.testing.allocator,
+        schema,
+        scalar_extrema_window_request.select,
+        scalar_extrema_window_request.select_all,
+        scalar_extrema_window_request.windows,
+    );
+    defer if (scalar_extrema_window_output_columns.len > 0) std.testing.allocator.free(scalar_extrema_window_output_columns);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(scalar_extrema_window_output_columns, "first_status").?.field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(scalar_extrema_window_output_columns, "last_status_key").?.field_type);
+
     var array_window_request = try parseRowsWindowRequest(
         std.testing.allocator,
         "{\"windows\":[{\"as\":\"prev_tags\",\"function\":\"lag\",\"expr\":{\"field\":\"tags\"},\"order_by\":[{\"field\":\"amount\"}]}],\"select\":[\"tenant\"],\"order_by\":[{\"field\":\"tenant\"}]}",
@@ -17905,6 +17927,11 @@ test "relational rows window contract accepts typed row number plans" {
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsWindowRequest(
         std.testing.allocator,
         "{\"windows\":[{\"as\":\"bad_sum\",\"function\":\"sum\",\"expr\":{\"field\":\"status\"},\"order_by\":[{\"field\":\"amount\"}]}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsWindowRequest(
+        std.testing.allocator,
+        "{\"windows\":[{\"as\":\"bad_max\",\"function\":\"max\",\"expr\":{\"field\":\"tags\"},\"order_by\":[{\"field\":\"amount\"}]}]}",
         schema,
     ));
 

@@ -5023,8 +5023,9 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `rank() OVER (...)`, `dense_rank() OVER (...)`, `lag(expr, offset, default)
    OVER (...)`, `lead(expr, offset, default) OVER (...)`,
    `first_value(expr) OVER (...)`, `last_value(expr) OVER (...)`, `count(*)` /
-   `count(expr) OVER (...)`, `sum(expr)`, `avg(expr)`, `min(expr)`,
-   `max(expr)`, `bool_or(expr)`, and `bool_and(expr)` are separate typed
+   `count(expr) OVER (...)`, `sum(expr)`, `avg(expr)`, scalar extrema such as
+   `min(status) OVER (...)` and `max(lower(status)) OVER (...)`,
+   `bool_or(expr)`, and `bool_and(expr)` are separate typed
    window stages over typed materialized streams; ordered ranking, offset, and
    scalar value windows are needed for migration/backfill ranking,
    previous/next-row value projection, and wake-one job selection. Numeric
@@ -5045,7 +5046,8 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    bounded `ROWS n PRECEDING/FOLLOWING` offsets. The native REST/SDK shape
    requires a non-empty output alias, non-empty partition-key names when
    partitioning is declared, and a non-empty `windows` list. Aggregate-style
-   windows (`count`, numeric folds, `min`, `max`, `bool_or`, and `bool_and`) may
+   windows (`count`, `sum`, `avg`, scalar `min`/`max`, `bool_or`, and
+   `bool_and`) may
    omit `order_by`; without `order_by` and without an explicit frame, the frame
    is the whole partition, matching `COUNT(*) OVER ()` and
    `SUM(amount) OVER (PARTITION BY tenant)`. Explicit frame metadata without
@@ -5058,7 +5060,8 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    explicit positive offset; `lag`/`lead` require a value expression and may
    preserve an explicit JSON `null` default; scalar value and aggregate-value
    windows require the expression/default combinations accepted by the parser.
-   Aggregate-style windows (`count`, numeric folds, `bool_or`, and `bool_and`)
+   Aggregate-style windows (`count`, `sum`, `avg`, scalar `min`/`max`,
+   `bool_or`, and `bool_and`)
    may carry the same typed filter shape as grouped aggregates: scalar checks,
    array/membership/text/JSON access filters, computed expression predicates,
    computed array-containment predicates, and boolean predicate groups. SQL

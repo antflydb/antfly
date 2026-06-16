@@ -20111,7 +20111,16 @@ pub const DB = struct {
                     row_index,
                     window,
                 ),
-                .sum, .avg, .min, .max => try writeRelationalRowsWindowNumericAggregate(
+                .sum, .avg => try writeRelationalRowsWindowNumericAggregate(
+                    alloc,
+                    writer,
+                    context.source_rows,
+                    context.partition_keys,
+                    context.order_keys,
+                    row_index,
+                    window,
+                ),
+                .min, .max => try writeRelationalRowsWindowScalarExtrema(
                     alloc,
                     writer,
                     context.source_rows,
@@ -20508,7 +20517,6 @@ pub const DB = struct {
         const expression = window.value_expression orelse return error.InvalidQueryRequest;
         var count: u64 = 0;
         var sum: f64 = 0;
-        var best: f64 = 0;
         for (source_rows[range.start .. range.end + 1]) |row_json| {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
@@ -20520,15 +20528,8 @@ pub const DB = struct {
             defer value.deinit();
             if (value.value == .null) continue;
             const number = jsonNumberAsF64(value.value) orelse return error.InvalidQueryRequest;
-            if (count == 0) best = number;
             switch (window.function) {
                 .sum, .avg => sum += number,
-                .min => {
-                    if (number < best) best = number;
-                },
-                .max => {
-                    if (number > best) best = number;
-                },
                 else => return error.InvalidQueryRequest,
             }
             count += 1;
@@ -20540,10 +20541,62 @@ pub const DB = struct {
         const result = switch (window.function) {
             .sum => sum,
             .avg => sum / @as(f64, @floatFromInt(count)),
-            .min, .max => best,
             else => return error.InvalidQueryRequest,
         };
         try writer.print("{d}", .{result});
+    }
+
+    fn writeRelationalRowsWindowScalarExtrema(
+        alloc: Allocator,
+        writer: *std.Io.Writer,
+        source_rows: []const []const u8,
+        partition_keys: []const []const u8,
+        order_keys: []const []RelationalRowsQueryOrderKey,
+        row_index: usize,
+        window: types.RelationalRowsWindowSpec,
+    ) !void {
+        const frame = relationalRowsWindowFrame(window);
+        const range = (try relationalRowsWindowFrameRange(source_rows, partition_keys, order_keys, window.order_by, row_index, frame)) orelse {
+            try writer.writeAll("null");
+            return;
+        };
+        const expression = window.value_expression orelse return error.InvalidQueryRequest;
+        var best_json: ?[]u8 = null;
+        defer if (best_json) |json| alloc.free(json);
+
+        for (source_rows[range.start .. range.end + 1]) |row_json| {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            if (!(try relationalRowsWindowFilterPasses(alloc, parsed.value, window))) continue;
+            const value_json = try relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression);
+            defer alloc.free(value_json);
+            var value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+            defer value.deinit();
+            if (value.value == .null) continue;
+            if (best_json == null) {
+                best_json = try alloc.dupe(u8, value_json);
+                continue;
+            }
+
+            var parsed_best = std.json.parseFromSlice(std.json.Value, alloc, best_json.?, .{}) catch return error.InvalidQueryRequest;
+            defer parsed_best.deinit();
+            const comparison = compareRelationalRowsJsonScalars(value.value, parsed_best.value) orelse return error.InvalidQueryRequest;
+            const replace = switch (window.function) {
+                .min => comparison == .lt,
+                .max => comparison == .gt,
+                else => return error.InvalidQueryRequest,
+            };
+            if (!replace) continue;
+            const next = try alloc.dupe(u8, value_json);
+            alloc.free(best_json.?);
+            best_json = next;
+        }
+        if (best_json) |json| {
+            try writer.writeAll(json);
+        } else {
+            try writer.writeAll("null");
+        }
     }
 
     fn writeRelationalRowsWindowBooleanAggregate(
@@ -82998,6 +83051,22 @@ test "relational rows window plan computes row_number over ordered partitions" {
             .frame = .{ .unit = .rows, .end = .unbounded_following },
         },
         .{
+            .output = "first_status",
+            .function = .min,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "status" },
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
+            .output = "last_status",
+            .function = .max,
+            .partition_by = partition_by[0..],
+            .order_by = window_order[0..],
+            .value_expression = .{ .kind = .field, .field = "status" },
+            .frame = .{ .unit = .rows, .end = .unbounded_following },
+        },
+        .{
             .output = "tail_count",
             .function = .count,
             .partition_by = partition_by[0..],
@@ -83050,11 +83119,11 @@ test "relational rows window plan computes row_number over ordered partitions" {
 
     try std.testing.expectEqual(@as(u32, 5), result.total_rows);
     try std.testing.expectEqual(@as(usize, 5), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":30,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"tail_count\":3,\"neighbor_count\":2,\"next_frame_amount\":30,\"range_tail_count\":3,\"range_count\":2}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"tail_count\":2,\"neighbor_count\":3,\"next_frame_amount\":10,\"range_tail_count\":3,\"range_count\":2}", result.rows[1]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":10,\"partition_min\":10,\"partition_max\":30,\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":3}", result.rows[2]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":5,\"first_amount\":40,\"last_amount\":5,\"partition_count\":2,\"partition_sum\":45,\"current_avg\":40,\"partition_min\":5,\"partition_max\":40,\"tail_count\":2,\"neighbor_count\":2,\"next_frame_amount\":5,\"range_tail_count\":1,\"range_count\":1}", result.rows[3]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"row_num\":2,\"rank\":2,\"dense_rank\":2,\"prev_amount\":40,\"next_amount\":null,\"first_amount\":40,\"last_amount\":5,\"partition_count\":2,\"partition_sum\":45,\"current_avg\":5,\"partition_min\":5,\"partition_max\":40,\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":2}", result.rows[4]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"a\",\"amount\":30,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":30,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":3,\"neighbor_count\":2,\"next_frame_amount\":30,\"range_tail_count\":3,\"range_count\":2}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":2,\"neighbor_count\":3,\"next_frame_amount\":10,\"range_tail_count\":3,\"range_count\":2}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":10,\"partition_min\":10,\"partition_max\":30,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":3}", result.rows[2]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"d\",\"amount\":40,\"row_num\":1,\"rank\":1,\"dense_rank\":1,\"prev_amount\":0,\"next_amount\":5,\"first_amount\":40,\"last_amount\":5,\"partition_count\":2,\"partition_sum\":45,\"current_avg\":40,\"partition_min\":5,\"partition_max\":40,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":2,\"neighbor_count\":2,\"next_frame_amount\":5,\"range_tail_count\":1,\"range_count\":1}", result.rows[3]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"e\",\"amount\":5,\"row_num\":2,\"rank\":2,\"dense_rank\":2,\"prev_amount\":40,\"next_amount\":null,\"first_amount\":40,\"last_amount\":5,\"partition_count\":2,\"partition_sum\":45,\"current_avg\":5,\"partition_min\":5,\"partition_max\":40,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":2}", result.rows[4]);
 
     const ctes = [_]types.RelationalRowsCte{.{
         .name = "open_usage",
@@ -83078,8 +83147,8 @@ test "relational rows window plan computes row_number over ordered partitions" {
 
     try std.testing.expectEqual(@as(u32, 5), paged.total_rows);
     try std.testing.expectEqual(@as(usize, 2), paged.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"tail_count\":2,\"neighbor_count\":3,\"next_frame_amount\":10,\"range_tail_count\":3,\"range_count\":2}", paged.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":10,\"partition_min\":10,\"partition_max\":30,\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":3}", paged.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"f\",\"amount\":30,\"row_num\":2,\"rank\":1,\"dense_rank\":1,\"prev_amount\":30,\"next_amount\":10,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":30,\"partition_min\":10,\"partition_max\":30,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":2,\"neighbor_count\":3,\"next_frame_amount\":10,\"range_tail_count\":3,\"range_count\":2}", paged.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"b\",\"amount\":10,\"row_num\":3,\"rank\":3,\"dense_rank\":2,\"prev_amount\":30,\"next_amount\":null,\"first_amount\":30,\"last_amount\":10,\"partition_count\":3,\"partition_sum\":70,\"current_avg\":10,\"partition_min\":10,\"partition_max\":30,\"first_status\":\"open\",\"last_status\":\"open\",\"tail_count\":1,\"neighbor_count\":2,\"next_frame_amount\":null,\"range_tail_count\":1,\"range_count\":3}", paged.rows[1]);
 
     const projected_usage_select = [_][]const u8{ "tenant", "id", "amount" };
     const projected_usage_ctes = [_]types.RelationalRowsCte{

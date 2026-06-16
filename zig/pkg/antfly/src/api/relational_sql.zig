@@ -16225,7 +16225,8 @@ const Parser = struct {
         errdefer if (!value_expression_transferred) if (value_expression) |expression| freeExpression(self.alloc, expression);
         if (value_expression) |expression| {
             switch (function) {
-                .sum, .avg, .min, .max => try self.validateNumericRowExpression(expression),
+                .sum, .avg => try self.validateNumericRowExpression(expression),
+                .min, .max => try self.validateAggregateMinMaxRowExpression(expression),
                 .bool_or, .bool_and => try self.validateBooleanRowExpression(expression),
                 else => {},
             }
@@ -62748,6 +62749,7 @@ const AppParityCorpusCoverage = struct {
     window_frame_signature: bool = false,
     window_aggregate_filter: bool = false,
     window_computed_pattern_filter: bool = false,
+    window_scalar_minmax: bool = false,
     window_modulo_expression: bool = false,
     joined_source_computed_pattern_filter: bool = false,
 
@@ -63287,6 +63289,9 @@ const AppParityCorpusCoverage = struct {
                 self.window_expression_order = self.window_expression_order or appParityPlanHasNonZeroToken(entry.plan, ":order_expr=");
                 self.window_modulo_expression = self.window_modulo_expression or (std.mem.indexOf(u8, entry.sql, "sum(amount % quantity)") != null and
                     std.mem.indexOf(u8, entry.sql, "avg(MOD(amount + quantity") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, ":window_expr="));
+                self.window_scalar_minmax = self.window_scalar_minmax or (std.mem.indexOf(u8, entry.sql, "min(status) OVER") != null and
+                    std.mem.indexOf(u8, entry.sql, "max(lower(status)) OVER") != null and
                     appParityPlanHasNonZeroToken(entry.plan, ":window_expr="));
                 self.window_boolean_aggregate_functions = self.window_boolean_aggregate_functions or (std.mem.indexOf(u8, entry.sql, "bool_or(") != null and
                     std.mem.indexOf(u8, entry.sql, "bool_and(") != null and
@@ -64633,6 +64638,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.window_cte_expression_access);
         try std.testing.expect(self.window_offset);
         try std.testing.expect(self.window_frame_signature);
+        try std.testing.expect(self.window_scalar_minmax);
     }
 
     fn expectComputedPatternCoverage(self: @This()) !void {
@@ -67729,6 +67735,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .ctes = 0, .predicates = 1, .select = 2, .windows = 2, .order_by = 1, .limit = 5 },
             .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=1:limit=5",
             .sql = "SELECT tenant_id, id, sum(amount % quantity) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_remainder, avg(MOD(amount + quantity, quantity)) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS average_shifted_remainder FROM usage_records WHERE status = 'open' ORDER BY running_remainder DESC LIMIT 5",
+        },
+        .{
+            .name = "window scalar min max inputs",
+            .family = .window,
+            .summary = .{ .table_name = "usage_records", .ctes = 0, .select = 2, .windows = 2 },
+            .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=0:limit=-1",
+            .sql = "SELECT tenant_id, id, min(status) OVER (PARTITION BY tenant_id) AS first_status, max(lower(status)) OVER (PARTITION BY tenant_id) AS last_status_key FROM usage_records",
         },
         .{
             .name = "window aggregate filters",
@@ -78450,6 +78463,28 @@ test "postgres sql adapter typed read plans execute through relational storage" 
         else => return error.TestUnexpectedResult,
     }
 
+    var scalar_extrema_window_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT tenant, id, min(status) OVER (PARTITION BY tenant) AS first_status, max(lower(status)) OVER (PARTITION BY tenant) AS last_status_key FROM usage_records WHERE kind = 'order' ORDER BY id ASC",
+        schema,
+        &.{},
+    );
+    defer scalar_extrema_window_plan.deinit(alloc);
+
+    switch (scalar_extrema_window_plan) {
+        .window => |lowered| {
+            var result = try db.windowRelationalRowsPlan(alloc, schema, lowered.plan);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 3), result.total_rows);
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o1\",\"first_status\":\"open\",\"last_status_key\":\"open\"}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o2\",\"first_status\":\"open\",\"last_status_key\":\"open\"}", result.rows[1]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"o3\",\"first_status\":\"open\",\"last_status_key\":\"open\"}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var following_rows_window_plan = try lowerReadPlanAlloc(
         alloc,
         "SELECT id, count(*) OVER (ORDER BY amount DESC, id ASC ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS current_and_next FROM usage_records WHERE kind = 'order' ORDER BY current_and_next DESC, id ASC",
@@ -78841,6 +78876,19 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expectEqualStrings("running_min", offset_windows.plan.window.windows[8].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.max, offset_windows.plan.window.windows[9].function);
     try std.testing.expectEqualStrings("running_max", offset_windows.plan.window.windows[9].output);
+
+    var scalar_extrema_windows = try lowerWindowPlanAlloc(
+        alloc,
+        "SELECT tenant, id, min(status) OVER (PARTITION BY tenant) AS first_status, max(lower(status)) OVER (PARTITION BY tenant) AS last_status_key FROM usage_records WHERE status = 'open' ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer scalar_extrema_windows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), scalar_extrema_windows.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.min, scalar_extrema_windows.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("status", scalar_extrema_windows.plan.window.windows[0].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.max, scalar_extrema_windows.plan.window.windows[1].function);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, scalar_extrema_windows.plan.window.windows[1].value_expression.?.kind);
 
     var modulo_window = try lowerWindowPlanAlloc(
         alloc,
