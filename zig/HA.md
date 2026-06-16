@@ -529,6 +529,11 @@ and either rewind or reseed.
 
 ### Phase 9: Operator Integration
 
+The Kubernetes operator integration lives in `go/pkg/operator`. The Zig HA
+planner should remain a portable policy engine, but CRD fields, status
+conditions, admin-job targeting, service updates, and promotion automation must
+be validated against that operator package.
+
 - Add CRD fields for HA mode, standby topology, sync policy, failure policy,
   retention caps, and automatic-failover policy.
 - Bootstrap standby pods from base backup and attach them to replication slots.

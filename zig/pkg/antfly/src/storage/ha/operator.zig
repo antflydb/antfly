@@ -1172,6 +1172,81 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
     try std.testing.expectEqualStrings("SyncPolicyUnsatisfied", failover.reason);
 }
 
+test "storage.ha operator plans reseed finish and bootstrap with manifest paths" {
+    const alloc = std.testing.allocator;
+    const slots = [_]status.SlotSnapshot{
+        .{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .active = true,
+            .reseed_required = true,
+            .restart_lsn = 1,
+            .received_lsn = 2,
+            .applied_lsn = 1,
+            .safe_read_lsn = 1,
+            .write_lag_lsn = 8,
+            .apply_lag_lsn = 9,
+            .safe_read_lag_lsn = 9,
+            .retention_lag_lsn = 9,
+            .status = .reseed_required,
+        },
+    };
+    const primary = status.PrimarySnapshot{
+        .identity = .{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 },
+        .current_lsn = 10,
+        .slots = @constCast(slots[0..]),
+        .retention = .{
+            .primary_lsn = 10,
+            .oldest_restart_lsn = 1,
+            .retained_lsn_count = 9,
+            .active_slots = 1,
+            .reseed_recommended = 1,
+        },
+    };
+    const standbys = [_]StandbySpec{
+        .{
+            .name = "standby-a",
+            .seed_manifest_path = "/backup/reseed-standby-a-10.afha",
+            .seed_content_root = "/backup/reseed-standby-a-10",
+        },
+    };
+
+    var plan = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+    }, .{ .primary = primary });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.mark_reseed, plan.actions[0].kind);
+    try std.testing.expectEqual(ActionKind.finish_standby_seed, plan.actions[1].kind);
+    try std.testing.expectEqual(ActionKind.bootstrap_standby_seed, plan.actions[2].kind);
+    try std.testing.expectEqual(@as(?ActionKind, null), plan.actions[0].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .mark_reseed), plan.actions[1].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .finish_standby_seed), plan.actions[2].depends_on);
+    try std.testing.expectEqual(@as(?u64, 10), plan.actions[0].target_lsn);
+    try std.testing.expectEqual(@as(?u64, 10), plan.actions[1].target_lsn);
+    try std.testing.expectEqual(@as(?u64, 10), plan.actions[2].target_lsn);
+    try std.testing.expectEqualStrings("SlotRequiresReseed", plan.actions[0].reason);
+    try std.testing.expectEqualStrings("SlotRequiresReseed", plan.actions[1].reason);
+    try std.testing.expectEqualStrings("SlotRequiresReseed", plan.actions[2].reason);
+    try std.testing.expectEqualStrings("/backup/reseed-standby-a-10.afha", plan.actions[1].seed_manifest_path.?);
+    try std.testing.expectEqualStrings("/backup/reseed-standby-a-10", plan.actions[2].seed_content_root.?);
+
+    var finish = (try adminCommandForAction(alloc, plan.actions[1], primary.identity, .{})) orelse return error.TestExpectedEqual;
+    defer finish.deinit(alloc);
+    var finish_plan = try finish.parsePlan(alloc);
+    defer finish_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("/backup/reseed-standby-a-10.afha", finish_plan.command.seed.finish.manifest_path);
+
+    var bootstrap = (try adminCommandForAction(alloc, plan.actions[2], primary.identity, .{})) orelse return error.TestExpectedEqual;
+    defer bootstrap.deinit(alloc);
+    var bootstrap_plan = try bootstrap.parsePlan(alloc);
+    defer bootstrap_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("/backup/reseed-standby-a-10.afha", bootstrap_plan.command.seed.bootstrap.manifest_path);
+    try std.testing.expectEqualStrings("/backup/reseed-standby-a-10", bootstrap_plan.command.seed.bootstrap.content_root.?);
+}
+
 test "storage.ha operator gates automatic promotion on fencing and caught up standby" {
     const alloc = std.testing.allocator;
     const slots = [_]status.SlotSnapshot{
