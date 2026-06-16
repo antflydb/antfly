@@ -62274,6 +62274,34 @@ fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) boo
     };
 }
 
+fn appParityFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .query,
+        .join,
+        .lateral,
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        => true,
+        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:"),
+        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62537,6 +62565,9 @@ fn validateAppParityFixtureMetadata(
     if ((entry.summary.select_all != null or entry.summary.distinct_on != null) and
         !appParityFixtureAllowsFullQueryOutputSummary(entry))
     {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.summary.row_claim_skip_locked != null and !appParityFixtureAllowsRowClaimSummary(entry)) {
         return error.TestUnexpectedResult;
     }
     if (entry.applied_plan.len > 0 and entry.family != .ddl) {
@@ -62803,6 +62834,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .lateral,
         .summary = .{ .table_name = "usage_records", .lateral_correlations = 1, .join_on = 1 },
         .plan = "lateral:left=usage_records:right=archived_records:left_pred=0:right_pred=1:correlations=1:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "aggregate row claim summary",
+        .sql = "SELECT status, count(*) AS count FROM usage_records GROUP BY status",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .aggregations = 1, .row_claim_skip_locked = true },
+        .plan = "aggregate:table=usage_records:ctes=0:source_cte=0:source_pred=0:group_by=1:group_expr=0:agg=1:filter_groups=0:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "merge row claim summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .row_claim_skip_locked = false },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
