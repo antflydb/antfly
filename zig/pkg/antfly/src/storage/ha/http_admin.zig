@@ -63,15 +63,16 @@ pub const Server = struct {
     }
 
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const path = requestPath(req.uri);
         switch (req.method) {
             .GET => {
-                if (std.mem.eql(u8, req.uri, Routes.health)) {
+                if (std.mem.eql(u8, path, Routes.health)) {
                     return try textResponse(self.alloc, 200, "ok");
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
             .POST => {
-                if (std.mem.eql(u8, req.uri, Routes.command)) {
+                if (std.mem.eql(u8, path, Routes.command)) {
                     return try self.handleCommand(req);
                 }
                 return try textResponse(self.alloc, 404, "not found");
@@ -111,6 +112,13 @@ pub const Server = struct {
         return try self.handle(req);
     }
 };
+
+fn requestPath(uri: []const u8) []const u8 {
+    const scheme_index = std.mem.indexOf(u8, uri, "://") orelse return uri;
+    const authority_start = scheme_index + 3;
+    const path_index = std.mem.indexOfScalarPos(u8, uri, authority_start, '/') orelse return "/";
+    return uri[path_index..];
+}
 
 fn commandErrorStatus(err: anyerror) u16 {
     return switch (err) {
@@ -286,6 +294,16 @@ test "storage.ha http admin exposes request executor" {
     defer server.deinit();
     const executor = server.executor();
     var health = try executor.execute(alloc, .{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+}
+
+test "storage.ha http admin accepts absolute URIs" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var health = try server.handle(.{ .method = .GET, .uri = "http://ha-admin.test/ha/v1/health" });
     defer health.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), health.status);
 }
