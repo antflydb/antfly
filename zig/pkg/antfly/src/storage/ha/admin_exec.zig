@@ -213,6 +213,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendU64Line(alloc, &out, "received_lsn", response.received_lsn);
             try appendU64Line(alloc, &out, "applied_lsn", response.applied_lsn);
             try appendU64Line(alloc, &out, "restart_lsn", response.restart_lsn);
+            try appendOptionalLine(alloc, &out, "last_error", response.last_error);
             try appendU64Line(alloc, &out, "current_lsn", response.current_lsn);
         },
         .primary_status => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
@@ -605,6 +606,7 @@ fn appendCreateSlotResponseLines(
     try appendU64Line(alloc, out, "applied_lsn", slot.applied_lsn);
     try appendBoolLine(alloc, out, "active", slot.active);
     try appendBoolLine(alloc, out, "reseed_required", slot.reseed_required);
+    try appendOptionalLine(alloc, out, "last_error", slot.last_error);
     try appendU64Line(alloc, out, "current_lsn", slot.current_lsn);
 }
 
@@ -620,6 +622,7 @@ fn appendSlotLifecycleResponseLines(
     try appendU64Line(alloc, out, "applied_lsn", slot.applied_lsn);
     try appendBoolLine(alloc, out, "active", slot.active);
     try appendBoolLine(alloc, out, "reseed_required", slot.reseed_required);
+    try appendOptionalLine(alloc, out, "last_error", slot.last_error);
     try appendU64Line(alloc, out, "current_lsn", slot.current_lsn);
     try appendBoolLine(alloc, out, "dropped", slot.dropped);
 }
@@ -878,6 +881,10 @@ fn appendOptionalU64Line(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key
     }
 }
 
+fn appendOptionalLine(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: []const u8, value: ?[]const u8) !void {
+    try appendLine(alloc, out, key, value orelse "-");
+}
+
 fn appendPrefixedU64Line(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1082,13 +1089,37 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer created.deinit(alloc);
     try std.testing.expectEqualStrings("standby-a", created.slot.create.slot_name);
     try std.testing.expectEqual(@as(u64, 1), created.slot.create.restart_lsn);
+    const created_table = try renderTableAlloc(alloc, created);
+    defer alloc.free(created_table);
+    try expectContains(created_table, "last_error=-\n");
 
     var ack_plan = try admin_cli.parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "1", "--received-lsn", "2", "--applied-lsn", "1" });
     defer ack_plan.deinit(alloc);
     var acked = try execute(alloc, .{ .primary = &primary }, ack_plan);
     defer acked.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), acked.standby_status_update.received_lsn);
+    const acked_table = try renderTableAlloc(alloc, acked);
+    defer alloc.free(acked_table);
+    try expectContains(acked_table, "last_error=-\n");
     try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");
+
+    var pause_plan = try admin_cli.parse(alloc, &.{ "slot", "pause", "standby-a" });
+    defer pause_plan.deinit(alloc);
+    var paused = try execute(alloc, .{ .primary = &primary }, pause_plan);
+    defer paused.deinit(alloc);
+    const paused_table = try renderTableAlloc(alloc, paused);
+    defer alloc.free(paused_table);
+    try expectContains(paused_table, "slot_action=pause\n");
+    try expectContains(paused_table, "last_error=IntentionalApplyFailure\n");
+
+    var resume_plan = try admin_cli.parse(alloc, &.{ "slot", "resume", "standby-a" });
+    defer resume_plan.deinit(alloc);
+    var resumed = try execute(alloc, .{ .primary = &primary }, resume_plan);
+    defer resumed.deinit(alloc);
+    const resumed_table = try renderTableAlloc(alloc, resumed);
+    defer alloc.free(resumed_table);
+    try expectContains(resumed_table, "slot_action=resume\n");
+    try expectContains(resumed_table, "last_error=IntentionalApplyFailure\n");
 
     var primary_status_plan = try admin_cli.parse(alloc, &.{
         "status",
