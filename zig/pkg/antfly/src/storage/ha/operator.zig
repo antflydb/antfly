@@ -123,6 +123,33 @@ pub const Plan = struct {
     }
 };
 
+pub const PlanDocument = struct {
+    schema_version: u32 = 1,
+    automatic_promotion_allowed: bool,
+    desired_standby_count: usize,
+    healthy_standby_count: usize,
+    reseed_required_count: usize,
+    actions: []const Action,
+    conditions: []const Condition,
+    former_primary_assessment: ?rejoin.Assessment,
+};
+
+pub fn planDocument(plan: Plan) PlanDocument {
+    return .{
+        .automatic_promotion_allowed = plan.automatic_promotion_allowed,
+        .desired_standby_count = plan.desired_standby_count,
+        .healthy_standby_count = plan.healthy_standby_count,
+        .reseed_required_count = plan.reseed_required_count,
+        .actions = plan.actions,
+        .conditions = plan.conditions,
+        .former_primary_assessment = plan.former_primary_assessment,
+    };
+}
+
+pub fn renderJsonAlloc(alloc: Allocator, plan: Plan) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, planDocument(plan), .{});
+}
+
 pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     var actions = std.ArrayListUnmanaged(Action).empty;
     errdefer actions.deinit(alloc);
@@ -528,6 +555,70 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
 }
 
+test "storage.ha operator renders versioned json plan for controllers" {
+    const alloc = std.testing.allocator;
+    const slots = [_]status.SlotSnapshot{
+        .{
+            .name = "standby-a",
+            .timeline_id = 1,
+            .active = true,
+            .reseed_required = false,
+            .restart_lsn = 10,
+            .received_lsn = 12,
+            .applied_lsn = 12,
+            .write_lag_lsn = 0,
+            .apply_lag_lsn = 0,
+            .retention_lag_lsn = 2,
+            .status = .healthy,
+        },
+    };
+    const primary = status.PrimarySnapshot{
+        .identity = .{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 },
+        .current_lsn = 12,
+        .slots = @constCast(slots[0..]),
+        .retention = .{
+            .primary_lsn = 12,
+            .oldest_restart_lsn = 10,
+            .retained_lsn_count = 2,
+            .active_slots = 1,
+            .reseed_recommended = 0,
+        },
+        .durability = .{
+            .status = .satisfied,
+            .mode = .remote_apply,
+            .selection = .any,
+            .target_lsn = 12,
+            .satisfied_count = 1,
+            .required_count = 1,
+            .candidate_count = 1,
+        },
+    };
+    const standbys = [_]StandbySpec{
+        .{ .name = "standby-a" },
+    };
+
+    var plan = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+        },
+    }, .{ .primary = primary });
+    defer plan.deinit(alloc);
+
+    const rendered = try renderJsonAlloc(alloc, plan);
+    defer alloc.free(rendered);
+
+    try expectContains(rendered, "\"schema_version\":1");
+    try expectContains(rendered, "\"automatic_promotion_allowed\":true");
+    try expectContains(rendered, "\"desired_standby_count\":1");
+    try expectContains(rendered, "\"healthy_standby_count\":1");
+    try expectContains(rendered, "\"kind\":\"acquire_fence\"");
+    try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
+    try expectContains(rendered, "\"reason\":\"FencedPromotionReady\"");
+}
+
 test "storage.ha operator plans former primary demotion without fence" {
     const alloc = std.testing.allocator;
     const slots = [_]status.SlotSnapshot{};
@@ -633,4 +724,8 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     try std.testing.expectEqual(rejoin.Action.reseed, reseed.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.reseed_former_primary, reseed.actions[0].kind);
     try std.testing.expectEqualStrings("FormerPrimaryRequiresReseed", reseed.actions[0].reason);
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
