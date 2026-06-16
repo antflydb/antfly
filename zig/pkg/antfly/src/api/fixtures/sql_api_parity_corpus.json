@@ -171,6 +171,13 @@
       "sql": "CREATE TABLE price_adjustments_set_null (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON UPDATE SET NULL\n);"
     },
     {
+      "name": "unsupported system-time temporal table",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=system_time_temporal_table",
+      "classification_reason": "system_time_temporal_table",
+      "sql": "CREATE TABLE account_prices_history (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)\n) WITH SYSTEM VERSIONING;"
+    },
+    {
       "name": "schema replace table",
       "family": "ddl",
       "summary": {

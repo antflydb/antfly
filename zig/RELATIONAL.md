@@ -1235,7 +1235,9 @@ System-time / transaction-time history is intentionally not part of this
 application-time feature. If Antfly adds bitemporal tables later, system-time
 must be modeled as a separate catalog/runtime dimension with its own history
 retention, visibility, replay, and repair rules instead of being inferred from
-application-period rows or transaction metadata.
+application-period rows or transaction metadata. The SQL/API parity corpus pins
+`CREATE TABLE ... WITH SYSTEM VERSIONING` as an explicit unsupported DDL shape
+until that first-class system-time catalog and storage model exists.
 
 | Track | Current model shape | Long-term production plan |
 | --- | --- | --- |

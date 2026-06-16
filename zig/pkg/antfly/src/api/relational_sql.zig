@@ -44198,6 +44198,19 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
         ,
     ));
 
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE account_prices_history (
+        \\  tenant_id text NOT NULL,
+        \\  sku text NOT NULL,
+        \\  valid_from timestamptz NOT NULL,
+        \\  valid_to timestamptz NOT NULL,
+        \\  PERIOD FOR valid_time (valid_from, valid_to),
+        \\  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)
+        \\) WITH SYSTEM VERSIONING;
+        ,
+    ));
+
     var alter_lowered = try lowerDdlPlanAlloc(
         alloc,
         \\ALTER TABLE account_prices
@@ -62454,6 +62467,7 @@ const AppParityCorpusCoverage = struct {
     schema_temporal_portion_delete: bool = false,
     schema_temporal_range_column_portion_update: bool = false,
     schema_temporal_range_column_portion_delete: bool = false,
+    unsupported_ddl_system_time_temporal_table: bool = false,
     unsupported_duplicate_row_batch_target: bool = false,
     unsupported_duplicate_conflict_update_target: bool = false,
     unsupported_invalid_expression_conflict_target: bool = false,
@@ -63257,6 +63271,9 @@ const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
                 (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
                     std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
+            self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
+                (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
+                    std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
         } else if (entry.family == .unsupported_update) {
             self.unsupported_update_non_unique_point_selector = self.unsupported_update_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
         } else if (entry.family == .unsupported_update_source) {
@@ -64541,6 +64558,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.schema_temporal_portion_delete);
         try std.testing.expect(self.schema_temporal_range_column_portion_update);
         try std.testing.expect(self.schema_temporal_range_column_portion_delete);
+        try std.testing.expect(self.unsupported_ddl_system_time_temporal_table);
     }
 };
 
@@ -64787,6 +64805,22 @@ test "postgres sql adapter classifies application parity corpus" {
             \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
             \\    ON UPDATE SET NULL
             \\);
+            ,
+        },
+        .{
+            .name = "unsupported system-time temporal table",
+            .family = .unsupported_ddl,
+            .plan = "unsupported:ddl:requires=system_time_temporal_table",
+            .classification_reason = "system_time_temporal_table",
+            .sql =
+            \\CREATE TABLE account_prices_history (
+            \\  tenant_id text NOT NULL,
+            \\  sku text NOT NULL,
+            \\  valid_from timestamptz NOT NULL,
+            \\  valid_to timestamptz NOT NULL,
+            \\  PERIOD FOR valid_time (valid_from, valid_to),
+            \\  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)
+            \\) WITH SYSTEM VERSIONING;
             ,
         },
         .{
