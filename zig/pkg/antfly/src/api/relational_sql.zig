@@ -62386,6 +62386,79 @@ fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
     return true;
 }
 
+fn appParityFixtureAllowsPredicateSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .ddl,
+        .query,
+        .aggregate,
+        .join,
+        .lateral,
+        .window,
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        => true,
+        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
+            appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:") or
+            appParityReadPlanHasPrefix(entry, "read:window:"),
+        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
+            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
+            appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:") or
+            appParityReadPlanHasPrefix(entry, "read:window:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
+        else => false,
+    };
+}
+
+fn appParityFixtureSidePredicateSummaryMatchesPlan(plan: []const u8, expected: usize) bool {
+    return appParityPlanUsizeTokenSumMatches(plan, &.{ ":left_pred=", ":right_pred=" }, expected);
+}
+
+fn appParityFixturePredicateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    const expected = entry.summary.predicates orelse return true;
+    return switch (entry.family) {
+        .ddl => true,
+        .query => appParityPlanHasExactUsizeToken(entry.plan, ":pred=", expected),
+        .aggregate,
+        .window,
+        .insert_source,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":source_pred=", expected),
+        .join,
+        .lateral,
+        .update_joined_source,
+        .delete_joined_source,
+        => appParityFixtureSidePredicateSummaryMatchesPlan(entry.plan, expected),
+        .read => if (appParityReadPlanHasPrefix(entry, "read:query:"))
+            appParityPlanHasExactUsizeToken(entry.plan, ":pred=", expected)
+        else if (appParityReadPlanHasPrefix(entry, "read:aggregate:") or
+            appParityReadPlanHasPrefix(entry, "read:window:"))
+            appParityPlanHasExactUsizeToken(entry.plan, ":source_pred=", expected)
+        else if (appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityReadPlanHasPrefix(entry, "read:lateral:"))
+            appParityFixtureSidePredicateSummaryMatchesPlan(entry.plan, expected)
+        else
+            false,
+        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":pred=", expected) or
+            appParityPlanHasExactUsizeToken(entry.plan, ":source_pred=", expected) or
+            appParityFixtureSidePredicateSummaryMatchesPlan(entry.plan, expected),
+        else => false,
+    };
+}
+
 fn appParityFixtureSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
     const expected = entry.summary.select orelse return true;
     return switch (entry.family) {
@@ -62924,6 +62997,12 @@ fn validateAppParityFixtureMetadata(
     if (!appParityFixtureAggregateSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.predicates != null and !appParityFixtureAllowsPredicateSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
+    if (!appParityFixturePredicateSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (!appParityFixtureSelectSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -63224,6 +63303,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc);
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale query predicate summary",
+        .sql = "SELECT id FROM usage_records WHERE status = 'active'",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid query predicate summary",
+        .sql = "SELECT id FROM usage_records WHERE status = 'active'",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc);
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid mutation source pagination summary",
         .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed' ORDER BY id LIMIT 5 OFFSET 2",
@@ -63248,12 +63343,44 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "update_source:table=usage_records:source_pred=1:source_order=1:source_limit=5:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0:source_offset=1",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale source predicate summary",
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed'",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 1 },
+        .plan = "update_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid source predicate summary",
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE status = 'closed'",
+        .family = .update_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 1 },
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc);
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid joined pagination summary",
         .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id ORDER BY usage_records.id LIMIT 2 OFFSET 1",
         .family = .update_joined_source,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .order_by = 1, .limit = 2, .offset = 1, .operations = 1 },
         .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=1:limit=2:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0:offset=1",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale joined predicate summary",
+        .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id AND usage_records.status = 'open' AND source_records.status = 'archived'",
+        .family = .update_joined_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 1, .operations = 1 },
+        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid joined predicate summary",
+        .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id AND usage_records.status = 'open' AND source_records.status = 'archived'",
+        .family = .update_joined_source,
+        .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 1, .operations = 1 },
+        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=1:right_pred=1:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -64205,6 +64332,32 @@ fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected
         start = index + token.len;
     }
     return false;
+}
+
+fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        var pos = index + token.len;
+        if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') {
+            start = index + token.len;
+            continue;
+        }
+        var value: usize = 0;
+        while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
+            value = value * 10 + @as(usize, plan[pos] - '0');
+        }
+        return value;
+    }
+    return null;
+}
+
+fn appParityPlanUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        const value = appParityPlanUsizeTokenValue(plan, token) orelse return false;
+        sum += value;
+    }
+    return sum == expected;
 }
 
 fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {

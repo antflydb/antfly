@@ -5241,6 +5241,16 @@ must match `corr` and `right_offset`; `windows` is valid only on window plans an
 must match `windows`. This keeps the golden corpus tied to the REST/SDK-visible
 typed stage that actually owns each field.
 
+Row-stream predicate summaries are fingerprint-anchored for non-DDL typed read
+and source streams. Row-query plans, generic read-row plans, and `EXPLAIN`
+wrappers around them must match the exact `pred` token. Aggregate, window,
+insert-source, update-source, delete-source, and truncate-source plans must
+match `source_pred`. Join, lateral, and joined mutation-source plans must match
+the sum of `left_pred` and `right_pred` so side-local filters cannot drift from
+the claimed total. DDL keeps its own predicate accounting because DDL
+`predicates` refers to catalog checks, index predicates, or operation-family
+state rather than row-stream filter atoms.
+
 Join predicate summaries are scoped separately. `join_on` is valid only on join
 read plans, joined mutation-source update/delete plans, merge mutation match
 keys, generic read fingerprints whose resolved inner plan is a join, or
