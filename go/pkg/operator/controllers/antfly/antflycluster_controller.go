@@ -3268,7 +3268,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
-		if handled, err := r.executeHAPlannedActionTyped(ctx, action); handled {
+		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
 			action.AdminJobName = haAdminDirectAPIName
 			if err != nil {
 				action.AdminJobPhase = haAdminJobPhaseFailed
@@ -3303,7 +3303,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 
 const haAdminDirectAPIName = "direct-admin-api"
 
-func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, action *antflyv1.HAPlannedActionStatus) (bool, error) {
+func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
 	if action == nil {
 		return false, nil
 	}
@@ -3346,9 +3346,51 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			"manifest_id": fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN),
 		}
 		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
+	case string(haActionAcquireFence):
+		body, ok := haFenceAcquireBody(cluster, *action)
+		if !ok {
+			return false, nil
+		}
+		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/fence", body)
+	case string(haActionPromoteStandby):
+		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPost, action.AdminURL, "/admin/v1/ha/promotion/current-fence", nil)
+		if err == nil {
+			r.applyHADirectPromotionResult(cluster, *action, raw)
+		}
+		return true, err
 	default:
 		return false, nil
 	}
+}
+
+func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (map[string]any, bool) {
+	if cluster == nil {
+		return nil, false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || identity.CurrentPrimaryID == "" || strings.TrimSpace(action.StandbyName) == "" {
+		return nil, false
+	}
+	reason := action.Reason
+	if strings.TrimSpace(reason) == "" {
+		reason = action.FenceReason
+	}
+	return map[string]any{
+		"identity": map[string]any{
+			"cluster_id":  identity.ClusterID,
+			"shard_id":    identity.ShardID,
+			"table_id":    identity.TableID,
+			"timeline_id": identity.TimelineID,
+			"epoch":       identity.Epoch,
+		},
+		"old_primary_id":   identity.CurrentPrimaryID,
+		"promoted_node_id": strings.TrimSpace(action.StandbyName),
+		"new_timeline_id":  identity.TimelineID + 1,
+		"new_epoch":        identity.Epoch + 1,
+		"required_lsn":     action.TargetLSN,
+		"observed_lsn":     action.TargetLSN,
+		"reason":           reason,
+	}, true
 }
 
 func haActionSlotName(action antflyv1.HAPlannedActionStatus) string {
@@ -3356,6 +3398,38 @@ func haActionSlotName(action antflyv1.HAPlannedActionStatus) string {
 		return strings.TrimSpace(action.SlotName)
 	}
 	return strings.TrimSpace(action.StandbyName)
+}
+
+func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, raw []byte) {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || action.StandbyName == "" {
+		return
+	}
+	result, ok := parseHAPromotionAPIResult(raw)
+	if !ok {
+		return
+	}
+	if cluster.Status.HAStatus.LastPromotion == nil ||
+		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+		now := metav1.Now()
+		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      identity.CurrentPrimaryID,
+			PromotedStandbyID: action.StandbyName,
+			FenceAuthority:    action.FenceAuthority,
+			FenceReason:       haPromotionFenceReason(action),
+			CompletionTime:    &now,
+		}
+	}
+	applyHAPromotionJobResult(cluster.Status.HAStatus.LastPromotion, result)
+	if cluster.Status.HAStatus.LastPromotion.FenceAuthority == "" {
+		cluster.Status.HAStatus.LastPromotion.FenceAuthority = action.FenceAuthority
+	}
+	if cluster.Status.HAStatus.LastPromotion.FenceReason == "" {
+		cluster.Status.HAStatus.LastPromotion.FenceReason = haPromotionFenceReason(action)
+	}
 }
 
 func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) {
@@ -3615,6 +3689,81 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 	result.Forced, _ = parseHAResultBool(lines, "promotion.forced")
 	result.DataLossPossible, _ = parseHAResultBool(lines, "promotion.data_loss_possible")
 	return result, true
+}
+
+type haPromotionAPIResultEnvelope struct {
+	Result struct {
+		PromoteCurrentFence *haPromotionAPIResult `json:"promote_current_fence,omitempty"`
+		Promote             *haPromotionAPIResult `json:"promote,omitempty"`
+	} `json:"result"`
+}
+
+type haPromotionAPIResult struct {
+	Assessment struct {
+		RequiredLSN uint64 `json:"required_lsn"`
+		ReceivedLSN uint64 `json:"received_lsn"`
+		AppliedLSN  uint64 `json:"applied_lsn"`
+	} `json:"assessment"`
+	Promotion struct {
+		SwitchLSN   uint64 `json:"switch_lsn"`
+		OldIdentity struct {
+			TimelineID uint64 `json:"timeline_id"`
+			Epoch      uint64 `json:"epoch"`
+		} `json:"old_identity"`
+		NewIdentity struct {
+			TimelineID uint64 `json:"timeline_id"`
+			Epoch      uint64 `json:"epoch"`
+		} `json:"new_identity"`
+		Forced           bool `json:"forced"`
+		DataLossPossible bool `json:"data_loss_possible"`
+	} `json:"promotion"`
+	FenceGeneration uint64 `json:"fence_generation"`
+	FenceToken      string `json:"fence_token"`
+	Forced          bool   `json:"forced"`
+}
+
+func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
+	var envelope haPromotionAPIResultEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return haPromotionJobResult{}, false
+	}
+	result := envelope.Result.PromoteCurrentFence
+	if result == nil {
+		result = envelope.Result.Promote
+	}
+	if result == nil || result.Promotion.SwitchLSN == 0 ||
+		result.Promotion.OldIdentity.TimelineID == 0 ||
+		result.Promotion.OldIdentity.Epoch == 0 ||
+		result.Promotion.NewIdentity.TimelineID == 0 ||
+		result.Promotion.NewIdentity.Epoch == 0 ||
+		result.FenceGeneration == 0 ||
+		strings.TrimSpace(result.FenceToken) == "" {
+		return haPromotionJobResult{}, false
+	}
+	observedLSN := result.Assessment.ReceivedLSN
+	if result.Assessment.AppliedLSN > observedLSN {
+		observedLSN = result.Assessment.AppliedLSN
+	}
+	requiredLSN := result.Assessment.RequiredLSN
+	if requiredLSN == 0 {
+		requiredLSN = result.Promotion.SwitchLSN
+	}
+	if observedLSN == 0 {
+		observedLSN = requiredLSN
+	}
+	return haPromotionJobResult{
+		SwitchLSN:        result.Promotion.SwitchLSN,
+		ParentTimelineID: result.Promotion.OldIdentity.TimelineID,
+		ParentEpoch:      result.Promotion.OldIdentity.Epoch,
+		NewTimelineID:    result.Promotion.NewIdentity.TimelineID,
+		NewEpoch:         result.Promotion.NewIdentity.Epoch,
+		RequiredLSN:      requiredLSN,
+		ObservedLSN:      observedLSN,
+		FenceGeneration:  result.FenceGeneration,
+		FenceToken:       strings.TrimSpace(result.FenceToken),
+		Forced:           result.Forced || result.Promotion.Forced,
+		DataLossPossible: result.Promotion.DataLossPossible,
+	}, true
 }
 
 type haRejoinJobResult struct {
@@ -3888,14 +4037,16 @@ func (r *AntflyClusterReconciler) postHAAdminJSON(ctx context.Context, baseURL s
 	if err != nil {
 		return err
 	}
-	return r.requestHAAdminJSON(ctx, http.MethodPost, baseURL, apiPath, raw)
+	_, err = r.requestHAAdminJSONRaw(ctx, http.MethodPost, baseURL, apiPath, raw)
+	return err
 }
 
 func (r *AntflyClusterReconciler) requestHAAdminNoBody(ctx context.Context, method string, baseURL string, apiPath string) error {
-	return r.requestHAAdminJSON(ctx, method, baseURL, apiPath, nil)
+	_, err := r.requestHAAdminJSONRaw(ctx, method, baseURL, apiPath, nil)
+	return err
 }
 
-func (r *AntflyClusterReconciler) requestHAAdminJSON(ctx context.Context, method string, baseURL string, apiPath string, body []byte) error {
+func (r *AntflyClusterReconciler) requestHAAdminJSONRaw(ctx context.Context, method string, baseURL string, apiPath string, body []byte) ([]byte, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + apiPath
 	var reader io.Reader
 	if body != nil {
@@ -3903,7 +4054,7 @@ func (r *AntflyClusterReconciler) requestHAAdminJSON(ctx context.Context, method
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -3911,17 +4062,17 @@ func (r *AntflyClusterReconciler) requestHAAdminJSON(ctx context.Context, method
 	}
 	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
-	return nil
+	return raw, nil
 }
 
 func (r *AntflyClusterReconciler) executeHAAdminTableCommand(ctx context.Context, baseURL string, argv []string) (string, error) {

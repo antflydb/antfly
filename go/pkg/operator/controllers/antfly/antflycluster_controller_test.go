@@ -318,6 +318,125 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g.Expect(degraded.Message).To(ContainSubstring(haAdminDirectAPIName))
 }
 
+func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					Reason:          "AutomaticFailoverReady",
+					AdminCommand:    []string{"fence", "acquire"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+				}, {
+					Kind:            string(haActionPromoteStandby),
+					DependsOn:       string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+	var observed []string
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			observed = append(observed, req.Method+" "+req.URL.Path)
+			switch req.URL.Path {
+			case "/admin/v1/ha/fence":
+				g.Expect(req.Method).To(Equal(http.MethodPost))
+				var payload map[string]any
+				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+				g.Expect(payload["old_primary_id"]).To(Equal("primary-a"))
+				g.Expect(payload["promoted_node_id"]).To(Equal("standby-a"))
+				g.Expect(payload["new_timeline_id"]).To(Equal(float64(5)))
+				g.Expect(payload["new_epoch"]).To(Equal(float64(7)))
+				g.Expect(payload["required_lsn"]).To(Equal(float64(12)))
+				g.Expect(payload["observed_lsn"]).To(Equal(float64(12)))
+				g.Expect(payload["reason"]).To(Equal("AutomaticFailoverReady"))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{"fence_acquire":{"receipt":{"generation":3,"token":"ha-fence-token"}}}}`)),
+				}, nil
+			case "/admin/v1/ha/promotion/current-fence":
+				g.Expect(req.Method).To(Equal(http.MethodPost))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}}}`)),
+				}, nil
+			default:
+				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(observed).To(Equal([]string{
+		"POST /admin/v1/ha/fence",
+		"POST /admin/v1/ha/promotion/current-fence",
+	}))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(BeEmpty())
+
+	promotion := cluster.Status.HAStatus.LastPromotion
+	g.Expect(promotion).NotTo(BeNil())
+	g.Expect(promotion.PromotedStandbyID).To(Equal("standby-a"))
+	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
+	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(promotion.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
+}
+
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g := NewWithT(t)
 
