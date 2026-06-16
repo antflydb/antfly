@@ -26,11 +26,14 @@ const (
 )
 
 type haPlannedAction struct {
-	Kind        haActionKind
-	StandbyName string
-	SlotName    string
-	TargetLSN   uint64
-	Reason      string
+	Kind            haActionKind
+	StandbyName     string
+	SlotName        string
+	TargetLSN       uint64
+	FenceAuthority  antflyv1.HAFencingAuthority
+	FenceHolder     string
+	FenceGeneration uint64
+	Reason          string
 }
 
 type haPlan struct {
@@ -193,11 +196,40 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.FencingReady = haFencingReady(ha, status)
 	plan.AutomaticPromotionAllowed = haAutomaticPromotionAllowed(ha, status, plan)
 	if plan.AutomaticPromotionAllowed {
+		fence := status.Fencing
 		plan.Actions = append(plan.Actions,
-			haPlannedAction{Kind: haActionAcquireFence, TargetLSN: status.PrimaryLSN, Reason: "AutomaticFailoverReady"},
-			haPlannedAction{Kind: haActionPromoteStandby, TargetLSN: status.PrimaryLSN, Reason: "AutomaticFailoverReady"},
-			haPlannedAction{Kind: haActionUpdatePrimaryRoute, TargetLSN: status.PrimaryLSN, Reason: "PromotionPlanned"},
-			haPlannedAction{Kind: haActionDemoteFormerPrimary, TargetLSN: status.PrimaryLSN, Reason: "PromotionPlanned"},
+			haPlannedAction{
+				Kind:            haActionAcquireFence,
+				TargetLSN:       status.PrimaryLSN,
+				FenceAuthority:  fence.Authority,
+				FenceHolder:     fence.Holder,
+				FenceGeneration: fence.Generation,
+				Reason:          "AutomaticFailoverReady",
+			},
+			haPlannedAction{
+				Kind:            haActionPromoteStandby,
+				TargetLSN:       status.PrimaryLSN,
+				FenceAuthority:  fence.Authority,
+				FenceHolder:     fence.Holder,
+				FenceGeneration: fence.Generation,
+				Reason:          "AutomaticFailoverReady",
+			},
+			haPlannedAction{
+				Kind:            haActionUpdatePrimaryRoute,
+				TargetLSN:       status.PrimaryLSN,
+				FenceAuthority:  fence.Authority,
+				FenceHolder:     fence.Holder,
+				FenceGeneration: fence.Generation,
+				Reason:          "PromotionPlanned",
+			},
+			haPlannedAction{
+				Kind:            haActionDemoteFormerPrimary,
+				TargetLSN:       status.PrimaryLSN,
+				FenceAuthority:  fence.Authority,
+				FenceHolder:     fence.Holder,
+				FenceGeneration: fence.Generation,
+				Reason:          "PromotionPlanned",
+			},
 		)
 	}
 
@@ -231,11 +263,14 @@ func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActi
 	out := make([]antflyv1.HAPlannedActionStatus, 0, len(actions))
 	for _, action := range actions {
 		out = append(out, antflyv1.HAPlannedActionStatus{
-			Kind:        string(action.Kind),
-			StandbyName: action.StandbyName,
-			SlotName:    action.SlotName,
-			TargetLSN:   action.TargetLSN,
-			Reason:      action.Reason,
+			Kind:            string(action.Kind),
+			StandbyName:     action.StandbyName,
+			SlotName:        action.SlotName,
+			TargetLSN:       action.TargetLSN,
+			FenceAuthority:  action.FenceAuthority,
+			FenceHolder:     action.FenceHolder,
+			FenceGeneration: action.FenceGeneration,
+			Reason:          action.Reason,
 		})
 	}
 	return out

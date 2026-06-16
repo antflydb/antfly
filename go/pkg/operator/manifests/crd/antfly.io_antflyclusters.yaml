@@ -6533,6 +6533,15 @@ spec:
                       description: HAPlannedActionStatus reports one planned HA operator
                         action.
                       properties:
+                        fenceAuthority:
+                          description: HAFencingAuthority selects the authority used
+                            before automatic promotion.
+                          type: string
+                        fenceGeneration:
+                          format: int64
+                          type: integer
+                        fenceHolder:
+                          type: string
                         kind:
                           type: string
                         reason:
