@@ -338,9 +338,9 @@ test "ha cmd keeps promotion identity flags in admin command" {
     try std.testing.expectEqualStrings("--cluster-id", parsed.command_args[1]);
 }
 
-test "ha cmd runs local slot command against durable primary state" {
+test "ha cmd streams local primary WAL into durable standby state" {
     const alloc = std.testing.allocator;
-    const paths = try testPaths(alloc, "slot-command");
+    const paths = try testPaths(alloc, "stream-command");
     defer paths.deinit(alloc);
 
     try runArgv(alloc, std.testing.io, &.{
@@ -357,14 +357,53 @@ test "ha cmd runs local slot command against durable primary state" {
         "0",
     });
 
-    var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
-    defer primary.close();
-    const slot = primary.slot("standby-cli") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 1), slot.timeline_id);
-    try std.testing.expectEqual(@as(u64, 0), slot.restart_lsn);
-    try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
-    try std.testing.expect(slot.active);
+    try runArgv(alloc, std.testing.io, &.{
+        "--primary-log",    paths.primary_log,
+        "--primary-slots",  paths.primary_slots,
+        "--ha-cluster-id",  "10",
+        "--ha-shard-id",    "20",
+        "--ha-table-id",    "30",
+        "--ha-timeline-id", "1",
+        "--ha-epoch",       "2",
+        "--",               "--table",
+        "commit",           "append",
+        "--payload",        "one",
+        "--sync-mode",      "async",
+    });
+
+    try runArgv(alloc, std.testing.io, &.{
+        "--primary-log",      paths.primary_log,
+        "--primary-slots",    paths.primary_slots,
+        "--standby-log",      paths.standby_log,
+        "--standby-progress", paths.standby_progress,
+        "--ha-cluster-id",    "10",
+        "--ha-shard-id",      "20",
+        "--ha-table-id",      "30",
+        "--ha-timeline-id",   "1",
+        "--ha-epoch",         "2",
+        "--",                 "--table",
+        "stream",             "once",
+        "--slot",             "standby-cli",
+    });
+
+    {
+        var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+        defer primary.close();
+        const slot = primary.slot("standby-cli") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 1), slot.timeline_id);
+        try std.testing.expectEqual(@as(u64, 0), slot.restart_lsn);
+        try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+        try std.testing.expect(slot.active);
+    }
+
+    {
+        var standby = try ha.standby.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, testIdentity(), .{});
+        defer standby.close();
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().safe_read_lsn);
+    }
 }
 
 test "ha cmd compiles" {
@@ -376,10 +415,14 @@ test "ha cmd compiles" {
 const TestPaths = struct {
     primary_log: [:0]u8,
     primary_slots: [:0]u8,
+    standby_log: [:0]u8,
+    standby_progress: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
+        alloc.free(self.standby_log);
+        alloc.free(self.standby_progress);
     }
 };
 
@@ -389,15 +432,23 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(primary_log);
     const primary_slots = try allocPrintPath(alloc, name, "primary-slots", nonce);
     defer alloc.free(primary_slots);
+    const standby_log = try allocPrintPath(alloc, name, "standby-log", nonce);
+    defer alloc.free(standby_log);
+    const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
+    defer alloc.free(standby_progress);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
         .primary_slots = try alloc.dupeZ(u8, primary_slots),
+        .standby_log = try alloc.dupeZ(u8, standby_log),
+        .standby_progress = try alloc.dupeZ(u8, standby_progress),
     };
 }
 
