@@ -68,6 +68,33 @@ pub const HAStandbyBootstrapResponse = struct {
     checkpoint_lsn: i64,
 };
 
+pub const HAPromotionAssessment = struct {
+    required_lsn: i64,
+    received_lsn: i64,
+    applied_lsn: i64,
+    has_required_lsn: bool,
+    caught_up_to_received: bool,
+    fencing_confirmed: bool,
+    force: bool,
+    data_loss_possible: bool,
+    safe: bool,
+    requires_fencing: bool,
+    requires_force: bool,
+    can_promote: bool,
+};
+
+pub const HARejoinAssessment = struct {
+    action: []const u8,
+    reason: []const u8,
+    former_node_id: []const u8,
+    target_timeline_id: i64,
+    target_epoch: i64,
+    fork_lsn: i64,
+    former_last_lsn: i64,
+    retained_from_lsn: i64,
+    data_loss_discarded: bool,
+};
+
 pub const HASlotSnapshot = struct {
     name: []const u8,
     timeline_id: i64,
@@ -150,6 +177,14 @@ pub const HAFenceReceipt = struct {
     reason: []const u8,
 };
 
+pub const HAPromotionResult = struct {
+    switch_lsn: i64,
+    old_identity: HAIdentity,
+    new_identity: HAIdentity,
+    forced: bool,
+    data_loss_possible: bool,
+};
+
 pub const HAStandbySnapshot = struct {
     role: []const u8,
     identity: HAIdentity,
@@ -163,6 +198,16 @@ pub const HAStandbySnapshot = struct {
     unapplied_lsn_count: i64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
+};
+
+pub const HAPromotionAssessResponse = struct {
+    schema_version: i64,
+    assessment: HAPromotionAssessment,
+};
+
+pub const HARejoinAssessResponse = struct {
+    schema_version: i64,
+    assessment: HARejoinAssessment,
 };
 
 pub const HAPrimarySnapshot = struct {
@@ -191,6 +236,26 @@ pub const RejoinAssessRequest = struct {
     allow_rewind_after_forced_promotion: ?bool = null,
     /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     receipt: ?HAFenceReceipt = null,
+};
+
+pub const HAFenceResponse = struct {
+    schema_version: i64,
+    receipt: HAFenceReceipt,
+};
+
+pub const HACurrentFenceResponse = struct {
+    schema_version: i64,
+    held: bool,
+    receipt: ?HAFenceReceipt = null,
+};
+
+pub const HAPromotionResponse = struct {
+    schema_version: i64,
+    assessment: HAPromotionAssessment,
+    promotion: HAPromotionResult,
+    fence_generation: i64,
+    fence_token: []const u8,
+    forced: bool,
 };
 
 pub const HAStandbyStatusResponse = struct {

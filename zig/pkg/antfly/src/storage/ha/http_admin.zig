@@ -318,24 +318,34 @@ pub const Server = struct {
     }
 
     fn handleAdminFenceCurrent(self: *Server) !http_common.HttpResponse {
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .fence_current,
+        const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
+        var current = ha_admin.currentPromotionFence(self.alloc, fence_store) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        defer if (current) |*result| result.deinit(self.alloc);
+
+        if (current) |result| {
+            return try self.handleTypedJson(CurrentFenceDocument{
+                .held = true,
+                .receipt = result.receipt,
+            });
+        }
+        return try self.handleTypedJson(CurrentFenceDocument{
+            .held = false,
+            .receipt = null,
+        });
     }
 
     fn handleAdminAcquireFence(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         const fence = self.parseFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA fence request");
         };
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .fence_acquire = fence },
+        var result = ha_admin.acquirePromotionFence(self.alloc, fence_store, fence) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        defer result.deinit(self.alloc);
+        return try self.handleTypedJson(FenceDocument{ .receipt = result.receipt });
     }
 
     fn handleAdminAssessPromotion(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -362,28 +372,39 @@ pub const Server = struct {
             .command = .{ .promote_assess = command },
         };
         defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        var result = admin_exec.execute(self.alloc, self.ctx, plan) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+        return switch (result) {
+            .promote_assess => |assessment| try self.handleTypedJson(PromotionAssessDocument{
+                .assessment = assessment,
+            }),
+            else => unreachable,
+        };
     }
 
     fn handleAdminPromoteCurrentFence(self: *Server) !http_common.HttpResponse {
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .promote_current_fence,
+        const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
+        const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
+        var result = ha_admin.promoteWithCurrentFence(self.alloc, fence_store, standby) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        defer result.deinit(self.alloc);
+        return try self.handleTypedJson(promotionDocument(result));
     }
 
     fn handleAdminPromote(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
+        const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
         const fence = self.parseFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA promotion request");
         };
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .promote = .{ .fence = fence } },
+        var result = ha_admin.promoteWithFence(self.alloc, fence_store, standby, .{ .fence = fence }) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        defer result.deinit(self.alloc);
+        return try self.handleTypedJson(promotionDocument(result));
     }
 
     fn handleAdminAssessRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -410,23 +431,16 @@ pub const Server = struct {
         else
             null;
 
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .rejoin_assess = .{
-                .former = rejoin.FormerPrimaryState{
-                    .node_id = parsed.value.node_id,
-                    .identity = identity,
-                    .last_lsn = last_lsn,
-                },
-                .receipt = receipt,
-                .policy = rejoin.RejoinPolicy{
-                    .retained_from_lsn = retained_from_lsn,
-                    .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion orelse false,
-                },
-            } },
-        };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        return try self.handleTypedJson(RejoinAssessDocument{
+            .assessment = ha_admin.assessFormerPrimaryRejoin(.{
+                .node_id = parsed.value.node_id,
+                .identity = identity,
+                .last_lsn = last_lsn,
+            }, receipt, .{
+                .retained_from_lsn = retained_from_lsn,
+                .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion orelse false,
+            }),
+        });
     }
 
     fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
@@ -521,6 +535,46 @@ const StandbyBootstrapDocument = struct {
     backup_lsn: u64,
     checkpoint_lsn: u64,
 };
+
+const FenceDocument = struct {
+    schema_version: u32 = 1,
+    receipt: fencing.Receipt,
+};
+
+const CurrentFenceDocument = struct {
+    schema_version: u32 = 1,
+    held: bool,
+    receipt: ?fencing.Receipt,
+};
+
+const PromotionAssessDocument = struct {
+    schema_version: u32 = 1,
+    assessment: status_mod.PromotionAssessment,
+};
+
+const PromotionDocument = struct {
+    schema_version: u32 = 1,
+    assessment: status_mod.PromotionAssessment,
+    promotion: standby_mod.PromotionResult,
+    fence_generation: u64,
+    fence_token: []const u8,
+    forced: bool,
+};
+
+const RejoinAssessDocument = struct {
+    schema_version: u32 = 1,
+    assessment: rejoin.Assessment,
+};
+
+fn promotionDocument(result: ha_admin.FencedPromotionResult) PromotionDocument {
+    return .{
+        .assessment = result.assessment,
+        .promotion = result.promotion,
+        .fence_generation = result.fence_generation,
+        .fence_token = result.fence_token,
+        .forced = result.forced,
+    };
+}
 
 const SlotDocument = struct {
     slot_name: []const u8,
@@ -1146,7 +1200,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
     try std.testing.expectEqualStrings("application/json", typed_fence.content_type.?);
-    try expectContains(typed_fence.body, "\"fence_acquire\"");
+    try expectContains(typed_fence.body, "\"schema_version\":1");
+    try expectContains(typed_fence.body, "\"receipt\"");
     try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 
     var typed_current_fence = try server.handle(.{
@@ -1156,7 +1211,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_current_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_current_fence.status);
     try std.testing.expectEqualStrings("application/json", typed_current_fence.content_type.?);
-    try expectContains(typed_current_fence.body, "\"fence_current\"");
+    try expectContains(typed_current_fence.body, "\"held\":true");
+    try expectContains(typed_current_fence.body, "\"receipt\"");
     try expectContains(typed_current_fence.body, "\"old_primary_id\":\"primary-a\"");
 
     var typed_rejoin_unfenced = try server.handle(.{
@@ -1168,7 +1224,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_rejoin_unfenced.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_unfenced.status);
     try std.testing.expectEqualStrings("application/json", typed_rejoin_unfenced.content_type.?);
-    try expectContains(typed_rejoin_unfenced.body, "\"rejoin_assess\"");
+    try expectContains(typed_rejoin_unfenced.body, "\"schema_version\":1");
+    try expectContains(typed_rejoin_unfenced.body, "\"assessment\"");
     try expectContains(typed_rejoin_unfenced.body, "\"action\":\"reject_unfenced\"");
     try expectContains(typed_rejoin_unfenced.body, "\"reason\":\"no_fence\"");
 
@@ -1181,7 +1238,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_rejoin_fenced.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_fenced.status);
     try std.testing.expectEqualStrings("application/json", typed_rejoin_fenced.content_type.?);
-    try expectContains(typed_rejoin_fenced.body, "\"rejoin_assess\"");
+    try expectContains(typed_rejoin_fenced.body, "\"assessment\"");
     try expectContains(typed_rejoin_fenced.body, "\"action\":\"rewind\"");
     try expectContains(typed_rejoin_fenced.body, "\"target_timeline_id\":2");
 
@@ -1194,7 +1251,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_promote_assess.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote_assess.status);
     try std.testing.expectEqualStrings("application/json", typed_promote_assess.content_type.?);
-    try expectContains(typed_promote_assess.body, "\"promote_assess\"");
+    try expectContains(typed_promote_assess.body, "\"schema_version\":1");
+    try expectContains(typed_promote_assess.body, "\"assessment\"");
     try expectContains(typed_promote_assess.body, "\"can_promote\":true");
 
     var typed_promote = try server.handle(.{
@@ -1205,7 +1263,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
     try std.testing.expectEqualStrings("application/json", typed_promote.content_type.?);
-    try expectContains(typed_promote.body, "\"promote_current_fence\"");
+    try expectContains(typed_promote.body, "\"promotion\"");
+    try expectContains(typed_promote.body, "\"fence_generation\":1");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
 }
 

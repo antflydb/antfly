@@ -274,7 +274,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAFenceResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -290,7 +290,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HACurrentFenceResponse"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/promotion/assess:
@@ -310,7 +310,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAPromotionAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -326,7 +326,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAPromotionResponse"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/promotion:
@@ -346,7 +346,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAPromotionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -368,7 +368,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HARejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
 components:
@@ -732,6 +732,194 @@ components:
           format: uint64
           minimum: 1
           description: Standby checkpoint LSN after manifest validation.
+    HAFenceResponse:
+      type: object
+      required: [schema_version, receipt]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        receipt:
+          $ref: "#/components/schemas/HAFenceReceipt"
+    HACurrentFenceResponse:
+      type: object
+      required: [schema_version, held]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        held:
+          type: boolean
+        receipt:
+          nullable: true
+          $ref: "#/components/schemas/HAFenceReceipt"
+    HAPromotionAssessResponse:
+      type: object
+      required: [schema_version, assessment]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        assessment:
+          $ref: "#/components/schemas/HAPromotionAssessment"
+    HAPromotionResponse:
+      type: object
+      required: [schema_version, assessment, promotion, fence_generation, fence_token, forced]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        assessment:
+          $ref: "#/components/schemas/HAPromotionAssessment"
+        promotion:
+          $ref: "#/components/schemas/HAPromotionResult"
+        fence_generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        fence_token:
+          type: string
+          minLength: 1
+        forced:
+          type: boolean
+    HARejoinAssessResponse:
+      type: object
+      required: [schema_version, assessment]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        assessment:
+          $ref: "#/components/schemas/HARejoinAssessment"
+    HAPromotionAssessment:
+      type: object
+      required:
+        - required_lsn
+        - received_lsn
+        - applied_lsn
+        - has_required_lsn
+        - caught_up_to_received
+        - fencing_confirmed
+        - force
+        - data_loss_possible
+        - safe
+        - requires_fencing
+        - requires_force
+        - can_promote
+      additionalProperties: false
+      properties:
+        required_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        has_required_lsn:
+          type: boolean
+        caught_up_to_received:
+          type: boolean
+        fencing_confirmed:
+          type: boolean
+        force:
+          type: boolean
+        data_loss_possible:
+          type: boolean
+        safe:
+          type: boolean
+        requires_fencing:
+          type: boolean
+        requires_force:
+          type: boolean
+        can_promote:
+          type: boolean
+    HAPromotionResult:
+      type: object
+      required: [switch_lsn, old_identity, new_identity, forced, data_loss_possible]
+      additionalProperties: false
+      properties:
+        switch_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        old_identity:
+          $ref: "#/components/schemas/HAIdentity"
+        new_identity:
+          $ref: "#/components/schemas/HAIdentity"
+        forced:
+          type: boolean
+        data_loss_possible:
+          type: boolean
+    HARejoinAssessment:
+      type: object
+      required:
+        - action
+        - reason
+        - former_node_id
+        - target_timeline_id
+        - target_epoch
+        - fork_lsn
+        - former_last_lsn
+        - retained_from_lsn
+        - data_loss_discarded
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [reject_unfenced, already_current, rewind, reseed]
+        reason:
+          type: string
+          enum:
+            - no_fence
+            - current_timeline
+            - parent_timeline_retained
+            - parent_timeline_wal_expired
+            - incompatible_timeline
+            - wrong_old_primary
+            - wrong_cluster
+            - wrong_shard
+            - wrong_table
+            - local_lsn_before_fork
+        former_node_id:
+          type: string
+          minLength: 1
+        target_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        target_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        fork_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        former_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_from_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        data_loss_discarded:
+          type: boolean
     HAPrimarySnapshot:
       type: object
       required: [role, identity, current_lsn, slots, retention]
