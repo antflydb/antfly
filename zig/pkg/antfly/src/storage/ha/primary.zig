@@ -255,6 +255,8 @@ pub const Primary = struct {
         applied_lsn: u64,
     ) !void {
         if (timeline_id != self.identity.timeline_id) return error.WrongTimeline;
+        const state = self.slots.get(slot_name) orelse return error.SlotNotFound;
+        if (state.timeline_id != timeline_id) return error.WrongTimeline;
         if (received_lsn > self.lastLsn()) return error.StandbyAheadOfPrimary;
         try self.slots.updateProgress(slot_name, received_lsn, applied_lsn);
     }
@@ -769,6 +771,35 @@ test "storage.ha primary scopes retention to the current timeline" {
     const old = primary.slot("old-timeline") orelse return error.TestExpectedEqual;
     try std.testing.expect(old.reseed_required);
     try std.testing.expectError(error.SlotRequiresReseed, primary.streamFrom(alloc, "old-timeline", 1));
+}
+
+test "storage.ha primary rejects status updates for old timeline slots" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "timeline-ack");
+    defer paths.deinit(alloc);
+    var identity = testIdentity();
+    identity.timeline_id = 2;
+    identity.epoch = 2;
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+    try primary.slots.createOrUpdate(.{
+        .name = "old-timeline",
+        .timeline_id = 1,
+        .restart_lsn = 1,
+        .received_lsn = 1,
+        .applied_lsn = 1,
+        .reseed_required = true,
+    });
+
+    try std.testing.expectError(
+        error.WrongTimeline,
+        primary.standbyStatusUpdate("old-timeline", identity.timeline_id, 1, 1),
+    );
+    const old = primary.slot("old-timeline") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), old.timeline_id);
+    try std.testing.expect(old.reseed_required);
 }
 
 test "storage.ha primary pauses and resumes slot streaming across reopen" {
