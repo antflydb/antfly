@@ -62241,6 +62241,20 @@ fn appParityFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) bo
     };
 }
 
+fn appParityFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) bool {
+    return switch (family) {
+        .read,
+        .join,
+        .lateral,
+        .insert_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => true,
+        else => false,
+    };
+}
+
 fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
     if (entry.family != .ddl) return false;
     return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -62377,6 +62391,9 @@ fn validateAppParityFixtureMetadata(
     if (entry.applied_plan.len > 0 and !appParityAppliedPlanIsStructured(entry.applied_plan)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.source_schema_json.len > 0 and !appParityFixtureFamilyAllowsSourceSchema(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
     if (try appParityDdlFixtureRequiresAppliedPlan(entry)) {
         if (entry.applied_plan.len == 0) return error.TestUnexpectedResult;
     }
@@ -62468,6 +62485,15 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
         .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "ignored source schema",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .source_schema_json = "{}",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
