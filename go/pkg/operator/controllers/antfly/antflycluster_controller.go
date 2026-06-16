@@ -3088,15 +3088,18 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
-		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
-			return err
-		}
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 			return err
 		}
 		haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
 		if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 			haAdminStatusErr = standbyErr
+		}
+		if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
+			return err
+		}
+		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+			return err
 		}
 		r.updateHAStatusAndConditions(cluster)
 		if haAdminStatusErr != nil {
@@ -3180,15 +3183,18 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
 	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
-	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
-		return err
-	}
 	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 		return err
 	}
 	haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
 	if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 		haAdminStatusErr = standbyErr
+	}
+	if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
+		return err
+	}
+	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+		return err
 	}
 	r.updateHAStatusAndConditions(cluster)
 	if haAdminStatusErr != nil {

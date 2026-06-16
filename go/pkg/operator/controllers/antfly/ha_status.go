@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 type haActionKind string
@@ -32,6 +33,8 @@ const (
 	haActionRewindFormerPrimary  haActionKind = "RewindFormerPrimary"
 	haActionReseedFormerPrimary  haActionKind = "ReseedFormerPrimary"
 )
+
+const haFencingLeaseDefaultDurationSeconds int32 = 30
 
 type haPlannedAction struct {
 	Kind             haActionKind
@@ -111,6 +114,96 @@ func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.
 	setHAConditions(cluster, plan)
 }
 
+func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
+		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
+		return nil
+	}
+	if cluster.Status.HAStatus == nil {
+		return nil
+	}
+	holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus)
+	if holder == "" {
+		return nil
+	}
+
+	now := metav1.NowMicro()
+	lease := &coordinationv1.Lease{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      haFencingLeaseName(cluster),
+		Namespace: cluster.Namespace,
+	}, lease)
+	if apierrors.IsNotFound(err) {
+		transitions := int32(1)
+		durationSeconds := haFencingLeaseDefaultDurationSeconds
+		lease = &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      haFencingLeaseName(cluster),
+				Namespace: cluster.Namespace,
+				Labels:    haFencingLeaseLabels(cluster),
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       &holder,
+				LeaseDurationSeconds: &durationSeconds,
+				AcquireTime:          &now,
+				RenewTime:            &now,
+				LeaseTransitions:     &transitions,
+			},
+		}
+		if r.Scheme != nil {
+			if err := controllerutil.SetControllerReference(cluster, lease, r.Scheme); err != nil {
+				return err
+			}
+		}
+		return r.Create(ctx, lease)
+	}
+	if err != nil {
+		return err
+	}
+
+	currentHolder := ""
+	if lease.Spec.HolderIdentity != nil {
+		currentHolder = *lease.Spec.HolderIdentity
+	}
+	transitions := int32(0)
+	if lease.Spec.LeaseTransitions != nil {
+		transitions = *lease.Spec.LeaseTransitions
+	}
+	holderChanged := currentHolder != holder
+	if holderChanged {
+		transitions++
+		lease.Spec.LeaseTransitions = &transitions
+		lease.Spec.AcquireTime = &now
+	} else if transitions == 0 {
+		transitions = 1
+		lease.Spec.LeaseTransitions = &transitions
+		if lease.Spec.AcquireTime == nil {
+			lease.Spec.AcquireTime = &now
+		}
+	}
+	durationSeconds := haFencingLeaseDefaultDurationSeconds
+	if lease.Spec.LeaseDurationSeconds != nil && *lease.Spec.LeaseDurationSeconds > 0 {
+		durationSeconds = *lease.Spec.LeaseDurationSeconds
+	}
+	lease.Spec.HolderIdentity = &holder
+	lease.Spec.LeaseDurationSeconds = &durationSeconds
+	lease.Spec.RenewTime = &now
+	if lease.Labels == nil {
+		lease.Labels = map[string]string{}
+	}
+	for key, value := range haFencingLeaseLabels(cluster) {
+		lease.Labels[key] = value
+	}
+	if r.Scheme != nil {
+		if err := controllerutil.SetControllerReference(cluster, lease, r.Scheme); err != nil {
+			return err
+		}
+	}
+	return r.Update(ctx, lease)
+}
+
 func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	ha := cluster.Spec.HighAvailability
 	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
@@ -158,6 +251,15 @@ func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cl
 
 func haFencingLeaseName(cluster *antflyv1.AntflyCluster) string {
 	return cluster.Name + "-ha-fence"
+}
+
+func haFencingLeaseLabels(cluster *antflyv1.AntflyCluster) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":       "antfly",
+		"app.kubernetes.io/instance":   cluster.Name,
+		"app.kubernetes.io/managed-by": "antfly-operator",
+		"antfly.io/ha-fence":           "kubernetes-lease",
+	}
 }
 
 func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.Time) (bool, string) {
@@ -891,6 +993,42 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 			continue
 		}
 		return fenceHolder
+	}
+	return ""
+}
+
+func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	if ha == nil || ha.AutomaticFailover == nil || status == nil {
+		return ""
+	}
+	sync := haEvaluateSyncPolicy(ha, status)
+	if sync.Degraded {
+		return ""
+	}
+	standbys := haStandbyStatusByName(status)
+	maxLag := ha.AutomaticFailover.MaximumLagLSN
+	requireApply := ha.AutomaticFailover.RequireRemoteApply == nil || *ha.AutomaticFailover.RequireRemoteApply
+	for _, desired := range ha.Standbys {
+		if !standbyDesired(desired) || desired.Name == "" {
+			continue
+		}
+		standby, ok := standbys[desired.Name]
+		if !ok {
+			standby, ok = standbys[standbySlotName(desired)]
+		}
+		if !ok || !standby.Active || standby.ReseedRequired {
+			continue
+		}
+		if standby.ReceivedLSN+maxLag < status.PrimaryLSN {
+			continue
+		}
+		if requireApply && standby.AppliedLSN+maxLag < status.PrimaryLSN {
+			continue
+		}
+		if standbySafeReadLSN(standby)+maxLag < status.PrimaryLSN {
+			continue
+		}
+		return desired.Name
 	}
 	return ""
 }

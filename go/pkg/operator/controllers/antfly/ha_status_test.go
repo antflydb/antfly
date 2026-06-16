@@ -8,6 +8,7 @@ import (
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -864,6 +865,128 @@ func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
 		fencing.Ready ||
 		fencing.Reason != "LeaseMissing" {
 		t.Fatalf("expected missing lease fencing status, got %#v", fencing)
+	}
+}
+
+func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:         antflyv1.HADurabilityModeRemoteApply,
+		Required:     1,
+		StandbyNames: []string{"standby-a"},
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease); err != nil {
+		t.Fatalf("get fencing lease: %v", err)
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != "standby-a" {
+		t.Fatalf("expected standby-a lease holder, got %#v", lease.Spec.HolderIdentity)
+	}
+	if lease.Spec.LeaseDurationSeconds == nil || *lease.Spec.LeaseDurationSeconds != haFencingLeaseDefaultDurationSeconds {
+		t.Fatalf("expected default lease duration, got %#v", lease.Spec.LeaseDurationSeconds)
+	}
+	if lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions != 1 {
+		t.Fatalf("expected first lease transition, got %#v", lease.Spec.LeaseTransitions)
+	}
+	if lease.Spec.AcquireTime == nil || lease.Spec.RenewTime == nil {
+		t.Fatalf("expected acquire and renew timestamps, got %#v", lease.Spec)
+	}
+	if lease.Labels["antfly.io/ha-fence"] != "kubernetes-lease" {
+		t.Fatalf("expected HA fence label, got %#v", lease.Labels)
+	}
+	if len(lease.OwnerReferences) != 1 || lease.OwnerReferences[0].Name != cluster.Name {
+		t.Fatalf("expected cluster owner reference, got %#v", lease.OwnerReferences)
+	}
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected reconciled Kubernetes lease to satisfy automatic promotion fencing gate")
+	}
+}
+
+func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{Name: "standby-b"})
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 12,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:        "standby-a",
+			SlotName:    "standby-a",
+			Active:      true,
+			ReceivedLSN: 10,
+			AppliedLSN:  10,
+			SafeReadLSN: 10,
+			Status:      "lagging",
+		}, {
+			Name:        "standby-b",
+			SlotName:    "standby-b",
+			Active:      true,
+			ReceivedLSN: 12,
+			AppliedLSN:  12,
+			SafeReadLSN: 12,
+			Status:      "healthy",
+		}},
+	}
+	durationSeconds := int32(15)
+	lease := haFenceLease(cluster, time.Now().Add(-time.Second), durationSeconds, 2, "standby-a")
+	reconciler := testHAReconciler(t, cluster, lease)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, observed); err != nil {
+		t.Fatalf("get fencing lease: %v", err)
+	}
+	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-b" {
+		t.Fatalf("expected standby-b lease holder, got %#v", observed.Spec.HolderIdentity)
+	}
+	if observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 3 {
+		t.Fatalf("expected holder transition to increment, got %#v", observed.Spec.LeaseTransitions)
+	}
+	if observed.Spec.LeaseDurationSeconds == nil || *observed.Spec.LeaseDurationSeconds != durationSeconds {
+		t.Fatalf("expected existing lease duration to be preserved, got %#v", observed.Spec.LeaseDurationSeconds)
+	}
+	if observed.Spec.AcquireTime == nil || observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.After(lease.Spec.RenewTime.Time) {
+		t.Fatalf("expected timestamps to advance on holder change, got old=%#v new=%#v", lease.Spec.RenewTime, observed.Spec)
+	}
+}
+
+func TestReconcileHAFencingLeaseSkipsWithoutSafeCandidate(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 12,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:        "standby-a",
+			SlotName:    "standby-a",
+			Active:      true,
+			ReceivedLSN: 11,
+			AppliedLSN:  11,
+			SafeReadLSN: 11,
+			Status:      "lagging",
+		}},
+	}
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no fencing lease without safe candidate, got lease=%#v err=%v", lease, err)
 	}
 }
 
