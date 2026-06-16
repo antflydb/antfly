@@ -5251,6 +5251,15 @@ the claimed total. DDL keeps its own predicate accounting because DDL
 `predicates` refers to catalog checks, index predicates, or operation-family
 state rather than row-stream filter atoms.
 
+DDL projection and predicate summaries are also typed-fingerprint evidence where
+the catalog tag has a stable count home. `select` on `CREATE TABLE`, relation
+lifetime, partitioned-table creation, views, materialized views, enum types,
+aggregates, identity allocators, and index creation must match the relevant
+`columns`, `fields`, `values`, `args`, or index column/expression/generation
+tokens. DDL `predicates` must match `where` for index predicates or `checks` for
+domains. Other DDL operation-family counts remain tied to the DDL lowerer and
+applied-plan verifier until they have tag-local fingerprint assertions.
+
 Declared-access and expression-predicate summaries follow the same typed-stage
 ownership rule. `array_any`, `in_predicates`, `json_path_eq`, `json_contains`,
 `json_path_exists`, `array_contains`, `array_eq`, `text_patterns`,

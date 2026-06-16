@@ -62386,6 +62386,46 @@ fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
     return true;
 }
 
+fn appParityPlanBoolTokenValue(plan: []const u8, token: []const u8) ?bool {
+    if (appParityPlanHasExactBoolToken(plan, token, true)) return true;
+    if (appParityPlanHasExactBoolToken(plan, token, false)) return false;
+    return null;
+}
+
+fn appParityPlanBoolTokenUsize(plan: []const u8, token: []const u8) usize {
+    return if (appParityPlanBoolTokenValue(plan, token) orelse false) 1 else 0;
+}
+
+fn appParityFixtureDdlSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    const expected = entry.summary.select orelse return true;
+    if (entry.family != .ddl) return true;
+    return switch (entry.summary.ddl_tag orelse return false) {
+        .create_table,
+        .relation_lifetime,
+        .create_partitioned_table,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":columns=", expected),
+        .identity_allocator => (appParityPlanUsizeTokenValue(entry.plan, ":columns=") orelse return false) +
+            appParityPlanBoolTokenUsize(entry.plan, ":primary=") == expected,
+        .create_index => appParityPlanUsizeOptionalTokenSumMatches(entry.plan, &.{ ":columns=", ":expr=", ":generated_expr=" }, expected),
+        .create_view,
+        .create_materialized_view,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":fields=", expected),
+        .create_enum_type => appParityPlanHasExactUsizeToken(entry.plan, ":values=", expected),
+        .create_aggregate => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
+        else => false,
+    };
+}
+
+fn appParityFixtureDdlPredicateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    const expected = entry.summary.predicates orelse return true;
+    if (entry.family != .ddl) return true;
+    return switch (entry.summary.ddl_tag orelse return false) {
+        .create_index => appParityPlanHasExactUsizeToken(entry.plan, ":where=", expected),
+        .create_domain => appParityPlanHasExactUsizeToken(entry.plan, ":checks=", expected),
+        else => false,
+    };
+}
+
 fn appParityFixtureAllowsPredicateSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .ddl,
@@ -63154,6 +63194,12 @@ fn validateAppParityFixtureMetadata(
     if (!appParityFixtureAggregateSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
+    if (!appParityFixtureDdlSelectSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
+    if (!appParityFixtureDdlPredicateSummaryMatchesPlan(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.predicates != null and !appParityFixtureAllowsPredicateSummary(entry)) {
         return error.TestUnexpectedResult;
     }
@@ -63369,6 +63415,40 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records" },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale ddl select summary",
+        .sql = "CREATE UNIQUE INDEX usage_records_expr_idx ON usage_records (status, lower(id))",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false",
+        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid ddl select summary",
+        .sql = "CREATE UNIQUE INDEX usage_records_expr_idx ON usage_records (status, lower(id))",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=true:if_not_exists=false",
+        .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale ddl predicate summary",
+        .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_domain, .table_name = "positive_amount", .predicates = 1 },
+        .plan = "ddl:create_domain:domain=positive_amount:type=numeric:checks=0:not_null=false:default=false",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid ddl predicate summary",
+        .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_domain, .table_name = "positive_amount", .predicates = 1 },
+        .plan = "ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "ignored operations summary",
