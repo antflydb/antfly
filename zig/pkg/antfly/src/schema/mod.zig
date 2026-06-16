@@ -514,6 +514,7 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
             .name = try alloc.dupe(u8, constraint.name),
             .columns = try cloneStringSlice(alloc, constraint.columns),
             .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
+            .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
             .without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
             .where = try cloneUniquePredicates(alloc, constraint.where),
             .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, constraint.where_expressions),
@@ -536,6 +537,8 @@ fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage
         if (constraint.columns.len > 0) alloc.free(constraint.columns);
         for (constraint.expressions) |expression| alloc.free(expression.field);
         if (constraint.expressions.len > 0) alloc.free(constraint.expressions);
+        for (constraint.include_columns) |column| alloc.free(column);
+        if (constraint.include_columns.len > 0) alloc.free(constraint.include_columns);
         if (constraint.without_overlaps_period) |period| alloc.free(period);
         for (constraint.where) |predicate| {
             alloc.free(predicate.field);

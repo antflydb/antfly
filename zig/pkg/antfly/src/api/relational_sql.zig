@@ -4806,11 +4806,12 @@ fn applyCreateIndexPlanAlloc(
     }
 
     if (plan.unique) {
-        if (plan.include_columns.len != 0) return error.UnsupportedSqlShape;
+        try validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
         const constraint: runtime_schema.UniqueConstraint = .{
             .name = plan.index_name,
             .columns = plan.columns,
             .expressions = plan.expressions,
+            .include_columns = plan.include_columns,
             .without_overlaps_period = plan.without_overlaps_period,
             .where = plan.where,
             .where_expressions = plan.where_expressions,
@@ -8569,7 +8570,7 @@ const Parser = struct {
         var include_columns_owned = false;
         errdefer if (include_columns_owned) freeStringSlice(self.alloc, include_columns);
         if (self.matchKeyword("include")) {
-            if (unique or method == .gin or generated_expression != null) return error.UnsupportedSqlShape;
+            if (method == .gin or generated_expression != null) return error.UnsupportedSqlShape;
             include_columns = try self.parseDdlColumnListAlloc();
             include_columns_owned = true;
             try validateSqlIdentifierListsDisjoint(columns.items, include_columns);
@@ -38815,11 +38816,12 @@ fn applyCreateIndexPlanToSchemaJsonValue(
         } else return error.InvalidSqlCatalog;
     }
     if (plan.unique) {
-        if (plan.include_columns.len != 0) return error.UnsupportedSqlShape;
+        try validateCreateIndexIncludeColumnsForSchemaJsonProperties(schema_parts.properties, plan.columns, plan.include_columns);
         const constraint: runtime_schema.UniqueConstraint = .{
             .name = plan.index_name,
             .columns = plan.columns,
             .expressions = plan.expressions,
+            .include_columns = plan.include_columns,
             .without_overlaps_period = plan.without_overlaps_period,
             .where = plan.where,
             .where_expressions = plan.where_expressions,
@@ -39557,6 +39559,7 @@ fn renameConstraintArrayFields(
             .unique => {
                 try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name);
                 if (item.object.getPtr("expressions")) |expressions| try renameUniqueExpressionJsonFields(alloc, expressions, old_name, new_name);
+                try renameStringInJsonArray(alloc, item.object.getPtr("include_columns"), old_name, new_name);
                 if (item.object.getPtr("where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
                 if (item.object.getPtr("where_expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
             },
@@ -39929,6 +39932,9 @@ fn jsonUniqueConstraintReferencesAny(value: std.json.Value, fields: []const []co
             }
         }
     }
+    if (value.object.get("include_columns")) |include_columns| {
+        if (jsonStringArrayReferencesAny(include_columns, fields)) return true;
+    }
     if (value.object.get("where")) |where| {
         if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
     }
@@ -40052,6 +40058,7 @@ fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: runtime
     try putJsonString(alloc, &object, "name", constraint.name);
     if (constraint.columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, constraint.columns));
     if (constraint.expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "expressions"), try schemaJsonUniqueExpressionsAlloc(alloc, constraint.expressions));
+    if (constraint.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, constraint.include_columns));
     if (constraint.without_overlaps_period) |period| try putJsonString(alloc, &object, "without_overlaps_period", period);
     if (constraint.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, constraint.where));
     if (constraint.where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "where_expressions"), try schemaJsonExpressionConditionsAlloc(alloc, constraint.where_expressions));
@@ -40479,6 +40486,7 @@ fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema
     errdefer freeDdlUniqueConstraint(alloc, out);
     out.columns = try cloneStringSlice(alloc, constraint.columns);
     out.expressions = try cloneDdlUniqueExpressions(alloc, constraint.expressions);
+    out.include_columns = try cloneStringSlice(alloc, constraint.include_columns);
     out.without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
     out.where = try cloneDdlUniquePredicates(alloc, constraint.where);
     out.where_expressions = try cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
@@ -40663,6 +40671,7 @@ fn renameRelationalColumnAlloc(
         for (@constCast(constraint.expressions)) |*expression| {
             try replaceOwnedStringIfEqualAlloc(alloc, &expression.field, operation.old_name, operation.new_name);
         }
+        try renameStringSliceValuesAlloc(alloc, constraint.include_columns, operation.old_name, operation.new_name);
         try renameUniquePredicatesAlloc(alloc, constraint.where, operation.old_name, operation.new_name);
         try renameExpressionConditionsAlloc(alloc, constraint.where_expressions, operation.old_name, operation.new_name);
     }
@@ -41610,6 +41619,7 @@ fn validateUniqueConstraintForColumns(columns: []const runtime_schema.Relational
             },
         }
     }
+    try validateCreateIndexIncludeColumns(columns, constraint.columns, constraint.include_columns);
     try validateUniquePredicatesForColumns(columns, constraint.where);
     try validateUniquePredicateExpressionsForColumns(columns, constraint.where_expressions);
 }
@@ -42362,6 +42372,7 @@ fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema.
     alloc.free(constraint.name);
     freeStringSlice(alloc, constraint.columns);
     freeDdlUniqueExpressions(alloc, constraint.expressions);
+    freeStringSlice(alloc, constraint.include_columns);
     if (constraint.without_overlaps_period) |period| alloc.free(period);
     freeDdlUniquePredicates(alloc, constraint.where);
     freeExpressionConditions(alloc, constraint.where_expressions);
@@ -45259,9 +45270,30 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         alloc,
         "CREATE UNIQUE INDEX usage_records_duplicate_expr_key ON usage_records (lower(email), lower(email));",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var unique_covering = try lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (tenant_id);",
+    );
+    defer unique_covering.deinit(alloc);
+    switch (unique_covering) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_email_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("email", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (email);",
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
@@ -46601,6 +46633,21 @@ test "postgres sql adapter applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("users_tenant_lower_email_key", unique_schema.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints[0].expressions.len);
     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, unique_schema.unique_constraints[0].validation_state);
+
+    var unique_covering_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_email_cover_key ON users (email) INCLUDE (tenant_id, status);",
+    );
+    defer unique_covering_index.deinit(alloc);
+    const unique_covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, unique_covering_index);
+    defer runtime_schema.freeSchema(alloc, unique_covering_schema);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_email_cover_key", unique_covering_schema.unique_constraints[1].name);
+    try std.testing.expectEqual(@as(usize, 1), unique_covering_schema.unique_constraints[1].columns.len);
+    try std.testing.expectEqualStrings("email", unique_covering_schema.unique_constraints[1].columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering_schema.unique_constraints[1].include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", unique_covering_schema.unique_constraints[1].include_columns[0]);
+    try std.testing.expectEqualStrings("status", unique_covering_schema.unique_constraints[1].include_columns[1]);
 
     var upper_unique_index = try lowerDdlPlanAlloc(
         alloc,
@@ -48552,6 +48599,28 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     defer indexed.deinit(alloc);
     try std.testing.expect(indexed.requires_rebuild);
     try std.testing.expect(indexed.validation_required);
+
+    var unique_covering_index = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_email_cover_key ON users (email) INCLUDE (tenant_id, status);",
+    );
+    defer unique_covering_index.deinit(alloc);
+    var unique_covering_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, unique_covering_index);
+    defer unique_covering_indexed.deinit(alloc);
+    try std.testing.expect(unique_covering_indexed.requires_rebuild);
+    try std.testing.expect(unique_covering_indexed.validation_required);
+    var parsed_unique_covering_indexed = try schema_api.parseValidatedTableSchema(alloc, unique_covering_indexed.schema_json);
+    defer parsed_unique_covering_indexed.deinit(alloc);
+    const unique_covering_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_unique_covering_indexed);
+    defer runtime_schema.freeSchema(alloc, unique_covering_runtime);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering_runtime.unique_constraints.len);
+    const unique_covering = unique_covering_runtime.unique_constraints[1];
+    try std.testing.expectEqualStrings("users_email_cover_key", unique_covering.name);
+    try std.testing.expectEqual(@as(usize, 1), unique_covering.columns.len);
+    try std.testing.expectEqualStrings("email", unique_covering.columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering.include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", unique_covering.include_columns[0]);
+    try std.testing.expectEqualStrings("status", unique_covering.include_columns[1]);
 
     var expression_where_unique_index = try lowerDdlPlanAlloc(
         alloc,
@@ -64663,6 +64732,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false:include=2",
             .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE status = 'pending';",
+        },
+        .{
+            .name = "schema unique covering index",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
+            .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:include=2",
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE UNIQUE INDEX usage_records_email_cover_key ON usage_records (email) INCLUDE (tenant_id, status);",
         },
         .{
             .name = "schema concurrent partial index",

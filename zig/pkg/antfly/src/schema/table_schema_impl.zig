@@ -284,6 +284,7 @@ pub const UniqueConstraint = struct {
     name: []const u8,
     columns: [][]const u8 = &.{},
     expressions: []UniqueExpression = &.{},
+    include_columns: [][]const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
     where: []UniquePredicate = &.{},
     where_expressions: []storage_schema.RelationalRowsExpressionCondition = &.{},
@@ -295,6 +296,8 @@ pub const UniqueConstraint = struct {
         if (self.columns.len > 0) alloc.free(self.columns);
         for (self.expressions) |expression| alloc.free(expression.field);
         if (self.expressions.len > 0) alloc.free(self.expressions);
+        for (self.include_columns) |column| alloc.free(column);
+        if (self.include_columns.len > 0) alloc.free(self.include_columns);
         if (self.without_overlaps_period) |period| alloc.free(period);
         for (self.where) |predicate| {
             alloc.free(predicate.field);
@@ -1203,6 +1206,7 @@ fn validateUniqueConstraints(value: std.json.Value) !void {
         if (columns == null and expressions == null) return error.InvalidSchemaUpdateRequest;
         if (columns) |columns_value| try validateStringArray(columns_value, false);
         if (expressions) |expressions_value| try validateUniqueExpressionArray(expressions_value);
+        if (object.get("include_columns")) |include_columns| try validateStringArray(include_columns, false);
         const column_count = if (columns) |columns_value| columns_value.array.items.len else 0;
         const expression_count = if (expressions) |expressions_value| expressions_value.array.items.len else 0;
         if (column_count + expression_count == 0) return error.InvalidSchemaUpdateRequest;
@@ -1225,6 +1229,7 @@ fn isAllowedUniqueConstraintField(field: []const u8) bool {
     return std.mem.eql(u8, field, "name") or
         std.mem.eql(u8, field, "columns") or
         std.mem.eql(u8, field, "expressions") or
+        std.mem.eql(u8, field, "include_columns") or
         std.mem.eql(u8, field, "without_overlaps_period") or
         std.mem.eql(u8, field, "where") or
         std.mem.eql(u8, field, "where_expressions") or
@@ -2410,6 +2415,14 @@ fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
                 if (uniqueExpressionsEqual(previous_expression, expression)) return error.InvalidSchemaUpdateRequest;
             }
         }
+        for (constraint.include_columns, 0..) |column, column_index| {
+            if (stringSlicesContains(constraint.columns, column)) return error.InvalidSchemaUpdateRequest;
+            const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+            for (constraint.include_columns[0..column_index]) |previous_column| {
+                if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
         for (constraint.where) |predicate| try validateRelationalUniquePredicate(schema, predicate);
         for (constraint.where_expressions) |condition| try validateRelationalUniquePredicateExpression(schema, condition);
         for (schema.unique_constraints[0..i]) |previous| {
@@ -3042,6 +3055,13 @@ fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
         if (!std.mem.eql(u8, left, right)) return false;
     }
     return true;
+}
+
+fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| {
+        if (std.mem.eql(u8, candidate, value)) return true;
+    }
+    return false;
 }
 
 fn isRelationalUniqueConstraintColumn(property: DocumentProperty) bool {
@@ -4851,6 +4871,7 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
             .name = try alloc.dupe(u8, object.get("name").?.string),
             .columns = if (object.get("columns")) |columns| try parseStringArrayAlloc(alloc, columns) else &.{},
             .expressions = if (object.get("expressions")) |expressions| try parseUniqueExpressions(alloc, expressions) else &.{},
+            .include_columns = if (object.get("include_columns")) |include_columns| try parseStringArrayAlloc(alloc, include_columns) else &.{},
             .without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null,
             .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
             .where_expressions = if (object.get("where_expressions")) |where_expressions| try parseRelationalRowsExpressionConditionsAlloc(alloc, where_expressions) else &.{},
@@ -6456,10 +6477,13 @@ test "relational schema rejects unsupported unique constraint shapes" {
     );
     var parsed_partial = try parseSchema(
         std.testing.allocator,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"},{\"name\":\"email_upper_key\",\"expressions\":[{\"op\":\"upper\",\"field\":\"email\"}]},{\"name\":\"email_md5_key\",\"expressions\":[{\"op\":\"md5\",\"field\":\"email\"}]}]}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"display_name\":{\"type\":\"text\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"include_columns\":[\"status\",\"display_name\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"},{\"name\":\"email_upper_key\",\"expressions\":[{\"op\":\"upper\",\"field\":\"email\"}]},{\"name\":\"email_md5_key\",\"expressions\":[{\"op\":\"md5\",\"field\":\"email\"}]}]}",
     );
     defer parsed_partial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), parsed_partial.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].include_columns.len);
+    try std.testing.expectEqualStrings("status", parsed_partial.unique_constraints[0].include_columns[0]);
+    try std.testing.expectEqualStrings("display_name", parsed_partial.unique_constraints[0].include_columns[1]);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, parsed_partial.unique_constraints[0].where[0].op);
@@ -6477,6 +6501,13 @@ test "relational schema rejects unsupported unique constraint shapes" {
     try std.testing.expectEqual(UniqueConstraintValidationState.unvalidated, parsed_partial.unique_constraints[1].validation_state);
     try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[2].validation_state);
     try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[3].validation_state);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\"],\"include_columns\":[\"email\"]}]}",
+        ),
+    );
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         parseSchema(

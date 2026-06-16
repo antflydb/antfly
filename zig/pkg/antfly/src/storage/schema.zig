@@ -395,6 +395,7 @@ pub const UniqueConstraint = struct {
     name: []const u8,
     columns: []const []const u8 = &.{},
     expressions: []const UniqueExpression = &.{},
+    include_columns: []const []const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
     where: []const UniquePredicate = &.{},
     where_expressions: []const RelationalRowsExpressionCondition = &.{},
@@ -616,6 +617,7 @@ pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!stringSlicesEqual(a.columns, b.columns)) return false;
         if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
+        if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
         if (!optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period)) return false;
         if (!uniquePredicateSlicesEqual(a.where, b.where)) return false;
         if (!relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions)) return false;
@@ -692,7 +694,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 35); // format version
+    try appendU32(&buf, alloc, 36); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -827,6 +829,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try buf.append(alloc, @intFromEnum(expression.op));
             try appendStr(&buf, alloc, expression.field);
         }
+        try appendStringSlice(&buf, alloc, constraint.include_columns);
         try appendOptStr(&buf, alloc, constraint.without_overlaps_period);
         try appendU32(&buf, alloc, @intCast(constraint.where.len));
         for (constraint.where) |predicate| {
@@ -892,7 +895,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 35) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 36) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1330,6 +1333,8 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeStringSlice(alloc, columns);
             const expressions = if (fmt_version >= 19) try readUniqueExpressionSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniqueExpressionSlice(alloc, expressions);
+            const include_columns = if (fmt_version >= 36) try readStringSliceAlloc(alloc, data, &pos) else &.{};
+            errdefer freeStringSlice(alloc, include_columns);
             const without_overlaps_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
             errdefer if (without_overlaps_period) |period| alloc.free(period);
             const where = if (fmt_version >= 19) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
@@ -1345,6 +1350,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .name = name,
                 .columns = columns,
                 .expressions = expressions,
+                .include_columns = include_columns,
                 .without_overlaps_period = without_overlaps_period,
                 .where = where,
                 .where_expressions = where_expressions,
@@ -1539,6 +1545,7 @@ fn freeUniqueConstraint(alloc: Allocator, constraint: UniqueConstraint) void {
     alloc.free(constraint.name);
     freeStringSlice(alloc, constraint.columns);
     freeUniqueExpressionSlice(alloc, constraint.expressions);
+    freeStringSlice(alloc, constraint.include_columns);
     if (constraint.without_overlaps_period) |period| alloc.free(period);
     freeUniquePredicateSlice(alloc, constraint.where);
     freeRelationalRowsExpressionConditionSlice(alloc, constraint.where_expressions);
@@ -2577,6 +2584,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{
                 .name = "users_tenant_email_key",
                 .columns = &.{ "tenant_id", "email" },
+                .include_columns = &.{ "created_at", "request_id" },
                 .where = &.{
                     .{ .field = "email", .op = .is_not_null },
                 },
@@ -2713,6 +2721,9 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints[0].columns.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.unique_constraints[0].columns[0]);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints[0].include_columns.len);
+    try std.testing.expectEqualStrings("created_at", loaded.unique_constraints[0].include_columns[0]);
+    try std.testing.expectEqualStrings("request_id", loaded.unique_constraints[0].include_columns[1]);
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.unique_constraints[0].where[0].op);
