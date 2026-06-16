@@ -438,9 +438,24 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	route.RouteFrom = "standby-b"
 	g.Expect(haAdminActionHash(route)).NotTo(Equal(routeHash))
 
-	fenced := antflyv1.HAPlannedActionStatus{Kind: string(haActionAcquireFence), FenceReason: "LeaseAcquired"}
+	fenced := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionAcquireFence),
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 1,
+		FenceReason:     "LeaseAcquired",
+	}
 	fencedHash := haAdminActionHash(fenced)
 	fenced.FenceReason = "LeaseRenewed"
+	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
+	fenced.FenceReason = "LeaseAcquired"
+	fenced.FenceGeneration = 2
+	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
+	fenced.FenceGeneration = 1
+	fenced.FenceHolder = "standby-b"
+	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
+	fenced.FenceHolder = "standby-a"
+	fenced.FenceAuthority = antflyv1.HAFencingAuthorityExternal
 	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
 }
 

@@ -4173,6 +4173,9 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
 		RouteFrom    string   `json:"routeFrom,omitempty"`
 		RouteTo      string   `json:"routeTo,omitempty"`
+		FenceAuth    string   `json:"fenceAuthority,omitempty"`
+		FenceHolder  string   `json:"fenceHolder,omitempty"`
+		FenceGen     uint64   `json:"fenceGeneration,omitempty"`
 		FenceReason  string   `json:"fenceReason,omitempty"`
 		SeedManifest string   `json:"seedManifestPath,omitempty"`
 		SeedRoot     string   `json:"seedContentRoot,omitempty"`
@@ -4191,6 +4194,9 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		RetainedLSN:  action.RetainedFromLSN,
 		RouteFrom:    action.RouteFrom,
 		RouteTo:      action.RouteTo,
+		FenceAuth:    string(action.FenceAuthority),
+		FenceHolder:  action.FenceHolder,
+		FenceGen:     action.FenceGeneration,
 		FenceReason:  action.FenceReason,
 		SeedManifest: action.SeedManifestPath,
 		SeedRoot:     action.SeedContentRoot,
@@ -4199,7 +4205,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		Reason:       action.Reason,
 	})
 	if err != nil {
-		rendered = []byte(fmt.Sprintf("%s/%s/%s/%d/%s/%v/%s", action.Kind, action.StandbyName, action.SlotName, action.TargetLSN, action.AdminURL, action.AdminCommand, action.Reason))
+		rendered = []byte(fmt.Sprintf("%s/%s/%s/%d/%s/%d/%s/%s/%v/%s", action.Kind, action.StandbyName, action.SlotName, action.TargetLSN, action.FenceAuthority, action.FenceGeneration, action.FenceHolder, action.AdminURL, action.AdminCommand, action.Reason))
 	}
 	sum := sha256.Sum256(rendered)
 	return fmt.Sprintf("%x", sum)
