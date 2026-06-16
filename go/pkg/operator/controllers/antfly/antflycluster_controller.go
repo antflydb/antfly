@@ -3884,6 +3884,7 @@ func parseHAStandbyStatusTable(body string, standbyName string, slotName string)
 	}
 	status.SafeReadLSN, _ = parseHAResultUint(lines, "safe_read_lsn")
 	status.UpstreamLSN, _ = parseHAResultUint(lines, "upstream_lsn")
+	status.WriteLagLSN, _ = parseHAResultUint(lines, "write_lag_lsn")
 	status.ReceiveLagLSN, _ = parseHAResultUint(lines, "receive_lag_lsn")
 	status.ApplyLagLSN, _ = parseHAResultUint(lines, "apply_lag_lsn")
 	status.UnappliedLSNCount, _ = parseHAResultUint(lines, "unapplied_lsn_count")
@@ -3922,6 +3923,7 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 		if observed.UpstreamLSN != 0 {
 			existing.UpstreamLSN = observed.UpstreamLSN
 		}
+		existing.WriteLagLSN = observed.WriteLagLSN
 		existing.ReceiveLagLSN = observed.ReceiveLagLSN
 		existing.ApplyLagLSN = observed.ApplyLagLSN
 		existing.UnappliedLSNCount = observed.UnappliedLSNCount

@@ -76,6 +76,7 @@ pub const StandbySnapshot = struct {
     applied_lsn: u64,
     safe_read_lsn: u64,
     upstream_lsn: ?u64,
+    write_lag_lsn: ?u64,
     receive_lag_lsn: ?u64,
     apply_lag_lsn: ?u64,
     unapplied_lsn_count: u64,
@@ -211,6 +212,7 @@ pub fn standbySnapshot(standby: *const standby_mod.Standby, upstream_lsn: ?u64) 
         .applied_lsn = progress.applied_lsn,
         .safe_read_lsn = progress.safe_read_lsn,
         .upstream_lsn = upstream_lsn,
+        .write_lag_lsn = if (upstream_lsn) |lsn| lsn -| progress.received_lsn else null,
         .receive_lag_lsn = if (upstream_lsn) |lsn| lsn -| progress.received_lsn else null,
         .apply_lag_lsn = if (upstream_lsn) |lsn| lsn -| progress.applied_lsn else null,
         .unapplied_lsn_count = progress.received_lsn -| progress.applied_lsn,
@@ -408,6 +410,7 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     try std.testing.expectEqual(Role.standby, lagging.role);
     try std.testing.expectEqual(@as(u64, 2), lagging.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), lagging.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 1), lagging.write_lag_lsn.?);
     try std.testing.expectEqual(@as(u64, 1), lagging.receive_lag_lsn.?);
     try std.testing.expectEqual(@as(u64, 2), lagging.apply_lag_lsn.?);
     try std.testing.expectEqual(@as(u64, 1), lagging.unapplied_lsn_count);
@@ -425,6 +428,7 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     }
 
     const ready = standbySnapshot(&standby, 2);
+    try std.testing.expectEqual(@as(u64, 0), ready.write_lag_lsn.?);
     try std.testing.expectEqual(@as(u64, 0), ready.receive_lag_lsn.?);
     try std.testing.expectEqual(@as(u64, 0), ready.apply_lag_lsn.?);
     try std.testing.expect(ready.caught_up_to_received);

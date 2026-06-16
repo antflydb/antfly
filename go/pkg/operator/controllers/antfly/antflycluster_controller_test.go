@@ -1125,6 +1125,7 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 				"applied_lsn=11",
 				"safe_read_lsn=11",
 				"upstream_lsn=13",
+				"write_lag_lsn=1",
 				"receive_lag_lsn=1",
 				"apply_lag_lsn=2",
 				"unapplied_lsn_count=1",
@@ -1176,6 +1177,7 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g.Expect(standby.AppliedLSN).To(Equal(uint64(11)))
 	g.Expect(standby.SafeReadLSN).To(Equal(uint64(11)))
 	g.Expect(standby.UpstreamLSN).To(Equal(uint64(13)))
+	g.Expect(standby.WriteLagLSN).To(Equal(uint64(1)))
 	g.Expect(standby.ReceiveLagLSN).To(Equal(uint64(1)))
 	g.Expect(standby.ApplyLagLSN).To(Equal(uint64(2)))
 	g.Expect(standby.UnappliedLSNCount).To(Equal(uint64(1)))

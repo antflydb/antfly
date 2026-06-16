@@ -92,6 +92,7 @@ pub const StandbyMetrics = struct {
     applied_lsn: u64,
     safe_read_lsn: u64,
     upstream_configured: u64,
+    write_lag_lsn: u64,
     receive_lag_lsn: u64,
     apply_lag_lsn: u64,
     unapplied_lsn_count: u64,
@@ -201,6 +202,7 @@ pub fn fromStandbySnapshot(snapshot: status_mod.StandbySnapshot) StandbyMetrics 
         .applied_lsn = snapshot.applied_lsn,
         .safe_read_lsn = snapshot.safe_read_lsn,
         .upstream_configured = boolGauge(snapshot.upstream_lsn != null),
+        .write_lag_lsn = snapshot.write_lag_lsn orelse 0,
         .receive_lag_lsn = snapshot.receive_lag_lsn orelse 0,
         .apply_lag_lsn = snapshot.apply_lag_lsn orelse 0,
         .unapplied_lsn_count = snapshot.unapplied_lsn_count,
@@ -294,6 +296,7 @@ pub fn renderStandbyPrometheusAlloc(alloc: Allocator, metrics: StandbyMetrics) !
     try appendGauge(alloc, &out, "antfly_ha_standby_applied_lsn", metrics.applied_lsn);
     try appendGauge(alloc, &out, "antfly_ha_standby_safe_read_lsn", metrics.safe_read_lsn);
     try appendGauge(alloc, &out, "antfly_ha_standby_upstream_configured", metrics.upstream_configured);
+    try appendGauge(alloc, &out, "antfly_ha_standby_write_lag_lsn", metrics.write_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_standby_receive_lag_lsn", metrics.receive_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_standby_apply_lag_lsn", metrics.apply_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_standby_unapplied_lsn_count", metrics.unapplied_lsn_count);
@@ -523,6 +526,7 @@ test "storage.ha metrics derives standby and promotion gauges" {
         .applied_lsn = 6,
         .safe_read_lsn = 6,
         .upstream_lsn = 10,
+        .write_lag_lsn = 2,
         .receive_lag_lsn = 2,
         .apply_lag_lsn = 4,
         .unapplied_lsn_count = 2,
@@ -532,6 +536,7 @@ test "storage.ha metrics derives standby and promotion gauges" {
     const standby_metrics = fromStandbySnapshot(standby_snapshot);
     try std.testing.expectEqual(@as(u64, 8), standby_metrics.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), standby_metrics.upstream_configured);
+    try std.testing.expectEqual(@as(u64, 2), standby_metrics.write_lag_lsn);
     try std.testing.expectEqual(@as(u64, 2), standby_metrics.receive_lag_lsn);
     try std.testing.expectEqual(@as(u64, 4), standby_metrics.apply_lag_lsn);
     try std.testing.expectEqual(@as(u64, 0), standby_metrics.caught_up_to_received);
@@ -622,6 +627,7 @@ test "storage.ha metrics renders prometheus text" {
         .applied_lsn = 10,
         .safe_read_lsn = 10,
         .upstream_configured = 1,
+        .write_lag_lsn = 4,
         .receive_lag_lsn = 4,
         .apply_lag_lsn = 2,
         .unapplied_lsn_count = 2,
@@ -629,6 +635,7 @@ test "storage.ha metrics renders prometheus text" {
         .can_serve_safe_reads = 1,
     });
     defer alloc.free(standby_text);
+    try expectContains(standby_text, "antfly_ha_standby_write_lag_lsn 4\n");
     try expectContains(standby_text, "antfly_ha_standby_can_serve_safe_reads 1\n");
 
     const promotion_text = try renderPromotionPrometheusAlloc(alloc, .{

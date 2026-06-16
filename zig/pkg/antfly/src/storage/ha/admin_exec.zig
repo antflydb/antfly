@@ -770,6 +770,7 @@ fn appendStandbySnapshotLines(
     try appendU64Line(alloc, out, "applied_lsn", snapshot.applied_lsn);
     try appendU64Line(alloc, out, "safe_read_lsn", snapshot.safe_read_lsn);
     try appendOptionalU64Line(alloc, out, "upstream_lsn", snapshot.upstream_lsn);
+    try appendOptionalU64Line(alloc, out, "write_lag_lsn", snapshot.write_lag_lsn);
     try appendOptionalU64Line(alloc, out, "receive_lag_lsn", snapshot.receive_lag_lsn);
     try appendOptionalU64Line(alloc, out, "apply_lag_lsn", snapshot.apply_lag_lsn);
     try appendU64Line(alloc, out, "unapplied_lsn_count", snapshot.unapplied_lsn_count);
