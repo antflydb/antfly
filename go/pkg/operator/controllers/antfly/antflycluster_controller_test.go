@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -701,6 +702,8 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 		"--sync-failure", "fail-closed",
 	}))
 	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.Retention.OldestRestartLSN).To(Equal(uint64(7)))
 	g.Expect(cluster.Status.HAStatus.Retention.RetainedLSNCount).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.Retention.ActiveSlots).To(Equal(int32(1)))
@@ -712,6 +715,13 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(standby.AppliedLSN).To(Equal(uint64(11)))
 	g.Expect(standby.ApplyLagLSN).To(Equal(uint64(1)))
 	g.Expect(standby.Status).To(Equal("healthy"))
+
+	reconciler.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("primary admin refused connection")
+	})}
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).NotTo(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("primary admin refused connection"))
 }
 
 func TestObserveHAStandbyAdminStatuses(t *testing.T) {

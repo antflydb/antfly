@@ -218,6 +218,9 @@ const (
 	// ReasonHAFencingNotReady indicates automatic failover lacks an observed ready fence.
 	ReasonHAFencingNotReady = "HAFencingNotReady"
 
+	// ReasonHAPrimaryStillReachable indicates automatic failover is blocked while the primary admin endpoint is reachable.
+	ReasonHAPrimaryStillReachable = "HAPrimaryStillReachable"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 
@@ -1320,6 +1323,15 @@ type HAStatus struct {
 	// PrimaryLSN is the current primary replication LSN.
 	// +optional
 	PrimaryLSN uint64 `json:"primaryLSN,omitempty"`
+
+	// PrimaryAdminReachable reports whether the operator most recently reached the primary HA admin endpoint.
+	// Automatic promotion requires this to be false with PrimaryAdminLastError set.
+	// +optional
+	PrimaryAdminReachable bool `json:"primaryAdminReachable,omitempty"`
+
+	// PrimaryAdminLastError reports the latest primary HA admin observation error.
+	// +optional
+	PrimaryAdminLastError string `json:"primaryAdminLastError,omitempty"`
 
 	// DesiredStandbyCount is the count requested by spec.highAvailability.
 	// +optional

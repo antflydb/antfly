@@ -119,6 +119,7 @@ type haPlan struct {
 	ReseedRequiredCount       int32
 	FencingReady              bool
 	PromotionStandbyName      string
+	PrimaryAdminUnavailable   bool
 	SyncPolicyDegraded        bool
 	SyncPolicy                haSyncEvaluation
 	FormerPrimary             haFormerPrimaryEvaluation
@@ -415,6 +416,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.SyncPolicy = haEvaluateSyncPolicy(ha, status)
 	plan.SyncPolicyDegraded = plan.SyncPolicy.Degraded
 	plan.FencingReady = haFencingReady(ha, status)
+	plan.PrimaryAdminUnavailable = haPrimaryAdminUnavailable(status)
 	plan.PromotionStandbyName = haAutomaticPromotionStandby(ha, status, plan)
 	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
 	if plan.AutomaticPromotionAllowed {
@@ -981,6 +983,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if !plan.FencingReady {
 		return ""
 	}
+	if !haPrimaryAdminUnavailable(status) {
+		return ""
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return ""
 	}
@@ -1104,10 +1109,17 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	if !plan.FencingReady {
 		return antflyv1.ReasonHAFencingNotReady
 	}
+	if !plan.PrimaryAdminUnavailable {
+		return antflyv1.ReasonHAPrimaryStillReachable
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return antflyv1.ReasonHASyncPolicyUnsatisfied
 	}
 	return antflyv1.ReasonHANoHealthyStandby
+}
+
+func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {
+	return status != nil && !status.PrimaryAdminReachable && status.PrimaryAdminLastError != ""
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {

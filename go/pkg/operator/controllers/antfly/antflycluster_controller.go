@@ -3627,17 +3627,23 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 		ha.Admin == nil || strings.TrimSpace(ha.Admin.PrimaryURL) == "" {
 		return nil
 	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
 	body, err := r.executeHAAdminTableCommand(ctx, ha.Admin.PrimaryURL, haPrimaryStatusCommand(ha))
 	if err != nil {
+		cluster.Status.HAStatus.PrimaryAdminReachable = false
+		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
 		return err
 	}
 	status, err := parseHAPrimaryStatusTable(body)
 	if err != nil {
+		cluster.Status.HAStatus.PrimaryAdminReachable = false
+		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
 		return err
 	}
-	if cluster.Status.HAStatus == nil {
-		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
-	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PrimaryAdminLastError = ""
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
 	cluster.Status.HAStatus.Retention = status.Retention
 	cluster.Status.HAStatus.Standbys = status.Standbys

@@ -8786,6 +8786,15 @@ spec:
                           type: integer
                       type: object
                     type: array
+                  primaryAdminLastError:
+                    description: PrimaryAdminLastError reports the latest primary
+                      HA admin observation error.
+                    type: string
+                  primaryAdminReachable:
+                    description: |-
+                      PrimaryAdminReachable reports whether the operator most recently reached the primary HA admin endpoint.
+                      Automatic promotion requires this to be false with PrimaryAdminLastError set.
+                    type: boolean
                   primaryLSN:
                     description: PrimaryLSN is the current primary replication LSN.
                     format: int64

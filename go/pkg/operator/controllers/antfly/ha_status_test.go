@@ -373,8 +373,32 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	cluster.Status.HAStatus.Fencing = readyFencingStatus()
 	reconciler.updateHAStatusAndConditions(cluster)
 
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked while primary admin failure is not observed")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAPrimaryStillReachable {
+		t.Fatalf("expected primary-still-reachable condition, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PrimaryAdminLastError = ""
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked while primary admin is reachable")
+	}
+	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAPrimaryStillReachable {
+		t.Fatalf("expected primary-still-reachable condition, got %#v", failover)
+	}
+
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
+	reconciler.updateHAStatusAndConditions(cluster)
+
 	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
-		t.Fatal("expected automatic promotion to be allowed with ready fencing and caught-up standby")
+		t.Fatal("expected automatic promotion to be allowed with ready fencing, primary failure, and caught-up standby")
 	}
 	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
 	if failover == nil || failover.Status != metav1.ConditionTrue || failover.Reason != "HAFencedPromotionReady" {
@@ -482,6 +506,8 @@ func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromot
 	}
 	cluster.Status.HAStatus = caughtUpHAStatus()
 	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
 	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 10
 	cluster.Status.HAStatus.Standbys[0].SafeReadLagLSN = 2
 	reconciler := &AntflyClusterReconciler{}
@@ -909,8 +935,14 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 		t.Fatalf("observe fencing status: %v", err)
 	}
 	reconciler.updateHAStatusAndConditions(cluster)
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected reconciled Kubernetes lease to be insufficient while primary admin has not failed")
+	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler.updateHAStatusAndConditions(cluster)
 	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
-		t.Fatal("expected reconciled Kubernetes lease to satisfy automatic promotion fencing gate")
+		t.Fatal("expected reconciled Kubernetes lease and primary admin failure to satisfy automatic promotion fencing gate")
 	}
 }
 
@@ -1019,6 +1051,8 @@ func TestObserveHAFencingStatusAllowsPromotionWithReadyKubernetesLease(t *testin
 	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
 		t.Fatalf("observe fencing status: %v", err)
 	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	fencing := cluster.Status.HAStatus.Fencing
