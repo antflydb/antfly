@@ -33,6 +33,7 @@ const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
+const write_gate = @import("write_gate.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -153,6 +154,20 @@ pub fn evaluateStandbyRead(
     request: read_gate.Request,
 ) !read_gate.Decision {
     return try read_gate.evaluateStandby(standby, request);
+}
+
+pub fn evaluatePrimaryWrite(
+    primary: *const primary_mod.Primary,
+    request: write_gate.Request,
+) !write_gate.Decision {
+    return try write_gate.evaluatePrimary(primary, request);
+}
+
+pub fn evaluateStandbyWrite(
+    standby: *standby_mod.Standby,
+    request: write_gate.Request,
+) !write_gate.Decision {
+    return try write_gate.evaluateStandby(standby, request);
 }
 
 pub fn assessPromotion(
@@ -478,6 +493,14 @@ test "storage.ha admin exposes commit and read freshness decisions" {
     defer standby.close();
 
     _ = try applySlotAction(&primary, .create, .{ .slot_name = "standby-a", .initial_lsn = 0 });
+    const primary_write = try evaluatePrimaryWrite(&primary, .{ .expected_identity = identity });
+    try std.testing.expect(primary_write.canWrite());
+    try std.testing.expectEqual(write_gate.Action.allow_write, primary_write.action);
+
+    const standby_write = try evaluateStandbyWrite(&standby, .{ .expected_identity = identity });
+    try std.testing.expect(!standby_write.canWrite());
+    try std.testing.expectEqual(write_gate.Action.reject_read_only_standby, standby_write.action);
+
     _ = try primary.append(.{ .payload = "one" });
     const names = [_][]const u8{"standby-a"};
     var gate = try evaluateCommit(&primary, 1, .{
@@ -547,6 +570,11 @@ test "storage.ha admin acquires fence and promotes standby" {
     try std.testing.expectEqual(@as(u64, 3), result.promotion.switch_lsn);
     try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
     try std.testing.expect(!result.forced);
+
+    const promoted_write = try evaluateStandbyWrite(&standby, .{ .expected_identity = result.promotion.new_identity });
+    try std.testing.expect(!promoted_write.canWrite());
+    try std.testing.expectEqual(write_gate.Action.open_promoted_primary, promoted_write.action);
+    try std.testing.expect(promoted_write.promotion_handoff != null);
 }
 
 test "storage.ha admin rejects mismatched fence identity for promotion" {
