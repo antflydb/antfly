@@ -70,6 +70,22 @@ pub const Progress = struct {
     }
 };
 
+pub const PromotionRequest = struct {
+    new_timeline_id: u64,
+    new_epoch: u64,
+    required_lsn: ?u64 = null,
+    fencing_confirmed: bool = false,
+    force: bool = false,
+};
+
+pub const PromotionResult = struct {
+    switch_lsn: u64,
+    old_identity: Identity,
+    new_identity: Identity,
+    forced: bool,
+    data_loss_possible: bool,
+};
+
 pub const OpenOptions = struct {
     receive_log_options: replication_log.OpenOptions = .{},
     progress_wal_options: wal_mod.WalOptions = .{},
@@ -183,6 +199,59 @@ pub const Standby = struct {
         return applied_count;
     }
 
+    pub fn promote(self: *Standby, request: PromotionRequest) !PromotionResult {
+        if (request.new_timeline_id <= self.identity.timeline_id) return error.InvalidTimelineSwitch;
+        if (request.new_epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
+        if (!request.fencing_confirmed and !request.force) return error.FencingRequired;
+
+        const required_lsn = request.required_lsn orelse self.progress.received_lsn;
+        const data_loss_possible = self.progress.received_lsn < required_lsn or
+            self.progress.applied_lsn < self.progress.received_lsn or
+            self.progress.applied_lsn < required_lsn;
+        if (data_loss_possible and !request.force) return error.PromotionRequiresForce;
+
+        const old_identity = self.identity;
+        const new_identity = Identity{
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = self.identity.shard_id,
+            .table_id = self.identity.table_id,
+            .timeline_id = request.new_timeline_id,
+            .epoch = request.new_epoch,
+        };
+        const switch_lsn = self.progress.received_lsn + 1;
+        const payload = try promotionPayload(self.alloc, old_identity, new_identity, required_lsn, data_loss_possible);
+        defer self.alloc.free(payload);
+
+        _ = try self.receive_log.append(self.alloc, .{
+            .kind = .timeline_switch,
+            .payload_codec = .json,
+            .cluster_id = new_identity.cluster_id,
+            .shard_id = new_identity.shard_id,
+            .table_id = new_identity.table_id,
+            .timeline_id = new_identity.timeline_id,
+            .epoch = new_identity.epoch,
+            .lsn = switch_lsn,
+            .previous_lsn = switch_lsn - 1,
+            .payload = payload,
+        });
+
+        self.identity = new_identity;
+        self.progress = .{
+            .received_lsn = switch_lsn,
+            .applied_lsn = switch_lsn,
+            .safe_read_lsn = switch_lsn,
+        };
+        try self.persistProgress(self.progress);
+
+        return .{
+            .switch_lsn = switch_lsn,
+            .old_identity = old_identity,
+            .new_identity = new_identity,
+            .forced = request.force,
+            .data_loss_possible = data_loss_possible,
+        };
+    }
+
     fn validateReceivedLog(self: *Standby) !void {
         const entries = try self.receive_log.iterateFrom(self.alloc, 1);
         defer replication_log.freeEntries(self.alloc, entries);
@@ -231,6 +300,27 @@ pub const Standby = struct {
         _ = try self.progress_wal.append(&encoded);
     }
 };
+
+fn promotionPayload(
+    alloc: Allocator,
+    old_identity: Identity,
+    new_identity: Identity,
+    required_lsn: u64,
+    data_loss_possible: bool,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"parent_timeline_id\":{d},\"new_timeline_id\":{d},\"parent_epoch\":{d},\"new_epoch\":{d},\"required_lsn\":{d},\"data_loss_possible\":{}}}",
+        .{
+            old_identity.timeline_id,
+            new_identity.timeline_id,
+            old_identity.epoch,
+            new_identity.epoch,
+            required_lsn,
+            data_loss_possible,
+        },
+    );
+}
 
 fn encodeProgress(identity: Identity, progress: Progress) [progress_header_len]u8 {
     var out: [progress_header_len]u8 = undefined;
@@ -466,4 +556,88 @@ test "storage.ha standby does not advance applied lsn when apply fails" {
         try std.testing.expectEqual(@as(u64, 2), progress.applied_lsn);
         try std.testing.expectEqual(@as(u64, 2), progress.safe_read_lsn);
     }
+}
+
+test "storage.ha standby promotion requires fencing and appends timeline switch" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "promote-safe");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(baseRecord(identity, 1, "one"));
+    _ = try standby.receive(baseRecord(identity, 2, "two"));
+
+    try std.testing.expectError(error.FencingRequired, standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+    }));
+    try std.testing.expectError(error.PromotionRequiresForce, standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .fencing_confirmed = true,
+    }));
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(usize, 2), try standby.applyAvailable(&capture, ApplyCapture.apply));
+
+    const result = try standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+        .fencing_confirmed = true,
+    });
+    try std.testing.expectEqual(@as(u64, 3), result.switch_lsn);
+    try std.testing.expectEqual(@as(u64, 1), result.old_identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), result.new_identity.timeline_id);
+    try std.testing.expect(!result.forced);
+    try std.testing.expect(!result.data_loss_possible);
+    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
+
+    const entries = try standby.receive_log.iterateFrom(alloc, 3);
+    defer replication_log.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(replication_record.RecordKind.timeline_switch, entries[0].record.kind);
+    try std.testing.expectEqual(@as(u64, 2), entries[0].record.timeline_id);
+    try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"data_loss_possible\":false") != null);
+}
+
+test "storage.ha standby forced promotion records possible data loss" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "promote-forced");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(baseRecord(identity, 1, "one"));
+    _ = try standby.receive(baseRecord(identity, 2, "two"));
+
+    var capture = ApplyCapture{ .alloc = alloc, .fail_at_lsn = 2 };
+    defer capture.deinit();
+    try std.testing.expectError(error.IntentionalApplyFailure, standby.applyAvailable(&capture, ApplyCapture.apply));
+    try std.testing.expectEqual(@as(u64, 2), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
+
+    const result = try standby.promote(.{
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 2,
+        .force = true,
+    });
+    try std.testing.expectEqual(@as(u64, 3), result.switch_lsn);
+    try std.testing.expect(result.forced);
+    try std.testing.expect(result.data_loss_possible);
+    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
+
+    const entries = try standby.receive_log.iterateFrom(alloc, 3);
+    defer replication_log.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(replication_record.RecordKind.timeline_switch, entries[0].record.kind);
+    try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"data_loss_possible\":true") != null);
 }
