@@ -25,6 +25,7 @@ pub const replication_api = @import("replication_api.zig");
 pub const fencing = @import("fencing.zig");
 pub const rejoin = @import("rejoin.zig");
 pub const commit_gate = @import("commit_gate.zig");
+pub const read_gate = @import("read_gate.zig");
 
 test {
     _ = replication_record;
@@ -40,4 +41,5 @@ test {
     _ = fencing;
     _ = rejoin;
     _ = commit_gate;
+    _ = read_gate;
 }
