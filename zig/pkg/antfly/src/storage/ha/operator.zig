@@ -49,6 +49,14 @@ pub const AutoFailoverPolicy = struct {
     maximum_lag_lsn: u64 = 0,
 };
 
+pub const FencingObservation = struct {
+    authority: FencingAuthority = .none,
+    ready: bool = false,
+    holder: ?[]const u8 = null,
+    generation: ?u64 = null,
+    reason: []const u8 = "NotObserved",
+};
+
 pub const StandbySpec = struct {
     name: []const u8,
     desired: bool = true,
@@ -135,6 +143,7 @@ pub const AdminCommand = struct {
 
 pub const Observed = struct {
     primary: status.PrimarySnapshot,
+    fencing: FencingObservation = .{},
     former_primary: ?rejoin.FormerPrimaryState = null,
     promotion_receipt: ?fencing.Receipt = null,
     rejoin_policy: rejoin.RejoinPolicy = .{ .retained_from_lsn = 0 },
@@ -143,6 +152,7 @@ pub const Observed = struct {
 pub const Plan = struct {
     actions: []Action,
     conditions: []Condition,
+    fencing: FencingObservation = .{},
     former_primary_assessment: ?rejoin.Assessment = null,
     automatic_promotion_allowed: bool,
     desired_standby_count: usize,
@@ -159,6 +169,7 @@ pub const Plan = struct {
 pub const PlanDocument = struct {
     schema_version: u32 = 1,
     automatic_promotion_allowed: bool,
+    fencing: FencingObservation,
     desired_standby_count: usize,
     healthy_standby_count: usize,
     reseed_required_count: usize,
@@ -170,6 +181,7 @@ pub const PlanDocument = struct {
 pub fn planDocument(plan: Plan) PlanDocument {
     return .{
         .automatic_promotion_allowed = plan.automatic_promotion_allowed,
+        .fencing = plan.fencing,
         .desired_standby_count = plan.desired_standby_count,
         .healthy_standby_count = plan.healthy_standby_count,
         .reseed_required_count = plan.reseed_required_count,
@@ -199,6 +211,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         return .{
             .actions = try actions.toOwnedSlice(alloc),
             .conditions = try conditions.toOwnedSlice(alloc),
+            .fencing = observed.fencing,
             .automatic_promotion_allowed = false,
             .desired_standby_count = 0,
             .healthy_standby_count = 0,
@@ -268,7 +281,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
 
     const retention_pressure = observed.primary.retention.reseed_recommended > 0;
     const degraded = isDegraded(observed.primary.durability);
-    const automatic_standby = automaticPromotionStandby(spec, observed.primary);
+    const automatic_standby = automaticPromotionStandby(spec, observed.primary, observed.fencing);
     const automatic_allowed = automatic_standby != null;
 
     try conditions.append(alloc, .{
@@ -298,7 +311,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     try conditions.append(alloc, .{
         .type = .automatic_failover_ready,
         .status = automatic_allowed,
-        .reason = automaticFailoverReason(spec, observed.primary, automatic_allowed),
+        .reason = automaticFailoverReason(spec, observed.primary, observed.fencing, automatic_allowed),
         .message = if (automatic_allowed) "Automatic failover may acquire a fence and promote a caught-up standby" else "Automatic failover is disabled or missing a safe fencing/readiness prerequisite",
     });
 
@@ -336,6 +349,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     return .{
         .actions = try actions.toOwnedSlice(alloc),
         .conditions = try conditions.toOwnedSlice(alloc),
+        .fencing = observed.fencing,
         .former_primary_assessment = former_primary_assessment,
         .automatic_promotion_allowed = automatic_allowed,
         .desired_standby_count = desired_count,
@@ -555,14 +569,15 @@ fn isDegraded(durability: ?primary_mod.DurabilityDecision) bool {
     return decision.status != .satisfied;
 }
 
-fn automaticPromotionAllowed(spec: Spec, primary: status.PrimarySnapshot) bool {
-    return automaticPromotionStandby(spec, primary) != null;
+fn automaticPromotionAllowed(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation) bool {
+    return automaticPromotionStandby(spec, primary, fencing_observed) != null;
 }
 
-fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot) ?[]const u8 {
+fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation) ?[]const u8 {
     if (!spec.auto_failover.enabled) return null;
     if (spec.auto_failover.fencing_authority == .none) return null;
     if (isDegraded(primary.durability)) return null;
+    if (!fencingAuthorityReady(spec.auto_failover, fencing_observed)) return null;
 
     const max_lag = spec.auto_failover.maximum_lag_lsn;
     for (spec.standbys) |standby| {
@@ -577,6 +592,12 @@ fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot) ?[]con
         return standby.name;
     }
     return null;
+}
+
+fn fencingAuthorityReady(policy: AutoFailoverPolicy, observed: FencingObservation) bool {
+    if (policy.fencing_authority == .none) return false;
+    if (observed.authority != policy.fencing_authority) return false;
+    return observed.ready;
 }
 
 fn appendSlotLifecycleCommand(
@@ -631,11 +652,13 @@ fn appendOwnedFmt(
     try argv.append(alloc, owned);
 }
 
-fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, allowed: bool) []const u8 {
+fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation, allowed: bool) []const u8 {
     if (allowed) return "FencedPromotionReady";
     if (!spec.auto_failover.enabled) return "AutomaticFailoverDisabled";
     if (spec.auto_failover.fencing_authority == .none) return "FencingAuthorityMissing";
     if (isDegraded(primary.durability)) return "SyncPolicyUnsatisfied";
+    if (fencing_observed.authority != .none and fencing_observed.authority != spec.auto_failover.fencing_authority) return "FencingAuthorityMismatch";
+    if (!fencing_observed.ready) return "FencingAuthorityNotReady";
     return "NoEligibleStandby";
 }
 
@@ -799,7 +822,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         (condition(unsafe, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
 
-    var safe = try reconcile(alloc, .{
+    var unobserved = try reconcile(alloc, .{
         .mode = .hot_standby,
         .standbys = &standbys,
         .auto_failover = .{
@@ -808,6 +831,31 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
             .maximum_lag_lsn = 0,
         },
     }, .{ .primary = primary });
+    defer unobserved.deinit(alloc);
+    try std.testing.expect(!unobserved.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "FencingAuthorityNotReady",
+        (condition(unobserved, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var safe = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 7,
+            .reason = "LeaseAcquired",
+        },
+    });
     defer safe.deinit(alloc);
     try std.testing.expect(safe.automatic_promotion_allowed);
     try std.testing.expectEqual(@as(usize, 4), safe.actions.len);
@@ -867,7 +915,16 @@ test "storage.ha operator renders versioned json plan for controllers" {
             .enabled = true,
             .fencing_authority = .kubernetes_lease,
         },
-    }, .{ .primary = primary });
+    }, .{
+        .primary = primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 11,
+            .reason = "LeaseAcquired",
+        },
+    });
     defer plan.deinit(alloc);
 
     const rendered = try renderJsonAlloc(alloc, plan);
@@ -875,6 +932,9 @@ test "storage.ha operator renders versioned json plan for controllers" {
 
     try expectContains(rendered, "\"schema_version\":1");
     try expectContains(rendered, "\"automatic_promotion_allowed\":true");
+    try expectContains(rendered, "\"fencing\"");
+    try expectContains(rendered, "\"authority\":\"kubernetes_lease\"");
+    try expectContains(rendered, "\"ready\":true");
     try expectContains(rendered, "\"desired_standby_count\":1");
     try expectContains(rendered, "\"healthy_standby_count\":1");
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
