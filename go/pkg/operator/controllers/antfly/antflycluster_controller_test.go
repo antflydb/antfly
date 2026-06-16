@@ -393,6 +393,35 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	}))
 }
 
+func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
+	g := NewWithT(t)
+
+	actions := []antflyv1.HAPlannedActionStatus{{
+		Kind:          string(haActionPauseSlot),
+		AdminCommand:  []string{"slot", "pause"},
+		AdminJobPhase: haAdminJobPhaseFailed,
+	}, {
+		Kind:          string(haActionCreateSlot),
+		AdminCommand:  []string{"slot", "create"},
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+	}, {
+		Kind:         string(haActionSeedStandby),
+		DependsOn:    string(haActionCreateSlot),
+		AdminCommand: []string{"seed", "begin"},
+	}}
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeTrue())
+
+	actions[2].DependsOn = ""
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeFalse())
+
+	actions[2].DependsOn = string(haActionDropSlot)
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 2)).To(BeFalse())
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, -1)).To(BeFalse())
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, len(actions))).To(BeFalse())
+}
+
 func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g := NewWithT(t)
 

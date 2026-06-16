@@ -3256,6 +3256,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		if len(action.AdminCommand) == 0 || strings.TrimSpace(action.AdminURL) == "" {
 			continue
 		}
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+			return nil
+		}
 
 		job := buildHAAdminJob(cluster, ha.Admin, *action)
 		action.AdminJobName = job.Name
@@ -3294,7 +3297,7 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			action.StandbyName == "" {
 			continue
 		}
-		if !haPriorAdminActionsSucceeded(cluster.Status.HAStatus.PlannedActions[:i]) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			continue
 		}
 		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
@@ -3346,7 +3349,7 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 			action.AdminJobName == "" {
 			continue
 		}
-		if !haPriorAdminActionsSucceeded(cluster.Status.HAStatus.PlannedActions[:i]) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			continue
 		}
 		if cluster.Status.HAStatus.FormerPrimary == nil {
@@ -3936,7 +3939,7 @@ func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, c
 		if action.Kind != string(haActionUpdatePrimaryRoute) {
 			continue
 		}
-		if !haPriorAdminActionsSucceeded(cluster.Status.HAStatus.PlannedActions[:i]) {
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			return nil
 		}
 		if action.RouteTo == "" {
@@ -3989,6 +3992,27 @@ func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool
 		}
 	}
 	return true
+}
+
+func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStatus, index int) bool {
+	if index < 0 || index >= len(actions) {
+		return false
+	}
+	action := actions[index]
+	if action.DependsOn == "" {
+		return haPriorAdminActionsSucceeded(actions[:index])
+	}
+	for i := 0; i < index; i++ {
+		dependency := actions[i]
+		if dependency.Kind != action.DependsOn {
+			continue
+		}
+		if len(dependency.AdminCommand) == 0 {
+			return true
+		}
+		return dependency.AdminJobPhase == haAdminJobPhaseSucceeded
+	}
+	return false
 }
 
 func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
