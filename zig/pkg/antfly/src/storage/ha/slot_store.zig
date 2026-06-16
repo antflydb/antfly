@@ -180,6 +180,22 @@ pub const SlotStore = struct {
         return null;
     }
 
+    pub fn listAlloc(self: *const SlotStore, alloc: Allocator) ![]SlotState {
+        const out = try alloc.alloc(SlotState, self.slots.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |slot| alloc.free(slot.name);
+            alloc.free(out);
+        }
+
+        for (self.slots.items, 0..) |slot, idx| {
+            out[idx] = slot.state;
+            out[idx].name = try alloc.dupe(u8, slot.state.name);
+            filled += 1;
+        }
+        return out;
+    }
+
     pub fn retentionSnapshot(
         self: *SlotStore,
         primary_lsn: u64,
@@ -277,6 +293,11 @@ pub const SlotStore = struct {
         return null;
     }
 };
+
+pub fn freeSlotList(alloc: Allocator, slots: []SlotState) void {
+    for (slots) |slot| alloc.free(slot.name);
+    alloc.free(slots);
+}
 
 fn encodeEvent(alloc: Allocator, event: EventView) ![]u8 {
     if (event.state.name.len > std.math.maxInt(u32)) return error.SlotNameTooLong;
