@@ -61143,6 +61143,53 @@ fn appParityPlanFamilyIsSupportedWrite(family: AppParityCorpusPlanFamily) bool {
     };
 }
 
+fn appParityUnsupportedFingerprintFamily(family: AppParityCorpusPlanFamily) ?[]const u8 {
+    return switch (family) {
+        .unsupported => "query",
+        .unsupported_read => "read",
+        .unsupported_ddl => "ddl",
+        .unsupported_write => "write",
+        .unsupported_insert => "insert",
+        .unsupported_update => "update",
+        .unsupported_update_source => "update_source",
+        .unsupported_delete => "delete",
+        .unsupported_update_joined_source => "update_joined_source",
+        .unsupported_delete_joined_source => "delete_joined_source",
+        else => null,
+    };
+}
+
+fn appParityPlanFamilyIsUnsupported(family: AppParityCorpusPlanFamily) bool {
+    return appParityUnsupportedFingerprintFamily(family) != null;
+}
+
+fn expectAppParityUnsupportedPlanEntry(
+    alloc: std.mem.Allocator,
+    effective_schema: runtime_schema.TableSchema,
+    entry: AppParityCorpusEntry,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+    row_claim: db_mod.types.RowClaimRequest,
+) !void {
+    switch (entry.family) {
+        .unsupported => try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
+        .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
+        .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanAlloc(alloc, entry.sql)),
+        .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, unique_resolver, row_claim)),
+        .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update => try expectFailClosedUnsupported(lowerUpdateAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update_source => try expectFailClosedUnsupported(lowerUpdateMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
+        .unsupported_delete => try expectFailClosedUnsupported(lowerDeleteAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update_joined_source => try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
+        .unsupported_delete_joined_source => try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const fingerprint_family = appParityUnsupportedFingerprintFamily(entry.family) orelse return error.TestUnexpectedResult;
+    const fingerprint = try unsupportedFingerprintAlloc(alloc, fingerprint_family, entry.classification_reason);
+    defer alloc.free(fingerprint);
+    try expectAppParityPlan(entry.plan, fingerprint);
+}
+
 fn expectAppParityCorpusEntry(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
@@ -61177,6 +61224,9 @@ fn expectAppParityCorpusEntry(
     }
     if (appParityPlanFamilyIsSupportedWrite(entry.family)) {
         return try expectAppParityWritePlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
+    }
+    if (appParityPlanFamilyIsUnsupported(entry.family)) {
+        return try expectAppParityUnsupportedPlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
     }
 
     switch (entry.family) {
@@ -61257,66 +61307,17 @@ fn expectAppParityCorpusEntry(
                 try expectAppParityPlan(entry.plan, fingerprint);
             }
         },
-        .unsupported => {
-            try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "query", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_read => {
-            try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "read", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_ddl => {
-            try expectFailClosedUnsupported(lowerDdlPlanAlloc(alloc, entry.sql));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "ddl", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_write => {
-            try expectFailClosedUnsupported(lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, effective_unique_resolver, row_claim));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "write", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_insert => {
-            try expectFailClosedUnsupported(lowerInsertWithResolverAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "insert", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_update => {
-            try expectFailClosedUnsupported(lowerUpdateAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "update", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_update_source => {
-            try expectFailClosedUnsupported(lowerUpdateMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "update_source", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_delete => {
-            try expectFailClosedUnsupported(lowerDeleteAlloc(alloc, entry.sql, effective_schema, entry.params, effective_unique_resolver));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "delete", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_update_joined_source => {
-            try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "update_joined_source", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .unsupported_delete_joined_source => {
-            try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim));
-            const fingerprint = try unsupportedFingerprintAlloc(alloc, "delete_joined_source", entry.classification_reason);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
+        .unsupported,
+        .unsupported_read,
+        .unsupported_ddl,
+        .unsupported_write,
+        .unsupported_insert,
+        .unsupported_update,
+        .unsupported_update_source,
+        .unsupported_delete,
+        .unsupported_update_joined_source,
+        .unsupported_delete_joined_source,
+        => return error.TestUnexpectedResult,
     }
 }
 
