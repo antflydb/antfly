@@ -33,6 +33,7 @@ type haPlan struct {
 	AutomaticPromotionAllowed bool
 	DesiredStandbyCount       int32
 	HealthyStandbyCount       int32
+	ReadSafeStandbyCount      int32
 	ReseedRequiredCount       int32
 }
 
@@ -102,6 +103,9 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		if observed.Active && observed.ApplyLagLSN == 0 {
 			plan.HealthyStandbyCount++
 		}
+		if standbyReadSafe(status, observed) {
+			plan.ReadSafeStandbyCount++
+		}
 	}
 
 	plan.AutomaticPromotionAllowed = haAutomaticPromotionAllowed(ha, status, plan)
@@ -130,6 +134,7 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.Mode = ha.Mode
 	cluster.Status.HAStatus.DesiredStandbyCount = plan.DesiredStandbyCount
 	cluster.Status.HAStatus.HealthyStandbyCount = plan.HealthyStandbyCount
+	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
 	mergeConfiguredStandbys(cluster.Status.HAStatus, ha)
@@ -175,10 +180,10 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 		return
 	}
 
-	if plan.HealthyStandbyCount > 0 {
-		setHACondition(cluster, antflyv1.TypeHAAvailable, metav1.ConditionTrue, antflyv1.ReasonHAStandbyAvailable, fmt.Sprintf("%d desired standby is caught up to apply", plan.HealthyStandbyCount))
+	if plan.ReadSafeStandbyCount > 0 {
+		setHACondition(cluster, antflyv1.TypeHAAvailable, metav1.ConditionTrue, antflyv1.ReasonHAStandbyAvailable, fmt.Sprintf("%d desired standby is safe for reads", plan.ReadSafeStandbyCount))
 	} else {
-		setHACondition(cluster, antflyv1.TypeHAAvailable, metav1.ConditionFalse, antflyv1.ReasonHANoHealthyStandby, "No desired standby is caught up to apply")
+		setHACondition(cluster, antflyv1.TypeHAAvailable, metav1.ConditionFalse, antflyv1.ReasonHANoHealthyStandby, "No desired standby is safe for reads")
 	}
 
 	degraded := haSyncPolicyDegraded(ha, plan)
@@ -244,9 +249,26 @@ func haAutomaticPromotionAllowed(ha *antflyv1.HighAvailabilitySpec, status *antf
 		if requireApply && standby.AppliedLSN+maxLag < status.PrimaryLSN {
 			continue
 		}
+		if standbySafeReadLSN(standby)+maxLag < status.PrimaryLSN {
+			continue
+		}
 		return true
 	}
 	return false
+}
+
+func standbyReadSafe(status *antflyv1.HAStatus, standby antflyv1.HAStandbyStatus) bool {
+	if !standby.Active || standby.ReseedRequired {
+		return false
+	}
+	return standbySafeReadLSN(standby) >= status.PrimaryLSN
+}
+
+func standbySafeReadLSN(standby antflyv1.HAStandbyStatus) uint64 {
+	if standby.SafeReadLSN != 0 || standby.SafeReadLagLSN != 0 {
+		return standby.SafeReadLSN
+	}
+	return standby.AppliedLSN
 }
 
 func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) string {

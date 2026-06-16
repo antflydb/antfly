@@ -1227,6 +1227,10 @@ type HAStatus struct {
 	// +optional
 	HealthyStandbyCount int32 `json:"healthyStandbyCount,omitempty"`
 
+	// ReadSafeStandbyCount is the count of desired standbys safe for reads.
+	// +optional
+	ReadSafeStandbyCount int32 `json:"readSafeStandbyCount,omitempty"`
+
 	// ReseedRequiredCount is the count of desired standbys requiring reseed.
 	// +optional
 	ReseedRequiredCount int32 `json:"reseedRequiredCount,omitempty"`
@@ -1266,9 +1270,13 @@ type HAStandbyStatus struct {
 
 	AppliedLSN uint64 `json:"appliedLSN,omitempty"`
 
+	SafeReadLSN uint64 `json:"safeReadLSN,omitempty"`
+
 	WriteLagLSN uint64 `json:"writeLagLSN,omitempty"`
 
 	ApplyLagLSN uint64 `json:"applyLagLSN,omitempty"`
+
+	SafeReadLagLSN uint64 `json:"safeReadLagLSN,omitempty"`
 
 	Status string `json:"status,omitempty"`
 

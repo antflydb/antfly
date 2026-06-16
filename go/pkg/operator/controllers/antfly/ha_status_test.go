@@ -144,6 +144,50 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 }
 
+func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromotion(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:         antflyv1.HADurabilityModeRemoteApply,
+		Required:     1,
+		StandbyNames: []string{"standby-a"},
+	}
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 10
+	cluster.Status.HAStatus.Standbys[0].SafeReadLagLSN = 2
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.HealthyStandbyCount != 1 {
+		t.Fatalf("expected applied standby to remain healthy for sync, got %d", cluster.Status.HAStatus.HealthyStandbyCount)
+	}
+	if cluster.Status.HAStatus.ReadSafeStandbyCount != 0 {
+		t.Fatalf("expected no read-safe standby, got %d", cluster.Status.HAStatus.ReadSafeStandbyCount)
+	}
+	available := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAvailable)
+	if available == nil || available.Status != metav1.ConditionFalse || available.Reason != antflyv1.ReasonHANoHealthyStandby {
+		t.Fatalf("expected unavailable read-safe condition, got %#v", available)
+	}
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to wait for safe-read progress")
+	}
+
+	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 12
+	cluster.Status.HAStatus.Standbys[0].SafeReadLagLSN = 0
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.ReadSafeStandbyCount != 1 {
+		t.Fatalf("expected one read-safe standby, got %d", cluster.Status.HAStatus.ReadSafeStandbyCount)
+	}
+	if !cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion after safe-read catch-up")
+	}
+}
+
 func haCluster() *antflyv1.AntflyCluster {
 	return &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -171,6 +215,7 @@ func caughtUpHAStatus() *antflyv1.HAStatus {
 			Active:      true,
 			ReceivedLSN: 12,
 			AppliedLSN:  12,
+			SafeReadLSN: 12,
 			ApplyLagLSN: 0,
 			Status:      "healthy",
 		}},

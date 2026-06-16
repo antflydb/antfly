@@ -6499,6 +6499,11 @@ spec:
                     description: PrimaryLSN is the current primary replication LSN.
                     format: int64
                     type: integer
+                  readSafeStandbyCount:
+                    description: ReadSafeStandbyCount is the count of desired standbys
+                      safe for reads.
+                    format: int32
+                    type: integer
                   reseedRequiredCount:
                     description: ReseedRequiredCount is the count of desired standbys
                       requiring reseed.
@@ -6543,6 +6548,12 @@ spec:
                         reseedRequired:
                           type: boolean
                         restartLSN:
+                          format: int64
+                          type: integer
+                        safeReadLSN:
+                          format: int64
+                          type: integer
+                        safeReadLagLSN:
                           format: int64
                           type: integer
                         slotName:
