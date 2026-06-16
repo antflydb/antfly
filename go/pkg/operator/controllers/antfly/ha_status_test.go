@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,93 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
 		cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://primary-ha.default.svc:8081" {
 		t.Fatalf("expected slot and seed actions to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+}
+
+func TestParseHAOperatorPlanTableActions(t *testing.T) {
+	plan, err := parseHAOperatorPlanTable(strings.Join([]string{
+		"result=operator_plan",
+		"automatic_promotion_allowed=true",
+		"desired_standby_count=1",
+		"healthy_standby_count=1",
+		"unhealthy_standby_count=0",
+		"lagging_standby_count=0",
+		"reseed_required_count=0",
+		"action_count=4",
+		"actions.0.kind=acquire_fence",
+		"actions.0.phase=fence",
+		"actions.0.executor=admin_command",
+		"actions.0.reason=AutomaticFailoverReady",
+		"actions.0.standby_name=standby-a",
+		"actions.0.target_lsn=12",
+		"actions.0.fence_authority=kubernetes_lease",
+		"actions.0.fence_holder=standby-a",
+		"actions.0.fence_generation=3",
+		"actions.0.fence_reason=LeaseHeld",
+		"actions.0.admin_url=http://standby-a-ha.default.svc:8081",
+		"actions.1.kind=promote_standby",
+		"actions.1.phase=promote",
+		"actions.1.executor=admin_command",
+		"actions.1.depends_on=acquire_fence",
+		"actions.1.standby_name=standby-a",
+		"actions.1.target_lsn=12",
+		"actions.2.kind=update_primary_endpoint",
+		"actions.2.phase=route",
+		"actions.2.executor=controller_action",
+		"actions.2.depends_on=promote_standby",
+		"actions.2.route_from=primary",
+		"actions.2.route_to=standby-a",
+		"actions.3.kind=rewind_former_primary",
+		"actions.3.phase=rejoin",
+		"actions.3.executor=admin_command",
+		"actions.3.depends_on=promote_standby",
+		"actions.3.standby_name=primary-a",
+		"actions.3.target_lsn=12",
+		"actions.3.observed_lsn=13",
+		"actions.3.retained_from_lsn=8",
+		"actions.3.seed_manifest_path=/backup/base.afha",
+		"actions.3.seed_content_root=/backup/base",
+		"",
+	}, "\n"))
+	if err != nil {
+		t.Fatalf("parse operator plan table: %v", err)
+	}
+	if !plan.AutomaticPromotionAllowed ||
+		plan.DesiredStandbyCount != 1 ||
+		plan.HealthyStandbyCount != 1 ||
+		plan.UnhealthyStandbyCount != 0 ||
+		len(plan.Actions) != 4 {
+		t.Fatalf("unexpected parsed operator plan summary: %#v", plan)
+	}
+	if plan.Actions[0].Kind != string(haActionAcquireFence) ||
+		plan.Actions[0].Phase != string(haActionPhaseFence) ||
+		plan.Actions[0].Executor != string(haActionExecutorAdminCommand) ||
+		plan.Actions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
+		plan.Actions[0].FenceHolder != "standby-a" ||
+		plan.Actions[0].FenceGeneration != 3 ||
+		plan.Actions[0].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		t.Fatalf("unexpected parsed acquire-fence action: %#v", plan.Actions[0])
+	}
+	if plan.Actions[1].Kind != string(haActionPromoteStandby) ||
+		plan.Actions[1].DependsOn != string(haActionAcquireFence) {
+		t.Fatalf("unexpected parsed promote action: %#v", plan.Actions[1])
+	}
+	if plan.Actions[2].Kind != string(haActionUpdatePrimaryRoute) ||
+		plan.Actions[2].Executor != string(haActionExecutorControllerAction) ||
+		plan.Actions[2].DependsOn != string(haActionPromoteStandby) ||
+		plan.Actions[2].RouteFrom != "primary" ||
+		plan.Actions[2].RouteTo != "standby-a" {
+		t.Fatalf("unexpected parsed route action: %#v", plan.Actions[2])
+	}
+	if plan.Actions[3].Kind != string(haActionRewindFormerPrimary) ||
+		plan.Actions[3].Phase != string(haActionPhaseRejoin) ||
+		plan.Actions[3].StandbyName != "primary-a" ||
+		plan.Actions[3].TargetLSN != 12 ||
+		plan.Actions[3].ObservedLSN != 13 ||
+		plan.Actions[3].RetainedFromLSN != 8 ||
+		plan.Actions[3].SeedManifestPath != "/backup/base.afha" ||
+		plan.Actions[3].SeedContentRoot != "/backup/base" {
+		t.Fatalf("unexpected parsed former-primary action: %#v", plan.Actions[3])
 	}
 }
 

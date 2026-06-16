@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
@@ -149,6 +150,16 @@ type haPlan struct {
 	SyncPolicy                haSyncEvaluation
 	FormerPrimary             haFormerPrimaryEvaluation
 	PrimaryRoute              haPrimaryRouteEvaluation
+}
+
+type haOperatorPlanTable struct {
+	AutomaticPromotionAllowed bool
+	DesiredStandbyCount       int32
+	HealthyStandbyCount       int32
+	UnhealthyStandbyCount     int32
+	LaggingStandbyCount       int32
+	ReseedRequiredCount       int32
+	Actions                   []antflyv1.HAPlannedActionStatus
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -584,6 +595,170 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		})
 	}
 	return out
+}
+
+func parseHAOperatorPlanTable(body string) (haOperatorPlanTable, error) {
+	lines := parseHATableLines(body)
+	if result := strings.TrimSpace(lines["result"]); result != "" && result != "operator_plan" {
+		return haOperatorPlanTable{}, fmt.Errorf("unexpected HA operator plan result %q", result)
+	}
+
+	var parsed haOperatorPlanTable
+	parsed.AutomaticPromotionAllowed, _ = parseHAResultBool(lines, "automatic_promotion_allowed")
+	parsed.DesiredStandbyCount = haParseInt32Line(lines, "desired_standby_count")
+	parsed.HealthyStandbyCount = haParseInt32Line(lines, "healthy_standby_count")
+	parsed.UnhealthyStandbyCount = haParseInt32Line(lines, "unhealthy_standby_count")
+	parsed.LaggingStandbyCount = haParseInt32Line(lines, "lagging_standby_count")
+	parsed.ReseedRequiredCount = haParseInt32Line(lines, "reseed_required_count")
+
+	actionCount, ok := parseHAResultUint(lines, "action_count")
+	if !ok {
+		return haOperatorPlanTable{}, fmt.Errorf("missing action_count")
+	}
+	if actionCount == 0 {
+		return parsed, nil
+	}
+	parsed.Actions = make([]antflyv1.HAPlannedActionStatus, 0, actionCount)
+	for i := uint64(0); i < actionCount; i++ {
+		action, err := parseHAOperatorPlanAction(lines, i)
+		if err != nil {
+			return haOperatorPlanTable{}, err
+		}
+		parsed.Actions = append(parsed.Actions, action)
+	}
+	return parsed, nil
+}
+
+func parseHAOperatorPlanAction(lines map[string]string, idx uint64) (antflyv1.HAPlannedActionStatus, error) {
+	prefix := fmt.Sprintf("actions.%d.", idx)
+	kind, ok := haCLIActionKind(strings.TrimSpace(lines[prefix+"kind"]))
+	if !ok {
+		return antflyv1.HAPlannedActionStatus{}, fmt.Errorf("missing or unknown HA operator action kind at index %d", idx)
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:             string(kind),
+		Phase:            string(haPlannedActionPhase(kind)),
+		Executor:         string(haPlannedActionExecutor(kind)),
+		DependsOn:        haCLIOptionalActionKind(lines[prefix+"depends_on"]),
+		StandbyName:      strings.TrimSpace(lines[prefix+"standby_name"]),
+		SlotName:         strings.TrimSpace(lines[prefix+"slot_name"]),
+		RouteFrom:        strings.TrimSpace(lines[prefix+"route_from"]),
+		RouteTo:          strings.TrimSpace(lines[prefix+"route_to"]),
+		FenceAuthority:   haCLIFencingAuthority(lines[prefix+"fence_authority"]),
+		FenceHolder:      strings.TrimSpace(lines[prefix+"fence_holder"]),
+		FenceReason:      strings.TrimSpace(lines[prefix+"fence_reason"]),
+		AdminURL:         strings.TrimSpace(lines[prefix+"admin_url"]),
+		SeedManifestPath: strings.TrimSpace(lines[prefix+"seed_manifest_path"]),
+		SeedContentRoot:  strings.TrimSpace(lines[prefix+"seed_content_root"]),
+		Reason:           strings.TrimSpace(lines[prefix+"reason"]),
+	}
+	if phase, ok := haCLIActionPhase(lines[prefix+"phase"]); ok {
+		action.Phase = string(phase)
+	}
+	if executor, ok := haCLIActionExecutor(lines[prefix+"executor"]); ok {
+		action.Executor = string(executor)
+	}
+	action.TargetLSN, _ = parseHAResultUint(lines, prefix+"target_lsn")
+	action.ObservedLSN, _ = parseHAResultUint(lines, prefix+"observed_lsn")
+	action.RetainedFromLSN, _ = parseHAResultUint(lines, prefix+"retained_from_lsn")
+	action.FenceGeneration, _ = parseHAResultUint(lines, prefix+"fence_generation")
+	return action, nil
+}
+
+func haParseInt32Line(lines map[string]string, key string) int32 {
+	value, ok := parseHAResultUint(lines, key)
+	if !ok || value > uint64(^uint32(0)>>1) {
+		return 0
+	}
+	return int32(value)
+}
+
+func haCLIOptionalActionKind(raw string) string {
+	kind, ok := haCLIActionKind(strings.TrimSpace(raw))
+	if !ok {
+		return ""
+	}
+	return string(kind)
+}
+
+func haCLIActionKind(raw string) (haActionKind, bool) {
+	switch raw {
+	case "create_slot":
+		return haActionCreateSlot, true
+	case "resume_slot":
+		return haActionResumeSlot, true
+	case "pause_slot":
+		return haActionPauseSlot, true
+	case "drop_slot":
+		return haActionDropSlot, true
+	case "seed_standby":
+		return haActionSeedStandby, true
+	case "finish_standby_seed":
+		return haActionFinishStandbySeed, true
+	case "bootstrap_standby_seed":
+		return haActionBootstrapStandbySeed, true
+	case "mark_reseed":
+		return haActionMarkReseed, true
+	case "acquire_fence":
+		return haActionAcquireFence, true
+	case "promote_standby":
+		return haActionPromoteStandby, true
+	case "update_primary_endpoint":
+		return haActionUpdatePrimaryRoute, true
+	case "demote_former_primary":
+		return haActionDemoteFormerPrimary, true
+	case "rewind_former_primary":
+		return haActionRewindFormerPrimary, true
+	case "reseed_former_primary":
+		return haActionReseedFormerPrimary, true
+	default:
+		return "", false
+	}
+}
+
+func haCLIActionPhase(raw string) (haActionPhase, bool) {
+	switch strings.TrimSpace(raw) {
+	case "reconcile":
+		return haActionPhaseReconcile, true
+	case "fence":
+		return haActionPhaseFence, true
+	case "promote":
+		return haActionPhasePromote, true
+	case "route":
+		return haActionPhaseRoute, true
+	case "rejoin":
+		return haActionPhaseRejoin, true
+	default:
+		return "", false
+	}
+}
+
+func haCLIActionExecutor(raw string) (haActionExecutor, bool) {
+	switch strings.TrimSpace(raw) {
+	case "admin_command":
+		return haActionExecutorAdminCommand, true
+	case "controller_action":
+		return haActionExecutorControllerAction, true
+	default:
+		return "", false
+	}
+}
+
+func haCLIFencingAuthority(raw string) antflyv1.HAFencingAuthority {
+	switch strings.TrimSpace(raw) {
+	case "none":
+		return antflyv1.HAFencingAuthorityNone
+	case "kubernetes_lease":
+		return antflyv1.HAFencingAuthorityKubernetesLease
+	case "storage_fence":
+		return antflyv1.HAFencingAuthorityStorageFence
+	case "metadata_raft":
+		return antflyv1.HAFencingAuthorityMetadataRaft
+	case "external":
+		return antflyv1.HAFencingAuthorityExternal
+	default:
+		return ""
+	}
 }
 
 func haPlannedActionPhase(kind haActionKind) haActionPhase {
