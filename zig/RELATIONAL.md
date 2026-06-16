@@ -2562,8 +2562,12 @@ The landed execution shape is:
   the qualifying physical rows, computes the overlap with the requested portion,
   and rewrites the row as left, affected, and right fragments. The affected
   fragment is updated or deleted, adjacent fragments retain the original values,
-  and all staged writes/deletes flow through the ordinary relational transaction
-  path.
+  and a portion spanning multiple qualifying source rows is evaluated per
+  source row without coalescing adjacent affected fragments. This preserves the
+  same application-time semantics as PostgreSQL 19 `FOR PORTION OF`: storage
+  may split row counts upward, but it never merges separately sourced intervals
+  just because their post-update values match. All staged writes/deletes flow
+  through the ordinary relational transaction path.
   Whenever a portion mutation splits a physical row, storage deletes the source
   row and writes every remaining fragment under a canonical key derived from the
   scalar primary-key tuple, period name, and normalized `[start, end)` span

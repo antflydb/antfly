@@ -73975,6 +73975,53 @@ test "db relational temporal mutation source splits portions transactionally" {
     try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[3], "sku:a", 8, 9, 77);
     try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[4], "sku:a", 9, 10, 10);
 
+    const multi_row_update_txn = try db.beginTransaction(2_019);
+    const multi_row_update_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "55",
+    }};
+    var multi_row_update = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = update_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-multi-row-update",
+                .txn_id = multi_row_update_txn,
+            },
+        },
+        .operations = multi_row_update_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "3",
+            .to_json = "9",
+        },
+        .returning_all = true,
+    });
+    defer multi_row_update.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), multi_row_update.matched);
+    try std.testing.expectEqual(@as(u32, 3), multi_row_update.staged);
+    try std.testing.expectEqual(@as(usize, 3), multi_row_update.returning_rows.len);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[0], "sku:a", 3, 7, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[1], "sku:a", 7, 8, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[2], "sku:a", 8, 9, 55);
+    try db.commitTransaction(multi_row_update_txn, 2_019);
+
+    var multi_row_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = update_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer multi_row_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), multi_row_rows.total);
+    try std.testing.expectEqual(@as(usize, 5), multi_row_rows.rows.len);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[0], "sku:a", 0, 3, 10);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[1], "sku:a", 3, 7, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[2], "sku:a", 7, 8, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[3], "sku:a", 8, 9, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[4], "sku:a", 9, 10, 10);
+
     const scanned_rows = try relational_store_mod.scanRowsAlloc(alloc, db.core.store, "", "");
     defer relational_store_mod.freeRows(alloc, scanned_rows);
     for (scanned_rows) |row| {
