@@ -1030,7 +1030,9 @@ pub const SequenceOptions = struct {
     as_type: ?[]const u8 = null,
     start_with: ?i64 = null,
     increment_by: ?i64 = null,
+    min_value_specified: bool = false,
     min_value: ?i64 = null,
+    max_value_specified: bool = false,
     max_value: ?i64 = null,
     cache: ?i64 = null,
     cycle: ?bool = null,
@@ -7344,10 +7346,12 @@ const Parser = struct {
             if (options.increment_by != null) return error.UnsupportedSqlShape;
             options.increment_by = try self.parseSequenceInteger();
         } else if (self.matchKeyword("minvalue")) {
-            if (options.min_value != null) return error.UnsupportedSqlShape;
+            if (options.min_value_specified) return error.UnsupportedSqlShape;
+            options.min_value_specified = true;
             options.min_value = try self.parseSequenceInteger();
         } else if (self.matchKeyword("maxvalue")) {
-            if (options.max_value != null) return error.UnsupportedSqlShape;
+            if (options.max_value_specified) return error.UnsupportedSqlShape;
+            options.max_value_specified = true;
             options.max_value = try self.parseSequenceInteger();
         } else if (self.matchKeyword("cache")) {
             if (options.cache != null) return error.UnsupportedSqlShape;
@@ -7357,10 +7361,12 @@ const Parser = struct {
             options.cycle = true;
         } else if (self.matchKeyword("no")) {
             if (self.matchKeyword("minvalue")) {
-                if (options.min_value != null) return error.UnsupportedSqlShape;
+                if (options.min_value_specified) return error.UnsupportedSqlShape;
+                options.min_value_specified = true;
                 options.min_value = null;
             } else if (self.matchKeyword("maxvalue")) {
-                if (options.max_value != null) return error.UnsupportedSqlShape;
+                if (options.max_value_specified) return error.UnsupportedSqlShape;
+                options.max_value_specified = true;
                 options.max_value = null;
             } else if (self.matchKeyword("cycle")) {
                 if (options.cycle != null) return error.UnsupportedSqlShape;
@@ -47110,7 +47116,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:drop_domain:domain=positive_amount:if_exists=true:cascade=true", drop_domain_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, drop_domain));
 
-    var create_sequence = try lowerDdlPlanAlloc(alloc, "CREATE SEQUENCE IF NOT EXISTS users_id_seq START WITH 1 INCREMENT BY 1 CACHE 32 NO CYCLE;");
+    var create_sequence = try lowerDdlPlanAlloc(alloc, "CREATE SEQUENCE IF NOT EXISTS users_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE;");
     defer create_sequence.deinit(alloc);
     const create_sequence_plan = switch (create_sequence) {
         .sequence_catalog => |plan| switch (plan) {
@@ -47123,12 +47129,18 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(create_sequence_plan.if_not_exists);
     try std.testing.expectEqual(@as(?i64, 1), create_sequence_plan.options.start_with);
     try std.testing.expectEqual(@as(?i64, 1), create_sequence_plan.options.increment_by);
+    try std.testing.expect(create_sequence_plan.options.min_value_specified);
+    try std.testing.expectEqual(@as(?i64, null), create_sequence_plan.options.min_value);
+    try std.testing.expect(create_sequence_plan.options.max_value_specified);
+    try std.testing.expectEqual(@as(?i64, null), create_sequence_plan.options.max_value);
     try std.testing.expectEqual(@as(?i64, 32), create_sequence_plan.options.cache);
     try std.testing.expectEqual(@as(?bool, false), create_sequence_plan.options.cycle);
     const create_sequence_fingerprint = try ddlFingerprintAlloc(alloc, create_sequence);
     defer alloc.free(create_sequence_fingerprint);
-    try std.testing.expectEqualStrings("ddl:create_sequence:sequence=users_id_seq:if_not_exists=true:options=4", create_sequence_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_sequence:sequence=users_id_seq:if_not_exists=true:options=6", create_sequence_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_sequence));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MINVALUE MINVALUE 1;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
 
     var create_owned_sequence = try lowerDdlPlanAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
     defer create_owned_sequence.deinit(alloc);
@@ -47236,7 +47248,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:identity_allocator:table=usage_records:column=id:kind=generated_by_default:primary=true:columns=1", generated_identity_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, generated_identity));
 
-    var generated_identity_options = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 CACHE 4 NO CYCLE) PRIMARY KEY, status text);");
+    var generated_identity_options = try lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text);");
     defer generated_identity_options.deinit(alloc);
     const generated_identity_options_plan = switch (generated_identity_options) {
         .identity_allocator_catalog => |plan| plan,
@@ -47248,12 +47260,17 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(generated_identity_options_plan.primary_key);
     try std.testing.expectEqual(@as(?i64, 100), generated_identity_options_plan.options.start_with);
     try std.testing.expectEqual(@as(?i64, 10), generated_identity_options_plan.options.increment_by);
+    try std.testing.expect(generated_identity_options_plan.options.min_value_specified);
+    try std.testing.expectEqual(@as(?i64, null), generated_identity_options_plan.options.min_value);
+    try std.testing.expect(generated_identity_options_plan.options.max_value_specified);
+    try std.testing.expectEqual(@as(?i64, null), generated_identity_options_plan.options.max_value);
     try std.testing.expectEqual(@as(?i64, 4), generated_identity_options_plan.options.cache);
     try std.testing.expectEqual(@as(?bool, false), generated_identity_options_plan.options.cycle);
     const generated_identity_options_fingerprint = try ddlFingerprintAlloc(alloc, generated_identity_options);
     defer alloc.free(generated_identity_options_fingerprint);
-    try std.testing.expectEqualStrings("ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=4", generated_identity_options_fingerprint);
+    try std.testing.expectEqualStrings("ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=6", generated_identity_options_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, generated_identity_options));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (NO MINVALUE MINVALUE 1) PRIMARY KEY, status text);"));
 
     var create_public_schema = try lowerDdlPlanAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
     defer create_public_schema.deinit(alloc);
@@ -58590,8 +58607,8 @@ fn sequenceOptionCount(options: SequenceOptions) usize {
     if (options.as_type != null) count += 1;
     if (options.start_with != null) count += 1;
     if (options.increment_by != null) count += 1;
-    if (options.min_value != null) count += 1;
-    if (options.max_value != null) count += 1;
+    if (options.min_value_specified) count += 1;
+    if (options.max_value_specified) count += 1;
     if (options.cache != null) count += 1;
     if (options.cycle != null) count += 1;
     if (options.owned_by != null) count += 1;
@@ -69238,9 +69255,9 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "create sequence catalog ddl",
             .family = .ddl,
-            .summary = .{ .ddl_tag = .create_sequence, .table_name = "usage_records_id_seq", .operations = 2 },
-            .plan = "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=2",
-            .sql = "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1",
+            .summary = .{ .ddl_tag = .create_sequence, .table_name = "usage_records_id_seq", .operations = 4 },
+            .plan = "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=4",
+            .sql = "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE",
         },
         .{
             .name = "create typed owned sequence catalog ddl",
@@ -69288,8 +69305,8 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "generated identity options allocator catalog ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .identity_allocator, .table_name = "usage_records", .select = 2, .operations = 1 },
-            .plan = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=4",
-            .sql = "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 CACHE 4 NO CYCLE) PRIMARY KEY, status text)",
+            .plan = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=6",
+            .sql = "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text)",
         },
         .{
             .name = "row security enable catalog ddl",

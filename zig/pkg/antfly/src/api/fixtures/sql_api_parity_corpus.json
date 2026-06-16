@@ -7511,10 +7511,10 @@
       "summary": {
         "ddl_tag": "create_sequence",
         "table_name": "usage_records_id_seq",
-        "operations": 2
+        "operations": 4
       },
-      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=2",
-      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1"
+      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=4",
+      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE"
     },
     {
       "name": "create typed owned sequence catalog ddl",
@@ -7592,8 +7592,8 @@
         "select": 2,
         "operations": 1
       },
-      "plan": "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=4",
-      "sql": "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 CACHE 4 NO CYCLE) PRIMARY KEY, status text)"
+      "plan": "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=6",
+      "sql": "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text)"
     },
     {
       "name": "row security enable catalog ddl",
