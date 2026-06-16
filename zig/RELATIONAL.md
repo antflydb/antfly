@@ -5246,9 +5246,11 @@ Pagination summaries are scoped to typed stages that actually order or trim a
 row stream. `order_by`, `limit`, and `offset` are valid on row-query, aggregate,
 join, lateral, window, source-query mutation, joined mutation-source, generic
 read, and `EXPLAIN` wrapper plans whose runner structurally asserts those
-fields. Point writes, merge arms, DDL, and relation-population metadata reject
-pagination summaries unless their verifier grows a dedicated typed stream
-assertion path.
+fields. Point writes, merge arms, and DDL reject pagination summaries. Relation
+population summaries are target-only today: they may name the populated relation,
+while source projection, predicate, CTE, and pagination evidence stays in the
+typed source-read fingerprint until the fixture runner has a dedicated source
+summary assertion path.
 
 Row-claim summaries are tied to lockable query sources. `row_claim_skip_locked`
 is valid only on row-query plans, join/lateral plans that assert the left

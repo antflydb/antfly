@@ -61570,6 +61570,12 @@ fn appParitySummaryHasFields(summary: AppParityPlanSummary) bool {
         summary.temporal_foreign_keys != null;
 }
 
+fn appParitySummaryHasNonTableFields(summary: AppParityPlanSummary) bool {
+    var without_table = summary;
+    without_table.table_name = null;
+    return appParitySummaryHasFields(without_table);
+}
+
 fn appParityWriteObjectComma(writer: anytype, first: *bool) !void {
     if (first.*) {
         first.* = false;
@@ -62591,6 +62597,9 @@ fn validateAppParityFixtureMetadata(
     if (appParitySummaryHasFields(entry.summary) and !appParityFixtureFamilyAllowsSummary(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.family == .relation_population and appParitySummaryHasNonTableFields(entry.summary)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.summary.ctes) |ctes| {
         if (!appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", ctes)) {
             return error.TestUnexpectedResult;
@@ -62851,6 +62860,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_archive", .limit = 5 },
         .plan = "relation_population:mode=create_table_as:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "relation population source projection summary",
+        .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+        .family = .relation_population,
+        .summary = .{ .table_name = "usage_archive", .select = 2 },
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "relation population source predicate summary",
+        .sql = "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'",
+        .family = .relation_population,
+        .summary = .{ .table_name = "usage_archive", .predicates = 1 },
+        .plan = "relation_population:mode=select_into:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid relation population target summary",
+        .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+        .family = .relation_population,
+        .summary = .{ .table_name = "usage_archive" },
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "stale query cte summary",
