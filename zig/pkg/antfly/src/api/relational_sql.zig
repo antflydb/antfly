@@ -27382,6 +27382,10 @@ const Parser = struct {
         return sqlExpressionTypeIsTextLike(field_type) or field_type == .numeric or field_type == .datetime or field_type == .boolean;
     }
 
+    fn sqlExpressionTypeIsOrderKey(field_type: runtime_schema.AntflyType) bool {
+        return sqlExpressionTypeIsOrderable(field_type) or field_type == .json or field_type == .array;
+    }
+
     fn stringToArrayPredicateIsContainment(self: *@This()) bool {
         if (!self.peekKeyword("string_to_array")) return false;
         var depth: usize = 0;
@@ -32450,7 +32454,7 @@ const Parser = struct {
 
     fn validateOrderableRowExpression(self: *@This(), expression: db_mod.types.RelationalRowsExpression) anyerror!void {
         const output_type = try self.rowExpressionOutputType(expression);
-        if (!sqlExpressionTypeIsOrderable(output_type)) return error.UnsupportedSqlShape;
+        if (!sqlExpressionTypeIsOrderKey(output_type)) return error.UnsupportedSqlShape;
     }
 
     fn rowExpressionOutputType(self: *@This(), expression: db_mod.types.RelationalRowsExpression) !runtime_schema.AntflyType {
@@ -50129,12 +50133,16 @@ test "postgres sql adapter lowers jsonb containment existence and extraction pro
     try std.testing.expectEqualStrings("id", to_jsonb.query.order_by[0].field);
     try std.testing.expect(to_jsonb.query.order_by[0].expression == null);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    var to_jsonb_order = try lowerSelectAlloc(
         alloc,
         "SELECT id, to_jsonb(id) AS id_json FROM usage_records WHERE jsonb_typeof(to_jsonb(id)) = 'string' ORDER BY to_jsonb(id) ASC LIMIT 5",
         schema,
         &.{},
-    ));
+    );
+    defer to_jsonb_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), to_jsonb_order.query.order_by.len);
+    try std.testing.expect(to_jsonb_order.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.to_jsonb, to_jsonb_order.query.order_by[0].expression.?.kind);
 
     var convert_from = try lowerSelectAlloc(
         alloc,
@@ -54816,24 +54824,38 @@ test "postgres sql adapter lowers length into expression AST" {
     try std.testing.expect(parenthesized_boolean_order.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, parenthesized_boolean_order.query.order_by[0].expression.?.kind);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    var json_object_order = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records ORDER BY jsonb_build_object('id', id) ASC LIMIT 5",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    );
+    defer json_object_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), json_object_order.query.order_by.len);
+    try std.testing.expect(json_object_order.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_build_object, json_object_order.query.order_by[0].expression.?.kind);
+
+    var to_jsonb_status_order = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    );
+    defer to_jsonb_status_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), to_jsonb_status_order.query.order_by.len);
+    try std.testing.expect(to_jsonb_status_order.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.to_jsonb, to_jsonb_status_order.query.order_by[0].expression.?.kind);
+
+    var array_order = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records ORDER BY (string_to_array(status, '-')) ASC LIMIT 5",
         schema,
         &.{},
-    ));
+    );
+    defer array_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), array_order.query.order_by.len);
+    try std.testing.expect(array_order.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, array_order.query.order_by[0].expression.?.kind);
 
     var ends = try lowerSelectAlloc(
         alloc,
@@ -62168,11 +62190,9 @@ const AppParityCorpusCoverage = struct {
     unsupported_update_joined_source: bool = false,
     unsupported_delete_joined_source: bool = false,
     unsupported_query_recursive_cte_stream_plan: bool = false,
-    unsupported_query_unorderable_order_key: bool = false,
     unsupported_query_set_operation_plan: bool = false,
     query_calendar_interval_expression: bool = false,
     unsupported_read_recursive_cte_stream_plan: bool = false,
-    unsupported_read_unorderable_order_key: bool = false,
     unsupported_read_duplicate_output_name: bool = false,
     unsupported_read_aggregate_duplicate_output_name: bool = false,
     unsupported_read_set_operation_union: bool = false,
@@ -63126,11 +63146,9 @@ const AppParityCorpusCoverage = struct {
         }
         if (entry.family == .unsupported) {
             self.unsupported_query_recursive_cte_stream_plan = self.unsupported_query_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
-            self.unsupported_query_unorderable_order_key = self.unsupported_query_unorderable_order_key or std.mem.eql(u8, entry.classification_reason, "unorderable_order_key");
             self.unsupported_query_set_operation_plan = self.unsupported_query_set_operation_plan or std.mem.eql(u8, entry.classification_reason, "set_operation_plan");
         } else if (entry.family == .unsupported_read) {
             self.unsupported_read_recursive_cte_stream_plan = self.unsupported_read_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
-            self.unsupported_read_unorderable_order_key = self.unsupported_read_unorderable_order_key or std.mem.eql(u8, entry.classification_reason, "unorderable_order_key");
             self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
                 std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
@@ -64041,11 +64059,9 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_advisory_lock);
         try std.testing.expect(self.ddl_advisory_unlock);
         try std.testing.expect(self.unsupported_query_recursive_cte_stream_plan);
-        try std.testing.expect(self.unsupported_query_unorderable_order_key);
         try std.testing.expect(self.unsupported_query_set_operation_plan);
         try std.testing.expect(self.query_calendar_interval_expression);
         try std.testing.expect(self.unsupported_read_recursive_cte_stream_plan);
-        try std.testing.expect(self.unsupported_read_unorderable_order_key);
         try std.testing.expect(self.unsupported_read_duplicate_output_name);
         try std.testing.expect(self.unsupported_read_aggregate_duplicate_output_name);
         try std.testing.expect(self.unsupported_read_set_operation_union);
@@ -68972,10 +68988,10 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree",
         },
         .{
-            .name = "unsupported unorderable json order key query",
-            .family = .unsupported,
-            .plan = "unsupported:query:requires=unorderable_order_key",
-            .classification_reason = "unorderable_order_key",
+            .name = "single table json expression order key query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
             .sql = "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5",
         },
         .{
@@ -69119,10 +69135,10 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree",
         },
         .{
-            .name = "unsupported read unorderable json order key",
-            .family = .unsupported_read,
-            .plan = "unsupported:read:requires=unorderable_order_key",
-            .classification_reason = "unorderable_order_key",
+            .name = "read json expression order key",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
             .sql = "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5",
         },
         .{

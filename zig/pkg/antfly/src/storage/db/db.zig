@@ -22830,6 +22830,7 @@ pub const DB = struct {
         bool: bool,
         number: f64,
         string: []const u8,
+        json: []const u8,
     };
 
     const RelationalRowsQuerySortContext = struct {
@@ -26367,6 +26368,7 @@ pub const DB = struct {
                 .bool => |value| .{ .bool = value },
                 .number => |value| .{ .number = value },
                 .string => |value| .{ .string = try alloc.dupe(u8, value) },
+                .json => |value| .{ .json = try alloc.dupe(u8, value) },
             };
             initialized += 1;
         }
@@ -26401,8 +26403,51 @@ pub const DB = struct {
             .integer => |integer| .{ .number = @floatFromInt(integer) },
             .float => |float| .{ .number = float },
             .string => |text| .{ .string = try alloc.dupe(u8, text) },
+            .array, .object => .{ .json = try relationalRowsCanonicalJsonOrderKeyAlloc(alloc, selected.*) },
             else => error.InvalidQueryRequest,
         };
+    }
+
+    fn relationalRowsCanonicalJsonOrderKeyAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        try writeRelationalRowsCanonicalJsonOrderKey(alloc, &out.writer, value);
+        return try out.toOwnedSlice();
+    }
+
+    fn writeRelationalRowsCanonicalJsonOrderKey(alloc: Allocator, writer: *std.Io.Writer, value: std.json.Value) !void {
+        switch (value) {
+            .array => |items| {
+                try writer.writeByte('[');
+                for (items.items, 0..) |item, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try writeRelationalRowsCanonicalJsonOrderKey(alloc, writer, item);
+                }
+                try writer.writeByte(']');
+            },
+            .object => |object| {
+                const keys = object.keys();
+                const order = try alloc.alloc(usize, keys.len);
+                defer alloc.free(order);
+                for (order, 0..) |*slot, i| slot.* = i;
+                const KeyOrder = struct {
+                    keys: []const []const u8,
+                    fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
+                        return std.mem.order(u8, ctx.keys[lhs], ctx.keys[rhs]) == .lt;
+                    }
+                };
+                std.sort.pdq(usize, order, KeyOrder{ .keys = keys }, KeyOrder.lessThan);
+                try writer.writeByte('{');
+                for (order, 0..) |key_index, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    const key = keys[key_index];
+                    try writer.print("{f}:", .{std.json.fmt(key, .{})});
+                    try writeRelationalRowsCanonicalJsonOrderKey(alloc, writer, object.get(key).?);
+                }
+                try writer.writeByte('}');
+            },
+            else => try std.json.Stringify.value(value, .{}, writer),
+        }
     }
 
     fn sortRelationalRowsOutputRowsAlloc(
@@ -26493,6 +26538,11 @@ pub const DB = struct {
                 .eq => .eq,
                 .gt => .gt,
             },
+            .json => |left| switch (std.mem.order(u8, left, rhs.json)) {
+                .lt => .lt,
+                .eq => .eq,
+                .gt => .gt,
+            },
         };
     }
 
@@ -26509,8 +26559,9 @@ pub const DB = struct {
             .bool => 0,
             .number => 1,
             .string => 2,
-            .null => 3,
-            .missing => 4,
+            .json => 3,
+            .null => 4,
+            .missing => 5,
         };
     }
 
@@ -26580,7 +26631,7 @@ pub const DB = struct {
 
     fn freeRelationalRowsQueryOrderKeys(alloc: Allocator, keys: []const RelationalRowsQueryOrderKey) void {
         for (keys) |key| switch (key) {
-            .string => |text| alloc.free(text),
+            .string, .json => |text| alloc.free(text),
             else => {},
         };
     }

@@ -510,11 +510,14 @@ with selected fields, and `SELECT *` extras that collide with real row fields
 fail closed before a typed row-query plan is produced.
 Parenthesized scalar order expressions are the same typed order keys as their
 unparenthesized forms: text-like, numeric, datetime, and boolean outputs are
-accepted, while JSON, array, and object-valued expressions fail closed instead
-of entering storage as unorderable values. The SQL adapter applies that same
-guard to every direct `SELECT` and read-classifier expression `ORDER BY` branch,
-including JSON construction, `to_jsonb`, and array-producing expressions, so
-unsupported order keys fail before a typed plan is accepted.
+accepted directly. JSON, object, and array outputs are also typed order keys:
+storage encodes them as canonical JSON for comparison, sorting object keys
+recursively and preserving array order, so SQL and REST/SDK expression ordering
+share one deterministic contract. The SQL adapter applies that same guard to
+every direct `SELECT` and read-classifier expression `ORDER BY` branch,
+including JSON construction, `to_jsonb`, and array-producing expressions; only
+expression domains with no deterministic order key still fail before a typed
+plan is accepted.
 PostgreSQL `ORDER BY expr USING <` / `USING <=` lowers to the same ascending
 typed order direction as `ASC`, and `USING >` / `USING >=` lowers to the same
 descending direction as `DESC`; other ordering operators fail closed because

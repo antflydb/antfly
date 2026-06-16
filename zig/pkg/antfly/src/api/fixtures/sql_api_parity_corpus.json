@@ -6683,10 +6683,15 @@
       "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
     },
     {
-      "name": "unsupported unorderable json order key query",
-      "family": "unsupported",
-      "plan": "unsupported:query:requires=unorderable_order_key",
-      "classification_reason": "unorderable_order_key",
+      "name": "single table json expression order key query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
       "sql": "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5"
     },
     {
@@ -6898,10 +6903,15 @@
       "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
     },
     {
-      "name": "unsupported read unorderable json order key",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=unorderable_order_key",
-      "classification_reason": "unorderable_order_key",
+      "name": "read json expression order key",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
       "sql": "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5"
     },
     {
