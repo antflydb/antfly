@@ -62371,6 +62371,9 @@ fn validateAppParityFixtureMetadata(
         if (entry.summary.returning == null or entry.summary.returning.? != entry.returning_rows.len) {
             return error.TestUnexpectedResult;
         }
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", entry.returning_rows.len)) {
+            return error.TestUnexpectedResult;
+        }
     }
     for (entry.returning_rows) |returning_row| {
         if (!(try appParityJsonTextIsObject(alloc, returning_row))) return error.TestUnexpectedResult;
@@ -62624,6 +62627,15 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "returning rows plan count mismatch",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+        .returning_rows = &.{"{\"id\":\"u1\"}"},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "resolver row without version",
         .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id",
         .family = .insert,
@@ -62781,6 +62793,24 @@ fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
             value = value * 10 + @as(usize, plan[pos] - '0');
         }
         if (value > 0) return true;
+        start = index + token.len;
+    }
+    return false;
+}
+
+fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        var pos = index + token.len;
+        if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') {
+            start = index + token.len;
+            continue;
+        }
+        var value: usize = 0;
+        while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
+            value = value * 10 + @as(usize, plan[pos] - '0');
+        }
+        if (value == expected) return true;
         start = index + token.len;
     }
     return false;
