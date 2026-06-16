@@ -61197,89 +61197,12 @@ fn expectAppParityCorpusEntry(
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
         },
-        .query => {
-            var lowered = try lowerQueryPlanAlloc(alloc, entry.sql, effective_schema, entry.params);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.ctes, lowered.plan.ctes.len);
-            try expectQuerySummary(entry.summary, lowered.plan.query);
-            var fingerprint = try queryFingerprintAlloc(alloc, "query", lowered.table_name, lowered.plan.query, lowered.plan.ctes.len);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lowered.plan.query.offset);
-            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "select_all", lowered.plan.query.select_all);
-            fingerprint = try appendQueryAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.query);
-            fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.ctes);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .aggregate => {
-            var lowered = try lowerAggregatePlanAlloc(alloc, entry.sql, effective_schema, entry.params);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.ctes, lowered.plan.ctes.len);
-            try expectQuerySourceSummary(entry.summary, lowered.plan.aggregate.source);
-            try expectOptionalUsize(entry.summary.group_by, lowered.plan.aggregate.group_by.len);
-            try expectOptionalUsize(entry.summary.group_expressions, lowered.plan.aggregate.group_expressions.len);
-            try expectOptionalUsize(entry.summary.aggregations, lowered.plan.aggregate.aggregations.len);
-            try expectOptionalUsize(entry.summary.filter_groups, aggregateFilterGroupCount(lowered.plan.aggregate.aggregations));
-            try expectOptionalUsize(entry.summary.having, lowered.plan.aggregate.having_predicates.len);
-            try expectOptionalUsize(entry.summary.having_expressions, lowered.plan.aggregate.having_expressions.len);
-            try expectOptionalUsize(entry.summary.having_any, lowered.plan.aggregate.having_any.len);
-            try expectOptionalUsize(entry.summary.having_not, lowered.plan.aggregate.having_not.len);
-            try expectOptionalUsize(entry.summary.order_by, lowered.plan.aggregate.order_by.len);
-            try expectOptionalU32(entry.summary.limit, lowered.plan.aggregate.limit);
-            if (entry.summary.offset) |expected| try std.testing.expectEqual(expected, lowered.plan.aggregate.offset);
-            var fingerprint = try aggregatePlanFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lowered.plan.aggregate.offset);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .join => {
-            var lowered = try lowerJoinAlloc(alloc, entry.sql, effective_schema, entry.params);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.left_table_name);
-            try expectCombinedQuerySourceSummary(entry.summary, lowered.join.left, lowered.join.right);
-            try expectOptionalUsize(entry.summary.join_on, lowered.join.on.len);
-            try expectOptionalUsize(entry.summary.join_select, lowered.join.select.len);
-            try expectOptionalUsize(entry.summary.order_by, lowered.join.order_by.len);
-            try expectOptionalU32(entry.summary.limit, lowered.join.limit);
-            if (entry.summary.offset) |expected| try std.testing.expectEqual(expected, lowered.join.offset);
-            var fingerprint = try joinFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lowered.join.offset);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .lateral => {
-            var lowered = try lowerLateralPlanAlloc(alloc, entry.sql, effective_schema, entry.params);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.left_table_name);
-            try expectCombinedQuerySourceSummary(entry.summary, lowered.plan.lateral.left, lowered.plan.lateral.right);
-            try expectOptionalUsize(entry.summary.lateral_correlations, lowered.plan.lateral.correlations.len);
-            try expectOptionalUsize(entry.summary.join_select, lowered.plan.lateral.select.len);
-            try expectOptionalUsize(entry.summary.order_by, lowered.plan.lateral.order_by.len);
-            try expectOptionalU32(entry.summary.limit, lowered.plan.lateral.limit);
-            if (entry.summary.offset) |expected| try std.testing.expectEqual(expected, lowered.plan.lateral.offset);
-            if (entry.summary.right_offset) |expected| try std.testing.expectEqual(expected, lowered.plan.lateral.right.offset);
-            var fingerprint = try lateralFingerprintAlloc(alloc, lowered);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "right_offset", lowered.plan.lateral.right.offset);
-            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lowered.plan.lateral.offset);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
-        .window => {
-            var lowered = try lowerWindowPlanAlloc(alloc, entry.sql, effective_schema, entry.params);
-            defer lowered.deinit(alloc);
-            try expectOptionalTableName(entry.summary.table_name, lowered.table_name);
-            try expectOptionalUsize(entry.summary.ctes, lowered.plan.ctes.len);
-            try expectQuerySourceSummary(entry.summary, lowered.plan.window.source);
-            try expectOptionalUsize(entry.summary.windows, lowered.plan.window.windows.len);
-            try expectOptionalUsize(entry.summary.select, lowered.plan.window.select.len);
-            try expectOptionalUsize(entry.summary.order_by, lowered.plan.window.order_by.len);
-            try expectOptionalU32(entry.summary.limit, lowered.plan.window.limit);
-            if (entry.summary.offset) |expected| try std.testing.expectEqual(expected, lowered.plan.window.offset);
-            const fingerprint = try windowFingerprintAlloc(alloc, lowered);
-            defer alloc.free(fingerprint);
-            try expectAppParityPlan(entry.plan, fingerprint);
-        },
+        .query,
+        .aggregate,
+        .join,
+        .lateral,
+        .window,
+        => return error.TestUnexpectedResult,
         .explain => {
             var lowered = try lowerAppParityExplainPlanAlloc(
                 alloc,
