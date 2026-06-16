@@ -24,6 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const admin = @import("admin.zig");
 const admin_cli = @import("admin_cli.zig");
+const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const metrics = @import("metrics.zig");
@@ -37,10 +38,35 @@ const status = @import("status.zig");
 
 var test_path_counter: u64 = 0;
 
+const max_manifest_bytes = 64 * 1024 * 1024;
+const max_manifest_file_bytes = 256 * 1024 * 1024;
+
 pub const Context = struct {
     primary: ?*primary_mod.Primary = null,
     standby: ?*standby_mod.Standby = null,
     fence_store: ?*fencing.Store = null,
+};
+
+pub const SeedFinishResult = struct {
+    manifest_id: []u8,
+    backup_lsn: u64,
+    end_record_lsn: u64,
+
+    pub fn deinit(self: *SeedFinishResult, alloc: Allocator) void {
+        alloc.free(self.manifest_id);
+        self.* = undefined;
+    }
+};
+
+pub const SeedBootstrapResult = struct {
+    manifest_id: []u8,
+    backup_lsn: u64,
+    checkpoint_lsn: u64,
+
+    pub fn deinit(self: *SeedBootstrapResult, alloc: Allocator) void {
+        alloc.free(self.manifest_id);
+        self.* = undefined;
+    }
 };
 
 pub const Result = union(enum) {
@@ -48,6 +74,8 @@ pub const Result = union(enum) {
     slot: admin.SlotResult,
     slot_list: status.PrimarySnapshot,
     seed_begin: primary_mod.BaseBackupStartResult,
+    seed_finish: SeedFinishResult,
+    seed_bootstrap: SeedBootstrapResult,
     start_replication: replication_api.StartReplicationResponse,
     standby_status_update: replication_api.StandbyStatusUpdateResponse,
     primary_status: status.PrimarySnapshot,
@@ -63,6 +91,8 @@ pub const Result = union(enum) {
         switch (self.*) {
             .start_replication => |*result| result.deinit(alloc),
             .slot_list => |*snapshot| snapshot.deinit(alloc),
+            .seed_finish => |*result| result.deinit(alloc),
+            .seed_bootstrap => |*result| result.deinit(alloc),
             .primary_status => |*snapshot| snapshot.deinit(alloc),
             .primary_metrics => |*snapshot| snapshot.deinit(alloc),
             .promote => |*result| result.deinit(alloc),
@@ -134,6 +164,16 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .seed_begin => |response| {
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "start_record_lsn", response.start_record_lsn);
+        },
+        .seed_finish => |response| {
+            try appendLine(alloc, &out, "manifest_id", response.manifest_id);
+            try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
+            try appendU64Line(alloc, &out, "end_record_lsn", response.end_record_lsn);
+        },
+        .seed_bootstrap => |response| {
+            try appendLine(alloc, &out, "manifest_id", response.manifest_id);
+            try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
+            try appendU64Line(alloc, &out, "checkpoint_lsn", response.checkpoint_lsn);
         },
         .start_replication => |response| {
             try appendLine(alloc, &out, "slot_name", response.slot_name);
@@ -238,7 +278,7 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .slot_list => |command| .{
             .slot_list = try admin.primaryStatus(alloc, try requirePrimary(ctx), command.retention_policy, null),
         },
-        .seed => |command| try executeSeed(try requirePrimary(ctx), command),
+        .seed => |command| try executeSeed(alloc, ctx, command),
         .start_replication => |request| .{
             .start_replication = try replication_api.startReplication(alloc, try requirePrimary(ctx), request),
         },
@@ -262,12 +302,54 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
     };
 }
 
-fn executeSeed(primary: *primary_mod.Primary, command: admin_cli.SeedCommand) !Result {
+fn executeSeed(alloc: Allocator, ctx: Context, command: admin_cli.SeedCommand) !Result {
     return switch (command) {
-        .begin => |request| .{ .seed_begin = try admin.beginBaseBackup(primary, request) },
-        .finish => error.ManifestFileExecutionRequiresIntegration,
-        .bootstrap => error.ManifestFileExecutionRequiresIntegration,
+        .begin => |request| .{ .seed_begin = try admin.beginBaseBackup(try requirePrimary(ctx), request) },
+        .finish => |request| try executeSeedFinish(alloc, try requirePrimary(ctx), request),
+        .bootstrap => |request| try executeSeedBootstrap(alloc, try requireStandby(ctx), request),
     };
+}
+
+fn executeSeedFinish(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    command: admin_cli.SeedManifestPathCommand,
+) !Result {
+    var decoded = try readManifestAlloc(alloc, command.manifest_path);
+    defer decoded.deinit(alloc);
+
+    const ended = try admin.endBaseBackup(primary, .{
+        .identity = decoded.view.identity,
+        .manifest_id = decoded.view.manifest_id,
+        .backup_lsn = decoded.view.backup_lsn,
+        .checkpoint_lsn = decoded.view.checkpoint_lsn,
+        .files = decoded.view.files,
+        .flags = decoded.view.flags,
+    });
+
+    return .{ .seed_finish = .{
+        .manifest_id = try alloc.dupe(u8, ended.manifest_id),
+        .backup_lsn = ended.backup_lsn,
+        .end_record_lsn = ended.end_record_lsn,
+    } };
+}
+
+fn executeSeedBootstrap(
+    alloc: Allocator,
+    standby: *standby_mod.Standby,
+    command: admin_cli.SeedBootstrapCommand,
+) !Result {
+    var decoded = try readManifestAlloc(alloc, command.manifest_path);
+    defer decoded.deinit(alloc);
+    var contents = try readManifestContentsAlloc(alloc, decoded.view, command.content_root orelse manifestParent(command.manifest_path));
+    defer contents.deinit(alloc);
+
+    const bootstrapped = try admin.bootstrapStandby(alloc, standby, decoded.view, contents.items);
+    return .{ .seed_bootstrap = .{
+        .manifest_id = try alloc.dupe(u8, bootstrapped.manifest_id),
+        .backup_lsn = bootstrapped.backup_lsn,
+        .checkpoint_lsn = bootstrapped.checkpoint_lsn,
+    } };
 }
 
 fn executePrimaryStatus(
@@ -297,6 +379,76 @@ fn executeStandbyStatus(standby: *const standby_mod.Standby, command: admin_cli.
     };
 }
 
+const DecodedManifest = struct {
+    raw: []u8,
+    view: backup_manifest.ManifestView,
+
+    fn deinit(self: *DecodedManifest, alloc: Allocator) void {
+        backup_manifest.freeDecoded(alloc, self.view);
+        alloc.free(self.raw);
+        self.* = undefined;
+    }
+};
+
+const ManifestContents = struct {
+    items: []backup_manifest.FileContent,
+
+    fn deinit(self: *ManifestContents, alloc: Allocator) void {
+        for (self.items) |content| alloc.free(content.bytes);
+        alloc.free(self.items);
+        self.* = undefined;
+    }
+};
+
+fn readManifestAlloc(alloc: Allocator, path: []const u8) !DecodedManifest {
+    const raw = try readFileAlloc(alloc, path, max_manifest_bytes);
+    errdefer alloc.free(raw);
+    const view = try backup_manifest.decodeAlloc(alloc, raw);
+    return .{
+        .raw = raw,
+        .view = view,
+    };
+}
+
+fn readManifestContentsAlloc(
+    alloc: Allocator,
+    manifest: backup_manifest.ManifestView,
+    content_root: []const u8,
+) !ManifestContents {
+    const items = try alloc.alloc(backup_manifest.FileContent, manifest.files.len);
+    errdefer alloc.free(items);
+
+    var filled: usize = 0;
+    errdefer for (items[0..filled]) |content| alloc.free(content.bytes);
+    for (manifest.files, 0..) |file, idx| {
+        const path = try std.fs.path.join(alloc, &.{ content_root, file.path });
+        defer alloc.free(path);
+        const max_bytes = try checkedManifestFileReadLimit(file.size_bytes);
+        items[idx] = .{
+            .path = file.path,
+            .bytes = try readFileAlloc(alloc, path, max_bytes),
+        };
+        filled += 1;
+    }
+
+    return .{ .items = items };
+}
+
+fn checkedManifestFileReadLimit(size_bytes: u64) !usize {
+    if (size_bytes > max_manifest_file_bytes) return error.ManifestFileTooLarge;
+    return @intCast(size_bytes + 1);
+}
+
+fn readFileAlloc(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
+}
+
+fn manifestParent(path: []const u8) []const u8 {
+    return std.fs.path.dirname(path) orelse ".";
+}
+
 fn requirePrimary(ctx: Context) !*primary_mod.Primary {
     return ctx.primary orelse error.PrimaryUnavailable;
 }
@@ -315,6 +467,8 @@ fn resultName(result: Result) []const u8 {
         .slot => "slot",
         .slot_list => "slot_list",
         .seed_begin => "seed_begin",
+        .seed_finish => "seed_finish",
+        .seed_bootstrap => "seed_bootstrap",
         .start_replication => "start_replication",
         .standby_status_update => "standby_status_update",
         .primary_status => "primary_status",
@@ -642,6 +796,7 @@ const TestPaths = struct {
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
     fence_wal: [:0]u8,
+    backup_root: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
@@ -649,6 +804,7 @@ const TestPaths = struct {
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
         alloc.free(self.fence_wal);
+        alloc.free(self.backup_root);
     }
 };
 
@@ -664,6 +820,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_progress);
     const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
     defer alloc.free(fence_wal);
+    const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -672,6 +830,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
@@ -679,6 +838,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
         .fence_wal = try alloc.dupeZ(u8, fence_wal),
+        .backup_root = try alloc.dupeZ(u8, backup_root),
     };
 }
 
@@ -713,6 +873,23 @@ fn baseRecord(identity: standby_mod.Identity, lsn: u64, payload: []const u8) rep
         .previous_lsn = lsn - 1,
         .payload = payload,
     };
+}
+
+fn seedFiles() [2]backup_manifest.FileEntry {
+    return .{
+        .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+        .{ .path = "sst/0001", .kind = .sstable, .size_bytes = 7, .crc32 = backup_manifest.crc32("sstable") },
+    };
+}
+
+fn writeTestFile(path: []const u8, bytes: []const u8) !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = path,
+        .data = bytes,
+    });
 }
 
 const ApplyCounter = struct {
@@ -780,6 +957,68 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer rendered.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain; version=0.0.4", rendered.content_type);
     try expectContains(rendered.body, "antfly_ha_primary_current_lsn 2\n");
+}
+
+test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "seed-files");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var begin_plan = try admin_cli.parse(alloc, &.{ "seed", "begin", "--slot", "standby-a", "--manifest-id", "base-0001" });
+    defer begin_plan.deinit(alloc);
+    var begun = try execute(alloc, .{ .primary = &primary }, begin_plan);
+    defer begun.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), begun.seed_begin.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
+
+    const files = seedFiles();
+    const encoded_manifest = try backup_manifest.encodeAlloc(alloc, .{
+        .identity = identity,
+        .manifest_id = "base-0001",
+        .backup_lsn = begun.seed_begin.backup_lsn,
+        .checkpoint_lsn = 2,
+        .files = &files,
+    });
+    defer alloc.free(encoded_manifest);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "backup.afha" });
+    defer alloc.free(manifest_path);
+    const manifest_file_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "manifest" });
+    defer alloc.free(manifest_file_path);
+    const sstable_path = try std.fs.path.join(alloc, &.{ paths.backup_root, "sst/0001" });
+    defer alloc.free(sstable_path);
+    try writeTestFile(manifest_path, encoded_manifest);
+    try writeTestFile(manifest_file_path, "manifest");
+    try writeTestFile(sstable_path, "sstable");
+
+    var finish_plan = try admin_cli.parse(alloc, &.{ "seed", "finish", "--manifest", manifest_path });
+    defer finish_plan.deinit(alloc);
+    var finished = try execute(alloc, .{ .primary = &primary }, finish_plan);
+    defer finished.deinit(alloc);
+    try std.testing.expectEqualStrings("base-0001", finished.seed_finish.manifest_id);
+    try std.testing.expectEqual(@as(u64, 1), finished.seed_finish.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 3), finished.seed_finish.end_record_lsn);
+
+    var bootstrap_plan = try admin_cli.parse(alloc, &.{ "seed", "bootstrap", "--manifest", manifest_path, "--content-root", paths.backup_root });
+    defer bootstrap_plan.deinit(alloc);
+    var bootstrapped = try execute(alloc, .{ .standby = &standby }, bootstrap_plan);
+    defer bootstrapped.deinit(alloc);
+    try std.testing.expectEqualStrings("base-0001", bootstrapped.seed_bootstrap.manifest_id);
+    try std.testing.expectEqual(@as(u64, 1), bootstrapped.seed_bootstrap.backup_lsn);
+    try std.testing.expectEqual(@as(u64, 2), bootstrapped.seed_bootstrap.checkpoint_lsn);
+    try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
+
+    const table_body = try renderTableAlloc(alloc, bootstrapped);
+    defer alloc.free(table_body);
+    try expectContains(table_body, "result=seed_bootstrap\n");
+    try expectContains(table_body, "manifest_id=base-0001\n");
+    try expectContains(table_body, "checkpoint_lsn=2\n");
 }
 
 test "storage.ha admin exec runs read commit promote and rejoin commands" {
