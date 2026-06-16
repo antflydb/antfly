@@ -63182,6 +63182,18 @@ const AppParityCorpusCoverage = struct {
     window_scalar_minmax: bool = false,
     window_modulo_expression: bool = false,
     joined_source_computed_pattern_filter: bool = false,
+    parameterized_query: bool = false,
+    parameterized_aggregate: bool = false,
+    parameterized_join: bool = false,
+    parameterized_lateral: bool = false,
+    parameterized_window: bool = false,
+    parameterized_insert: bool = false,
+    parameterized_update: bool = false,
+    parameterized_delete: bool = false,
+    parameterized_update_source: bool = false,
+    parameterized_delete_source: bool = false,
+    parameterized_update_joined_source: bool = false,
+    parameterized_delete_joined_source: bool = false,
 
     fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
         const uses_cte_stream = appParityPlanHasNonZeroToken(entry.plan, ":ctes=") or appParityPlanHasNonZeroToken(entry.plan, ":source_cte=");
@@ -63193,6 +63205,23 @@ const AppParityCorpusCoverage = struct {
         const is_update_joined_source = entry.family == .update_joined_source;
         const is_delete_joined_source = entry.family == .delete_joined_source;
         const is_joined_source = is_update_joined_source or is_delete_joined_source;
+        if (entry.params.len > 0) {
+            switch (entry.family) {
+                .query => self.parameterized_query = true,
+                .aggregate => self.parameterized_aggregate = true,
+                .join => self.parameterized_join = true,
+                .lateral => self.parameterized_lateral = true,
+                .window => self.parameterized_window = true,
+                .insert => self.parameterized_insert = true,
+                .update => self.parameterized_update = true,
+                .delete => self.parameterized_delete = true,
+                .update_source => self.parameterized_update_source = true,
+                .delete_source => self.parameterized_delete_source = true,
+                .update_joined_source => self.parameterized_update_joined_source = true,
+                .delete_joined_source => self.parameterized_delete_joined_source = true,
+                else => {},
+            }
+        }
         self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or std.mem.indexOf(u8, entry.sql, "to_jsonb(") != null;
         self.to_jsonb_dynamic_expression = self.to_jsonb_dynamic_expression or
             std.mem.indexOf(u8, entry.sql, "to_jsonb(lower(") != null or
@@ -65075,6 +65104,22 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.window_offset);
         try std.testing.expect(self.window_frame_signature);
         try std.testing.expect(self.window_scalar_minmax);
+        try self.expectParameterizedCoverage();
+    }
+
+    fn expectParameterizedCoverage(self: @This()) !void {
+        try std.testing.expect(self.parameterized_query);
+        try std.testing.expect(self.parameterized_aggregate);
+        try std.testing.expect(self.parameterized_join);
+        try std.testing.expect(self.parameterized_lateral);
+        try std.testing.expect(self.parameterized_window);
+        try std.testing.expect(self.parameterized_insert);
+        try std.testing.expect(self.parameterized_update);
+        try std.testing.expect(self.parameterized_delete);
+        try std.testing.expect(self.parameterized_update_source);
+        try std.testing.expect(self.parameterized_delete_source);
+        try std.testing.expect(self.parameterized_update_joined_source);
+        try std.testing.expect(self.parameterized_delete_joined_source);
     }
 
     fn expectComputedPatternCoverage(self: @This()) !void {
