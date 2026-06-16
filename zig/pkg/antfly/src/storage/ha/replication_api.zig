@@ -59,6 +59,7 @@ pub const CreateReplicationSlotResponse = struct {
     applied_lsn: u64,
     active: bool,
     reseed_required: bool,
+    last_error: ?[]const u8 = null,
     current_lsn: u64,
 };
 
@@ -74,6 +75,7 @@ pub const SlotLifecycleResponse = struct {
     applied_lsn: u64,
     active: bool,
     reseed_required: bool,
+    last_error: ?[]const u8 = null,
     current_lsn: u64,
     dropped: bool = false,
 };
@@ -129,6 +131,7 @@ pub const StandbyStatusUpdateResponse = struct {
     received_lsn: u64,
     applied_lsn: u64,
     restart_lsn: u64,
+    last_error: ?[]const u8 = null,
     current_lsn: u64,
 };
 
@@ -158,6 +161,7 @@ pub fn createReplicationSlot(
         .applied_lsn = slot.applied_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
+        .last_error = slot.last_error,
         .current_lsn = primary.lastLsn(),
     };
 }
@@ -194,6 +198,7 @@ pub fn dropReplicationSlot(
         .applied_lsn = slot.applied_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
+        .last_error = null,
         .current_lsn = primary.lastLsn(),
         .dropped = true,
     };
@@ -272,6 +277,7 @@ fn lifecycleResponse(primary: *const primary_mod.Primary, slot_name: []const u8,
         .applied_lsn = slot.applied_lsn,
         .active = slot.active,
         .reseed_required = slot.reseed_required,
+        .last_error = slot.last_error,
         .current_lsn = primary.lastLsn(),
         .dropped = dropped,
     };
@@ -294,6 +300,7 @@ pub fn standbyStatusUpdate(
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
         .restart_lsn = slot.restart_lsn,
+        .last_error = slot.last_error,
         .current_lsn = primary.lastLsn(),
     };
 }
@@ -368,6 +375,7 @@ test "storage.ha replication api identifies primary and creates restartable slot
     try std.testing.expectEqual(@as(u64, 2), created.restart_lsn);
     try std.testing.expectEqual(@as(u64, 2), created.received_lsn);
     try std.testing.expectEqual(@as(u64, 2), created.applied_lsn);
+    try std.testing.expect(created.last_error == null);
     try std.testing.expectError(error.InitialLsnAheadOfPrimary, createReplicationSlot(&primary, .{
         .slot_name = "bad",
         .initial_lsn = 99,
@@ -441,11 +449,13 @@ test "storage.ha replication api pauses resumes and drops slots" {
         .slot_name = "standby-a",
         .initial_lsn = 1,
     });
+    try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");
 
     const paused = try pauseReplicationSlot(&primary, .{ .slot_name = "standby-a" });
     try std.testing.expectEqualStrings("standby-a", paused.slot_name);
     try std.testing.expect(!paused.active);
     try std.testing.expect(!paused.dropped);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", paused.last_error.?);
     try std.testing.expectError(error.SlotInactive, startReplication(alloc, &primary, .{
         .slot_name = "standby-a",
         .from_lsn = 1,
@@ -453,6 +463,7 @@ test "storage.ha replication api pauses resumes and drops slots" {
 
     const resumed = try resumeReplicationSlot(&primary, .{ .slot_name = "standby-a" });
     try std.testing.expect(resumed.active);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", resumed.last_error.?);
     var batch = try startReplication(alloc, &primary, .{
         .slot_name = "standby-a",
         .from_lsn = 1,
@@ -463,6 +474,7 @@ test "storage.ha replication api pauses resumes and drops slots" {
     const dropped = try dropReplicationSlot(&primary, .{ .slot_name = "standby-a" });
     try std.testing.expect(dropped.dropped);
     try std.testing.expectEqualStrings("standby-a", dropped.slot_name);
+    try std.testing.expect(dropped.last_error == null);
     try std.testing.expectError(error.SlotNotFound, startReplication(alloc, &primary, .{
         .slot_name = "standby-a",
         .from_lsn = 1,
@@ -484,6 +496,7 @@ test "storage.ha replication api persists standby status updates" {
             .slot_name = "standby-a",
             .initial_lsn = 0,
         });
+        try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");
 
         const updated = try standbyStatusUpdate(&primary, .{
             .slot_name = "standby-a",
@@ -494,6 +507,7 @@ test "storage.ha replication api persists standby status updates" {
         try std.testing.expectEqual(@as(u64, 2), updated.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), updated.applied_lsn);
         try std.testing.expectEqual(@as(u64, 1), updated.restart_lsn);
+        try std.testing.expect(updated.last_error == null);
         try std.testing.expectError(error.StandbyAheadOfPrimary, standbyStatusUpdate(&primary, .{
             .slot_name = "standby-a",
             .timeline_id = identity.timeline_id,
