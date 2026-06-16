@@ -62224,6 +62224,22 @@ fn appParityFixtureAllowsJoinSelectSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureAllowsJoinOnSummary(entry: AppParityCorpusEntry) bool {
+    return switch (entry.family) {
+        .join,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => true,
+        .read => appParityReadPlanHasPrefix(entry, "read:join:"),
+        .explain => appParityReadPlanHasPrefix(entry, "read:join:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:") or
+            appParityExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:"),
+        else => false,
+    };
+}
+
 fn appParityFixtureAllowsLateralSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .lateral => true,
@@ -62507,6 +62523,9 @@ fn validateAppParityFixtureMetadata(
     if (entry.summary.join_select != null and !appParityFixtureAllowsJoinSelectSummary(entry)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.join_on != null and !appParityFixtureAllowsJoinOnSummary(entry)) {
+        return error.TestUnexpectedResult;
+    }
     if ((entry.summary.lateral_correlations != null or entry.summary.right_offset != null) and
         !appParityFixtureAllowsLateralSummary(entry))
     {
@@ -62768,6 +62787,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .join,
         .summary = .{ .table_name = "usage_records", .join_on = 1, .distinct_on = 1 },
         .plan = "join:left=usage_records:right=archived_records:left_pred=0:right_pred=0:on=1:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "query join summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .join_on = 1 },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "lateral join summary",
+        .sql = "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM archived_records WHERE archived_records.id = usage_records.id LIMIT 1) AS latest ON true",
+        .family = .lateral,
+        .summary = .{ .table_name = "usage_records", .lateral_correlations = 1, .join_on = 1 },
+        .plan = "lateral:left=usage_records:right=archived_records:left_pred=0:right_pred=1:correlations=1:select=1:order=0:limit=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

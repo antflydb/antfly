@@ -5229,6 +5229,12 @@ lateral plans, and `windows` is valid only on window plans. This keeps the
 golden corpus tied to the REST/SDK-visible typed stage that actually owns each
 field.
 
+Join predicate summaries are scoped separately. `join_on` is valid only on join
+read plans, joined mutation-source update/delete plans, merge mutation match
+keys, generic read fingerprints whose resolved inner plan is a join, or
+`EXPLAIN` wrappers around those plans. Plain row queries, lateral correlations,
+aggregate/window stages, and point writes reject it.
+
 Full query-output summaries are separate from derived-stage output summaries.
 `select_all` and `distinct_on` are valid only on row-query plans, source-query
 write plans, generic read fingerprints whose resolved inner plan is a row query,
