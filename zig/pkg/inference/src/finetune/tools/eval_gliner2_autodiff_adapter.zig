@@ -36,17 +36,9 @@ const LoadedWeight = weight_source_mod.LoadedWeight;
 const Tensor = inference.backends.Tensor;
 const MetalWeightStore = if (build_options.enable_metal) gpu_hosted_store.WeightStore else void;
 
-const mlx_mod = inference.backends.mlx;
-const mlx = if (build_options.enable_mlx) mlx_mod else struct {};
-const mlx_compute = if (build_options.enable_mlx) inference.native_compute.mlx else struct {};
-const mlx_c = if (build_options.enable_mlx) mlx_mod.c else struct {};
-const MlxWeightStore = if (build_options.enable_mlx) mlx_compute.WeightStore else void;
-const MlxMap = if (build_options.enable_mlx) mlx_c.mlx_map_string_to_array else void;
-
 pub const EvalBackend = enum {
     auto,
     metal,
-    mlx,
     native,
 };
 
@@ -547,26 +539,18 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
     var native_backend: NativeCompute = undefined;
     var metal_weight_store: MetalWeightStore = undefined;
     var metal_backend: if (build_options.enable_metal) metal_compute.MetalCompute else void = undefined;
-    var mlx_weight_store: MlxWeightStore = undefined;
-    var mlx_backend: if (build_options.enable_mlx) *mlx_compute.MlxCompute else void = undefined;
 
     const force_native = envFlag("TERMITE_GLINER2_FORCE_NATIVE");
     const metal_available = if (comptime build_options.enable_metal)
         (!force_native and metal_runtime.metalDeviceAvailable())
     else
         false;
-    const mlx_available = if (comptime build_options.enable_mlx)
-        (!force_native and (mlx.metalDeviceAvailable() or mlx.allowCpuStreamWithoutMetal()))
-    else
-        false;
-    const selected_backend = try selectBackend(opts.backend, force_native, metal_available, mlx_available);
+    const selected_backend = try selectBackend(opts.backend, force_native, metal_available);
 
     var cb = if (selected_backend == .metal) blk: {
         if (comptime build_options.enable_metal) {
             metal_weight_store = .{
                 .allocator = allocator,
-                .resident_weights = if (comptime build_options.enable_mlx) mlx_c.mlx_map_string_to_array_new() else {},
-                .stream = if (comptime build_options.enable_mlx) mlx.openDefaultStream().stream else {},
                 .prefix = "",
                 .lazy_weights = .{},
             };
@@ -576,23 +560,6 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
             metal_compute.initPrefetchQueue(&metal_weight_store, allocator);
             metal_backend = try metal_compute.MetalCompute.init(allocator, &metal_weight_store, null);
             break :blk metal_backend.computeBackend();
-        } else unreachable;
-    } else if (selected_backend == .mlx) blk: {
-        if (comptime build_options.enable_mlx) {
-            const resident_weights = try loadSafetensorsIntoMlxStore(allocator, safetensors_path, &task_head);
-            mlx_weight_store = .{
-                .allocator = allocator,
-                .resident_weights = resident_weights.map,
-                .stream = mlx.openDefaultStream().stream,
-                .prefix = "",
-                .lazy_weights = .{},
-            };
-            errdefer deinitMlxWeightStore(allocator, &mlx_weight_store);
-            loaded_base_weight_count = resident_weights.loaded_count;
-            mlx_backend = try allocator.create(mlx_compute.MlxCompute);
-            errdefer allocator.destroy(mlx_backend);
-            mlx_backend.* = try mlx_compute.MlxCompute.init(allocator, &mlx_weight_store, null);
-            break :blk mlx_backend.computeBackend();
         } else unreachable;
     } else blk: {
         native_weight_store = .{
@@ -612,15 +579,10 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
     defer switch (selected_backend) {
         .native => deinitNativeWeightStore(allocator, &native_weight_store, &native_owned_names),
         .metal => if (comptime build_options.enable_metal) deinitGpuHostedWeightStore(allocator, &metal_weight_store),
-        .mlx => if (comptime build_options.enable_mlx) deinitMlxWeightStore(allocator, &mlx_weight_store),
         .auto => {},
     };
     defer switch (selected_backend) {
         .metal => if (comptime build_options.enable_metal) metal_backend.deinit(),
-        .mlx => if (comptime build_options.enable_mlx) {
-            mlx_backend.deinit();
-            allocator.destroy(mlx_backend);
-        },
         else => {},
     };
 
@@ -650,7 +612,6 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
             .regular_trainable_params = &regular_trainable_params,
             .execution_engine = switch (selected_backend) {
                 .metal => .compiled_metal,
-                .mlx => .compiled_mlx,
                 else => .interpreter,
             },
             .compiled_required = opts.compiled_required,
@@ -873,76 +834,6 @@ fn addTaskHeadWeightsToGpuHostedStore(
 fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *MetalWeightStore) void {
     if (comptime !build_options.enable_metal) return;
     metal_compute.deinitPrefetchQueue(weight_store);
-    var it = weight_store.lazy_weights.iterator();
-    while (it.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        if (entry.value_ptr.host_loaded) |*loaded| loaded.deinit();
-        if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
-    }
-    weight_store.lazy_weights.deinit(allocator);
-    if (comptime build_options.enable_mlx) {
-        _ = mlx_c.mlx_map_string_to_array_free(weight_store.resident_weights);
-    }
-}
-
-const LoadedMlxWeights = if (build_options.enable_mlx) struct {
-    map: MlxMap,
-    loaded_count: usize,
-} else struct {};
-
-fn loadSafetensorsIntoMlxStore(
-    allocator: std.mem.Allocator,
-    safetensors_path: []const u8,
-    head: *const gliner2_bundle.ClassifierTaskHead,
-) !LoadedMlxWeights {
-    if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-    const raw_weights = try mlx.loadSafetensors(safetensors_path, allocator, mlx.openDefaultStream().stream);
-    errdefer _ = mlx_c.mlx_map_string_to_array_free(raw_weights);
-    const stripped_weights = mlx_c.mlx_map_string_to_array_new();
-    errdefer _ = mlx_c.mlx_map_string_to_array_free(stripped_weights);
-    const it = mlx_c.mlx_map_string_to_array_iterator_new(raw_weights);
-    defer _ = mlx_c.mlx_map_string_to_array_iterator_free(it);
-    var loaded_count: usize = 0;
-    while (true) {
-        var key: [*c]const u8 = null;
-        var val = mlx_c.mlx_array_new();
-        if (mlx_c.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0) {
-            _ = mlx_c.mlx_array_free(val);
-            break;
-        }
-        if (key == null) {
-            _ = mlx_c.mlx_array_free(val);
-            break;
-        }
-        const name = std.mem.span(key);
-        const stripped_z = try allocator.dupeZ(u8, stripEncoderPrefix(name));
-        defer allocator.free(stripped_z);
-        _ = mlx_c.mlx_map_string_to_array_insert(stripped_weights, stripped_z.ptr, val);
-        _ = mlx_c.mlx_array_free(val);
-        loaded_count += 1;
-    }
-    _ = mlx_c.mlx_map_string_to_array_free(raw_weights);
-    try addTaskHeadWeightsToMlxStore(allocator, stripped_weights, head);
-    return .{ .map = stripped_weights, .loaded_count = loaded_count };
-}
-
-fn addTaskHeadWeightsToMlxStore(
-    allocator: std.mem.Allocator,
-    weights: MlxMap,
-    head: *const gliner2_bundle.ClassifierTaskHead,
-) !void {
-    if (comptime !build_options.enable_mlx) return error.MlxBackendUnavailable;
-    const weight_shape = [_]i32{ @intCast(head.num_classes), @intCast(head.hidden_size) };
-    const weight_arr = mlx.arrayFromFloat32(head.weight, &weight_shape);
-    try mlx.insertWeight(weights, allocator, "classifier.weight", weight_arr);
-    const bias_shape = [_]i32{@intCast(head.num_classes)};
-    const bias_arr = mlx.arrayFromFloat32(head.bias, &bias_shape);
-    try mlx.insertWeight(weights, allocator, "classifier.bias", bias_arr);
-}
-
-fn deinitMlxWeightStore(allocator: std.mem.Allocator, weight_store: *MlxWeightStore) void {
-    if (comptime !build_options.enable_mlx) return;
-    _ = mlx_c.mlx_map_string_to_array_free(weight_store.resident_weights);
     var it = weight_store.lazy_weights.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
@@ -1582,7 +1473,6 @@ fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
 fn parseBackend(value: []const u8) ?EvalBackend {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     return null;
 }
@@ -1591,13 +1481,11 @@ fn selectBackend(
     requested: EvalBackend,
     force_native: bool,
     metal_available: bool,
-    mlx_available: bool,
 ) !EvalBackend {
     if (force_native) return .native;
     return switch (requested) {
-        .auto => if (metal_available) .metal else if (mlx_available) .mlx else .native,
+        .auto => if (metal_available) .metal else .native,
         .metal => if (metal_available) .metal else error.MetalBackendUnavailable,
-        .mlx => if (mlx_available) .mlx else error.MlxBackendUnavailable,
         .native => .native,
     };
 }
@@ -1606,7 +1494,6 @@ fn backendLabel(backend: EvalBackend) []const u8 {
     return switch (backend) {
         .auto => "auto",
         .metal => "Metal",
-        .mlx => "MLX (Apple Silicon)",
         .native => "native CPU/BLAS",
     };
 }
@@ -1666,7 +1553,7 @@ fn printUsage() void {
         \\  --entity-types CSV
         \\  --seq-len N
         \\  --max-span-width N
-        \\  --backend auto|metal|mlx|native
+        \\  --backend auto|metal|native
         \\  --compiled-required
         \\  --objective token|span-start
         \\  --expect-text TEXT

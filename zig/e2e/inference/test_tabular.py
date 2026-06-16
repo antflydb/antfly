@@ -38,7 +38,7 @@ import numpy as np
 import pytest
 import requests
 
-from .conftest import api_path
+from .conftest import DEFAULT_REQUEST_TIMEOUT, api_path
 from .models import REPO_ROOT, inference_command, ml_dir
 
 
@@ -486,12 +486,14 @@ def test_upload_and_convert_routes_removed(base_url):
             f"{base_url}{api_path(path)}?name=removed",
             data=body,
             headers={"content-type": "application/octet-stream"},
+            timeout=DEFAULT_REQUEST_TIMEOUT,
         )
         assert r.status_code == 404, f"{path} should not be exposed over HTTP"
 
     r = requests.post(
         f"{base_url}/ai/v1/predict",
         json={"model": "iris-classifier", "input": [IRIS_SAMPLE_SETOSA]},
+        timeout=DEFAULT_REQUEST_TIMEOUT,
     )
     assert r.status_code == 404, "/ai/v1/predict should move to /ml/v1/predict"
 
@@ -657,6 +659,7 @@ def test_convert_malformed_xgboost_does_not_crash_server(base_url, tmp_path):
     follow = requests.post(
         f"{base_url}{api_path('/predict')}",
         json={"model": "iris-classifier", "input": [IRIS_SAMPLE_SETOSA]},
+        timeout=DEFAULT_REQUEST_TIMEOUT,
     )
     assert follow.status_code == 200, follow.text
 
@@ -752,5 +755,6 @@ def test_hostile_int_does_not_crash_loader(base_url, tmp_path):
     follow = requests.post(
         f"{base_url}{api_path('/predict')}",
         json={"model": "iris-classifier", "input": [IRIS_SAMPLE_SETOSA]},
+        timeout=DEFAULT_REQUEST_TIMEOUT,
     )
     assert follow.status_code == 200, follow.text

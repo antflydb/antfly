@@ -9,11 +9,11 @@ import { useDensity } from "@/hooks/use-density";
 import { useTheme } from "@/hooks/use-theme";
 import { cn } from "@/lib/utils";
 
-interface WorkspaceHeaderProps extends React.HTMLAttributes<HTMLDivElement> {
+interface AppHeaderProps extends React.HTMLAttributes<HTMLDivElement> {
   title?: string;
 }
 
-export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderProps) {
+export function AppHeader({ title, className, ...props }: AppHeaderProps) {
   const { toggle: toggleCommandPalette } = useCommandPalette();
   const { density, toggleDensity } = useDensity();
   const { theme, setTheme } = useTheme();
@@ -26,7 +26,7 @@ export function WorkspaceHeader({ title, className, ...props }: WorkspaceHeaderP
   return (
     <header
       className={cn(
-        "af-workspace-header sticky top-0 z-10 flex shrink-0 h-14 items-center gap-4 border-b border-border bg-background px-4",
+        "af-app-header sticky top-0 z-10 flex shrink-0 h-14 items-center gap-4 border-b border-border bg-background px-4",
         className
       )}
       {...props}

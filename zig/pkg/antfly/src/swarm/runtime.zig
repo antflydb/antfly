@@ -24,7 +24,6 @@ const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
-const http_common = antfly.common.http.http_common;
 const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
@@ -58,6 +57,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 };
@@ -67,6 +67,7 @@ const ResolvedPaths = struct {
     replica_catalog_path: []u8,
     local_metadata_catalog_path: []u8,
     snapshot_root_dir: []u8,
+    extension_package_store_dir: []u8,
     secret_store_path: []u8,
     auth_store_root_dir: []u8,
 
@@ -75,6 +76,7 @@ const ResolvedPaths = struct {
         alloc.free(self.replica_catalog_path);
         alloc.free(self.local_metadata_catalog_path);
         alloc.free(self.snapshot_root_dir);
+        alloc.free(self.extension_package_store_dir);
         alloc.free(self.secret_store_path);
         alloc.free(self.auth_store_root_dir);
     }
@@ -121,6 +123,7 @@ const LocalSwarmMetadata = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     manager: antfly.metadata.TableManager,
+    extension_catalog: antfly.extensions.ExtensionCatalog,
     local_node_id: u64,
     store_id: u64,
     api_url: []const u8,
@@ -134,6 +137,10 @@ const LocalSwarmMetadata = struct {
         epoch: u64 = 1,
         tables: []const antfly.metadata.TableRecord = &.{},
         ranges: []const antfly.metadata.RangeRecord = &.{},
+        extension_packages: []const antfly.extensions.PackageManifest = &.{},
+        installed_extensions: []const antfly.extensions.InstalledExtension = &.{},
+        extension_members: []const antfly.extensions.ExtensionMember = &.{},
+        extension_dependencies: []const antfly.extensions.ExtensionDependency = &.{},
     };
 
     fn init(
@@ -154,6 +161,7 @@ const LocalSwarmMetadata = struct {
         var self = LocalSwarmMetadata{
             .alloc = alloc,
             .manager = antfly.metadata.TableManager.init(alloc),
+            .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
             .local_node_id = local_node_id,
             .store_id = store_id,
             .api_url = owned_api_url,
@@ -167,6 +175,7 @@ const LocalSwarmMetadata = struct {
     }
 
     fn deinit(self: *LocalSwarmMetadata) void {
+        self.extension_catalog.deinit();
         self.manager.deinit();
         self.alloc.free(self.catalog_path);
         self.alloc.free(self.replica_root_dir);
@@ -201,6 +210,13 @@ const LocalSwarmMetadata = struct {
                 .wait_table_lifecycle = waitTableLifecycle,
                 .wait_table_projection = waitTableProjection,
                 .run_round = runRound,
+                .install_extension = installExtension,
+                .update_extension = updateExtension,
+                .drop_extension = dropExtension,
+                .enable_extension = enableExtension,
+                .disable_extension = disableExtension,
+                .configure_extension = configureExtension,
+                .restore_extensions = restoreExtensions,
             },
         };
     }
@@ -214,6 +230,10 @@ const LocalSwarmMetadata = struct {
             .metadata_epoch = self.epoch,
             .metadata_raft_role = "disabled",
             .projected_tables = self.manager.tables.count(),
+            .projected_extension_packages = self.extension_catalog.packages.items.len,
+            .projected_installed_extensions = self.extension_catalog.installed.items.len,
+            .projected_extension_members = self.extension_catalog.members.items.len,
+            .projected_extension_dependencies = self.extension_catalog.dependencies.items.len,
             .projected_ranges = self.manager.ranges.count(),
             .projected_stores = 1,
             .projected_placement_intents = self.manager.ranges.count(),
@@ -234,6 +254,14 @@ const LocalSwarmMetadata = struct {
         errdefer self.manager.freeTables(self.alloc, tables);
         const ranges = try self.manager.listRanges(self.alloc);
         errdefer self.manager.freeRanges(self.alloc, ranges);
+        const extension_packages = try self.extension_catalog.listPackages(self.alloc);
+        errdefer self.extension_catalog.freePackages(self.alloc, extension_packages);
+        const installed_extensions = try self.extension_catalog.listInstalled(self.alloc);
+        errdefer self.extension_catalog.freeInstalled(self.alloc, installed_extensions);
+        const extension_members = try self.extension_catalog.listMembers(self.alloc);
+        errdefer self.extension_catalog.freeMembers(self.alloc, extension_members);
+        const extension_dependencies = try self.extension_catalog.listDependencies(self.alloc);
+        errdefer self.extension_catalog.freeDependencies(self.alloc, extension_dependencies);
 
         const stores = try self.alloc.alloc(antfly.metadata.StoreRecord, 1);
         errdefer self.alloc.free(stores);
@@ -269,6 +297,10 @@ const LocalSwarmMetadata = struct {
                 .metadata_epoch = self.epoch,
                 .metadata_raft_role = "disabled",
                 .projected_tables = tables.len,
+                .projected_extension_packages = extension_packages.len,
+                .projected_installed_extensions = installed_extensions.len,
+                .projected_extension_members = extension_members.len,
+                .projected_extension_dependencies = extension_dependencies.len,
                 .projected_ranges = ranges.len,
                 .projected_stores = stores.len,
                 .projected_placement_intents = placement_intents.len,
@@ -278,6 +310,10 @@ const LocalSwarmMetadata = struct {
             .ranges = ranges,
             .stores = stores,
             .placement_intents = placement_intents,
+            .extension_packages = extension_packages,
+            .installed_extensions = installed_extensions,
+            .extension_members = extension_members,
+            .extension_dependencies = extension_dependencies,
             .split_transitions = try self.alloc.alloc(antfly.metadata.SplitTransitionRecord, 0),
             .merge_transitions = try self.alloc.alloc(antfly.metadata.MergeTransitionRecord, 0),
         };
@@ -290,6 +326,10 @@ const LocalSwarmMetadata = struct {
         for (snapshot.stores) |store| antfly.metadata.table_manager.freeStore(self.alloc, store);
         self.alloc.free(snapshot.stores);
         self.alloc.free(snapshot.placement_intents);
+        self.extension_catalog.freePackages(self.alloc, snapshot.extension_packages);
+        self.extension_catalog.freeInstalled(self.alloc, snapshot.installed_extensions);
+        self.extension_catalog.freeMembers(self.alloc, snapshot.extension_members);
+        self.extension_catalog.freeDependencies(self.alloc, snapshot.extension_dependencies);
         self.alloc.free(snapshot.split_transitions);
         self.alloc.free(snapshot.merge_transitions);
         snapshot.* = undefined;
@@ -409,6 +449,137 @@ const LocalSwarmMetadata = struct {
         };
     }
 
+    fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.InstallExtensionRequest) !antfly.extensions.InstalledExtension {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
+        var persisted_req = req;
+        persisted_req.dry_run = false;
+        if (req.dry_run) {
+            var catalog = try self.cloneExtensionCatalogLocked();
+            defer catalog.deinit();
+            var planned = try catalog.installManifestOnly(extension_name, extension_name, persisted_req, installed_at_ms);
+            defer planned.deinitOwned(self.alloc);
+            return try antfly.extensions.cloneInstalledExtensionAlloc(alloc, planned);
+        }
+        var installed = try self.extension_catalog.installManifestOnly(extension_name, extension_name, persisted_req, installed_at_ms);
+        defer installed.deinitOwned(self.alloc);
+        self.epoch +|= 1;
+        try self.persistLocked();
+        return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
+    }
+
+    fn updateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.UpdateExtensionRequest) !antfly.extensions.InstalledExtension {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var persisted_req = req;
+        persisted_req.dry_run = false;
+        if (req.dry_run) {
+            var catalog = try self.cloneExtensionCatalogLocked();
+            defer catalog.deinit();
+            var planned = try catalog.updateManifestOnly(extension_name, persisted_req);
+            defer planned.deinitOwned(self.alloc);
+            return try antfly.extensions.cloneInstalledExtensionAlloc(alloc, planned);
+        }
+        var installed = try self.extension_catalog.updateManifestOnly(extension_name, persisted_req);
+        defer installed.deinitOwned(self.alloc);
+        self.epoch +|= 1;
+        try self.persistLocked();
+        return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
+    }
+
+    fn dropExtension(ptr: *anyopaque, _: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.DropExtensionRequest) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var persisted_req = req;
+        persisted_req.dry_run = false;
+        if (req.dry_run) {
+            var catalog = try self.cloneExtensionCatalogLocked();
+            defer catalog.deinit();
+            return try catalog.dropInstalledWithMode(extension_name, persisted_req);
+        }
+        try self.extension_catalog.dropInstalledWithMode(extension_name, persisted_req);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn enableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.extension_catalog.enableInstalled(extension_name);
+        self.epoch +|= 1;
+        try self.persistLocked();
+        return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
+    }
+
+    fn disableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8) !antfly.extensions.InstalledExtension {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.extension_catalog.disableInstalled(extension_name);
+        self.epoch +|= 1;
+        try self.persistLocked();
+        return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
+    }
+
+    fn configureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.ConfigureExtensionRequest) !antfly.extensions.InstalledExtension {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.extension_catalog.configureInstalled(extension_name, req);
+        self.epoch +|= 1;
+        try self.persistLocked();
+        return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
+    }
+
+    fn restoreExtensions(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        installed: []const antfly.extensions.InstalledExtension,
+        members: []const antfly.extensions.ExtensionMember,
+        dependencies: []const antfly.extensions.ExtensionDependency,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        for (installed) |extension| try self.extension_catalog.upsertInstalled(extension);
+        for (members) |member| try self.extension_catalog.upsertMember(member);
+        for (dependencies) |dependency| try self.extension_catalog.upsertDependency(dependency);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn cloneExtensionCatalogLocked(self: *LocalSwarmMetadata) !antfly.extensions.ExtensionCatalog {
+        var catalog = antfly.extensions.ExtensionCatalog.init(self.alloc);
+        errdefer catalog.deinit();
+        try catalog.loadProjectedRows(
+            self.extension_catalog.packages.items,
+            self.extension_catalog.installed.items,
+            self.extension_catalog.members.items,
+            self.extension_catalog.dependencies.items,
+        );
+        return catalog;
+    }
+
+    fn syncExtensionPackageStore(self: *LocalSwarmMetadata, io: std.Io, root_path: []const u8) !usize {
+        const entries = try antfly.extensions.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer antfly.extensions.freePackageStoreEntries(self.alloc, entries);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        for (entries) |entry| try self.extension_catalog.registerPackage(entry.manifest);
+        if (entries.len > 0) {
+            self.epoch +|= 1;
+            try self.persistLocked();
+        }
+        return entries.len;
+    }
+
     fn finalizeReadySchemaMigrations(self: *LocalSwarmMetadata) !void {
         const now_ms = monotonicMs();
         const snapshot = blk: {
@@ -508,6 +679,12 @@ const LocalSwarmMetadata = struct {
         defer parsed.deinit();
 
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
+        try self.extension_catalog.loadProjectedRows(
+            parsed.value.extension_packages,
+            parsed.value.installed_extensions,
+            parsed.value.extension_members,
+            parsed.value.extension_dependencies,
+        );
         self.epoch = @max(parsed.value.epoch, 1);
     }
 
@@ -516,11 +693,23 @@ const LocalSwarmMetadata = struct {
         defer self.manager.freeTables(self.alloc, tables);
         const ranges = try self.manager.listRanges(self.alloc);
         defer self.manager.freeRanges(self.alloc, ranges);
+        const extension_packages = try self.extension_catalog.listPackages(self.alloc);
+        defer self.extension_catalog.freePackages(self.alloc, extension_packages);
+        const installed_extensions = try self.extension_catalog.listInstalled(self.alloc);
+        defer self.extension_catalog.freeInstalled(self.alloc, installed_extensions);
+        const extension_members = try self.extension_catalog.listMembers(self.alloc);
+        defer self.extension_catalog.freeMembers(self.alloc, extension_members);
+        const extension_dependencies = try self.extension_catalog.listDependencies(self.alloc);
+        defer self.extension_catalog.freeDependencies(self.alloc, extension_dependencies);
 
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, PersistedCatalog{
             .epoch = self.epoch,
             .tables = tables,
             .ranges = ranges,
+            .extension_packages = extension_packages,
+            .installed_extensions = installed_extensions,
+            .extension_members = extension_members,
+            .extension_dependencies = extension_dependencies,
         }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(encoded);
 
@@ -649,7 +838,6 @@ pub fn runFromIterator(
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
-    antfly_node.seedAndDiscoverPredictors(init.io);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -710,6 +898,10 @@ pub fn runFromIterator(
         node_backend_runtime.ptr(),
     );
     defer local_metadata.deinit();
+    const synced_extension_packages = try local_metadata.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
+    if (synced_extension_packages > 0) {
+        std.log.info("swarm synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
+    }
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -1229,9 +1421,10 @@ fn serveUnifiedInner(
     var server = httpx.Server.initWithConfig(alloc, io_impl.io(), publicHttpServerConfig(bind_host, bind_port));
     defer server.deinit();
 
-    // Register antfly routes under /ai/v1
+    // Register inference AI routes under /ai/v1 and Traditional ML routes under /ml/v1.
     if (antfly_node) |node| {
         try node.registerRoutesOn(inference.server.public_api_prefix, &server);
+        try node.registerAiRoutesOn(inference.server.ai_api_prefix, &server);
     }
 
     // Register antfly public API routes under /db/v1
@@ -1251,6 +1444,7 @@ fn serveUnifiedInner(
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
     try registerMcpRoutes(&server);
+    try registerExtensionRoutes(&server);
     try registerInternalGroupRoutes(&server);
     try registerAntfarmRoutes(&server);
 
@@ -1314,6 +1508,22 @@ fn registerMcpRoutes(server: anytype) !void {
         try server.get(path, mcpBridgeHandler);
         try server.post(path, mcpBridgeHandler);
         try server.delete(path, mcpBridgeHandler);
+    }
+}
+
+fn registerExtensionRoutes(server: anytype) !void {
+    const routes = antfly.public_api.http_routes.Routes;
+    const extension_paths = [_][]const u8{
+        routes.extensions_v1,
+        routes.extensions_v1_packages,
+        routes.extensions_v1_packages_prefix ++ "*",
+        routes.extensions_v1_installed,
+        routes.extensions_v1_installed_prefix ++ "*",
+    };
+    inline for (extension_paths) |path| {
+        try server.get(path, extensionBridgeHandler);
+        try server.post(path, extensionBridgeHandler);
+        try server.put(path, extensionBridgeHandler);
     }
 }
 
@@ -1443,6 +1653,7 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         "/metadata",
         "/internal",
         "/mcp",
+        "/extensions",
         "/healthz",
         "/readyz",
         "/registry",
@@ -1589,26 +1800,12 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    // Reconstruct HttpRequest for legacy handler.
-    const method: http_common.Method = switch (ctx.request.method) {
-        .GET => .GET,
-        .POST => .POST,
-        .PUT => .PUT,
-        .DELETE => .DELETE,
-        else => {
+    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+        error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
-    };
-
-    const body_data = (try ctx.body()) orelse "";
-
-    const legacy_req = http_common.HttpRequest{
-        .method = method,
-        .uri = ctx.request.uri.raw,
-        .authorization = ctx.header("authorization"),
-        .content_type = ctx.header("content-type"),
-        .body = body_data,
+        else => return err,
     };
 
     var resp = (try server.handleInternalRoute(legacy_req)) orelse {
@@ -1624,30 +1821,30 @@ fn mcpBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
         return ctx.text("not ready");
     };
 
-    const method: http_common.Method = switch (ctx.request.method) {
-        .GET => .GET,
-        .POST => .POST,
-        .DELETE => .DELETE,
-        else => {
+    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+        error.UnsupportedMethod => {
             _ = ctx.status(405);
             return ctx.text("method not allowed");
         },
+        else => return err,
     };
 
-    const body_data = (try ctx.body()) orelse "";
-    const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(antfly.public_api.http_server.trusted_principal_header)) |trusted_principal| blk: {
-        const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
-        headers[0] = .{ .name = antfly.public_api.http_server.trusted_principal_header, .value = trusted_principal };
-        break :blk headers;
-    } else &.{};
+    var resp = try server.handle(legacy_req);
+    return AntflyApiHandler.respond(ctx, &resp);
+}
 
-    const legacy_req = http_common.HttpRequest{
-        .method = method,
-        .uri = ctx.request.uri.raw,
-        .headers = trusted_principal_headers,
-        .authorization = ctx.header("authorization"),
-        .content_type = ctx.header("content-type"),
-        .body = body_data,
+fn extensionBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    const server = active_api_server orelse {
+        _ = ctx.status(503);
+        return ctx.text("not ready");
+    };
+
+    const legacy_req = AntflyApiHandler.httpRequestFromContext(ctx, null) catch |err| switch (err) {
+        error.UnsupportedMethod => {
+            _ = ctx.status(405);
+            return ctx.text("method not allowed");
+        },
+        else => return err,
     };
 
     var resp = try server.handle(legacy_req);
@@ -1755,6 +1952,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extension-package-store")) {
+            cfg.extension_package_store_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -1815,6 +2016,14 @@ fn resolvePaths(
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
+    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(extension_package_store_dir);
     const secret_store_path = if (cli.secret_store_path) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
@@ -1835,6 +2044,7 @@ fn resolvePaths(
         .replica_catalog_path = replica_catalog_path,
         .local_metadata_catalog_path = local_metadata_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
+        .extension_package_store_dir = extension_package_store_dir,
         .secret_store_path = secret_store_path,
         .auth_store_root_dir = auth_store_root_dir,
     };
@@ -1981,6 +2191,7 @@ fn printUsage() void {
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
         \\  --snapshot-root-dir <path>            Snapshot root directory
+        \\  --extension-package-store <path>      Extension package store directory
         \\  --secret-store-path <path>            Antfly secrets.json file path
         \\  -h, --help                            Show this help
         \\
@@ -1996,6 +2207,7 @@ fn parseBoolFlag(raw: []const u8) ?bool {
 const RecordingRouteMethod = enum {
     get,
     post,
+    put,
     delete,
 };
 
@@ -2026,6 +2238,10 @@ const RecordingServer = struct {
 
     pub fn post(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
         try self.append(.post, path);
+    }
+
+    pub fn put(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+        try self.append(.put, path);
     }
 
     pub fn delete(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
@@ -2074,6 +2290,23 @@ test "swarm runtime leaves auth disabled unless config or cli enables it" {
     try std.testing.expect(!resolveAuthEnabled(.{}, null));
     try std.testing.expect(resolveAuthEnabled(.{ .auth_enabled = true }, null));
     try std.testing.expect(!resolveAuthEnabled(.{ .auth_enabled = false }, null));
+}
+
+test "swarm bridge shared adapter preserves protocol headers and absent body" {
+    const alloc = std.testing.allocator;
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
+    defer request.deinit();
+    try request.setHeader("Mcp-Session-Id", "session-123");
+
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    const req = try AntflyApiHandler.httpRequestFromContext(&ctx, null);
+    defer alloc.free(req.headers);
+
+    try std.testing.expectEqualStrings("session-123", req.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("", req.body);
 }
 
 test "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved" {
@@ -2161,6 +2394,24 @@ test "swarm runtime registers mcp routes before antfarm catch-all" {
     try std.testing.expect(server.hasRoute(.get, "/*"));
 }
 
+test "swarm runtime registers extension routes before antfarm catch-all" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerExtensionRoutes(&server);
+    try registerAntfarmRoutes(&server);
+
+    const routes = antfly.public_api.http_routes.Routes;
+    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1));
+    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_packages));
+    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_packages_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_installed));
+    try std.testing.expect(server.hasRoute(.get, routes.extensions_v1_installed_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.post, routes.extensions_v1_installed_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.put, routes.extensions_v1_installed_prefix ++ "*"));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
 test "swarm runtime registers antfarm static routes" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
@@ -2177,6 +2428,7 @@ test "swarm runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
+    try std.testing.expect(isAntfarmReservedPath("/extensions/v1/packages"));
     try std.testing.expect(!isAntfarmReservedPath("/models"));
     try std.testing.expect(hasUnsafeStaticPath("../index.html"));
     try std.testing.expect(hasUnsafeStaticPath("%2e%2e/index.html"));
@@ -2195,6 +2447,13 @@ test "parse cli accepts secret store path" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const cfg = try parseCli(&iter);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+}
+
+test "parse cli accepts extension package store path" {
+    var argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
 }
 
 test "parse cli accepts canonical host port and models dir flags" {
@@ -2341,13 +2600,23 @@ test "swarm runtime resolves paths from common storage base dir" {
     defer alloc.free(expected_local_metadata);
     const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_data_base, "snapshots" });
     defer alloc.free(expected_snapshot_root);
+    const expected_extension_store = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/extensions");
+    defer alloc.free(expected_extension_store);
     try std.testing.expectEqualStrings(expected_replica_root, resolved.replica_root_dir);
     try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
     try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings(expected_extension_store, resolved.extension_package_store_dir);
     const expected_secret_store = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/secrets.json");
     defer alloc.free(expected_secret_store);
     try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
+}
+
+test "swarm runtime resolves explicit extension package store path" {
+    const alloc = std.testing.allocator;
+    const resolved = try resolvePaths(alloc, .{ .extension_package_store_dir = "/opt/antfly/extensions" }, null);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", resolved.extension_package_store_dir);
 }
 
 test "swarm runtime resolves explicit secret store path" {

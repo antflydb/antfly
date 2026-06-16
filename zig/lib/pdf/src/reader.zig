@@ -787,7 +787,10 @@ fn extractTextRunsFromContentAppendWithState(
     var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
     try current_clip_points.appendSlice(alloc, initial_clip_points);
     while (true) {
-        var lex = try scanner.readLexeme();
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            clearContentOperands(alloc, &operands);
+            continue;
+        };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
@@ -799,7 +802,12 @@ fn extractTextRunsFromContentAppendWithState(
         }
 
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        try operands.append(alloc, try scanner.readObject());
+        const maybe_obj = try readContentObject(&scanner);
+        if (maybe_obj) |obj| {
+            try operands.append(alloc, obj);
+        } else {
+            clearContentOperands(alloc, &operands);
+        }
     }
 }
 
@@ -853,7 +861,10 @@ fn extractImageRunsFromContentAppendWithState(
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
     while (true) {
-        var lex = try scanner.readLexeme();
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            clearContentOperands(alloc, &operands);
+            continue;
+        };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
@@ -865,7 +876,12 @@ fn extractImageRunsFromContentAppendWithState(
         }
 
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        try operands.append(alloc, try scanner.readObject());
+        const maybe_obj = try readContentObject(&scanner);
+        if (maybe_obj) |obj| {
+            try operands.append(alloc, obj);
+        } else {
+            clearContentOperands(alloc, &operands);
+        }
     }
 }
 
@@ -944,7 +960,10 @@ fn extractShadingRunsFromContentAppendWithState(
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
     while (true) {
-        var lex = try scanner.readLexeme();
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            clearContentOperands(alloc, &operands);
+            continue;
+        };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
@@ -956,7 +975,12 @@ fn extractShadingRunsFromContentAppendWithState(
         }
 
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        try operands.append(alloc, try scanner.readObject());
+        const maybe_obj = try readContentObject(&scanner);
+        if (maybe_obj) |obj| {
+            try operands.append(alloc, obj);
+        } else {
+            clearContentOperands(alloc, &operands);
+        }
     }
 }
 
@@ -1003,7 +1027,10 @@ fn extractPatternRunsFromContentAppendWithState(
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
     while (true) {
-        var lex = try scanner.readLexeme();
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            clearContentOperands(alloc, &operands);
+            continue;
+        };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
@@ -1015,7 +1042,12 @@ fn extractPatternRunsFromContentAppendWithState(
         }
 
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        try operands.append(alloc, try scanner.readObject());
+        const maybe_obj = try readContentObject(&scanner);
+        if (maybe_obj) |obj| {
+            try operands.append(alloc, obj);
+        } else {
+            clearContentOperands(alloc, &operands);
+        }
     }
 }
 
@@ -1061,7 +1093,10 @@ fn extractShapeRunsFromContentAppendWithState(
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
     while (true) {
-        var lex = try scanner.readLexeme();
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            clearContentOperands(alloc, &operands);
+            continue;
+        };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
@@ -1073,7 +1108,12 @@ fn extractShapeRunsFromContentAppendWithState(
         }
 
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        try operands.append(alloc, try scanner.readObject());
+        const maybe_obj = try readContentObject(&scanner);
+        if (maybe_obj) |obj| {
+            try operands.append(alloc, obj);
+        } else {
+            clearContentOperands(alloc, &operands);
+        }
     }
 }
 
@@ -5186,7 +5226,10 @@ fn extractTextFromContentAlloc(alloc: Allocator, bytes: []const u8, fonts: []con
     var state = TextExtractionState{};
 
     while (true) {
-        var lex = try scanner.readLexeme();
+        var lex = (try readContentLexeme(&scanner)) orelse {
+            clearContentOperands(alloc, &operands);
+            continue;
+        };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
 
         if (lex == .eof) break;
@@ -5198,10 +5241,49 @@ fn extractTextFromContentAlloc(alloc: Allocator, bytes: []const u8, fonts: []con
         }
 
         try scanner.unreadLexeme(try cloneLexemeForContent(alloc, lex));
-        try operands.append(alloc, try scanner.readObject());
+        const maybe_obj = try readContentObject(&scanner);
+        if (maybe_obj) |obj| {
+            try operands.append(alloc, obj);
+        } else {
+            clearContentOperands(alloc, &operands);
+        }
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+fn readContentLexeme(scanner: *syntax.Scanner) anyerror!?syntax.Lexeme {
+    return scanner.readLexeme() catch |err| {
+        if (isRecoverableContentSyntaxError(err)) return null;
+        return err;
+    };
+}
+
+fn readContentObject(scanner: *syntax.Scanner) anyerror!?syntax.Object {
+    return scanner.readObject() catch |err| {
+        if (isRecoverableContentSyntaxError(err)) return null;
+        return err;
+    };
+}
+
+fn clearContentOperands(alloc: Allocator, operands: *std.ArrayList(syntax.Object)) void {
+    for (operands.items) |*obj| obj.deinit(alloc);
+    operands.clearRetainingCapacity();
+}
+
+fn isRecoverableContentSyntaxError(err: anyerror) bool {
+    return switch (err) {
+        error.UnexpectedDelimiter,
+        error.MalformedHexString,
+        error.MalformedName,
+        error.InvalidEscapeSequence,
+        error.InvalidOctalEscape,
+        error.UnexpectedKeyword,
+        error.UnexpectedDictKey,
+        error.UnexpectedEof,
+        => true,
+        else => false,
+    };
 }
 
 fn cloneLexemeForContent(alloc: Allocator, lex: syntax.Lexeme) !syntax.Lexeme {

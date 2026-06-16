@@ -17,6 +17,7 @@ const std = @import("std");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("mod.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
@@ -1237,6 +1238,17 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
     }
 
+    pub fn upsertExtensionPackage(self: *MetadataService, record: extension_domain.PackageManifest) !void {
+        try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+    }
+
+    pub fn syncExtensionPackageStore(self: *MetadataService, io: std.Io, root_path: []const u8) !usize {
+        const entries = try extension_domain.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer extension_domain.freePackageStoreEntries(self.alloc, entries);
+        for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
+        return entries.len;
+    }
+
     pub fn runRound(self: *MetadataService) !void {
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
@@ -1461,6 +1473,46 @@ pub const MetadataService = struct {
     pub fn freeProjectedReplicationSourceStatuses(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.ReplicationSourceStatusRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeReplicationSourceStatuses(alloc, records);
+    }
+
+    pub fn listProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.PackageManifest {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionPackages(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionPackages(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.PackageManifest) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionPackages(alloc, records);
+    }
+
+    pub fn listProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.InstalledExtension {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listInstalledExtensions(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedInstalledExtensions(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.InstalledExtension) void {
+        const store = self.projectedStore() orelse return;
+        store.freeInstalledExtensions(alloc, records);
+    }
+
+    pub fn listProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionMember {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionMembers(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionMembers(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionMember) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionMembers(alloc, records);
+    }
+
+    pub fn listProjectedExtensionDependencies(self: *MetadataService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionDependency {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionDependencies(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionDependencies(self: *MetadataService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionDependency) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionDependencies(alloc, records);
     }
 
     pub fn listProjectedShuffleJoinLeases(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.ShuffleJoinLeaseRecord {
@@ -2457,6 +2509,17 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .remove_reallocation_request = .{} });
     }
 
+    pub fn upsertExtensionPackage(self: *MetadataHttpService, record: extension_domain.PackageManifest) !void {
+        try self.proposeTransitionCommand(.{ .upsert_extension_package = record });
+    }
+
+    pub fn syncExtensionPackageStore(self: *MetadataHttpService, io: std.Io, root_path: []const u8) !usize {
+        const entries = try extension_domain.scanPackageStoreAlloc(self.alloc, io, root_path);
+        defer extension_domain.freePackageStoreEntries(self.alloc, entries);
+        for (entries) |entry| try self.upsertExtensionPackage(entry.manifest);
+        return entries.len;
+    }
+
     pub fn runRound(self: *MetadataHttpService) !void {
         var phase_start_ns = platform_time.monotonicNs();
         try self.ensureLifecycleListenerRegistered();
@@ -2783,6 +2846,10 @@ pub const MetadataHttpService = struct {
             .split_observations = &.{},
             .merge_observations = &.{},
             .merged_group_statuses = &.{},
+            .extension_packages = &.{},
+            .installed_extensions = &.{},
+            .extension_members = &.{},
+            .extension_dependencies = &.{},
         };
         errdefer self.freeAdminSnapshot(&snapshot);
 
@@ -2800,6 +2867,10 @@ pub const MetadataHttpService = struct {
         snapshot.replication_source_statuses = try cloneProjectedReplicationSourceStatusesOwned(self.alloc, core.replication_source_statuses);
         snapshot.split_transitions = try cloneProjectedSplitTransitionsOwned(self.alloc, core.split_transitions);
         snapshot.merge_transitions = try cloneProjectedMergeTransitionsOwned(self.alloc, core.merge_transitions);
+        snapshot.extension_packages = try store.listExtensionPackages(self.alloc, self.metadata_group_id);
+        snapshot.installed_extensions = try store.listInstalledExtensions(self.alloc, self.metadata_group_id);
+        snapshot.extension_members = try store.listExtensionMembers(self.alloc, self.metadata_group_id);
+        snapshot.extension_dependencies = try store.listExtensionDependencies(self.alloc, self.metadata_group_id);
         self.unlockRuntime();
 
         snapshot.local_bootstrap_statuses = try self.listLocalBootstrapStatuses(self.alloc);
@@ -2974,6 +3045,54 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedShuffleJoinLeases(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.ShuffleJoinLeaseRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeShuffleJoinLeases(alloc, records);
+    }
+
+    pub fn listProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.PackageManifest {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionPackages(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionPackages(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.PackageManifest) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionPackages(alloc, records);
+    }
+
+    pub fn listProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.InstalledExtension {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listInstalledExtensions(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedInstalledExtensions(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.InstalledExtension) void {
+        const store = self.projectedStore() orelse return;
+        store.freeInstalledExtensions(alloc, records);
+    }
+
+    pub fn listProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionMember {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionMembers(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionMembers(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionMember) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionMembers(alloc, records);
+    }
+
+    pub fn listProjectedExtensionDependencies(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]extension_domain.ExtensionDependency {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listExtensionDependencies(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedExtensionDependencies(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []extension_domain.ExtensionDependency) void {
+        const store = self.projectedStore() orelse return;
+        store.freeExtensionDependencies(alloc, records);
     }
 
     pub fn listLocalBootstrapStatuses(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]raft_host.BootstrapStatus {
@@ -5341,6 +5460,34 @@ pub fn snapshotStatusWithOptions(
     defer if (@hasDecl(SourceDeclType, "freeProjectedReplicationSourceStatuses") and projected_replication_source_statuses.len > 0) {
         service.freeProjectedReplicationSourceStatuses(alloc, projected_replication_source_statuses);
     };
+    const projected_extension_packages = if (@hasDecl(SourceDeclType, "listProjectedExtensionPackages"))
+        try service.listProjectedExtensionPackages(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedExtensionPackages") and projected_extension_packages.len > 0) {
+        service.freeProjectedExtensionPackages(alloc, projected_extension_packages);
+    };
+    const projected_installed_extensions = if (@hasDecl(SourceDeclType, "listProjectedInstalledExtensions"))
+        try service.listProjectedInstalledExtensions(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedInstalledExtensions") and projected_installed_extensions.len > 0) {
+        service.freeProjectedInstalledExtensions(alloc, projected_installed_extensions);
+    };
+    const projected_extension_members = if (@hasDecl(SourceDeclType, "listProjectedExtensionMembers"))
+        try service.listProjectedExtensionMembers(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedExtensionMembers") and projected_extension_members.len > 0) {
+        service.freeProjectedExtensionMembers(alloc, projected_extension_members);
+    };
+    const projected_extension_dependencies = if (@hasDecl(SourceDeclType, "listProjectedExtensionDependencies"))
+        try service.listProjectedExtensionDependencies(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedExtensionDependencies") and projected_extension_dependencies.len > 0) {
+        service.freeProjectedExtensionDependencies(alloc, projected_extension_dependencies);
+    };
     const projected_split_transitions = try service.listProjectedSplitTransitions(alloc);
     defer service.freeProjectedSplitTransitions(alloc, projected_split_transitions);
     const projected_merge_transitions = try service.listProjectedMergeTransitions(alloc);
@@ -5586,6 +5733,10 @@ pub fn snapshotStatusWithOptions(
         .projected_replication_source_last_success_at_ms_max = projected_replication_source_last_success_at_ms_max,
         .projected_replication_source_last_source_commit_at_ms_max = projected_replication_source_last_source_commit_at_ms_max,
         .projected_replication_source_last_change_applied_at_ms_max = projected_replication_source_last_change_applied_at_ms_max,
+        .projected_extension_packages = projected_extension_packages.len,
+        .projected_installed_extensions = projected_installed_extensions.len,
+        .projected_extension_members = projected_extension_members.len,
+        .projected_extension_dependencies = projected_extension_dependencies.len,
         .projected_ranges = projected_ranges.len,
         .projected_stores = projected_stores.len,
         .projected_placement_intents = projected_placement_intents.len,

@@ -77,7 +77,7 @@ function isRecognizerCapability(value: string): value is RecognizerCapability {
   return value === "labels" || value === "zeroshot" || value === "relations" || value === "answers";
 }
 
-const BACKEND_ORDER: Backend[] = ["native", "onnx", "metal", "mlx", "cuda", "xla", "wasm"];
+const BACKEND_ORDER: Backend[] = ["native", "onnx", "metal", "cuda", "xla", "wasm"];
 
 function enabledBackends(backends: BackendRuntimesResponse | undefined): Backend[] {
   if (!backends) return [];

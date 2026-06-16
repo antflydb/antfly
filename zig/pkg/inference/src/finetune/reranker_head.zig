@@ -839,10 +839,10 @@ pub fn openEncoder(allocator: std.mem.Allocator, model_dir: []const u8, backend:
 
     const session = switch (backend) {
         .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
+        .metal => try session_factory.createMetalSessionWithTaskOverride(allocator, model_dir, .generic),
         .auto => blk: {
-            if (build_options.enable_mlx) {
-                break :blk session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic) catch try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic);
+            if (build_options.enable_metal) {
+                break :blk session_factory.createMetalSessionWithTaskOverride(allocator, model_dir, .generic) catch try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic);
             }
             break :blk try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic);
         },

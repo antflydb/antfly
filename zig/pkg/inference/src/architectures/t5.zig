@@ -14,7 +14,7 @@
 
 // T5 encoder-decoder architecture using abstract ComputeBackend ops.
 //
-// Single implementation works with any backend (native, MLX, etc).
+// Single implementation works with any backend (native).
 // T5 differences from BERT:
 // - RMSNorm (no bias, no mean subtraction)
 // - No bias in linear projections

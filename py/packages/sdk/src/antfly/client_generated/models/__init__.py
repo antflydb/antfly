@@ -54,6 +54,7 @@ from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
+from .capability import Capability
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -89,6 +90,7 @@ from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_generator_config import CohereGeneratorConfig
 from .cohere_reranker_config import CohereRerankerConfig
 from .confidence_step_config import ConfidenceStepConfig
+from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
 from .connected_model import ConnectedModel
 from .connected_model_type import ConnectedModelType
@@ -101,6 +103,8 @@ from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilt
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .credentials import Credentials
+from .data_shape_decl import DataShapeDecl
+from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
@@ -126,6 +130,9 @@ from .document_artifact_table_reprocess_response_reprocess_status import (
 )
 from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
+from .drop_extension_request import DropExtensionRequest
+from .drop_extension_request_mode import DropExtensionRequestMode
+from .drop_extension_response import DropExtensionResponse
 from .dynamic_template import DynamicTemplate
 from .dynamic_template_match_mapping_type import DynamicTemplateMatchMappingType
 from .edge import Edge
@@ -158,6 +165,12 @@ from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
+from .extension_error import ExtensionError
+from .extension_member import ExtensionMember
+from .extension_object_decl import ExtensionObjectDecl
+from .extension_object_kind import ExtensionObjectKind
+from .extension_scope import ExtensionScope
+from .extension_scope_kind import ExtensionScopeKind
 from .external_io_connection import ExternalIoConnection
 from .external_io_protocol import ExternalIoProtocol
 from .extraction_classification import ExtractionClassification
@@ -354,6 +367,10 @@ from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
 from .inference_vad_options import InferenceVADOptions
 from .inferenceschemas_config import InferenceschemasConfig
+from .install_extension_request import InstallExtensionRequest
+from .install_manifest import InstallManifest
+from .installed_extension import InstalledExtension
+from .installed_extension_status import InstalledExtensionStatus
 from .ip_range_query import IPRangeQuery
 from .join_condition import JoinCondition
 from .join_operator import JoinOperator
@@ -403,6 +420,12 @@ from .open_ai_embedder_config import OpenAIEmbedderConfig
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_generator_config import OpenRouterGeneratorConfig
+from .package_artifact import PackageArtifact
+from .package_artifact_kind import PackageArtifactKind
+from .package_dependency import PackageDependency
+from .package_kind import PackageKind
+from .package_manifest import PackageManifest
+from .package_manifest_manifest_api_version import PackageManifestManifestApiVersion
 from .path import Path
 from .path_edge import PathEdge
 from .path_edge_metadata import PathEdgeMetadata
@@ -458,6 +481,8 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .runtime_decl import RuntimeDecl
+from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -537,6 +562,8 @@ from .traversal_result_document import TraversalResultDocument
 from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
+from .update_extension_request import UpdateExtensionRequest
+from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
@@ -606,6 +633,7 @@ __all__ = (
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "CalendarInterval",
+    "Capability",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -641,6 +669,7 @@ __all__ = (
     "CohereGeneratorConfig",
     "CohereRerankerConfig",
     "ConfidenceStepConfig",
+    "ConfigureExtensionRequest",
     "ConjunctionQuery",
     "ConnectedModel",
     "ConnectedModelType",
@@ -653,6 +682,8 @@ __all__ = (
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "DataShapeDecl",
+    "DataShapeKind",
     "DateRangeStringQuery",
     "DisjunctionQuery",
     "DistanceMetric",
@@ -676,6 +707,9 @@ __all__ = (
     "DocumentArtifactTableReprocessResponseReprocessStatus",
     "DocumentSchema",
     "DocumentSchemaSchema",
+    "DropExtensionRequest",
+    "DropExtensionRequestMode",
+    "DropExtensionResponse",
     "DynamicTemplate",
     "DynamicTemplateMatchMappingType",
     "Edge",
@@ -708,6 +742,12 @@ __all__ = (
     "EvaluatorScoreMetadata",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExtensionError",
+    "ExtensionMember",
+    "ExtensionObjectDecl",
+    "ExtensionObjectKind",
+    "ExtensionScope",
+    "ExtensionScopeKind",
     "ExternalIoConnection",
     "ExternalIoProtocol",
     "ExtractionClassification",
@@ -904,6 +944,10 @@ __all__ = (
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
     "InferenceVADOptions",
+    "InstalledExtension",
+    "InstalledExtensionStatus",
+    "InstallExtensionRequest",
+    "InstallManifest",
     "IPRangeQuery",
     "JoinCondition",
     "JoinOperator",
@@ -953,6 +997,12 @@ __all__ = (
     "OpenAIGeneratorConfig",
     "OpenRouterEmbedderConfig",
     "OpenRouterGeneratorConfig",
+    "PackageArtifact",
+    "PackageArtifactKind",
+    "PackageDependency",
+    "PackageKind",
+    "PackageManifest",
+    "PackageManifestManifestApiVersion",
     "Path",
     "PathEdge",
     "PathEdgeMetadata",
@@ -1008,6 +1058,8 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RuntimeDecl",
+    "RuntimeDeclMode",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -1087,6 +1139,8 @@ __all__ = (
     "TraversalRules",
     "TraverseResponse",
     "TreeSearchConfig",
+    "UpdateExtensionRequest",
+    "UpdateManifestRef",
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",

@@ -222,7 +222,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
     return (
       <Card>
         <CardHeader>
-          <CardTitle>Document Builder</CardTitle>
+          <CardTitle>Manual Entry</CardTitle>
         </CardHeader>
         <CardContent>
           <p className="text-muted-foreground">
@@ -237,7 +237,7 @@ const DocumentBuilder: React.FC<DocumentBuilderProps> = ({ tableName, schema }) 
     <div className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle>Build Document from Schema</CardTitle>
+          <CardTitle>Manual Entry</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex flex-col gap-4">

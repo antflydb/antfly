@@ -36,6 +36,7 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 
 import pytest
@@ -45,6 +46,8 @@ from .models import bootstrap_models_for_listing, inference_command, maybe_pull_
 
 API_PREFIX = "/ai/v1"
 ML_API_PREFIX = "/ml/v1"
+DEFAULT_REQUEST_TIMEOUT = float(os.environ.get("ANTFLY_INFERENCE_REQUEST_TIMEOUT", "30"))
+SERVER_OUTPUT_LIMIT = 4000
 
 
 def env_first(*names: str) -> str | None:
@@ -79,10 +82,10 @@ def wait_for_server(url: str, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            r = requests.get(f"{url}/readyz", timeout=2)
+            r = requests.get(f"{url}/healthz", timeout=2)
             if r.ok:
                 return True
-        except requests.ConnectionError:
+        except requests.RequestException:
             pass
         time.sleep(0.5)
     return False
@@ -93,6 +96,7 @@ class InferenceServer:
 
     def __init__(self, command_prefix: list[str], models_path: str, ml_path: str, host: str, port: int):
         self.url = f"http://{host}:{port}"
+        self.output = tempfile.TemporaryFile(mode="w+b")
         self.proc = subprocess.Popen(
             [
                 *command_prefix,
@@ -106,18 +110,20 @@ class InferenceServer:
                 "--ml-dir",
                 ml_path,
             ],
-            stdout=subprocess.PIPE,
+            stdout=self.output,
             stderr=subprocess.STDOUT,
         )
         if not wait_for_server(self.url):
-            # Capture output for debugging
-            out = ""
-            if self.proc.stdout:
-                out = self.proc.stdout.read().decode(errors="replace")[:2000]
-            self.stop()
+            self.stop(close_output=False)
+            out = self.read_output()
+            self.output.close()
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
 
-    def stop(self):
+    def read_output(self) -> str:
+        self.output.seek(0)
+        return self.output.read(SERVER_OUTPUT_LIMIT).decode(errors="replace")
+
+    def stop(self, close_output: bool = True):
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:
@@ -125,6 +131,8 @@ class InferenceServer:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait()
+        if close_output:
+            self.output.close()
 
 
 @pytest.fixture(scope="session")
@@ -186,6 +194,7 @@ def api(base_url):
         def _request(self, method: str, path: str, *, json=None, retry_on_missing_model: bool = True, **kwargs):
             request = getattr(self.s, method)
             normalized_path = api_path(path)
+            kwargs.setdefault("timeout", DEFAULT_REQUEST_TIMEOUT)
             response = request(f"{self.url}{normalized_path}", json=json, **kwargs)
             if retry_on_missing_model and maybe_pull_missing_model(normalized_path, json, response):
                 response.close()

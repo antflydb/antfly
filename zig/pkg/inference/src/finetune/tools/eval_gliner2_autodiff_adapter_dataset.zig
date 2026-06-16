@@ -780,7 +780,6 @@ fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
 fn parseBackend(value: []const u8) ?adapter_eval.EvalBackend {
     if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "mlx")) return .mlx;
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     return null;
 }
@@ -928,7 +927,7 @@ fn printUsage() void {
         \\options:
         \\  --seq-len N
         \\  --max-span-width N
-        \\  --backend auto|metal|mlx|native
+        \\  --backend auto|metal|native
         \\  --compiled-required
         \\  --objective token|span-start
         \\  --max-examples N

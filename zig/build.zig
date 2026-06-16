@@ -87,13 +87,6 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
     module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
 }
 
-fn mlxRootAvailable(b: *std.Build, target: std.Build.ResolvedTarget, root: []const u8) bool {
-    if (target.result.os.tag != .macos) return false;
-    const header = b.fmt("{s}/include/mlx/c/mlx.h", .{root});
-    const library = b.fmt("{s}/lib/libmlxc.dylib", .{root});
-    return pathExists(b, header) and pathExists(b, library);
-}
-
 fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
         "uv",
@@ -122,6 +115,7 @@ const openapi_join_input_paths = [_][]const u8{
     "../specs/openapi/antfly/reranking.yaml",
     "../specs/openapi/antfly/websearch.yaml",
     "../specs/openapi/auth/api.yaml",
+    "../specs/openapi/extensions/api.yaml",
     "../specs/openapi/inference/api.yaml",
     "../specs/openapi/inference/config.yaml",
     "../specs/openapi/shared/generating.yaml",
@@ -199,8 +193,6 @@ fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
 fn addDelegatedInferenceOptions(
     b: *std.Build,
     run: *std.Build.Step.Run,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
     enable_metal: bool,
     enable_onnx: bool,
     onnx_root: []const u8,
@@ -210,12 +202,6 @@ fn addDelegatedInferenceOptions(
     blas_root: ?[]const u8,
 ) void {
     run.addArg("-Dshared-lib-root=../..");
-    if (enable_mlx) {
-        run.addArg("-Dmlx=true");
-        if (mlx_root) |root| run.addArg(b.fmt("-Dmlx-root={s}", .{root}));
-    } else {
-        run.addArg("-Dmlx=false");
-    }
     run.addArg(if (enable_metal) "-Dmetal=true" else "-Dmetal=false");
     run.addArg(if (enable_onnx) "-Donnx=true" else "-Donnx=false");
     if (enable_onnx) {
@@ -238,8 +224,6 @@ fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
 
 fn addDelegatedInferenceBuildSteps(
     b: *std.Build,
-    enable_mlx: bool,
-    mlx_root: ?[]const u8,
     enable_metal: bool,
     enable_onnx: bool,
     onnx_root: []const u8,
@@ -253,7 +237,7 @@ fn addDelegatedInferenceBuildSteps(
     for (inference_delegated_steps) |step_name| {
         const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_mlx, mlx_root, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
+        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
@@ -276,21 +260,6 @@ const SpngPaths = struct {
     include_dir: []const u8,
     lib_dir: []const u8,
 };
-
-fn detectMlxRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
-    if (target.result.os.tag != .macos) return null;
-
-    const candidates = [_][]const u8{
-        "/opt/homebrew",
-        "/opt/homebrew/opt/mlx-c",
-        "/usr/local",
-        "/usr/local/opt/mlx-c",
-    };
-    for (candidates) |root| {
-        if (mlxRootAvailable(b, target, root)) return root;
-    }
-    return null;
-}
 
 fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     const platform_str = switch (target.result.os.tag) {
@@ -1104,12 +1073,6 @@ pub fn build(b: *std.Build) void {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const termite_mlx_option = b.option(bool, "mlx", "Enable MLX inference support when available");
-    const termite_mlx_requested = if (link_libc)
-        termite_mlx_option orelse false
-    else
-        false;
-    const termite_mlx_root_opt = b.option([]const u8, "mlx-root", "Path to MLX C root with include/ and lib/");
     const termite_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
     const termite_enable_onnx = if (link_libc)
         termite_onnx_option orelse false
@@ -1118,14 +1081,9 @@ pub fn build(b: *std.Build) void {
     const termite_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
     const termite_onnx_root = termite_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
     const termite_enable_metal = if (link_libc)
-        b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse if (target.result.os.tag == .macos) true else termite_mlx_requested
+        b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse (target.result.os.tag == .macos)
     else
         false;
-    const termite_enable_mlx = termite_enable_metal and termite_mlx_requested;
-    const termite_mlx_root = if (termite_enable_mlx)
-        termite_mlx_root_opt orelse detectMlxRoot(b, target)
-    else
-        termite_mlx_root_opt;
     const termite_enable_cuda = b.option(bool, "cuda", "Enable CUDA inference support through the NVIDIA Driver API") orelse false;
     const termite_cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: portable PTX; fatbin is not implemented yet") orelse "portable";
     if (!std.mem.eql(u8, termite_cuda_artifacts, "portable")) {
@@ -1142,12 +1100,6 @@ pub fn build(b: *std.Build) void {
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
-    if (termite_enable_mlx) {
-        const root = termite_mlx_root orelse @panic("-Dmlx=true requires an MLX C install; pass -Dmlx-root=<path>");
-        if (!mlxRootAvailable(b, target, root)) {
-            @panic("-Dmlx=true requires an MLX C install with include/mlx/c/mlx.h and lib/libmlxc.dylib");
-        }
-    }
     if (termite_enable_onnx) {
         const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
             pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
@@ -1157,8 +1109,6 @@ pub fn build(b: *std.Build) void {
     }
     const delegated_inference_steps = addDelegatedInferenceBuildSteps(
         b,
-        termite_enable_mlx,
-        termite_mlx_root,
         termite_enable_metal,
         termite_enable_onnx,
         termite_onnx_root,
@@ -1556,8 +1506,6 @@ pub fn build(b: *std.Build) void {
         .backend = .{
             .enable_onnx = termite_enable_onnx,
             .onnx_root = termite_onnx_root,
-            .enable_mlx = termite_enable_mlx,
-            .mlx_root = termite_mlx_root,
             .enable_metal = termite_enable_metal,
             .enable_cuda = termite_enable_cuda,
             .cuda_artifacts = termite_cuda_artifacts,
@@ -1894,7 +1842,6 @@ pub fn build(b: *std.Build) void {
     // --- Inference WASM modules for unified antfly.wasm ---
     const inference_wasm_build_options = b.addOptions();
     inference_wasm_build_options.addOption(bool, "enable_onnx", false);
-    inference_wasm_build_options.addOption(bool, "enable_mlx", false);
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
@@ -2265,6 +2212,10 @@ pub fn build(b: *std.Build) void {
             "artifact reprocess job store recovers durable jobs and reseeds ids",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
     const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
@@ -2600,6 +2551,10 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"common config"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
@@ -2809,6 +2764,10 @@ pub fn build(b: *std.Build) void {
     const lib_db_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
     const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
@@ -3320,6 +3279,10 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &public_api_parity_default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
@@ -3356,6 +3319,10 @@ pub fn build(b: *std.Build) void {
             "auth row filter validator rejects malformed auth node",
             "effective resolved row filter prefers table filter before wildcard",
             "artifact operations apply source document row filter visibility",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
@@ -3834,6 +3801,10 @@ pub fn build(b: *std.Build) void {
             "hbc cache shrinks to resource budget under pressure",
             "provisioned group storage derives all resource budgets",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
     const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
@@ -4025,6 +3996,10 @@ pub fn build(b: *std.Build) void {
             "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
         },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
     const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
@@ -4155,8 +4130,13 @@ pub fn build(b: *std.Build) void {
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
+    wal_test_mod.addImport("structlog", structlog_mod);
     const wal_unit_tests = b.addTest(.{
         .root_module = wal_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
 
@@ -4222,8 +4202,13 @@ pub fn build(b: *std.Build) void {
     persistent_test_mod.addImport("antfly_vector", vector_mod);
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
+    persistent_test_mod.addImport("structlog", structlog_mod);
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
 
@@ -4287,9 +4272,14 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
+    index_manager_test_mod.addImport("structlog", structlog_mod);
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
         .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
 
@@ -4358,6 +4348,7 @@ pub fn build(b: *std.Build) void {
     db_test_mod.addImport("antfly_pdf", pdf_mod);
     db_test_mod.addImport("antfly_image", image_mod);
     db_test_mod.addImport("antfly_font", font_mod);
+    db_test_mod.addImport("structlog", structlog_mod);
 
     const db_split_sim_default_filters = [_][]const u8{
         "db split sim default workload stays green",
@@ -4398,6 +4389,10 @@ pub fn build(b: *std.Build) void {
 
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
@@ -4451,6 +4446,10 @@ pub fn build(b: *std.Build) void {
             "dirty runtime status refresh finishes expired auto bulk before collecting leases",
             "managed startup catch-up ignores stale dirty bit after writer cache entry is gone",
             "provisioned table write source deinit drains restore repair jobs",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
@@ -6171,6 +6170,10 @@ pub fn build(b: *std.Build) void {
     });
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");

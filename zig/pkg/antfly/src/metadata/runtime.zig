@@ -67,6 +67,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 };
@@ -132,11 +133,13 @@ const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
+    extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
+        alloc.free(self.extension_package_store_dir);
     }
 };
 
@@ -752,6 +755,10 @@ pub fn runFromIterator(
     defer server.deinit();
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
+    const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
+    if (synced_extension_packages > 0) {
+        std.log.info("metadata synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
+    }
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -875,6 +882,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extension-package-store")) {
+            cfg.extension_package_store_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -923,11 +934,20 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
+    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(extension_package_store_dir);
 
     return .{
         .replica_root_dir = replica_root_dir,
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
+        .extension_package_store_dir = extension_package_store_dir,
     };
 }
 
@@ -1183,6 +1203,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Snapshot root directory
+        \\  --extension-package-store <path>
+        \\                                 Extension package store directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
@@ -1200,11 +1222,17 @@ test "metadata runtime module compiles" {
     _ = runFromIterator;
 }
 
-test "metadata runtime cli accepts secret store path" {
-    var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
+test "metadata runtime cli accepts secret and extension package store paths" {
+    var argv = [_][*:0]const u8{
+        "--secret-store-path",
+        "/run/antfly/secrets/secrets.json",
+        "--extension-package-store",
+        "/opt/antfly/extensions",
+    };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const cfg = try parseCli(&iter);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
 }
 
 fn expectMetricPresent(output: []const u8, name: []const u8) !void {
@@ -1520,6 +1548,17 @@ test "metadata runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
+}
+
+test "metadata runtime resolves explicit extension package store path" {
+    const alloc = std.testing.allocator;
+    const resolved = try resolvePaths(alloc, .{
+        .data_dir = "/tmp/antflydb",
+        .extension_package_store_dir = "/opt/antfly/extension-store",
+    }, null);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("/opt/antfly/extension-store", resolved.extension_package_store_dir);
 }
 
 test "metadata runtime derives reconciler config from common shard allocation settings" {

@@ -790,9 +790,9 @@ test "pjrt_mesh: createPjrtMesh from CPU plugin" {
 
     // Use fake backends — we only test mesh structure, not execution.
     const fake_pjrt_cb = @as(*const ComputeBackend, @ptrFromInt(0x1000));
-    const fake_blas_cb = @as(*const ComputeBackend, @ptrFromInt(0x2000));
+    const fake_native_cb = @as(*const ComputeBackend, @ptrFromInt(0x2000));
 
-    var mesh = try pjrt_mesh.createPjrtMesh(allocator, &client, fake_pjrt_cb, fake_blas_cb);
+    var mesh = try pjrt_mesh.createPjrtMesh(allocator, &client, fake_pjrt_cb, fake_native_cb);
     defer mesh.deinit();
 
     // CPU plugin has at least 1 device; mesh should have that + 1 native fallback
@@ -807,7 +807,7 @@ test "pjrt_mesh: createPjrtMesh from CPU plugin" {
     const last_id: device_mesh_mod.DeviceId = @intCast(mesh.deviceCount() - 1);
     const last = mesh.device(last_id).?;
     try std.testing.expectEqual(contracts.BackendKind.native, last.kind);
-    try std.testing.expectEqual(fake_blas_cb, last.backend);
+    try std.testing.expectEqual(fake_native_cb, last.backend);
 
     // pjrtDeviceCount should be total - 1
     const pjrt_count = pjrt_mesh.pjrtDeviceCount(&mesh);

@@ -15,6 +15,8 @@
 const std = @import("std");
 const routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const extension_domain = @import("../extensions/mod.zig");
+const wasmtime_runtime = extension_domain.wasmtime_runtime;
 const usermgr = @import("../usermgr/mod.zig");
 const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
@@ -163,7 +165,56 @@ const mcp_tool_specs = [_]McpToolSpec{
     },
 };
 
+const ExtensionMcpTool = struct {
+    member: *const extension_domain.ExtensionMember,
+    description: []u8,
+    input_schema_json: []u8,
+    handler: []u8,
+    runtime_binding: ?ExtensionRuntimeBinding = null,
+
+    fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
+        alloc.free(self.description);
+        alloc.free(self.input_schema_json);
+        alloc.free(self.handler);
+        if (self.runtime_binding) |binding| binding.deinit(alloc);
+    }
+};
+
+const ExtensionRuntimeBinding = struct {
+    package_name: []u8,
+    package_version: []u8,
+    runtime_name: []u8,
+    artifact: []u8,
+    entrypoint: []u8,
+
+    fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
+        alloc.free(self.package_name);
+        alloc.free(self.package_version);
+        alloc.free(self.runtime_name);
+        alloc.free(self.artifact);
+        alloc.free(self.entrypoint);
+    }
+
+    fn runtime(self: ExtensionRuntimeBinding) wasmtime_runtime.RuntimeBinding {
+        return .{
+            .package_name = self.package_name,
+            .package_version = self.package_version,
+            .runtime_name = self.runtime_name,
+            .artifact = self.artifact,
+            .entrypoint = self.entrypoint,
+        };
+    }
+};
+
 pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype) !http_common.HttpResponse {
+    return try handleMcpRequestFiltered(server_ptr, req, authenticated_identity, routes.Routes.mcp_v1, null);
+}
+
+pub fn handleExtensionMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype, extension_name: []const u8) !http_common.HttpResponse {
+    return try handleMcpRequestFiltered(server_ptr, req, authenticated_identity, req.uri, extension_name);
+}
+
+fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: anytype, endpoint_path: []const u8, extension_name_filter: ?[]const u8) !http_common.HttpResponse {
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
@@ -335,6 +386,20 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             return try mcpResultFromHttpResponse(alloc, resp);
         }
     };
+    const ExtensionToolContext = struct {
+        server: Server,
+        installed: *const extension_domain.InstalledExtension,
+        tool: *const ExtensionMcpTool,
+
+        fn handler(ctx: *@This()) mcp.ToolHandler {
+            return .{ .ptr = ctx, .call_fn = call };
+        }
+
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.installed, ctx.tool.*, args);
+        }
+    };
 
     var contexts: [mcp_tool_specs.len]ToolContext = undefined;
     for (&contexts, mcp_tool_specs) |*ctx, spec| {
@@ -344,6 +409,38 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
             .trusted_principal = req.header(trusted_principal_header),
             .kind = spec.kind,
         };
+    }
+
+    var snapshot_opt = try server_ptr.source.adminSnapshot();
+    defer if (snapshot_opt) |*snapshot| server_ptr.source.freeAdminSnapshot(snapshot);
+
+    var extension_tools = std.ArrayListUnmanaged(ExtensionMcpTool).empty;
+    defer {
+        for (extension_tools.items) |tool| tool.deinit(server_ptr.alloc);
+        extension_tools.deinit(server_ptr.alloc);
+    }
+    if (snapshot_opt) |*snapshot| {
+        if (extension_name_filter) |extension_name| {
+            if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, extension_name)) {
+                return try textResponse(server_ptr.alloc, 404, "extension not found");
+            }
+        }
+        for (snapshot.extension_members) |*member| {
+            if (member.object_kind != .mcp_tool) continue;
+            if (extension_name_filter) |extension_name| {
+                if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
+            }
+            if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, member.extension_name)) continue;
+            try extension_tools.append(server_ptr.alloc, try extensionMcpToolFromMemberAlloc(server_ptr.alloc, member, snapshot));
+        }
+    } else if (extension_name_filter != null) {
+        return try textResponse(server_ptr.alloc, 404, "extension not found");
+    }
+    const extension_contexts = try server_ptr.alloc.alloc(ExtensionToolContext, extension_tools.items.len);
+    defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
+    for (extension_contexts, 0..) |*ctx, i| {
+        const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try textResponse(server_ptr.alloc, 404, "extension not found");
+        ctx.* = .{ .server = server_ptr, .installed = installed, .tool = &extension_tools.items[i] };
     }
 
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
@@ -361,12 +458,22 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
         .session_store = server_ptr.mcp_sessions.iface(),
     };
     defer protocol_server.deinit(server_ptr.alloc);
-    for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
-        if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
+    if (extension_name_filter == null) {
+        for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
+            if (!mcpToolVisibleForIdentity(spec.kind, authenticated_identity)) continue;
+            try protocol_server.addTool(server_ptr.alloc, .{
+                .name = spec.name,
+                .description = spec.description,
+                .input_schema_json = input_schemas[i],
+                .handler = ctx.handler(),
+            });
+        }
+    }
+    for (extension_tools.items, extension_contexts) |tool, *ctx| {
         try protocol_server.addTool(server_ptr.alloc, .{
-            .name = spec.name,
-            .description = spec.description,
-            .input_schema_json = input_schemas[i],
+            .name = tool.member.object_name,
+            .description = tool.description,
+            .input_schema_json = tool.input_schema_json,
             .handler = ctx.handler(),
         });
     }
@@ -379,7 +486,7 @@ pub fn handleMcpRequest(server_ptr: anytype, req: http_common.HttpRequest, authe
     var transport = switch (req.method) {
         .GET => try protocol_server.handleStreamableHttpGetWithSession(
             server_ptr.alloc,
-            routes.Routes.mcp_v1,
+            endpoint_path,
             req.header(mcp.session_id_header),
             req.header(mcp.last_event_id_header),
         ),
@@ -429,6 +536,323 @@ fn validateMcpSession(server_ptr: anytype, req: http_common.HttpRequest) !?http_
     const session_id = req.header(mcp.session_id_header) orelse return try textResponse(server_ptr.alloc, 400, "missing MCP session");
     if (!server_ptr.mcp_sessions.iface().exists(session_id)) return try textResponse(server_ptr.alloc, 404, "unknown MCP session");
     return null;
+}
+
+fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, snapshot: anytype) !ExtensionMcpTool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+
+    var description: ?[]u8 = null;
+    errdefer if (description) |value| alloc.free(value);
+    var input_schema_json: ?[]u8 = null;
+    errdefer if (input_schema_json) |value| alloc.free(value);
+    var handler: ?[]u8 = null;
+    errdefer if (handler) |value| alloc.free(value);
+
+    if (parsed) |config| {
+        if (config.value == .object) {
+            if (jsonStringObjectField(config.value.object, "description")) |value| {
+                description = try alloc.dupe(u8, value);
+            }
+            if (config.value.object.get("input_schema")) |schema| {
+                if (schema == .object) input_schema_json = try stringifyJsonValue(alloc, schema);
+            }
+            if (input_schema_json == null) {
+                if (jsonStringObjectField(config.value.object, "input_schema_json")) |schema_json| {
+                    if (schema_json.len != 0) input_schema_json = try cloneValidMcpInputSchemaJson(alloc, schema_json);
+                }
+            }
+            if (jsonStringObjectField(config.value.object, "handler")) |value| {
+                handler = try alloc.dupe(u8, value);
+            }
+        }
+    }
+
+    if (description == null) {
+        description = try std.fmt.allocPrint(alloc, "Extension MCP tool {s}.{s}", .{ member.extension_name, member.object_name });
+    }
+    if (input_schema_json == null) {
+        input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}");
+    }
+    if (handler == null) {
+        handler = try alloc.dupe(u8, "");
+    }
+
+    return .{
+        .member = member,
+        .description = description.?,
+        .input_schema_json = input_schema_json.?,
+        .handler = handler.?,
+        .runtime_binding = try extensionRuntimeBindingAlloc(alloc, member, handler.?, snapshot),
+    };
+}
+
+fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, handler: []const u8, snapshot: anytype) !?ExtensionRuntimeBinding {
+    const parsed = parseWasmHandler(handler) orelse return null;
+    const installed = findInstalledExtension(snapshot.installed_extensions, member.extension_name) orelse return null;
+    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version) orelse return null;
+    const runtime = findWasmRuntime(package.install.runtimes, parsed.runtime_name) orelse return null;
+
+    var package_name: ?[]u8 = null;
+    errdefer if (package_name) |value| alloc.free(value);
+    var package_version: ?[]u8 = null;
+    errdefer if (package_version) |value| alloc.free(value);
+    var runtime_name: ?[]u8 = null;
+    errdefer if (runtime_name) |value| alloc.free(value);
+    var artifact: ?[]u8 = null;
+    errdefer if (artifact) |value| alloc.free(value);
+    var entrypoint: ?[]u8 = null;
+    errdefer if (entrypoint) |value| alloc.free(value);
+
+    package_name = try alloc.dupe(u8, installed.package_name);
+    package_version = try alloc.dupe(u8, installed.package_version);
+    runtime_name = try alloc.dupe(u8, parsed.runtime_name);
+    artifact = try alloc.dupe(u8, runtime.artifact);
+    entrypoint = try runtimeEntrypointAlloc(alloc, runtime.config_json);
+
+    return .{
+        .package_name = package_name.?,
+        .package_version = package_version.?,
+        .runtime_name = runtime_name.?,
+        .artifact = artifact.?,
+        .entrypoint = entrypoint.?,
+    };
+}
+
+fn runtimeEntrypointAlloc(alloc: std.mem.Allocator, config_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, config_json, .{}) catch return try alloc.dupe(u8, "call-tool");
+    defer parsed.deinit();
+    if (parsed.value != .object) return try alloc.dupe(u8, "call-tool");
+    return try alloc.dupe(u8, jsonStringObjectField(parsed.value.object, "entrypoint") orelse "call-tool");
+}
+
+const WasmHandler = struct {
+    runtime_name: []const u8,
+    tool_name: []const u8,
+};
+
+fn parseWasmHandler(handler: []const u8) ?WasmHandler {
+    if (!std.mem.startsWith(u8, handler, "wasm:")) return null;
+    const rest = handler["wasm:".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= rest.len) return null;
+    return .{ .runtime_name = rest[0..slash], .tool_name = rest[slash + 1 ..] };
+}
+
+fn findInstalledExtension(installed_extensions: []const extension_domain.InstalledExtension, name: []const u8) ?extension_domain.InstalledExtension {
+    for (installed_extensions) |installed| {
+        if (std.mem.eql(u8, installed.name, name)) return installed;
+    }
+    return null;
+}
+
+fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8) ?extension_domain.PackageManifest {
+    for (packages) |package| {
+        if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
+    }
+    return null;
+}
+
+fn findWasmRuntime(runtimes: []const extension_domain.RuntimeDecl, name: []const u8) ?extension_domain.RuntimeDecl {
+    for (runtimes) |runtime| {
+        if (runtime.mode == .wasm and std.mem.eql(u8, runtime.name, name)) return runtime;
+    }
+    return null;
+}
+
+fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_domain.InstalledExtension, name: []const u8) ?*const extension_domain.InstalledExtension {
+    for (installed_extensions) |*installed| {
+        if (std.mem.eql(u8, installed.name, name) and installed.status == .ready) return installed;
+    }
+    return null;
+}
+
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+    if (parseWasmHandler(tool.handler)) |handler| {
+        const tool_name = handler.tool_name;
+        if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
+            return try mcpError(alloc, "extension MCP handler does not match requested tool");
+        }
+        const binding = tool.runtime_binding orelse return try mcpError(alloc, "extension wasm runtime binding is unavailable");
+        const request_json = try stringifyJsonValue(alloc, args);
+        defer alloc.free(request_json);
+        var host_context = ExtensionHostContext(@TypeOf(server)){
+            .server = server,
+            .installed = installed,
+        };
+        if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
+            .host_imports = .{
+                .ptr = &host_context,
+                .db_query = ExtensionHostContext(@TypeOf(server)).dbQuery,
+                .db_write = ExtensionHostContext(@TypeOf(server)).dbWrite,
+                .ai_embed = ExtensionHostContext(@TypeOf(server)).aiEmbed,
+            },
+        })) |body| {
+            return try mcpResultFromExtensionJson(alloc, body);
+        } else |err| switch (err) {
+            error.WasmtimeUnavailable,
+            error.WasmtimeUnsupportedArtifact,
+            error.WasmtimePackageStoreUnavailable,
+            error.WasmtimeArtifactNotFound,
+            error.WasmtimeSymbolMissing,
+            => return try mcpError(alloc, "extension wasm runtime is unavailable"),
+            else => return try mcpError(alloc, "extension wasm runtime invocation failed"),
+        }
+    }
+
+    const message = try std.fmt.allocPrint(alloc, "extension MCP tool '{s}' is registered but has no executable handler", .{tool.member.object_name});
+    defer alloc.free(message);
+    return mcpError(alloc, message);
+}
+
+fn ExtensionHostContext(comptime Server: type) type {
+    return struct {
+        server: Server,
+        installed: *const extension_domain.InstalledExtension,
+
+        fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
+            const ctx = hostContext(ptr);
+            try ctx.requireCapability("db:read");
+            const table_name = try ctx.resolveTableName(table);
+            const body = try extensionQueryBodyAlloc(alloc, query_json);
+            defer alloc.free(body);
+            return try ctx.dispatchJson(alloc, .POST, table_name, "query", body);
+        }
+
+        fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
+            const ctx = hostContext(ptr);
+            try ctx.requireCapability("db:write");
+            const table_name = try ctx.resolveTableName(table);
+            const body = try extensionBatchBodyAlloc(alloc, writes_json);
+            defer alloc.free(body);
+            return try ctx.dispatchJson(alloc, .POST, table_name, "batch", body);
+        }
+
+        fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
+            const ctx = hostContext(ptr);
+            try ctx.requireCapability("ai:embed");
+            const out = try alloc.alloc(f32, 8);
+            var hash = std.hash.Wyhash.init(0);
+            hash.update(text);
+            var state = hash.final();
+            for (out, 0..) |*value, i| {
+                state = std.hash.Wyhash.hash(state +% @as(u64, @intCast(i)), text);
+                const raw: u16 = @truncate(state);
+                value.* = @as(f32, @floatFromInt(raw)) / 65535.0;
+            }
+            return out;
+        }
+
+        fn hostContext(ptr: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr.?));
+        }
+
+        fn requireCapability(ctx: *@This(), name: []const u8) !void {
+            for (ctx.installed.granted_capabilities) |capability| {
+                if (!std.mem.eql(u8, capability.name, name)) continue;
+                if (capability.scope.len == 0 or
+                    std.mem.eql(u8, capability.scope, ctx.installed.package_name) or
+                    (ctx.installed.scope.kind == .table and std.mem.eql(u8, capability.scope, ctx.installed.scope.table_name)))
+                {
+                    return;
+                }
+            }
+            return error.ExtensionCapabilityDenied;
+        }
+
+        fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
+            return switch (ctx.installed.scope.kind) {
+                .table => ctx.installed.scope.table_name,
+                .cluster => requested,
+                .embedded_db => error.UnsupportedExtensionScope,
+            };
+        }
+
+        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_name: []const u8, route: []const u8, body: []const u8) ![]u8 {
+            const uri = try std.fmt.allocPrint(alloc, "/tables/{s}/{s}", .{ table_name, route });
+            defer alloc.free(uri);
+            var resp = try ctx.server.handle(.{
+                .method = method,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(ctx.server.alloc);
+            if (resp.status < 200 or resp.status >= 300) return error.ExtensionHostApiFailed;
+            return try alloc.dupe(u8, resp.body);
+        }
+    };
+}
+
+fn extensionBatchBodyAlloc(alloc: std.mem.Allocator, writes_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, writes_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidExtensionWrite;
+    const object = parsed.value.object;
+    if (object.get("inserts") != null or object.get("deletes") != null or object.get("transforms") != null) {
+        return try alloc.dupe(u8, writes_json);
+    }
+    const key = if (object.get("id")) |id_value| switch (id_value) {
+        .string => |value| try alloc.dupe(u8, value),
+        else => try extensionGeneratedKeyAlloc(alloc, writes_json),
+    } else try extensionGeneratedKeyAlloc(alloc, writes_json);
+    defer alloc.free(key);
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"inserts\":{");
+    try std.json.Stringify.value(key, .{}, &writer.writer);
+    try writer.writer.writeByte(':');
+    try std.json.Stringify.value(parsed.value, .{}, &writer.writer);
+    try writer.writer.writeAll("},\"sync_level\":\"full_index\"}");
+    return try writer.toOwnedSlice();
+}
+
+fn extensionGeneratedKeyAlloc(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "ext:{x}", .{std.hash.Wyhash.hash(0, bytes)});
+}
+
+fn extensionQueryBodyAlloc(alloc: std.mem.Allocator, query_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, query_json, .{});
+    defer parsed.deinit();
+    const object = if (parsed.value == .object) parsed.value.object else return error.InvalidExtensionQuery;
+    const limit = if (object.get("limit")) |value| switch (value) {
+        .integer => |raw| @max(1, @min(raw, 100)),
+        .float => |raw| @as(i64, @intFromFloat(@max(1, @min(raw, 100)))),
+        else => 10,
+    } else 10;
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.print("{{\"query\":{{\"match_all\":{{}}}},\"limit\":{d}}}", .{limit});
+    return try writer.toOwnedSlice();
+}
+
+fn mcpResultFromExtensionJson(alloc: std.mem.Allocator, body: []u8) !mcp.CallToolResult {
+    errdefer alloc.free(body);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{});
+    const is_error = parsed == .object and blk: {
+        const ok = parsed.object.get("ok") orelse break :blk false;
+        break :blk ok == .bool and !ok.bool;
+    };
+    return .{
+        .is_error = is_error,
+        .text = body,
+        .structured = parsed,
+    };
+}
+
+fn extensionRuntimeMemberVisible(installed_extensions: []const extension_domain.InstalledExtension, extension_name: []const u8) bool {
+    for (installed_extensions) |installed| {
+        if (!std.mem.eql(u8, installed.name, extension_name)) continue;
+        return installed.status == .ready;
+    }
+    return false;
+}
+
+fn cloneValidMcpInputSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return try alloc.dupe(u8, schema_json);
 }
 
 fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
