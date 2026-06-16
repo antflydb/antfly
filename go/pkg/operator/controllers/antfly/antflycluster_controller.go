@@ -89,6 +89,7 @@ const (
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
+//+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -3064,7 +3065,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 			return err
 		}
-		r.updateHALastPromotionFromAdminJobs(cluster)
+		r.updateHALastPromotionFromAdminJobs(ctx, cluster)
 		if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
 			return err
 		}
@@ -3142,7 +3143,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 		return err
 	}
-	r.updateHALastPromotionFromAdminJobs(cluster)
+	r.updateHALastPromotionFromAdminJobs(ctx, cluster)
 	if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
 		return err
 	}
@@ -3191,7 +3192,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 	return nil
 }
 
-func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(cluster *antflyv1.AntflyCluster) {
+func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) {
 	if cluster.Status.HAStatus == nil {
 		return
 	}
@@ -3206,6 +3207,7 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(cluster *an
 			continue
 		}
 		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+			r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
 			return
 		}
 		now := metav1.Now()
@@ -3223,8 +3225,47 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(cluster *an
 			FenceReason:       action.Reason,
 			CompletionTime:    &now,
 		}
+		r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
 		return
 	}
+}
+
+func (r *AntflyClusterReconciler) updateHAPromotionStatusFromAdminJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, promotion *antflyv1.HAPromotionStatus) {
+	if r.KubeClient == nil || action.AdminJobName == "" || promotion == nil {
+		return
+	}
+	body, ok := r.haAdminJobLogBody(ctx, cluster, action.AdminJobName)
+	if !ok {
+		return
+	}
+	result, ok := parseHAPromotionJobResult(body)
+	if !ok {
+		return
+	}
+	applyHAPromotionJobResult(promotion, result)
+}
+
+func (r *AntflyClusterReconciler) haAdminJobLogBody(ctx context.Context, cluster *antflyv1.AntflyCluster, jobName string) (string, bool) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels{"job-name": jobName}); err != nil {
+		log.FromContext(ctx).V(1).Info("Unable to list HA admin job pods", "job", jobName, "error", err)
+		return "", false
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase != corev1.PodSucceeded {
+			continue
+		}
+		raw, err := r.KubeClient.CoreV1().Pods(cluster.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			Container: "ha-admin",
+		}).DoRaw(ctx)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("Unable to read HA admin job logs", "job", jobName, "pod", pod.Name, "error", err)
+			continue
+		}
+		return string(raw), true
+	}
+	return "", false
 }
 
 func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
@@ -3237,6 +3278,114 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 		status.NewEpoch == identity.Epoch+1 &&
 		status.SwitchLSN == action.TargetLSN &&
 		status.FenceGeneration == action.FenceGeneration
+}
+
+type haPromotionJobResult struct {
+	SwitchLSN        uint64
+	ParentTimelineID uint64
+	ParentEpoch      uint64
+	NewTimelineID    uint64
+	NewEpoch         uint64
+	RequiredLSN      uint64
+	ObservedLSN      uint64
+	FenceGeneration  uint64
+	FenceToken       string
+	Forced           bool
+	DataLossPossible bool
+}
+
+func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
+	lines := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || key == "" {
+			continue
+		}
+		lines[key] = value
+	}
+	resultName := lines["result"]
+	if resultName != "promote_current_fence" && resultName != "promote" {
+		return haPromotionJobResult{}, false
+	}
+
+	var result haPromotionJobResult
+	var ok bool
+	if result.SwitchLSN, ok = parseHAResultUint(lines, "promotion.switch_lsn"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.ParentTimelineID, ok = parseHAResultUint(lines, "promotion.old_identity.timeline_id"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.ParentEpoch, ok = parseHAResultUint(lines, "promotion.old_identity.epoch"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.NewTimelineID, ok = parseHAResultUint(lines, "promotion.new_identity.timeline_id"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.NewEpoch, ok = parseHAResultUint(lines, "promotion.new_identity.epoch"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.FenceGeneration, ok = parseHAResultUint(lines, "fence_generation"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	result.FenceToken = strings.TrimSpace(lines["fence_token"])
+	if result.FenceToken == "" {
+		return haPromotionJobResult{}, false
+	}
+	result.RequiredLSN, _ = parseHAResultUint(lines, "assessment.required_lsn")
+	receivedLSN, _ := parseHAResultUint(lines, "assessment.received_lsn")
+	appliedLSN, _ := parseHAResultUint(lines, "assessment.applied_lsn")
+	result.ObservedLSN = receivedLSN
+	if appliedLSN > result.ObservedLSN {
+		result.ObservedLSN = appliedLSN
+	}
+	if result.RequiredLSN == 0 {
+		result.RequiredLSN = result.SwitchLSN
+	}
+	if result.ObservedLSN == 0 {
+		result.ObservedLSN = result.RequiredLSN
+	}
+	result.Forced, _ = parseHAResultBool(lines, "promotion.forced")
+	result.DataLossPossible, _ = parseHAResultBool(lines, "promotion.data_loss_possible")
+	return result, true
+}
+
+func parseHAResultUint(lines map[string]string, key string) (uint64, bool) {
+	raw, ok := lines[key]
+	if !ok {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	return value, err == nil
+}
+
+func parseHAResultBool(lines map[string]string, key string) (bool, bool) {
+	raw, ok := lines[key]
+	if !ok {
+		return false, false
+	}
+	switch strings.TrimSpace(raw) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func applyHAPromotionJobResult(promotion *antflyv1.HAPromotionStatus, result haPromotionJobResult) {
+	promotion.ParentTimelineID = result.ParentTimelineID
+	promotion.ParentEpoch = result.ParentEpoch
+	promotion.NewTimelineID = result.NewTimelineID
+	promotion.NewEpoch = result.NewEpoch
+	promotion.SwitchLSN = result.SwitchLSN
+	promotion.RequiredLSN = result.RequiredLSN
+	promotion.ObservedLSN = result.ObservedLSN
+	promotion.FenceGeneration = result.FenceGeneration
+	promotion.FenceToken = result.FenceToken
+	promotion.Forced = result.Forced
+	promotion.DataLossPossible = result.DataLossPossible
 }
 
 func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {

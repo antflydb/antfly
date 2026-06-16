@@ -390,7 +390,7 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	}
 	reconciler := &AntflyClusterReconciler{}
 
-	reconciler.updateHALastPromotionFromAdminJobs(cluster)
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 
 	promotion := cluster.Status.HAStatus.LastPromotion
 	g.Expect(promotion).NotTo(BeNil())
@@ -403,15 +403,59 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(promotion.CompletionTime).NotTo(BeNil())
 	firstCompletion := promotion.CompletionTime
 
-	reconciler.updateHALastPromotionFromAdminJobs(cluster)
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
 
 	cluster.Status.HAStatus.LastPromotion.FenceToken = "token"
 	cluster.Status.HAStatus.LastPromotion.ObservedLSN = 13
-	reconciler.updateHALastPromotionFromAdminJobs(cluster)
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion.FenceToken).To(Equal("token"))
 	g.Expect(cluster.Status.HAStatus.LastPromotion.ObservedLSN).To(Equal(uint64(13)))
 	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
+}
+
+func TestParseHAPromotionJobResult(t *testing.T) {
+	g := NewWithT(t)
+
+	result, ok := parseHAPromotionJobResult(strings.Join([]string{
+		"result=promote_current_fence",
+		"assessment.required_lsn=12",
+		"assessment.received_lsn=13",
+		"assessment.applied_lsn=11",
+		"promotion.switch_lsn=12",
+		"promotion.old_identity.timeline_id=4",
+		"promotion.old_identity.epoch=6",
+		"promotion.new_identity.timeline_id=5",
+		"promotion.new_identity.epoch=7",
+		"promotion.forced=true",
+		"promotion.data_loss_possible=true",
+		"fence_generation=3",
+		"fence_token=ha-fence-token",
+		"",
+	}, "\n"))
+
+	g.Expect(ok).To(BeTrue())
+	g.Expect(result.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(result.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(result.ParentEpoch).To(Equal(uint64(6)))
+	g.Expect(result.NewTimelineID).To(Equal(uint64(5)))
+	g.Expect(result.NewEpoch).To(Equal(uint64(7)))
+	g.Expect(result.RequiredLSN).To(Equal(uint64(12)))
+	g.Expect(result.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(result.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(result.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(result.Forced).To(BeTrue())
+	g.Expect(result.DataLossPossible).To(BeTrue())
+
+	promotion := &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+	}
+	applyHAPromotionJobResult(promotion, result)
+	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(promotion.NewEpoch).To(Equal(uint64(7)))
+	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(promotion.DataLossPossible).To(BeTrue())
 }
 
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false
