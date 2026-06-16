@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const admin_cli = @import("admin_cli.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const rejoin = @import("rejoin.zig");
@@ -98,6 +99,32 @@ pub const Action = struct {
     slot_name: ?[]const u8 = null,
     target_lsn: ?u64 = null,
     reason: []const u8,
+};
+
+pub const AdminCommandOptions = struct {
+    manifest_id_prefix: []const u8 = "base",
+    old_primary_id: ?[]const u8 = null,
+    promoted_node_id: ?[]const u8 = null,
+    new_timeline_id: ?u64 = null,
+    new_epoch: ?u64 = null,
+    force: bool = false,
+    reason: []const u8 = "operator",
+};
+
+pub const AdminCommand = struct {
+    argv: []const []const u8,
+    owned_args: []const []u8,
+
+    pub fn deinit(self: *AdminCommand, alloc: Allocator) void {
+        for (self.owned_args) |arg| alloc.free(arg);
+        alloc.free(self.owned_args);
+        alloc.free(self.argv);
+        self.* = undefined;
+    }
+
+    pub fn parsePlan(self: AdminCommand, alloc: Allocator) !admin_cli.Plan {
+        return try admin_cli.parse(alloc, self.argv);
+    }
 };
 
 pub const Observed = struct {
@@ -235,7 +262,8 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
 
     const retention_pressure = observed.primary.retention.reseed_recommended > 0;
     const degraded = isDegraded(observed.primary.durability);
-    const automatic_allowed = automaticPromotionAllowed(spec, observed.primary);
+    const automatic_standby = automaticPromotionStandby(spec, observed.primary);
+    const automatic_allowed = automatic_standby != null;
 
     try conditions.append(alloc, .{
         .type = .available,
@@ -271,11 +299,13 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     if (automatic_allowed) {
         try actions.append(alloc, .{
             .kind = .acquire_fence,
+            .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
         });
         try actions.append(alloc, .{
             .kind = .promote_standby,
+            .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
         });
@@ -305,6 +335,88 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         .desired_standby_count = desired_count,
         .healthy_standby_count = healthy_count,
         .reseed_required_count = reseed_count,
+    };
+}
+
+pub fn adminCommandForAction(
+    alloc: Allocator,
+    action: Action,
+    identity: primary_mod.Identity,
+    options: AdminCommandOptions,
+) !?AdminCommand {
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer argv.deinit(alloc);
+    var owned_args = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (owned_args.items) |arg| alloc.free(arg);
+        owned_args.deinit(alloc);
+    }
+
+    switch (action.kind) {
+        .create_slot => {
+            const slot_name = action.slot_name orelse action.standby_name orelse return error.SlotNameMissing;
+            try appendArg(alloc, &argv, "slot");
+            try appendArg(alloc, &argv, "create");
+            try appendArg(alloc, &argv, "--slot");
+            try appendArg(alloc, &argv, slot_name);
+            if (action.target_lsn) |target_lsn| {
+                try appendArg(alloc, &argv, "--initial-lsn");
+                try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{target_lsn});
+            }
+        },
+        .resume_slot => try appendSlotLifecycleCommand(alloc, &argv, "resume", action),
+        .pause_slot => try appendSlotLifecycleCommand(alloc, &argv, "pause", action),
+        .drop_slot => try appendSlotLifecycleCommand(alloc, &argv, "drop", action),
+        .seed_standby, .mark_reseed => {
+            const standby_name = action.standby_name orelse action.slot_name orelse return error.StandbyNameMissing;
+            try appendArg(alloc, &argv, "seed");
+            try appendArg(alloc, &argv, "begin");
+            try appendArg(alloc, &argv, "--slot");
+            try appendArg(alloc, &argv, standby_name);
+            try appendArg(alloc, &argv, "--manifest-id");
+            try appendOwnedFmt(
+                alloc,
+                &argv,
+                &owned_args,
+                "{s}-{s}-{d}",
+                .{ options.manifest_id_prefix, standby_name, action.target_lsn orelse 0 },
+            );
+        },
+        .promote_standby => {
+            const promoted_node_id = options.promoted_node_id orelse action.standby_name orelse return error.PromotedNodeIdMissing;
+            const old_primary_id = options.old_primary_id orelse return error.OldPrimaryIdMissing;
+            try appendArg(alloc, &argv, "promote");
+            try appendIdentityArgs(alloc, &argv, &owned_args, identity);
+            try appendArg(alloc, &argv, "--old-primary-id");
+            try appendArg(alloc, &argv, old_primary_id);
+            try appendArg(alloc, &argv, "--promoted-node-id");
+            try appendArg(alloc, &argv, promoted_node_id);
+            try appendArg(alloc, &argv, "--new-timeline-id");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_timeline_id orelse return error.NewTimelineIdMissing});
+            try appendArg(alloc, &argv, "--new-epoch");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{options.new_epoch orelse return error.NewEpochMissing});
+            try appendArg(alloc, &argv, "--required-lsn");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.RequiredLsnMissing});
+            try appendArg(alloc, &argv, "--observed-lsn");
+            try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{action.target_lsn orelse return error.ObservedLsnMissing});
+            if (options.force) try appendArg(alloc, &argv, "--force");
+            try appendArg(alloc, &argv, "--reason");
+            try appendArg(alloc, &argv, options.reason);
+        },
+        .acquire_fence,
+        .update_primary_endpoint,
+        .demote_former_primary,
+        .rewind_former_primary,
+        .reseed_former_primary,
+        => return null,
+    }
+
+    const argv_slice = try argv.toOwnedSlice(alloc);
+    errdefer alloc.free(argv_slice);
+    const owned_slice = try owned_args.toOwnedSlice(alloc);
+    return .{
+        .argv = argv_slice,
+        .owned_args = owned_slice,
     };
 }
 
@@ -349,9 +461,13 @@ fn isDegraded(durability: ?primary_mod.DurabilityDecision) bool {
 }
 
 fn automaticPromotionAllowed(spec: Spec, primary: status.PrimarySnapshot) bool {
-    if (!spec.auto_failover.enabled) return false;
-    if (spec.auto_failover.fencing_authority == .none) return false;
-    if (isDegraded(primary.durability)) return false;
+    return automaticPromotionStandby(spec, primary) != null;
+}
+
+fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot) ?[]const u8 {
+    if (!spec.auto_failover.enabled) return null;
+    if (spec.auto_failover.fencing_authority == .none) return null;
+    if (isDegraded(primary.durability)) return null;
 
     const max_lag = spec.auto_failover.maximum_lag_lsn;
     for (spec.standbys) |standby| {
@@ -363,9 +479,61 @@ fn automaticPromotionAllowed(spec: Spec, primary: status.PrimarySnapshot) bool {
         if (spec.auto_failover.require_remote_apply) {
             if (slot.applied_lsn + max_lag < primary.current_lsn) continue;
         }
-        return true;
+        return standby.name;
     }
-    return false;
+    return null;
+}
+
+fn appendSlotLifecycleCommand(
+    alloc: Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    action_name: []const u8,
+    action: Action,
+) !void {
+    const slot_name = action.slot_name orelse action.standby_name orelse return error.SlotNameMissing;
+    try appendArg(alloc, argv, "slot");
+    try appendArg(alloc, argv, action_name);
+    try appendArg(alloc, argv, "--slot");
+    try appendArg(alloc, argv, slot_name);
+}
+
+fn appendIdentityArgs(
+    alloc: Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    owned_args: *std.ArrayListUnmanaged([]u8),
+    identity: primary_mod.Identity,
+) !void {
+    try appendArg(alloc, argv, "--cluster-id");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.cluster_id});
+    try appendArg(alloc, argv, "--shard-id");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.shard_id});
+    try appendArg(alloc, argv, "--table-id");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.table_id});
+    try appendArg(alloc, argv, "--timeline-id");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.timeline_id});
+    try appendArg(alloc, argv, "--epoch");
+    try appendOwnedFmt(alloc, argv, owned_args, "{d}", .{identity.epoch});
+}
+
+fn appendArg(
+    alloc: Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    arg: []const u8,
+) !void {
+    try argv.append(alloc, arg);
+}
+
+fn appendOwnedFmt(
+    alloc: Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    owned_args: *std.ArrayListUnmanaged([]u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const owned = try std.fmt.allocPrint(alloc, fmt, args);
+    errdefer alloc.free(owned);
+    try owned_args.append(alloc, owned);
+    try argv.append(alloc, owned);
 }
 
 fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, allowed: bool) []const u8 {
@@ -617,6 +785,67 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
     try expectContains(rendered, "\"reason\":\"FencedPromotionReady\"");
+}
+
+test "storage.ha operator renders executable admin commands for slot and seed actions" {
+    const alloc = std.testing.allocator;
+    const identity = primary_mod.Identity{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 };
+
+    var create = (try adminCommandForAction(alloc, .{
+        .kind = .create_slot,
+        .standby_name = "standby-a",
+        .slot_name = "standby-a",
+        .target_lsn = 7,
+        .reason = "SlotMissing",
+    }, identity, .{})).?;
+    defer create.deinit(alloc);
+    var create_plan = try create.parsePlan(alloc);
+    defer create_plan.deinit(alloc);
+    try std.testing.expectEqual(admin_cli.OutputFormat.json, create_plan.output);
+    try std.testing.expectEqualStrings("standby-a", create_plan.command.slot.request.slot_name);
+    try std.testing.expectEqual(@as(?u64, 7), create_plan.command.slot.request.initial_lsn);
+
+    var seed = (try adminCommandForAction(alloc, .{
+        .kind = .seed_standby,
+        .standby_name = "standby-a",
+        .slot_name = "standby-a",
+        .target_lsn = 7,
+        .reason = "StandbyNeedsBaseBackup",
+    }, identity, .{ .manifest_id_prefix = "operator-base" })).?;
+    defer seed.deinit(alloc);
+    var seed_plan = try seed.parsePlan(alloc);
+    defer seed_plan.deinit(alloc);
+    try std.testing.expectEqualStrings("standby-a", seed_plan.command.seed.begin.slot_name);
+    try std.testing.expectEqualStrings("operator-base-standby-a-7", seed_plan.command.seed.begin.manifest_id);
+}
+
+test "storage.ha operator renders executable admin command for fenced promotion" {
+    const alloc = std.testing.allocator;
+    const identity = primary_mod.Identity{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 };
+
+    var command = (try adminCommandForAction(alloc, .{
+        .kind = .promote_standby,
+        .standby_name = "standby-a",
+        .target_lsn = 12,
+        .reason = "AutomaticFailoverReady",
+    }, identity, .{
+        .old_primary_id = "primary-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .reason = "operator-approved",
+    })).?;
+    defer command.deinit(alloc);
+
+    var plan = try command.parsePlan(alloc);
+    defer plan.deinit(alloc);
+    const fence = plan.command.promote.fence;
+    try std.testing.expectEqual(@as(u64, 100), fence.identity.cluster_id);
+    try std.testing.expectEqualStrings("primary-a", fence.old_primary_id);
+    try std.testing.expectEqualStrings("standby-a", fence.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 2), fence.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), fence.required_lsn);
+    try std.testing.expectEqual(@as(u64, 12), fence.observed_lsn);
+    try std.testing.expectEqualStrings("operator-approved", fence.reason);
 }
 
 test "storage.ha operator plans former primary demotion without fence" {
