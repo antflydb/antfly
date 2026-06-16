@@ -86,4 +86,5 @@ test "cli mod compiles" {
     _ = backup;
     _ = agents;
     _ = internal;
+    _ = auth;
 }
