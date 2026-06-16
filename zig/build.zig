@@ -662,7 +662,7 @@ fn addSnowballGeneratedOutputs(
     };
 }
 
-fn addSnowballRegenStep(b: *std.Build) void {
+fn addSnowballRegenStep(b: *std.Build) *std.Build.Step {
     const regen_step = b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers");
     const snowball_compiler = addSnowballCompiler(b);
     const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
@@ -681,9 +681,10 @@ fn addSnowballRegenStep(b: *std.Build) void {
     });
     fmt.step.dependOn(&update.step);
     regen_step.dependOn(&fmt.step);
+    return regen_step;
 }
 
-fn addSnowballCheckStep(b: *std.Build) void {
+fn addSnowballCheckStep(b: *std.Build) *std.Build.Step {
     const check_step = b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current");
     const snowball_compiler = addSnowballCompiler(b);
     const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
@@ -710,6 +711,10 @@ fn addSnowballCheckStep(b: *std.Build) void {
         compare.addFileArg(b.path(snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang})));
     }
     check_step.dependOn(&compare.step);
+
+    const snowball_check_step = b.step("snowball-check", "Check checked-in Zig Snowball stemmers are current");
+    snowball_check_step.dependOn(check_step);
+    return snowball_check_step;
 }
 
 fn addOpenApiModuleFromYamlPath(
@@ -967,7 +972,7 @@ fn addOpenApiRegenRun(
 fn addOpenApiRegenStep(
     b: *std.Build,
     openapi_codegen: *std.Build.Step.Compile,
-) void {
+) *std.Build.Step {
     const regen_step = b.step("regen-openapi", "Regenerate checked-in Zig OpenAPI modules");
 
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
@@ -1072,6 +1077,10 @@ fn addOpenApiRegenStep(
         fmt.step.dependOn(&run.step);
     }
     regen_step.dependOn(&fmt.step);
+
+    const openapi_generate_step = b.step("openapi-generate", "Regenerate checked-in Zig OpenAPI modules");
+    openapi_generate_step.dependOn(regen_step);
+    return openapi_generate_step;
 }
 
 pub fn build(b: *std.Build) void {
@@ -1189,10 +1198,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addSnowballRegenStep(b);
-    addSnowballCheckStep(b);
+    const snowball_regen_step = addSnowballRegenStep(b);
+    const snowball_check_step = addSnowballCheckStep(b);
     const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
-    addOpenApiRegenStep(b, openapi_codegen);
+    const openapi_generate_step = addOpenApiRegenStep(b, openapi_codegen);
+    const snowball_sources_available = pathExists(b, "deps/snowball/zig/env.zig") and pathExists(b, "deps/snowball/compiler/analyser.c");
+
+    const generate_step = b.step("generate", "Regenerate checked-in Zig generated artifacts");
+    generate_step.dependOn(openapi_generate_step);
+    if (snowball_sources_available) {
+        generate_step.dependOn(snowball_regen_step);
+    }
     const openapi_root_check = addOpenApiRootCheckStep(b);
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
@@ -4331,6 +4347,15 @@ pub fn build(b: *std.Build) void {
 
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
+    const openapi_check_step = b.step("openapi-check", "Check checked-in OpenAPI artifacts are current");
+    openapi_check_step.dependOn(openapi_root_check_step);
+
+    const generated_check_step = b.step("generated-check", "Check checked-in Zig generated artifacts are current");
+    generated_check_step.dependOn(openapi_check_step);
+    if (snowball_sources_available) {
+        generated_check_step.dependOn(snowball_check_step);
+    }
+    generated_check_step.dependOn(sql_api_parity_fixture_check_step);
 
     const lib_metadata_sim_forward_tests = b.addTest(.{
         .root_module = lib_test_mod,

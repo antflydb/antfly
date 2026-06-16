@@ -5,6 +5,15 @@ ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
+SNOWBALL_REQUIRED_SOURCES := deps/snowball/zig/env.zig deps/snowball/compiler/analyser.c
+SNOWBALL_PRESENT_SOURCES := $(wildcard $(SNOWBALL_REQUIRED_SOURCES))
+ifeq ($(words $(SNOWBALL_PRESENT_SOURCES)),2)
+SNOWBALL_GENERATED_TARGETS := snowball-generate
+SNOWBALL_CHECK_TARGETS := snowball-check
+else
+SNOWBALL_GENERATED_TARGETS :=
+SNOWBALL_CHECK_TARGETS :=
+endif
 
 # ====================================================================================
 # Build
@@ -108,9 +117,9 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 
 .PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check sql-api-parity-fixture-promote sql-api-parity-fixture-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate sql-api-parity-fixture-promote ## Regenerate checked-in generated sources.
+generate: openapi-generate $(SNOWBALL_GENERATED_TARGETS) sql-api-parity-fixture-promote ## Regenerate checked-in generated sources.
 
-generated-check: openapi-check snowball-check sql-api-parity-fixture-check ## Check all checked-in generated sources are current.
+generated-check: openapi-check $(SNOWBALL_CHECK_TARGETS) sql-api-parity-fixture-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
