@@ -30,6 +30,7 @@ pub const admin = @import("admin.zig");
 pub const operator = @import("operator.zig");
 pub const chaos = @import("chaos.zig");
 pub const metrics = @import("metrics.zig");
+pub const admin_cli = @import("admin_cli.zig");
 
 test {
     _ = replication_record;
@@ -50,4 +51,5 @@ test {
     _ = operator;
     _ = chaos;
     _ = metrics;
+    _ = admin_cli;
 }
