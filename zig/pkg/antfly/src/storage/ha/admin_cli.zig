@@ -30,6 +30,7 @@ const replication_api = @import("replication_api.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
+const status = @import("status.zig");
 
 pub const OutputFormat = enum {
     json,
@@ -97,6 +98,11 @@ pub const RejoinAssessCommand = struct {
     policy: rejoin.RejoinPolicy,
 };
 
+pub const PromoteAssessCommand = struct {
+    check: status.PromotionCheck,
+    use_current_fence: bool = false,
+};
+
 pub const Command = union(enum) {
     identify_system,
     slot: SlotCommand,
@@ -112,6 +118,7 @@ pub const Command = union(enum) {
     read_check: read_gate.Request,
     fence_acquire: fencing.FenceRequest,
     fence_current,
+    promote_assess: PromoteAssessCommand,
     promote: admin.FencedPromotionRequest,
     rejoin_assess: RejoinAssessCommand,
 };
@@ -219,7 +226,7 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
         return plan;
     }
     if (std.mem.eql(u8, root, "promote")) {
-        plan.command = .{ .promote = try parsePromote(&cursor) };
+        plan.command = try parsePromote(&cursor);
         try cursor.expectEnd();
         return plan;
     }
@@ -592,8 +599,36 @@ fn parseFence(cursor: *Cursor) !Command {
     return error.UnknownFenceSubcommand;
 }
 
-fn parsePromote(cursor: *Cursor) !admin.FencedPromotionRequest {
-    return .{ .fence = try parseFenceRequest(cursor) };
+fn parsePromote(cursor: *Cursor) !Command {
+    if (cursor.peek()) |subcommand| {
+        if (std.mem.eql(u8, subcommand, "assess")) {
+            _ = cursor.next();
+            return .{ .promote_assess = try parsePromoteAssess(cursor) };
+        }
+    }
+    return .{ .promote = .{ .fence = try parseFenceRequest(cursor) } };
+}
+
+fn parsePromoteAssess(cursor: *Cursor) !PromoteAssessCommand {
+    var command = PromoteAssessCommand{ .check = .{} };
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--required-lsn") or std.mem.eql(u8, arg, "--at-least-lsn")) {
+            _ = cursor.next();
+            command.check.required_lsn = try parseU64(try cursor.value(arg));
+        } else if (std.mem.eql(u8, arg, "--fencing-confirmed")) {
+            _ = cursor.next();
+            command.check.fencing_confirmed = true;
+        } else if (std.mem.eql(u8, arg, "--current-fence") or std.mem.eql(u8, arg, "--use-current-fence")) {
+            _ = cursor.next();
+            command.use_current_fence = true;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            _ = cursor.next();
+            command.check.force = true;
+        } else {
+            break;
+        }
+    }
+    return command;
 }
 
 fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
@@ -1197,6 +1232,16 @@ test "storage.ha admin cli parses fenced promotion request" {
         .fence_current => {},
         else => return error.TestExpectedEqual,
     }
+
+    var direct_assess = try parse(alloc, &.{ "promote", "assess", "--required-lsn", "100", "--fencing-confirmed" });
+    defer direct_assess.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 100), direct_assess.command.promote_assess.check.required_lsn);
+    try std.testing.expect(direct_assess.command.promote_assess.check.fencing_confirmed);
+    try std.testing.expect(!direct_assess.command.promote_assess.use_current_fence);
+
+    var fenced_assess = try parse(alloc, &.{ "promote", "assess", "--current-fence" });
+    defer fenced_assess.deinit(alloc);
+    try std.testing.expect(fenced_assess.command.promote_assess.use_current_fence);
 
     var plan = try parse(alloc, &.{
         "promote",

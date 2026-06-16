@@ -89,6 +89,7 @@ pub const Result = union(enum) {
     read_check: read_gate.Decision,
     fence_acquire: admin.FenceReceiptResult,
     fence_current: ?admin.FenceReceiptResult,
+    promote_assess: status.PromotionAssessment,
     promote: admin.FencedPromotionResult,
     rejoin_assess: rejoin.Assessment,
 
@@ -147,6 +148,10 @@ pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
         .standby_status => |snapshot| try metrics.renderStandbyPrometheusAlloc(
             alloc,
             metrics.fromStandbySnapshot(snapshot),
+        ),
+        .promote_assess => |assessment| try metrics.renderPromotionPrometheusAlloc(
+            alloc,
+            metrics.fromPromotionAssessment(assessment),
         ),
         .primary_metrics => |metric_snapshot| try metrics.renderPrimaryPrometheusAlloc(alloc, metric_snapshot),
         .standby_metrics => |metric_snapshot| try metrics.renderStandbyPrometheusAlloc(alloc, metric_snapshot),
@@ -240,6 +245,9 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
                 try appendBoolLine(alloc, &out, "held", false);
             }
         },
+        .promote_assess => |assessment| {
+            try appendPromotionAssessmentLines(alloc, &out, "assessment", assessment);
+        },
         .promote => |promotion_result| {
             try appendPromotionAssessmentLines(alloc, &out, "assessment", promotion_result.assessment);
             try appendU64Line(alloc, &out, "promotion.switch_lsn", promotion_result.promotion.switch_lsn);
@@ -331,6 +339,9 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .fence_current => .{
             .fence_current = try admin.currentPromotionFence(alloc, try requireFenceStore(ctx)),
         },
+        .promote_assess => |command| .{
+            .promote_assess = try executePromoteAssess(alloc, ctx, command),
+        },
         .promote => |request| .{
             .promote = try admin.promoteWithFence(alloc, try requireFenceStore(ctx), try requireStandby(ctx), request),
         },
@@ -338,6 +349,20 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
             .rejoin_assess = admin.assessFormerPrimaryRejoin(command.former, command.receipt, command.policy),
         },
     };
+}
+
+fn executePromoteAssess(
+    alloc: Allocator,
+    ctx: Context,
+    command: admin_cli.PromoteAssessCommand,
+) !status.PromotionAssessment {
+    const standby = try requireStandby(ctx);
+    if (command.use_current_fence) {
+        var current = (try admin.currentPromotionFence(alloc, try requireFenceStore(ctx))) orelse return error.FenceReceiptMissing;
+        defer current.deinit(alloc);
+        return admin.assessPromotionWithFence(standby, current.receipt);
+    }
+    return admin.assessPromotion(standby, command.check);
 }
 
 fn executeStreamOnce(
@@ -540,6 +565,7 @@ fn resultName(result: Result) []const u8 {
         .read_check => "read_check",
         .fence_acquire => "fence_acquire",
         .fence_current => "fence_current",
+        .promote_assess => "promote_assess",
         .promote => "promote",
         .rejoin_assess => "rejoin_assess",
     };
@@ -1272,6 +1298,28 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(current_fence_table, "result=fence_current\n");
     try expectContains(current_fence_table, "held=true\n");
     try expectContains(current_fence_table, "old_primary_id=primary-a\n");
+
+    var direct_assess_plan = try admin_cli.parse(alloc, &.{ "--table", "promote", "assess", "--required-lsn", "1", "--fencing-confirmed" });
+    defer direct_assess_plan.deinit(alloc);
+    var direct_assess = try execute(alloc, .{ .standby = &standby }, direct_assess_plan);
+    defer direct_assess.deinit(alloc);
+    try std.testing.expect(direct_assess.promote_assess.safe);
+    try std.testing.expect(direct_assess.promote_assess.can_promote);
+    const direct_assess_table = try renderTableAlloc(alloc, direct_assess);
+    defer alloc.free(direct_assess_table);
+    try expectContains(direct_assess_table, "result=promote_assess\n");
+    try expectContains(direct_assess_table, "assessment.can_promote=true\n");
+
+    var fenced_assess_plan = try admin_cli.parse(alloc, &.{ "--prometheus", "promote", "assess", "--current-fence" });
+    defer fenced_assess_plan.deinit(alloc);
+    var fenced_assess = try execute(alloc, .{ .standby = &standby, .fence_store = &fence_store }, fenced_assess_plan);
+    defer fenced_assess.deinit(alloc);
+    try std.testing.expect(fenced_assess.promote_assess.fencing_confirmed);
+    try std.testing.expect(fenced_assess.promote_assess.can_promote);
+    var fenced_assess_prometheus = try renderOutputAlloc(alloc, fenced_assess, fenced_assess_plan.output);
+    defer fenced_assess_prometheus.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; version=0.0.4", fenced_assess_prometheus.content_type);
+    try expectContains(fenced_assess_prometheus.body, "antfly_ha_promotion_can_promote 1\n");
 
     var promote_plan = try admin_cli.parse(alloc, &.{
         "promote",

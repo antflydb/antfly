@@ -162,6 +162,13 @@ pub fn assessPromotion(
     return status.assessPromotion(standby, check);
 }
 
+pub fn assessPromotionWithFence(
+    standby: *const standby_mod.Standby,
+    receipt: fencing.Receipt,
+) status.PromotionAssessment {
+    return status.assessPromotionWithFence(standby, receipt);
+}
+
 pub fn acquirePromotionFence(
     alloc: Allocator,
     fence_store: *fencing.Store,

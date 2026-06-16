@@ -126,6 +126,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.StandbyUnavailable,
         error.FenceStoreUnavailable,
         error.FenceAlreadyHeld,
+        error.FenceReceiptMissing,
         => 409,
         error.SlotNotFound,
         error.BackupStartNotFound,
@@ -292,6 +293,17 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), current_fence.status);
     try expectContains(current_fence.body, "result=fence_current\n");
     try expectContains(current_fence.body, "held=true\n");
+
+    var promote_assess = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"--table\",\"promote\",\"assess\",\"--current-fence\"]}",
+    });
+    defer promote_assess.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), promote_assess.status);
+    try expectContains(promote_assess.body, "result=promote_assess\n");
+    try expectContains(promote_assess.body, "assessment.can_promote=true\n");
 }
 
 test "storage.ha http admin returns route method and command errors" {
