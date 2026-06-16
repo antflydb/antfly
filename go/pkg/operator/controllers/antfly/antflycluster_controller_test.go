@@ -454,7 +454,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -1311,6 +1311,31 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(promotion.NewEpoch).To(Equal(uint64(7)))
 	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(promotion.DataLossPossible).To(BeTrue())
+}
+
+func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
+	g := NewWithT(t)
+
+	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(openAPIResult.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(openAPIResult.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(openAPIResult.NewEpoch).To(Equal(uint64(7)))
+	g.Expect(openAPIResult.RequiredLSN).To(Equal(uint64(12)))
+	g.Expect(openAPIResult.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(openAPIResult.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(openAPIResult.FenceToken).To(Equal("ha-fence-token"))
+
+	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15},"promotion":{"switch_lsn":14,"old_identity":{"timeline_id":5,"epoch":7},"new_identity":{"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(legacyResult.SwitchLSN).To(Equal(uint64(14)))
+	g.Expect(legacyResult.ParentTimelineID).To(Equal(uint64(5)))
+	g.Expect(legacyResult.NewEpoch).To(Equal(uint64(8)))
+	g.Expect(legacyResult.ObservedLSN).To(Equal(uint64(15)))
+	g.Expect(legacyResult.FenceGeneration).To(Equal(uint64(4)))
+	g.Expect(legacyResult.FenceToken).To(Equal("legacy-token"))
+	g.Expect(legacyResult.Forced).To(BeTrue())
+	g.Expect(legacyResult.DataLossPossible).To(BeTrue())
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {

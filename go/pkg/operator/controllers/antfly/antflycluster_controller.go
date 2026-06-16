@@ -3849,6 +3849,7 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 }
 
 type haPromotionAPIResultEnvelope struct {
+	haPromotionAPIResult
 	Result struct {
 		PromoteCurrentFence *haPromotionAPIResult `json:"promote_current_fence,omitempty"`
 		Promote             *haPromotionAPIResult `json:"promote,omitempty"`
@@ -3884,7 +3885,10 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return haPromotionJobResult{}, false
 	}
-	result := envelope.Result.PromoteCurrentFence
+	result := &envelope.haPromotionAPIResult
+	if result.Promotion.SwitchLSN == 0 {
+		result = envelope.Result.PromoteCurrentFence
+	}
 	if result == nil {
 		result = envelope.Result.Promote
 	}
