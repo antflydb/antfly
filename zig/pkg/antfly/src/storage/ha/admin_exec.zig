@@ -213,6 +213,8 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendU64Line(alloc, &out, "received_lsn", response.received_lsn);
             try appendU64Line(alloc, &out, "applied_lsn", response.applied_lsn);
             try appendU64Line(alloc, &out, "restart_lsn", response.restart_lsn);
+            try appendBoolLine(alloc, &out, "active", response.active);
+            try appendBoolLine(alloc, &out, "reseed_required", response.reseed_required);
             try appendOptionalLine(alloc, &out, "last_error", response.last_error);
             try appendU64Line(alloc, &out, "current_lsn", response.current_lsn);
         },
@@ -1098,8 +1100,12 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     var acked = try execute(alloc, .{ .primary = &primary }, ack_plan);
     defer acked.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), acked.standby_status_update.received_lsn);
+    try std.testing.expect(acked.standby_status_update.active);
+    try std.testing.expect(!acked.standby_status_update.reseed_required);
     const acked_table = try renderTableAlloc(alloc, acked);
     defer alloc.free(acked_table);
+    try expectContains(acked_table, "active=true\n");
+    try expectContains(acked_table, "reseed_required=false\n");
     try expectContains(acked_table, "last_error=-\n");
     try primary.reportReplicationError("standby-a", "IntentionalApplyFailure");
 

@@ -131,6 +131,8 @@ pub const StandbyStatusUpdateResponse = struct {
     received_lsn: u64,
     applied_lsn: u64,
     restart_lsn: u64,
+    active: bool,
+    reseed_required: bool,
     last_error: ?[]const u8 = null,
     current_lsn: u64,
 };
@@ -300,6 +302,8 @@ pub fn standbyStatusUpdate(
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
         .restart_lsn = slot.restart_lsn,
+        .active = slot.active,
+        .reseed_required = slot.reseed_required,
         .last_error = slot.last_error,
         .current_lsn = primary.lastLsn(),
     };
@@ -507,6 +511,8 @@ test "storage.ha replication api persists standby status updates" {
         try std.testing.expectEqual(@as(u64, 2), updated.received_lsn);
         try std.testing.expectEqual(@as(u64, 1), updated.applied_lsn);
         try std.testing.expectEqual(@as(u64, 1), updated.restart_lsn);
+        try std.testing.expect(updated.active);
+        try std.testing.expect(!updated.reseed_required);
         try std.testing.expect(updated.last_error == null);
         try std.testing.expectError(error.StandbyAheadOfPrimary, standbyStatusUpdate(&primary, .{
             .slot_name = "standby-a",
