@@ -1250,6 +1250,10 @@ type HAStatus struct {
 	// +optional
 	PlannedActions []HAPlannedActionStatus `json:"plannedActions,omitempty"`
 
+	// PrimaryRoute reports the operator-facing primary endpoint target.
+	// +optional
+	PrimaryRoute HAPrimaryRouteStatus `json:"primaryRoute,omitempty"`
+
 	// Sync reports the observed synchronous durability policy state.
 	// +optional
 	Sync HASyncStatus `json:"sync,omitempty"`
@@ -1362,6 +1366,23 @@ type HAPlannedActionStatus struct {
 	FenceHolder string `json:"fenceHolder,omitempty"`
 
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	Reason string `json:"reason,omitempty"`
+}
+
+// HAPrimaryRouteStatus reports the operator-facing primary endpoint target.
+type HAPrimaryRouteStatus struct {
+	ServiceName string `json:"serviceName,omitempty"`
+
+	CurrentTarget string `json:"currentTarget,omitempty"`
+
+	DesiredTarget string `json:"desiredTarget,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	Stale bool `json:"stale,omitempty"`
+
+	Action string `json:"action,omitempty"`
 
 	Reason string `json:"reason,omitempty"`
 }

@@ -6600,6 +6600,26 @@ spec:
                     description: PrimaryLSN is the current primary replication LSN.
                     format: int64
                     type: integer
+                  primaryRoute:
+                    description: PrimaryRoute reports the operator-facing primary
+                      endpoint target.
+                    properties:
+                      action:
+                        type: string
+                      currentTarget:
+                        type: string
+                      desiredTarget:
+                        type: string
+                      fenceGeneration:
+                        format: int64
+                        type: integer
+                      reason:
+                        type: string
+                      serviceName:
+                        type: string
+                      stale:
+                        type: boolean
+                    type: object
                   readSafeStandbyCount:
                     description: ReadSafeStandbyCount is the count of desired standbys
                       safe for reads.

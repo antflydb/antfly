@@ -68,6 +68,16 @@ type haFormerPrimaryEvaluation struct {
 	Reason             string
 }
 
+type haPrimaryRouteEvaluation struct {
+	ServiceName     string
+	CurrentTarget   string
+	DesiredTarget   string
+	FenceGeneration uint64
+	Stale           bool
+	Action          string
+	Reason          string
+}
+
 type haPlan struct {
 	Actions                   []haPlannedAction
 	AutomaticPromotionAllowed bool
@@ -80,6 +90,7 @@ type haPlan struct {
 	SyncPolicyDegraded        bool
 	SyncPolicy                haSyncEvaluation
 	FormerPrimary             haFormerPrimaryEvaluation
+	PrimaryRoute              haPrimaryRouteEvaluation
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -275,6 +286,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 		)
 	}
+	plan.PrimaryRoute = haEvaluatePrimaryRoute(cluster, status, plan.PromotionStandbyName)
+	if action := haPrimaryRoutePlannedAction(plan.PrimaryRoute, status); action.Kind != "" && !haHasPlannedAction(plan.Actions, action.Kind) {
+		plan.Actions = append(plan.Actions, action)
+	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
 	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary); action.Kind != "" {
 		plan.Actions = append(plan.Actions, action)
@@ -300,6 +315,7 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
 	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions)
+	cluster.Status.HAStatus.PrimaryRoute = haPrimaryRouteStatus(plan.PrimaryRoute)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
 	cluster.Status.HAStatus.FormerPrimary = haFormerPrimaryStatus(plan.FormerPrimary)
 	mergeConfiguredStandbys(cluster.Status.HAStatus, ha)
@@ -337,6 +353,48 @@ func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActi
 		})
 	}
 	return out
+}
+
+func haPrimaryRouteStatus(evaluation haPrimaryRouteEvaluation) antflyv1.HAPrimaryRouteStatus {
+	return antflyv1.HAPrimaryRouteStatus{
+		ServiceName:     evaluation.ServiceName,
+		CurrentTarget:   evaluation.CurrentTarget,
+		DesiredTarget:   evaluation.DesiredTarget,
+		FenceGeneration: evaluation.FenceGeneration,
+		Stale:           evaluation.Stale,
+		Action:          evaluation.Action,
+		Reason:          evaluation.Reason,
+	}
+}
+
+func haPrimaryRoutePlannedAction(evaluation haPrimaryRouteEvaluation, status *antflyv1.HAStatus) haPlannedAction {
+	if !evaluation.Stale || evaluation.Action != string(haActionUpdatePrimaryRoute) {
+		return haPlannedAction{}
+	}
+	action := haPlannedAction{
+		Kind:            haActionUpdatePrimaryRoute,
+		RouteTo:         evaluation.DesiredTarget,
+		FenceGeneration: evaluation.FenceGeneration,
+		Reason:          evaluation.Reason,
+	}
+	if status != nil {
+		action.TargetLSN = status.PrimaryLSN
+		action.FenceAuthority = status.Fencing.Authority
+		action.FenceHolder = status.Fencing.Holder
+	}
+	if evaluation.DesiredTarget != "" && evaluation.DesiredTarget != "primary" {
+		action.StandbyName = evaluation.DesiredTarget
+	}
+	return action
+}
+
+func haHasPlannedAction(actions []haPlannedAction, kind haActionKind) bool {
+	for _, action := range actions {
+		if action.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func haFormerPrimaryStatus(evaluation haFormerPrimaryEvaluation) *antflyv1.HAFormerPrimaryStatus {
@@ -658,6 +716,39 @@ func haSyncFailureAction(policy antflyv1.HAFailurePolicy) string {
 	default:
 		return "BlockWrites"
 	}
+}
+
+func haEvaluatePrimaryRoute(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus, promotionTarget string) haPrimaryRouteEvaluation {
+	evaluation := haPrimaryRouteEvaluation{
+		ServiceName:   cluster.Name + "-public-api",
+		CurrentTarget: "primary",
+		DesiredTarget: "primary",
+		Action:        "None",
+		Reason:        "PrimaryRouteCurrent",
+	}
+	if status != nil {
+		if status.PrimaryRoute.CurrentTarget != "" {
+			evaluation.CurrentTarget = status.PrimaryRoute.CurrentTarget
+		}
+		if status.LastPromotion != nil {
+			evaluation.FenceGeneration = status.LastPromotion.FenceGeneration
+			if status.LastPromotion.PromotedStandbyID != "" {
+				evaluation.DesiredTarget = status.LastPromotion.PromotedStandbyID
+			}
+		}
+	}
+	if promotionTarget != "" {
+		evaluation.DesiredTarget = promotionTarget
+		if status != nil {
+			evaluation.FenceGeneration = status.Fencing.Generation
+		}
+	}
+	evaluation.Stale = evaluation.CurrentTarget != evaluation.DesiredTarget
+	if evaluation.Stale {
+		evaluation.Action = string(haActionUpdatePrimaryRoute)
+		evaluation.Reason = "PrimaryRouteTargetChanged"
+	}
+	return evaluation
 }
 
 func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluation {

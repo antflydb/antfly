@@ -226,6 +226,14 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 1 {
 		t.Fatalf("expected planned action to publish fence precondition, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
+	route := cluster.Status.HAStatus.PrimaryRoute
+	if route.ServiceName != "antfly-public-api" ||
+		route.CurrentTarget != "primary" ||
+		route.DesiredTarget != "standby-a" ||
+		!route.Stale ||
+		route.Action != string(haActionUpdatePrimaryRoute) {
+		t.Fatalf("expected stale route to promoted standby, got %#v", route)
+	}
 }
 
 func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromotion(t *testing.T) {
@@ -367,6 +375,9 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryLSN: 12,
+		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+			CurrentTarget: "standby-a",
+		},
 		Fencing: antflyv1.HAFencingStatus{
 			Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
 			Ready:      true,
@@ -454,6 +465,58 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}
 	if len(cluster.Status.HAStatus.PlannedActions) != 0 {
 		t.Fatalf("expected no former-primary planned action after rejoin, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+}
+
+func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 12,
+		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+			CurrentTarget: "primary",
+		},
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			PromotedStandbyID: "standby-a",
+			FenceGeneration:   5,
+		},
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:        "standby-a",
+			SlotName:    "standby-a",
+			Active:      true,
+			TimelineID:  2,
+			ReceivedLSN: 12,
+			AppliedLSN:  12,
+			SafeReadLSN: 12,
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	route := cluster.Status.HAStatus.PrimaryRoute
+	if route.CurrentTarget != "primary" ||
+		route.DesiredTarget != "standby-a" ||
+		route.FenceGeneration != 5 ||
+		!route.Stale ||
+		route.Action != string(haActionUpdatePrimaryRoute) {
+		t.Fatalf("expected route update after completed promotion, got %#v", route)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionUpdatePrimaryRoute) ||
+		cluster.Status.HAStatus.PlannedActions[0].RouteTo != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 5 {
+		t.Fatalf("expected route planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+
+	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = "standby-a"
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	route = cluster.Status.HAStatus.PrimaryRoute
+	if route.Stale || route.Action != "None" || route.DesiredTarget != "standby-a" {
+		t.Fatalf("expected current route after update, got %#v", route)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 0 {
+		t.Fatalf("expected no route planned action once current, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 }
 
