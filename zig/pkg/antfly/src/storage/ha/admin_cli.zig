@@ -113,6 +113,23 @@ pub const Plan = struct {
     }
 };
 
+pub const PlanDocument = struct {
+    schema_version: u32 = 1,
+    output: OutputFormat,
+    command: Command,
+};
+
+pub fn planDocument(plan: Plan) PlanDocument {
+    return .{
+        .output = plan.output,
+        .command = plan.command,
+    };
+}
+
+pub fn renderJsonAlloc(alloc: Allocator, plan: Plan) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, planDocument(plan), .{});
+}
+
 pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     var cursor = Cursor{ .args = argv };
     var output: OutputFormat = .json;
@@ -915,6 +932,41 @@ test "storage.ha admin cli parses primary status with sync policy" {
     try std.testing.expectEqualStrings("b", policy.standby_names[1]);
 }
 
+test "storage.ha admin cli renders versioned json command plan" {
+    const alloc = std.testing.allocator;
+    var plan = try parse(alloc, &.{
+        "--prometheus",
+        "status",
+        "primary",
+        "--view",
+        "metrics",
+        "--max-lag-lsn",
+        "50",
+        "--sync-mode",
+        "remote-apply",
+        "--sync-selection",
+        "first",
+        "--sync-standby",
+        "standby-a",
+        "--sync-failure",
+        "degrade-to-async",
+    });
+    defer plan.deinit(alloc);
+
+    const rendered = try renderJsonAlloc(alloc, plan);
+    defer alloc.free(rendered);
+
+    try expectContains(rendered, "\"schema_version\":1");
+    try expectContains(rendered, "\"output\":\"prometheus\"");
+    try expectContains(rendered, "\"primary_status\"");
+    try expectContains(rendered, "\"view\":\"metrics\"");
+    try expectContains(rendered, "\"max_lag_lsn\":50");
+    try expectContains(rendered, "\"mode\":\"remote_apply\"");
+    try expectContains(rendered, "\"selection\":\"first\"");
+    try expectContains(rendered, "\"failure_policy\":\"degrade_to_async\"");
+    try expectContains(rendered, "\"standby-a\"");
+}
+
 test "storage.ha admin cli parses stream ack commit and read checks" {
     const alloc = std.testing.allocator;
 
@@ -1041,4 +1093,8 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
     try std.testing.expectEqual(@as(u64, 2), receipt.generation);
     try std.testing.expect(receipt.forced);
     try std.testing.expectEqualStrings("operator-approved", receipt.reason);
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
