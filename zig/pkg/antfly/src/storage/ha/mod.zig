@@ -27,6 +27,7 @@ pub const rejoin = @import("rejoin.zig");
 pub const commit_gate = @import("commit_gate.zig");
 pub const read_gate = @import("read_gate.zig");
 pub const write_gate = @import("write_gate.zig");
+pub const owner_job_gate = @import("owner_job_gate.zig");
 pub const admin = @import("admin.zig");
 pub const admin_exec = @import("admin_exec.zig");
 pub const operator = @import("operator.zig");
@@ -53,6 +54,7 @@ test {
     _ = commit_gate;
     _ = read_gate;
     _ = write_gate;
+    _ = owner_job_gate;
     _ = admin;
     _ = admin_exec;
     _ = operator;

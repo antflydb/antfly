@@ -25,6 +25,7 @@ const backup_manifest = @import("backup_manifest.zig");
 const bootstrap = @import("bootstrap.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
+const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
@@ -168,6 +169,20 @@ pub fn evaluateStandbyWrite(
     request: write_gate.Request,
 ) !write_gate.Decision {
     return try write_gate.evaluateStandby(standby, request);
+}
+
+pub fn evaluatePrimaryOwnerJob(
+    primary: *const primary_mod.Primary,
+    request: owner_job_gate.Request,
+) !owner_job_gate.Decision {
+    return try owner_job_gate.evaluatePrimary(primary, request);
+}
+
+pub fn evaluateStandbyOwnerJob(
+    standby: *standby_mod.Standby,
+    request: owner_job_gate.Request,
+) !owner_job_gate.Decision {
+    return try owner_job_gate.evaluateStandby(standby, request);
 }
 
 pub fn assessPromotion(
@@ -497,9 +512,23 @@ test "storage.ha admin exposes commit and read freshness decisions" {
     try std.testing.expect(primary_write.canWrite());
     try std.testing.expectEqual(write_gate.Action.allow_write, primary_write.action);
 
+    const primary_job = try evaluatePrimaryOwnerJob(&primary, .{
+        .kind = .derived_effect_writer,
+        .expected_identity = identity,
+    });
+    try std.testing.expect(primary_job.canRun());
+    try std.testing.expectEqual(owner_job_gate.Action.run, primary_job.action);
+
     const standby_write = try evaluateStandbyWrite(&standby, .{ .expected_identity = identity });
     try std.testing.expect(!standby_write.canWrite());
     try std.testing.expectEqual(write_gate.Action.reject_read_only_standby, standby_write.action);
+
+    const standby_job = try evaluateStandbyOwnerJob(&standby, .{
+        .kind = .derived_effect_writer,
+        .expected_identity = identity,
+    });
+    try std.testing.expect(!standby_job.canRun());
+    try std.testing.expectEqual(owner_job_gate.Action.disable_on_standby, standby_job.action);
 
     _ = try primary.append(.{ .payload = "one" });
     const names = [_][]const u8{"standby-a"};
@@ -575,6 +604,14 @@ test "storage.ha admin acquires fence and promotes standby" {
     try std.testing.expect(!promoted_write.canWrite());
     try std.testing.expectEqual(write_gate.Action.open_promoted_primary, promoted_write.action);
     try std.testing.expect(promoted_write.promotion_handoff != null);
+
+    const promoted_job = try evaluateStandbyOwnerJob(&standby, .{
+        .kind = .retention_advance,
+        .expected_identity = result.promotion.new_identity,
+    });
+    try std.testing.expect(!promoted_job.canRun());
+    try std.testing.expectEqual(owner_job_gate.Action.open_promoted_primary, promoted_job.action);
+    try std.testing.expect(promoted_job.promotion_handoff != null);
 }
 
 test "storage.ha admin rejects mismatched fence identity for promotion" {
