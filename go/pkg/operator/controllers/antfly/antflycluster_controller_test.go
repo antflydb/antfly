@@ -149,7 +149,7 @@ func TestApplyDefaults_ServiceMeshDefaults(t *testing.T) {
 	g.Expect(clusterEnabled.Spec.ServiceMesh.Enabled).To(BeTrue())
 }
 
-func TestReconcileHAAdminJobsCreatesRemoteCommandJobs(t *testing.T) {
+func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -193,7 +193,7 @@ func TestReconcileHAAdminJobsCreatesRemoteCommandJobs(t *testing.T) {
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
-	g.Expect(jobs.Items).To(HaveLen(2))
+	g.Expect(jobs.Items).To(HaveLen(1))
 
 	var createSlotJob *batchv1.Job
 	for i := range jobs.Items {
@@ -220,6 +220,40 @@ func TestReconcileHAAdminJobsCreatesRemoteCommandJobs(t *testing.T) {
 		"standby-a",
 		"--initial-lsn",
 		"5",
+	}))
+
+	createSlotJob.Status.Conditions = []batchv1.JobCondition{{
+		Type:   batchv1.JobComplete,
+		Status: corev1.ConditionTrue,
+	}}
+	g.Expect(reconciler.Status().Update(context.Background(), createSlotJob)).To(Succeed())
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	jobs = batchv1.JobList{}
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(2))
+
+	var seedJob *batchv1.Job
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if job.Annotations["antfly.io/ha-action-kind"] == string(haActionSeedStandby) {
+			seedJob = job
+			break
+		}
+	}
+	g.Expect(seedJob).NotTo(BeNil())
+	seedContainer := seedJob.Spec.Template.Spec.Containers[0]
+	g.Expect(seedContainer.Args).To(Equal([]string{
+		"ha",
+		"--ha-url",
+		"http://primary-ha.default.svc:8081",
+		"--",
+		"seed",
+		"begin",
+		"--slot",
+		"standby-a",
+		"--manifest-id",
+		"base-standby-a-5",
 	}))
 }
 

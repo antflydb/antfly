@@ -3151,13 +3151,13 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		existing := &batchv1.Job{}
 		err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
 		if errors.IsNotFound(err) {
-			if err := r.Create(ctx, job); err != nil {
-				return err
-			}
-			continue
+			return r.Create(ctx, job)
 		}
 		if err != nil {
 			return err
+		}
+		if !haAdminJobComplete(existing) {
+			return nil
 		}
 	}
 	return nil
@@ -3210,6 +3210,18 @@ func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlanned
 		labels["antfly.io/ha-standby"] = action.StandbyName
 	}
 	return labels
+}
+
+func haAdminJobComplete(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return false
+		}
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {
