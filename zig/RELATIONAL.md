@@ -4989,8 +4989,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `COUNT(DISTINCT regexp_substr(status, '[A-Z]+'))`,
    `ARRAY_AGG(DISTINCT status ORDER BY amount DESC) FILTER (...)`,
    `ARRAY_AGG(metadata->'flags')`, bounded
-   `STRING_AGG(DISTINCT status, '|' ORDER BY created_at DESC)`, and numeric
-   inputs such as `SUM(amount - discount)`, `SUM(regexp_count(status, '[0-9]+'))`,
+   `STRING_AGG(DISTINCT status, '|' ORDER BY created_at DESC)`,
+   scalar extrema such as `MIN(status)`, `MAX(lower(status))`, and
+   `MAX(created_at)`, and numeric inputs such as `SUM(amount - discount)`,
+   `SUM(regexp_count(status, '[0-9]+'))`,
    and `SUM(regexp_instr(status, '[A-Z]+'))` execute through the same row-expression evaluator
    used by projections and order keys. `COUNT(field)` and bounded
    `array_agg(field)` accept declared scalar, JSON, and array fields;
@@ -5001,7 +5003,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `string_to_array(...)`, and value-window outputs such as `lag(tags)`, so
    downstream typed CTE/API validation can distinguish arrays of numeric,
    boolean, JSON, scalar, or nested-array values instead of treating every
-   derived collection as a string array. Numeric reducers remain numeric-only.
+   derived collection as a string array. `SUM` and `AVG` remain numeric-only;
+   `MIN` and `MAX` preserve the scalar input type for text-like, numeric, and
+   datetime fields or expressions, and reject JSON/array inputs at the adapter
+   boundary.
    Collection aggregate specs declare a maximum materialized
    output count plus optional aggregate-local typed ordering, so the coordinator
    never creates an unbounded or scan-order-dependent collection aggregate by

@@ -21567,8 +21567,8 @@ pub const DB = struct {
     const RelationalRowsAggregateMetric = struct {
         count: u64 = 0,
         sum: f64 = 0,
-        min: ?f64 = null,
-        max: ?f64 = null,
+        min_json: ?[]u8 = null,
+        max_json: ?[]u8 = null,
         bool_or: bool = false,
         bool_and: bool = true,
         distinct_seen: std.StringHashMapUnmanaged(void) = .empty,
@@ -21576,6 +21576,8 @@ pub const DB = struct {
         array_seen: usize = 0,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.min_json) |value| alloc.free(value);
+            if (self.max_json) |value| alloc.free(value);
             var keys = self.distinct_seen.keyIterator();
             while (keys.next()) |key_ptr| alloc.free(@constCast(key_ptr.*));
             self.distinct_seen.deinit(alloc);
@@ -21634,6 +21636,38 @@ pub const DB = struct {
                 _ = self.array_items.pop();
             }
             self.count = self.array_items.items.len;
+        }
+
+        fn updateMinMaxValue(
+            self: *@This(),
+            alloc: Allocator,
+            value_json: []const u8,
+            value: std.json.Value,
+            op: types.RelationalRowsAggregateOp,
+        ) !void {
+            const slot = switch (op) {
+                .min => &self.min_json,
+                .max => &self.max_json,
+                else => return error.InvalidQueryRequest,
+            };
+            if (slot.* == null) {
+                slot.* = try alloc.dupe(u8, value_json);
+                return;
+            }
+
+            var parsed_current = std.json.parseFromSlice(std.json.Value, alloc, (slot.*).?, .{}) catch return error.InvalidQueryRequest;
+            defer parsed_current.deinit();
+            const comparison = compareRelationalRowsJsonScalars(value, parsed_current.value) orelse return error.InvalidQueryRequest;
+            const replace = switch (op) {
+                .min => comparison == .lt,
+                .max => comparison == .gt,
+                else => unreachable,
+            };
+            if (!replace) return;
+
+            const next = try alloc.dupe(u8, value_json);
+            alloc.free((slot.*).?);
+            slot.* = next;
         }
     };
 
@@ -21701,7 +21735,7 @@ pub const DB = struct {
                         }
                         self.metrics[i].count += 1;
                     },
-                    .sum, .avg, .min, .max => {
+                    .sum, .avg => {
                         const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
                         defer alloc.free(value_json);
                         var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
@@ -21711,8 +21745,16 @@ pub const DB = struct {
                         if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, parsed.value, spec.distinct_max_items))) continue;
                         self.metrics[i].count += 1;
                         self.metrics[i].sum += number;
-                        self.metrics[i].min = if (self.metrics[i].min) |current| @min(current, number) else number;
-                        self.metrics[i].max = if (self.metrics[i].max) |current| @max(current, number) else number;
+                    },
+                    .min, .max => {
+                        const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
+                        defer alloc.free(value_json);
+                        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+                        defer parsed.deinit();
+                        if (parsed.value == .null) continue;
+                        if (spec.distinct and !(try self.metrics[i].acceptDistinctValue(alloc, parsed.value, spec.distinct_max_items))) continue;
+                        self.metrics[i].count += 1;
+                        try self.metrics[i].updateMinMaxValue(alloc, value_json, parsed.value, spec.op);
                     },
                     .array_agg, .string_agg => {
                         const value_json = (try relationalRowsAggregateInputValueJsonAlloc(alloc, row, spec)) orelse return error.InvalidQueryRequest;
@@ -21881,12 +21923,12 @@ pub const DB = struct {
                 if (metric.count == 0) return try writer.writeAll("null");
                 try writeRelationalRowsAggregateNumberJson(writer, metric.sum / @as(f64, @floatFromInt(metric.count)));
             },
-            .min => if (metric.min) |value|
-                try writeRelationalRowsAggregateNumberJson(writer, value)
+            .min => if (metric.min_json) |value|
+                try writer.writeAll(value)
             else
                 try writer.writeAll("null"),
-            .max => if (metric.max) |value|
-                try writeRelationalRowsAggregateNumberJson(writer, value)
+            .max => if (metric.max_json) |value|
+                try writer.writeAll(value)
             else
                 try writer.writeAll("null"),
             .array_agg => {
@@ -86452,6 +86494,8 @@ test "relational rows aggregate groups filtered row-query streams" {
         .{ .name = "open_amount_avg", .op = .avg, .field = "amount", .filter_predicates = open_filter[0..] },
         .{ .name = "open_amount_min", .op = .min, .field = "amount", .filter_predicates = open_filter[0..] },
         .{ .name = "open_amount_max", .op = .max, .field = "amount", .filter_predicates = open_filter[0..] },
+        .{ .name = "first_status", .op = .min, .field = "status" },
+        .{ .name = "last_status", .op = .max, .field = "status" },
     };
     const order_by = [_]types.RelationalRowsQueryOrder{.{
         .field = "amount_sum",
@@ -86466,8 +86510,8 @@ test "relational rows aggregate groups filtered row-query streams" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"open_count\":2,\"amount_sum\":129,\"open_amount_sum\":30,\"open_amount_avg\":15,\"open_amount_min\":10,\"open_amount_max\":20}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"row_count\":1,\"open_count\":1,\"amount_sum\":7,\"open_amount_sum\":7,\"open_amount_avg\":7,\"open_amount_min\":7,\"open_amount_max\":7}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"customer\":\"alice\",\"row_count\":3,\"open_count\":2,\"amount_sum\":129,\"open_amount_sum\":30,\"open_amount_avg\":15,\"open_amount_min\":10,\"open_amount_max\":20,\"first_status\":\"closed\",\"last_status\":\"open\"}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"customer\":\"bob\",\"row_count\":1,\"open_count\":1,\"amount_sum\":7,\"open_amount_sum\":7,\"open_amount_avg\":7,\"open_amount_min\":7,\"open_amount_max\":7,\"first_status\":\"open\",\"last_status\":\"open\"}", result.rows[1]);
 }
 
 test "relational rows aggregate supports global metrics and windowing" {

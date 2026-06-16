@@ -3559,7 +3559,8 @@ fn validateRowsAggregateFieldInput(
     switch (op) {
         .count, .array_agg => {},
         .string_agg => if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidRowsRequest,
-        .sum, .avg, .min, .max => if (column.field_type != .numeric) return error.InvalidRowsRequest,
+        .sum, .avg => if (column.field_type != .numeric) return error.InvalidRowsRequest,
+        .min, .max => if (!rowsAggregateMinMaxTypeAllowed(column.field_type)) return error.InvalidRowsRequest,
         .bool_or, .bool_and => if (column.field_type != .boolean) return error.InvalidRowsRequest,
     }
 }
@@ -3573,9 +3574,23 @@ fn validateRowsAggregateExpressionInput(
     switch (op) {
         .count, .array_agg => {},
         .string_agg => try validateRowsQueryTextExpression(alloc, schema, expression),
-        .sum, .avg, .min, .max => try validateRowsQueryNumericExpression(alloc, schema, expression),
+        .sum, .avg => try validateRowsQueryNumericExpression(alloc, schema, expression),
+        .min, .max => try validateRowsAggregateMinMaxExpressionInput(alloc, schema, expression),
         .bool_or, .bool_and => try validateRowsQueryBooleanExpression(alloc, schema, expression),
     }
+}
+
+fn validateRowsAggregateMinMaxExpressionInput(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    expression: db_mod.types.RelationalRowsExpression,
+) !void {
+    const output_type = try rowsExpressionOutputType(alloc, schema, expression);
+    if (!rowsAggregateMinMaxTypeAllowed(output_type)) return error.InvalidRowsRequest;
+}
+
+fn rowsAggregateMinMaxTypeAllowed(field_type: runtime_schema.AntflyType) bool {
+    return rowsExpressionTypeIsTextLike(field_type) or field_type == .numeric or field_type == .datetime;
 }
 
 fn parseRowsAggregateFilterExpressionsAlloc(
@@ -3991,7 +4006,7 @@ fn rowsAggregateOutputColumnsAlloc(
         out[initialized] = .{
             .name = aggregation.name,
             .path = aggregation.name,
-            .field_type = rowsAggregateOutputType(aggregation),
+            .field_type = try rowsAggregateOutputType(alloc, schema, aggregation),
             .array_item_type = try rowsAggregateOutputArrayItemType(alloc, schema, aggregation),
             .nullable = rowsAggregateOutputNullable(aggregation),
         };
@@ -4729,13 +4744,33 @@ fn rowsAggregateOutputColumnExists(columns: []const runtime_schema.RelationalCol
     return false;
 }
 
-fn rowsAggregateOutputType(aggregation: db_mod.types.RelationalRowsAggregateSpec) runtime_schema.AntflyType {
+fn rowsAggregateOutputType(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    aggregation: db_mod.types.RelationalRowsAggregateSpec,
+) !runtime_schema.AntflyType {
     return switch (aggregation.op) {
         .array_agg => .array,
         .string_agg => .keyword,
-        .count, .sum, .min, .max, .avg => .numeric,
+        .count, .sum, .avg => .numeric,
+        .min, .max => try rowsAggregateInputType(alloc, schema, aggregation),
         .bool_or, .bool_and => .boolean,
     };
+}
+
+fn rowsAggregateInputType(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    aggregation: db_mod.types.RelationalRowsAggregateSpec,
+) !runtime_schema.AntflyType {
+    if (aggregation.field) |field| {
+        const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+        return column.field_type;
+    }
+    if (aggregation.expression) |expression| {
+        return try rowsExpressionOutputType(alloc, schema, expression);
+    }
+    return error.InvalidRowsRequest;
 }
 
 fn rowsAggregateOutputNullable(aggregation: db_mod.types.RelationalRowsAggregateSpec) bool {
@@ -17435,7 +17470,7 @@ test "relational rows query contract filters orders paginates and projects rows"
 
 test "relational rows aggregate contract accepts typed expression inputs and filters" {
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"status":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"created_at":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id","customer","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"status":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"created_at":{"type":"datetime"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id","customer","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(std.testing.allocator, schema_json);
     defer parsed.deinit(std.testing.allocator);
@@ -17571,6 +17606,24 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectEqual(runtime_schema.AntflyType.array, findRelationalColumn(numeric_output_columns, "amount_samples").?.field_type);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, findRelationalColumn(numeric_output_columns, "amount_samples").?.array_item_type.?);
 
+    var scalar_extrema_request = try parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"first_status\",\"op\":\"min\",\"field\":\"status\"},{\"name\":\"last_status_key\",\"op\":\"max\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}},{\"name\":\"latest_created_at\",\"op\":\"max\",\"field\":\"created_at\"}]}",
+        schema,
+    );
+    defer scalar_extrema_request.deinit(std.testing.allocator);
+    const scalar_extrema_output_columns = try rowsAggregateOutputColumnsAlloc(
+        std.testing.allocator,
+        schema,
+        scalar_extrema_request.group_by,
+        scalar_extrema_request.group_expressions,
+        scalar_extrema_request.aggregations,
+    );
+    defer if (scalar_extrema_output_columns.len > 0) std.testing.allocator.free(scalar_extrema_output_columns);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(scalar_extrema_output_columns, "first_status").?.field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, findRelationalColumn(scalar_extrema_output_columns, "last_status_key").?.field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, findRelationalColumn(scalar_extrema_output_columns, "latest_created_at").?.field_type);
+
     var group_expression_array_request = try parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"group_expressions\":[{\"as\":\"scope_parts\",\"expr\":{\"op\":\"string_to_array\",\"args\":[{\"field\":\"scope\"},{\"value\":\" \"}]}}],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"}]}",
@@ -17618,6 +17671,16 @@ test "relational rows aggregate contract accepts typed expression inputs and fil
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
         std.testing.allocator,
         "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"sum\",\"field\":\"status\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"min\",\"field\":\"attrs\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"aggregations\":[{\"name\":\"bad\",\"op\":\"max\",\"field\":\"tags\"}]}",
         schema,
     ));
 

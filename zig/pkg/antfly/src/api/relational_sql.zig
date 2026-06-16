@@ -16657,7 +16657,8 @@ const Parser = struct {
                     switch (op) {
                         .count, .array_agg => {},
                         .string_agg => if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog,
-                        .sum, .avg, .min, .max => if (column.field_type != .numeric) return error.InvalidSqlCatalog,
+                        .sum, .avg => if (column.field_type != .numeric) return error.InvalidSqlCatalog,
+                        .min, .max => if (!sqlAggregateMinMaxTypeAllowed(column.field_type)) return error.InvalidSqlCatalog,
                         .bool_or, .bool_and => if (column.field_type != .boolean) return error.InvalidSqlCatalog,
                     }
                 } else {
@@ -16916,9 +16917,18 @@ const Parser = struct {
         switch (op) {
             .count, .array_agg => {},
             .string_agg => try self.validateTextRowExpression(expression),
-            .sum, .avg, .min, .max => try self.validateNumericRowExpression(expression),
+            .sum, .avg => try self.validateNumericRowExpression(expression),
+            .min, .max => try self.validateAggregateMinMaxRowExpression(expression),
             .bool_or, .bool_and => try self.validateBooleanRowExpression(expression),
         }
+    }
+
+    fn validateAggregateMinMaxRowExpression(
+        self: *@This(),
+        expression: db_mod.types.RelationalRowsExpression,
+    ) !void {
+        const output_type = try self.rowExpressionOutputType(expression);
+        if (!sqlAggregateMinMaxTypeAllowed(output_type)) return error.UnsupportedSqlShape;
     }
 
     const AggregateFilter = struct {
@@ -27433,6 +27443,10 @@ const Parser = struct {
         return sqlExpressionTypeIsTextLike(field_type) or field_type == .numeric or field_type == .datetime or field_type == .boolean;
     }
 
+    fn sqlAggregateMinMaxTypeAllowed(field_type: runtime_schema.AntflyType) bool {
+        return sqlExpressionTypeIsTextLike(field_type) or field_type == .numeric or field_type == .datetime;
+    }
+
     fn sqlExpressionTypeIsOrderKey(field_type: runtime_schema.AntflyType) bool {
         return sqlExpressionTypeIsOrderable(field_type) or field_type == .json or field_type == .array;
     }
@@ -30372,13 +30386,40 @@ const Parser = struct {
             out[initialized] = .{
                 .name = aggregation.name,
                 .path = aggregation.name,
-                .field_type = aggregateOutputType(aggregation),
+                .field_type = try self.aggregateOutputType(aggregation),
                 .array_item_type = if (aggregation.op == .array_agg) .keyword else null,
                 .nullable = false,
             };
             initialized += 1;
         }
         return out;
+    }
+
+    fn aggregateOutputType(
+        self: *@This(),
+        aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    ) !runtime_schema.AntflyType {
+        return switch (aggregation.op) {
+            .array_agg => .array,
+            .string_agg => .keyword,
+            .count, .sum, .avg => .numeric,
+            .min, .max => try self.aggregateInputType(aggregation),
+            .bool_or, .bool_and => .boolean,
+        };
+    }
+
+    fn aggregateInputType(
+        self: *@This(),
+        aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    ) !runtime_schema.AntflyType {
+        if (aggregation.field) |field| {
+            const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
+            return column.field_type;
+        }
+        if (aggregation.expression) |expression| {
+            return try self.rowExpressionOutputType(expression);
+        }
+        return error.UnsupportedSqlShape;
     }
 
     fn parseAggregateOutputFieldAlloc(
@@ -38485,15 +38526,6 @@ fn aggregateOutputColumnExists(columns: []const runtime_schema.RelationalColumn,
         if (std.mem.eql(u8, column.name, name)) return true;
     }
     return false;
-}
-
-fn aggregateOutputType(aggregation: db_mod.types.RelationalRowsAggregateSpec) runtime_schema.AntflyType {
-    return switch (aggregation.op) {
-        .array_agg => .array,
-        .string_agg => .keyword,
-        .count, .sum, .min, .max, .avg => .numeric,
-        .bool_or, .bool_and => .boolean,
-    };
 }
 
 fn aggregateSpecsEquivalent(
@@ -52966,7 +52998,7 @@ test "postgres sql adapter lowers bounded array aggregate specs" {
 test "postgres sql adapter lowers global aggregate queries" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"},"created_at":{"type":"datetime"},"metadata":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -52975,18 +53007,31 @@ test "postgres sql adapter lowers global aggregate queries" {
 
     var lowered = try lowerAggregateAlloc(
         alloc,
-        "SELECT COUNT(*) AS row_count, MIN(amount) AS min_amount, MAX(amount) AS max_amount FROM usage_records",
+        "SELECT COUNT(*) AS row_count, MIN(amount) AS min_amount, MAX(amount) AS max_amount, MIN(status) AS first_status, MAX(lower(status)) AS last_status_key, MAX(created_at) AS latest_created_at FROM usage_records",
         schema,
         &.{},
     );
     defer lowered.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), lowered.aggregate.group_by.len);
-    try std.testing.expectEqual(@as(usize, 3), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 6), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.min, lowered.aggregate.aggregations[1].op);
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].field.?);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.max, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.min, lowered.aggregate.aggregations[3].op);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[3].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.max, lowered.aggregate.aggregations[4].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.aggregate.aggregations[4].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.max, lowered.aggregate.aggregations[5].op);
+    try std.testing.expectEqualStrings("created_at", lowered.aggregate.aggregations[5].field.?);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerAggregateAlloc(
+        alloc,
+        "SELECT MIN(metadata) AS first_metadata FROM usage_records",
+        schema,
+        &.{},
+    ));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
         alloc,
@@ -62604,6 +62649,7 @@ const AppParityCorpusCoverage = struct {
     aggregate_modulo_expression: bool = false,
     aggregate_octet_length_expression: bool = false,
     aggregate_bit_length_expression: bool = false,
+    aggregate_scalar_minmax: bool = false,
     aggregate_regexp_numeric_expression: bool = false,
     aggregate_regexp_text_expression: bool = false,
     query_date_trunc_expression: bool = false,
@@ -63134,6 +63180,9 @@ const AppParityCorpusCoverage = struct {
                 self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(octet_length(status))") != null and
                     appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
                 self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(bit_length(status))") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
+                self.aggregate_scalar_minmax = self.aggregate_scalar_minmax or (std.mem.indexOf(u8, entry.sql, "MIN(status)") != null and
+                    std.mem.indexOf(u8, entry.sql, "MAX(lower(status))") != null and
                     appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
                 self.aggregate_regexp_numeric_expression = self.aggregate_regexp_numeric_expression or (std.mem.indexOf(u8, entry.sql, "SUM(regexp_count(status,") != null and
                     std.mem.indexOf(u8, entry.sql, "SUM(regexp_instr(status,") != null and
@@ -64547,6 +64596,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.aggregate_input_expression);
         try std.testing.expect(self.aggregate_octet_length_expression);
         try std.testing.expect(self.aggregate_bit_length_expression);
+        try std.testing.expect(self.aggregate_scalar_minmax);
         try std.testing.expect(self.aggregate_group_expression);
         try std.testing.expect(self.aggregate_group_expression_alias);
         try std.testing.expect(self.aggregate_having_expression);
@@ -67266,6 +67316,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .aggregations = 3 },
             .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=3:agg_expr=3:filter_expr=0:having=0:order=0:limit=-1",
             .sql = "SELECT SUM(regexp_count(status, '[0-9]+')) AS status_digit_groups, SUM(regexp_instr(status, '[A-Z]+')) AS status_letter_offsets, COUNT(DISTINCT regexp_substr(status, '[A-Z]+')) AS status_token_count FROM usage_records",
+        },
+        .{
+            .name = "aggregate scalar min max inputs",
+            .family = .aggregate,
+            .summary = .{ .table_name = "usage_records", .aggregations = 2 },
+            .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=2:agg_expr=1:filter_expr=0:having=0:order=0:limit=-1",
+            .sql = "SELECT MIN(status) AS first_status, MAX(lower(status)) AS last_status_key FROM usage_records",
         },
         .{
             .name = "distinct grouped projection",
