@@ -1874,6 +1874,72 @@ func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T)
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsDuplicateSlotIdentities(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", SlotName: "shared-slot"},
+			{Name: "standby-b", SlotName: "shared-slot"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected duplicate slot identity validation error")
+	}
+	if !strings.Contains(err.Error(), "duplicates standby slot identity") {
+		t.Fatalf("expected duplicate slot identity error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsUnsatisfiableSyncCardinality(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteApply,
+			Selection:    HAStandbySelectionFirst,
+			Required:     4,
+			StandbyNames: []string{"standby-a", "standby-b", "standby-b"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected unsatisfiable sync policy validation errors")
+	}
+	if !strings.Contains(err.Error(), "required (4) cannot exceed standbyNames length (3)") {
+		t.Fatalf("expected sync cardinality error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "duplicates standbyNames") {
+		t.Fatalf("expected duplicate sync standby error, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutStandbys(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without standbys to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover requires at least one declared standby") {
+		t.Fatalf("expected automatic failover standby validation error, got: %v", err)
+	}
+}
+
 func baseCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

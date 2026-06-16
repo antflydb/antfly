@@ -1129,6 +1129,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	var errors []string
 	names := map[string]struct{}{}
+	slotNames := map[string]int{}
 	for i, standby := range ha.Standbys {
 		name := strings.TrimSpace(standby.Name)
 		if name == "" {
@@ -1142,6 +1143,16 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if strings.TrimSpace(standby.SlotName) == "" && standby.SlotName != "" {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not be whitespace", i))
 		}
+		slotName := standby.SlotName
+		if slotName == "" {
+			slotName = name
+		}
+		if strings.TrimSpace(slotName) != "" {
+			if first, exists := slotNames[slotName]; exists {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName %q duplicates standby slot identity from spec.highAvailability.standbys[%d]", i, slotName, first))
+			}
+			slotNames[slotName] = i
+		}
 	}
 
 	if sync := ha.SyncPolicy; sync != nil && sync.modeOrDefault() != HADurabilityModeAsync {
@@ -1154,11 +1165,21 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		if len(sync.StandbyNames) == 0 {
 			errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames is required for synchronous modes")
 		}
+		required := sync.requiredOrDefault()
+		selection := sync.selectionOrDefault()
+		if selection != HAStandbySelectionAll && required > int32(len(sync.StandbyNames)) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.required (%d) cannot exceed standbyNames length (%d) for %s selection", required, len(sync.StandbyNames), selection))
+		}
+		seenSyncNames := map[string]int{}
 		for i, name := range sync.StandbyNames {
 			if strings.TrimSpace(name) == "" {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] is empty", i))
 				continue
 			}
+			if first, exists := seenSyncNames[name]; exists {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, name, first))
+			}
+			seenSyncNames[name] = i
 			if _, ok := names[name]; !ok {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
 			}
@@ -1166,6 +1187,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 	}
 
 	if failover := ha.AutomaticFailover; failover != nil && failover.Enabled {
+		if len(names) == 0 {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one declared standby")
+		}
 		if failover.fencingAuthorityOrDefault() == HAFencingAuthorityNone {
 			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must not be None when automatic failover is enabled")
 		}
@@ -1192,6 +1216,13 @@ func (p *HASyncPolicy) modeOrDefault() HADurabilityMode {
 		return HADurabilityModeAsync
 	}
 	return p.Mode
+}
+
+func (p *HASyncPolicy) selectionOrDefault() HAStandbySelection {
+	if p == nil || p.Selection == "" {
+		return HAStandbySelectionAny
+	}
+	return p.Selection
 }
 
 func (p *HASyncPolicy) requiredOrDefault() int32 {
