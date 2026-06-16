@@ -71061,6 +71061,39 @@ test "postgres sql adapter lowers joined mutation source with separate target an
     try std.testing.expect(implicit_delete.mutation.req.join.left.row_claim != null);
     try std.testing.expect(!implicit_delete.mutation.req.join.left.row_claim.?.skip_locked);
 
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.source_status FROM source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.source_status FROM source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .owner_id = "joined-worker", .lease_ms = 0, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .owner_id = "joined-worker", .lease_ms = 0, .txn_id = txn_id },
+    ));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateJoinedMutationSourceWithSchemasAlloc(
         alloc,
         "UPDATE archive.usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
@@ -72821,6 +72854,21 @@ test "postgres sql adapter lowers claimed delete mutation source" {
     try std.testing.expectEqual(@as(usize, 1), table_wide.mutation.req.returning_expressions.len);
     try std.testing.expectEqualStrings("status_key", table_wide.mutation.req.returning_expressions[0].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, table_wide.mutation.req.returning_expressions[0].expression.kind);
+
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteMutationSourceAlloc(
+        alloc,
+        "DELETE FROM usage_records RETURNING id",
+        schema,
+        &.{},
+        .{ .mode = .for_update, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteMutationSourceAlloc(
+        alloc,
+        "DELETE FROM usage_records RETURNING id",
+        schema,
+        &.{},
+        .{ .mode = .for_update, .owner_id = "cleanup", .lease_ms = 0, .txn_id = txn_id },
+    ));
 }
 
 test "postgres sql adapter routes write sql through typed plan families" {
