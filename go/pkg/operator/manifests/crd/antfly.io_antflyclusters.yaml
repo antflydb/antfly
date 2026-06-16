@@ -6612,6 +6612,11 @@ spec:
                       caught up to apply.
                     format: int32
                     type: integer
+                  laggingStandbyCount:
+                    description: LaggingStandbyCount is the count of desired standbys
+                      with non-zero replication lag.
+                    format: int32
+                    type: integer
                   lastPromotion:
                     description: LastPromotion records the last completed promotion.
                     properties:
@@ -6844,6 +6849,11 @@ spec:
                           satisfy synchronous commit.
                         type: string
                     type: object
+                  unhealthyStandbyCount:
+                    description: UnhealthyStandbyCount is the count of desired standbys
+                      missing, inactive, or reporting replication errors.
+                    format: int32
+                    type: integer
                 type: object
               metadataNodesReady:
                 description: MetadataNodesReady represents the number of ready metadata

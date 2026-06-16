@@ -92,6 +92,8 @@ type haPlan struct {
 	AutomaticPromotionAllowed bool
 	DesiredStandbyCount       int32
 	HealthyStandbyCount       int32
+	UnhealthyStandbyCount     int32
+	LaggingStandbyCount       int32
 	ReadSafeStandbyCount      int32
 	ReseedRequiredCount       int32
 	FencingReady              bool
@@ -229,6 +231,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		}
 		plan.DesiredStandbyCount++
 		if !ok {
+			plan.UnhealthyStandbyCount++
 			plan.Actions = append(plan.Actions, haPlannedAction{
 				Kind:        haActionCreateSlot,
 				StandbyName: standby.Name,
@@ -246,6 +249,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			continue
 		}
 		if !observed.Active && !observed.ReseedRequired {
+			plan.UnhealthyStandbyCount++
 			plan.Actions = append(plan.Actions, haPlannedAction{
 				Kind:        haActionResumeSlot,
 				StandbyName: standby.Name,
@@ -253,6 +257,12 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Reason:      "SlotInactive",
 			})
 			continue
+		}
+		if observed.LastError != "" {
+			plan.UnhealthyStandbyCount++
+		}
+		if standbyLagging(observed) {
+			plan.LaggingStandbyCount++
 		}
 		if observed.ReseedRequired || observed.Status == "reseed_required" {
 			plan.ReseedRequiredCount++
@@ -348,6 +358,8 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.Mode = ha.Mode
 	cluster.Status.HAStatus.DesiredStandbyCount = plan.DesiredStandbyCount
 	cluster.Status.HAStatus.HealthyStandbyCount = plan.HealthyStandbyCount
+	cluster.Status.HAStatus.UnhealthyStandbyCount = plan.UnhealthyStandbyCount
+	cluster.Status.HAStatus.LaggingStandbyCount = plan.LaggingStandbyCount
 	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
@@ -738,13 +750,19 @@ func mergeConfiguredStandbys(status *antflyv1.HAStatus, ha *antflyv1.HighAvailab
 		if key != "" {
 			observed[key] = standby
 		}
+		if standby.SlotName != "" {
+			observed[standby.SlotName] = standby
+		}
 	}
 	merged := make([]antflyv1.HAStandbyStatus, 0, len(ha.Standbys))
 	for _, desired := range ha.Standbys {
 		if !standbyDesired(desired) {
 			continue
 		}
-		entry := observed[desired.Name]
+		entry, ok := observed[desired.Name]
+		if !ok {
+			entry = observed[standbySlotName(desired)]
+		}
 		entry.Name = desired.Name
 		if entry.SlotName == "" {
 			entry.SlotName = standbySlotName(desired)
@@ -759,6 +777,8 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled {
 		setHACondition(cluster, antflyv1.TypeHAAvailable, metav1.ConditionTrue, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
+		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
+		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
 		setHACondition(cluster, antflyv1.TypeHARetentionPressure, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
 		setHACondition(cluster, antflyv1.TypeHAReseedRequired, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
 		setHACondition(cluster, antflyv1.TypeHAAutomaticFailoverReady, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
@@ -776,6 +796,18 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionTrue, antflyv1.ReasonHASyncPolicyUnsatisfied, "Synchronous HA policy is not currently satisfied")
 	} else {
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionFalse, "HASyncPolicySatisfied", "Synchronous HA policy is satisfied or not configured")
+	}
+
+	if plan.UnhealthyStandbyCount > 0 {
+		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionTrue, "HAStandbyUnhealthy", fmt.Sprintf("%d desired standby is missing, inactive, or reporting replication errors", plan.UnhealthyStandbyCount))
+	} else {
+		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionFalse, "HAStandbysHealthy", "No desired standby is missing, inactive, or reporting replication errors")
+	}
+
+	if plan.LaggingStandbyCount > 0 {
+		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionTrue, "HAStandbyLagging", fmt.Sprintf("%d desired standby has replication lag", plan.LaggingStandbyCount))
+	} else {
+		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionFalse, "HANoLaggingStandbys", "No desired standby has replication lag")
 	}
 
 	retentionPressure := cluster.Status.HAStatus != nil && cluster.Status.HAStatus.Retention.ReseedRecommended > 0
@@ -1153,6 +1185,13 @@ func standbySatisfiesSync(primaryLSN uint64, mode antflyv1.HADurabilityMode, sta
 
 func standbySyncEligible(standby antflyv1.HAStandbyStatus) bool {
 	return standby.Active && !standby.ReseedRequired
+}
+
+func standbyLagging(standby antflyv1.HAStandbyStatus) bool {
+	return standby.Status == "lagging" ||
+		standby.WriteLagLSN > 0 ||
+		standby.ApplyLagLSN > 0 ||
+		standby.SafeReadLagLSN > 0
 }
 
 func standbyDesired(standby antflyv1.HAStandbySpec) bool {

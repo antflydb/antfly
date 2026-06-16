@@ -164,6 +164,52 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	if cluster.Status.HAStatus.DesiredStandbyCount != 1 {
 		t.Fatalf("expected only desired standby counted, got %d", cluster.Status.HAStatus.DesiredStandbyCount)
 	}
+	if len(cluster.Status.HAStatus.Standbys) != 1 ||
+		cluster.Status.HAStatus.Standbys[0].Name != "standby-b" ||
+		cluster.Status.HAStatus.Standbys[0].SlotName != "slot-b" {
+		t.Fatalf("expected slotName override to survive status merge, got %#v", cluster.Status.HAStatus.Standbys)
+	}
+}
+
+func TestUpdateHAStatusReportsUnhealthyAndLaggingStandbys(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name: "standby-a",
+	}, {
+		Name: "standby-b",
+	}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 10,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:        "standby-a",
+			SlotName:    "standby-a",
+			Active:      true,
+			ReceivedLSN: 9,
+			AppliedLSN:  8,
+			WriteLagLSN: 1,
+			ApplyLagLSN: 2,
+			Status:      "lagging",
+			LastError:   "replication timeout",
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.UnhealthyStandbyCount != 2 {
+		t.Fatalf("expected two unhealthy standbys including missing standby, got %d", cluster.Status.HAStatus.UnhealthyStandbyCount)
+	}
+	if cluster.Status.HAStatus.LaggingStandbyCount != 1 {
+		t.Fatalf("expected one lagging standby, got %d", cluster.Status.HAStatus.LaggingStandbyCount)
+	}
+	unhealthy := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAUnhealthy)
+	if unhealthy == nil || unhealthy.Status != metav1.ConditionTrue || unhealthy.Reason != "HAStandbyUnhealthy" {
+		t.Fatalf("expected unhealthy condition, got %#v", unhealthy)
+	}
+	lagging := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHALagging)
+	if lagging == nil || lagging.Status != metav1.ConditionTrue || lagging.Reason != "HAStandbyLagging" {
+		t.Fatalf("expected lagging condition, got %#v", lagging)
+	}
 }
 
 func TestUpdateHAStatusReportsReseedAndDegradedSync(t *testing.T) {

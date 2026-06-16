@@ -86,6 +86,12 @@ const (
 	// TypeHADegraded indicates whether the configured HA durability policy is degraded.
 	TypeHADegraded = "HADegraded"
 
+	// TypeHAUnhealthy indicates whether one or more desired HA standbys are unhealthy.
+	TypeHAUnhealthy = "HAUnhealthy"
+
+	// TypeHALagging indicates whether one or more desired HA standbys are lagging.
+	TypeHALagging = "HALagging"
+
 	// TypeHARetentionPressure indicates whether HA slots are forcing WAL retention beyond policy.
 	TypeHARetentionPressure = "HARetentionPressure"
 
@@ -1305,6 +1311,14 @@ type HAStatus struct {
 	// HealthyStandbyCount is the count of desired standbys caught up to apply.
 	// +optional
 	HealthyStandbyCount int32 `json:"healthyStandbyCount,omitempty"`
+
+	// UnhealthyStandbyCount is the count of desired standbys missing, inactive, or reporting replication errors.
+	// +optional
+	UnhealthyStandbyCount int32 `json:"unhealthyStandbyCount,omitempty"`
+
+	// LaggingStandbyCount is the count of desired standbys with non-zero replication lag.
+	// +optional
+	LaggingStandbyCount int32 `json:"laggingStandbyCount,omitempty"`
 
 	// ReadSafeStandbyCount is the count of desired standbys safe for reads.
 	// +optional
