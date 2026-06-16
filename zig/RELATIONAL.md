@@ -525,10 +525,11 @@ containment are verified the same way. Joined mutation-source
 source-row field and a target-row field can participate in one typed arithmetic
 assignment without adapter-private evaluation. PostgreSQL row-list mutation
 syntax such as `SET (status, amount) = ('active', amount + 1)`, including
-`ON CONFLICT ... DO UPDATE` row-list assignments, is adapter sugar over the same
-ordered per-field typed assignments; it is rejected on duplicate targets and
-never creates tuple-valued storage operations. Row-query projection labels are
-a closed result-object contract: duplicate selected fields, compact projection
+`ON CONFLICT ... DO UPDATE` row-list assignments and `DEFAULT` items inside
+row-list assignments, is adapter sugar over the same ordered per-field typed
+assignments; it is rejected on duplicate targets and never creates tuple-valued
+storage operations. Row-query projection labels are a closed result-object
+contract: duplicate selected fields, compact projection
 outputs, and expression projection outputs fail request validation before
 execution, so storage and API-side preview execution never emit ambiguous JSON
 objects with repeated keys. The PostgreSQL adapter applies the same contract

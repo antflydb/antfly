@@ -4580,7 +4580,7 @@
         "returning": 1
       },
       "plan": "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
-      "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET (status, quantity) = (excluded.status, quantity + excluded.quantity) RETURNING id, status, quantity"
+      "sql": "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET (status, quantity) = (DEFAULT, quantity + excluded.quantity) RETURNING id, status, quantity"
     },
     {
       "name": "conflict boolean expression update",
@@ -6358,7 +6358,7 @@
         "row_claim_skip_locked": false
       },
       "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=2:patch_expr=0:increment_expr=0:json_set_expr=0:returning=3:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET (status, priority) = ('processing', priority + 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority"
+      "sql": "UPDATE usage_records SET (status, priority) = (DEFAULT, priority + 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority"
     },
     {
       "name": "claimed queue update modulo expression assignment",
@@ -8494,7 +8494,7 @@
         "join_on": 1
       },
       "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=1:returning=3:returning_expr=0:returning_all=0",
-      "sql": "UPDATE usage_records SET (quantity, status) = (source.quantity, 'synced') FROM source_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id, quantity, status"
+      "sql": "UPDATE usage_records SET (quantity, status) = (source.quantity, DEFAULT) FROM source_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id, quantity, status"
     },
     {
       "name": "joined update source modulo expression assignment",

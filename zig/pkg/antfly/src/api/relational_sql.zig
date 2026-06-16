@@ -62375,6 +62375,7 @@ const AppParityCorpusCoverage = struct {
     conflict_interval_update: bool = false,
     conflict_mixed_interval_update: bool = false,
     conflict_row_assignment: bool = false,
+    conflict_row_assignment_default: bool = false,
     conflict_boolean_expression_update: bool = false,
     update_source_boolean_expression_update: bool = false,
     update_joined_source_boolean_expression_update: bool = false,
@@ -62428,6 +62429,7 @@ const AppParityCorpusCoverage = struct {
     update_joined_source_json_expression: bool = false,
     delete_joined_source_json_expression: bool = false,
     update_joined_source_row_assignment: bool = false,
+    update_joined_source_row_assignment_default: bool = false,
     update_source_patch_expression: bool = false,
     update_source_increment_expression: bool = false,
     update_source_modulo_expression: bool = false,
@@ -62437,6 +62439,7 @@ const AppParityCorpusCoverage = struct {
     update_source_regexp_instr_expression: bool = false,
     update_source_regexp_substr_expression: bool = false,
     update_source_row_assignment: bool = false,
+    update_source_row_assignment_default: bool = false,
     schema_default_primary_named_conflict_target: bool = false,
     schema_custom_primary_named_conflict_target: bool = false,
     schema_unique_conflict_target: bool = false,
@@ -62809,6 +62812,10 @@ const AppParityCorpusCoverage = struct {
         self.update_source_row_assignment = self.update_source_row_assignment or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":ops="));
+        self.update_source_row_assignment_default = self.update_source_row_assignment_default or (entry.family == .update_source and
+            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
+            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_boolean_is_not_predicate = self.update_source_boolean_is_not_predicate or (entry.family == .update_source and
             appParityPlanHasNonZeroToken(entry.plan, ":source_or=") and
             (std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null or
@@ -62956,6 +62963,11 @@ const AppParityCorpusCoverage = struct {
             appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":source_assignments=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
+        self.update_joined_source_row_assignment_default = self.update_joined_source_row_assignment_default or (is_update_joined_source and
+            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
+            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":source_assignments=") and
             appParityPlanHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_boolean_expression_update = self.update_joined_source_boolean_expression_update or (is_update_joined_source and
@@ -63898,6 +63910,9 @@ const AppParityCorpusCoverage = struct {
                     appParityPlanHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_row_assignment = self.conflict_row_assignment or
                 std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null;
+            self.conflict_row_assignment_default = self.conflict_row_assignment_default or
+                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null and
+                    std.mem.indexOf(u8, entry.sql, "DEFAULT") != null);
             self.conflict_boolean_expression_update = self.conflict_boolean_expression_update or
                 std.mem.indexOf(u8, entry.sql, "SET enabled = excluded.enabled OR false") != null;
             self.schema_default_primary_named_conflict_target = self.schema_default_primary_named_conflict_target or
@@ -64485,8 +64500,11 @@ const AppParityCorpusCoverage = struct {
 
     fn expectRowAssignmentCoverage(self: @This()) !void {
         try std.testing.expect(self.conflict_row_assignment);
+        try std.testing.expect(self.conflict_row_assignment_default);
         try std.testing.expect(self.update_source_row_assignment);
+        try std.testing.expect(self.update_source_row_assignment_default);
         try std.testing.expect(self.update_joined_source_row_assignment);
+        try std.testing.expect(self.update_joined_source_row_assignment_default);
     }
 
     fn expectSeededBooleanAssignmentCoverage(self: @This()) !void {
@@ -67547,7 +67565,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .family = .insert,
             .summary = .{ .table_name = "usage_records", .operations = 2, .returning = 1 },
             .plan = "insert:table=usage_records:writes=0:transforms=1:ops=2:deletes=0:returning_rows=1:returning_expr=0",
-            .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET (status, quantity) = (excluded.status, quantity + excluded.quantity) RETURNING id, status, quantity",
+            .sql = "INSERT INTO usage_records (id, status, quantity) VALUES ('u1', 'open', 2) ON CONFLICT (id) DO UPDATE SET (status, quantity) = (DEFAULT, quantity + excluded.quantity) RETURNING id, status, quantity",
         },
         .{
             .name = "conflict boolean expression update",
@@ -68890,7 +68908,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .family = .update_source,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 2, .returning = 3, .row_claim_skip_locked = false },
             .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=2:patch_expr=0:increment_expr=0:json_set_expr=0:returning=3:returning_expr=0:returning_all=0",
-            .sql = "UPDATE usage_records SET (status, priority) = ('processing', priority + 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority",
+            .sql = "UPDATE usage_records SET (status, priority) = (DEFAULT, priority + 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority",
         },
         .{
             .name = "claimed queue update modulo expression assignment",
@@ -70323,7 +70341,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .family = .update_joined_source,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .source_assignments = 1, .returning = 3 },
             .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=1:returning=3:returning_expr=0:returning_all=0",
-            .sql = "UPDATE usage_records SET (quantity, status) = (source.quantity, 'synced') FROM source_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id, quantity, status",
+            .sql = "UPDATE usage_records SET (quantity, status) = (source.quantity, DEFAULT) FROM source_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id, quantity, status",
         },
         .{
             .name = "joined update source modulo expression assignment",
@@ -70682,7 +70700,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
 test "postgres sql adapter lowers joined mutation source with separate target and source schemas" {
     const alloc = std.testing.allocator;
     const target_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const source_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"source_pk":{"type":"keyword"},"id":{"type":"keyword"},"source_status":{"type":"keyword"},"source_quantity":{"type":"numeric"},"source_enabled":{"type":"boolean"}},"required":["source_pk"],"additionalProperties":false}}},"primary_key":{"columns":["source_pk"]}}
@@ -70751,7 +70769,7 @@ test "postgres sql adapter lowers joined mutation source with separate target an
 
     var row_assignment = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
         alloc,
-        "UPDATE usage_records SET (quantity, status) = (source.source_quantity, 'synced') FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity, status",
+        "UPDATE usage_records SET (quantity, status) = (source.source_quantity, DEFAULT) FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity, status",
         target_schema,
         source_schema,
         &.{},
@@ -70763,7 +70781,7 @@ test "postgres sql adapter lowers joined mutation source with separate target an
     try std.testing.expectEqualStrings("source_quantity", row_assignment.mutation.req.source_assignments[0].source_field);
     try std.testing.expectEqual(@as(usize, 1), row_assignment.mutation.req.operations.len);
     try std.testing.expectEqualStrings("status", row_assignment.mutation.req.operations[0].path);
-    try std.testing.expectEqualStrings("\"synced\"", row_assignment.mutation.req.operations[0].value_json.?);
+    try std.testing.expectEqualStrings("\"active\"", row_assignment.mutation.req.operations[0].value_json.?);
     try std.testing.expectEqual(@as(usize, 3), row_assignment.mutation.req.returning.len);
 
     var expression_assignment = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
@@ -72300,7 +72318,7 @@ test "postgres sql adapter lowers partial unique point selectors" {
 test "postgres sql adapter lowers claimed update mutation source" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"priority":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"priority":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -72441,7 +72459,7 @@ test "postgres sql adapter lowers claimed update mutation source" {
 
     var row_assignment = try lowerUpdateMutationSourceAlloc(
         alloc,
-        "UPDATE usage_records SET (status, priority) = ('processing', priority + 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority",
+        "UPDATE usage_records SET (status, priority) = (DEFAULT, priority + 1) WHERE status = 'queued' FOR UPDATE RETURNING id, status, priority",
         schema,
         &.{},
         claim,
@@ -72450,6 +72468,7 @@ test "postgres sql adapter lowers claimed update mutation source" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, row_assignment.mutation.req.kind);
     try std.testing.expectEqual(@as(usize, 2), row_assignment.mutation.req.operations.len);
     try std.testing.expectEqualStrings("status", row_assignment.mutation.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", row_assignment.mutation.req.operations[0].value_json.?);
     try std.testing.expectEqual(db_mod.types.TransformOpType.inc, row_assignment.mutation.req.operations[1].op);
     try std.testing.expectEqualStrings("priority", row_assignment.mutation.req.operations[1].path);
     try std.testing.expectEqualStrings("1", row_assignment.mutation.req.operations[1].value_json.?);
@@ -75545,6 +75564,22 @@ test "postgres sql adapter lowers conflict update explicit default values" {
     try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(@as(u64, 15), lowered.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+
+    var row_assignment = try lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET (status) = (DEFAULT) RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer row_assignment.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), row_assignment.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), row_assignment.batch.transformed);
+    try std.testing.expectEqualStrings("status", row_assignment.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", row_assignment.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 15), row_assignment.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"status\":\"active\"}", row_assignment.batch.returning_rows[0]);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverAlloc(
         alloc,
