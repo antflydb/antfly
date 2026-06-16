@@ -37,6 +37,7 @@ pub const admin_cli = @import("admin_cli.zig");
 pub const compat = @import("compat.zig");
 pub const http_admin = @import("http_admin.zig");
 pub const http_internal = @import("http_internal.zig");
+pub const http_replication_client = @import("http_replication_client.zig");
 pub const http_client = @import("http_client.zig");
 
 test {
@@ -65,5 +66,6 @@ test {
     _ = compat;
     _ = http_admin;
     _ = http_internal;
+    _ = http_replication_client;
     _ = http_client;
 }
