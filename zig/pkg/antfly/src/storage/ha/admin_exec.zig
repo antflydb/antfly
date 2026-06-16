@@ -28,6 +28,7 @@ const backup_manifest = @import("backup_manifest.zig");
 const commit_gate = @import("commit_gate.zig");
 const fencing = @import("fencing.zig");
 const metrics = @import("metrics.zig");
+const operator = @import("operator.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
@@ -93,6 +94,7 @@ pub const Result = union(enum) {
     promote_current_fence: admin.FencedPromotionResult,
     promote: admin.FencedPromotionResult,
     rejoin_assess: rejoin.Assessment,
+    operator_plan: operator.Plan,
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
         switch (self.*) {
@@ -106,6 +108,7 @@ pub const Result = union(enum) {
             .fence_current => |*maybe_result| if (maybe_result.*) |*result| result.deinit(alloc),
             .promote_current_fence => |*result| result.deinit(alloc),
             .promote => |*result| result.deinit(alloc),
+            .operator_plan => |*result| result.deinit(alloc),
             else => {},
         }
         self.* = undefined;
@@ -270,6 +273,16 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendU64Line(alloc, &out, "retained_from_lsn", assessment.retained_from_lsn);
             try appendBoolLine(alloc, &out, "data_loss_discarded", assessment.data_loss_discarded);
         },
+        .operator_plan => |operator_plan| {
+            try appendBoolLine(alloc, &out, "automatic_promotion_allowed", operator_plan.automatic_promotion_allowed);
+            try appendUsizeLine(alloc, &out, "desired_standby_count", operator_plan.desired_standby_count);
+            try appendUsizeLine(alloc, &out, "healthy_standby_count", operator_plan.healthy_standby_count);
+            try appendUsizeLine(alloc, &out, "unhealthy_standby_count", operator_plan.unhealthy_standby_count);
+            try appendUsizeLine(alloc, &out, "lagging_standby_count", operator_plan.lagging_standby_count);
+            try appendUsizeLine(alloc, &out, "reseed_required_count", operator_plan.reseed_required_count);
+            try appendUsizeLine(alloc, &out, "action_count", operator_plan.actions.len);
+            try appendUsizeLine(alloc, &out, "condition_count", operator_plan.conditions.len);
+        },
     }
 
     return try out.toOwnedSlice(alloc);
@@ -351,7 +364,24 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .rejoin_assess => |command| .{
             .rejoin_assess = admin.assessFormerPrimaryRejoin(command.former, command.receipt, command.policy),
         },
+        .operator_plan => |command| .{
+            .operator_plan = try executeOperatorPlan(alloc, try requirePrimary(ctx), command),
+        },
     };
+}
+
+fn executeOperatorPlan(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    command: admin_cli.OperatorPlanCommand,
+) !operator.Plan {
+    var snapshot = try admin.primaryStatus(alloc, primary, command.spec.retention_policy, command.spec.sync_policy);
+    defer snapshot.deinit(alloc);
+    return try operator.reconcile(alloc, command.spec, .{
+        .primary = snapshot,
+        .current_primary_id = command.current_primary_id,
+        .fencing = command.fencing,
+    });
 }
 
 fn executePromoteAssess(
@@ -572,6 +602,7 @@ fn resultName(result: Result) []const u8 {
         .promote_current_fence => "promote_current_fence",
         .promote => "promote",
         .rejoin_assess => "rejoin_assess",
+        .operator_plan => "operator_plan",
     };
 }
 
@@ -1199,6 +1230,54 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer rendered.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain; version=0.0.4", rendered.content_type);
     try expectContains(rendered.body, "antfly_ha_primary_current_lsn 2\n");
+}
+
+test "storage.ha admin exec renders operator plan command" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "operator-plan");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 1);
+
+    var plan = try admin_cli.parse(alloc, &.{
+        "operator",           "plan",
+        "--standby",          "standby-a",
+        "--sync-mode",        "remote-apply",
+        "--sync-standby",     "standby-a",
+        "--auto-failover",    "--fencing-authority",
+        "kubernetes-lease",   "--current-primary-id",
+        "primary-a",          "--fence-authority",
+        "kubernetes-lease",   "--fence-ready",
+        "--fence-holder",     "standby-a",
+        "--fence-generation", "9",
+        "--fence-reason",     "LeaseAcquired",
+    });
+    defer plan.deinit(alloc);
+
+    var result = try execute(alloc, .{ .primary = &primary }, plan);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.operator_plan.automatic_promotion_allowed);
+    try std.testing.expectEqual(@as(usize, 4), result.operator_plan.actions.len);
+    try std.testing.expectEqual(operator.ActionKind.update_primary_endpoint, result.operator_plan.actions[2].kind);
+    try std.testing.expectEqual(@as(u64, 9), result.operator_plan.actions[2].fencing_precondition.?.generation);
+
+    const json_body = try renderJsonAlloc(alloc, result);
+    defer alloc.free(json_body);
+    try expectContains(json_body, "\"operator_plan\"");
+    try expectContains(json_body, "\"automatic_promotion_allowed\":true");
+    try expectContains(json_body, "\"fencing_precondition\"");
+    try expectContains(json_body, "\"generation\":9");
+
+    const table_body = try renderTableAlloc(alloc, result);
+    defer alloc.free(table_body);
+    try expectContains(table_body, "result=operator_plan\n");
+    try expectContains(table_body, "automatic_promotion_allowed=true\n");
+    try expectContains(table_body, "action_count=4\n");
 }
 
 test "storage.ha admin exec finishes and bootstraps seed manifests from files" {

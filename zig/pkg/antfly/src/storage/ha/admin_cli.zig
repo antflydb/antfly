@@ -23,6 +23,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const admin = @import("admin.zig");
 const fencing = @import("fencing.zig");
+const operator = @import("operator.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
@@ -98,6 +99,12 @@ pub const RejoinAssessCommand = struct {
     policy: rejoin.RejoinPolicy,
 };
 
+pub const OperatorPlanCommand = struct {
+    spec: operator.Spec,
+    current_primary_id: ?[]const u8 = null,
+    fencing: operator.FencingObservation = .{},
+};
+
 pub const PromoteAssessCommand = struct {
     check: status.PromotionCheck,
     use_current_fence: bool = false,
@@ -122,15 +129,18 @@ pub const Command = union(enum) {
     promote_current_fence,
     promote: admin.FencedPromotionRequest,
     rejoin_assess: RejoinAssessCommand,
+    operator_plan: OperatorPlanCommand,
 };
 
 pub const Plan = struct {
     output: OutputFormat = .json,
     command: Command,
     owned_standby_names: []const []const u8 = &.{},
+    owned_operator_standbys: []operator.StandbySpec = &.{},
 
     pub fn deinit(self: *Plan, alloc: Allocator) void {
         alloc.free(self.owned_standby_names);
+        alloc.free(self.owned_operator_standbys);
         self.* = undefined;
     }
 };
@@ -233,6 +243,11 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
     }
     if (std.mem.eql(u8, root, "rejoin")) {
         plan.command = .{ .rejoin_assess = try parseRejoin(&cursor) };
+        try cursor.expectEnd();
+        return plan;
+    }
+    if (std.mem.eql(u8, root, "operator")) {
+        plan.command = .{ .operator_plan = try parseOperator(alloc, &cursor, &plan.owned_operator_standbys, &plan.owned_standby_names) };
         try cursor.expectEnd();
         return plan;
     }
@@ -618,6 +633,85 @@ fn parsePromote(cursor: *Cursor) !Command {
     return .{ .promote = .{ .fence = try parseFenceRequest(cursor) } };
 }
 
+fn parseOperator(
+    alloc: Allocator,
+    cursor: *Cursor,
+    owned_standbys: *[]operator.StandbySpec,
+    owned_sync_names: *[]const []const u8,
+) !OperatorPlanCommand {
+    const subcommand = cursor.next() orelse return error.OperatorSubcommandMissing;
+    if (!std.mem.eql(u8, subcommand, "plan")) return error.UnknownOperatorSubcommand;
+
+    var standbys = std.ArrayListUnmanaged(operator.StandbySpec).empty;
+    errdefer standbys.deinit(alloc);
+    var command = OperatorPlanCommand{
+        .spec = .{ .mode = .hot_standby },
+    };
+    var sync_builder = SyncPolicyBuilder{};
+    defer sync_builder.deinit(alloc);
+
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--standby")) {
+            _ = cursor.next();
+            try standbys.append(alloc, .{ .name = try cursor.value("--standby") });
+        } else if (std.mem.eql(u8, arg, "--standby-initial-lsn")) {
+            _ = cursor.next();
+            if (standbys.items.len == 0) return error.StandbyNameMissing;
+            standbys.items[standbys.items.len - 1].initial_lsn = try parseU64(try cursor.value("--standby-initial-lsn"));
+        } else if (std.mem.eql(u8, arg, "--standby-disabled")) {
+            _ = cursor.next();
+            try standbys.append(alloc, .{
+                .name = try cursor.value("--standby-disabled"),
+                .desired = false,
+            });
+        } else if (std.mem.eql(u8, arg, "--max-lag-lsn")) {
+            _ = cursor.next();
+            command.spec.retention_policy.max_lag_lsn = try parseU64(try cursor.value("--max-lag-lsn"));
+        } else if (std.mem.eql(u8, arg, "--auto-failover")) {
+            _ = cursor.next();
+            command.spec.auto_failover.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--fencing-authority")) {
+            _ = cursor.next();
+            command.spec.auto_failover.fencing_authority = try parseFencingAuthority(try cursor.value("--fencing-authority"));
+        } else if (std.mem.eql(u8, arg, "--auto-max-lag-lsn")) {
+            _ = cursor.next();
+            command.spec.auto_failover.maximum_lag_lsn = try parseU64(try cursor.value("--auto-max-lag-lsn"));
+        } else if (std.mem.eql(u8, arg, "--auto-allow-remote-write")) {
+            _ = cursor.next();
+            command.spec.auto_failover.require_remote_apply = false;
+        } else if (std.mem.eql(u8, arg, "--current-primary-id")) {
+            _ = cursor.next();
+            command.current_primary_id = try cursor.value("--current-primary-id");
+        } else if (std.mem.eql(u8, arg, "--fence-authority")) {
+            _ = cursor.next();
+            command.fencing.authority = try parseFencingAuthority(try cursor.value("--fence-authority"));
+        } else if (std.mem.eql(u8, arg, "--fence-ready")) {
+            _ = cursor.next();
+            command.fencing.ready = true;
+        } else if (std.mem.eql(u8, arg, "--fence-holder")) {
+            _ = cursor.next();
+            command.fencing.holder = try cursor.value("--fence-holder");
+        } else if (std.mem.eql(u8, arg, "--fence-generation")) {
+            _ = cursor.next();
+            command.fencing.generation = try parseU64(try cursor.value("--fence-generation"));
+        } else if (std.mem.eql(u8, arg, "--fence-reason")) {
+            _ = cursor.next();
+            command.fencing.reason = try cursor.value("--fence-reason");
+        } else if (try sync_builder.parseFlag(alloc, cursor, arg)) {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    const standby_slice = try standbys.toOwnedSlice(alloc);
+    standbys = .empty;
+    owned_standbys.* = standby_slice;
+    command.spec.standbys = standby_slice;
+    command.spec.sync_policy = try sync_builder.finish(alloc, owned_sync_names);
+    return command;
+}
+
 fn parsePromoteAssess(cursor: *Cursor) !PromoteAssessCommand {
     var command = PromoteAssessCommand{ .check = .{} };
     while (cursor.peek()) |arg| {
@@ -976,6 +1070,15 @@ fn parseStatusView(raw: []const u8) !StatusView {
     return error.InvalidStatusView;
 }
 
+fn parseFencingAuthority(raw: []const u8) !operator.FencingAuthority {
+    if (std.mem.eql(u8, raw, "none")) return .none;
+    if (std.mem.eql(u8, raw, "kubernetes_lease") or std.mem.eql(u8, raw, "kubernetes-lease")) return .kubernetes_lease;
+    if (std.mem.eql(u8, raw, "storage_fence") or std.mem.eql(u8, raw, "storage-fence")) return .storage_fence;
+    if (std.mem.eql(u8, raw, "metadata_raft") or std.mem.eql(u8, raw, "metadata-raft")) return .metadata_raft;
+    if (std.mem.eql(u8, raw, "external")) return .external;
+    return error.InvalidFencingAuthority;
+}
+
 fn parseDurabilityMode(raw: []const u8) !primary_mod.DurabilityMode {
     if (std.mem.eql(u8, raw, "async")) return .async;
     if (std.mem.eql(u8, raw, "remote_write")) return .remote_write;
@@ -1107,6 +1210,48 @@ test "storage.ha admin cli parses primary status with sync policy" {
     try std.testing.expectEqual(@as(usize, 2), policy.standby_names.len);
     try std.testing.expectEqualStrings("a", policy.standby_names[0]);
     try std.testing.expectEqualStrings("b", policy.standby_names[1]);
+}
+
+test "storage.ha admin cli parses operator plan command" {
+    const alloc = std.testing.allocator;
+    var plan = try parse(alloc, &.{
+        "operator",              "plan",
+        "--standby",             "standby-a",
+        "--standby-initial-lsn", "3",
+        "--standby-disabled",    "standby-b",
+        "--max-lag-lsn",         "50",
+        "--sync-mode",           "remote-apply",
+        "--sync-standby",        "standby-a",
+        "--auto-failover",       "--fencing-authority",
+        "kubernetes-lease",      "--auto-max-lag-lsn",
+        "2",                     "--current-primary-id",
+        "primary-a",             "--fence-authority",
+        "kubernetes_lease",      "--fence-ready",
+        "--fence-holder",        "standby-a",
+        "--fence-generation",    "7",
+        "--fence-reason",        "LeaseAcquired",
+    });
+    defer plan.deinit(alloc);
+
+    const command = plan.command.operator_plan;
+    try std.testing.expectEqual(operator.Mode.hot_standby, command.spec.mode);
+    try std.testing.expectEqual(@as(usize, 2), command.spec.standbys.len);
+    try std.testing.expectEqualStrings("standby-a", command.spec.standbys[0].name);
+    try std.testing.expectEqual(@as(?u64, 3), command.spec.standbys[0].initial_lsn);
+    try std.testing.expectEqualStrings("standby-b", command.spec.standbys[1].name);
+    try std.testing.expect(!command.spec.standbys[1].desired);
+    try std.testing.expectEqual(@as(u64, 50), command.spec.retention_policy.max_lag_lsn);
+    try std.testing.expect(command.spec.auto_failover.enabled);
+    try std.testing.expectEqual(operator.FencingAuthority.kubernetes_lease, command.spec.auto_failover.fencing_authority);
+    try std.testing.expectEqual(@as(u64, 2), command.spec.auto_failover.maximum_lag_lsn);
+    try std.testing.expectEqualStrings("primary-a", command.current_primary_id.?);
+    try std.testing.expectEqual(operator.FencingAuthority.kubernetes_lease, command.fencing.authority);
+    try std.testing.expect(command.fencing.ready);
+    try std.testing.expectEqualStrings("standby-a", command.fencing.holder.?);
+    try std.testing.expectEqual(@as(?u64, 7), command.fencing.generation);
+    try std.testing.expectEqualStrings("LeaseAcquired", command.fencing.reason);
+    try std.testing.expectEqual(primary_mod.DurabilityMode.remote_apply, command.spec.sync_policy.?.mode);
+    try std.testing.expectEqualStrings("standby-a", command.spec.sync_policy.?.standby_names[0]);
 }
 
 test "storage.ha admin cli renders versioned json command plan" {
