@@ -1488,6 +1488,14 @@ type HAFencingStatus struct {
 type HAPlannedActionStatus struct {
 	Kind string `json:"kind,omitempty"`
 
+	// Phase groups the action into the HA workflow stage.
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
+	// Executor identifies whether the operator or an HA admin command executes this action.
+	// +optional
+	Executor string `json:"executor,omitempty"`
+
 	// DependsOn names the action kind that must complete before this action runs.
 	// +optional
 	DependsOn string `json:"dependsOn,omitempty"`

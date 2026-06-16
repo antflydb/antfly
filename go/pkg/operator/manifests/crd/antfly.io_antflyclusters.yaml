@@ -8752,6 +8752,10 @@ spec:
                           description: DependsOn names the action kind that must complete
                             before this action runs.
                           type: string
+                        executor:
+                          description: Executor identifies whether the operator or
+                            an HA admin command executes this action.
+                          type: string
                         fenceAuthority:
                           description: HAFencingAuthority selects the authority used
                             before automatic promotion.
@@ -8766,6 +8770,10 @@ spec:
                         observedLSN:
                           format: int64
                           type: integer
+                        phase:
+                          description: Phase groups the action into the HA workflow
+                            stage.
+                          type: string
                         reason:
                           type: string
                         retainedFromLSN:

@@ -86,6 +86,12 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	if cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionCreateSlot) {
 		t.Fatalf("expected seed action to depend on create-slot, got %#v", cluster.Status.HAStatus.PlannedActions[1])
 	}
+	if cluster.Status.HAStatus.PlannedActions[0].Phase != string(haActionPhaseReconcile) ||
+		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminCommand) ||
+		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhaseReconcile) ||
+		cluster.Status.HAStatus.PlannedActions[1].Executor != string(haActionExecutorAdminCommand) {
+		t.Fatalf("expected slot and seed actions to publish reconcile/admin executor metadata, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
 	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
 		cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://primary-ha.default.svc:8081" {
 		t.Fatalf("expected slot and seed actions to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions)
@@ -442,6 +448,14 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionAcquireFence) ||
 		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionPromoteStandby) {
 		t.Fatalf("unexpected promotion action status: %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].Phase != string(haActionPhaseFence) ||
+		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhasePromote) ||
+		cluster.Status.HAStatus.PlannedActions[2].Phase != string(haActionPhaseRoute) ||
+		cluster.Status.HAStatus.PlannedActions[3].Phase != string(haActionPhaseRejoin) ||
+		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminCommand) ||
+		cluster.Status.HAStatus.PlannedActions[2].Executor != string(haActionExecutorControllerAction) {
+		t.Fatalf("expected promotion action status to publish phase/executor metadata, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
 		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionAcquireFence) ||

@@ -34,6 +34,23 @@ const (
 	haActionReseedFormerPrimary  haActionKind = "ReseedFormerPrimary"
 )
 
+type haActionPhase string
+
+const (
+	haActionPhaseReconcile haActionPhase = "Reconcile"
+	haActionPhaseFence     haActionPhase = "Fence"
+	haActionPhasePromote   haActionPhase = "Promote"
+	haActionPhaseRoute     haActionPhase = "Route"
+	haActionPhaseRejoin    haActionPhase = "Rejoin"
+)
+
+type haActionExecutor string
+
+const (
+	haActionExecutorAdminCommand     haActionExecutor = "AdminCommand"
+	haActionExecutorControllerAction haActionExecutor = "ControllerAction"
+)
+
 const haFencingLeaseDefaultDurationSeconds int32 = 30
 
 func haFencingLeaseRenewalRequeueAfter() time.Duration {
@@ -535,6 +552,8 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	for _, action := range actions {
 		out = append(out, antflyv1.HAPlannedActionStatus{
 			Kind:             string(action.Kind),
+			Phase:            string(haPlannedActionPhase(action.Kind)),
+			Executor:         string(haPlannedActionExecutor(action.Kind)),
 			DependsOn:        string(action.DependsOn),
 			StandbyName:      action.StandbyName,
 			SlotName:         action.SlotName,
@@ -553,6 +572,28 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		})
 	}
 	return out
+}
+
+func haPlannedActionPhase(kind haActionKind) haActionPhase {
+	switch kind {
+	case haActionAcquireFence:
+		return haActionPhaseFence
+	case haActionPromoteStandby:
+		return haActionPhasePromote
+	case haActionUpdatePrimaryRoute:
+		return haActionPhaseRoute
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		return haActionPhaseRejoin
+	default:
+		return haActionPhaseReconcile
+	}
+}
+
+func haPlannedActionExecutor(kind haActionKind) haActionExecutor {
+	if kind == haActionUpdatePrimaryRoute {
+		return haActionExecutorControllerAction
+	}
+	return haActionExecutorAdminCommand
 }
 
 func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {
