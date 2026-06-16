@@ -259,7 +259,7 @@ pub const Standby = struct {
             .epoch = request.new_epoch,
         };
         const switch_lsn = self.progress.received_lsn + 1;
-        const payload = try promotionPayload(self.alloc, old_identity, new_identity, required_lsn, data_loss_possible);
+        const payload = try promotionPayload(self.alloc, old_identity, new_identity, required_lsn, request.force, data_loss_possible);
         defer self.alloc.free(payload);
 
         _ = try self.receive_log.append(self.alloc, .{
@@ -430,20 +430,18 @@ fn promotionPayload(
     old_identity: Identity,
     new_identity: Identity,
     required_lsn: u64,
+    forced: bool,
     data_loss_possible: bool,
 ) ![]u8 {
-    return try std.fmt.allocPrint(
-        alloc,
-        "{{\"parent_timeline_id\":{d},\"new_timeline_id\":{d},\"parent_epoch\":{d},\"new_epoch\":{d},\"required_lsn\":{d},\"data_loss_possible\":{}}}",
-        .{
-            old_identity.timeline_id,
-            new_identity.timeline_id,
-            old_identity.epoch,
-            new_identity.epoch,
-            required_lsn,
-            data_loss_possible,
-        },
-    );
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .parent_timeline_id = old_identity.timeline_id,
+        .new_timeline_id = new_identity.timeline_id,
+        .parent_epoch = old_identity.epoch,
+        .new_epoch = new_identity.epoch,
+        .required_lsn = required_lsn,
+        .forced = forced,
+        .data_loss_possible = data_loss_possible,
+    }, .{});
 }
 
 fn encodeProgress(identity: Identity, progress: Progress) [progress_header_len]u8 {
@@ -567,6 +565,16 @@ const ApplyCapture = struct {
         errdefer self.alloc.free(owned);
         try self.payloads.append(self.alloc, owned);
     }
+};
+
+const TimelineSwitchPayload = struct {
+    parent_timeline_id: u64,
+    new_timeline_id: u64,
+    parent_epoch: u64,
+    new_epoch: u64,
+    required_lsn: u64,
+    forced: bool,
+    data_loss_possible: bool,
 };
 
 test "storage.ha standby receives applies and persists progress across reopen" {
@@ -730,7 +738,15 @@ test "storage.ha standby promotion requires fencing and appends timeline switch"
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(replication_record.RecordKind.timeline_switch, entries[0].record.kind);
     try std.testing.expectEqual(@as(u64, 2), entries[0].record.timeline_id);
-    try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"data_loss_possible\":false") != null);
+    var switch_payload = try std.json.parseFromSlice(TimelineSwitchPayload, alloc, entries[0].record.payload, .{});
+    defer switch_payload.deinit();
+    try std.testing.expectEqual(@as(u64, 1), switch_payload.value.parent_timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), switch_payload.value.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 1), switch_payload.value.parent_epoch);
+    try std.testing.expectEqual(@as(u64, 2), switch_payload.value.new_epoch);
+    try std.testing.expectEqual(@as(u64, 2), switch_payload.value.required_lsn);
+    try std.testing.expect(!switch_payload.value.forced);
+    try std.testing.expect(!switch_payload.value.data_loss_possible);
 }
 
 test "storage.ha standby forced promotion records possible data loss" {
@@ -767,7 +783,15 @@ test "storage.ha standby forced promotion records possible data loss" {
     defer replication_log.freeEntries(alloc, entries);
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(replication_record.RecordKind.timeline_switch, entries[0].record.kind);
-    try std.testing.expect(std.mem.indexOf(u8, entries[0].record.payload, "\"data_loss_possible\":true") != null);
+    var switch_payload = try std.json.parseFromSlice(TimelineSwitchPayload, alloc, entries[0].record.payload, .{});
+    defer switch_payload.deinit();
+    try std.testing.expectEqual(@as(u64, 1), switch_payload.value.parent_timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), switch_payload.value.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 1), switch_payload.value.parent_epoch);
+    try std.testing.expectEqual(@as(u64, 2), switch_payload.value.new_epoch);
+    try std.testing.expectEqual(@as(u64, 2), switch_payload.value.required_lsn);
+    try std.testing.expect(switch_payload.value.forced);
+    try std.testing.expect(switch_payload.value.data_loss_possible);
 }
 
 test "storage.ha promoted standby reopens on new timeline and rejects old timeline" {
