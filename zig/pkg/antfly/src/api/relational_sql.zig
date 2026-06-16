@@ -60917,6 +60917,112 @@ fn expectAppParityReadSummary(summary: AppParityPlanSummary, lowered: LoweredRea
     }
 }
 
+fn expectAppParityWriteSummary(summary: AppParityPlanSummary, lowered: LoweredWritePlan) !void {
+    switch (lowered) {
+        .insert => |insert| {
+            try expectOptionalTableName(summary.table_name, insert.table_name);
+            try expectOptionalUsize(summary.operations, transformOperationCount(insert.batch.transforms));
+            try expectOptionalUsize(summary.returning, insert.batch.returning_rows.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, insert.returning_all);
+            if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert.conflict_where);
+        },
+        .insert_source => |insert_source| {
+            try expectOptionalTableName(summary.table_name, insert_source.table_name);
+            try expectOptionalUsize(summary.ctes, insert_source.ctes.len);
+            try expectQuerySummary(summary, insert_source.insert_source.req.source);
+            try expectOptionalUsize(summary.operations, insert_source.insert_source.req.assignments.len);
+            const conflict_patch_expressions = if (insert_source.insert_source.req.on_conflict) |conflict| conflict.patch_expressions.len else 0;
+            const conflict_increment_expressions = if (insert_source.insert_source.req.on_conflict) |conflict| conflict.increment_expressions.len else 0;
+            const conflict_json_set_expressions = if (insert_source.insert_source.req.on_conflict) |conflict| conflict.json_set_expressions.len else 0;
+            try expectOptionalUsize(summary.patch_expressions, conflict_patch_expressions);
+            try expectOptionalUsize(summary.increment_expressions, conflict_increment_expressions);
+            try expectOptionalUsize(summary.json_set_expressions, conflict_json_set_expressions);
+            try expectOptionalUsize(summary.returning, insert_source.insert_source.req.returning.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, insert_source.insert_source.req.returning_all);
+            if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert_source.conflict_where);
+        },
+        .update => |update| {
+            try expectOptionalTableName(summary.table_name, update.table_name);
+            try expectOptionalUsize(summary.operations, transformOperationCount(update.batch.transforms));
+            try expectOptionalUsize(summary.returning, update.batch.returning_rows.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, update.returning_all);
+        },
+        .delete => |delete| {
+            try expectOptionalTableName(summary.table_name, delete.table_name);
+            try expectOptionalUsize(summary.returning, delete.batch.returning_rows.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, delete.returning_all);
+        },
+        .update_source => |update_source| {
+            try expectOptionalTableName(summary.table_name, update_source.table_name);
+            try expectQuerySummary(summary, update_source.mutation.req.source);
+            try expectOptionalUsize(summary.operations, update_source.mutation.req.operations.len);
+            try expectOptionalUsize(summary.patch_expressions, update_source.mutation.req.patch_expressions.len);
+            try expectOptionalUsize(summary.increment_expressions, update_source.mutation.req.increment_expressions.len);
+            try expectOptionalUsize(summary.json_set_expressions, update_source.mutation.req.json_set_expressions.len);
+            try expectOptionalUsize(summary.returning, update_source.mutation.req.returning.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, update_source.mutation.req.returning_all);
+        },
+        .delete_source => |delete_source| {
+            try expectOptionalTableName(summary.table_name, delete_source.table_name);
+            try expectQuerySummary(summary, delete_source.mutation.req.source);
+            try expectOptionalUsize(summary.returning, delete_source.mutation.req.returning.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, delete_source.mutation.req.returning_all);
+        },
+        .truncate_source => |truncate_source| {
+            try expectOptionalTableName(summary.table_name, truncate_source.table_name);
+            try expectQuerySummary(summary, truncate_source.mutation.req.source);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, truncate_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 0), truncate_source.mutation.req.returning.len);
+            try std.testing.expect(!truncate_source.mutation.req.returning_all);
+        },
+        .update_joined_source => |update_joined_source| {
+            try expectOptionalTableName(summary.table_name, update_joined_source.target_table_name);
+            try expectCombinedQuerySourceSummary(summary, update_joined_source.mutation.req.join.left, update_joined_source.mutation.req.join.right);
+            try expectOptionalUsize(summary.join_on, update_joined_source.mutation.req.join.on.len);
+            try expectOptionalUsize(summary.order_by, update_joined_source.mutation.req.join.order_by.len);
+            try expectOptionalU32(summary.limit, update_joined_source.mutation.req.join.limit);
+            try expectOptionalU32(summary.offset, update_joined_source.mutation.req.join.offset);
+            try expectOptionalUsize(summary.operations, update_joined_source.mutation.req.operations.len);
+            try expectOptionalUsize(summary.source_assignments, update_joined_source.mutation.req.source_assignments.len);
+            try expectOptionalUsize(summary.patch_expressions, update_joined_source.mutation.req.patch_expressions.len);
+            try expectOptionalUsize(summary.increment_expressions, update_joined_source.mutation.req.increment_expressions.len);
+            try expectOptionalUsize(summary.json_set_expressions, update_joined_source.mutation.req.json_set_expressions.len);
+            try expectOptionalUsize(summary.returning, update_joined_source.mutation.req.returning.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, update_joined_source.mutation.req.returning_all);
+        },
+        .delete_joined_source => |delete_joined_source| {
+            try expectOptionalTableName(summary.table_name, delete_joined_source.target_table_name);
+            try expectCombinedQuerySourceSummary(summary, delete_joined_source.mutation.req.join.left, delete_joined_source.mutation.req.join.right);
+            try expectOptionalUsize(summary.join_on, delete_joined_source.mutation.req.join.on.len);
+            try expectOptionalUsize(summary.order_by, delete_joined_source.mutation.req.join.order_by.len);
+            try expectOptionalU32(summary.limit, delete_joined_source.mutation.req.join.limit);
+            try expectOptionalU32(summary.offset, delete_joined_source.mutation.req.join.offset);
+            try expectOptionalUsize(summary.returning, delete_joined_source.mutation.req.returning.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, delete_joined_source.mutation.req.returning_all);
+        },
+        .merge_mutation => |merge_mutation| {
+            try expectOptionalTableName(summary.table_name, merge_mutation.target_table_name);
+            try expectOptionalUsize(summary.join_on, merge_mutation.match_fields.len);
+            try expectOptionalUsize(summary.matched_predicates, mergeMatchedPredicateCount(merge_mutation.matched_arms));
+            try expectOptionalUsize(summary.operations, mergeMatchedUpdateCount(merge_mutation.matched_arms));
+            if (summary.matched_delete) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDelete(merge_mutation.matched_arms));
+            if (summary.matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDoNothing(merge_mutation.matched_arms));
+            try expectOptionalUsize(summary.not_matched_predicates, mergeNotMatchedPredicateCount(merge_mutation.not_matched_arms));
+            try expectOptionalUsize(summary.select, mergeNotMatchedInsertCount(merge_mutation.not_matched_arms));
+            if (summary.not_matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeNotMatchedHasDoNothing(merge_mutation.not_matched_arms));
+            try expectOptionalUsize(summary.returning, merge_mutation.returning.fields.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, merge_mutation.returning.returnsAll());
+        },
+    }
+}
+
+fn expectAppParityExplainSummary(summary: AppParityPlanSummary, lowered: LoweredExplainPlan) !void {
+    switch (lowered.subject) {
+        .read => |read| try expectAppParityReadSummary(summary, read),
+        .write => |write| try expectAppParityWriteSummary(summary, write),
+    }
+}
+
 fn appParityPlanFamilyIsSupportedRead(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .query,
@@ -61295,6 +61401,7 @@ fn expectAppParityCorpusEntry(
                 row_claim,
             );
             defer lowered.deinit(alloc);
+            try expectAppParityExplainSummary(entry.summary, lowered);
             const fingerprint = try explainPlanFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
@@ -62286,6 +62393,7 @@ fn appParityFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) bo
         .join,
         .lateral,
         .window,
+        .explain,
         .relation_population,
         .insert,
         .insert_source,
@@ -62311,6 +62419,7 @@ fn appParityFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool {
         .join,
         .lateral,
         .window,
+        .explain,
         .relation_population,
         .insert,
         .insert_source,
@@ -62713,14 +62822,6 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "client_encoding" },
         .classification_reason = "session_setting",
         .plan = "adapter_noop:ddl:reason=session_setting",
-    }, &seen, alloc));
-
-    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
-        .name = "explain summary without assertion path",
-        .sql = "EXPLAIN SELECT id FROM usage_records WHERE status = 'active'",
-        .family = .explain,
-        .summary = .{ .table_name = "usage_records", .predicates = 1 },
-        .plan = "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -66420,36 +66521,42 @@ test "postgres sql adapter classifies application parity corpus" {
         .{
             .name = "explain read plan",
             .family = .explain,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
             .plan = "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "EXPLAIN SELECT id FROM usage_records WHERE status = 'open'",
         },
         .{
             .name = "explain json verbose read plan",
             .family = .explain,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
             .plan = "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:verbose=1:costs=0",
             .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF) SELECT id FROM usage_records WHERE status = 'open'",
         },
         .{
             .name = "explain insert write plan",
             .family = .explain,
+            .summary = .{ .table_name = "usage_records", .returning = 1 },
             .plan = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
             .sql = "EXPLAIN INSERT INTO usage_records (id, status) VALUES ('u_explain', 'pending') RETURNING id",
         },
         .{
             .name = "explain claimed update write plan",
             .family = .explain,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .returning = 1 },
             .plan = "explain:kind=write:analyze=false:inner=update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
             .sql = "EXPLAIN UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR UPDATE RETURNING id",
         },
         .{
             .name = "explain joined update write plan",
             .family = .explain,
+            .summary = .{ .table_name = "usage_records", .join_on = 1, .returning = 1 },
             .plan = "explain:kind=write:analyze=false:inner=update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
             .sql = "EXPLAIN UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id",
         },
         .{
             .name = "explain analyze read plan",
             .family = .explain,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
             .plan = "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "EXPLAIN ANALYZE SELECT id FROM usage_records WHERE status = 'open'",
         },

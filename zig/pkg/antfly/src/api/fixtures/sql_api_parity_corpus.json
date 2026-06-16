@@ -869,36 +869,65 @@
     {
       "name": "explain read plan",
       "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
       "plan": "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "EXPLAIN SELECT id FROM usage_records WHERE status = 'open'"
     },
     {
       "name": "explain json verbose read plan",
       "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
       "plan": "explain:kind=read:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:format=json:verbose=1:costs=0",
       "sql": "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF) SELECT id FROM usage_records WHERE status = 'open'"
     },
     {
       "name": "explain insert write plan",
       "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "returning": 1
+      },
       "plan": "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
       "sql": "EXPLAIN INSERT INTO usage_records (id, status) VALUES ('u_explain', 'pending') RETURNING id"
     },
     {
       "name": "explain claimed update write plan",
       "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "returning": 1
+      },
       "plan": "explain:kind=write:analyze=false:inner=update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
       "sql": "EXPLAIN UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR UPDATE RETURNING id"
     },
     {
       "name": "explain joined update write plan",
       "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "returning": 1,
+        "join_on": 1
+      },
       "plan": "explain:kind=write:analyze=false:inner=update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
       "sql": "EXPLAIN UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id"
     },
     {
       "name": "explain analyze read plan",
       "family": "explain",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
       "plan": "explain:kind=read:analyze=true:inner=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "EXPLAIN ANALYZE SELECT id FROM usage_records WHERE status = 'open'"
     },
