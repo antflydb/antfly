@@ -814,6 +814,52 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
 }
 
+func TestUpdateHAAdminJobExecutionConditionReportsMissingPromotionReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionPromoteStandby),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminJobName:    "promote-job",
+					AdminJobPhase:   haAdminJobPhaseSucceeded,
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAPromotionReceiptMissing))
+	g.Expect(degraded.Message).To(ContainSubstring("promote-job"))
+	g.Expect(degraded.Message).To(ContainSubstring("former-primary rejoin remains blocked"))
+}
+
 func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 	g := NewWithT(t)
 

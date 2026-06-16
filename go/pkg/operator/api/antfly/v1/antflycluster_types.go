@@ -227,6 +227,9 @@ const (
 	// ReasonHAPromotionAlreadyRecorded indicates automatic failover already recorded a promotion for this identity.
 	ReasonHAPromotionAlreadyRecorded = "HAPromotionAlreadyRecorded"
 
+	// ReasonHAPromotionReceiptMissing indicates a completed promotion lacks the receipt needed for fenced rejoin.
+	ReasonHAPromotionReceiptMissing = "HAPromotionReceiptMissing"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 

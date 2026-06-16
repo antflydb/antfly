@@ -4071,6 +4071,39 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		)
 		return
 	}
+
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil {
+		return
+	}
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind != string(haActionPromoteStandby) ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			action.StandbyName == "" {
+			continue
+		}
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+			continue
+		}
+		if !haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+			continue
+		}
+		if haPromotionReceipt(cluster.Status.HAStatus) != nil {
+			continue
+		}
+		jobName := action.AdminJobName
+		if jobName == "" {
+			jobName = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAPromotionReceiptMissing,
+			fmt.Sprintf("HA promotion action %s succeeded in Job %s, but the operator has not observed a complete promotion receipt with a fence token; former-primary rejoin remains blocked", action.Kind, jobName),
+		)
+		return
+	}
 }
 
 func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
