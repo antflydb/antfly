@@ -3871,7 +3871,11 @@ Claimed mutation-source execution tests pin the shared expression-tree path for
 final-image row writes: SQL `SET` expressions lower to native `patch_expr` and
 `increment_expr` assignments, storage stages those transforms in the claiming
 transaction, and `RETURNING` field plus expression outputs are projected from
-the same final row image that will commit.
+the same final row image that will commit. Joined mutation-source execution
+uses the same invariant for source-derived target expressions: `UPDATE ...
+FROM` assignments lower to typed target `patch_expr` nodes over target/source
+row inputs, claim only the target rows, and project final target rows plus
+source-derived returning expressions from the staged image.
 
 Owner-injected lockable mutation-source ranges are a storage-side planning
 contract, not public request syntax. The planner collects each sorted,

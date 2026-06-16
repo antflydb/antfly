@@ -74000,6 +74000,79 @@ test "postgres sql adapter typed write plans execute through relational storage"
     try db.commitTransaction(joined_update_txn, 3_010);
     joined_update_committed = true;
 
+    const joined_source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"source_rows","enforce_types":true,"document_schemas":{"source_rows":{"schema":{"type":"object","properties":{"source_pk":{"type":"keyword"},"source_status":{"type":"keyword"},"source_quantity":{"type":"numeric"}},"required":["source_pk"],"additionalProperties":false}}},"primary_key":{"columns":["source_pk"]}}
+    ;
+    var parsed_joined_source_schema = try schema_api.parseValidatedTableSchema(alloc, joined_source_schema_json);
+    defer parsed_joined_source_schema.deinit(alloc);
+    const joined_source_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_joined_source_schema);
+    defer runtime_schema.freeSchema(alloc, joined_source_schema);
+
+    const joined_expression_txn = try db.beginTransaction(3_011);
+    var joined_expression_committed = false;
+    defer if (!joined_expression_committed) db.abortTransaction(joined_expression_txn, 3_012) catch {};
+    const joined_expression_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-write-joined-expression-update",
+        .txn_id = joined_expression_txn,
+    };
+    var joined_expression_plan = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(source.source_status) FROM source_records AS source WHERE usage_records.id = source.source_pk FOR UPDATE RETURNING id, status, lower(source.source_status) AS source_status_key",
+        schema,
+        joined_source_schema,
+        &.{},
+        joined_expression_claim,
+    );
+    defer joined_expression_plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), joined_expression_plan.mutation.req.patch_expressions.len);
+    var joined_expression_targets = try db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(
+        alloc,
+        schema,
+        joined_expression_plan.mutation.req,
+        null,
+    );
+    errdefer {
+        for (joined_expression_targets) |*candidate| candidate.deinit(alloc);
+        if (joined_expression_targets.len > 0) alloc.free(joined_expression_targets);
+    }
+    const joined_expression_source_rows = [_][]const u8{
+        "{\"source_pk\":\"t3\",\"source_status\":\"stale\",\"source_quantity\":7}",
+    };
+    var joined_expression_candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(
+        alloc,
+        joined_expression_plan.mutation.req,
+        &joined_expression_targets,
+        joined_expression_source_rows[0..],
+    );
+    errdefer {
+        for (joined_expression_candidates) |*candidate| candidate.deinit(alloc);
+        if (joined_expression_candidates.len > 0) alloc.free(joined_expression_candidates);
+    }
+    var joined_expression_storage_plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(
+        alloc,
+        joined_expression_plan.mutation.req,
+        &joined_expression_candidates,
+    );
+    defer joined_expression_storage_plan.deinit(alloc);
+    var joined_expression_result = try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(
+        alloc,
+        schema,
+        joined_source_schema,
+        joined_expression_plan.mutation.req,
+        joined_expression_storage_plan.matched,
+        joined_expression_storage_plan.candidates,
+    );
+    defer joined_expression_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), joined_expression_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), joined_expression_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), joined_expression_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t3\",\"status\":\"stale\",\"source_status_key\":\"stale\"}", joined_expression_result.returning_rows[0]);
+
+    try db.commitTransaction(joined_expression_txn, 3_020);
+    joined_expression_committed = true;
+
     const joined_delete_txn = try db.beginTransaction(3_101);
     var joined_delete_committed = false;
     defer if (!joined_delete_committed) db.abortTransaction(joined_delete_txn, 3_102) catch {};
@@ -74050,7 +74123,7 @@ test "postgres sql adapter typed write plans execute through relational storage"
     try std.testing.expectEqualStrings("{\"id\":\"s1\",\"status\":\"synced\"}", joined_rows.rows[3]);
     try std.testing.expectEqualStrings("{\"id\":\"s2\",\"status\":\"stale\"}", joined_rows.rows[4]);
     try std.testing.expectEqualStrings("{\"id\":\"t1\",\"status\":\"joined\"}", joined_rows.rows[5]);
-    try std.testing.expectEqualStrings("{\"id\":\"t3\",\"status\":\"ready\"}", joined_rows.rows[6]);
+    try std.testing.expectEqualStrings("{\"id\":\"t3\",\"status\":\"stale\"}", joined_rows.rows[6]);
     try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"queued\"}", joined_rows.rows[7]);
     try std.testing.expectEqualStrings("{\"id\":\"u3_copy\",\"status\":\"QUEUED\"}", joined_rows.rows[8]);
     try std.testing.expectEqualStrings("{\"id\":\"u3_copy_cte_copy\",\"status\":\"QUEUED\"}", joined_rows.rows[9]);
