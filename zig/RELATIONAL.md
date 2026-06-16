@@ -506,6 +506,10 @@ filters such as `string_to_array(scope, ' ') @> ARRAY['write']`, JSON
 containment filters, and declared-array containment filters through
 `aggregateRelationalRowsPlan`, not just SQL lowerer fingerprints. Window
 aggregate filters use the same contract through `windowRelationalRowsPlan`.
+Distinct and ordered aggregate execution is pinned through the same SQL-to-storage
+path: `COUNT(DISTINCT json_expr)`, `array_agg(DISTINCT json_expr)`,
+ordered `array_agg`, and `string_agg(DISTINCT ... ORDER BY ...)` all execute
+against stored rows after lowering to bounded typed aggregate specs.
 Storage-backed SQL read-plan tests also pin partitioned ranking, offset, value,
 and bucket windows: `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`,
 `LAST_VALUE`, `NTH_VALUE`, `PERCENT_RANK`, `CUME_DIST`, and `NTILE` execute

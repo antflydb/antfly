@@ -77526,7 +77526,7 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             .{ .key = "row:c1", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c1\",\"name\":\"Alice\"}" },
             .{ .key = "row:c2", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c2\",\"name\":\"Bob\"}" },
             .{ .key = "row:o1", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\",\"customer_id\":\"c1\",\"status\":\"open\",\"enabled\":true,\"amount\":10,\"scope\":\"read write\",\"tags\":[\"hot\",\"new\"],\"metadata\":{\"source\":\"api\",\"flags\":[\"rated\"]}}" },
-            .{ .key = "row:o2", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o2\",\"customer_id\":\"missing\",\"status\":\"open\",\"enabled\":false,\"amount\":5,\"scope\":\"read\",\"tags\":[\"cold\"],\"metadata\":{\"source\":\"batch\"}}" },
+            .{ .key = "row:o2", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o2\",\"customer_id\":\"missing\",\"status\":\"open\",\"enabled\":false,\"amount\":5,\"scope\":\"read\",\"tags\":[\"cold\"],\"metadata\":{\"source\":\"batch\",\"flags\":[\"manual\"]}}" },
             .{ .key = "row:o3", .value = "{\"kind\":\"order\",\"tenant\":\"t2\",\"id\":\"o3\",\"customer_id\":\"c1\",\"status\":\"open\",\"enabled\":true,\"amount\":7,\"scope\":\"write\",\"tags\":[\"hot\"],\"metadata\":{\"source\":\"api\",\"flags\":[\"rated\"]}}" },
             .{ .key = "row:p1", .value = "{\"kind\":\"pattern\",\"tenant\":\"t1\",\"id\":\"p1\",\"status\":\"op_en\"}" },
             .{ .key = "row:p2", .value = "{\"kind\":\"pattern\",\"tenant\":\"t1\",\"id\":\"p2\",\"status\":\"open\"}" },
@@ -77766,6 +77766,42 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             try std.testing.expectEqual(@as(usize, 2), result.rows.len);
             try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"total_amount\":15,\"order_ids\":\"o1|o2\"}", result.rows[0]);
             try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"total_amount\":7,\"order_ids\":\"o3\"}", result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var distinct_aggregate_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT tenant, COUNT(DISTINCT metadata->>'source') AS source_count, array_agg(DISTINCT metadata->'flags') AS distinct_flags, array_agg(DISTINCT id ORDER BY amount DESC) AS ordered_ids, string_agg(DISTINCT status, '|' ORDER BY amount DESC) AS status_text FROM usage_records WHERE kind = 'order' GROUP BY tenant ORDER BY tenant ASC",
+        schema,
+        &.{},
+    );
+    defer distinct_aggregate_plan.deinit(alloc);
+
+    switch (distinct_aggregate_plan) {
+        .aggregate => |lowered| {
+            try std.testing.expectEqual(@as(usize, 4), lowered.plan.aggregate.aggregations.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.plan.aggregate.aggregations[0].op);
+            try std.testing.expect(lowered.plan.aggregate.aggregations[0].distinct);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.plan.aggregate.aggregations[0].expression.?.kind);
+            try std.testing.expect(lowered.plan.aggregate.aggregations[0].expression.?.json_as_text);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.plan.aggregate.aggregations[1].op);
+            try std.testing.expect(lowered.plan.aggregate.aggregations[1].distinct);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.plan.aggregate.aggregations[1].expression.?.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.plan.aggregate.aggregations[2].op);
+            try std.testing.expect(lowered.plan.aggregate.aggregations[2].distinct);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations[2].array_order_by.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.string_agg, lowered.plan.aggregate.aggregations[3].op);
+            try std.testing.expect(lowered.plan.aggregate.aggregations[3].distinct);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations[3].array_order_by.len);
+
+            var result = try db.aggregateRelationalRowsPlan(alloc, schema, lowered.plan);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"source_count\":2,\"distinct_flags\":[[\"rated\"],[\"manual\"]],\"ordered_ids\":[\"o1\",\"o2\"],\"status_text\":\"open\"}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"source_count\":1,\"distinct_flags\":[[\"rated\"]],\"ordered_ids\":[\"o3\"],\"status_text\":\"open\"}", result.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }
