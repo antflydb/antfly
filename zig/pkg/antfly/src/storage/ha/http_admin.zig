@@ -148,6 +148,8 @@ fn commandErrorStatus(err: anyerror) u16 {
         => 404,
         error.PrometheusUnsupportedForResult,
         error.InvalidSlotName,
+        error.InvalidSlotProgress,
+        error.InvalidReplicationError,
         error.InvalidReplicationStartLsn,
         error.InvalidCheckpointLsn,
         error.InitialLsnAheadOfPrimary,
@@ -300,6 +302,16 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(stream.body, "result=stream_once\n");
     try expectContains(stream.body, "received_count=1\n");
     try expectContains(stream.body, "applied_lsn=1\n");
+
+    var invalid_progress = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"standby\",\"ack\",\"--slot\",\"standby-a\",\"--timeline-id\",\"1\",\"--received-lsn\",\"1\",\"--applied-lsn\",\"2\"]}",
+    });
+    defer invalid_progress.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_progress.status);
+    try expectContains(invalid_progress.body, "InvalidSlotProgress");
 
     try primary.pauseSlot("standby-a");
     var inactive_stream = try server.handle(.{
