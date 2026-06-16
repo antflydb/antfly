@@ -1542,7 +1542,7 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminJobName string `json:"adminJobName,omitempty"`
 
-	// AdminJobPhase summarizes the Kubernetes Job state for AdminCommand.
+	// AdminJobPhase summarizes dependency wait state or the Kubernetes Job state for AdminCommand.
 	// +optional
 	AdminJobPhase string `json:"adminJobPhase,omitempty"`
 

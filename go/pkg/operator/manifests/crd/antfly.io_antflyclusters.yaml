@@ -8741,8 +8741,8 @@ spec:
                             to execute AdminCommand.
                           type: string
                         adminJobPhase:
-                          description: AdminJobPhase summarizes the Kubernetes Job
-                            state for AdminCommand.
+                          description: AdminJobPhase summarizes dependency wait state
+                            or the Kubernetes Job state for AdminCommand.
                           type: string
                         adminURL:
                           description: AdminURL is the HA admin endpoint that should
