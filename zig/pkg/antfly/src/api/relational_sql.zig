@@ -25143,12 +25143,16 @@ const Parser = struct {
         if (self.peekStandaloneSqlBooleanLiteral() != null) return true;
         if (self.defer_row_expression_field_validation and self.peekKind(.identifier) and self.pos + 1 < self.tokens.len) {
             switch (self.tokens[self.pos + 1].kind) {
-                .eq, .neq, .gt, .gte, .lt, .lte => return true,
+                .eq, .neq, .gt, .gte, .lt, .lte => {
+                    if (relationalColumnForField(self.schema, self.tokens[self.pos].text, null) != null) return false;
+                    return true;
+                },
                 else => if (std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "is") or
                     std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "not") or
                     std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "in") or
                     std.ascii.eqlIgnoreCase(self.tokens[self.pos + 1].text, "between"))
                 {
+                    if (relationalColumnForField(self.schema, self.tokens[self.pos].text, null) != null) return false;
                     return true;
                 },
             }
@@ -62749,7 +62753,7 @@ const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.sql, " UNION ") != null and
                 appParityPlanHasNonZeroToken(entry.plan, ":ctes=") and
                 appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":expr_or=") and
+                appParityPlanHasNonZeroToken(entry.plan, ":or=") and
                 appParityPlanHasNonZeroToken(entry.plan, ":order="));
         self.set_operation_numeric_range_disjoint = self.set_operation_numeric_range_disjoint or
             ((entry.family == .query or entry.family == .read) and
@@ -67087,7 +67091,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "chained cte query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .ctes = 2, .predicates = 0, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none:cte1_expr_pred=1",
+            .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2",
         },
         .{
@@ -69101,7 +69105,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "query cte union set operation ordered page",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .ctes = 1, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .plan = "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY",
         },
         .{
@@ -69269,7 +69273,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "read cte union set operation ordered page",
             .family = .read,
             .summary = .{ .table_name = "usage_records", .ctes = 1, .select = 1, .order_by = 1, .limit = 2 },
-            .plan = "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .plan = "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY",
         },
         .{

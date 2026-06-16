@@ -3758,7 +3758,7 @@
         "order_by": 1,
         "limit": 2
       },
-      "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none:cte1_expr_pred=1",
+      "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
       "sql": "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2"
     },
     {
@@ -6769,7 +6769,7 @@
         "order_by": 1,
         "limit": 2
       },
-      "plan": "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+      "plan": "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
       "sql": "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY"
     },
     {
@@ -7016,7 +7016,7 @@
         "order_by": 1,
         "limit": 2
       },
-      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
       "sql": "WITH scoped AS (SELECT id, status FROM usage_records WHERE organization_id = 'org_1') SELECT id FROM scoped WHERE status = 'open' UNION SELECT id FROM scoped WHERE status = 'closed' ORDER BY id ASC FETCH FIRST 2 ROWS ONLY"
     },
     {
