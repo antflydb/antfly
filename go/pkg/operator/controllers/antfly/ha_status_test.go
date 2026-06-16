@@ -673,7 +673,8 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryLSN: 12,
 		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
-			CurrentTarget: "standby-a",
+			CurrentTarget:   "standby-a",
+			FenceGeneration: 4,
 		},
 		Fencing: antflyv1.HAFencingStatus{
 			Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
@@ -783,7 +784,8 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryLSN: 12,
 		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
-			CurrentTarget: "standby-a",
+			CurrentTarget:   "standby-a",
+			FenceGeneration: 4,
 		},
 		Retention: antflyv1.HARetentionStatus{
 			OldestRestartLSN: 8,
@@ -905,6 +907,27 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	}
 
 	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = "standby-a"
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 4
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	route = cluster.Status.HAStatus.PrimaryRoute
+	if !route.Stale ||
+		route.Action != string(haActionUpdatePrimaryRoute) ||
+		route.Reason != "PrimaryRouteFenceGenerationStale" ||
+		route.CurrentTarget != "standby-a" ||
+		route.DesiredTarget != "standby-a" ||
+		route.FenceGeneration != 5 {
+		t.Fatalf("expected route update for stale fence generation, got %#v", route)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionUpdatePrimaryRoute) ||
+		cluster.Status.HAStatus.PlannedActions[0].RouteFrom != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[0].RouteTo != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[0].FenceGeneration != 5 {
+		t.Fatalf("expected route planned action for stale fence generation, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 5
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	route = cluster.Status.HAStatus.PrimaryRoute
@@ -934,7 +957,7 @@ func TestUpdateHAStatusDoesNotReplanRecordedPromotion(t *testing.T) {
 	cluster.Status.HAStatus.PrimaryAdminReachable = false
 	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
 	cluster.Status.HAStatus.Fencing = readyFencingStatus()
-	cluster.Status.HAStatus.PrimaryRoute = antflyv1.HAPrimaryRouteStatus{CurrentTarget: "standby-a"}
+	cluster.Status.HAStatus.PrimaryRoute = antflyv1.HAPrimaryRouteStatus{CurrentTarget: "standby-a", FenceGeneration: 1}
 	cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
 		OldPrimaryID:      "primary-a",
 		PromotedStandbyID: "standby-a",

@@ -3638,6 +3638,13 @@ func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Contex
 		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
 	}
 	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = target
+	if raw := strings.TrimSpace(service.Annotations[haPrimaryRouteFenceGenerationAnnotation]); raw != "" {
+		if fenceGeneration, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = fenceGeneration
+		}
+	} else {
+		cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 0
+	}
 	return nil
 }
 
