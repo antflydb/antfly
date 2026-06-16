@@ -17,6 +17,8 @@ const antfly = @import("antfly-zig");
 
 const ha = antfly.ha;
 
+var test_path_counter: u64 = 0;
+
 const LocalOptions = struct {
     remote_url: ?[]const u8 = null,
     primary_log: ?[]const u8 = null,
@@ -336,8 +338,83 @@ test "ha cmd keeps promotion identity flags in admin command" {
     try std.testing.expectEqualStrings("--cluster-id", parsed.command_args[1]);
 }
 
+test "ha cmd runs local slot command against durable primary state" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "slot-command");
+    defer paths.deinit(alloc);
+
+    try runArgv(alloc, std.testing.io, &.{
+        "--primary-log",    paths.primary_log,
+        "--primary-slots",  paths.primary_slots,
+        "--ha-cluster-id",  "10",
+        "--ha-shard-id",    "20",
+        "--ha-table-id",    "30",
+        "--ha-timeline-id", "1",
+        "--ha-epoch",       "2",
+        "--",               "--table",
+        "slot",             "create",
+        "standby-cli",      "--initial-lsn",
+        "0",
+    });
+
+    var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const slot = primary.slot("standby-cli") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.timeline_id);
+    try std.testing.expectEqual(@as(u64, 0), slot.restart_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+    try std.testing.expect(slot.active);
+}
+
 test "ha cmd compiles" {
     _ = run;
     _ = runFromIterator;
     _ = runArgv;
+}
+
+const TestPaths = struct {
+    primary_log: [:0]u8,
+    primary_slots: [:0]u8,
+
+    fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
+        alloc.free(self.primary_log);
+        alloc.free(self.primary_slots);
+    }
+};
+
+fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
+    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
+    const primary_log = try allocPrintPath(alloc, name, "primary-log", nonce);
+    defer alloc.free(primary_log);
+    const primary_slots = try allocPrintPath(alloc, name, "primary-slots", nonce);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    return .{
+        .primary_log = try alloc.dupeZ(u8, primary_log),
+        .primary_slots = try alloc.dupeZ(u8, primary_slots),
+    };
+}
+
+fn allocPrintPath(alloc: std.mem.Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/ha-cmd-" ++ name ++ "-" ++ part ++ "-{d}-{d}",
+        .{ std.testing.random_seed, nonce },
+    );
+}
+
+fn testIdentity() ha.standby.Identity {
+    return .{
+        .cluster_id = 10,
+        .shard_id = 20,
+        .table_id = 30,
+        .timeline_id = 1,
+        .epoch = 2,
+    };
 }
