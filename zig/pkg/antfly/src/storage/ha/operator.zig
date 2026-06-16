@@ -123,11 +123,19 @@ pub const ActionExecutor = enum {
     controller_action,
 };
 
+pub const FencingPrecondition = struct {
+    authority: FencingAuthority,
+    holder: []const u8,
+    generation: u64,
+    reason: []const u8,
+};
+
 pub const Action = struct {
     kind: ActionKind,
     phase: ActionPhase = .reconcile,
     executor: ActionExecutor = .admin_command,
     depends_on: ?ActionKind = null,
+    fencing_precondition: ?FencingPrecondition = null,
     standby_name: ?[]const u8 = null,
     slot_name: ?[]const u8 = null,
     target_lsn: ?u64 = null,
@@ -381,9 +389,11 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
     });
 
     if (automatic_allowed) {
+        const fence_precondition = automaticFencingPrecondition(observed.fencing) orelse unreachable;
         try actions.append(alloc, .{
             .kind = .acquire_fence,
             .phase = .fence,
+            .fencing_precondition = fence_precondition,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
@@ -392,6 +402,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .kind = .promote_standby,
             .phase = .promote,
             .depends_on = .acquire_fence,
+            .fencing_precondition = fence_precondition,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "AutomaticFailoverReady",
@@ -401,6 +412,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .phase = .route,
             .executor = .controller_action,
             .depends_on = .promote_standby,
+            .fencing_precondition = fence_precondition,
             .standby_name = automatic_standby,
             .target_lsn = observed.primary.current_lsn,
             .reason = "PromotionPlanned",
@@ -410,6 +422,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
                 .kind = .demote_former_primary,
                 .phase = .rejoin,
                 .depends_on = .promote_standby,
+                .fencing_precondition = fence_precondition,
                 .standby_name = current_primary_id,
                 .target_lsn = observed.primary.current_lsn,
                 .reason = "PromotionPlanned",
@@ -669,6 +682,7 @@ fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencin
     if (isDegraded(primary.durability)) return null;
     if (!fencingAuthorityReady(spec.auto_failover, fencing_observed)) return null;
     const fence_holder = fencing_observed.holder orelse return null;
+    _ = fencing_observed.generation orelse return null;
 
     const max_lag = spec.auto_failover.maximum_lag_lsn;
     for (spec.standbys) |standby| {
@@ -691,6 +705,18 @@ fn fencingAuthorityReady(policy: AutoFailoverPolicy, observed: FencingObservatio
     if (policy.fencing_authority == .none) return false;
     if (observed.authority != policy.fencing_authority) return false;
     return observed.ready;
+}
+
+fn automaticFencingPrecondition(observed: FencingObservation) ?FencingPrecondition {
+    if (!observed.ready) return null;
+    const holder = observed.holder orelse return null;
+    const generation = observed.generation orelse return null;
+    return .{
+        .authority = observed.authority,
+        .holder = holder,
+        .generation = generation,
+        .reason = observed.reason,
+    };
 }
 
 fn appendSlotLifecycleCommand(
@@ -753,6 +779,7 @@ fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, fencing_
     if (fencing_observed.authority != .none and fencing_observed.authority != spec.auto_failover.fencing_authority) return "FencingAuthorityMismatch";
     if (!fencing_observed.ready) return "FencingAuthorityNotReady";
     const fence_holder = fencing_observed.holder orelse return "FencingHolderMissing";
+    _ = fencing_observed.generation orelse return "FencingGenerationMissing";
     if (!desiredStandbyNamed(spec, fence_holder)) return "FencingHolderNotDesired";
     if (automaticFailoverSlotReason(spec, primary, fence_holder)) |reason| return reason;
     return "NoEligibleStandby";
@@ -1028,6 +1055,30 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         (condition(wrong_holder, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
 
+    var generation_missing = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer generation_missing.deinit(alloc);
+    try std.testing.expect(!generation_missing.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "FencingGenerationMissing",
+        (condition(generation_missing, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
     var inactive_slots = slots;
     inactive_slots[0].active = false;
     var inactive_primary = primary;
@@ -1199,6 +1250,13 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(@as(?ActionKind, .acquire_fence), safe.actions[1].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[2].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[3].depends_on);
+    for (safe.actions) |action| {
+        const precondition = action.fencing_precondition orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(FencingAuthority.kubernetes_lease, precondition.authority);
+        try std.testing.expectEqualStrings("standby-a", precondition.holder);
+        try std.testing.expectEqual(@as(u64, 7), precondition.generation);
+        try std.testing.expectEqualStrings("LeaseAcquired", precondition.reason);
+    }
     try std.testing.expectEqualStrings("standby-a", safe.actions[2].standby_name.?);
     try std.testing.expectEqualStrings("primary-a", safe.actions[3].standby_name.?);
     try std.testing.expect((try adminCommandForAction(alloc, safe.actions[2], primary.identity, .{})) == null);
@@ -1284,6 +1342,9 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"executor\":\"admin_command\"");
     try expectContains(rendered, "\"executor\":\"controller_action\"");
+    try expectContains(rendered, "\"fencing_precondition\"");
+    try expectContains(rendered, "\"generation\":11");
+    try expectContains(rendered, "\"holder\":\"standby-a\"");
     try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
     try expectContains(rendered, "\"severity\":\"info\"");
     try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
