@@ -1161,8 +1161,8 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
-		if storageAutoGrowEnabled(workingCluster) {
-			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		if requeueAfter := periodicRequeueAfter(workingCluster); requeueAfter > 0 {
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
 		}
 		return ctrl.Result{}, nil
 	}
@@ -1422,15 +1422,35 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// If autoscaling is enabled, requeue for periodic evaluation
-	if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	if storageAutoGrowEnabled(workingCluster) {
-		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	if requeueAfter := periodicRequeueAfter(workingCluster); requeueAfter > 0 {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	var requeueAfter time.Duration
+	if haKubernetesLeaseRenewalEnabled(cluster) {
+		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter())
+	}
+	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
+		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
+	}
+	if storageAutoGrowEnabled(cluster) {
+		requeueAfter = minPositiveDuration(requeueAfter, 60*time.Second)
+	}
+	return requeueAfter
+}
+
+func minPositiveDuration(current time.Duration, candidate time.Duration) time.Duration {
+	if candidate <= 0 {
+		return current
+	}
+	if current <= 0 || candidate < current {
+		return candidate
+	}
+	return current
 }
 
 func (r *AntflyClusterReconciler) reconcileInferencePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {

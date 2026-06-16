@@ -36,6 +36,23 @@ const (
 
 const haFencingLeaseDefaultDurationSeconds int32 = 30
 
+func haFencingLeaseRenewalRequeueAfter() time.Duration {
+	return time.Duration(haFencingLeaseDefaultDurationSeconds) * time.Second / 3
+}
+
+func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	return ha != nil &&
+		ha.Mode != "" &&
+		ha.Mode != antflyv1.HAModeDisabled &&
+		ha.AutomaticFailover != nil &&
+		ha.AutomaticFailover.Enabled &&
+		ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityKubernetesLease
+}
+
 type haPlannedAction struct {
 	Kind             haActionKind
 	StandbyName      string

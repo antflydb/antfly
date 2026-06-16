@@ -1030,6 +1030,24 @@ func TestObserveHAFencingStatusAllowsPromotionWithReadyKubernetesLease(t *testin
 	}
 }
 
+func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+
+	if got, want := periodicRequeueAfter(cluster), 10*time.Second; got != want {
+		t.Fatalf("expected HA lease renewal requeue %s, got %s", want, got)
+	}
+
+	cluster.Spec.DataNodes.AutoScaling = &antflyv1.AutoScalingSpec{Enabled: true}
+	if got, want := periodicRequeueAfter(cluster), 10*time.Second; got != want {
+		t.Fatalf("expected HA lease requeue to win over autoscaling, got %s", got)
+	}
+
+	cluster.Spec.HighAvailability.AutomaticFailover.Enabled = false
+	if got, want := periodicRequeueAfter(cluster), 30*time.Second; got != want {
+		t.Fatalf("expected autoscaling requeue without HA renewal, got %s", got)
+	}
+}
+
 func haCluster() *antflyv1.AntflyCluster {
 	return &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
