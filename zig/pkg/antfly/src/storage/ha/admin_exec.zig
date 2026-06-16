@@ -85,6 +85,7 @@ pub const Result = union(enum) {
     primary_metrics: metrics.PrimaryMetrics,
     standby_metrics: metrics.StandbyMetrics,
     commit_check: commit_gate.GateResult,
+    commit_append: commit_gate.AppendResult,
     read_check: read_gate.Decision,
     promote: admin.FencedPromotionResult,
     rejoin_assess: rejoin.Assessment,
@@ -208,15 +209,11 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .primary_metrics => |snapshot| try appendPrimaryMetricsLines(alloc, &out, snapshot),
         .standby_metrics => |snapshot| try appendStandbyMetricsLines(alloc, &out, snapshot),
         .commit_check => |gate| {
-            try appendU64Line(alloc, &out, "target_lsn", gate.target_lsn);
-            try appendLine(alloc, &out, "action", @tagName(gate.action));
-            try appendLine(alloc, &out, "durability.status", @tagName(gate.decision.status));
-            try appendLine(alloc, &out, "durability.mode", @tagName(gate.decision.mode));
-            try appendLine(alloc, &out, "durability.selection", @tagName(gate.decision.selection));
-            try appendU64Line(alloc, &out, "durability.target_lsn", gate.decision.target_lsn);
-            try appendUsizeLine(alloc, &out, "durability.satisfied_count", gate.decision.satisfied_count);
-            try appendUsizeLine(alloc, &out, "durability.required_count", gate.decision.required_count);
-            try appendUsizeLine(alloc, &out, "durability.candidate_count", gate.decision.candidate_count);
+            try appendCommitGateLines(alloc, &out, gate);
+        },
+        .commit_append => |append_result| {
+            try appendU64Line(alloc, &out, "lsn", append_result.lsn);
+            try appendCommitGateLines(alloc, &out, append_result.gate);
         },
         .read_check => |decision| {
             try appendLine(alloc, &out, "action", @tagName(decision.action));
@@ -306,6 +303,9 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .standby_status => |command| executeStandbyStatus(try requireStandby(ctx), command),
         .commit_check => |command| .{
             .commit_check = try admin.evaluateCommit(try requirePrimary(ctx), command.target_lsn, command.policy),
+        },
+        .commit_append => |command| .{
+            .commit_append = try commit_gate.appendAndEvaluate(try requirePrimary(ctx), command.append, command.policy),
         },
         .read_check => |request| .{
             .read_check = try admin.evaluateStandbyRead(try requireStandby(ctx), request),
@@ -515,6 +515,7 @@ fn resultName(result: Result) []const u8 {
         .primary_metrics => "primary_metrics",
         .standby_metrics => "standby_metrics",
         .commit_check => "commit_check",
+        .commit_append => "commit_append",
         .read_check => "read_check",
         .promote => "promote",
         .rejoin_assess => "rejoin_assess",
@@ -700,6 +701,22 @@ fn appendStandbyMetricsLines(
     try appendU64Line(alloc, out, "unapplied_lsn_count", snapshot.unapplied_lsn_count);
     try appendU64Line(alloc, out, "caught_up_to_received", snapshot.caught_up_to_received);
     try appendU64Line(alloc, out, "can_serve_safe_reads", snapshot.can_serve_safe_reads);
+}
+
+fn appendCommitGateLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    gate: commit_gate.GateResult,
+) !void {
+    try appendU64Line(alloc, out, "target_lsn", gate.target_lsn);
+    try appendLine(alloc, out, "action", @tagName(gate.action));
+    try appendLine(alloc, out, "durability.status", @tagName(gate.decision.status));
+    try appendLine(alloc, out, "durability.mode", @tagName(gate.decision.mode));
+    try appendLine(alloc, out, "durability.selection", @tagName(gate.decision.selection));
+    try appendU64Line(alloc, out, "durability.target_lsn", gate.decision.target_lsn);
+    try appendUsizeLine(alloc, out, "durability.satisfied_count", gate.decision.satisfied_count);
+    try appendUsizeLine(alloc, out, "durability.required_count", gate.decision.required_count);
+    try appendUsizeLine(alloc, out, "durability.candidate_count", gate.decision.candidate_count);
 }
 
 fn appendPromotionAssessmentLines(
@@ -1128,6 +1145,32 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var commit = try execute(alloc, .{ .primary = &primary }, commit_plan);
     defer commit.deinit(alloc);
     try std.testing.expectEqual(commit_gate.Action.acknowledge, commit.commit_check.action);
+
+    var append_plan = try admin_cli.parse(alloc, &.{
+        "--table",
+        "commit",
+        "append",
+        "--payload",
+        "two",
+        "--sync-mode",
+        "remote-apply",
+        "--sync-standby",
+        "standby-a",
+        "--sync-failure",
+        "degrade-to-async",
+    });
+    defer append_plan.deinit(alloc);
+    var appended = try execute(alloc, .{ .primary = &primary }, append_plan);
+    defer appended.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), appended.commit_append.lsn);
+    try std.testing.expectEqual(commit_gate.Action.acknowledge_degraded, appended.commit_append.gate.action);
+    try std.testing.expectEqual(primary_mod.DurabilityStatus.degraded_to_async, appended.commit_append.gate.decision.status);
+
+    const append_table = try renderTableAlloc(alloc, appended);
+    defer alloc.free(append_table);
+    try expectContains(append_table, "result=commit_append\n");
+    try expectContains(append_table, "lsn=2\n");
+    try expectContains(append_table, "action=acknowledge_degraded\n");
 
     var read_plan = try admin_cli.parse(alloc, &.{ "read", "check", "--at-least-lsn", "1" });
     defer read_plan.deinit(alloc);

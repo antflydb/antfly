@@ -197,7 +197,21 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqualStrings("application/json", created.content_type);
     try expectContains(created.body, "\"slot_name\":\"standby-a\"");
 
-    try std.testing.expectEqual(@as(u64, 1), try primary.append(.{ .payload = "one" }));
+    var appended = try client.executeCommand("http://ha-admin.test", &.{
+        "--table",
+        "commit",
+        "append",
+        "--payload",
+        "one",
+        "--sync-mode",
+        "async",
+    });
+    defer appended.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain; charset=utf-8", appended.content_type);
+    try expectContains(appended.body, "result=commit_append\n");
+    try expectContains(appended.body, "lsn=1\n");
+    try expectContains(appended.body, "action=acknowledge\n");
+
     var streamed = try client.executeCommand("http://ha-admin.test", &.{ "--table", "stream", "once", "--slot", "standby-a" });
     defer streamed.deinit(alloc);
     try std.testing.expectEqualStrings("text/plain; charset=utf-8", streamed.content_type);

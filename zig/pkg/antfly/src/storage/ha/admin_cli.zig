@@ -27,6 +27,7 @@ const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
+const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 
@@ -85,6 +86,11 @@ pub const CommitCheckCommand = struct {
     policy: primary_mod.SyncPolicy,
 };
 
+pub const CommitAppendCommand = struct {
+    append: primary_mod.AppendOptions,
+    policy: primary_mod.SyncPolicy,
+};
+
 pub const RejoinAssessCommand = struct {
     former: rejoin.FormerPrimaryState,
     receipt: ?fencing.Receipt = null,
@@ -102,6 +108,7 @@ pub const Command = union(enum) {
     primary_status: PrimaryStatusCommand,
     standby_status: StandbyStatusCommand,
     commit_check: CommitCheckCommand,
+    commit_append: CommitAppendCommand,
     read_check: read_gate.Request,
     promote: admin.FencedPromotionRequest,
     rejoin_assess: RejoinAssessCommand,
@@ -195,7 +202,7 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
         return plan;
     }
     if (std.mem.eql(u8, root, "commit")) {
-        plan.command = .{ .commit_check = try parseCommitCheck(alloc, &cursor, &plan.owned_standby_names) };
+        plan.command = try parseCommit(alloc, &cursor, &plan.owned_standby_names);
         try cursor.expectEnd();
         return plan;
     }
@@ -473,10 +480,18 @@ fn parseStatus(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]const 
     return error.UnknownStatusRole;
 }
 
-fn parseCommitCheck(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]const []const u8) !CommitCheckCommand {
+fn parseCommit(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]const []const u8) !Command {
     const subcommand = cursor.next() orelse return error.CommitSubcommandMissing;
-    if (!std.mem.eql(u8, subcommand, "check")) return error.UnknownCommitSubcommand;
+    if (std.mem.eql(u8, subcommand, "check")) {
+        return .{ .commit_check = try parseCommitCheck(alloc, cursor, owned_standby_names) };
+    }
+    if (std.mem.eql(u8, subcommand, "append")) {
+        return .{ .commit_append = try parseCommitAppend(alloc, cursor, owned_standby_names) };
+    }
+    return error.UnknownCommitSubcommand;
+}
 
+fn parseCommitCheck(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]const []const u8) !CommitCheckCommand {
     var target_lsn: ?u64 = null;
     var sync_builder = SyncPolicyBuilder{};
     defer sync_builder.deinit(alloc);
@@ -494,6 +509,47 @@ fn parseCommitCheck(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]c
     const policy = (try sync_builder.finish(alloc, owned_standby_names)) orelse return error.SyncPolicyMissing;
     return .{
         .target_lsn = target_lsn orelse return error.TargetLsnMissing,
+        .policy = policy,
+    };
+}
+
+fn parseCommitAppend(alloc: Allocator, cursor: *Cursor, owned_standby_names: *[]const []const u8) !CommitAppendCommand {
+    var append = primary_mod.AppendOptions{};
+    var payload_seen = false;
+    var sync_builder = SyncPolicyBuilder{};
+    defer sync_builder.deinit(alloc);
+
+    while (cursor.peek()) |arg| {
+        if (std.mem.eql(u8, arg, "--payload")) {
+            _ = cursor.next();
+            append.payload = try cursor.value("--payload");
+            payload_seen = true;
+        } else if (std.mem.eql(u8, arg, "--kind")) {
+            _ = cursor.next();
+            append.kind = try parseRecordKind(try cursor.value("--kind"));
+        } else if (std.mem.eql(u8, arg, "--payload-codec")) {
+            _ = cursor.next();
+            append.payload_codec = try parsePayloadCodec(try cursor.value("--payload-codec"));
+        } else if (std.mem.eql(u8, arg, "--shard-id")) {
+            _ = cursor.next();
+            append.shard_id = try parseU64(try cursor.value("--shard-id"));
+        } else if (std.mem.eql(u8, arg, "--table-id")) {
+            _ = cursor.next();
+            append.table_id = try parseU64(try cursor.value("--table-id"));
+        } else if (std.mem.eql(u8, arg, "--commit-timestamp-ns")) {
+            _ = cursor.next();
+            append.commit_timestamp_ns = try parseI64(try cursor.value("--commit-timestamp-ns"));
+        } else if (try sync_builder.parseFlag(alloc, cursor, arg)) {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    if (!payload_seen) return error.PayloadMissing;
+    const policy = (try sync_builder.finish(alloc, owned_standby_names)) orelse primary_mod.SyncPolicy{ .mode = .async };
+    return .{
+        .append = append,
         .policy = policy,
     };
 }
@@ -890,8 +946,29 @@ fn parseConsistency(raw: []const u8) !read_gate.Consistency {
     return error.InvalidReadConsistency;
 }
 
+fn parseRecordKind(raw: []const u8) !replication_record.RecordKind {
+    if (std.mem.eql(u8, raw, "batch_mutation") or std.mem.eql(u8, raw, "batch-mutation")) return .batch_mutation;
+    if (std.mem.eql(u8, raw, "metadata_mutation") or std.mem.eql(u8, raw, "metadata-mutation")) return .metadata_mutation;
+    if (std.mem.eql(u8, raw, "derived_effect") or std.mem.eql(u8, raw, "derived-effect")) return .derived_effect;
+    if (std.mem.eql(u8, raw, "checkpoint")) return .checkpoint;
+    if (std.mem.eql(u8, raw, "manifest")) return .manifest;
+    if (std.mem.eql(u8, raw, "truncate")) return .truncate;
+    return error.InvalidRecordKind;
+}
+
+fn parsePayloadCodec(raw: []const u8) !replication_record.PayloadCodec {
+    if (std.mem.eql(u8, raw, "raw")) return .raw;
+    if (std.mem.eql(u8, raw, "json")) return .json;
+    if (std.mem.eql(u8, raw, "binary")) return .binary;
+    return error.InvalidPayloadCodec;
+}
+
 fn parseU64(raw: []const u8) !u64 {
     return std.fmt.parseInt(u64, raw, 10) catch return error.InvalidInteger;
+}
+
+fn parseI64(raw: []const u8) !i64 {
+    return std.fmt.parseInt(i64, raw, 10) catch return error.InvalidInteger;
 }
 
 fn parseUsize(raw: []const u8) !usize {
@@ -1031,6 +1108,24 @@ test "storage.ha admin cli parses stream ack commit and read checks" {
     try std.testing.expectEqual(@as(u64, 9), commit.command.commit_check.target_lsn);
     try std.testing.expectEqual(primary_mod.DurabilityMode.remote_write, commit.command.commit_check.policy.mode);
     try std.testing.expectEqualStrings("standby-a", commit.command.commit_check.policy.standby_names[0]);
+
+    var append = try parse(alloc, &.{
+        "commit",                "append",
+        "--payload",             "{\"id\":\"a\"}",
+        "--payload-codec",       "json",
+        "--kind",                "metadata-mutation",
+        "--commit-timestamp-ns", "123",
+        "--sync-mode",           "remote-apply",
+        "--sync-standby",        "standby-a",
+        "--sync-failure",        "fail-closed",
+    });
+    defer append.deinit(alloc);
+    try std.testing.expectEqual(replication_record.RecordKind.metadata_mutation, append.command.commit_append.append.kind);
+    try std.testing.expectEqual(replication_record.PayloadCodec.json, append.command.commit_append.append.payload_codec);
+    try std.testing.expectEqual(@as(i64, 123), append.command.commit_append.append.commit_timestamp_ns);
+    try std.testing.expectEqual(primary_mod.DurabilityMode.remote_apply, append.command.commit_append.policy.mode);
+    try std.testing.expectEqual(primary_mod.FailurePolicy.fail_closed, append.command.commit_append.policy.failure_policy);
+    try std.testing.expectEqualStrings("standby-a", append.command.commit_append.policy.standby_names[0]);
 
     var read = try parse(alloc, &.{ "read", "check", "--at-least-lsn", "9" });
     defer read.deinit(alloc);
