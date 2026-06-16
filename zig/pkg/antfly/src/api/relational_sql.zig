@@ -62295,6 +62295,9 @@ fn appParityJsonTextIsObject(alloc: std.mem.Allocator, text: []const u8) !bool {
 fn appParitySourceSchemaJsonIsValid(alloc: std.mem.Allocator, text: []const u8) !bool {
     var parsed = schema_api.parseValidatedTableSchema(alloc, text) catch return false;
     defer parsed.deinit(alloc);
+    const schema = schema_api.deriveRuntimeTableSchema(alloc, parsed) catch return false;
+    defer runtime_schema.freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational or schema.primary_key == null) return false;
     return true;
 }
 
@@ -62355,6 +62358,11 @@ fn validateAppParityFixtureMetadata(
     }
     if (entry.source_schema_json.len > 0 and !(try appParitySourceSchemaJsonIsValid(alloc, entry.source_schema_json))) {
         return error.TestUnexpectedResult;
+    }
+    if (entry.source_schema_json.len > 0) {
+        const source_table_name = (appParitySourceTableNameAlloc(alloc, entry) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
+        defer alloc.free(@constCast(source_table_name));
+        if (source_table_name.len == 0) return error.TestUnexpectedResult;
     }
     if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
         return error.TestUnexpectedResult;
@@ -62550,6 +62558,28 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records" },
         .plan = "join:left=usage_records:right=archived_records:on=1",
         .source_schema_json = "{\"fields\":",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "source schema without primary key",
+        .sql = "SELECT usage_records.id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "join:left=usage_records:right=archived_records:on=1",
+        .source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+        ,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "source schema without source table",
+        .sql = "SELECT id FROM usage_records",
+        .family = .join,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "join:left=usage_records:right=archived_records:on=1",
+        .source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
