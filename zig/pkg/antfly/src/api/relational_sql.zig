@@ -61891,7 +61891,8 @@ const AppParityCorpusCoverage = struct {
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
     unsupported_ddl_materialized_view_replace: bool = false,
-    ddl_temporal_fk_delete_action: bool = false,
+    ddl_temporal_fk_delete_set_null_action: bool = false,
+    ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_write: bool = false,
     unsupported_insert: bool = false,
@@ -62929,9 +62930,12 @@ const AppParityCorpusCoverage = struct {
                 .create_table => {
                     self.ddl_create_table = true;
                     self.ddl_temporal_table = self.ddl_temporal_table or std.mem.indexOf(u8, entry.plan, ":periods=") != null;
-                    self.ddl_temporal_fk_delete_action = self.ddl_temporal_fk_delete_action or
+                    self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
                         (std.mem.indexOf(u8, entry.plan, ":temporal_fk=1") != null and
-                            std.mem.indexOf(u8, entry.sql, " ON DELETE ") != null);
+                            std.mem.indexOf(u8, entry.sql, " ON DELETE SET NULL") != null);
+                    self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
+                        (std.mem.indexOf(u8, entry.plan, ":temporal_fk=1") != null and
+                            std.mem.indexOf(u8, entry.sql, " ON DELETE CASCADE") != null);
                     self.ddl_replace_table = self.ddl_replace_table or std.mem.indexOf(u8, entry.plan, ":replace=true") != null;
                 },
                 .table_clone => self.ddl_table_clone = true,
@@ -63777,7 +63781,8 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_set_operation_union);
         try std.testing.expect(self.unsupported_read_set_operation_intersect);
         try std.testing.expect(self.unsupported_read_set_operation_except);
-        try std.testing.expect(self.ddl_temporal_fk_delete_action);
+        try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
+        try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
         try std.testing.expect(self.read_row_lock_nowait);
         try std.testing.expect(self.unsupported_read_row_lock_share);
@@ -64387,6 +64392,28 @@ test "postgres sql adapter classifies application parity corpus" {
             \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
             \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
             \\    ON DELETE CASCADE
+            \\);
+            ,
+        },
+        .{
+            .name = "schema temporal foreign key set-null delete action",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_set_null_delete", .select = 5 },
+            .plan = "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+            .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql =
+            \\CREATE TABLE price_adjustments_set_null_delete (
+            \\  tenant_id text,
+            \\  sku text,
+            \\  adjustment_id text NOT NULL,
+            \\  valid_from timestamptz NOT NULL,
+            \\  valid_to timestamptz NOT NULL,
+            \\  PERIOD FOR valid_time (valid_from, valid_to),
+            \\  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),
+            \\  CONSTRAINT price_adjustments_price_fkey
+            \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
+            \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
+            \\    ON DELETE SET NULL
             \\);
             ,
         },

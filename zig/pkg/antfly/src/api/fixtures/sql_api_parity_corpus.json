@@ -152,6 +152,18 @@
       "sql": "CREATE TABLE price_adjustments_cascade (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE CASCADE\n);"
     },
     {
+      "name": "schema temporal foreign key set-null delete action",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_table",
+        "table_name": "price_adjustments_set_null_delete",
+        "select": 5
+      },
+      "plan": "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+      "sql": "CREATE TABLE price_adjustments_set_null_delete (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE SET NULL\n);"
+    },
+    {
       "name": "unsupported temporal foreign key set-null update action",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=temporal_fk_action",

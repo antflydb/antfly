@@ -6066,6 +6066,13 @@ test "relational schema parses application-time temporal constraints" {
     );
     defer parsed_delete_cascade.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_delete_cascade.foreign_keys[0].on_delete);
+
+    var parsed_delete_set_null = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"adjustment_id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["adjustment_id","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["adjustment_id"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_delete":"set_null"}]}
+    );
+    defer parsed_delete_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_delete_set_null.foreign_keys[0].on_delete);
+
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         parseSchema(std.testing.allocator,
