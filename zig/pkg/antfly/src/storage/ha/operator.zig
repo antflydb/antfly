@@ -74,6 +74,7 @@ pub const Spec = struct {
 pub const ConditionType = enum {
     available,
     degraded,
+    unhealthy,
     retention_pressure,
     reseed_required,
     automatic_failover_ready,
@@ -175,6 +176,7 @@ pub const Plan = struct {
     automatic_promotion_allowed: bool,
     desired_standby_count: usize,
     healthy_standby_count: usize,
+    unhealthy_standby_count: usize,
     reseed_required_count: usize,
 
     pub fn deinit(self: *Plan, alloc: Allocator) void {
@@ -190,6 +192,7 @@ pub const PlanDocument = struct {
     fencing: FencingObservation,
     desired_standby_count: usize,
     healthy_standby_count: usize,
+    unhealthy_standby_count: usize,
     reseed_required_count: usize,
     actions: []const Action,
     conditions: []const Condition,
@@ -202,6 +205,7 @@ pub fn planDocument(plan: Plan) PlanDocument {
         .fencing = plan.fencing,
         .desired_standby_count = plan.desired_standby_count,
         .healthy_standby_count = plan.healthy_standby_count,
+        .unhealthy_standby_count = plan.unhealthy_standby_count,
         .reseed_required_count = plan.reseed_required_count,
         .actions = plan.actions,
         .conditions = plan.conditions,
@@ -234,12 +238,16 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .automatic_promotion_allowed = false,
             .desired_standby_count = 0,
             .healthy_standby_count = 0,
+            .unhealthy_standby_count = 0,
             .reseed_required_count = 0,
         };
     }
 
     var desired_count: usize = 0;
     var healthy_count: usize = 0;
+    var unhealthy_count: usize = 0;
+    var inactive_count: usize = 0;
+    var replication_error_count: usize = 0;
     var reseed_count: usize = 0;
 
     for (spec.standbys) |standby| {
@@ -274,7 +282,14 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             continue;
         };
 
+        var slot_unhealthy = false;
+        if (slot.last_error != null) {
+            replication_error_count += 1;
+            slot_unhealthy = true;
+        }
         if (!slot.active and !slot.reseed_required) {
+            inactive_count += 1;
+            slot_unhealthy = true;
             try actions.append(alloc, .{
                 .kind = .resume_slot,
                 .standby_name = standby.name,
@@ -282,6 +297,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
                 .reason = "SlotInactive",
             });
         }
+        if (slot_unhealthy) unhealthy_count += 1;
 
         if (slot.reseed_required or slot.status == .reseed_required) {
             reseed_count += 1;
@@ -316,6 +332,18 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         .severity = if (degraded) .critical else .info,
         .reason = if (degraded) "SyncPolicyUnsatisfied" else "SyncPolicySatisfied",
         .message = if (degraded) "Synchronous HA policy is not currently satisfied" else "Synchronous HA policy is satisfied or not configured",
+    });
+    try conditions.append(alloc, .{
+        .type = .unhealthy,
+        .status = unhealthy_count > 0,
+        .severity = if (replication_error_count > 0) .critical else if (unhealthy_count > 0) .warning else .info,
+        .reason = unhealthyConditionReason(replication_error_count, inactive_count),
+        .message = if (replication_error_count > 0)
+            "One or more desired standbys have a recorded replication or apply error"
+        else if (inactive_count > 0)
+            "One or more desired standby slots are inactive"
+        else
+            "No desired standby has a recorded unhealthy replication state",
     });
     try conditions.append(alloc, .{
         .type = .retention_pressure,
@@ -389,6 +417,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         .automatic_promotion_allowed = automatic_allowed,
         .desired_standby_count = desired_count,
         .healthy_standby_count = healthy_count,
+        .unhealthy_standby_count = unhealthy_count,
         .reseed_required_count = reseed_count,
     };
 }
@@ -607,6 +636,12 @@ fn isDegraded(durability: ?primary_mod.DurabilityDecision) bool {
     return decision.status != .satisfied;
 }
 
+fn unhealthyConditionReason(replication_error_count: usize, inactive_count: usize) []const u8 {
+    if (replication_error_count > 0) return "StandbyReplicationError";
+    if (inactive_count > 0) return "StandbyInactive";
+    return "NoUnhealthyStandby";
+}
+
 fn automaticPromotionAllowed(spec: Spec, primary: status.PrimarySnapshot, fencing_observed: FencingObservation) bool {
     return automaticPromotionStandby(spec, primary, fencing_observed) != null;
 }
@@ -625,6 +660,7 @@ fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencin
         const slot = findSlot(primary.slots, standby.name) orelse continue;
         if (!slot.active or slot.reseed_required) continue;
         if (slot.status == .reseed_required) continue;
+        if (slot.last_error != null) continue;
         if (exceedsLagPolicy(slot.received_lsn, primary.current_lsn, max_lag)) continue;
         if (spec.auto_failover.require_remote_apply) {
             if (exceedsLagPolicy(slot.applied_lsn, primary.current_lsn, max_lag)) continue;
@@ -709,6 +745,7 @@ fn automaticFailoverSlotReason(spec: Spec, primary: status.PrimarySnapshot, stan
     const slot = findSlot(primary.slots, standby_name) orelse return "StandbySlotMissing";
     if (!slot.active) return "StandbySlotInactive";
     if (slot.reseed_required or slot.status == .reseed_required) return "StandbyRequiresReseed";
+    if (slot.last_error != null) return "StandbyReplicationError";
     const max_lag = spec.auto_failover.maximum_lag_lsn;
     if (exceedsLagPolicy(slot.received_lsn, primary.current_lsn, max_lag)) return "StandbyReceiveLagExceedsPolicy";
     if (spec.auto_failover.require_remote_apply and
@@ -789,6 +826,7 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
             .apply_lag_lsn = 9,
             .retention_lag_lsn = 9,
             .status = .reseed_required,
+            .last_error = "IntentionalApplyFailure",
         },
     };
     const primary = status.PrimarySnapshot{
@@ -829,6 +867,7 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
     defer plan.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), plan.reseed_required_count);
+    try std.testing.expectEqual(@as(usize, 1), plan.unhealthy_standby_count);
     try std.testing.expectEqual(ActionKind.mark_reseed, plan.actions[0].kind);
     const retention_pressure = condition(plan, .retention_pressure) orelse return error.TestExpectedEqual;
     try std.testing.expect(retention_pressure.status);
@@ -836,6 +875,10 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
     const degraded_condition = condition(plan, .degraded) orelse return error.TestExpectedEqual;
     try std.testing.expect(degraded_condition.status);
     try std.testing.expectEqual(ConditionSeverity.critical, degraded_condition.severity);
+    const unhealthy_condition = condition(plan, .unhealthy) orelse return error.TestExpectedEqual;
+    try std.testing.expect(unhealthy_condition.status);
+    try std.testing.expectEqual(ConditionSeverity.critical, unhealthy_condition.severity);
+    try std.testing.expectEqualStrings("StandbyReplicationError", unhealthy_condition.reason);
     const reseed_condition = condition(plan, .reseed_required) orelse return error.TestExpectedEqual;
     try std.testing.expect(reseed_condition.status);
     try std.testing.expectEqual(ConditionSeverity.warning, reseed_condition.severity);
@@ -997,6 +1040,42 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         "StandbySlotInactive",
         (condition(inactive, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
+    const inactive_unhealthy = condition(inactive, .unhealthy) orelse return error.TestExpectedEqual;
+    try std.testing.expect(inactive_unhealthy.status);
+    try std.testing.expectEqual(ConditionSeverity.warning, inactive_unhealthy.severity);
+    try std.testing.expectEqualStrings("StandbyInactive", inactive_unhealthy.reason);
+
+    var error_slots = slots;
+    error_slots[0].last_error = "IntentionalApplyFailure";
+    var error_primary = primary;
+    error_primary.slots = error_slots[0..];
+    var replication_error = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = error_primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer replication_error.deinit(alloc);
+    try std.testing.expect(!replication_error.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "StandbyReplicationError",
+        (condition(replication_error, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+    const replication_unhealthy = condition(replication_error, .unhealthy) orelse return error.TestExpectedEqual;
+    try std.testing.expect(replication_unhealthy.status);
+    try std.testing.expectEqual(ConditionSeverity.critical, replication_unhealthy.severity);
 
     var receive_lag_slots = slots;
     receive_lag_slots[0].received_lsn = 11;
@@ -1172,6 +1251,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"ready\":true");
     try expectContains(rendered, "\"desired_standby_count\":1");
     try expectContains(rendered, "\"healthy_standby_count\":1");
+    try expectContains(rendered, "\"unhealthy_standby_count\":0");
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"phase\":\"fence\"");
     try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
