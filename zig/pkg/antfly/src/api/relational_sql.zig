@@ -77886,6 +77886,43 @@ test "postgres sql adapter typed read plans execute through relational storage" 
         else => return error.TestUnexpectedResult,
     }
 
+    var advanced_window_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT tenant, id, RANK() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS amount_rank, DENSE_RANK() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS dense_amount_rank, LAG(amount, 1, 0) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS prev_amount, LEAD(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS next_amount, FIRST_VALUE(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS first_amount, LAST_VALUE(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amount, NTH_VALUE(amount, 2) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second_amount, PERCENT_RANK() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS percent_rank, CUME_DIST() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS cume_dist, NTILE(2) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS amount_bucket FROM usage_records WHERE kind = 'order' ORDER BY tenant ASC, id ASC",
+        schema,
+        &.{},
+    );
+    defer advanced_window_plan.deinit(alloc);
+
+    switch (advanced_window_plan) {
+        .window => |lowered| {
+            try std.testing.expectEqual(@as(usize, 10), lowered.plan.window.windows.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.rank, lowered.plan.window.windows[0].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.dense_rank, lowered.plan.window.windows[1].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.lag, lowered.plan.window.windows[2].function);
+            try std.testing.expectEqualStrings("0", lowered.plan.window.windows[2].default_json);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.lead, lowered.plan.window.windows[3].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.first_value, lowered.plan.window.windows[4].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.last_value, lowered.plan.window.windows[5].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.nth_value, lowered.plan.window.windows[6].function);
+            try std.testing.expectEqual(@as(u32, 2), lowered.plan.window.windows[6].offset);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.percent_rank, lowered.plan.window.windows[7].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.cume_dist, lowered.plan.window.windows[8].function);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.ntile, lowered.plan.window.windows[9].function);
+            try std.testing.expectEqual(@as(u32, 2), lowered.plan.window.windows[9].offset);
+
+            var result = try db.windowRelationalRowsPlan(alloc, schema, lowered.plan);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 3), result.total_rows);
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o1\",\"amount_rank\":1,\"dense_amount_rank\":1,\"prev_amount\":0,\"next_amount\":5,\"first_amount\":10,\"last_amount\":5,\"second_amount\":5,\"percent_rank\":0,\"cume_dist\":0.5,\"amount_bucket\":1}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"id\":\"o2\",\"amount_rank\":2,\"dense_amount_rank\":2,\"prev_amount\":10,\"next_amount\":null,\"first_amount\":10,\"last_amount\":5,\"second_amount\":5,\"percent_rank\":1,\"cume_dist\":1,\"amount_bucket\":2}", result.rows[1]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"id\":\"o3\",\"amount_rank\":1,\"dense_amount_rank\":1,\"prev_amount\":0,\"next_amount\":null,\"first_amount\":7,\"last_amount\":7,\"second_amount\":null,\"percent_rank\":0,\"cume_dist\":1,\"amount_bucket\":1}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var filtered_window_plan = try lowerReadPlanAlloc(
         alloc,
         "SELECT tenant, id, COUNT(*) FILTER (WHERE string_to_array(scope, ' ') @> ARRAY['write']) OVER (PARTITION BY tenant) AS writable_orders, SUM(amount) FILTER (WHERE lower(status) = 'open') OVER (PARTITION BY tenant) AS open_amount, COUNT(*) FILTER (WHERE metadata @> '{\"source\":\"api\"}'::jsonb) OVER (PARTITION BY tenant) AS api_orders, COUNT(*) FILTER (WHERE tags @> ARRAY['hot']) OVER (PARTITION BY tenant) AS hot_orders FROM usage_records WHERE kind = 'order' ORDER BY id ASC",

@@ -505,10 +505,14 @@ expression filters such as `lower(status) = 'open'`, computed-array containment
 filters such as `string_to_array(scope, ' ') @> ARRAY['write']`, JSON
 containment filters, and declared-array containment filters through
 `aggregateRelationalRowsPlan`, not just SQL lowerer fingerprints. Window
-aggregate filters use the same contract through `windowRelationalRowsPlan`, so
-partitioned window `COUNT`, `SUM`, `BOOL_OR`, and `BOOL_AND` filters over
+aggregate filters use the same contract through `windowRelationalRowsPlan`.
+Storage-backed SQL read-plan tests also pin partitioned ranking, offset, value,
+and bucket windows: `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`,
+`LAST_VALUE`, `NTH_VALUE`, `PERCENT_RANK`, `CUME_DIST`, and `NTILE` execute
+against stored rows after PostgreSQL syntax lowers to the typed window plan.
+Partitioned window `COUNT`, `SUM`, `BOOL_OR`, and `BOOL_AND` filters over
 expressions, computed-array containment, JSON containment, and declared-array
-containment are verified against stored rows. Joined mutation-source
+containment are verified the same way. Joined mutation-source
 `patch_expr` assignments use the same source-aware expression nodes, so a
 source-row field and a target-row field can participate in one typed arithmetic
 assignment without adapter-private evaluation. PostgreSQL row-list mutation
