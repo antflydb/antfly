@@ -29,6 +29,7 @@ pub const read_gate = @import("read_gate.zig");
 pub const admin = @import("admin.zig");
 pub const operator = @import("operator.zig");
 pub const chaos = @import("chaos.zig");
+pub const metrics = @import("metrics.zig");
 
 test {
     _ = replication_record;
@@ -48,4 +49,5 @@ test {
     _ = admin;
     _ = operator;
     _ = chaos;
+    _ = metrics;
 }
