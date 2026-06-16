@@ -3706,6 +3706,16 @@
       "sql": "SELECT SUM(octet_length(status)) AS status_bytes, SUM(bit_length(status)) AS status_bits FROM usage_records"
     },
     {
+      "name": "aggregate regexp input expressions",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "aggregations": 3
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=3:agg_expr=3:filter_expr=0:having=0:order=0:limit=-1",
+      "sql": "SELECT SUM(regexp_count(status, '[0-9]+')) AS status_digit_groups, SUM(regexp_instr(status, '[A-Z]+')) AS status_letter_offsets, COUNT(DISTINCT regexp_substr(status, '[A-Z]+')) AS status_token_count FROM usage_records"
+    },
+    {
       "name": "distinct grouped projection",
       "family": "aggregate",
       "summary": {
