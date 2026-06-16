@@ -262,6 +262,21 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 		"--manifest-id",
 		"base-standby-a-5",
 	}))
+
+	seedJob.Status.Conditions = []batchv1.JobCondition{{
+		Type:   batchv1.JobFailed,
+		Status: corev1.ConditionTrue,
+	}}
+	g.Expect(reconciler.Status().Update(context.Background(), seedJob)).To(Succeed())
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal("HAAdminJobFailed"))
+	g.Expect(degraded.Message).To(ContainSubstring(seedJob.Name))
 }
 
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false

@@ -3058,6 +3058,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 			return err
 		}
+		r.updateHAAdminJobExecutionCondition(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -3128,6 +3129,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
 		return err
 	}
+	r.updateHAAdminJobExecutionCondition(cluster)
 
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
@@ -3170,6 +3172,29 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 	}
 	return nil
+}
+
+func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
+	if cluster.Status.HAStatus == nil {
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhaseFailed {
+			continue
+		}
+		jobName := action.AdminJobName
+		if jobName == "" {
+			jobName = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			"HAAdminJobFailed",
+			fmt.Sprintf("HA admin action %s failed in Job %s", action.Kind, jobName),
+		)
+		return
+	}
 }
 
 func buildHAAdminJob(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
