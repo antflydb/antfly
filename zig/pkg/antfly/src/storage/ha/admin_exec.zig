@@ -240,11 +240,14 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendLine(alloc, &out, "action", @tagName(decision.action));
             try appendLine(alloc, &out, "consistency", @tagName(decision.consistency));
             try appendOptionalU64Line(alloc, &out, "required_lsn", decision.required_lsn);
+            try appendOptionalU64Line(alloc, &out, "required_metadata_lsn", decision.required_metadata_lsn);
             try appendU64Line(alloc, &out, "received_lsn", decision.received_lsn);
             try appendU64Line(alloc, &out, "applied_lsn", decision.applied_lsn);
             try appendU64Line(alloc, &out, "safe_read_lsn", decision.safe_read_lsn);
+            try appendOptionalU64Line(alloc, &out, "metadata_applied_lsn", decision.metadata_applied_lsn);
             try appendOptionalU64Line(alloc, &out, "serve_lsn", decision.serve_lsn);
             try appendU64Line(alloc, &out, "missing_lsn_count", decision.missing_lsn_count);
+            try appendU64Line(alloc, &out, "metadata_missing_lsn_count", decision.metadata_missing_lsn_count);
         },
         .write_check => |decision| try appendWriteGateLines(alloc, &out, decision),
         .owner_job_check => |decision| try appendOwnerJobGateLines(alloc, &out, decision),
@@ -1568,6 +1571,27 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var read = try execute(alloc, .{ .standby = &standby }, read_plan);
     defer read.deinit(alloc);
     try std.testing.expectEqual(read_gate.Action.serve_standby, read.read_check.action);
+
+    var metadata_read_plan = try admin_cli.parse(alloc, &.{
+        "--table",
+        "read",
+        "check",
+        "--at-least-lsn",
+        "1",
+        "--metadata-applied-lsn",
+        "0",
+    });
+    defer metadata_read_plan.deinit(alloc);
+    var metadata_read = try execute(alloc, .{ .standby = &standby }, metadata_read_plan);
+    defer metadata_read.deinit(alloc);
+    try std.testing.expectEqual(read_gate.Action.wait_for_metadata, metadata_read.read_check.action);
+    try std.testing.expectEqual(@as(u64, 1), metadata_read.read_check.metadata_missing_lsn_count);
+    const metadata_read_table = try renderTableAlloc(alloc, metadata_read);
+    defer alloc.free(metadata_read_table);
+    try expectContains(metadata_read_table, "result=read_check\n");
+    try expectContains(metadata_read_table, "action=wait_for_metadata\n");
+    try expectContains(metadata_read_table, "metadata_applied_lsn=0\n");
+    try expectContains(metadata_read_table, "metadata_missing_lsn_count=1\n");
 
     var primary_write_plan = try admin_cli.parse(alloc, &.{ "--table", "write", "check", "--role", "primary" });
     defer primary_write_plan.deinit(alloc);

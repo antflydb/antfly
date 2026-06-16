@@ -629,6 +629,12 @@ fn parseReadCheck(cursor: *Cursor) !read_gate.Request {
             _ = cursor.next();
             request.required_lsn = try parseU64(try cursor.value(arg));
             if (std.mem.eql(u8, arg, "--at-least-lsn")) request.consistency = .at_least_lsn;
+        } else if (std.mem.eql(u8, arg, "--required-metadata-lsn")) {
+            _ = cursor.next();
+            request.required_metadata_lsn = try parseU64(try cursor.value("--required-metadata-lsn"));
+        } else if (std.mem.eql(u8, arg, "--metadata-applied-lsn")) {
+            _ = cursor.next();
+            request.metadata_applied_lsn = try parseU64(try cursor.value("--metadata-applied-lsn"));
         } else {
             break;
         }
@@ -1595,10 +1601,21 @@ test "storage.ha admin cli parses stream ack commit and read checks" {
     try std.testing.expectEqual(primary_mod.FailurePolicy.fail_closed, append.command.commit_append.policy.failure_policy);
     try std.testing.expectEqualStrings("standby-a", append.command.commit_append.policy.standby_names[0]);
 
-    var read = try parse(alloc, &.{ "read", "check", "--at-least-lsn", "9" });
+    var read = try parse(alloc, &.{
+        "read",
+        "check",
+        "--at-least-lsn",
+        "9",
+        "--required-metadata-lsn",
+        "7",
+        "--metadata-applied-lsn",
+        "6",
+    });
     defer read.deinit(alloc);
     try std.testing.expectEqual(read_gate.Consistency.at_least_lsn, read.command.read_check.consistency);
     try std.testing.expectEqual(@as(?u64, 9), read.command.read_check.required_lsn);
+    try std.testing.expectEqual(@as(?u64, 7), read.command.read_check.required_metadata_lsn);
+    try std.testing.expectEqual(@as(?u64, 6), read.command.read_check.metadata_applied_lsn);
 
     var write = try parse(alloc, &.{ "write", "check", "--role", "standby" });
     defer write.deinit(alloc);
