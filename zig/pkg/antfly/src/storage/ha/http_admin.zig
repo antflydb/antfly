@@ -156,6 +156,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.InvalidSlotProgress,
         error.InvalidReplicationError,
         error.InvalidReplicationStartLsn,
+        error.ReplicationStartAheadOfPrimary,
         error.InvalidCheckpointLsn,
         error.InvalidBackupLsn,
         error.InvalidManifestId,

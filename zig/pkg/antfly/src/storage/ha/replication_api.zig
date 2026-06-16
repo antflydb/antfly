@@ -434,9 +434,24 @@ test "storage.ha replication api starts replication with record and byte batchin
         try std.testing.expect(tail.end_of_wal);
     }
 
+    {
+        var poll = try startReplication(alloc, &primary, .{
+            .slot_name = "standby-a",
+            .from_lsn = primary.nextLsn(),
+        });
+        defer poll.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), poll.records.len);
+        try std.testing.expectEqual(primary.nextLsn(), poll.next_lsn);
+        try std.testing.expect(poll.end_of_wal);
+    }
+
     try std.testing.expectError(error.InvalidReplicationStartLsn, startReplication(alloc, &primary, .{
         .slot_name = "standby-a",
         .from_lsn = 0,
+    }));
+    try std.testing.expectError(error.ReplicationStartAheadOfPrimary, startReplication(alloc, &primary, .{
+        .slot_name = "standby-a",
+        .from_lsn = primary.nextLsn() + 1,
     }));
 }
 

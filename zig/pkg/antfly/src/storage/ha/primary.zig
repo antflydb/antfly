@@ -239,6 +239,7 @@ pub const Primary = struct {
         if (state.reseed_required) return error.SlotRequiresReseed;
         if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
         if (from_lsn < state.restart_lsn) return error.WalNoLongerRetained;
+        if (from_lsn > self.nextLsn()) return error.ReplicationStartAheadOfPrimary;
         return try self.log.iterateFrom(alloc, from_lsn);
     }
 
@@ -990,6 +991,27 @@ test "storage.ha primary refuses streaming from reseed or expired slots" {
 
     try primary.slots.markReseedRequired("standby-a");
     try std.testing.expectError(error.SlotRequiresReseed, primary.streamFrom(alloc, "standby-a", 2));
+}
+
+test "storage.ha primary rejects replication start beyond next lsn" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "stream-ahead");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+
+    const tail = try primary.streamFrom(alloc, "standby-a", primary.nextLsn());
+    defer replication_log.freeEntries(alloc, tail);
+    try std.testing.expectEqual(@as(usize, 0), tail.len);
+
+    try std.testing.expectError(
+        error.ReplicationStartAheadOfPrimary,
+        primary.streamFrom(alloc, "standby-a", primary.nextLsn() + 1),
+    );
 }
 
 test "storage.ha primary scopes retention to the current timeline" {
