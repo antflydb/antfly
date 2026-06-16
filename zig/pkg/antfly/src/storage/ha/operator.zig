@@ -625,9 +625,9 @@ fn automaticPromotionStandby(spec: Spec, primary: status.PrimarySnapshot, fencin
         const slot = findSlot(primary.slots, standby.name) orelse continue;
         if (!slot.active or slot.reseed_required) continue;
         if (slot.status == .reseed_required) continue;
-        if (slot.received_lsn + max_lag < primary.current_lsn) continue;
+        if (exceedsLagPolicy(slot.received_lsn, primary.current_lsn, max_lag)) continue;
         if (spec.auto_failover.require_remote_apply) {
-            if (slot.applied_lsn + max_lag < primary.current_lsn) continue;
+            if (exceedsLagPolicy(slot.applied_lsn, primary.current_lsn, max_lag)) continue;
         }
         return standby.name;
     }
@@ -701,7 +701,26 @@ fn automaticFailoverReason(spec: Spec, primary: status.PrimarySnapshot, fencing_
     if (!fencing_observed.ready) return "FencingAuthorityNotReady";
     const fence_holder = fencing_observed.holder orelse return "FencingHolderMissing";
     if (!desiredStandbyNamed(spec, fence_holder)) return "FencingHolderNotDesired";
+    if (automaticFailoverSlotReason(spec, primary, fence_holder)) |reason| return reason;
     return "NoEligibleStandby";
+}
+
+fn automaticFailoverSlotReason(spec: Spec, primary: status.PrimarySnapshot, standby_name: []const u8) ?[]const u8 {
+    const slot = findSlot(primary.slots, standby_name) orelse return "StandbySlotMissing";
+    if (!slot.active) return "StandbySlotInactive";
+    if (slot.reseed_required or slot.status == .reseed_required) return "StandbyRequiresReseed";
+    const max_lag = spec.auto_failover.maximum_lag_lsn;
+    if (exceedsLagPolicy(slot.received_lsn, primary.current_lsn, max_lag)) return "StandbyReceiveLagExceedsPolicy";
+    if (spec.auto_failover.require_remote_apply and
+        exceedsLagPolicy(slot.applied_lsn, primary.current_lsn, max_lag))
+    {
+        return "StandbyApplyLagExceedsPolicy";
+    }
+    return null;
+}
+
+fn exceedsLagPolicy(progress_lsn: u64, target_lsn: u64, max_lag_lsn: u64) bool {
+    return progress_lsn +| max_lag_lsn < target_lsn;
 }
 
 fn desiredStandbyNamed(spec: Spec, name: []const u8) bool {
@@ -948,6 +967,97 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqualStrings(
         "FencingHolderNotDesired",
         (condition(wrong_holder, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var inactive_slots = slots;
+    inactive_slots[0].active = false;
+    var inactive_primary = primary;
+    inactive_primary.slots = inactive_slots[0..];
+    var inactive = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = inactive_primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer inactive.deinit(alloc);
+    try std.testing.expect(!inactive.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "StandbySlotInactive",
+        (condition(inactive, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var receive_lag_slots = slots;
+    receive_lag_slots[0].received_lsn = 11;
+    receive_lag_slots[0].applied_lsn = 11;
+    receive_lag_slots[0].write_lag_lsn = 1;
+    receive_lag_slots[0].apply_lag_lsn = 1;
+    var receive_lag_primary = primary;
+    receive_lag_primary.slots = receive_lag_slots[0..];
+    var receive_lag = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = receive_lag_primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer receive_lag.deinit(alloc);
+    try std.testing.expect(!receive_lag.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "StandbyReceiveLagExceedsPolicy",
+        (condition(receive_lag, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+
+    var apply_lag_slots = slots;
+    apply_lag_slots[0].applied_lsn = 11;
+    apply_lag_slots[0].apply_lag_lsn = 1;
+    var apply_lag_primary = primary;
+    apply_lag_primary.slots = apply_lag_slots[0..];
+    var apply_lag = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = apply_lag_primary,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer apply_lag.deinit(alloc);
+    try std.testing.expect(!apply_lag.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "StandbyApplyLagExceedsPolicy",
+        (condition(apply_lag, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
 
     var safe = try reconcile(alloc, .{
