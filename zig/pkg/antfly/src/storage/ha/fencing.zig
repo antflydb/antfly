@@ -158,6 +158,7 @@ pub const Store = struct {
                 const cloned = try held.clone(self.alloc);
                 return cloned.receipt;
             }
+            if (!chainsFromHeldFence(held.receipt, request)) return error.FenceAlreadyHeld;
             if (held.receipt.new_epoch >= request.new_epoch or
                 held.receipt.new_timeline_id >= request.new_timeline_id)
             {
@@ -262,6 +263,15 @@ fn sameFence(receipt: Receipt, request: FenceRequest) bool {
         receipt.forced == request.force and
         std.mem.eql(u8, receipt.old_primary_id, request.old_primary_id) and
         std.mem.eql(u8, receipt.promoted_node_id, request.promoted_node_id);
+}
+
+fn chainsFromHeldFence(receipt: Receipt, request: FenceRequest) bool {
+    return receipt.identity.cluster_id == request.identity.cluster_id and
+        receipt.identity.shard_id == request.identity.shard_id and
+        receipt.identity.table_id == request.identity.table_id and
+        receipt.new_timeline_id == request.identity.timeline_id and
+        receipt.new_epoch == request.identity.epoch and
+        std.mem.eql(u8, receipt.promoted_node_id, request.old_primary_id);
 }
 
 fn sameReceipt(a: Receipt, b: Receipt) bool {
@@ -606,9 +616,16 @@ test "storage.ha fencing rejects unsafe and competing promotions" {
     competing.new_timeline_id = 3;
     competing.new_epoch = 3;
     competing.observed_lsn = 10;
+    try std.testing.expectError(error.FenceAlreadyHeld, store.acquirePromotionFence(competing));
+
+    competing.identity.timeline_id = 2;
+    competing.identity.epoch = 2;
+    competing.old_primary_id = "standby-b";
     const next = try store.acquirePromotionFence(competing);
     defer freeReceipt(alloc, next);
     try std.testing.expectEqual(@as(u64, 2), next.generation);
+    try std.testing.expectEqual(@as(u64, 2), next.parent_timeline_id);
+    try std.testing.expectEqualStrings("standby-b", next.old_primary_id);
     try std.testing.expectEqualStrings("standby-c", next.promoted_node_id);
 }
 
