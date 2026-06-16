@@ -2663,7 +2663,7 @@ fn relationalRowsExpressionType(
             if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .numeric) return error.InvalidSchemaUpdateRequest;
             return .text;
         },
-        .length, .octet_length, .ascii => {
+        .length, .octet_length, .bit_length, .ascii => {
             for (expression.operands) |operand| {
                 if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
             }
@@ -4747,6 +4747,7 @@ fn parseRelationalRowsExpressionKind(op: []const u8) !storage_schema.RelationalR
     if (std.mem.eql(u8, op, "concat_ws")) return .concat_ws;
     if (std.mem.eql(u8, op, "length")) return .length;
     if (std.mem.eql(u8, op, "octet_length")) return .octet_length;
+    if (std.mem.eql(u8, op, "bit_length")) return .bit_length;
     if (std.mem.eql(u8, op, "nullif")) return .nullif;
     if (std.mem.eql(u8, op, "greatest")) return .greatest;
     if (std.mem.eql(u8, op, "least")) return .least;
@@ -4791,7 +4792,7 @@ fn parseRelationalRowsExpressionKind(op: []const u8) !storage_schema.RelationalR
 fn validateRelationalRowsExpressionArity(kind: storage_schema.RelationalRowsExpressionKind, len: usize) !void {
     switch (kind) {
         .now, .uuid_v4 => if (len != 0) return error.InvalidSchemaUpdateRequest,
-        .lower, .upper, .initcap, .length, .octet_length, .ascii, .chr, .md5, .reverse, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .interval_ns, .interval_months, .date_part, .date_trunc, .cast, .json_extract, .json_path_exists, .json_typeof, .json_array_length, .array_length, .to_jsonb => if (len != 1 and kind != .date_part and kind != .date_trunc) return error.InvalidSchemaUpdateRequest,
+        .lower, .upper, .initcap, .length, .octet_length, .bit_length, .ascii, .chr, .md5, .reverse, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .interval_ns, .interval_months, .date_part, .date_trunc, .cast, .json_extract, .json_path_exists, .json_typeof, .json_array_length, .array_length, .to_jsonb => if (len != 1 and kind != .date_part and kind != .date_trunc) return error.InvalidSchemaUpdateRequest,
         .power => if (len != 2) return error.InvalidSchemaUpdateRequest,
         .date_bin => if (len != 3) return error.InvalidSchemaUpdateRequest,
         .trim, .ltrim, .rtrim => if (len != 1 and len != 2) return error.InvalidSchemaUpdateRequest,

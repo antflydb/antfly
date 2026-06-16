@@ -2360,6 +2360,20 @@
       "sql": "SELECT id, octet_length(status) AS status_bytes FROM usage_records WHERE char_length(status) > $1 ORDER BY character_length(status) DESC LIMIT 5"
     },
     {
+      "name": "single table bit length predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 16}],
+      "sql": "SELECT id, bit_length(status) AS status_bits FROM usage_records WHERE bit_length(status) > $1 ORDER BY bit_length(status) DESC LIMIT 5"
+    },
+    {
       "name": "single table trim predicate query",
       "family": "query",
       "summary": {

@@ -2996,13 +2996,14 @@ fn rowExpressionValueJsonAlloc(
                 else => return error.InvalidColumnValue,
             }
         },
-        .length, .octet_length, .strpos, .ascii => blk: {
+        .length, .octet_length, .bit_length, .strpos, .ascii => blk: {
             const source = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[0]);
             defer if (source) |text| alloc.free(text);
             if (source == null) break :blk try alloc.dupe(u8, "null");
             const result: i64 = switch (expression.kind) {
                 .length => @intCast(std.unicode.utf8CountCodepoints(source.?) catch return error.InvalidColumnValue),
                 .octet_length => @intCast(source.?.len),
+                .bit_length => @intCast(source.?.len * 8),
                 .strpos => pos: {
                     if (expression.operands.len != 2) return error.InvalidColumnValue;
                     const needle = try rowExpressionStringValueAlloc(alloc, row_value, expression.operands[1]);

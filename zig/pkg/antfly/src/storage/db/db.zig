@@ -25113,7 +25113,7 @@ pub const DB = struct {
                 };
                 break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
             },
-            .length, .octet_length => blk: {
+            .length, .octet_length, .bit_length => blk: {
                 if (expression.operands.len != 1) return error.InvalidQueryRequest;
                 const value_json = try relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
                 defer alloc.free(value_json);
@@ -25125,6 +25125,7 @@ pub const DB = struct {
                         const len = switch (expression.kind) {
                             .length => std.unicode.utf8CountCodepoints(text) catch return error.InvalidQueryRequest,
                             .octet_length => text.len,
+                            .bit_length => text.len * 8,
                             else => unreachable,
                         };
                         break :blk try std.fmt.allocPrint(alloc, "{d}", .{len});

@@ -100,6 +100,10 @@ fn sqlKeywordIsOctetLengthFunction(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "octet_length");
 }
 
+fn sqlKeywordIsBitLengthFunction(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "bit_length");
+}
+
 fn sqlKeywordIsJsonArrayLengthFunction(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "json_array_length") or
         std.ascii.eqlIgnoreCase(text, "jsonb_array_length");
@@ -24877,6 +24881,7 @@ const Parser = struct {
             .concat_ws => "concat_ws",
             .length => "length",
             .octet_length => "octet_length",
+            .bit_length => "bit_length",
             .nullif => "nullif",
             .greatest => "greatest",
             .least => "least",
@@ -26033,6 +26038,7 @@ const Parser = struct {
             self.functionCallStartsAt(index, "power") or
             std.ascii.eqlIgnoreCase(token.text, "chr") or
             std.ascii.eqlIgnoreCase(token.text, "length") or
+            std.ascii.eqlIgnoreCase(token.text, "bit_length") or
             std.ascii.eqlIgnoreCase(token.text, "lower") or
             std.ascii.eqlIgnoreCase(token.text, "now") or
             std.ascii.eqlIgnoreCase(token.text, "null") or
@@ -32270,7 +32276,7 @@ const Parser = struct {
                 if (expression.operands.len != 2) return error.UnsupportedSqlShape;
                 for (expression.operands) |operand| try self.validateNumericRowExpression(operand);
             },
-            .length, .octet_length, .ascii => {
+            .length, .octet_length, .bit_length, .ascii => {
                 if (expression.operands.len != 1) return error.UnsupportedSqlShape;
                 try self.validateTextRowExpression(expression.operands[0]);
             },
@@ -32530,7 +32536,7 @@ const Parser = struct {
                 if (expression.operands.len != 2) return error.UnsupportedSqlShape;
                 return try self.rowExpressionOutputType(expression.operands[0]);
             },
-            .length, .octet_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part => return .numeric,
+            .length, .octet_length, .bit_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part => return .numeric,
             .add, .sub => {
                 if (expression.operands.len > 0 and @This().sqlExpressionContainsInterval(expression)) {
                     return try self.rowExpressionOutputType(expression.operands[0]);
@@ -36505,6 +36511,8 @@ const Parser = struct {
             .length
         else if (sqlKeywordIsOctetLengthFunction(token.text))
             .octet_length
+        else if (sqlKeywordIsBitLengthFunction(token.text))
+            .bit_length
         else
             return null;
         self.pos += 1;
@@ -36755,7 +36763,7 @@ const Parser = struct {
     fn peekTextLengthFunctionKeyword(self: *@This()) bool {
         if (self.pos >= self.tokens.len) return false;
         const token = self.tokens[self.pos];
-        return token.kind == .identifier and (sqlKeywordIsLengthFunction(token.text) or sqlKeywordIsOctetLengthFunction(token.text));
+        return token.kind == .identifier and (sqlKeywordIsLengthFunction(token.text) or sqlKeywordIsOctetLengthFunction(token.text) or sqlKeywordIsBitLengthFunction(token.text));
     }
 
     fn peekAsciiFunctionCall(self: *@This()) bool {
@@ -41822,7 +41830,7 @@ fn checkExpressionTypeForColumns(
             }
             return .{ .type = .text };
         },
-        .length, .octet_length, .ascii, .strpos => {
+        .length, .octet_length, .bit_length, .ascii, .strpos => {
             for (expression.operands) |operand| {
                 if (!checkExpressionTypeTextLike(try checkExpressionTypeForColumns(columns, operand))) return error.InvalidSqlCatalog;
             }
@@ -54532,6 +54540,22 @@ test "postgres sql adapter lowers length into expression AST" {
     try std.testing.expect(octets.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, octets.query.order_by[0].expression.?.kind);
 
+    var bits = try lowerSelectAlloc(
+        alloc,
+        "SELECT bit_length(status) AS status_bits FROM usage_records WHERE bit_length(status) > $1 ORDER BY bit_length(status) DESC LIMIT 5",
+        schema,
+        &.{.{ .integer = 16 }},
+    );
+    defer bits.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), bits.query.expressions.len);
+    try std.testing.expectEqualStrings("status_bits", bits.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, bits.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), bits.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, bits.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), bits.query.order_by.len);
+    try std.testing.expect(bits.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, bits.query.order_by[0].expression.?.kind);
+
     var ascii_chr = try lowerSelectAlloc(
         alloc,
         "SELECT ascii(status) AS first_code, chr(amount) AS amount_char FROM usage_records WHERE ascii(status) > $1 ORDER BY chr(amount) ASC LIMIT 5",
@@ -62540,6 +62564,7 @@ const AppParityCorpusCoverage = struct {
     query_reverse_expression: bool = false,
     query_initcap_expression: bool = false,
     query_text_length_expression: bool = false,
+    query_bit_length_expression: bool = false,
     query_md5_expression: bool = false,
     query_concat_ws_expression: bool = false,
     query_nullif_expression: bool = false,
@@ -63768,6 +63793,11 @@ const AppParityCorpusCoverage = struct {
             appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
             appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
             appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
+        self.query_bit_length_expression = self.query_bit_length_expression or (entry.family == .query and
+            std.mem.indexOf(u8, entry.sql, "bit_length(status") != null and
+            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
+            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_md5_expression = self.query_md5_expression or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, "md5(status") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
@@ -64295,6 +64325,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.query_reverse_expression);
         try std.testing.expect(self.query_initcap_expression);
         try std.testing.expect(self.query_text_length_expression);
+        try std.testing.expect(self.query_bit_length_expression);
         try std.testing.expect(self.query_md5_expression);
         try std.testing.expect(self.query_concat_ws_expression);
         try std.testing.expect(self.query_nullif_expression);
@@ -66404,6 +66435,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
             .sql = "SELECT id, octet_length(status) AS status_bytes FROM usage_records WHERE char_length(status) > $1 ORDER BY character_length(status) DESC LIMIT 5",
             .params = &.{.{ .integer = 3 }},
+        },
+        .{
+            .name = "single table bit length predicate query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+            .sql = "SELECT id, bit_length(status) AS status_bits FROM usage_records WHERE bit_length(status) > $1 ORDER BY bit_length(status) DESC LIMIT 5",
+            .params = &.{.{ .integer = 16 }},
         },
         .{
             .name = "single table trim predicate query",

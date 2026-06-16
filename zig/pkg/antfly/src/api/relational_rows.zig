@@ -4075,7 +4075,7 @@ fn rowsExpressionOutputNullableWithSources(
             if (expression.operands.len < 2) return error.InvalidRowsRequest;
             return try rowsExpressionOutputNullableWithSources(alloc, schema, source_schema, expression.operands[0]);
         },
-        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .json_typeof, .array_to_string, .regexp_replace, .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists, .length, .octet_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part, .add, .sub, .date_trunc, .date_bin, .to_jsonb, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .array_replace, .string_to_array => {
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .substring, .overlay, .split_part, .left, .right, .lpad, .rpad, .repeat, .reverse, .chr, .md5, .json_typeof, .array_to_string, .regexp_replace, .starts_with, .ends_with, .like, .ilike, .regexp_match, .bool_and, .bool_or, .bool_not, .json_path_exists, .length, .octet_length, .bit_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part, .add, .sub, .date_trunc, .date_bin, .to_jsonb, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .array_replace, .string_to_array => {
             return try rowsExpressionAnyOperandNullableWithSources(alloc, schema, source_schema, expression.operands);
         },
     }
@@ -4124,7 +4124,7 @@ fn rowsExpressionOutputTypeWithSources(
             if (expression.operands.len != 2) return error.InvalidRowsRequest;
             return try rowsExpressionOutputTypeWithSources(alloc, schema, source_schema, expression.operands[0]);
         },
-        .length, .octet_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part => return .numeric,
+        .length, .octet_length, .bit_length, .strpos, .ascii, .regexp_count, .regexp_instr, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .json_array_length, .array_length, .array_position, .interval_ns, .interval_months, .date_part => return .numeric,
         .add, .sub => {
             if (expression.operands.len > 0 and rowsExpressionContainsInterval(expression)) {
                 return try rowsExpressionOutputTypeWithSources(alloc, schema, source_schema, expression.operands[0]);
@@ -8386,6 +8386,8 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         .length
     else if (std.mem.eql(u8, op.string, "octet_length"))
         .octet_length
+    else if (std.mem.eql(u8, op.string, "bit_length"))
+        .bit_length
     else if (std.mem.eql(u8, op.string, "nullif"))
         .nullif
     else if (std.mem.eql(u8, op.string, "greatest"))
@@ -8470,7 +8472,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         .json_path_exists => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args", "path" }),
         else => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args" }),
     }
-    if ((expression_kind == .lower or expression_kind == .upper or expression_kind == .initcap or expression_kind == .length or expression_kind == .octet_length or expression_kind == .ascii or expression_kind == .chr or expression_kind == .md5) and args_value.array.items.len != 1) return error.InvalidRowsRequest;
+    if ((expression_kind == .lower or expression_kind == .upper or expression_kind == .initcap or expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .chr or expression_kind == .md5) and args_value.array.items.len != 1) return error.InvalidRowsRequest;
     if ((expression_kind == .trim or expression_kind == .ltrim or expression_kind == .rtrim) and (args_value.array.items.len != 1 and args_value.array.items.len != 2)) return error.InvalidRowsRequest;
     if ((expression_kind == .replace or expression_kind == .translate) and args_value.array.items.len != 3) return error.InvalidRowsRequest;
     if (expression_kind == .regexp_replace and (args_value.array.items.len != 3 and args_value.array.items.len != 4)) return error.InvalidRowsRequest;
@@ -8575,7 +8577,7 @@ fn parseRowsExpressionWithSourceSchemaAlloc(
         }
     }
     const expression: db_mod.types.RelationalRowsExpression = .{ .kind = expression_kind, .operands = operands, .cast_type = cast_type, .json_path = json_path, .json_as_text = json_as_text };
-    if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .array_position or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
+    if (expression_kind == .length or expression_kind == .octet_length or expression_kind == .bit_length or expression_kind == .ascii or expression_kind == .regexp_count or expression_kind == .regexp_instr or expression_kind == .json_array_length or expression_kind == .array_position or expression_kind == .abs or expression_kind == .round or expression_kind == .trunc or expression_kind == .floor or expression_kind == .ceil or expression_kind == .sqrt or expression_kind == .sign or expression_kind == .power or expression_kind == .add or expression_kind == .sub or expression_kind == .mul or expression_kind == .div or expression_kind == .mod or expression_kind == .interval_ns or expression_kind == .interval_months) try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .array_positions) try validateRowsArrayPositionExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .chr or expression_kind == .md5 or expression_kind == .json_typeof or expression_kind == .array_to_string or expression_kind == .regexp_replace or expression_kind == .regexp_substr) try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression);
     if (expression_kind == .date_trunc) try validateRowsDateTruncExpressionWithSources(alloc, schema, source_schema, expression);
@@ -8868,7 +8870,7 @@ fn validateRowsQueryNumericExpressionWithSources(
             if (expression.operands.len != 2) return error.InvalidRowsRequest;
             for (expression.operands) |operand| try validateRowsQueryNumericExpressionWithSources(alloc, schema, source_schema, operand);
         },
-        .length, .octet_length => {
+        .length, .octet_length, .bit_length => {
             if (expression.operands.len != 1) return error.InvalidRowsRequest;
             try validateRowsQueryTextExpressionWithSources(alloc, schema, source_schema, expression.operands[0]);
         },
@@ -10909,7 +10911,7 @@ fn expressionValueJsonWithExplicitSourceAlloc(
             };
             break :blk try std.fmt.allocPrint(alloc, "{d}", .{result});
         },
-        .length, .octet_length => blk: {
+        .length, .octet_length, .bit_length => blk: {
             if (expression.operands.len != 1) return error.InvalidRowsRequest;
             const value_json = try expressionValueJsonWithExplicitSourceAlloc(alloc, row, proposed_row, source_row, expression.operands[0]);
             defer alloc.free(value_json);
@@ -10921,6 +10923,7 @@ fn expressionValueJsonWithExplicitSourceAlloc(
                     const len = switch (expression.kind) {
                         .length => std.unicode.utf8CountCodepoints(text) catch return error.InvalidRowsRequest,
                         .octet_length => text.len,
+                        .bit_length => text.len * 8,
                         else => unreachable,
                     };
                     break :blk try std.fmt.allocPrint(alloc, "{d}", .{len});
@@ -19993,16 +19996,17 @@ test "relational rows query contract projects generic expression AST" {
 
     var octet_request = try parseRowsQueryRequest(
         std.testing.allocator,
-        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"bytes\",\"expr\":{\"op\":\"octet_length\",\"args\":[{\"value\":\"\\u00e9\"}]}},{\"as\":\"chars\",\"expr\":{\"op\":\"length\",\"args\":[{\"value\":\"\\u00e9\"}]}}]}",
+        "{\"select\":[\"id\"],\"expressions\":[{\"as\":\"bytes\",\"expr\":{\"op\":\"octet_length\",\"args\":[{\"value\":\"\\u00e9\"}]}},{\"as\":\"bits\",\"expr\":{\"op\":\"bit_length\",\"args\":[{\"value\":\"\\u00e9\"}]}},{\"as\":\"chars\",\"expr\":{\"op\":\"length\",\"args\":[{\"value\":\"\\u00e9\"}]}}]}",
         schema,
     );
     defer octet_request.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), octet_request.expressions.len);
+    try std.testing.expectEqual(@as(usize, 3), octet_request.expressions.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, octet_request.expressions[0].expression.kind);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, octet_request.expressions[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, octet_request.expressions[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, octet_request.expressions[2].expression.kind);
     var octet_result = try executeRowsQueryOnJsonRowsAlloc(std.testing.allocator, schema, octet_request, rows[0..1]);
     defer octet_result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("{\"id\":\"a\",\"bytes\":2,\"chars\":1}", octet_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"bytes\":2,\"bits\":16,\"chars\":1}", octet_result.rows[0]);
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
@@ -20162,6 +20166,7 @@ test "relational rows query contract parses public expression operator surface" 
         .{ .op = "char_length", .expr_json = "{\"op\":\"char_length\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .length },
         .{ .op = "character_length", .expr_json = "{\"op\":\"character_length\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .length },
         .{ .op = "octet_length", .expr_json = "{\"op\":\"octet_length\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .octet_length },
+        .{ .op = "bit_length", .expr_json = "{\"op\":\"bit_length\",\"args\":[{\"field\":\"text_value\"}]}", .kind = .bit_length },
         .{ .op = "nullif", .expr_json = "{\"op\":\"nullif\",\"args\":[{\"field\":\"text_value\"},{\"value\":\"none\"}]}", .kind = .nullif },
         .{ .op = "greatest", .expr_json = "{\"op\":\"greatest\",\"args\":[{\"field\":\"n\"},{\"field\":\"m\"}]}", .kind = .greatest },
         .{ .op = "least", .expr_json = "{\"op\":\"least\",\"args\":[{\"field\":\"n\"},{\"field\":\"m\"}]}", .kind = .least },

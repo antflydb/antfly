@@ -247,6 +247,7 @@ pub const RelationalRowsExpressionKind = enum {
     concat_ws,
     length,
     octet_length,
+    bit_length,
     nullif,
     greatest,
     least,
