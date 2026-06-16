@@ -46,6 +46,7 @@ type haPlan struct {
 	ReseedRequiredCount       int32
 	FencingReady              bool
 	PromotionStandbyName      string
+	SyncPolicyDegraded        bool
 }
 
 func (r *AntflyClusterReconciler) updateHAStatusAndConditions(cluster *antflyv1.AntflyCluster) {
@@ -195,6 +196,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		}
 	}
 
+	plan.SyncPolicyDegraded = haSyncPolicyDegradedForStatus(ha, status)
 	plan.FencingReady = haFencingReady(ha, status)
 	plan.PromotionStandbyName = haAutomaticPromotionStandby(ha, status, plan)
 	plan.AutomaticPromotionAllowed = plan.PromotionStandbyName != ""
@@ -472,14 +474,96 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {
+	_ = ha
+	return plan.SyncPolicyDegraded
+}
+
+func haSyncPolicyDegradedForStatus(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) bool {
 	if ha == nil || ha.SyncPolicy == nil || ha.SyncPolicy.Mode == "" || ha.SyncPolicy.Mode == antflyv1.HADurabilityModeAsync {
 		return false
 	}
-	required := ha.SyncPolicy.Required
+	if status == nil {
+		return true
+	}
+	policy := ha.SyncPolicy
+	required := policy.Required
 	if required == 0 {
 		required = 1
 	}
-	return plan.HealthyStandbyCount < required
+	standbys := haStandbyStatusByName(status)
+	switch policy.Selection {
+	case antflyv1.HAStandbySelectionAll:
+		if len(policy.StandbyNames) == 0 {
+			return true
+		}
+		for _, name := range policy.StandbyNames {
+			standby, ok := standbys[name]
+			if !ok || !standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
+				return true
+			}
+		}
+		return false
+	case antflyv1.HAStandbySelectionFirst:
+		var candidates int32
+		var satisfied int32
+		for _, name := range policy.StandbyNames {
+			standby, ok := standbys[name]
+			if !ok || !standbySyncEligible(standby) {
+				continue
+			}
+			candidates++
+			if standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
+				satisfied++
+			}
+			if candidates == required {
+				break
+			}
+		}
+		return candidates < required || satisfied < required
+	default:
+		var satisfied int32
+		for _, name := range policy.StandbyNames {
+			standby, ok := standbys[name]
+			if ok && standbySatisfiesSync(status.PrimaryLSN, policy.Mode, standby) {
+				satisfied++
+			}
+		}
+		return satisfied < required
+	}
+}
+
+func haStandbyStatusByName(status *antflyv1.HAStatus) map[string]antflyv1.HAStandbyStatus {
+	standbys := map[string]antflyv1.HAStandbyStatus{}
+	if status == nil {
+		return standbys
+	}
+	for _, standby := range status.Standbys {
+		if standby.Name != "" {
+			standbys[standby.Name] = standby
+		}
+		if standby.SlotName != "" {
+			standbys[standby.SlotName] = standby
+		}
+	}
+	return standbys
+}
+
+func standbySatisfiesSync(primaryLSN uint64, mode antflyv1.HADurabilityMode, standby antflyv1.HAStandbyStatus) bool {
+	if !standbySyncEligible(standby) {
+		return false
+	}
+	switch mode {
+	case antflyv1.HADurabilityModeRemoteWrite:
+		return standby.ReceivedLSN >= primaryLSN
+	case antflyv1.HADurabilityModeRemoteApply:
+		return standby.AppliedLSN >= primaryLSN
+	default:
+		return true
+	}
+}
+
+func standbySyncEligible(standby antflyv1.HAStandbyStatus) bool {
+	return standby.Active && !standby.ReseedRequired
 }
 
 func standbyDesired(standby antflyv1.HAStandbySpec) bool {

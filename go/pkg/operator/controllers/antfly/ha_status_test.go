@@ -273,6 +273,64 @@ func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromot
 	}
 }
 
+func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
+		{Name: "standby-a"},
+		{Name: "standby-b"},
+		{Name: "standby-c"},
+	}
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:         antflyv1.HADurabilityModeRemoteWrite,
+		Selection:    antflyv1.HAStandbySelectionAny,
+		Required:     2,
+		StandbyNames: []string{"standby-a", "standby-b", "standby-c"},
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 10,
+		Standbys: []antflyv1.HAStandbyStatus{
+			{Name: "standby-a", SlotName: "standby-a", Active: true, ReceivedLSN: 10, AppliedLSN: 1, ApplyLagLSN: 9, Status: "receiving"},
+			{Name: "standby-b", SlotName: "standby-b", Active: true, ReceivedLSN: 9, AppliedLSN: 9, ApplyLagLSN: 1, Status: "lagging"},
+			{Name: "standby-c", SlotName: "standby-c", Active: true, ReceivedLSN: 10, AppliedLSN: 1, ApplyLagLSN: 9, Status: "receiving"},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.HealthyStandbyCount != 0 {
+		t.Fatalf("expected no remote-apply healthy standbys, got %d", cluster.Status.HAStatus.HealthyStandbyCount)
+	}
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ANY remote-write sync policy to be satisfied by standby-a and standby-c, got %#v", degraded)
+	}
+
+	cluster.Spec.HighAvailability.SyncPolicy.Selection = antflyv1.HAStandbySelectionFirst
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != antflyv1.ReasonHASyncPolicyUnsatisfied {
+		t.Fatalf("expected FIRST policy to require standby-a and standby-b, got %#v", degraded)
+	}
+
+	cluster.Spec.HighAvailability.SyncPolicy.Selection = antflyv1.HAStandbySelectionAll
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue {
+		t.Fatalf("expected ALL policy to require every named standby, got %#v", degraded)
+	}
+
+	cluster.Status.HAStatus.Standbys[1].ReceivedLSN = 10
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionFalse {
+		t.Fatalf("expected ALL policy to be satisfied after standby-b receives primary LSN, got %#v", degraded)
+	}
+}
+
 func TestObserveHAFencingStatusReportsMissingKubernetesLease(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	reconciler := testHAReconciler(t)
