@@ -72,6 +72,41 @@ pub const Result = union(enum) {
     }
 };
 
+pub const ResultDocument = struct {
+    schema_version: u32 = 1,
+    result: Result,
+};
+
+pub fn resultDocument(result: Result) ResultDocument {
+    return .{ .result = result };
+}
+
+pub fn renderJsonAlloc(alloc: Allocator, result: Result) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, resultDocument(result), .{});
+}
+
+pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
+    return switch (result) {
+        .slot_list => |snapshot| blk: {
+            var metric_snapshot = try metrics.fromPrimarySnapshot(alloc, snapshot);
+            defer metric_snapshot.deinit(alloc);
+            break :blk try metrics.renderPrimaryPrometheusAlloc(alloc, metric_snapshot);
+        },
+        .primary_status => |snapshot| blk: {
+            var metric_snapshot = try metrics.fromPrimarySnapshot(alloc, snapshot);
+            defer metric_snapshot.deinit(alloc);
+            break :blk try metrics.renderPrimaryPrometheusAlloc(alloc, metric_snapshot);
+        },
+        .standby_status => |snapshot| try metrics.renderStandbyPrometheusAlloc(
+            alloc,
+            metrics.fromStandbySnapshot(snapshot),
+        ),
+        .primary_metrics => |metric_snapshot| try metrics.renderPrimaryPrometheusAlloc(alloc, metric_snapshot),
+        .standby_metrics => |metric_snapshot| try metrics.renderStandbyPrometheusAlloc(alloc, metric_snapshot),
+        else => error.PrometheusUnsupportedForResult,
+    };
+}
+
 pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
     return switch (plan.command) {
         .identify_system => .{ .identify_system = admin.identifyPrimary(try requirePrimary(ctx)) },
@@ -271,6 +306,17 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try std.testing.expectEqual(@as(u64, 2), primary_metrics.primary_metrics.current_lsn);
     try std.testing.expectEqual(@as(u64, 1), primary_metrics.primary_metrics.slot_count);
     try std.testing.expectEqual(@as(u64, 1), primary_metrics.primary_metrics.max_apply_lag_lsn);
+
+    const json_body = try renderJsonAlloc(alloc, primary_metrics);
+    defer alloc.free(json_body);
+    try expectContains(json_body, "\"schema_version\":1");
+    try expectContains(json_body, "\"primary_metrics\"");
+    try expectContains(json_body, "\"current_lsn\":2");
+
+    const prometheus_body = try renderPrometheusAlloc(alloc, primary_metrics);
+    defer alloc.free(prometheus_body);
+    try expectContains(prometheus_body, "antfly_ha_primary_current_lsn 2\n");
+    try expectContains(prometheus_body, "antfly_ha_slot_apply_lag_lsn{slot=\"standby-a\"} 1\n");
 }
 
 test "storage.ha admin exec runs read commit promote and rejoin commands" {
@@ -353,4 +399,16 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var rejoin_result = try execute(alloc, .{}, rejoin_plan);
     defer rejoin_result.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.reject_unfenced, rejoin_result.rejoin_assess.action);
+
+    const read_json = try renderJsonAlloc(alloc, read);
+    defer alloc.free(read_json);
+    try expectContains(read_json, "\"schema_version\":1");
+    try expectContains(read_json, "\"read_check\"");
+    try expectContains(read_json, "\"action\":\"serve_standby\"");
+
+    try std.testing.expectError(error.PrometheusUnsupportedForResult, renderPrometheusAlloc(alloc, read));
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
