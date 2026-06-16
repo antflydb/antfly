@@ -405,6 +405,13 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 
 	reconciler.updateHALastPromotionFromAdminJobs(cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
+
+	cluster.Status.HAStatus.LastPromotion.FenceToken = "token"
+	cluster.Status.HAStatus.LastPromotion.ObservedLSN = 13
+	reconciler.updateHALastPromotionFromAdminJobs(cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion.FenceToken).To(Equal("token"))
+	g.Expect(cluster.Status.HAStatus.LastPromotion.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(cluster.Status.HAStatus.LastPromotion.CompletionTime).To(Equal(firstCompletion))
 }
 
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false

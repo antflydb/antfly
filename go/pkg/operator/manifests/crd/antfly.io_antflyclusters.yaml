@@ -6607,18 +6607,34 @@ spec:
                       fenceGeneration:
                         format: int64
                         type: integer
+                      fenceReason:
+                        type: string
+                      fenceToken:
+                        type: string
                       forced:
                         type: boolean
+                      newEpoch:
+                        format: int64
+                        type: integer
                       newTimelineID:
+                        format: int64
+                        type: integer
+                      observedLSN:
                         format: int64
                         type: integer
                       oldPrimaryID:
                         type: string
+                      parentEpoch:
+                        format: int64
+                        type: integer
                       parentTimelineID:
                         format: int64
                         type: integer
                       promotedStandbyID:
                         type: string
+                      requiredLSN:
+                        format: int64
+                        type: integer
                       switchLSN:
                         format: int64
                         type: integer
@@ -6662,8 +6678,14 @@ spec:
                           type: string
                         kind:
                           type: string
+                        observedLSN:
+                          format: int64
+                          type: integer
                         reason:
                           type: string
+                        retainedFromLSN:
+                          format: int64
+                          type: integer
                         routeTo:
                           type: string
                         slotName:

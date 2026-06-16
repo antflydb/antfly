@@ -33,6 +33,8 @@ type haPlannedAction struct {
 	StandbyName     string
 	SlotName        string
 	TargetLSN       uint64
+	ObservedLSN     uint64
+	RetainedFromLSN uint64
 	RouteTo         string
 	FenceAuthority  antflyv1.HAFencingAuthority
 	FenceHolder     string
@@ -279,7 +281,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			},
 			haPlannedAction{
 				Kind:            haActionDemoteFormerPrimary,
+				StandbyName:     haAutomaticFailoverFormerPrimaryID(ha),
 				TargetLSN:       status.PrimaryLSN,
+				ObservedLSN:     status.PrimaryLSN,
+				RetainedFromLSN: status.Retention.OldestRestartLSN,
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
@@ -292,7 +297,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.Actions = append(plan.Actions, action)
 	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
-	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary); action.Kind != "" {
+	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
 		plan.Actions = append(plan.Actions, action)
 	}
 
@@ -315,7 +320,7 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
-	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha)
+	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions, ha, cluster.Status.HAStatus)
 	cluster.Status.HAStatus.PrimaryRoute = haPrimaryRouteStatus(plan.PrimaryRoute)
 	cluster.Status.HAStatus.Sync = haSyncStatus(plan.SyncPolicy)
 	cluster.Status.HAStatus.FormerPrimary = haFormerPrimaryStatus(plan.FormerPrimary)
@@ -335,7 +340,7 @@ func haSyncStatus(evaluation haSyncEvaluation) antflyv1.HASyncStatus {
 	}
 }
 
-func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec) []antflyv1.HAPlannedActionStatus {
+func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) []antflyv1.HAPlannedActionStatus {
 	if len(actions) == 0 {
 		return nil
 	}
@@ -346,11 +351,13 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			StandbyName:     action.StandbyName,
 			SlotName:        action.SlotName,
 			TargetLSN:       action.TargetLSN,
+			ObservedLSN:     action.ObservedLSN,
+			RetainedFromLSN: action.RetainedFromLSN,
 			RouteTo:         action.RouteTo,
 			FenceAuthority:  action.FenceAuthority,
 			FenceHolder:     action.FenceHolder,
 			FenceGeneration: action.FenceGeneration,
-			AdminCommand:    haAdminCommand(action, haReplicationIdentity(ha)),
+			AdminCommand:    haAdminCommand(action, haReplicationIdentity(ha), status),
 			AdminURL:        haAdminURL(action, ha),
 			Reason:          action.Reason,
 		})
@@ -358,7 +365,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 	return out
 }
 
-func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec) []string {
+func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {
 	switch action.Kind {
 	case haActionCreateSlot:
 		slotName := action.SlotName
@@ -380,6 +387,8 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 		return []string{"seed", "begin", "--slot", slotName, "--manifest-id", fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)}
 	case haActionPromoteStandby:
 		return []string{"promote", "--current-fence"}
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		return haFormerPrimaryAdminCommand(action, identity, status)
 	case haActionAcquireFence:
 		if identity == nil || identity.CurrentPrimaryID == "" || action.StandbyName == "" {
 			return nil
@@ -404,6 +413,83 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 	}
 }
 
+func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {
+	if identity == nil || action.StandbyName == "" {
+		return nil
+	}
+	lastLSN := action.ObservedLSN
+	if lastLSN == 0 {
+		lastLSN = action.TargetLSN
+	}
+	args := []string{
+		"rejoin", "assess",
+		"--node-id", action.StandbyName,
+		"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
+		"--shard-id", strconv.FormatUint(identity.ShardID, 10),
+		"--table-id", strconv.FormatUint(identity.TableID, 10),
+		"--timeline-id", strconv.FormatUint(identity.TimelineID, 10),
+		"--epoch", strconv.FormatUint(identity.Epoch, 10),
+		"--last-lsn", strconv.FormatUint(lastLSN, 10),
+		"--retained-from-lsn", strconv.FormatUint(action.RetainedFromLSN, 10),
+	}
+	if action.Kind == haActionDemoteFormerPrimary {
+		return args
+	}
+
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return nil
+	}
+	args = append(args,
+		"--fence-old-primary-id", promotion.OldPrimaryID,
+		"--fence-promoted-node-id", promotion.PromotedStandbyID,
+		"--fence-parent-timeline-id", strconv.FormatUint(promotion.ParentTimelineID, 10),
+		"--fence-parent-epoch", strconv.FormatUint(promotion.ParentEpoch, 10),
+		"--fence-new-timeline-id", strconv.FormatUint(promotion.NewTimelineID, 10),
+		"--fence-new-epoch", strconv.FormatUint(promotion.NewEpoch, 10),
+		"--fence-required-lsn", strconv.FormatUint(haPromotionRequiredLSN(promotion), 10),
+		"--fence-observed-lsn", strconv.FormatUint(haPromotionObservedLSN(promotion), 10),
+		"--fence-generation", strconv.FormatUint(promotion.FenceGeneration, 10),
+		"--fence-token", promotion.FenceToken,
+	)
+	if promotion.FenceReason != "" {
+		args = append(args, "--fence-reason", promotion.FenceReason)
+	}
+	if promotion.Forced {
+		args = append(args, "--fence-forced")
+	}
+	return args
+}
+
+func haPromotionReceipt(status *antflyv1.HAStatus) *antflyv1.HAPromotionStatus {
+	if status == nil || status.LastPromotion == nil {
+		return nil
+	}
+	promotion := status.LastPromotion
+	if promotion.OldPrimaryID == "" || promotion.PromotedStandbyID == "" ||
+		promotion.ParentTimelineID == 0 || promotion.ParentEpoch == 0 ||
+		promotion.NewTimelineID == 0 || promotion.NewEpoch == 0 ||
+		haPromotionRequiredLSN(promotion) == 0 || haPromotionObservedLSN(promotion) == 0 ||
+		promotion.FenceGeneration == 0 || promotion.FenceToken == "" {
+		return nil
+	}
+	return promotion
+}
+
+func haPromotionRequiredLSN(promotion *antflyv1.HAPromotionStatus) uint64 {
+	if promotion.RequiredLSN != 0 {
+		return promotion.RequiredLSN
+	}
+	return promotion.SwitchLSN
+}
+
+func haPromotionObservedLSN(promotion *antflyv1.HAPromotionStatus) uint64 {
+	if promotion.ObservedLSN != 0 {
+		return promotion.ObservedLSN
+	}
+	return promotion.SwitchLSN
+}
+
 func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) string {
 	if ha == nil {
 		return ""
@@ -416,6 +502,14 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 		return ha.Admin.PrimaryURL
 	case haActionPromoteStandby:
 		return haStandbyAdminURL(ha, action.StandbyName)
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		if url := haStandbyAdminURL(ha, action.StandbyName); url != "" {
+			return url
+		}
+		if ha.Admin == nil {
+			return ""
+		}
+		return ha.Admin.PrimaryURL
 	default:
 		return ""
 	}
@@ -443,6 +537,14 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 		return nil
 	}
 	return identity
+}
+
+func haAutomaticFailoverFormerPrimaryID(ha *antflyv1.HighAvailabilitySpec) string {
+	identity := haReplicationIdentity(ha)
+	if identity == nil {
+		return ""
+	}
+	return identity.CurrentPrimaryID
 }
 
 func haPrimaryRouteStatus(evaluation haPrimaryRouteEvaluation) antflyv1.HAPrimaryRouteStatus {
@@ -509,9 +611,13 @@ func haFormerPrimaryStatus(evaluation haFormerPrimaryEvaluation) *antflyv1.HAFor
 	}
 }
 
-func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation) haPlannedAction {
+func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation, status *antflyv1.HAStatus) haPlannedAction {
 	if !evaluation.Present {
 		return haPlannedAction{}
+	}
+	retainedFromLSN := uint64(0)
+	if status != nil {
+		retainedFromLSN = status.Retention.OldestRestartLSN
 	}
 	switch evaluation.Action {
 	case string(haActionDemoteFormerPrimary), string(haActionRewindFormerPrimary), string(haActionReseedFormerPrimary):
@@ -519,6 +625,8 @@ func haFormerPrimaryPlannedAction(evaluation haFormerPrimaryEvaluation) haPlanne
 			Kind:            haActionKind(evaluation.Action),
 			StandbyName:     evaluation.NodeID,
 			TargetLSN:       evaluation.SwitchLSN,
+			ObservedLSN:     evaluation.ObservedLSN,
+			RetainedFromLSN: retainedFromLSN,
 			FenceGeneration: evaluation.FenceGeneration,
 			Reason:          evaluation.Reason,
 		}

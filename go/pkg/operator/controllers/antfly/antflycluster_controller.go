@@ -3213,9 +3213,14 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(cluster *an
 			OldPrimaryID:      identity.CurrentPrimaryID,
 			PromotedStandbyID: action.StandbyName,
 			ParentTimelineID:  identity.TimelineID,
+			ParentEpoch:       identity.Epoch,
 			NewTimelineID:     identity.TimelineID + 1,
+			NewEpoch:          identity.Epoch + 1,
 			SwitchLSN:         action.TargetLSN,
+			RequiredLSN:       action.TargetLSN,
+			ObservedLSN:       action.TargetLSN,
 			FenceGeneration:   action.FenceGeneration,
+			FenceReason:       action.Reason,
 			CompletionTime:    &now,
 		}
 		return
@@ -3227,7 +3232,9 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 		status.OldPrimaryID == identity.CurrentPrimaryID &&
 		status.PromotedStandbyID == action.StandbyName &&
 		status.ParentTimelineID == identity.TimelineID &&
+		status.ParentEpoch == identity.Epoch &&
 		status.NewTimelineID == identity.TimelineID+1 &&
+		status.NewEpoch == identity.Epoch+1 &&
 		status.SwitchLSN == action.TargetLSN &&
 		status.FenceGeneration == action.FenceGeneration
 }
@@ -3448,6 +3455,8 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		StandbyName  string   `json:"standbyName,omitempty"`
 		SlotName     string   `json:"slotName,omitempty"`
 		TargetLSN    uint64   `json:"targetLSN,omitempty"`
+		ObservedLSN  uint64   `json:"observedLSN,omitempty"`
+		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
 		RouteTo      string   `json:"routeTo,omitempty"`
 		AdminURL     string   `json:"adminURL,omitempty"`
 		AdminCommand []string `json:"adminCommand,omitempty"`
@@ -3457,6 +3466,8 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		StandbyName:  action.StandbyName,
 		SlotName:     action.SlotName,
 		TargetLSN:    action.TargetLSN,
+		ObservedLSN:  action.ObservedLSN,
+		RetainedLSN:  action.RetainedFromLSN,
 		RouteTo:      action.RouteTo,
 		AdminURL:     action.AdminURL,
 		AdminCommand: action.AdminCommand,

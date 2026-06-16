@@ -1421,6 +1421,10 @@ type HAPlannedActionStatus struct {
 
 	TargetLSN uint64 `json:"targetLSN,omitempty"`
 
+	ObservedLSN uint64 `json:"observedLSN,omitempty"`
+
+	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
+
 	RouteTo string `json:"routeTo,omitempty"`
 
 	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
@@ -1515,11 +1519,23 @@ type HAPromotionStatus struct {
 
 	ParentTimelineID uint64 `json:"parentTimelineID,omitempty"`
 
+	ParentEpoch uint64 `json:"parentEpoch,omitempty"`
+
 	NewTimelineID uint64 `json:"newTimelineID,omitempty"`
+
+	NewEpoch uint64 `json:"newEpoch,omitempty"`
 
 	SwitchLSN uint64 `json:"switchLSN,omitempty"`
 
+	RequiredLSN uint64 `json:"requiredLSN,omitempty"`
+
+	ObservedLSN uint64 `json:"observedLSN,omitempty"`
+
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	FenceToken string `json:"fenceToken,omitempty"`
+
+	FenceReason string `json:"fenceReason,omitempty"`
 
 	Forced bool `json:"forced,omitempty"`
 
