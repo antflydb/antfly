@@ -62265,6 +62265,19 @@ fn appParityFixtureFamilyAllowsReturningRows(family: AppParityCorpusPlanFamily) 
     };
 }
 
+fn appParityFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) bool {
+    return switch (family) {
+        .insert,
+        .update,
+        .delete,
+        .unsupported_insert,
+        .unsupported_update,
+        .unsupported_delete,
+        => true,
+        else => false,
+    };
+}
+
 fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
     if (dollar + 1 >= sql.len) return null;
     if (sql[dollar] != '$') return null;
@@ -62489,7 +62502,16 @@ fn validateAppParityFixtureMetadata(
     if (!appParitySqlParameterCoverageMatches(entry.sql, entry.params.len)) {
         return error.TestUnexpectedResult;
     }
+    const has_resolver_hint = entry.resolver_row_json.len > 0 or
+        entry.resolver_version != 0 or
+        entry.resolver_exists != null;
+    if (has_resolver_hint and !appParityFixtureFamilyAllowsResolverHint(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
+        return error.TestUnexpectedResult;
+    }
+    if (entry.resolver_row_json.len == 0 and entry.resolver_version != 0) {
         return error.TestUnexpectedResult;
     }
     if (entry.resolver_row_json.len > 0 and !(try appParityJsonTextIsObject(alloc, entry.resolver_row_json))) {
@@ -62666,6 +62688,25 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
         .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
         .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "ignored resolver hint",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
+        .resolver_version = 17,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "resolver version without row",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .operations = 1, .returning = 1 },
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+        .resolver_version = 17,
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
