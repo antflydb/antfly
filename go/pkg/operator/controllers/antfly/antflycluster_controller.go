@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strconv"
@@ -3714,13 +3715,18 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	if cluster.Status.HAStatus == nil {
 		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
 	}
-	body, err := r.executeHAAdminTableCommand(ctx, ha.Admin.PrimaryURL, haPrimaryStatusCommand(ha))
+	status, err := r.observeHAPrimaryStatusTyped(ctx, ha.Admin.PrimaryURL, ha)
 	if err != nil {
-		cluster.Status.HAStatus.PrimaryAdminReachable = false
-		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
-		return err
+		body, tableErr := r.executeHAAdminTableCommand(ctx, ha.Admin.PrimaryURL, haPrimaryStatusCommand(ha))
+		if tableErr == nil {
+			status, tableErr = parseHAPrimaryStatusTable(body)
+		}
+		if tableErr != nil {
+			err = tableErr
+		} else {
+			err = nil
+		}
 	}
-	status, err := parseHAPrimaryStatusTable(body)
 	if err != nil {
 		cluster.Status.HAStatus.PrimaryAdminReachable = false
 		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
@@ -3748,23 +3754,64 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 		if !standbyDesired(standby) || strings.TrimSpace(standby.AdminURL) == "" {
 			continue
 		}
-		body, err := r.executeHAAdminTableCommand(ctx, standby.AdminURL, haStandbyStatusCommand(cluster.Status.HAStatus.PrimaryLSN))
+		status, err := r.observeHAStandbyStatusTyped(ctx, standby.AdminURL, standby.Name, standbySlotName(standby), cluster.Status.HAStatus.PrimaryLSN)
 		if err != nil {
-			if observedErr == nil {
-				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
+			body, tableErr := r.executeHAAdminTableCommand(ctx, standby.AdminURL, haStandbyStatusCommand(cluster.Status.HAStatus.PrimaryLSN))
+			if tableErr == nil {
+				status, tableErr = parseHAStandbyStatusTable(body, standby.Name, standbySlotName(standby))
 			}
-			continue
-		}
-		status, err := parseHAStandbyStatusTable(body, standby.Name, standbySlotName(standby))
-		if err != nil {
-			if observedErr == nil {
-				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
+			if tableErr != nil {
+				if observedErr == nil {
+					observedErr = fmt.Errorf("standby %s: %w", standby.Name, tableErr)
+				}
+				continue
 			}
-			continue
 		}
 		mergeHAStandbyStatus(cluster.Status.HAStatus, status)
 	}
 	return observedErr
+}
+
+func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Context, baseURL string, ha *antflyv1.HighAvailabilitySpec) (haObservedPrimaryStatus, error) {
+	raw, err := r.getHAAdminJSON(ctx, baseURL, "/admin/v1/ha/primary/status", haPrimaryStatusQuery(ha))
+	if err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	return parseHAPrimaryStatusJSON(raw)
+}
+
+func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, baseURL string, standbyName string, slotName string, upstreamLSN uint64) (antflyv1.HAStandbyStatus, error) {
+	raw, err := r.getHAAdminJSON(ctx, baseURL, "/admin/v1/ha/standby/status", haStandbyStatusQuery(upstreamLSN))
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	return parseHAStandbyStatusJSON(raw, standbyName, slotName)
+}
+
+func (r *AntflyClusterReconciler) getHAAdminJSON(ctx context.Context, baseURL string, apiPath string, query url.Values) ([]byte, error) {
+	endpoint := strings.TrimRight(baseURL, "/") + apiPath
+	if encoded := query.Encode(); encoded != "" {
+		endpoint += "?" + encoded
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return raw, nil
 }
 
 func (r *AntflyClusterReconciler) executeHAAdminTableCommand(ctx context.Context, baseURL string, argv []string) (string, error) {
@@ -3833,6 +3880,42 @@ func haStandbyStatusCommand(upstreamLSN uint64) []string {
 	return argv
 }
 
+func haPrimaryStatusQuery(ha *antflyv1.HighAvailabilitySpec) url.Values {
+	query := url.Values{}
+	if ha == nil {
+		return query
+	}
+	if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
+		query.Set("max_lag_lsn", strconv.FormatUint(ha.Retention.MaxLagLSN, 10))
+	}
+	if ha.SyncPolicy != nil && ha.SyncPolicy.Mode != "" && ha.SyncPolicy.Mode != antflyv1.HADurabilityModeAsync {
+		query.Set("sync_mode", haDurabilityModeCLI(ha.SyncPolicy.Mode))
+		if ha.SyncPolicy.Selection != "" {
+			query.Set("sync_selection", haStandbySelectionCLI(ha.SyncPolicy.Selection))
+		}
+		if ha.SyncPolicy.Required > 0 {
+			query.Set("sync_required", strconv.FormatInt(int64(ha.SyncPolicy.Required), 10))
+		}
+		for _, name := range ha.SyncPolicy.StandbyNames {
+			if strings.TrimSpace(name) != "" {
+				query.Add("sync_standby", name)
+			}
+		}
+		if ha.SyncPolicy.FailurePolicy != "" {
+			query.Set("sync_failure", haFailurePolicyCLI(ha.SyncPolicy.FailurePolicy))
+		}
+	}
+	return query
+}
+
+func haStandbyStatusQuery(upstreamLSN uint64) url.Values {
+	query := url.Values{}
+	if upstreamLSN > 0 {
+		query.Set("upstream_lsn", strconv.FormatUint(upstreamLSN, 10))
+	}
+	return query
+}
+
 func haDurabilityModeCLI(mode antflyv1.HADurabilityMode) string {
 	switch mode {
 	case antflyv1.HADurabilityModeRemoteWrite:
@@ -3870,6 +3953,147 @@ type haObservedPrimaryStatus struct {
 	PrimaryLSN uint64
 	Retention  antflyv1.HARetentionStatus
 	Standbys   []antflyv1.HAStandbyStatus
+}
+
+type haAdminStatusJSON struct {
+	Result struct {
+		PrimaryStatus *haPrimaryStatusJSON `json:"primary_status,omitempty"`
+		StandbyStatus *haStandbyStatusJSON `json:"standby_status,omitempty"`
+	} `json:"result"`
+}
+
+type haPrimaryStatusJSON struct {
+	CurrentLSN *uint64 `json:"current_lsn"`
+	Retention  struct {
+		OldestRestartLSN  uint64 `json:"oldest_restart_lsn"`
+		RetainedLSNCount  uint64 `json:"retained_lsn_count"`
+		ActiveSlots       int32  `json:"active_slots"`
+		ReseedRecommended int32  `json:"reseed_recommended"`
+	} `json:"retention"`
+	Slots []struct {
+		Name            string `json:"name"`
+		TimelineID      uint64 `json:"timeline_id"`
+		Active          bool   `json:"active"`
+		ReseedRequired  bool   `json:"reseed_required"`
+		RestartLSN      uint64 `json:"restart_lsn"`
+		ReceivedLSN     uint64 `json:"received_lsn"`
+		AppliedLSN      uint64 `json:"applied_lsn"`
+		SafeReadLSN     uint64 `json:"safe_read_lsn"`
+		WriteLagLSN     uint64 `json:"write_lag_lsn"`
+		ApplyLagLSN     uint64 `json:"apply_lag_lsn"`
+		SafeReadLagLSN  uint64 `json:"safe_read_lag_lsn"`
+		RetentionLagLSN uint64 `json:"retention_lag_lsn"`
+		Status          string `json:"status"`
+		LastError       string `json:"last_error"`
+	} `json:"slots"`
+}
+
+type haStandbyStatusJSON struct {
+	Identity struct {
+		TimelineID uint64 `json:"timeline_id"`
+	} `json:"identity"`
+	ReceivedLSN        *uint64 `json:"received_lsn"`
+	AppliedLSN         *uint64 `json:"applied_lsn"`
+	SafeReadLSN        uint64  `json:"safe_read_lsn"`
+	UpstreamLSN        *uint64 `json:"upstream_lsn"`
+	WriteLagLSN        *uint64 `json:"write_lag_lsn"`
+	ReceiveLagLSN      *uint64 `json:"receive_lag_lsn"`
+	ApplyLagLSN        *uint64 `json:"apply_lag_lsn"`
+	UnappliedLSNCount  uint64  `json:"unapplied_lsn_count"`
+	CaughtUpToReceived bool    `json:"caught_up_to_received"`
+	CanServeSafeReads  bool    `json:"can_serve_safe_reads"`
+}
+
+func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
+	var doc haAdminStatusJSON
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	if doc.Result.PrimaryStatus == nil {
+		return haObservedPrimaryStatus{}, fmt.Errorf("missing primary_status")
+	}
+	snapshot := doc.Result.PrimaryStatus
+	if snapshot.CurrentLSN == nil {
+		return haObservedPrimaryStatus{}, fmt.Errorf("missing current_lsn")
+	}
+	status := haObservedPrimaryStatus{
+		PrimaryLSN: *snapshot.CurrentLSN,
+		Retention: antflyv1.HARetentionStatus{
+			OldestRestartLSN:  snapshot.Retention.OldestRestartLSN,
+			RetainedLSNCount:  snapshot.Retention.RetainedLSNCount,
+			ActiveSlots:       snapshot.Retention.ActiveSlots,
+			ReseedRecommended: snapshot.Retention.ReseedRecommended,
+		},
+	}
+	for _, slot := range snapshot.Slots {
+		if strings.TrimSpace(slot.Name) == "" {
+			continue
+		}
+		status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
+			Name:           slot.Name,
+			SlotName:       slot.Name,
+			TimelineID:     slot.TimelineID,
+			Active:         slot.Active,
+			ReseedRequired: slot.ReseedRequired,
+			RestartLSN:     slot.RestartLSN,
+			ReceivedLSN:    slot.ReceivedLSN,
+			AppliedLSN:     slot.AppliedLSN,
+			SafeReadLSN:    slot.SafeReadLSN,
+			WriteLagLSN:    slot.WriteLagLSN,
+			ApplyLagLSN:    slot.ApplyLagLSN,
+			SafeReadLagLSN: slot.SafeReadLagLSN,
+			Status:         strings.TrimSpace(slot.Status),
+			LastError:      strings.TrimSpace(slot.LastError),
+		})
+	}
+	return status, nil
+}
+
+func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {
+	var doc haAdminStatusJSON
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	if doc.Result.StandbyStatus == nil {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby_status")
+	}
+	snapshot := doc.Result.StandbyStatus
+	status := antflyv1.HAStandbyStatus{
+		Name:               standbyName,
+		SlotName:           slotName,
+		Active:             true,
+		TimelineID:         snapshot.Identity.TimelineID,
+		SafeReadLSN:        snapshot.SafeReadLSN,
+		UnappliedLSNCount:  snapshot.UnappliedLSNCount,
+		CaughtUpToReceived: snapshot.CaughtUpToReceived,
+		CanServeSafeReads:  snapshot.CanServeSafeReads,
+	}
+	if snapshot.ReceivedLSN == nil {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing received_lsn")
+	}
+	status.ReceivedLSN = *snapshot.ReceivedLSN
+	if snapshot.AppliedLSN == nil {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing applied_lsn")
+	}
+	status.AppliedLSN = *snapshot.AppliedLSN
+	if snapshot.UpstreamLSN != nil {
+		status.UpstreamLSN = *snapshot.UpstreamLSN
+	}
+	if snapshot.WriteLagLSN != nil {
+		status.WriteLagLSN = *snapshot.WriteLagLSN
+	}
+	if snapshot.ReceiveLagLSN != nil {
+		status.ReceiveLagLSN = *snapshot.ReceiveLagLSN
+	}
+	if snapshot.ApplyLagLSN != nil {
+		status.ApplyLagLSN = *snapshot.ApplyLagLSN
+	}
+	if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
+		status.Status = "lagging"
+	} else if status.CanServeSafeReads && status.Status == "" {
+		status.Status = "healthy"
+	}
+	return status, nil
 }
 
 func parseHAPrimaryStatusTable(body string) (haObservedPrimaryStatus, error) {

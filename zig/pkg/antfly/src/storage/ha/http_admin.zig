@@ -79,10 +79,10 @@ pub const Server = struct {
                     return try textResponse(self.alloc, 503, "not ready");
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
-                    return try self.handleAdminPrimaryStatus();
+                    return try self.handleAdminPrimaryStatus(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_status)) {
-                    return try self.handleAdminStandbyStatus();
+                    return try self.handleAdminStandbyStatus(req);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_replication_slots)) {
                     return try self.handleAdminReplicationSlots();
@@ -149,19 +149,39 @@ pub const Server = struct {
         }
     }
 
-    fn handleAdminPrimaryStatus(self: *Server) !http_common.HttpResponse {
+    fn handleAdminPrimaryStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const query = requestQuery(req.uri);
+        const max_lag_lsn = if (queryValue(query, "max_lag_lsn")) |raw|
+            uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA primary status request")
+        else
+            0;
+        var sync = buildSyncPolicyFromQuery(self.alloc, query) catch
+            return try textResponse(self.alloc, 400, "invalid HA primary status request");
+        errdefer sync.deinit(self.alloc);
+
         var plan = admin_cli.Plan{
             .output = .json,
-            .command = .{ .primary_status = .{} },
+            .command = .{ .primary_status = .{
+                .retention_policy = .{ .max_lag_lsn = max_lag_lsn },
+                .sync_policy = sync.policy,
+            } },
+            .owned_standby_names = sync.owned_standby_names,
         };
+        sync.owned_standby_names = &.{};
         defer plan.deinit(self.alloc);
         return try self.handleJsonPlan(plan);
     }
 
-    fn handleAdminStandbyStatus(self: *Server) !http_common.HttpResponse {
+    fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const query = requestQuery(req.uri);
+        const upstream_lsn = if (queryValue(query, "upstream_lsn")) |raw|
+            uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA standby status request")
+        else
+            null;
+
         var plan = admin_cli.Plan{
             .output = .json,
-            .command = .{ .standby_status = .{} },
+            .command = .{ .standby_status = .{ .upstream_lsn = upstream_lsn } },
         };
         defer plan.deinit(self.alloc);
         return try self.handleJsonPlan(plan);
@@ -452,10 +472,19 @@ pub const Server = struct {
 };
 
 fn requestPath(uri: []const u8) []const u8 {
-    const scheme_index = std.mem.indexOf(u8, uri, "://") orelse return uri;
-    const authority_start = scheme_index + 3;
-    const path_index = std.mem.indexOfScalarPos(u8, uri, authority_start, '/') orelse return "/";
-    return uri[path_index..];
+    const path_with_query = if (std.mem.indexOf(u8, uri, "://")) |scheme_index| blk: {
+        const authority_start = scheme_index + 3;
+        const path_index = std.mem.indexOfScalarPos(u8, uri, authority_start, '/') orelse return "/";
+        break :blk uri[path_index..];
+    } else uri;
+    const query_index = std.mem.indexOfScalar(u8, path_with_query, '?') orelse return path_with_query;
+    return path_with_query[0..query_index];
+}
+
+fn requestQuery(uri: []const u8) []const u8 {
+    const query_index = std.mem.indexOfScalar(u8, uri, '?') orelse return "";
+    const fragment_index = std.mem.indexOfScalarPos(u8, uri, query_index + 1, '#') orelse uri.len;
+    return uri[query_index + 1 .. fragment_index];
 }
 
 fn knownFixedRoute(path: []const u8) bool {
@@ -488,6 +517,103 @@ fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing
         .force = request.force orelse false,
         .reason = request.reason orelse "",
     };
+}
+
+const QuerySyncPolicy = struct {
+    policy: ?primary_mod.SyncPolicy = null,
+    owned_standby_names: []const []const u8 = &.{},
+
+    fn deinit(self: *QuerySyncPolicy, alloc: Allocator) void {
+        alloc.free(self.owned_standby_names);
+        self.* = undefined;
+    }
+};
+
+fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolicy {
+    var mode: ?primary_mod.DurabilityMode = null;
+    var selection: primary_mod.StandbySelection = .any;
+    var required: usize = 1;
+    var failure_policy: primary_mod.FailurePolicy = .block;
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer names.deinit(alloc);
+
+    if (queryValue(query, "sync_mode")) |raw| mode = try parseDurabilityModeQuery(raw);
+    if (queryValue(query, "sync_selection")) |raw| selection = try parseStandbySelectionQuery(raw);
+    if (queryValue(query, "sync_required")) |raw| {
+        const parsed = try uint64Text(raw);
+        if (parsed == 0 or parsed > std.math.maxInt(usize)) return error.InvalidAdminRequest;
+        required = @intCast(parsed);
+    }
+    if (queryValue(query, "sync_failure")) |raw| failure_policy = try parseFailurePolicyQuery(raw);
+
+    var iter = std.mem.splitScalar(u8, query, '&');
+    while (iter.next()) |part| {
+        const key, const value = splitQueryPart(part);
+        if (std.mem.eql(u8, key, "sync_standby")) {
+            if (value.len == 0) return error.InvalidAdminRequest;
+            try names.append(alloc, value);
+        }
+    }
+
+    const configured = mode != null or
+        selection != .any or
+        required != 1 or
+        failure_policy != .block or
+        names.items.len > 0;
+    if (!configured) return .{};
+
+    const owned = try names.toOwnedSlice(alloc);
+    names = .empty;
+    return .{
+        .policy = .{
+            .mode = mode orelse .remote_write,
+            .selection = selection,
+            .required = required,
+            .standby_names = owned,
+            .failure_policy = failure_policy,
+        },
+        .owned_standby_names = owned,
+    };
+}
+
+fn queryValue(query: []const u8, key: []const u8) ?[]const u8 {
+    var iter = std.mem.splitScalar(u8, query, '&');
+    while (iter.next()) |part| {
+        const part_key, const part_value = splitQueryPart(part);
+        if (std.mem.eql(u8, part_key, key)) return part_value;
+    }
+    return null;
+}
+
+fn splitQueryPart(part: []const u8) struct { []const u8, []const u8 } {
+    if (std.mem.indexOfScalar(u8, part, '=')) |idx| return .{ part[0..idx], part[idx + 1 ..] };
+    return .{ part, "" };
+}
+
+fn uint64Text(raw: []const u8) !u64 {
+    if (raw.len == 0) return error.InvalidAdminRequest;
+    return std.fmt.parseUnsigned(u64, raw, 10) catch error.InvalidAdminRequest;
+}
+
+fn parseDurabilityModeQuery(raw: []const u8) !primary_mod.DurabilityMode {
+    if (std.mem.eql(u8, raw, "async")) return .async;
+    if (std.mem.eql(u8, raw, "remote_write") or std.mem.eql(u8, raw, "remote-write")) return .remote_write;
+    if (std.mem.eql(u8, raw, "remote_apply") or std.mem.eql(u8, raw, "remote-apply")) return .remote_apply;
+    return error.InvalidAdminRequest;
+}
+
+fn parseStandbySelectionQuery(raw: []const u8) !primary_mod.StandbySelection {
+    if (std.mem.eql(u8, raw, "any")) return .any;
+    if (std.mem.eql(u8, raw, "first")) return .first;
+    if (std.mem.eql(u8, raw, "all")) return .all;
+    return error.InvalidAdminRequest;
+}
+
+fn parseFailurePolicyQuery(raw: []const u8) !primary_mod.FailurePolicy {
+    if (std.mem.eql(u8, raw, "block")) return .block;
+    if (std.mem.eql(u8, raw, "fail_closed") or std.mem.eql(u8, raw, "fail-closed")) return .fail_closed;
+    if (std.mem.eql(u8, raw, "degrade_to_async") or std.mem.eql(u8, raw, "degrade-to-async")) return .degrade_to_async;
+    return error.InvalidAdminRequest;
 }
 
 fn adminFenceReceiptFromOpenApi(receipt: admin_api.HAFenceReceipt) !fencing.Receipt {
@@ -841,6 +967,39 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_standby_status.body, "\"standby_status\"");
     try expectContains(typed_standby_status.body, "\"received_lsn\":1");
     try expectContains(typed_standby_status.body, "\"applied_lsn\":1");
+
+    const typed_primary_policy_uri = try std.fmt.allocPrint(
+        alloc,
+        "{s}?max_lag_lsn=1&sync_mode=remote-apply&sync_standby=standby-a&sync_failure=fail-closed",
+        .{admin_api.routes.ha_primary_status},
+    );
+    defer alloc.free(typed_primary_policy_uri);
+    var typed_primary_policy_status = try server.handle(.{
+        .method = .GET,
+        .uri = typed_primary_policy_uri,
+    });
+    defer typed_primary_policy_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_primary_policy_status.status);
+    try expectContains(typed_primary_policy_status.body, "\"primary_status\"");
+    try expectContains(typed_primary_policy_status.body, "\"durability\"");
+    try expectContains(typed_primary_policy_status.body, "\"mode\":\"remote_apply\"");
+    try expectContains(typed_primary_policy_status.body, "\"status\":\"satisfied\"");
+
+    const typed_standby_upstream_uri = try std.fmt.allocPrint(
+        alloc,
+        "{s}?upstream_lsn=2",
+        .{admin_api.routes.ha_standby_status},
+    );
+    defer alloc.free(typed_standby_upstream_uri);
+    var typed_standby_upstream_status = try server.handle(.{
+        .method = .GET,
+        .uri = typed_standby_upstream_uri,
+    });
+    defer typed_standby_upstream_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_standby_upstream_status.status);
+    try expectContains(typed_standby_upstream_status.body, "\"standby_status\"");
+    try expectContains(typed_standby_upstream_status.body, "\"upstream_lsn\":2");
+    try expectContains(typed_standby_upstream_status.body, "\"write_lag_lsn\":1");
 
     var invalid_progress = try server.handle(.{
         .method = .POST,

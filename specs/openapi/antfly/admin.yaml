@@ -21,6 +21,55 @@ paths:
       tags: [ha]
       operationId: getHAPrimaryStatus
       summary: Get primary HA status
+      parameters:
+        - name: max_lag_lsn
+          in: query
+          required: false
+          description: Mark slots reseed-recommended after this many retained LSNs.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+        - name: sync_mode
+          in: query
+          required: false
+          description: Optional synchronous durability mode to evaluate.
+          schema:
+            type: string
+            enum: [async, remote-write, remote-apply]
+        - name: sync_selection
+          in: query
+          required: false
+          description: How named standbys satisfy the synchronous policy.
+          schema:
+            type: string
+            enum: [any, first, all]
+        - name: sync_required
+          in: query
+          required: false
+          description: Number of standbys required for the synchronous policy.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 1
+        - name: sync_standby
+          in: query
+          required: false
+          description: Repeatable synchronous standby name.
+          schema:
+            type: array
+            items:
+              type: string
+              minLength: 1
+          style: form
+          explode: true
+        - name: sync_failure
+          in: query
+          required: false
+          description: Synchronous standby failure policy.
+          schema:
+            type: string
+            enum: [block, fail-closed, degrade-to-async]
       responses:
         "200":
           description: Primary status snapshot.
@@ -35,6 +84,15 @@ paths:
       tags: [ha]
       operationId: getHAStandbyStatus
       summary: Get standby HA status
+      parameters:
+        - name: upstream_lsn
+          in: query
+          required: false
+          description: Current upstream primary LSN used to compute standby lag.
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
       responses:
         "200":
           description: Standby status snapshot.

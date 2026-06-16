@@ -1149,42 +1149,24 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g := NewWithT(t)
 
-	var observedArgv []string
+	var observedTypedURL string
 	reconciler := &AntflyClusterReconciler{
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			g.Expect(req.Method).To(Equal(http.MethodPost))
-			g.Expect(req.URL.String()).To(Equal("http://primary-ha.default.svc:8081/ha/v1/admin/command"))
-			var payload struct {
-				Argv []string `json:"argv"`
-			}
-			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
-			observedArgv = append([]string{}, payload.Argv...)
-			body := strings.Join([]string{
-				"result=primary_status",
-				"role=primary",
-				"current_lsn=12",
-				"slot_count=1",
-				"retention.oldest_restart_lsn=7",
-				"retention.retained_lsn_count=5",
-				"retention.active_slots=1",
-				"retention.reseed_recommended=0",
-				"slots.0.name=standby-a",
-				"slots.0.timeline_id=4",
-				"slots.0.active=true",
-				"slots.0.reseed_required=false",
-				"slots.0.restart_lsn=7",
-				"slots.0.received_lsn=12",
-				"slots.0.applied_lsn=11",
-				"slots.0.safe_read_lsn=11",
-				"slots.0.write_lag_lsn=0",
-				"slots.0.apply_lag_lsn=1",
-				"slots.0.safe_read_lag_lsn=1",
-				"slots.0.status=healthy",
-				"",
-			}, "\n")
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
+			g.Expect(req.Header.Get("Accept")).To(Equal("application/json"))
+			observedTypedURL = req.URL.String()
+			query := req.URL.Query()
+			g.Expect(query.Get("max_lag_lsn")).To(Equal("50"))
+			g.Expect(query.Get("sync_mode")).To(Equal("remote-apply"))
+			g.Expect(query.Get("sync_selection")).To(Equal("first"))
+			g.Expect(query.Get("sync_required")).To(Equal("1"))
+			g.Expect(query["sync_standby"]).To(Equal([]string{"standby-a"}))
+			g.Expect(query.Get("sync_failure")).To(Equal("fail-closed"))
+			body := `{"schema_version":1,"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply"}}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
 				Body:       io.NopCloser(strings.NewReader(body)),
 			}, nil
 		})},
@@ -1209,15 +1191,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	}
 
 	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
-	g.Expect(observedArgv).To(Equal([]string{
-		"--table", "status", "primary",
-		"--max-lag-lsn", "50",
-		"--sync-mode", "remote-apply",
-		"--sync-selection", "first",
-		"--sync-required", "1",
-		"--sync-standby", "standby-a",
-		"--sync-failure", "fail-closed",
-	}))
+	g.Expect(observedTypedURL).To(ContainSubstring("/admin/v1/ha/primary/status?"))
 	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(12)))
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(BeEmpty())
@@ -1241,38 +1215,69 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("primary admin refused connection"))
 }
 
-func TestObserveHAStandbyAdminStatuses(t *testing.T) {
+func TestObserveHAPrimaryAdminStatusFallsBackToCommandEndpoint(t *testing.T) {
 	g := NewWithT(t)
 
 	var observedArgv []string
 	reconciler := &AntflyClusterReconciler{
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method == http.MethodGet {
+				g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader("not found")),
+				}, nil
+			}
 			g.Expect(req.Method).To(Equal(http.MethodPost))
-			g.Expect(req.URL.String()).To(Equal("http://standby-a-ha.default.svc:8081/ha/v1/admin/command"))
+			g.Expect(req.URL.String()).To(Equal("http://primary-ha.default.svc:8081/ha/v1/admin/command"))
 			var payload struct {
 				Argv []string `json:"argv"`
 			}
 			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 			observedArgv = append([]string{}, payload.Argv...)
 			body := strings.Join([]string{
-				"result=standby_status",
-				"role=standby",
-				"identity.timeline_id=4",
-				"received_lsn=12",
-				"applied_lsn=11",
-				"safe_read_lsn=11",
-				"upstream_lsn=13",
-				"write_lag_lsn=1",
-				"receive_lag_lsn=1",
-				"apply_lag_lsn=2",
-				"unapplied_lsn_count=1",
-				"caught_up_to_received=true",
-				"can_serve_safe_reads=true",
+				"result=primary_status",
+				"current_lsn=12",
+				"retention.oldest_restart_lsn=7",
+				"retention.retained_lsn_count=5",
+				"retention.active_slots=1",
 				"",
 			}, "\n")
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(observedArgv).To(Equal([]string{"--table", "status", "primary"}))
+	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(12)))
+}
+
+func TestObserveHAStandbyAdminStatuses(t *testing.T) {
+	g := NewWithT(t)
+
+	var observedTypedURL string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			g.Expect(req.URL.Query().Get("upstream_lsn")).To(Equal("13"))
+			observedTypedURL = req.URL.String()
+			body := `{"schema_version":1,"result":{"standby_status":{"role":"standby","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"unapplied_lsn_count":1,"caught_up_to_received":true,"can_serve_safe_reads":true}}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
 				Body:       io.NopCloser(strings.NewReader(body)),
 			}, nil
 		})},
@@ -1303,7 +1308,7 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	}
 
 	g.Expect(reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)).To(Succeed())
-	g.Expect(observedArgv).To(Equal([]string{"--table", "status", "standby", "--upstream-lsn", "13"}))
+	g.Expect(observedTypedURL).To(ContainSubstring("/admin/v1/ha/standby/status?"))
 	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
 	standby := cluster.Status.HAStatus.Standbys[0]
 	g.Expect(standby.Name).To(Equal("standby-a"))

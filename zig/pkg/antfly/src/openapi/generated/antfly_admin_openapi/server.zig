@@ -6,6 +6,26 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
+pub const GetHAPrimaryStatusParams = struct {
+    /// Mark slots reseed-recommended after this many retained LSNs.
+    max_lag_lsn: ?[]const u8 = null,
+    /// Optional synchronous durability mode to evaluate.
+    sync_mode: ?[]const u8 = null,
+    /// How named standbys satisfy the synchronous policy.
+    sync_selection: ?[]const u8 = null,
+    /// Number of standbys required for the synchronous policy.
+    sync_required: ?[]const u8 = null,
+    /// Repeatable synchronous standby name.
+    sync_standby: ?[]const u8 = null,
+    /// Synchronous standby failure policy.
+    sync_failure: ?[]const u8 = null,
+};
+
+pub const GetHAStandbyStatusParams = struct {
+    /// Current upstream primary LSN used to compute standby lag.
+    upstream_lsn: ?[]const u8 = null,
+};
+
 /// Parse the JSON request body for createHAReplicationSlot.
 pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ReplicationSlotCreateRequest) {
     return std.json.parseFromSlice(types.ReplicationSlotCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -153,14 +173,25 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// GET /ha/primary/status
         fn getHAPrimaryStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.getHAPrimaryStatus(ctx);
+            const query_params = GetHAPrimaryStatusParams{
+                .max_lag_lsn = ctx.query("max_lag_lsn"),
+                .sync_mode = ctx.query("sync_mode"),
+                .sync_selection = ctx.query("sync_selection"),
+                .sync_required = ctx.query("sync_required"),
+                .sync_standby = ctx.query("sync_standby"),
+                .sync_failure = ctx.query("sync_failure"),
+            };
+            return impl.getHAPrimaryStatus(ctx, query_params);
         }
 
         /// Get standby HA status
         /// GET /ha/standby/status
         fn getHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.getHAStandbyStatus(ctx);
+            const query_params = GetHAStandbyStatusParams{
+                .upstream_lsn = ctx.query("upstream_lsn"),
+            };
+            return impl.getHAStandbyStatus(ctx, query_params);
         }
 
         /// List HA replication slots
@@ -268,8 +299,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 
 // Handler interface. Implement these methods on your Impl struct:
 //
-//   fn getHAPrimaryStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getHAPrimaryStatus(self: *Impl, ctx: *httpx.Context, params: GetHAPrimaryStatusParams) !httpx.Response
+//   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
 //   fn listHAReplicationSlots(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
