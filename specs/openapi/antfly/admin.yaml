@@ -208,7 +208,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HABaseBackupBeginResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -230,7 +230,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HABaseBackupFinishResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -252,7 +252,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/HACommandResult"
+                $ref: "#/components/schemas/HAStandbyBootstrapResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -671,6 +671,67 @@ components:
           enum: [create, pause, resume, drop]
         slot:
           $ref: "#/components/schemas/HAReplicationSlot"
+    HABaseBackupBeginResponse:
+      type: object
+      required: [schema_version, backup_lsn, start_record_lsn]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: LSN reserved as the base-backup start boundary.
+        start_record_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Durable `backup_start` record LSN.
+    HABaseBackupFinishResponse:
+      type: object
+      required: [schema_version, manifest_id, backup_lsn, end_record_lsn]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        manifest_id:
+          type: string
+          minLength: 1
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        end_record_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Durable `backup_end` record LSN.
+    HAStandbyBootstrapResponse:
+      type: object
+      required: [schema_version, manifest_id, backup_lsn, checkpoint_lsn]
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        manifest_id:
+          type: string
+          minLength: 1
+        backup_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        checkpoint_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Standby checkpoint LSN after manifest validation.
     HAPrimarySnapshot:
       type: object
       required: [role, identity, current_lsn, slots, retention]

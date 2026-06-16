@@ -44,6 +44,30 @@ pub const PromotionAssessRequest = struct {
     use_current_fence: ?bool = null,
 };
 
+pub const HABaseBackupBeginResponse = struct {
+    schema_version: i64,
+    /// LSN reserved as the base-backup start boundary.
+    backup_lsn: i64,
+    /// Durable `backup_start` record LSN.
+    start_record_lsn: i64,
+};
+
+pub const HABaseBackupFinishResponse = struct {
+    schema_version: i64,
+    manifest_id: []const u8,
+    backup_lsn: i64,
+    /// Durable `backup_end` record LSN.
+    end_record_lsn: i64,
+};
+
+pub const HAStandbyBootstrapResponse = struct {
+    schema_version: i64,
+    manifest_id: []const u8,
+    backup_lsn: i64,
+    /// Standby checkpoint LSN after manifest validation.
+    checkpoint_lsn: i64,
+};
+
 pub const HASlotSnapshot = struct {
     name: []const u8,
     timeline_id: i64,

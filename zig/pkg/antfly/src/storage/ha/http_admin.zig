@@ -238,6 +238,7 @@ pub const Server = struct {
     }
 
     fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup request");
         var parsed = admin_api.openapi.server.parseBeginHABaseBackupBody(
             self.alloc,
@@ -245,15 +246,16 @@ pub const Server = struct {
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup request");
         defer parsed.deinit();
 
-        var plan = admin_cli.Plan{
-            .output = .json,
-            .command = .{ .seed = .{ .begin = .{
-                .slot_name = parsed.value.slot_name,
-                .manifest_id = parsed.value.manifest_id,
-            } } },
+        const result = ha_admin.beginBaseBackup(primary, .{
+            .slot_name = parsed.value.slot_name,
+            .manifest_id = parsed.value.manifest_id,
+        }) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        return try self.handleTypedJson(BaseBackupBeginDocument{
+            .backup_lsn = result.backup_lsn,
+            .start_record_lsn = result.start_record_lsn,
+        });
     }
 
     fn handleAdminFinishBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -271,7 +273,18 @@ pub const Server = struct {
             } } },
         };
         defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        var result = admin_exec.execute(self.alloc, self.ctx, plan) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+        return switch (result) {
+            .seed_finish => |seed| try self.handleTypedJson(BaseBackupFinishDocument{
+                .manifest_id = seed.manifest_id,
+                .backup_lsn = seed.backup_lsn,
+                .end_record_lsn = seed.end_record_lsn,
+            }),
+            else => unreachable,
+        };
     }
 
     fn handleAdminBootstrapStandby(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -290,7 +303,18 @@ pub const Server = struct {
             } } },
         };
         defer plan.deinit(self.alloc);
-        return try self.handleJsonPlan(plan);
+        var result = admin_exec.execute(self.alloc, self.ctx, plan) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+        return switch (result) {
+            .seed_bootstrap => |seed| try self.handleTypedJson(StandbyBootstrapDocument{
+                .manifest_id = seed.manifest_id,
+                .backup_lsn = seed.backup_lsn,
+                .checkpoint_lsn = seed.checkpoint_lsn,
+            }),
+            else => unreachable,
+        };
     }
 
     fn handleAdminFenceCurrent(self: *Server) !http_common.HttpResponse {
@@ -476,6 +500,26 @@ const SlotActionDocument = struct {
     schema_version: u32 = 1,
     slot_action: []const u8,
     slot: SlotDocument,
+};
+
+const BaseBackupBeginDocument = struct {
+    schema_version: u32 = 1,
+    backup_lsn: u64,
+    start_record_lsn: u64,
+};
+
+const BaseBackupFinishDocument = struct {
+    schema_version: u32 = 1,
+    manifest_id: []const u8,
+    backup_lsn: u64,
+    end_record_lsn: u64,
+};
+
+const StandbyBootstrapDocument = struct {
+    schema_version: u32 = 1,
+    manifest_id: []const u8,
+    backup_lsn: u64,
+    checkpoint_lsn: u64,
 };
 
 const SlotDocument = struct {
@@ -1188,8 +1232,9 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     defer typed_begin.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_begin.status);
     try std.testing.expectEqualStrings("application/json", typed_begin.content_type.?);
-    try expectContains(typed_begin.body, "\"seed_begin\"");
+    try expectContains(typed_begin.body, "\"schema_version\":1");
     try expectContains(typed_begin.body, "\"backup_lsn\":1");
+    try expectContains(typed_begin.body, "\"start_record_lsn\":1");
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
 
     const files = seedFiles();
@@ -1223,7 +1268,7 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     defer typed_finish.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_finish.status);
     try std.testing.expectEqualStrings("application/json", typed_finish.content_type.?);
-    try expectContains(typed_finish.body, "\"seed_finish\"");
+    try expectContains(typed_finish.body, "\"schema_version\":1");
     try expectContains(typed_finish.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_finish.body, "\"end_record_lsn\":3");
 
@@ -1242,7 +1287,7 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     defer typed_bootstrap.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_bootstrap.status);
     try std.testing.expectEqualStrings("application/json", typed_bootstrap.content_type.?);
-    try expectContains(typed_bootstrap.body, "\"seed_bootstrap\"");
+    try expectContains(typed_bootstrap.body, "\"schema_version\":1");
     try expectContains(typed_bootstrap.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_bootstrap.body, "\"checkpoint_lsn\":2");
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());
