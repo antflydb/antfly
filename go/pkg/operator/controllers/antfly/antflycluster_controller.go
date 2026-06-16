@@ -3259,9 +3259,21 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		if len(action.AdminCommand) == 0 || strings.TrimSpace(action.AdminURL) == "" {
 			continue
 		}
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
+			continue
+		}
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			if action.AdminJobName == "" && action.AdminJobPhase == "" {
 				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
+			}
+			continue
+		}
+		if handled, err := r.executeHAPlannedActionTyped(ctx, action); handled {
+			action.AdminJobName = haAdminDirectAPIName
+			if err != nil {
+				action.AdminJobPhase = haAdminJobPhaseFailed
+			} else {
+				action.AdminJobPhase = haAdminJobPhaseSucceeded
 			}
 			continue
 		}
@@ -3287,6 +3299,63 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 	}
 	return nil
+}
+
+const haAdminDirectAPIName = "direct-admin-api"
+
+func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, action *antflyv1.HAPlannedActionStatus) (bool, error) {
+	if action == nil {
+		return false, nil
+	}
+	switch action.Kind {
+	case string(haActionCreateSlot):
+		slotName := haActionSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		body := map[string]any{"slot_name": slotName}
+		if action.TargetLSN > 0 {
+			body["initial_lsn"] = action.TargetLSN
+		}
+		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/replication-slots", body)
+	case string(haActionPauseSlot):
+		slotName := haActionSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		return true, r.requestHAAdminNoBody(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/pause")
+	case string(haActionResumeSlot):
+		slotName := haActionSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		return true, r.requestHAAdminNoBody(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/resume")
+	case string(haActionDropSlot):
+		slotName := haActionSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		return true, r.requestHAAdminNoBody(ctx, http.MethodDelete, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName))
+	case string(haActionSeedStandby), string(haActionMarkReseed):
+		slotName := haActionSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		body := map[string]any{
+			"slot_name":   slotName,
+			"manifest_id": fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN),
+		}
+		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
+	default:
+		return false, nil
+	}
+}
+
+func haActionSlotName(action antflyv1.HAPlannedActionStatus) string {
+	if strings.TrimSpace(action.SlotName) != "" {
+		return strings.TrimSpace(action.SlotName)
+	}
+	return strings.TrimSpace(action.StandbyName)
 }
 
 func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) {
@@ -3812,6 +3881,47 @@ func (r *AntflyClusterReconciler) getHAAdminJSON(ctx context.Context, baseURL st
 		return nil, fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return raw, nil
+}
+
+func (r *AntflyClusterReconciler) postHAAdminJSON(ctx context.Context, baseURL string, apiPath string, body any) error {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	return r.requestHAAdminJSON(ctx, http.MethodPost, baseURL, apiPath, raw)
+}
+
+func (r *AntflyClusterReconciler) requestHAAdminNoBody(ctx context.Context, method string, baseURL string, apiPath string) error {
+	return r.requestHAAdminJSON(ctx, method, baseURL, apiPath, nil)
+}
+
+func (r *AntflyClusterReconciler) requestHAAdminJSON(ctx context.Context, method string, baseURL string, apiPath string, body []byte) error {
+	endpoint := strings.TrimRight(baseURL, "/") + apiPath
+	var reader io.Reader
+	if body != nil {
+		reader = strings.NewReader(string(body))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
 }
 
 func (r *AntflyClusterReconciler) executeHAAdminTableCommand(ctx context.Context, baseURL string, argv []string) (string, error) {
