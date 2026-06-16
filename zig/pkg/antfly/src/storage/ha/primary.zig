@@ -271,7 +271,7 @@ pub const Primary = struct {
         self: *Primary,
         policy: slot_store.RetentionPolicy,
     ) !slot_store.RetentionSnapshot {
-        return try self.slots.retentionSnapshot(self.lastLsn(), policy);
+        return try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
     }
 
     pub fn evaluateDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
@@ -736,6 +736,39 @@ test "storage.ha primary refuses streaming from reseed or expired slots" {
 
     try primary.slots.markReseedRequired("standby-a");
     try std.testing.expectError(error.SlotRequiresReseed, primary.streamFrom(alloc, "standby-a", 2));
+}
+
+test "storage.ha primary scopes retention to the current timeline" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "timeline-retention");
+    defer paths.deinit(alloc);
+    var identity = testIdentity();
+    identity.timeline_id = 2;
+    identity.epoch = 2;
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+    _ = try primary.append(.{ .payload = "three" });
+    try primary.createSlot("current-timeline", 3);
+    try primary.slots.createOrUpdate(.{
+        .name = "old-timeline",
+        .timeline_id = 1,
+        .restart_lsn = 1,
+        .received_lsn = 1,
+        .applied_lsn = 1,
+    });
+
+    const retention = try primary.retentionSnapshot(.{});
+    try std.testing.expectEqual(@as(usize, 1), retention.active_slots);
+    try std.testing.expectEqual(@as(usize, 1), retention.reseed_recommended);
+    try std.testing.expectEqual(@as(u64, 3), retention.oldest_restart_lsn);
+    try std.testing.expectEqual(@as(u64, 1), retention.retained_lsn_count);
+
+    const old = primary.slot("old-timeline") orelse return error.TestExpectedEqual;
+    try std.testing.expect(old.reseed_required);
+    try std.testing.expectError(error.SlotRequiresReseed, primary.streamFrom(alloc, "old-timeline", 1));
 }
 
 test "storage.ha primary pauses and resumes slot streaming across reopen" {

@@ -247,6 +247,24 @@ pub const SlotStore = struct {
         primary_lsn: u64,
         policy: RetentionPolicy,
     ) !RetentionSnapshot {
+        return try self.retentionSnapshotInternal(primary_lsn, null, policy);
+    }
+
+    pub fn retentionSnapshotForTimeline(
+        self: *SlotStore,
+        primary_lsn: u64,
+        timeline_id: u64,
+        policy: RetentionPolicy,
+    ) !RetentionSnapshot {
+        return try self.retentionSnapshotInternal(primary_lsn, timeline_id, policy);
+    }
+
+    fn retentionSnapshotInternal(
+        self: *SlotStore,
+        primary_lsn: u64,
+        current_timeline_id: ?u64,
+        policy: RetentionPolicy,
+    ) !RetentionSnapshot {
         var mark_reseed: std.ArrayListUnmanaged([]const u8) = .empty;
         defer {
             for (mark_reseed.items) |name| self.alloc.free(name);
@@ -259,6 +277,17 @@ pub const SlotStore = struct {
 
         for (self.slots.items) |slot| {
             if (!slot.state.active) continue;
+            if (current_timeline_id) |timeline_id| {
+                if (slot.state.timeline_id != timeline_id) {
+                    if (!slot.state.reseed_required) {
+                        const name = try self.alloc.dupe(u8, slot.state.name);
+                        errdefer self.alloc.free(name);
+                        try mark_reseed.append(self.alloc, name);
+                    }
+                    reseed += 1;
+                    continue;
+                }
+            }
             active += 1;
             if (slot.state.reseed_required or
                 (policy.max_lag_lsn > 0 and primary_lsn -| slot.state.restart_lsn > policy.max_lag_lsn))
