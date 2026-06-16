@@ -137,8 +137,7 @@ pub const SlotStore = struct {
     }
 
     pub fn createOrUpdate(self: *SlotStore, state: SlotState) !void {
-        if (state.name.len == 0) return error.InvalidSlotName;
-        if (state.applied_lsn > state.received_lsn) return error.InvalidSlotProgress;
+        try validateSlotState(state);
         try self.persistAndApply(.{
             .event_type = .upsert,
             .state = state,
@@ -336,6 +335,7 @@ pub const SlotStore = struct {
     }
 
     fn applyEvent(self: *SlotStore, event: EventView) !void {
+        try validateSlotState(event.state);
         switch (event.event_type) {
             .upsert => {
                 if (self.findIndex(event.state.name)) |idx| {
@@ -381,6 +381,14 @@ pub const SlotStore = struct {
         return null;
     }
 };
+
+fn validateSlotState(state: SlotState) !void {
+    if (state.name.len == 0) return error.InvalidSlotName;
+    if (state.applied_lsn > state.received_lsn) return error.InvalidSlotProgress;
+    if (state.last_error) |last_error| {
+        if (last_error.len == 0) return error.InvalidReplicationError;
+    }
+}
 
 pub fn freeSlotList(alloc: Allocator, slots: []SlotState) void {
     for (slots) |slot| {
@@ -621,6 +629,49 @@ test "storage.ha slot store decodes v1 slot events without last error" {
     try std.testing.expectEqual(EventType.upsert, event.event_type);
     try std.testing.expectEqualStrings("standby-a", event.state.name);
     try std.testing.expect(event.state.last_error == null);
+}
+
+test "storage.ha slot store rejects invalid slot state on replay" {
+    const alloc = std.testing.allocator;
+    const progress_path = try testPath(alloc, "replay-bad-progress");
+    defer alloc.free(progress_path);
+    {
+        var store = try SlotStore.open(alloc, progress_path.ptr, .{});
+        defer store.close();
+        const encoded = try encodeEvent(alloc, .{
+            .event_type = .upsert,
+            .state = .{
+                .name = "standby-a",
+                .timeline_id = 1,
+                .restart_lsn = 4,
+                .received_lsn = 3,
+                .applied_lsn = 4,
+            },
+        });
+        defer alloc.free(encoded);
+        _ = try store.wal.append(encoded);
+    }
+    try std.testing.expectError(error.InvalidSlotProgress, SlotStore.open(alloc, progress_path.ptr, .{}));
+
+    const name_path = try testPath(alloc, "replay-empty-name");
+    defer alloc.free(name_path);
+    {
+        var store = try SlotStore.open(alloc, name_path.ptr, .{});
+        defer store.close();
+        const encoded = try encodeEvent(alloc, .{
+            .event_type = .upsert,
+            .state = .{
+                .name = "",
+                .timeline_id = 1,
+                .restart_lsn = 1,
+                .received_lsn = 1,
+                .applied_lsn = 1,
+            },
+        });
+        defer alloc.free(encoded);
+        _ = try store.wal.append(encoded);
+    }
+    try std.testing.expectError(error.InvalidSlotName, SlotStore.open(alloc, name_path.ptr, .{}));
 }
 
 test "storage.ha slot store computes retention floor from active slots" {
