@@ -997,6 +997,7 @@ pub const CreateSequencePlan = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.sequence_name);
+        self.options.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1008,6 +1009,7 @@ pub const AlterSequencePlan = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.sequence_name);
+        freeSequenceAlterOperations(alloc, self.operations);
         if (self.operations.len > 0) alloc.free(self.operations);
         self.* = undefined;
     }
@@ -1025,15 +1027,35 @@ pub const DropSequencePlan = struct {
 };
 
 pub const SequenceOptions = struct {
+    as_type: ?[]const u8 = null,
     start_with: ?i64 = null,
     increment_by: ?i64 = null,
     min_value: ?i64 = null,
     max_value: ?i64 = null,
     cache: ?i64 = null,
     cycle: ?bool = null,
+    owned_by: ?SequenceOwnedBy = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.as_type) |as_type| alloc.free(as_type);
+        if (self.owned_by) |*owned_by| owned_by.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const SequenceOwnedBy = struct {
+    table_name: []const u8 = "",
+    column_name: []const u8 = "",
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.table_name.len > 0) alloc.free(self.table_name);
+        if (self.column_name.len > 0) alloc.free(self.column_name);
+        self.* = undefined;
+    }
 };
 
 pub const SequenceAlterOperation = union(enum) {
+    set_type: []const u8,
     restart: ?i64,
     set_start: i64,
     set_increment: i64,
@@ -1041,6 +1063,7 @@ pub const SequenceAlterOperation = union(enum) {
     set_max: ?i64,
     set_cache: i64,
     set_cycle: bool,
+    set_owned_by: SequenceOwnedBy,
 };
 
 pub const IdentityAllocatorPlan = struct {
@@ -7234,6 +7257,7 @@ const Parser = struct {
         var sequence_transferred = false;
         errdefer if (!sequence_transferred) self.alloc.free(sequence_name);
         var options: SequenceOptions = .{};
+        errdefer options.deinit(self.alloc);
         while (!self.atEnd() and !self.peekKind(.semicolon)) {
             try self.parseCreateSequenceOption(&options);
         }
@@ -7254,7 +7278,10 @@ const Parser = struct {
         var sequence_transferred = false;
         errdefer if (!sequence_transferred) self.alloc.free(sequence_name);
         var operations = std.ArrayListUnmanaged(SequenceAlterOperation).empty;
-        errdefer operations.deinit(self.alloc);
+        errdefer {
+            freeSequenceAlterOperations(self.alloc, operations.items);
+            operations.deinit(self.alloc);
+        }
         while (!self.atEnd() and !self.peekKind(.semicolon)) {
             try self.parseAlterSequenceOperation(&operations);
         }
@@ -7289,9 +7316,14 @@ const Parser = struct {
     }
 
     fn parseCreateSequenceOption(self: *@This(), options: *SequenceOptions) !void {
-        if (self.matchKeyword("as")) return error.UnsupportedSqlShape;
-        if (self.matchKeyword("owned")) return error.UnsupportedSqlShape;
-        if (self.matchKeyword("start")) {
+        if (self.matchKeyword("as")) {
+            if (options.as_type != null) return error.UnsupportedSqlShape;
+            options.as_type = try self.parseSequenceTypeNameOwned();
+        } else if (self.matchKeyword("owned")) {
+            try self.expectKeyword("by");
+            if (options.owned_by != null) return error.UnsupportedSqlShape;
+            options.owned_by = try self.parseSequenceOwnedByAlloc();
+        } else if (self.matchKeyword("start")) {
             _ = self.matchKeyword("with");
             if (options.start_with != null) return error.UnsupportedSqlShape;
             options.start_with = try self.parseSequenceInteger();
@@ -7333,9 +7365,16 @@ const Parser = struct {
         self: *@This(),
         operations: *std.ArrayListUnmanaged(SequenceAlterOperation),
     ) !void {
-        if (self.matchKeyword("as")) return error.UnsupportedSqlShape;
-        if (self.matchKeyword("owned")) return error.UnsupportedSqlShape;
-        if (self.matchKeyword("restart")) {
+        if (self.matchKeyword("as")) {
+            const type_name = try self.parseSequenceTypeNameOwned();
+            errdefer self.alloc.free(type_name);
+            try operations.append(self.alloc, .{ .set_type = type_name });
+        } else if (self.matchKeyword("owned")) {
+            try self.expectKeyword("by");
+            var owned_by = try self.parseSequenceOwnedByAlloc();
+            errdefer owned_by.deinit(self.alloc);
+            try operations.append(self.alloc, .{ .set_owned_by = owned_by });
+        } else if (self.matchKeyword("restart")) {
             const value = if (self.matchKeyword("with")) try self.parseSequenceInteger() else null;
             try operations.append(self.alloc, .{ .restart = value });
         } else if (self.matchKeyword("start")) {
@@ -7365,6 +7404,34 @@ const Parser = struct {
         } else {
             return error.UnsupportedSqlShape;
         }
+    }
+
+    fn parseSequenceTypeNameOwned(self: *@This()) ![]const u8 {
+        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        if (std.ascii.eqlIgnoreCase(token.text, "smallint")) return try self.alloc.dupe(u8, "smallint");
+        if (std.ascii.eqlIgnoreCase(token.text, "integer") or std.ascii.eqlIgnoreCase(token.text, "int")) return try self.alloc.dupe(u8, "integer");
+        if (std.ascii.eqlIgnoreCase(token.text, "bigint")) return try self.alloc.dupe(u8, "bigint");
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseSequenceOwnedByAlloc(self: *@This()) !SequenceOwnedBy {
+        if (self.matchKeyword("none")) return .{};
+        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        const raw = token.text;
+        const first_dot = std.mem.indexOfScalar(u8, raw, '.') orelse return error.UnsupportedSqlShape;
+        const table_start = if (std.ascii.eqlIgnoreCase(raw[0..first_dot], "public")) first_dot + 1 else 0;
+        const table_and_column = raw[table_start..];
+        const dot = std.mem.indexOfScalar(u8, table_and_column, '.') orelse return error.UnsupportedSqlShape;
+        if (std.mem.indexOfScalar(u8, table_and_column[dot + 1 ..], '.') != null) return error.UnsupportedSqlShape;
+        const table_name = table_and_column[0..dot];
+        const column_name = table_and_column[dot + 1 ..];
+        if (table_name.len == 0 or column_name.len == 0) return error.UnsupportedSqlShape;
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        return .{
+            .table_name = owned_table_name,
+            .column_name = try self.alloc.dupe(u8, column_name),
+        };
     }
 
     fn parseSequenceInteger(self: *@This()) !i64 {
@@ -42007,6 +42074,21 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
+fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlterOperation) void {
+    switch (operation) {
+        .set_type => |type_name| alloc.free(type_name),
+        .set_owned_by => |owned_by| {
+            var owned = owned_by;
+            owned.deinit(alloc);
+        },
+        else => {},
+    }
+}
+
+fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const SequenceAlterOperation) void {
+    for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
+}
+
 fn freeRowsDocKeyRanges(alloc: std.mem.Allocator, ranges: []const db_mod.types.RelationalRowsDocKeyRange) void {
     for (ranges) |range| {
         if (range.start.len > 0) alloc.free(range.start);
@@ -47012,6 +47094,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_sequence:sequence=users_id_seq:if_not_exists=true:options=4", create_sequence_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_sequence));
 
+    var create_owned_sequence = try lowerDdlPlanAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
+    defer create_owned_sequence.deinit(alloc);
+    const create_owned_sequence_plan = switch (create_owned_sequence) {
+        .sequence_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("users_owned_id_seq", create_owned_sequence_plan.sequence_name);
+    try std.testing.expectEqualStrings("bigint", create_owned_sequence_plan.options.as_type.?);
+    try std.testing.expectEqual(@as(?i64, 10), create_owned_sequence_plan.options.start_with);
+    try std.testing.expect(create_owned_sequence_plan.options.owned_by != null);
+    try std.testing.expectEqualStrings("users", create_owned_sequence_plan.options.owned_by.?.table_name);
+    try std.testing.expectEqualStrings("id", create_owned_sequence_plan.options.owned_by.?.column_name);
+    const create_owned_sequence_fingerprint = try ddlFingerprintAlloc(alloc, create_owned_sequence);
+    defer alloc.free(create_owned_sequence_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_sequence:sequence=users_owned_id_seq:if_not_exists=false:options=3", create_owned_sequence_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_owned_sequence));
+
     var alter_sequence = try lowerDdlPlanAlloc(alloc, "ALTER SEQUENCE users_id_seq RESTART WITH 1000 INCREMENT BY 5;");
     defer alter_sequence.deinit(alloc);
     const alter_sequence_plan = switch (alter_sequence) {
@@ -47029,6 +47131,34 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(alter_sequence_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_sequence:sequence=users_id_seq:if_exists=false:ops=2", alter_sequence_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, alter_sequence));
+
+    var alter_owned_sequence = try lowerDdlPlanAlloc(alloc, "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;");
+    defer alter_owned_sequence.deinit(alloc);
+    const alter_owned_sequence_plan = switch (alter_owned_sequence) {
+        .sequence_catalog => |plan| switch (plan) {
+            .alter => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("users_owned_id_seq", alter_owned_sequence_plan.sequence_name);
+    try std.testing.expect(alter_owned_sequence_plan.if_exists);
+    try std.testing.expectEqual(@as(usize, 2), alter_owned_sequence_plan.operations.len);
+    switch (alter_owned_sequence_plan.operations[0]) {
+        .set_type => |type_name| try std.testing.expectEqualStrings("integer", type_name),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_owned_sequence_plan.operations[1]) {
+        .set_owned_by => |owned_by| {
+            try std.testing.expectEqualStrings("", owned_by.table_name);
+            try std.testing.expectEqualStrings("", owned_by.column_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const alter_owned_sequence_fingerprint = try ddlFingerprintAlloc(alloc, alter_owned_sequence);
+    defer alloc.free(alter_owned_sequence_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_sequence:sequence=users_owned_id_seq:if_exists=true:ops=2", alter_owned_sequence_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, alter_owned_sequence));
 
     var drop_sequence = try lowerDdlPlanAlloc(alloc, "DROP SEQUENCE IF EXISTS users_id_seq RESTRICT;");
     defer drop_sequence.deinit(alloc);
@@ -58398,12 +58528,14 @@ fn ddlTypeFingerprintName(field_type: runtime_schema.AntflyType, array_item_type
 
 fn sequenceOptionCount(options: SequenceOptions) usize {
     var count: usize = 0;
+    if (options.as_type != null) count += 1;
     if (options.start_with != null) count += 1;
     if (options.increment_by != null) count += 1;
     if (options.min_value != null) count += 1;
     if (options.max_value != null) count += 1;
     if (options.cache != null) count += 1;
     if (options.cycle != null) count += 1;
+    if (options.owned_by != null) count += 1;
     return count;
 }
 
@@ -61560,7 +61692,9 @@ const AppParityCorpusCoverage = struct {
     ddl_domain_alter: bool = false,
     ddl_domain_drop: bool = false,
     ddl_sequence_create: bool = false,
+    ddl_sequence_create_typed_owned: bool = false,
     ddl_sequence_alter: bool = false,
+    ddl_sequence_alter_typed_owned: bool = false,
     ddl_sequence_drop: bool = false,
     ddl_identity_allocator_serial: bool = false,
     ddl_identity_allocator_generated: bool = false,
@@ -62740,8 +62874,18 @@ const AppParityCorpusCoverage = struct {
                 .create_domain => self.ddl_domain_create = true,
                 .alter_domain => self.ddl_domain_alter = true,
                 .drop_domain => self.ddl_domain_drop = true,
-                .create_sequence => self.ddl_sequence_create = true,
-                .alter_sequence => self.ddl_sequence_alter = true,
+                .create_sequence => {
+                    self.ddl_sequence_create = true;
+                    self.ddl_sequence_create_typed_owned = self.ddl_sequence_create_typed_owned or
+                        (std.mem.indexOf(u8, entry.sql, " AS bigint ") != null and
+                            std.mem.indexOf(u8, entry.sql, " OWNED BY ") != null);
+                },
+                .alter_sequence => {
+                    self.ddl_sequence_alter = true;
+                    self.ddl_sequence_alter_typed_owned = self.ddl_sequence_alter_typed_owned or
+                        (std.mem.indexOf(u8, entry.sql, " AS integer ") != null and
+                            std.mem.indexOf(u8, entry.sql, " OWNED BY NONE") != null);
+                },
                 .drop_sequence => self.ddl_sequence_drop = true,
                 .identity_allocator => {
                     self.ddl_identity_allocator_serial = self.ddl_identity_allocator_serial or std.mem.indexOf(u8, entry.plan, ":kind=bigserial:") != null or std.mem.indexOf(u8, entry.plan, ":kind=serial:") != null;
@@ -63468,7 +63612,9 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_domain_alter);
         try std.testing.expect(self.ddl_domain_drop);
         try std.testing.expect(self.ddl_sequence_create);
+        try std.testing.expect(self.ddl_sequence_create_typed_owned);
         try std.testing.expect(self.ddl_sequence_alter);
+        try std.testing.expect(self.ddl_sequence_alter_typed_owned);
         try std.testing.expect(self.ddl_sequence_drop);
         try std.testing.expect(self.ddl_schema_namespace_create);
         try std.testing.expect(self.ddl_schema_namespace_rename);
@@ -69033,11 +69179,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1",
         },
         .{
+            .name = "create typed owned sequence catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_sequence, .table_name = "usage_records_id_seq", .operations = 3 },
+            .plan = "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=3",
+            .sql = "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id",
+        },
+        .{
             .name = "alter sequence catalog ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_sequence, .table_name = "usage_records_id_seq", .operations = 1 },
             .plan = "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=false:ops=1",
             .sql = "ALTER SEQUENCE usage_records_id_seq RESTART WITH 1000",
+        },
+        .{
+            .name = "alter typed owned sequence catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .alter_sequence, .table_name = "usage_records_id_seq", .operations = 2 },
+            .plan = "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=true:ops=2",
+            .sql = "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE",
         },
         .{
             .name = "drop sequence catalog ddl",

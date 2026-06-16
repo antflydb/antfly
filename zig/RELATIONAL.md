@@ -4108,10 +4108,12 @@ catalog metadata, inherit defaults/nullability/checks through a typed expansion
 step, record table/default/check dependencies, and route ALTER/DROP effects
 through ordinary validation/rewrite jobs and catalog compare-and-swap promotion.
 PostgreSQL standalone sequence DDL lowers to typed sequence catalog intents.
-`CREATE SEQUENCE` records the sequence name, `IF NOT EXISTS`, and supported
-allocation options (`START`, `INCREMENT`, `MINVALUE`, `MAXVALUE`, `CACHE`, and
-`CYCLE`); `ALTER SEQUENCE` records typed restart and option-change operations;
-and `DROP SEQUENCE [IF EXISTS] ... [CASCADE]` records typed removal metadata.
+`CREATE SEQUENCE` records the sequence name, `IF NOT EXISTS`, type clauses
+(`AS smallint|integer|bigint`), supported allocation options (`START`,
+`INCREMENT`, `MINVALUE`, `MAXVALUE`, `CACHE`, and `CYCLE`), and `OWNED BY`
+dependency metadata including `OWNED BY NONE`; `ALTER SEQUENCE` records typed
+type, restart, option-change, and ownership operations; and
+`DROP SEQUENCE [IF EXISTS] ... [CASCADE]` records typed removal metadata.
 Schema application remains fail-closed until the durable sequence catalog and
 allocator exist: sequences must allocate transactionally through owner/range
 routing, expose snapshot-consistent catalog state, and track schema-owned
@@ -4122,8 +4124,8 @@ typed fail-closed identity-allocator catalog plans that preserve table identity,
 column identity, allocator kind, primary-key intent, and the count of ordinary
 peer columns. Schema application remains fail-closed until those defaults can
 claim monotonic values through the native allocator instead of raw SQL state.
-Sequence type clauses, identity option clauses, and `OWNED BY` still fail
-closed until the same durable allocator metadata owns them.
+Generated-identity option clauses still fail closed until the same durable
+allocator metadata owns them.
 
 PostgreSQL table partition DDL is schema-bearing catalog intent, not adapter
 text. `CREATE TABLE ... PARTITION BY RANGE (...)`, `CREATE TABLE ... PARTITION

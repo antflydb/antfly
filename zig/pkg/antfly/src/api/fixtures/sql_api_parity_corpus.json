@@ -7517,6 +7517,17 @@
       "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1"
     },
     {
+      "name": "create typed owned sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 3
+      },
+      "plan": "ddl:create_sequence:sequence=usage_records_id_seq:if_not_exists=false:options=3",
+      "sql": "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id"
+    },
+    {
       "name": "alter sequence catalog ddl",
       "family": "ddl",
       "summary": {
@@ -7526,6 +7537,17 @@
       },
       "plan": "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=false:ops=1",
       "sql": "ALTER SEQUENCE usage_records_id_seq RESTART WITH 1000"
+    },
+    {
+      "name": "alter typed owned sequence catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_sequence",
+        "table_name": "usage_records_id_seq",
+        "operations": 2
+      },
+      "plan": "ddl:alter_sequence:sequence=usage_records_id_seq:if_exists=true:ops=2",
+      "sql": "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE"
     },
     {
       "name": "drop sequence catalog ddl",
