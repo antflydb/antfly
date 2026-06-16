@@ -22,7 +22,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
+const rejoin = @import("rejoin.zig");
 const slot_store = @import("slot_store.zig");
 const status = @import("status.zig");
 
@@ -86,6 +88,8 @@ pub const ActionKind = enum {
     promote_standby,
     update_primary_endpoint,
     demote_former_primary,
+    rewind_former_primary,
+    reseed_former_primary,
 };
 
 pub const Action = struct {
@@ -98,11 +102,15 @@ pub const Action = struct {
 
 pub const Observed = struct {
     primary: status.PrimarySnapshot,
+    former_primary: ?rejoin.FormerPrimaryState = null,
+    promotion_receipt: ?fencing.Receipt = null,
+    rejoin_policy: rejoin.RejoinPolicy = .{ .retained_from_lsn = 0 },
 };
 
 pub const Plan = struct {
     actions: []Action,
     conditions: []Condition,
+    former_primary_assessment: ?rejoin.Assessment = null,
     automatic_promotion_allowed: bool,
     desired_standby_count: usize,
     healthy_standby_count: usize,
@@ -256,14 +264,49 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
         });
     }
 
+    const former_primary_assessment = if (observed.former_primary) |former| blk: {
+        const assessment = rejoin.assessFormerPrimary(former, observed.promotion_receipt, observed.rejoin_policy);
+        try appendFormerPrimaryAction(alloc, &actions, assessment);
+        break :blk assessment;
+    } else null;
+
     return .{
         .actions = try actions.toOwnedSlice(alloc),
         .conditions = try conditions.toOwnedSlice(alloc),
+        .former_primary_assessment = former_primary_assessment,
         .automatic_promotion_allowed = automatic_allowed,
         .desired_standby_count = desired_count,
         .healthy_standby_count = healthy_count,
         .reseed_required_count = reseed_count,
     };
+}
+
+fn appendFormerPrimaryAction(
+    alloc: Allocator,
+    actions: *std.ArrayListUnmanaged(Action),
+    assessment: rejoin.Assessment,
+) !void {
+    switch (assessment.action) {
+        .reject_unfenced => try actions.append(alloc, .{
+            .kind = .demote_former_primary,
+            .standby_name = assessment.former_node_id,
+            .target_lsn = assessment.former_last_lsn,
+            .reason = "FormerPrimaryRejectedUnfenced",
+        }),
+        .already_current => {},
+        .rewind => try actions.append(alloc, .{
+            .kind = .rewind_former_primary,
+            .standby_name = assessment.former_node_id,
+            .target_lsn = assessment.fork_lsn,
+            .reason = "FormerPrimaryCanRewind",
+        }),
+        .reseed => try actions.append(alloc, .{
+            .kind = .reseed_former_primary,
+            .standby_name = assessment.former_node_id,
+            .target_lsn = assessment.fork_lsn,
+            .reason = "FormerPrimaryRequiresReseed",
+        }),
+    }
 }
 
 fn findSlot(slots: []const status.SlotSnapshot, name: []const u8) ?status.SlotSnapshot {
@@ -483,4 +526,111 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(ActionKind.update_primary_endpoint, safe.actions[2].kind);
     try std.testing.expectEqual(ActionKind.demote_former_primary, safe.actions[3].kind);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
+}
+
+test "storage.ha operator plans former primary demotion without fence" {
+    const alloc = std.testing.allocator;
+    const slots = [_]status.SlotSnapshot{};
+    const primary = status.PrimarySnapshot{
+        .identity = .{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 2, .epoch = 2 },
+        .current_lsn = 12,
+        .slots = @constCast(slots[0..]),
+        .retention = .{
+            .primary_lsn = 12,
+            .oldest_restart_lsn = 10,
+            .retained_lsn_count = 2,
+            .active_slots = 0,
+            .reseed_recommended = 0,
+        },
+    };
+    const former_identity = primary.identity;
+
+    var plan = try reconcile(alloc, .{
+        .mode = .hot_standby,
+    }, .{
+        .primary = primary,
+        .former_primary = .{
+            .node_id = "primary-a",
+            .identity = former_identity,
+            .last_lsn = 12,
+        },
+        .promotion_receipt = null,
+        .rejoin_policy = .{ .retained_from_lsn = 10 },
+    });
+    defer plan.deinit(alloc);
+
+    const assessment = plan.former_primary_assessment orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(rejoin.Action.reject_unfenced, assessment.action);
+    try std.testing.expectEqual(@as(usize, 1), plan.actions.len);
+    try std.testing.expectEqual(ActionKind.demote_former_primary, plan.actions[0].kind);
+    try std.testing.expectEqualStrings("FormerPrimaryRejectedUnfenced", plan.actions[0].reason);
+}
+
+test "storage.ha operator plans former primary rewind or reseed from fence receipt" {
+    const alloc = std.testing.allocator;
+    const slots = [_]status.SlotSnapshot{};
+    const parent_identity = status.PrimarySnapshot{
+        .identity = .{ .cluster_id = 100, .shard_id = 10, .table_id = 20, .timeline_id = 1, .epoch = 1 },
+        .current_lsn = 12,
+        .slots = @constCast(slots[0..]),
+        .retention = .{
+            .primary_lsn = 12,
+            .oldest_restart_lsn = 10,
+            .retained_lsn_count = 2,
+            .active_slots = 0,
+            .reseed_recommended = 0,
+        },
+    };
+    var promoted_primary = parent_identity;
+    promoted_primary.identity.timeline_id = 2;
+    promoted_primary.identity.epoch = 2;
+    const receipt = fencing.Receipt{
+        .identity = promoted_primary.identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-b",
+        .parent_timeline_id = parent_identity.identity.timeline_id,
+        .parent_epoch = parent_identity.identity.epoch,
+        .new_timeline_id = promoted_primary.identity.timeline_id,
+        .new_epoch = promoted_primary.identity.epoch,
+        .required_lsn = 10,
+        .observed_lsn = 10,
+        .generation = 1,
+        .forced = false,
+        .token = "token",
+        .reason = "manual",
+    };
+
+    var rewind = try reconcile(alloc, .{
+        .mode = .hot_standby,
+    }, .{
+        .primary = promoted_primary,
+        .former_primary = .{
+            .node_id = "primary-a",
+            .identity = parent_identity.identity,
+            .last_lsn = 12,
+        },
+        .promotion_receipt = receipt,
+        .rejoin_policy = .{ .retained_from_lsn = 8 },
+    });
+    defer rewind.deinit(alloc);
+    try std.testing.expectEqual(rejoin.Action.rewind, rewind.former_primary_assessment.?.action);
+    try std.testing.expectEqual(ActionKind.rewind_former_primary, rewind.actions[0].kind);
+    try std.testing.expectEqual(@as(?u64, 10), rewind.actions[0].target_lsn);
+
+    var reseed = try reconcile(alloc, .{
+        .mode = .hot_standby,
+    }, .{
+        .primary = promoted_primary,
+        .former_primary = .{
+            .node_id = "primary-a",
+            .identity = parent_identity.identity,
+            .last_lsn = 12,
+        },
+        .promotion_receipt = receipt,
+        .rejoin_policy = .{ .retained_from_lsn = 11 },
+    });
+    defer reseed.deinit(alloc);
+    try std.testing.expectEqual(rejoin.Action.reseed, reseed.former_primary_assessment.?.action);
+    try std.testing.expectEqual(ActionKind.reseed_former_primary, reseed.actions[0].kind);
+    try std.testing.expectEqualStrings("FormerPrimaryRequiresReseed", reseed.actions[0].reason);
 }
