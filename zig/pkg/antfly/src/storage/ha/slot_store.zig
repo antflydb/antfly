@@ -167,6 +167,22 @@ pub const SlotStore = struct {
         try self.createOrUpdate(next);
     }
 
+    pub fn pause(self: *SlotStore, name: []const u8) !void {
+        const current = self.get(name) orelse return error.SlotNotFound;
+        if (!current.active) return;
+        var next = current;
+        next.active = false;
+        try self.createOrUpdate(next);
+    }
+
+    pub fn resumeSlot(self: *SlotStore, name: []const u8) !void {
+        const current = self.get(name) orelse return error.SlotNotFound;
+        if (current.active) return;
+        var next = current;
+        next.active = true;
+        try self.createOrUpdate(next);
+    }
+
     pub fn drop(self: *SlotStore, name: []const u8) !void {
         const current = self.get(name) orelse return error.SlotNotFound;
         try self.persistAndApply(.{
@@ -446,6 +462,41 @@ test "storage.ha slot store drops slots and releases retention" {
     const snapshot = try store.retentionSnapshot(10, .{});
     try std.testing.expectEqual(@as(u64, 11), snapshot.oldest_restart_lsn);
     try std.testing.expectEqual(@as(u64, 0), snapshot.retained_lsn_count);
+}
+
+test "storage.ha slot store persists pause and resume state" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "pause-resume");
+    defer alloc.free(path);
+
+    {
+        var store = try SlotStore.open(alloc, path.ptr, .{});
+        defer store.close();
+        try store.createOrUpdate(.{ .name = "standby-a", .timeline_id = 1, .restart_lsn = 4, .received_lsn = 8, .applied_lsn = 4 });
+        try store.pause("standby-a");
+        const paused = store.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(!paused.active);
+        const snapshot = try store.retentionSnapshot(10, .{});
+        try std.testing.expectEqual(@as(usize, 0), snapshot.active_slots);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.retained_lsn_count);
+    }
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        var paused = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(!paused.active);
+        try reopened.resumeSlot("standby-a");
+        paused = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(paused.active);
+    }
+
+    {
+        var reopened = try SlotStore.open(alloc, path.ptr, .{});
+        defer reopened.close();
+        const resumed = reopened.get("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(resumed.active);
+    }
 }
 
 test "storage.ha slot store allows backup pin ahead of standby progress" {

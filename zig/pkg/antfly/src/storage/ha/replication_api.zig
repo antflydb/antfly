@@ -32,6 +32,9 @@ var test_path_counter: u64 = 0;
 pub const Command = enum {
     identify_system,
     create_replication_slot,
+    pause_replication_slot,
+    resume_replication_slot,
+    drop_replication_slot,
     start_replication,
     standby_status_update,
 };
@@ -54,7 +57,25 @@ pub const CreateReplicationSlotResponse = struct {
     restart_lsn: u64,
     received_lsn: u64,
     applied_lsn: u64,
+    active: bool,
+    reseed_required: bool,
     current_lsn: u64,
+};
+
+pub const SlotLifecycleRequest = struct {
+    slot_name: []const u8,
+};
+
+pub const SlotLifecycleResponse = struct {
+    slot_name: []const u8,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    active: bool,
+    reseed_required: bool,
+    current_lsn: u64,
+    dropped: bool = false,
 };
 
 pub const StartReplicationRequest = struct {
@@ -135,8 +156,49 @@ pub fn createReplicationSlot(
         .restart_lsn = slot.restart_lsn,
         .received_lsn = slot.received_lsn,
         .applied_lsn = slot.applied_lsn,
+        .active = slot.active,
+        .reseed_required = slot.reseed_required,
         .current_lsn = primary.lastLsn(),
     };
+}
+
+pub fn pauseReplicationSlot(
+    primary: *primary_mod.Primary,
+    request: SlotLifecycleRequest,
+) !SlotLifecycleResponse {
+    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try primary.pauseSlot(request.slot_name);
+    return try lifecycleResponse(primary, request.slot_name, false);
+}
+
+pub fn resumeReplicationSlot(
+    primary: *primary_mod.Primary,
+    request: SlotLifecycleRequest,
+) !SlotLifecycleResponse {
+    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    try primary.resumeSlot(request.slot_name);
+    return try lifecycleResponse(primary, request.slot_name, false);
+}
+
+pub fn dropReplicationSlot(
+    primary: *primary_mod.Primary,
+    request: SlotLifecycleRequest,
+) !SlotLifecycleResponse {
+    if (request.slot_name.len == 0) return error.InvalidSlotName;
+    const slot = primary.slot(request.slot_name) orelse return error.SlotNotFound;
+    const response = SlotLifecycleResponse{
+        .slot_name = request.slot_name,
+        .timeline_id = slot.timeline_id,
+        .restart_lsn = slot.restart_lsn,
+        .received_lsn = slot.received_lsn,
+        .applied_lsn = slot.applied_lsn,
+        .active = slot.active,
+        .reseed_required = slot.reseed_required,
+        .current_lsn = primary.lastLsn(),
+        .dropped = true,
+    };
+    try primary.dropSlot(request.slot_name);
+    return response;
 }
 
 pub fn startReplication(
@@ -197,6 +259,21 @@ pub fn startReplication(
         .end_of_wal = end_of_wal,
         .encoded_bytes = encoded_bytes,
         .records = owned_records,
+    };
+}
+
+fn lifecycleResponse(primary: *const primary_mod.Primary, slot_name: []const u8, dropped: bool) !SlotLifecycleResponse {
+    const slot = primary.slot(slot_name) orelse return error.SlotNotFound;
+    return .{
+        .slot_name = slot.name,
+        .timeline_id = slot.timeline_id,
+        .restart_lsn = slot.restart_lsn,
+        .received_lsn = slot.received_lsn,
+        .applied_lsn = slot.applied_lsn,
+        .active = slot.active,
+        .reseed_required = slot.reseed_required,
+        .current_lsn = primary.lastLsn(),
+        .dropped = dropped,
     };
 }
 
@@ -348,6 +425,47 @@ test "storage.ha replication api starts replication with record and byte batchin
     try std.testing.expectError(error.InvalidReplicationStartLsn, startReplication(alloc, &primary, .{
         .slot_name = "standby-a",
         .from_lsn = 0,
+    }));
+}
+
+test "storage.ha replication api pauses resumes and drops slots" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "slot-lifecycle");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try createReplicationSlot(&primary, .{
+        .slot_name = "standby-a",
+        .initial_lsn = 1,
+    });
+
+    const paused = try pauseReplicationSlot(&primary, .{ .slot_name = "standby-a" });
+    try std.testing.expectEqualStrings("standby-a", paused.slot_name);
+    try std.testing.expect(!paused.active);
+    try std.testing.expect(!paused.dropped);
+    try std.testing.expectError(error.SlotInactive, startReplication(alloc, &primary, .{
+        .slot_name = "standby-a",
+        .from_lsn = 1,
+    }));
+
+    const resumed = try resumeReplicationSlot(&primary, .{ .slot_name = "standby-a" });
+    try std.testing.expect(resumed.active);
+    var batch = try startReplication(alloc, &primary, .{
+        .slot_name = "standby-a",
+        .from_lsn = 1,
+    });
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), batch.records.len);
+
+    const dropped = try dropReplicationSlot(&primary, .{ .slot_name = "standby-a" });
+    try std.testing.expect(dropped.dropped);
+    try std.testing.expectEqualStrings("standby-a", dropped.slot_name);
+    try std.testing.expectError(error.SlotNotFound, startReplication(alloc, &primary, .{
+        .slot_name = "standby-a",
+        .from_lsn = 1,
     }));
 }
 

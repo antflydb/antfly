@@ -224,6 +224,14 @@ pub const Primary = struct {
         try self.slots.drop(name);
     }
 
+    pub fn pauseSlot(self: *Primary, name: []const u8) !void {
+        try self.slots.pause(name);
+    }
+
+    pub fn resumeSlot(self: *Primary, name: []const u8) !void {
+        try self.slots.resumeSlot(name);
+    }
+
     pub fn slot(self: *const Primary, name: []const u8) ?slot_store.SlotState {
         return self.slots.get(name);
     }
@@ -685,4 +693,33 @@ test "storage.ha primary refuses streaming from reseed or expired slots" {
 
     try primary.slots.markReseedRequired("standby-a");
     try std.testing.expectError(error.SlotRequiresReseed, primary.streamFrom(alloc, "standby-a", 2));
+}
+
+test "storage.ha primary pauses and resumes slot streaming across reopen" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "pause-resume");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    {
+        var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+        defer primary.close();
+        try primary.createSlot("standby-a", 0);
+        _ = try primary.append(.{ .payload = "one" });
+        try primary.pauseSlot("standby-a");
+        try std.testing.expectError(error.SlotInactive, primary.streamFrom(alloc, "standby-a", 1));
+    }
+
+    {
+        var reopened = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+        defer reopened.close();
+        const paused = reopened.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expect(!paused.active);
+        try std.testing.expectError(error.SlotInactive, reopened.streamFrom(alloc, "standby-a", 1));
+        try reopened.resumeSlot("standby-a");
+        const entries = try reopened.streamFrom(alloc, "standby-a", 1);
+        defer replication_log.freeEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqualStrings("one", entries[0].record.payload);
+    }
 }
