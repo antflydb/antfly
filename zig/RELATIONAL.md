@@ -5265,6 +5265,12 @@ contains `conflict_where=1`; absence of the summary is the only representation
 for unguarded conflict actions. This keeps `ON CONFLICT ... WHERE` coverage tied
 to the typed proposed/existing-row predicate contract.
 
+Merge-arm summaries are anchored to the merge fingerprint. `matched_predicates`,
+`matched_delete`, `matched_do_nothing`, `not_matched_predicates`, and
+`not_matched_do_nothing` must match the `matched_pred`, `matched_delete`,
+`matched_noop`, `not_matched_pred`, and `not_matched_noop` tokens exactly before
+the fixture can claim coverage for `MERGE` arm routing.
+
 Row-claim summaries are tied to lockable query sources. `row_claim_skip_locked`
 is valid only on row-query plans, join/lateral plans that assert the left
 lockable source, mutation-source write plans, joined mutation-source write plans,

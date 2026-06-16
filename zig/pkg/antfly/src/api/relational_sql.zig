@@ -62268,6 +62268,25 @@ fn appParityFixtureAllowsMergeArmSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
+fn appParityFixtureMergeArmSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    if (entry.summary.matched_predicates) |matched_predicates| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":matched_pred=", matched_predicates)) return false;
+    }
+    if (entry.summary.matched_delete) |matched_delete| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":matched_delete=", @intFromBool(matched_delete))) return false;
+    }
+    if (entry.summary.matched_do_nothing) |matched_do_nothing| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":matched_noop=", @intFromBool(matched_do_nothing))) return false;
+    }
+    if (entry.summary.not_matched_predicates) |not_matched_predicates| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_pred=", not_matched_predicates)) return false;
+    }
+    if (entry.summary.not_matched_do_nothing) |not_matched_do_nothing| {
+        if (!appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_noop=", @intFromBool(not_matched_do_nothing))) return false;
+    }
+    return true;
+}
+
 fn appParityFixtureAllowsAggregateSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .aggregate => true,
@@ -62676,6 +62695,9 @@ fn validateAppParityFixtureMetadata(
         entry.summary.not_matched_do_nothing != null) and
         !appParityFixtureAllowsMergeArmSummary(entry))
     {
+        return error.TestUnexpectedResult;
+    }
+    if (!appParityFixtureMergeArmSummaryMatchesPlan(entry)) {
         return error.TestUnexpectedResult;
     }
     if ((entry.summary.group_by != null or
@@ -63167,6 +63189,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .row_claim_skip_locked = false },
         .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale merge matched predicate summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED AND target.status = 'old' THEN UPDATE SET status = source.status",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .matched_predicates = 1 },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale merge matched delete summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN DELETE",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .matched_delete = true },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid merge arm false summaries",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1, .matched_delete = false, .matched_do_nothing = false, .not_matched_do_nothing = false },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "query temporal ddl summary",
