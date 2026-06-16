@@ -219,6 +219,11 @@ pub const Store = struct {
         errdefer owned.deinit(self.alloc);
         if (self.current_receipt) |*held| {
             if (owned.receipt.generation < held.receipt.generation) return error.NonMonotonicFenceGeneration;
+            if (owned.receipt.generation == held.receipt.generation) {
+                if (!sameReceipt(held.receipt, owned.receipt)) return error.NonMonotonicFenceGeneration;
+                owned.deinit(self.alloc);
+                return;
+            }
             held.deinit(self.alloc);
         }
         self.current_receipt = owned;
@@ -257,6 +262,26 @@ fn sameFence(receipt: Receipt, request: FenceRequest) bool {
         receipt.forced == request.force and
         std.mem.eql(u8, receipt.old_primary_id, request.old_primary_id) and
         std.mem.eql(u8, receipt.promoted_node_id, request.promoted_node_id);
+}
+
+fn sameReceipt(a: Receipt, b: Receipt) bool {
+    return a.identity.cluster_id == b.identity.cluster_id and
+        a.identity.shard_id == b.identity.shard_id and
+        a.identity.table_id == b.identity.table_id and
+        a.identity.timeline_id == b.identity.timeline_id and
+        a.identity.epoch == b.identity.epoch and
+        a.parent_timeline_id == b.parent_timeline_id and
+        a.parent_epoch == b.parent_epoch and
+        a.new_timeline_id == b.new_timeline_id and
+        a.new_epoch == b.new_epoch and
+        a.required_lsn == b.required_lsn and
+        a.observed_lsn == b.observed_lsn and
+        a.generation == b.generation and
+        a.forced == b.forced and
+        std.mem.eql(u8, a.old_primary_id, b.old_primary_id) and
+        std.mem.eql(u8, a.promoted_node_id, b.promoted_node_id) and
+        std.mem.eql(u8, a.token, b.token) and
+        std.mem.eql(u8, a.reason, b.reason);
 }
 
 fn ownedReceiptFromReceipt(alloc: Allocator, receipt: Receipt) !OwnedReceipt {
@@ -585,6 +610,28 @@ test "storage.ha fencing rejects unsafe and competing promotions" {
     defer freeReceipt(alloc, next);
     try std.testing.expectEqual(@as(u64, 2), next.generation);
     try std.testing.expectEqualStrings("standby-c", next.promoted_node_id);
+}
+
+test "storage.ha fencing rejects conflicting duplicate generations on replay" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "duplicate-generation");
+    defer alloc.free(path);
+
+    {
+        var store = try Store.open(alloc, path.ptr, .{});
+        defer store.close();
+
+        const receipt = try store.acquirePromotionFence(baseRequest());
+        defer freeReceipt(alloc, receipt);
+
+        var conflicting = receipt;
+        conflicting.promoted_node_id = "standby-c";
+        const encoded = try encodeReceipt(alloc, .promotion_fence, conflicting);
+        defer alloc.free(encoded);
+        _ = try store.wal.append(encoded);
+    }
+
+    try std.testing.expectError(error.NonMonotonicFenceGeneration, Store.open(alloc, path.ptr, .{}));
 }
 
 test "storage.ha fencing receipt drives standby promotion" {
