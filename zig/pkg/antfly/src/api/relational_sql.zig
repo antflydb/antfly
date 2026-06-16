@@ -62170,9 +62170,127 @@ fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFami
     };
 }
 
+fn appParityPlanNonNoneStringTokenUsize(plan: []const u8, token: []const u8) usize {
+    if (!appParityPlanHasToken(plan, token)) return 0;
+    return if (appParityPlanHasExactStringToken(plan, token, "none")) 0 else 1;
+}
+
+fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    if (entry.family != .ddl) return true;
+    return switch (entry.summary.ddl_tag orelse return false) {
+        .create_table,
+        .relation_lifetime,
+        => appParityPlanUsizeOptionalTokenSumMatches(entry.plan, &.{ ":unique=", ":fk=", ":checks=" }, expected),
+        .alter_table,
+        .alter_domain,
+        .alter_database,
+        .alter_sequence,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":ops=", expected),
+        .create_sequence => appParityPlanHasExactUsizeToken(entry.plan, ":options=", expected),
+        .identity_allocator => appParityPlanBoolTokenUsize(entry.plan, ":primary=") == expected,
+        .create_function,
+        .create_procedure,
+        .drop_function,
+        .drop_procedure,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
+        .alter_role => appParityPlanNonNoneStringTokenUsize(entry.plan, ":setting=") == expected,
+        .grant_privilege,
+        .revoke_privilege,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":privileges=", expected),
+        .copy_from,
+        .copy_to,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":columns=", expected),
+        .create_partitioned_table => appParityPlanHasExactUsizeToken(entry.plan, ":keys=", expected),
+        .create_table_partition,
+        .attach_table_partition,
+        .detach_table_partition,
+        => expected == 0,
+        .enable_row_security,
+        .create_row_policy,
+        .drop_row_policy,
+        .create_update_policy,
+        => expected == 1,
+        .create_database,
+        .drop_database,
+        .create_tablespace,
+        .rename_tablespace,
+        .drop_tablespace,
+        .listen_notification,
+        .unlisten_notification,
+        .alter_subscription,
+        .drop_subscription,
+        .drop_publication,
+        .create_schema_namespace,
+        .rename_schema_namespace,
+        .drop_schema_namespace,
+        .create_extension,
+        .create_cast,
+        .drop_cast,
+        .deallocate_statement,
+        .declare_cursor,
+        .close_cursor,
+        .savepoint_transaction,
+        .release_savepoint,
+        .rollback_to_savepoint,
+        => expected == 0,
+        .create_publication => appParityPlanHasExactUsizeToken(entry.plan, ":tables=", expected),
+        .alter_publication => appParityPlanHasExactUsizeToken(entry.plan, ":add_tables=", expected),
+        .create_subscription => appParityPlanHasExactUsizeToken(entry.plan, ":publications=", expected),
+        .notify_notification => appParityPlanBoolTokenUsize(entry.plan, ":payload=") == expected,
+        .create_collation,
+        .create_operator,
+        .create_aggregate,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":options=", expected),
+        .drop_operator,
+        .drop_aggregate,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
+        .vacuum_maintenance => appParityPlanBoolTokenUsize(entry.plan, ":full=") +
+            appParityPlanBoolTokenUsize(entry.plan, ":freeze=") +
+            appParityPlanBoolTokenUsize(entry.plan, ":verbose=") +
+            appParityPlanBoolTokenUsize(entry.plan, ":analyze=") == expected,
+        .analyze_maintenance => (appParityPlanUsizeTokenValue(entry.plan, ":columns=") orelse return false) +
+            appParityPlanBoolTokenUsize(entry.plan, ":verbose=") == expected,
+        .reindex_maintenance => appParityPlanBoolTokenUsize(entry.plan, ":concurrently=") == expected,
+        .cluster_maintenance => appParityPlanNonNoneStringTokenUsize(entry.plan, ":index=") == expected,
+        .prepare_statement => appParityPlanHasExactUsizeToken(entry.plan, ":params=", expected),
+        .execute_statement => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
+        .comment_metadata => appParityPlanBoolTokenUsize(entry.plan, ":comment=") == expected,
+        .table_lock => appParityPlanHasExactUsizeToken(entry.plan, ":tables=", expected),
+        .constraint_mode => (appParityPlanUsizeTokenValue(entry.plan, ":constraints=") orelse return false) +
+            appParityPlanBoolTokenUsize(entry.plan, ":all=") == expected,
+        .transaction_mode => appParityPlanNonNoneStringTokenUsize(entry.plan, ":isolation=") +
+            appParityPlanNonNoneStringTokenUsize(entry.plan, ":access=") +
+            appParityPlanNonNoneStringTokenUsize(entry.plan, ":deferrable=") == expected,
+        .advisory_lock => appParityPlanHasExactUsizeToken(entry.plan, ":keys=", expected),
+        .fetch_cursor => appParityPlanHasExactUsizeToken(entry.plan, ":count=", expected) or expected == 0,
+        .create_index,
+        .drop_index,
+        .drop_table,
+        .create_view,
+        .rename_view,
+        .drop_view,
+        .create_materialized_view,
+        .refresh_materialized_view,
+        .drop_materialized_view,
+        .table_clone,
+        .create_enum_type,
+        .add_enum_value,
+        .drop_enum_type,
+        .create_domain,
+        .drop_domain,
+        .drop_sequence,
+        .create_role,
+        .drop_role,
+        .disable_row_security,
+        .rename_collation,
+        .drop_collation,
+        => false,
+    };
+}
+
 fn appParityFixtureOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
     return switch (entry.family) {
-        .ddl => true,
+        .ddl => appParityFixtureDdlOperationsSummaryMatchesPlan(entry, expected),
         .insert,
         .update,
         .update_source,
@@ -63448,6 +63566,40 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_domain, .table_name = "positive_amount", .predicates = 1 },
         .plan = "ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale ddl operations summary",
+        .sql = "CREATE TABLE usage_records (id text PRIMARY KEY, status text UNIQUE, source_id text REFERENCES sources(id), CHECK (status <> ''))",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 2, .operations = 3 },
+        .plan = "ddl:create_table:table=usage_records:columns=2:unique=1:fk=1:checks=0:if_not_exists=false:pk=1",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid ddl operations summary",
+        .sql = "CREATE TABLE usage_records (id text PRIMARY KEY, status text UNIQUE, source_id text REFERENCES sources(id), CHECK (status <> ''))",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 2, .operations = 3 },
+        .plan = "ddl:create_table:table=usage_records:columns=2:unique=1:fk=1:checks=1:if_not_exists=false:pk=1",
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale ddl transaction operations summary",
+        .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .transaction_mode, .operations = 2 },
+        .plan = "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=serializable:access=none:deferrable=none",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid ddl transaction operations summary",
+        .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .transaction_mode, .operations = 2 },
+        .plan = "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=serializable:access=read_only:deferrable=none",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

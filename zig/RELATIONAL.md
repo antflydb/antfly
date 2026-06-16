@@ -5257,8 +5257,14 @@ lifetime, partitioned-table creation, views, materialized views, enum types,
 aggregates, identity allocators, and index creation must match the relevant
 `columns`, `fields`, `values`, `args`, or index column/expression/generation
 tokens. DDL `predicates` must match `where` for index predicates or `checks` for
-domains. Other DDL operation-family counts remain tied to the DDL lowerer and
-applied-plan verifier until they have tag-local fingerprint assertions.
+domains. DDL `operations` summaries are tag-local and must match the typed
+fingerprint tokens for catalog families that expose stable counts, including
+`ops`, `options`, `keys`, `tables`, `publications`, `privileges`, `columns`,
+`args`, transaction-control option tokens, maintenance booleans, comment
+presence, and create-table `unique` + `fk` + `checks` totals. Tokenless one-bit
+catalog families may only declare the fixed one-operation summary and otherwise
+remain tied to the DDL lowerer and applied-plan verifier until their fingerprints
+grow explicit count tokens.
 
 Declared-access and expression-predicate summaries follow the same typed-stage
 ownership rule. `array_any`, `in_predicates`, `json_path_eq`, `json_contains`,
