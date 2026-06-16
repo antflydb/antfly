@@ -499,7 +499,12 @@ so projections, predicates, conflict actions, `RETURNING`, and bucketing
 functions all see the same typed-plan value shape. The same expression nodes are
 used for aggregate inputs, window value inputs, conflict actions, expression
 `RETURNING`, and claimed mutation-source `patch_expr` assignments so supported
-SQL arithmetic is not reimplemented per statement family. Joined mutation-source
+SQL arithmetic is not reimplemented per statement family. Aggregate filter
+execution uses that same path: storage-backed SQL read-plan tests pin
+expression filters such as `lower(status) = 'open'`, computed-array containment
+filters such as `string_to_array(scope, ' ') @> ARRAY['write']`, JSON
+containment filters, and declared-array containment filters through
+`aggregateRelationalRowsPlan`, not just SQL lowerer fingerprints. Joined mutation-source
 `patch_expr` assignments use the same source-aware expression nodes, so a
 source-row field and a target-row field can participate in one typed arithmetic
 assignment without adapter-private evaluation. PostgreSQL row-list mutation

@@ -77504,7 +77504,7 @@ test "postgres sql adapter classifies read sql into typed plan families" {
 test "postgres sql adapter typed read plans execute through relational storage" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"scope":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"scope":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -77525,9 +77525,9 @@ test "postgres sql adapter typed read plans execute through relational storage" 
         .writes = &.{
             .{ .key = "row:c1", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c1\",\"name\":\"Alice\"}" },
             .{ .key = "row:c2", .value = "{\"kind\":\"customer\",\"tenant\":\"t1\",\"id\":\"c2\",\"name\":\"Bob\"}" },
-            .{ .key = "row:o1", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":10}" },
-            .{ .key = "row:o2", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o2\",\"customer_id\":\"missing\",\"status\":\"open\",\"amount\":5}" },
-            .{ .key = "row:o3", .value = "{\"kind\":\"order\",\"tenant\":\"t2\",\"id\":\"o3\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":7}" },
+            .{ .key = "row:o1", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":10,\"scope\":\"read write\",\"tags\":[\"hot\",\"new\"],\"metadata\":{\"source\":\"api\",\"flags\":[\"rated\"]}}" },
+            .{ .key = "row:o2", .value = "{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o2\",\"customer_id\":\"missing\",\"status\":\"open\",\"amount\":5,\"scope\":\"read\",\"tags\":[\"cold\"],\"metadata\":{\"source\":\"batch\"}}" },
+            .{ .key = "row:o3", .value = "{\"kind\":\"order\",\"tenant\":\"t2\",\"id\":\"o3\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":7,\"scope\":\"write\",\"tags\":[\"hot\"],\"metadata\":{\"source\":\"api\",\"flags\":[\"rated\"]}}" },
             .{ .key = "row:p1", .value = "{\"kind\":\"pattern\",\"tenant\":\"t1\",\"id\":\"p1\",\"status\":\"op_en\"}" },
             .{ .key = "row:p2", .value = "{\"kind\":\"pattern\",\"tenant\":\"t1\",\"id\":\"p2\",\"status\":\"open\"}" },
             .{ .key = "row:p3", .value = "{\"kind\":\"pattern\",\"tenant\":\"t1\",\"id\":\"p3\",\"status\":\"OP_en\"}" },
@@ -77766,6 +77766,34 @@ test "postgres sql adapter typed read plans execute through relational storage" 
             try std.testing.expectEqual(@as(usize, 2), result.rows.len);
             try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"total_amount\":15,\"order_ids\":\"o1|o2\"}", result.rows[0]);
             try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"total_amount\":7,\"order_ids\":\"o3\"}", result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var filtered_aggregate_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT tenant, SUM(amount) FILTER (WHERE lower(status) = 'open') AS open_amount, COUNT(*) FILTER (WHERE string_to_array(scope, ' ') @> ARRAY['write']) AS writable_count, COUNT(*) FILTER (WHERE metadata @> '{\"source\":\"api\"}'::jsonb) AS api_count, COUNT(*) FILTER (WHERE tags @> ARRAY['hot']) AS hot_count FROM usage_records WHERE kind = 'order' GROUP BY tenant ORDER BY tenant ASC",
+        schema,
+        &.{},
+    );
+    defer filtered_aggregate_plan.deinit(alloc);
+
+    switch (filtered_aggregate_plan) {
+        .aggregate => |lowered| {
+            try std.testing.expectEqual(@as(usize, 4), lowered.plan.aggregate.aggregations.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations[0].filter_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.aggregate.aggregations[0].filter_expressions[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations[1].filter_expression_array_contains.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.plan.aggregate.aggregations[1].filter_expression_array_contains[0].expression.kind);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations[2].filter_json_contains.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations[3].filter_array_contains.len);
+            var result = try db.aggregateRelationalRowsPlan(alloc, schema, lowered.plan);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t1\",\"open_amount\":15,\"writable_count\":1,\"api_count\":1,\"hot_count\":1}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"tenant\":\"t2\",\"open_amount\":7,\"writable_count\":1,\"api_count\":1,\"hot_count\":1}", result.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }
