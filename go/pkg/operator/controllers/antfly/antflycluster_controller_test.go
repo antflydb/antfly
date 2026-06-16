@@ -626,6 +626,8 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 		"--manifest",
 		"/backup/base-standby-a-5.afha",
 	}))
+	g.Expect(finishJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-method", "POST"))
+	g.Expect(finishJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-path", "/admin/v1/ha/base-backups/finish"))
 	finishJob.Status.Conditions = []batchv1.JobCondition{{
 		Type:   batchv1.JobComplete,
 		Status: corev1.ConditionTrue,
@@ -654,6 +656,8 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 		"--content-root",
 		"/backup/base-standby-a-5",
 	}))
+	g.Expect(bootstrapJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-method", "POST"))
+	g.Expect(bootstrapJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-path", "/admin/v1/ha/standby/bootstrap"))
 }
 
 func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {

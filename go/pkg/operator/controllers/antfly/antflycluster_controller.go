@@ -4797,6 +4797,12 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 	if action.DependsOn != "" {
 		annotations["antfly.io/ha-action-depends-on"] = action.DependsOn
 	}
+	if action.AdminMethod != "" {
+		annotations["antfly.io/ha-admin-method"] = action.AdminMethod
+	}
+	if action.AdminPath != "" {
+		annotations["antfly.io/ha-admin-path"] = action.AdminPath
+	}
 	deadlineSeconds := haAdminJobTimeoutSeconds(admin)
 	backoffLimit := haAdminJobBackoffLimit(admin)
 	ttlSecondsAfterFinished := haAdminJobTTLSecondsAfterFinished(admin)
