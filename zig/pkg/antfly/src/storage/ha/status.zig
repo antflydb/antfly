@@ -98,6 +98,45 @@ pub const PromotionAssessment = struct {
     can_promote: bool,
 };
 
+pub const PrimaryStatusDocument = struct {
+    schema_version: u32 = 1,
+    snapshot: PrimarySnapshot,
+};
+
+pub const StandbyStatusDocument = struct {
+    schema_version: u32 = 1,
+    snapshot: StandbySnapshot,
+};
+
+pub const PromotionStatusDocument = struct {
+    schema_version: u32 = 1,
+    assessment: PromotionAssessment,
+};
+
+pub fn primaryStatusDocument(snapshot: PrimarySnapshot) PrimaryStatusDocument {
+    return .{ .snapshot = snapshot };
+}
+
+pub fn standbyStatusDocument(snapshot: StandbySnapshot) StandbyStatusDocument {
+    return .{ .snapshot = snapshot };
+}
+
+pub fn promotionStatusDocument(assessment: PromotionAssessment) PromotionStatusDocument {
+    return .{ .assessment = assessment };
+}
+
+pub fn renderPrimaryJsonAlloc(alloc: Allocator, snapshot: PrimarySnapshot) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, primaryStatusDocument(snapshot), .{});
+}
+
+pub fn renderStandbyJsonAlloc(alloc: Allocator, snapshot: StandbySnapshot) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, standbyStatusDocument(snapshot), .{});
+}
+
+pub fn renderPromotionJsonAlloc(alloc: Allocator, assessment: PromotionAssessment) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, promotionStatusDocument(assessment), .{});
+}
+
 pub fn primarySnapshot(
     alloc: Allocator,
     primary: *primary_mod.Primary,
@@ -312,10 +351,13 @@ test "storage.ha status snapshots primary slot lag retention and sync policy" {
     try std.testing.expectEqual(@as(u64, 2), slot_b.write_lag_lsn);
     try std.testing.expectEqual(@as(u64, 2), slot_b.apply_lag_lsn);
 
-    const encoded = try std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    const encoded = try renderPrimaryJsonAlloc(alloc, snapshot);
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"current_lsn\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"reseed_required\"") != null);
+    try expectContains(encoded, "\"schema_version\":1");
+    try expectContains(encoded, "\"snapshot\"");
+    try expectContains(encoded, "\"role\":\"primary\"");
+    try expectContains(encoded, "\"current_lsn\":3");
+    try expectContains(encoded, "\"reseed_required\"");
 }
 
 test "storage.ha status snapshots standby lag and promotion readiness" {
@@ -389,8 +431,21 @@ test "storage.ha status snapshots standby lag and promotion readiness" {
     try std.testing.expect(fenced.safe);
     try std.testing.expect(fenced.can_promote);
 
-    const encoded = try std.json.Stringify.valueAlloc(alloc, ready, .{});
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"role\":\"standby\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"applied_lsn\":2") != null);
+    const standby_json = try renderStandbyJsonAlloc(alloc, ready);
+    defer alloc.free(standby_json);
+    try expectContains(standby_json, "\"schema_version\":1");
+    try expectContains(standby_json, "\"snapshot\"");
+    try expectContains(standby_json, "\"role\":\"standby\"");
+    try expectContains(standby_json, "\"applied_lsn\":2");
+
+    const promotion_json = try renderPromotionJsonAlloc(alloc, fenced);
+    defer alloc.free(promotion_json);
+    try expectContains(promotion_json, "\"schema_version\":1");
+    try expectContains(promotion_json, "\"assessment\"");
+    try expectContains(promotion_json, "\"safe\":true");
+    try expectContains(promotion_json, "\"can_promote\":true");
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
 }
