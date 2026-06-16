@@ -450,6 +450,8 @@ pub fn adminCommandForAction(
     identity: primary_mod.Identity,
     options: AdminCommandOptions,
 ) !?AdminCommand {
+    if (action.executor == .controller_action) return null;
+
     var argv = std.ArrayListUnmanaged([]const u8).empty;
     errdefer argv.deinit(alloc);
     var owned_args = std.ArrayListUnmanaged([]u8).empty;
@@ -1207,6 +1209,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[3].depends_on);
     try std.testing.expectEqualStrings("standby-a", safe.actions[2].standby_name.?);
     try std.testing.expectEqualStrings("primary-a", safe.actions[3].standby_name.?);
+    try std.testing.expect((try adminCommandForAction(alloc, safe.actions[2], primary.identity, .{})) == null);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
 }
 
