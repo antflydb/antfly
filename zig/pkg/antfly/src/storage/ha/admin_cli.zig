@@ -103,6 +103,9 @@ pub const OperatorPlanCommand = struct {
     spec: operator.Spec,
     current_primary_id: ?[]const u8 = null,
     fencing: operator.FencingObservation = .{},
+    former_primary: ?rejoin.FormerPrimaryState = null,
+    promotion_receipt: ?fencing.Receipt = null,
+    rejoin_policy: rejoin.RejoinPolicy = .{ .retained_from_lsn = 0 },
 };
 
 pub const PromoteAssessCommand = struct {
@@ -649,6 +652,29 @@ fn parseOperator(
     };
     var sync_builder = SyncPolicyBuilder{};
     defer sync_builder.deinit(alloc);
+    var former_identity = standby_mod.Identity{
+        .cluster_id = 0,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 0,
+        .epoch = 0,
+    };
+    var former_node_id: ?[]const u8 = null;
+    var former_last_lsn: ?u64 = null;
+    var has_former_primary = false;
+    var has_fence = false;
+    var fence_old_primary_id: ?[]const u8 = null;
+    var fence_promoted_node_id: ?[]const u8 = null;
+    var fence_parent_timeline_id: ?u64 = null;
+    var fence_parent_epoch: ?u64 = null;
+    var fence_new_timeline_id: ?u64 = null;
+    var fence_new_epoch: ?u64 = null;
+    var fence_required_lsn: ?u64 = null;
+    var fence_observed_lsn: ?u64 = null;
+    var fence_generation: ?u64 = null;
+    var fence_forced = false;
+    var fence_token: ?[]const u8 = null;
+    var fence_reason: []const u8 = &.{};
 
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--standby")) {
@@ -697,11 +723,131 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--fence-reason")) {
             _ = cursor.next();
             command.fencing.reason = try cursor.value("--fence-reason");
+        } else if (std.mem.eql(u8, arg, "--former-primary-id") or std.mem.eql(u8, arg, "--former-node-id")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_node_id = try cursor.value(arg);
+        } else if (std.mem.eql(u8, arg, "--former-cluster-id")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_identity.cluster_id = try parseU64(try cursor.value("--former-cluster-id"));
+        } else if (std.mem.eql(u8, arg, "--former-shard-id")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_identity.shard_id = try parseU64(try cursor.value("--former-shard-id"));
+        } else if (std.mem.eql(u8, arg, "--former-table-id")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_identity.table_id = try parseU64(try cursor.value("--former-table-id"));
+        } else if (std.mem.eql(u8, arg, "--former-timeline-id")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_identity.timeline_id = try parseU64(try cursor.value("--former-timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--former-epoch")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_identity.epoch = try parseU64(try cursor.value("--former-epoch"));
+        } else if (std.mem.eql(u8, arg, "--former-last-lsn")) {
+            _ = cursor.next();
+            has_former_primary = true;
+            former_last_lsn = try parseU64(try cursor.value("--former-last-lsn"));
+        } else if (std.mem.eql(u8, arg, "--retained-from-lsn")) {
+            _ = cursor.next();
+            command.rejoin_policy.retained_from_lsn = try parseU64(try cursor.value("--retained-from-lsn"));
+        } else if (std.mem.eql(u8, arg, "--allow-forced-rewind")) {
+            _ = cursor.next();
+            command.rejoin_policy.allow_rewind_after_forced_promotion = true;
+        } else if (std.mem.eql(u8, arg, "--receipt-old-primary-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_old_primary_id = try cursor.value("--receipt-old-primary-id");
+        } else if (std.mem.eql(u8, arg, "--receipt-promoted-node-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_promoted_node_id = try cursor.value("--receipt-promoted-node-id");
+        } else if (std.mem.eql(u8, arg, "--receipt-parent-timeline-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_parent_timeline_id = try parseU64(try cursor.value("--receipt-parent-timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--receipt-parent-epoch")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_parent_epoch = try parseU64(try cursor.value("--receipt-parent-epoch"));
+        } else if (std.mem.eql(u8, arg, "--receipt-new-timeline-id")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_new_timeline_id = try parseU64(try cursor.value("--receipt-new-timeline-id"));
+        } else if (std.mem.eql(u8, arg, "--receipt-new-epoch")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_new_epoch = try parseU64(try cursor.value("--receipt-new-epoch"));
+        } else if (std.mem.eql(u8, arg, "--receipt-required-lsn")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_required_lsn = try parseU64(try cursor.value("--receipt-required-lsn"));
+        } else if (std.mem.eql(u8, arg, "--receipt-observed-lsn")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_observed_lsn = try parseU64(try cursor.value("--receipt-observed-lsn"));
+        } else if (std.mem.eql(u8, arg, "--receipt-generation")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_generation = try parseU64(try cursor.value("--receipt-generation"));
+        } else if (std.mem.eql(u8, arg, "--receipt-token")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_token = try cursor.value("--receipt-token");
+        } else if (std.mem.eql(u8, arg, "--receipt-reason")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_reason = try cursor.value("--receipt-reason");
+        } else if (std.mem.eql(u8, arg, "--receipt-forced")) {
+            _ = cursor.next();
+            has_fence = true;
+            fence_forced = true;
         } else if (try sync_builder.parseFlag(alloc, cursor, arg)) {
             continue;
         } else {
             break;
         }
+    }
+
+    if (has_former_primary) {
+        if (former_identity.cluster_id == 0) return error.FormerClusterIdMissing;
+        if (former_identity.shard_id == 0) return error.FormerShardIdMissing;
+        if (former_identity.table_id == 0) return error.FormerTableIdMissing;
+        if (former_identity.timeline_id == 0) return error.FormerTimelineIdMissing;
+        if (former_identity.epoch == 0) return error.FormerEpochMissing;
+        command.former_primary = .{
+            .node_id = former_node_id orelse return error.FormerPrimaryIdMissing,
+            .identity = former_identity,
+            .last_lsn = former_last_lsn orelse return error.FormerLastLsnMissing,
+        };
+    }
+
+    if (has_fence) {
+        if (!has_former_primary) return error.FormerPrimaryMissing;
+        command.promotion_receipt = .{
+            .identity = .{
+                .cluster_id = former_identity.cluster_id,
+                .shard_id = former_identity.shard_id,
+                .table_id = former_identity.table_id,
+                .timeline_id = fence_new_timeline_id orelse return error.FenceNewTimelineIdMissing,
+                .epoch = fence_new_epoch orelse return error.FenceNewEpochMissing,
+            },
+            .old_primary_id = fence_old_primary_id orelse return error.FenceOldPrimaryIdMissing,
+            .promoted_node_id = fence_promoted_node_id orelse return error.FencePromotedNodeIdMissing,
+            .parent_timeline_id = fence_parent_timeline_id orelse return error.FenceParentTimelineIdMissing,
+            .parent_epoch = fence_parent_epoch orelse return error.FenceParentEpochMissing,
+            .new_timeline_id = fence_new_timeline_id.?,
+            .new_epoch = fence_new_epoch.?,
+            .required_lsn = fence_required_lsn orelse return error.FenceRequiredLsnMissing,
+            .observed_lsn = fence_observed_lsn orelse return error.FenceObservedLsnMissing,
+            .generation = fence_generation orelse return error.FenceGenerationMissing,
+            .forced = fence_forced,
+            .token = fence_token orelse return error.FenceTokenMissing,
+            .reason = fence_reason,
+        };
     }
 
     const standby_slice = try standbys.toOwnedSlice(alloc);
@@ -1215,21 +1361,40 @@ test "storage.ha admin cli parses primary status with sync policy" {
 test "storage.ha admin cli parses operator plan command" {
     const alloc = std.testing.allocator;
     var plan = try parse(alloc, &.{
-        "operator",              "plan",
-        "--standby",             "standby-a",
-        "--standby-initial-lsn", "3",
-        "--standby-disabled",    "standby-b",
-        "--max-lag-lsn",         "50",
-        "--sync-mode",           "remote-apply",
-        "--sync-standby",        "standby-a",
-        "--auto-failover",       "--fencing-authority",
-        "kubernetes-lease",      "--auto-max-lag-lsn",
-        "2",                     "--current-primary-id",
-        "primary-a",             "--fence-authority",
-        "kubernetes_lease",      "--fence-ready",
-        "--fence-holder",        "standby-a",
-        "--fence-generation",    "7",
-        "--fence-reason",        "LeaseAcquired",
+        "operator",                     "plan",
+        "--standby",                    "standby-a",
+        "--standby-initial-lsn",        "3",
+        "--standby-disabled",           "standby-b",
+        "--max-lag-lsn",                "50",
+        "--sync-mode",                  "remote-apply",
+        "--sync-standby",               "standby-a",
+        "--auto-failover",              "--fencing-authority",
+        "kubernetes-lease",             "--auto-max-lag-lsn",
+        "2",                            "--current-primary-id",
+        "primary-a",                    "--fence-authority",
+        "kubernetes_lease",             "--fence-ready",
+        "--fence-holder",               "standby-a",
+        "--fence-generation",           "7",
+        "--fence-reason",               "LeaseAcquired",
+        "--former-primary-id",          "primary-a",
+        "--former-cluster-id",          "100",
+        "--former-shard-id",            "10",
+        "--former-table-id",            "20",
+        "--former-timeline-id",         "1",
+        "--former-epoch",               "1",
+        "--former-last-lsn",            "12",
+        "--retained-from-lsn",          "8",
+        "--receipt-old-primary-id",     "primary-a",
+        "--receipt-promoted-node-id",   "standby-a",
+        "--receipt-parent-timeline-id", "1",
+        "--receipt-parent-epoch",       "1",
+        "--receipt-new-timeline-id",    "2",
+        "--receipt-new-epoch",          "2",
+        "--receipt-required-lsn",       "10",
+        "--receipt-observed-lsn",       "10",
+        "--receipt-generation",         "3",
+        "--receipt-token",              "token",
+        "--receipt-reason",             "operator-approved",
     });
     defer plan.deinit(alloc);
 
@@ -1252,6 +1417,14 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqualStrings("LeaseAcquired", command.fencing.reason);
     try std.testing.expectEqual(primary_mod.DurabilityMode.remote_apply, command.spec.sync_policy.?.mode);
     try std.testing.expectEqualStrings("standby-a", command.spec.sync_policy.?.standby_names[0]);
+    try std.testing.expectEqualStrings("primary-a", command.former_primary.?.node_id);
+    try std.testing.expectEqual(@as(u64, 1), command.former_primary.?.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 12), command.former_primary.?.last_lsn);
+    try std.testing.expectEqual(@as(u64, 8), command.rejoin_policy.retained_from_lsn);
+    try std.testing.expectEqualStrings("standby-a", command.promotion_receipt.?.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 2), command.promotion_receipt.?.new_timeline_id);
+    try std.testing.expectEqual(@as(u64, 10), command.promotion_receipt.?.observed_lsn);
+    try std.testing.expectEqual(@as(u64, 3), command.promotion_receipt.?.generation);
 }
 
 test "storage.ha admin cli renders versioned json command plan" {

@@ -282,6 +282,12 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendUsizeLine(alloc, &out, "reseed_required_count", operator_plan.reseed_required_count);
             try appendUsizeLine(alloc, &out, "action_count", operator_plan.actions.len);
             try appendUsizeLine(alloc, &out, "condition_count", operator_plan.conditions.len);
+            if (operator_plan.former_primary_assessment) |assessment| {
+                try appendLine(alloc, &out, "former_primary.action", @tagName(assessment.action));
+                try appendLine(alloc, &out, "former_primary.reason", @tagName(assessment.reason));
+                try appendLine(alloc, &out, "former_primary.node_id", assessment.former_node_id);
+                try appendU64Line(alloc, &out, "former_primary.fork_lsn", assessment.fork_lsn);
+            }
         },
     }
 
@@ -381,6 +387,9 @@ fn executeOperatorPlan(
         .primary = snapshot,
         .current_primary_id = command.current_primary_id,
         .fencing = command.fencing,
+        .former_primary = command.former_primary,
+        .promotion_receipt = command.promotion_receipt,
+        .rejoin_policy = command.rejoin_policy,
     });
 }
 
@@ -1278,6 +1287,56 @@ test "storage.ha admin exec renders operator plan command" {
     try expectContains(table_body, "result=operator_plan\n");
     try expectContains(table_body, "automatic_promotion_allowed=true\n");
     try expectContains(table_body, "action_count=4\n");
+}
+
+test "storage.ha admin exec operator plan assesses former primary rejoin" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "operator-rejoin");
+    defer paths.deinit(alloc);
+    var promoted_identity = testIdentity();
+    promoted_identity.timeline_id = 2;
+    promoted_identity.epoch = 2;
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, promoted_identity, .{});
+    defer primary.close();
+
+    var plan = try admin_cli.parse(alloc, &.{
+        "operator",                     "plan",
+        "--former-primary-id",          "primary-a",
+        "--former-cluster-id",          "100",
+        "--former-shard-id",            "10",
+        "--former-table-id",            "20",
+        "--former-timeline-id",         "1",
+        "--former-epoch",               "1",
+        "--former-last-lsn",            "12",
+        "--retained-from-lsn",          "8",
+        "--receipt-old-primary-id",     "primary-a",
+        "--receipt-promoted-node-id",   "standby-a",
+        "--receipt-parent-timeline-id", "1",
+        "--receipt-parent-epoch",       "1",
+        "--receipt-new-timeline-id",    "2",
+        "--receipt-new-epoch",          "2",
+        "--receipt-required-lsn",       "10",
+        "--receipt-observed-lsn",       "10",
+        "--receipt-generation",         "3",
+        "--receipt-token",              "token",
+        "--receipt-reason",             "operator-approved",
+    });
+    defer plan.deinit(alloc);
+
+    var result = try execute(alloc, .{ .primary = &primary }, plan);
+    defer result.deinit(alloc);
+    const assessment = result.operator_plan.former_primary_assessment orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(rejoin.Action.rewind, assessment.action);
+    try std.testing.expectEqual(@as(usize, 1), result.operator_plan.actions.len);
+    try std.testing.expectEqual(operator.ActionKind.rewind_former_primary, result.operator_plan.actions[0].kind);
+    try std.testing.expectEqual(@as(?u64, 10), result.operator_plan.actions[0].target_lsn);
+
+    const table_body = try renderTableAlloc(alloc, result);
+    defer alloc.free(table_body);
+    try expectContains(table_body, "former_primary.action=rewind\n");
+    try expectContains(table_body, "former_primary.reason=parent_timeline_retained\n");
+    try expectContains(table_body, "former_primary.fork_lsn=10\n");
 }
 
 test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
