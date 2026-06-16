@@ -21,6 +21,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const http_common = @import("../../common/http/http_common.zig");
+const admin = @import("admin.zig");
 const admin_cli = @import("admin_cli.zig");
 const admin_exec = @import("admin_exec.zig");
 const fencing = @import("fencing.zig");
@@ -33,10 +34,17 @@ pub const Routes = struct {
     pub const health = "/ha/v1/health";
     pub const ready = "/ha/v1/ready";
     pub const command = "/ha/v1/admin/command";
+    pub const admin_ha_primary_status = "/admin/v1/ha/primary/status";
+    pub const admin_ha_replication_slots = "/admin/v1/ha/replication-slots";
 };
 
 pub const CommandRequest = struct {
     argv: []const []const u8,
+};
+
+pub const ReplicationSlotCreateRequest = struct {
+    slotName: []const u8,
+    initialLSN: ?u64 = null,
 };
 
 pub const Server = struct {
@@ -74,16 +82,68 @@ pub const Server = struct {
                     if (self.ready()) return try textResponse(self.alloc, 200, "ready");
                     return try textResponse(self.alloc, 503, "not ready");
                 }
+                if (std.mem.eql(u8, path, Routes.admin_ha_primary_status)) {
+                    return try self.handleAdminPrimaryStatus();
+                }
+                if (std.mem.eql(u8, path, Routes.admin_ha_replication_slots)) {
+                    return try self.handleAdminReplicationSlots();
+                }
                 return try textResponse(self.alloc, 404, "not found");
             },
             .POST => {
                 if (std.mem.eql(u8, path, Routes.command)) {
                     return try self.handleCommand(req);
                 }
+                if (std.mem.eql(u8, path, Routes.admin_ha_replication_slots)) {
+                    return try self.handleAdminCreateReplicationSlot(req);
+                }
                 return try textResponse(self.alloc, 404, "not found");
             },
             else => return try textResponse(self.alloc, 405, "method not allowed"),
         }
+    }
+
+    fn handleAdminPrimaryStatus(self: *Server) !http_common.HttpResponse {
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .primary_status = .{} },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminReplicationSlots(self: *Server) !http_common.HttpResponse {
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .slot_list = .{} },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
+    }
+
+    fn handleAdminCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
+
+        var parsed = std.json.parseFromSlice(
+            ReplicationSlotCreateRequest,
+            self.alloc,
+            req.body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");
+        defer parsed.deinit();
+
+        var plan = admin_cli.Plan{
+            .output = .json,
+            .command = .{ .slot = .{
+                .action = .create,
+                .request = admin.SlotRequest{
+                    .slot_name = parsed.value.slotName,
+                    .initial_lsn = parsed.value.initialLSN,
+                },
+            } },
+        };
+        defer plan.deinit(self.alloc);
+        return try self.handleJsonPlan(plan);
     }
 
     fn handleCommand(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -109,6 +169,19 @@ pub const Server = struct {
             .status = 200,
             .content_type = try self.alloc.dupe(u8, rendered.content_type),
             .body = rendered.body,
+        };
+    }
+
+    fn handleJsonPlan(self: *Server, plan: admin_cli.Plan) !http_common.HttpResponse {
+        var result = admin_exec.execute(self.alloc, self.ctx, plan) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+
+        return .{
+            .status = 200,
+            .content_type = try self.alloc.dupe(u8, "application/json"),
+            .body = try admin_exec.renderJsonAlloc(self.alloc, result),
         };
     }
 
@@ -306,6 +379,48 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), create.status);
     try std.testing.expectEqualStrings("application/json", create.content_type.?);
     try expectContains(create.body, "\"slot_name\":\"standby-a\"");
+
+    var typed_status = try server.handle(.{
+        .method = .GET,
+        .uri = Routes.admin_ha_primary_status,
+    });
+    defer typed_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_status.status);
+    try std.testing.expectEqualStrings("application/json", typed_status.content_type.?);
+    try expectContains(typed_status.body, "\"primary_status\"");
+    try expectContains(typed_status.body, "\"current_lsn\":0");
+
+    var typed_create = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.admin_ha_replication_slots,
+        .content_type = "application/json",
+        .body = "{\"slotName\":\"standby-b\",\"initialLSN\":0}",
+    });
+    defer typed_create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_create.status);
+    try std.testing.expectEqualStrings("application/json", typed_create.content_type.?);
+    try expectContains(typed_create.body, "\"slot_name\":\"standby-b\"");
+
+    var typed_slots = try server.handle(.{
+        .method = .GET,
+        .uri = Routes.admin_ha_replication_slots,
+    });
+    defer typed_slots.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_slots.status);
+    try std.testing.expectEqualStrings("application/json", typed_slots.content_type.?);
+    try expectContains(typed_slots.body, "\"slot_list\"");
+    try expectContains(typed_slots.body, "\"name\":\"standby-a\"");
+    try expectContains(typed_slots.body, "\"name\":\"standby-b\"");
+
+    var invalid_typed_create = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.admin_ha_replication_slots,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer invalid_typed_create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_typed_create.status);
+    try expectContains(invalid_typed_create.body, "invalid HA replication slot request");
 
     var duplicate_create = try server.handle(.{
         .method = .POST,
