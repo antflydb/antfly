@@ -52849,13 +52849,13 @@ test "postgres sql adapter lowers aggregate expression inputs" {
 
     var lowered = try lowerAggregateAlloc(
         alloc,
-        "SELECT customer, COUNT(DISTINCT lower(status)) AS status_count, SUM(amount - discount) AS net_amount, COUNT(DISTINCT coalesce(status, 'missing')) AS status_bucket_count, SUM(coalesce(amount, 0)) AS amount_total, SUM(array_length(tags, 1)) AS tag_total, COUNT(DISTINCT metadata->>'source') AS source_count, ARRAY_AGG(metadata->'flags') AS flag_sets FROM usage_records GROUP BY customer",
+        "SELECT customer, COUNT(DISTINCT lower(status)) AS status_count, SUM(amount - discount) AS net_amount, COUNT(DISTINCT coalesce(status, 'missing')) AS status_bucket_count, SUM(coalesce(amount, 0)) AS amount_total, SUM(array_length(tags, 1)) AS tag_total, SUM(octet_length(status)) AS status_bytes, SUM(bit_length(status)) AS status_bits, COUNT(DISTINCT metadata->>'source') AS source_count, ARRAY_AGG(metadata->'flags') AS flag_sets FROM usage_records GROUP BY customer",
         schema,
         &.{},
     );
     defer lowered.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 7), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 9), lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
     try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
     try std.testing.expect(lowered.aggregate.aggregations[0].field == null);
@@ -52874,17 +52874,23 @@ test "postgres sql adapter lowers aggregate expression inputs" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[4].op);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.aggregate.aggregations[4].expression.?.kind);
     try std.testing.expectEqualStrings("tags", lowered.aggregate.aggregations[4].expression.?.operands[0].field);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[5].op);
-    try std.testing.expect(lowered.aggregate.aggregations[5].distinct);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.aggregate.aggregations[5].expression.?.kind);
-    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[5].expression.?.operands[0].field);
-    try std.testing.expect(lowered.aggregate.aggregations[5].expression.?.json_as_text);
-    try std.testing.expectEqualStrings("source", lowered.aggregate.aggregations[5].expression.?.json_path);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.aggregate.aggregations[6].op);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.aggregate.aggregations[6].expression.?.kind);
-    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[6].expression.?.operands[0].field);
-    try std.testing.expect(!lowered.aggregate.aggregations[6].expression.?.json_as_text);
-    try std.testing.expectEqualStrings("flags", lowered.aggregate.aggregations[6].expression.?.json_path);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[5].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, lowered.aggregate.aggregations[5].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[5].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[6].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, lowered.aggregate.aggregations[6].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[6].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[7].op);
+    try std.testing.expect(lowered.aggregate.aggregations[7].distinct);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.aggregate.aggregations[7].expression.?.kind);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[7].expression.?.operands[0].field);
+    try std.testing.expect(lowered.aggregate.aggregations[7].expression.?.json_as_text);
+    try std.testing.expectEqualStrings("source", lowered.aggregate.aggregations[7].expression.?.json_path);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.aggregate.aggregations[8].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.aggregate.aggregations[8].expression.?.kind);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[8].expression.?.operands[0].field);
+    try std.testing.expect(!lowered.aggregate.aggregations[8].expression.?.json_as_text);
+    try std.testing.expectEqualStrings("flags", lowered.aggregate.aggregations[8].expression.?.json_path);
 }
 
 test "postgres sql adapter lowers bounded array aggregate specs" {
@@ -62586,6 +62592,8 @@ const AppParityCorpusCoverage = struct {
     query_ascii_chr_expression: bool = false,
     query_modulo_expression: bool = false,
     aggregate_modulo_expression: bool = false,
+    aggregate_octet_length_expression: bool = false,
+    aggregate_bit_length_expression: bool = false,
     query_date_trunc_expression: bool = false,
     query_date_bin_expression: bool = false,
     query_typed_datetime_literal_expression: bool = false,
@@ -63110,6 +63118,10 @@ const AppParityCorpusCoverage = struct {
                 self.aggregate_input_expression = self.aggregate_input_expression or appParityPlanHasNonZeroToken(entry.plan, ":agg_expr=");
                 self.aggregate_modulo_expression = self.aggregate_modulo_expression or (std.mem.indexOf(u8, entry.sql, "SUM(quantity % 7)") != null and
                     std.mem.indexOf(u8, entry.sql, "SUM(MOD(amount + quantity") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
+                self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(octet_length(status))") != null and
+                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
+                self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(bit_length(status))") != null and
                     appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
                 self.aggregate_group_expression = self.aggregate_group_expression or appParityPlanHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (appParityPlanHasNonZeroToken(entry.plan, ":group_expr=") and
@@ -64516,6 +64528,8 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.set_operation_expression_numeric_range_disjoint);
         try std.testing.expect(self.aggregate_offset);
         try std.testing.expect(self.aggregate_input_expression);
+        try std.testing.expect(self.aggregate_octet_length_expression);
+        try std.testing.expect(self.aggregate_bit_length_expression);
         try std.testing.expect(self.aggregate_group_expression);
         try std.testing.expect(self.aggregate_group_expression_alias);
         try std.testing.expect(self.aggregate_having_expression);
@@ -67219,6 +67233,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .aggregations = 1 },
             .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=1:agg_expr=1:filter_expr=0:having=0:order=0:limit=-1",
             .sql = "SELECT SUM((amount - quantity)) AS net_amount FROM usage_records",
+        },
+        .{
+            .name = "aggregate text length input expressions",
+            .family = .aggregate,
+            .summary = .{ .table_name = "usage_records", .aggregations = 2 },
+            .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=2:agg_expr=2:filter_expr=0:having=0:order=0:limit=-1",
+            .sql = "SELECT SUM(octet_length(status)) AS status_bytes, SUM(bit_length(status)) AS status_bits FROM usage_records",
         },
         .{
             .name = "distinct grouped projection",

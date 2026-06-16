@@ -3696,6 +3696,16 @@
       "sql": "SELECT SUM((amount - quantity)) AS net_amount FROM usage_records"
     },
     {
+      "name": "aggregate text length input expressions",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "aggregations": 2
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=0:aggs=2:agg_expr=2:filter_expr=0:having=0:order=0:limit=-1",
+      "sql": "SELECT SUM(octet_length(status)) AS status_bytes, SUM(bit_length(status)) AS status_bits FROM usage_records"
+    },
+    {
       "name": "distinct grouped projection",
       "family": "aggregate",
       "summary": {
