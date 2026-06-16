@@ -6495,6 +6495,26 @@ spec:
                   mode:
                     description: Mode is the observed HA mode.
                     type: string
+                  plannedActions:
+                    description: PlannedActions reports HA reconciliation actions
+                      the operator plans to take.
+                    items:
+                      description: HAPlannedActionStatus reports one planned HA operator
+                        action.
+                      properties:
+                        kind:
+                          type: string
+                        reason:
+                          type: string
+                        slotName:
+                          type: string
+                        standbyName:
+                          type: string
+                        targetLSN:
+                          format: int64
+                          type: integer
+                      type: object
+                    type: array
                   primaryLSN:
                     description: PrimaryLSN is the current primary replication LSN.
                     format: int64

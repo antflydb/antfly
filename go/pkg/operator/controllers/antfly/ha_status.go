@@ -137,7 +137,25 @@ func applyHAPlanStatus(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	cluster.Status.HAStatus.ReadSafeStandbyCount = plan.ReadSafeStandbyCount
 	cluster.Status.HAStatus.ReseedRequiredCount = plan.ReseedRequiredCount
 	cluster.Status.HAStatus.AutomaticPromotionAllowed = plan.AutomaticPromotionAllowed
+	cluster.Status.HAStatus.PlannedActions = haPlannedActionStatuses(plan.Actions)
 	mergeConfiguredStandbys(cluster.Status.HAStatus, ha)
+}
+
+func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActionStatus {
+	if len(actions) == 0 {
+		return nil
+	}
+	out := make([]antflyv1.HAPlannedActionStatus, 0, len(actions))
+	for _, action := range actions {
+		out = append(out, antflyv1.HAPlannedActionStatus{
+			Kind:        string(action.Kind),
+			StandbyName: action.StandbyName,
+			SlotName:    action.SlotName,
+			TargetLSN:   action.TargetLSN,
+			Reason:      action.Reason,
+		})
+	}
+	return out
 }
 
 func mergeConfiguredStandbys(status *antflyv1.HAStatus, ha *antflyv1.HighAvailabilitySpec) {

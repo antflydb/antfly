@@ -1243,6 +1243,10 @@ type HAStatus struct {
 	// +optional
 	Standbys []HAStandbyStatus `json:"standbys,omitempty"`
 
+	// PlannedActions reports HA reconciliation actions the operator plans to take.
+	// +optional
+	PlannedActions []HAPlannedActionStatus `json:"plannedActions,omitempty"`
+
 	// Retention summarizes primary WAL retention pressure.
 	// +optional
 	Retention HARetentionStatus `json:"retention,omitempty"`
@@ -1281,6 +1285,19 @@ type HAStandbyStatus struct {
 	Status string `json:"status,omitempty"`
 
 	LastError string `json:"lastError,omitempty"`
+}
+
+// HAPlannedActionStatus reports one planned HA operator action.
+type HAPlannedActionStatus struct {
+	Kind string `json:"kind,omitempty"`
+
+	StandbyName string `json:"standbyName,omitempty"`
+
+	SlotName string `json:"slotName,omitempty"`
+
+	TargetLSN uint64 `json:"targetLSN,omitempty"`
+
+	Reason string `json:"reason,omitempty"`
 }
 
 // HARetentionStatus reports HA WAL retention pressure.

@@ -57,6 +57,17 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	if plan.Actions[1].Kind != haActionSeedStandby || plan.Actions[1].TargetLSN != initial {
 		t.Fatalf("unexpected second action: %#v", plan.Actions[1])
 	}
+
+	reconciler := &AntflyClusterReconciler{}
+	reconciler.updateHAStatusAndConditions(cluster)
+	if len(cluster.Status.HAStatus.PlannedActions) != 2 {
+		t.Fatalf("expected planned actions in status, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionCreateSlot) ||
+		cluster.Status.HAStatus.PlannedActions[0].SlotName != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[0].TargetLSN != initial {
+		t.Fatalf("unexpected planned create-slot status: %#v", cluster.Status.HAStatus.PlannedActions[0])
+	}
 }
 
 func TestUpdateHAStatusReportsReseedAndDegradedSync(t *testing.T) {
@@ -141,6 +152,13 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 	if plan.Actions[0].Kind != haActionAcquireFence || plan.Actions[1].Kind != haActionPromoteStandby {
 		t.Fatalf("unexpected promotion actions: %#v", plan.Actions)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 4 {
+		t.Fatalf("expected fenced promotion action chain in status, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionAcquireFence) ||
+		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionPromoteStandby) {
+		t.Fatalf("unexpected promotion action status: %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 }
 
