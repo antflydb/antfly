@@ -5259,6 +5259,13 @@ match `returning_rows`, source-query writes and merge mutations must match
 image contract instead of allowing stale fixture metadata to claim result-shape
 coverage.
 
+Write operation-count summaries are fingerprint anchored for non-DDL writes.
+Point inserts/updates and mutation-source updates must match `ops`,
+insert-source plans must match `assignments`, and merge mutations must match
+`matched_update`. DDL operation summaries remain tied to the DDL lowerer and
+applied-plan verifier because their meaning depends on the specific catalog
+operation family.
+
 Conflict guard summaries are also positive evidence. A fixture may carry
 `conflict_where` only for insert or insert-source plans whose fingerprint
 contains `conflict_where=1`; absence of the summary is the only representation

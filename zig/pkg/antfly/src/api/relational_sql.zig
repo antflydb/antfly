@@ -62170,6 +62170,20 @@ fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFami
     };
 }
 
+fn appParityFixtureOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
+    return switch (entry.family) {
+        .ddl => true,
+        .insert,
+        .update,
+        .update_source,
+        .update_joined_source,
+        => appParityPlanHasExactUsizeToken(entry.plan, ":ops=", expected),
+        .insert_source => appParityPlanHasExactUsizeToken(entry.plan, ":assignments=", expected),
+        .merge_mutation => appParityPlanHasExactUsizeToken(entry.plan, ":matched_update=", expected),
+        else => false,
+    };
+}
+
 fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .insert,
@@ -62655,6 +62669,11 @@ fn validateAppParityFixtureMetadata(
     if (entry.summary.operations != null and !appParityFixtureFamilyAllowsOperationsSummary(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.summary.operations) |operations| {
+        if (!appParityFixtureOperationsSummaryMatchesPlan(entry, operations)) {
+            return error.TestUnexpectedResult;
+        }
+    }
     if ((entry.summary.returning != null or entry.summary.returning_all != null) and
         !appParityFixtureAllowsReturningSummary(entry))
     {
@@ -62972,6 +62991,30 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .update_source,
         .summary = .{ .table_name = "usage_records", .predicates = 1, .order_by = 1, .limit = 5, .offset = 2, .operations = 1 },
         .plan = "update_source:table=usage_records:source_pred=1:source_order=1:source_limit=5:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0:source_offset=2",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale insert source operations summary",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM usage_records",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records", .operations = 1 },
+        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale merge operations summary",
+        .sql = "MERGE INTO usage_records AS target USING source_records AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
+        .family = .merge_mutation,
+        .summary = .{ .table_name = "usage_records", .join_on = 1, .operations = 1 },
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=0:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid insert source operations summary",
+        .sql = "INSERT INTO usage_records (id) SELECT id FROM usage_records",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records", .operations = 1 },
+        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=1:conflict=0:returning=0:returning_expr=0:returning_all=0",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
