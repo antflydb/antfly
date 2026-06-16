@@ -756,7 +756,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 					Kind:         string(haActionSeedStandby),
 					DependsOn:    string(haActionCreateSlot),
 					StandbyName:  "standby-a",
-					AdminCommand: []string{"seed", "begin", "--slot", "standby-a"},
+					AdminCommand: []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "operator-base-standby-a-7"},
 					AdminURL:     "http://primary-ha.default.svc:8081",
 				}},
 			},
@@ -773,6 +773,9 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/base-backups"))
+			var payload map[string]any
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			g.Expect(payload["manifest_id"]).To(Equal("operator-base-standby-a-7"))
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},

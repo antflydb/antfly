@@ -3343,7 +3343,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		body := map[string]any{
 			"slot_name":   slotName,
-			"manifest_id": fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN),
+			"manifest_id": haSeedBeginManifestID(*action, slotName),
 		}
 		return true, r.postHAAdminJSON(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
 	case string(haActionAcquireFence):
@@ -3486,6 +3486,17 @@ func haActionSlotName(action antflyv1.HAPlannedActionStatus) string {
 		return strings.TrimSpace(action.SlotName)
 	}
 	return strings.TrimSpace(action.StandbyName)
+}
+
+func haSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName string) string {
+	for i := 0; i+1 < len(action.AdminCommand); i++ {
+		if action.AdminCommand[i] == "--manifest-id" {
+			if manifestID := strings.TrimSpace(action.AdminCommand[i+1]); manifestID != "" {
+				return manifestID
+			}
+		}
+	}
+	return fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)
 }
 
 func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, raw []byte) {
