@@ -62390,6 +62390,12 @@ fn validateAppParityFixtureMetadata(
     if (has_resolver_hint and !appParityFixtureFamilyAllowsResolverHint(entry.family)) {
         return error.TestUnexpectedResult;
     }
+    if (has_resolver_hint and
+        (entry.family == .insert or entry.family == .unsupported_insert) and
+        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") == null)
+    {
+        return error.TestUnexpectedResult;
+    }
     if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
         return error.TestUnexpectedResult;
     }
@@ -62664,6 +62670,16 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=1:order=0:limit=none",
+        .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
+        .resolver_version = 17,
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "plain insert resolver hint",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') RETURNING id",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning = 1 },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
         .resolver_row_json = "{\"id\":\"u1\",\"status\":\"old\"}",
         .resolver_version = 17,
     }, &seen, alloc));
