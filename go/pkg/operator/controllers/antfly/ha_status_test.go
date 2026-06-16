@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -73,6 +74,12 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 		cluster.Status.HAStatus.PlannedActions[0].SlotName != "standby-a" ||
 		cluster.Status.HAStatus.PlannedActions[0].TargetLSN != initial {
 		t.Fatalf("unexpected planned create-slot status: %#v", cluster.Status.HAStatus.PlannedActions[0])
+	}
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, []string{"slot", "create", "--slot", "standby-a", "--initial-lsn", "5"}) {
+		t.Fatalf("unexpected create-slot admin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+	}
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "base-standby-a-5"}) {
+		t.Fatalf("unexpected seed admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
 	}
 }
 
@@ -220,6 +227,12 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
 		cluster.Status.HAStatus.PlannedActions[2].RouteTo != "standby-a" {
 		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "--current-fence"}) {
+		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
+	}
+	if cluster.Status.HAStatus.PlannedActions[2].AdminCommand != nil {
+		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||

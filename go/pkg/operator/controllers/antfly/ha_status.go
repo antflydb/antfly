@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
@@ -349,10 +350,38 @@ func haPlannedActionStatuses(actions []haPlannedAction) []antflyv1.HAPlannedActi
 			FenceAuthority:  action.FenceAuthority,
 			FenceHolder:     action.FenceHolder,
 			FenceGeneration: action.FenceGeneration,
+			AdminCommand:    haAdminCommand(action),
 			Reason:          action.Reason,
 		})
 	}
 	return out
+}
+
+func haAdminCommand(action haPlannedAction) []string {
+	switch action.Kind {
+	case haActionCreateSlot:
+		slotName := action.SlotName
+		if slotName == "" {
+			slotName = action.StandbyName
+		}
+		if slotName == "" {
+			return nil
+		}
+		return []string{"slot", "create", "--slot", slotName, "--initial-lsn", strconv.FormatUint(action.TargetLSN, 10)}
+	case haActionSeedStandby, haActionMarkReseed:
+		slotName := action.SlotName
+		if slotName == "" {
+			slotName = action.StandbyName
+		}
+		if slotName == "" {
+			return nil
+		}
+		return []string{"seed", "begin", "--slot", slotName, "--manifest-id", fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)}
+	case haActionPromoteStandby:
+		return []string{"promote", "--current-fence"}
+	default:
+		return nil
+	}
 }
 
 func haPrimaryRouteStatus(evaluation haPrimaryRouteEvaluation) antflyv1.HAPrimaryRouteStatus {

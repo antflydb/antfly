@@ -1367,6 +1367,10 @@ type HAPlannedActionStatus struct {
 
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
 
+	// AdminCommand is an antfly HA admin argv for executable planned actions.
+	// +optional
+	AdminCommand []string `json:"adminCommand,omitempty"`
+
 	Reason string `json:"reason,omitempty"`
 }
 

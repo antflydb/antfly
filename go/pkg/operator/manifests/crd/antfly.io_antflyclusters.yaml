@@ -6572,6 +6572,12 @@ spec:
                       description: HAPlannedActionStatus reports one planned HA operator
                         action.
                       properties:
+                        adminCommand:
+                          description: AdminCommand is an antfly HA admin argv for
+                            executable planned actions.
+                          items:
+                            type: string
+                          type: array
                         fenceAuthority:
                           description: HAFencingAuthority selects the authority used
                             before automatic promotion.
