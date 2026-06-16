@@ -201,7 +201,7 @@ pub const Primary = struct {
     pub fn endBaseBackup(self: *Primary, manifest: backup_manifest.Manifest) !BaseBackupEndResult {
         try validateBackupManifestIdentity(self.identity, manifest.identity);
         try backup_manifest.validateManifestInput(manifest);
-        if (manifest.backup_lsn > self.lastLsn()) return error.BackupStartNotDurable;
+        try self.validateBackupStart(manifest);
 
         const encoded_manifest = try backup_manifest.encodeAlloc(self.alloc, manifest);
         defer self.alloc.free(encoded_manifest);
@@ -382,6 +382,37 @@ pub const Primary = struct {
             .applied_lsn = previous_lsn,
         });
     }
+
+    fn validateBackupStart(self: *Primary, manifest: backup_manifest.Manifest) !void {
+        if (manifest.backup_lsn > self.lastLsn()) return error.BackupStartNotDurable;
+        var entry = (try self.log.entryAt(self.alloc, manifest.backup_lsn)) orelse return error.BackupStartNotFound;
+        defer entry.deinit(self.alloc);
+        if (entry.record.kind != .backup_start) return error.BackupStartNotFound;
+        if (entry.record.payload_codec != .json) return error.BackupStartMismatch;
+
+        var parsed = std.json.parseFromSlice(BackupStartPayload, self.alloc, entry.record.payload, .{}) catch return error.BackupStartMismatch;
+        defer parsed.deinit();
+
+        const start = parsed.value;
+        if (start.cluster_id != self.identity.cluster_id) return error.BackupStartMismatch;
+        if (start.shard_id != self.identity.shard_id) return error.BackupStartMismatch;
+        if (start.table_id != self.identity.table_id) return error.BackupStartMismatch;
+        if (start.timeline_id != self.identity.timeline_id) return error.BackupStartMismatch;
+        if (start.epoch != self.identity.epoch) return error.BackupStartMismatch;
+        if (start.backup_lsn != manifest.backup_lsn) return error.BackupStartMismatch;
+        if (!std.mem.eql(u8, start.manifest_id, manifest.manifest_id)) return error.BackupStartMismatch;
+    }
+};
+
+const BackupStartPayload = struct {
+    cluster_id: u64,
+    shard_id: u64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
+    slot_name: []const u8,
+    manifest_id: []const u8,
+    backup_lsn: u64,
 };
 
 fn validateBackupManifestIdentity(expected: Identity, actual: Identity) !void {
@@ -760,6 +791,40 @@ test "storage.ha primary rejects backup end from wrong identity or missing start
         .manifest_id = "wrong",
         .backup_lsn = 1,
         .checkpoint_lsn = 1,
+        .files = &files,
+    }));
+}
+
+test "storage.ha primary requires matching backup start record before backup end" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "backup-end-start-match");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    const files = [_]backup_manifest.FileEntry{
+        .{ .path = "store/manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
+    };
+
+    _ = try primary.append(.{ .payload = "not-a-backup-start" });
+    try std.testing.expectError(error.BackupStartNotFound, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-1",
+        .backup_lsn = 1,
+        .checkpoint_lsn = 1,
+        .files = &files,
+    }));
+
+    const started = try primary.beginBaseBackup(.{
+        .slot_name = "standby-a",
+        .manifest_id = "manifest-1",
+    });
+    try std.testing.expectError(error.BackupStartMismatch, primary.endBaseBackup(.{
+        .identity = identity,
+        .manifest_id = "manifest-2",
+        .backup_lsn = started.backup_lsn,
+        .checkpoint_lsn = started.backup_lsn,
         .files = &files,
     }));
 }

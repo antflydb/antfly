@@ -556,6 +556,25 @@ pub const WAL = struct {
         return try alloc.dupe(WalEntry, entries.items);
     }
 
+    /// Read one retained entry by exact LSN. Caller owns the returned data.
+    pub fn readAt(self: *WAL, alloc: Allocator, lsn: u64) !?WalEntry {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+        const value = txn.get(&key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const decoded = decodeWalValue(value) catch |err| switch (err) {
+            error.CorruptWal => return error.CorruptWal,
+        };
+        return .{
+            .lsn = lsn,
+            .data = try alloc.dupe(u8, decoded),
+        };
+    }
+
     /// Import ScanAction from docstore for consistent API.
     pub const ScanAction = @import("docstore.zig").DocStore.ScanAction;
 

@@ -118,6 +118,19 @@ pub const ReplicationLog = struct {
         return try results.toOwnedSlice(alloc);
     }
 
+    pub fn entryAt(self: *ReplicationLog, alloc: Allocator, lsn: u64) !?Entry {
+        const wal_entry = (try self.wal.readAt(alloc, lsn)) orelse return null;
+        errdefer alloc.free(wal_entry.data);
+        const decoded = try replication_record.decode(wal_entry.data);
+        if (decoded.lsn != wal_entry.lsn) return error.RecordWalLsnMismatch;
+        if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+        return .{
+            .wal_lsn = wal_entry.lsn,
+            .encoded = wal_entry.data,
+            .record = decoded,
+        };
+    }
+
     pub fn truncate(self: *ReplicationLog, up_to_lsn: u64) !void {
         try self.wal.truncate(up_to_lsn);
     }
@@ -177,6 +190,27 @@ test "storage.ha replication log appends and iterates records in wal order" {
     try std.testing.expectEqual(@as(u64, 2), entries[1].wal_lsn);
     try std.testing.expectEqual(@as(u64, 2), entries[1].record.lsn);
     try std.testing.expectEqualStrings("two", entries[1].record.payload);
+}
+
+test "storage.ha replication log reads retained entries by exact lsn" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "entry-at");
+    defer alloc.free(path);
+
+    var log = try ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    _ = try log.append(alloc, baseRecord(2, "two"));
+
+    var entry = (try log.entryAt(alloc, 2)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), entry.wal_lsn);
+    try std.testing.expectEqual(@as(u64, 2), entry.record.lsn);
+    try std.testing.expectEqualStrings("two", entry.record.payload);
+
+    try log.truncate(1);
+    try std.testing.expect((try log.entryAt(alloc, 1)) == null);
 }
 
 test "storage.ha replication log survives reopen and keeps next lsn" {
