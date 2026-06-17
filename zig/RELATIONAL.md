@@ -3614,8 +3614,11 @@ SQL lowering before a typed aggregate plan is accepted, even when a later clause
 uses an ordinal that could otherwise disambiguate the reference.
 Direct aggregate-call ordering such as `ORDER BY SUM(amount) DESC`
 uses the same binding rule as `HAVING`: the call must structurally match exactly
-one selected metric output, and the stored typed plan orders by that emitted
-metric field. Aggregate `having`
+one selected metric specification, and the stored typed plan orders by the first
+matching emitted metric field. Repeated equivalent selected metrics therefore
+bind to the first selected output because they compute the same value; duplicate
+output names, non-equivalent matches, and unselected aggregate calls still fail
+closed before a typed aggregate plan is accepted. Aggregate `having`
 is a typed conjunction over emitted
 group/metric fields and is encoded as `{ "all": [...] }`. The `all` list must
 contain at least one predicate, each predicate must name a non-empty emitted
@@ -3643,8 +3646,10 @@ OR all_openish` lower to a single `having_expressions` condition over the same
 `and`/`or`/`not` row-expression AST used by row predicates and projections. Direct
 aggregate-call predicates such as
 `HAVING COUNT(*) > 0` and `HAVING SUM(amount) >= 10` resolve to the selected
-metric output when the call structurally matches exactly one emitted aggregate;
-unselected or ambiguous aggregate calls fail closed. Computed SQL `HAVING`
+metric output when the call structurally matches a selected aggregate spec;
+repeated equivalent selected specs resolve to the first selected metric output,
+while unselected or non-equivalent ambiguous aggregate calls fail closed.
+Computed SQL `HAVING`
 predicates over selected group/metric aliases lower to the same aggregate-output
 expression condition groups. Boolean expressions that mix comparison predicates
 and boolean-valued outputs still use the explicit `having`/`having_any`/`having_not`

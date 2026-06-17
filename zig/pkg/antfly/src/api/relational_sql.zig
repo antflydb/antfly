@@ -31038,14 +31038,11 @@ const Parser = struct {
         if (self.nextIsAggregateFunction()) {
             const candidate = try self.parseAggregateSpecAlloc();
             defer freeAggregateSpec(self.alloc, candidate);
-            var matched_name: ?[]const u8 = null;
             for (aggregations) |aggregation| {
                 if (!aggregateSpecsEquivalent(candidate, aggregation)) continue;
-                if (matched_name != null) return error.UnsupportedSqlShape;
-                matched_name = aggregation.name;
+                return try self.alloc.dupe(u8, aggregation.name);
             }
-            const name = matched_name orelse return error.UnsupportedSqlShape;
-            return try self.alloc.dupe(u8, name);
+            return error.UnsupportedSqlShape;
         }
 
         const field = try self.parseIdentifierOwned();
@@ -54039,18 +54036,27 @@ test "postgres sql adapter lowers grouped aggregate queries" {
     try std.testing.expectEqualStrings("order_count", output_expression_order.aggregate.order_by[0].expression.?.operands[1].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, output_expression_order.aggregate.order_by[0].direction);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
+    var duplicate_direct_having = try lowerAggregateAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS order_count, COUNT(*) AS duplicate_count FROM usage_records GROUP BY customer HAVING COUNT(*) > 0",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
+    );
+    defer duplicate_direct_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_direct_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("order_count", duplicate_direct_having.aggregate.having_predicates[0].field);
+
+    var duplicate_direct_order = try lowerAggregateAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS order_count, COUNT(*) AS duplicate_count FROM usage_records GROUP BY customer ORDER BY COUNT(*) DESC",
         schema,
         &.{},
-    ));
+    );
+    defer duplicate_direct_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_direct_order.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("order_count", duplicate_direct_order.aggregate.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, duplicate_direct_order.aggregate.order_by[0].direction);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer ORDER BY customer",
