@@ -1,5 +1,5 @@
 # Publish packages to npm when tagged
-# - ts/antfly/sdk/v* tags publish @antfly/sdk
+# - ts/packages/sdk/v* tags publish @antfly/sdk
 # - ts/antfly/components/v* tags publish @antfly/components
 # - ts/antfly/design-system/v* tags publish @antfly/design-system
 #
@@ -13,7 +13,7 @@ name: Publish to npm
 on:
   push:
     tags:
-      - 'ts/antfly/sdk/v*'
+      - 'ts/packages/sdk/v*'
       - 'ts/antfly/components/v*'
       - 'ts/antfly/design-system/v*'
 
@@ -55,7 +55,7 @@ jobs:
         run: npm install -g npm@latest
 
       - name: Publish SDK
-        if: startsWith(github.ref, 'refs/tags/ts/antfly/sdk/v')
+        if: startsWith(github.ref, 'refs/tags/ts/packages/sdk/v')
         working-directory: ts
         run: pnpm --filter @antfly/sdk publish --access public --no-git-checks --provenance
 
