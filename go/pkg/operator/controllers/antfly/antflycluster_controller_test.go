@@ -636,6 +636,90 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
 }
 
+func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					AdminCommand:    []string{"fence", "acquire"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+				}, {
+					Kind:            string(haActionPromoteStandby),
+					DependsOn:       string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 3,
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/admin/v1/ha/fence":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"receipt":{"generation":3,"token":"ha-fence-token"}}`)),
+				}, nil
+			case "/admin/v1/ha/promotion/current-fence":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"forced":false}`)),
+				}, nil
+			default:
+				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
+}
+
 func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 	g := NewWithT(t)
 
@@ -748,6 +832,85 @@ func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
 	g.Expect(jobs.Items).To(BeEmpty())
+}
+
+func TestReconcileHAAdminJobsRejectsDirectRejoinMismatchedAssessment(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  4,
+					ParentEpoch:       6,
+					NewTimelineID:     5,
+					NewEpoch:          7,
+					SwitchLSN:         12,
+					RequiredLSN:       12,
+					ObservedLSN:       13,
+					FenceGeneration:   3,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceToken:        "ha-fence-token",
+				},
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionRewindFormerPrimary),
+					StandbyName:     "primary-a",
+					TargetLSN:       12,
+					ObservedLSN:     13,
+					RetainedFromLSN: 8,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					AdminCommand:    []string{"rejoin", "assess"},
+					AdminURL:        "http://primary-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/rejoin/assess"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-b","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8}}`)),
+			}, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
 }
 
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
