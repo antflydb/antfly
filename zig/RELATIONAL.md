@@ -4173,14 +4173,17 @@ Adapter-only transaction-control coverage includes `BEGIN`, `BEGIN WORK`, bare
 `START TRANSACTION`, `COMMIT`, `COMMIT TRANSACTION`, `ROLLBACK`, and `ROLLBACK
 WORK` as explicit no-op classifications, so migration wrappers and client
 protocol boundary statements stay out of storage while still remaining visible in
-the golden corpus. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
+the golden corpus. The boundary tail matcher lives in
+`api/sql_adapter/grammar.zig`, including statement-end validation, `WORK` and
+`TRANSACTION` aliases, and fail-closed handling for prepared transactions or
+extra statements. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
 [SAVEPOINT]` lower to typed savepoint transaction-control intents that capture
 the savepoint name and fail closed at schema/storage application until native
 nested transaction rollback/release semantics exist. Prepared transaction
 commands are not boundary no-ops; they must fail closed until Antfly owns a
-durable prepared-transaction model. This keeps savepoint and prepared-transaction
-syntax out of storage while preserving a stable typed boundary for the future
-subtransaction model.
+durable prepared-transaction model. This keeps savepoint and
+prepared-transaction syntax out of storage while preserving a stable typed
+boundary for the future subtransaction model.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:

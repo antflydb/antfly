@@ -25,6 +25,11 @@ pub const RowSecurityAlterSyntax = struct {
     enabled: bool,
 };
 
+pub const AdapterNoopTransactionBoundaryTail = struct {
+    work: bool = false,
+    transaction: bool = false,
+};
+
 pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAlterSyntax {
     const start = pos.*;
     var cursor = parser.Cursor.init(tokens, pos);
@@ -89,6 +94,23 @@ pub fn parseAdapterNoopDiscardStatementTail(tokens: []const Token, pos: *usize) 
     try parseAdapterNoopStatementEnd(cursor);
 }
 
+pub fn matchAdapterNoopTransactionBoundaryTail(
+    tokens: []const Token,
+    pos: *usize,
+    options: AdapterNoopTransactionBoundaryTail,
+) !bool {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const checkpoint = cursor.checkpoint();
+    if (try matchAdapterNoopStatementEnd(cursor)) return true;
+    if ((options.work and cursor.matchKeyword("work")) or
+        (options.transaction and cursor.matchKeyword("transaction")))
+    {
+        if (try matchAdapterNoopStatementEnd(cursor)) return true;
+    }
+    cursor.restore(checkpoint);
+    return false;
+}
+
 fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
@@ -106,6 +128,14 @@ fn parseAdapterNoopStatementEnd(cursor: parser.Cursor) !void {
     if (!cursor.atEnd() and !cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
     if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
     if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+}
+
+fn matchAdapterNoopStatementEnd(cursor: parser.Cursor) !bool {
+    if (cursor.matchToken(.semicolon) != null) {
+        if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+        return true;
+    }
+    return cursor.atEnd();
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -479,4 +509,37 @@ test "sql adapter grammar rejects semantic session changes as noops" {
     defer lexer.freeTokens(alloc, &discard_temp_tokens);
     var discard_temp_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopDiscardStatementTail(discard_temp_tokens.items, &discard_temp_pos));
+}
+
+test "sql adapter grammar matches transaction boundary noops" {
+    const alloc = std.testing.allocator;
+
+    var bare_tokens = try lexer.tokenizeAlloc(alloc, ";");
+    defer lexer.freeTokens(alloc, &bare_tokens);
+    var bare_pos: usize = 0;
+    try std.testing.expect(try matchAdapterNoopTransactionBoundaryTail(bare_tokens.items, &bare_pos, .{}));
+    try std.testing.expectEqual(bare_tokens.items.len, bare_pos);
+
+    var work_tokens = try lexer.tokenizeAlloc(alloc, "WORK;");
+    defer lexer.freeTokens(alloc, &work_tokens);
+    var work_pos: usize = 0;
+    try std.testing.expect(try matchAdapterNoopTransactionBoundaryTail(work_tokens.items, &work_pos, .{ .work = true }));
+    try std.testing.expectEqual(work_tokens.items.len, work_pos);
+
+    var transaction_tokens = try lexer.tokenizeAlloc(alloc, "TRANSACTION;");
+    defer lexer.freeTokens(alloc, &transaction_tokens);
+    var transaction_pos: usize = 0;
+    try std.testing.expect(try matchAdapterNoopTransactionBoundaryTail(transaction_tokens.items, &transaction_pos, .{ .transaction = true }));
+    try std.testing.expectEqual(transaction_tokens.items.len, transaction_pos);
+
+    var prepared_tokens = try lexer.tokenizeAlloc(alloc, "PREPARED 'x';");
+    defer lexer.freeTokens(alloc, &prepared_tokens);
+    var prepared_pos: usize = 0;
+    try std.testing.expect(!try matchAdapterNoopTransactionBoundaryTail(prepared_tokens.items, &prepared_pos, .{ .work = true, .transaction = true }));
+    try std.testing.expectEqual(@as(usize, 0), prepared_pos);
+
+    var extra_tokens = try lexer.tokenizeAlloc(alloc, "; SELECT 1");
+    defer lexer.freeTokens(alloc, &extra_tokens);
+    var extra_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, matchAdapterNoopTransactionBoundaryTail(extra_tokens.items, &extra_pos, .{}));
 }

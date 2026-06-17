@@ -5129,29 +5129,8 @@ const Parser = struct {
         try sql_adapter.parseAdapterNoopDiscardStatementTail(self.tokens, &self.pos);
     }
 
-    const AdapterNoopTransactionBoundaryTail = struct {
-        work: bool = false,
-        transaction: bool = false,
-    };
-
-    fn matchAdapterNoopTransactionBoundaryTail(self: *@This(), options: AdapterNoopTransactionBoundaryTail) !bool {
-        const checkpoint = self.pos;
-        if (try self.matchStatementEnd()) return true;
-        if ((options.work and self.matchKeyword("work")) or
-            (options.transaction and self.matchKeyword("transaction")))
-        {
-            if (try self.matchStatementEnd()) return true;
-        }
-        self.pos = checkpoint;
-        return false;
-    }
-
-    fn matchStatementEnd(self: *@This()) !bool {
-        if (self.match(.semicolon) != null) {
-            if (!self.atEnd()) return error.UnsupportedSqlShape;
-            return true;
-        }
-        return self.atEnd();
+    fn matchAdapterNoopTransactionBoundaryTail(self: *@This(), options: sql_adapter.AdapterNoopTransactionBoundaryTail) !bool {
+        return try sql_adapter.matchAdapterNoopTransactionBoundaryTail(self.tokens, &self.pos, options);
     }
 
     fn parseCreateDomainDdl(self: *@This()) !CreateDomainPlan {
