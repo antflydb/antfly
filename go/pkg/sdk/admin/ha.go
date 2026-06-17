@@ -568,8 +568,8 @@ func ValidateHAReadCheckResponse(response HAReadCheckResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing read check schema_version")
 	}
-	if !HAReadDecisionComplete(response.Decision) {
-		return fmt.Errorf("missing read decision fields")
+	if err := validateHAReadDecision(response.Decision); err != nil {
+		return fmt.Errorf("invalid read decision: %w", err)
 	}
 	return nil
 }
@@ -578,8 +578,8 @@ func ValidateHAWriteCheckResponse(response HAWriteCheckResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing write check schema_version")
 	}
-	if !HAWriteDecisionComplete(response.Decision) {
-		return fmt.Errorf("missing write decision fields")
+	if err := validateHAWriteDecision(response.Decision); err != nil {
+		return fmt.Errorf("invalid write decision: %w", err)
 	}
 	return nil
 }
@@ -588,8 +588,8 @@ func ValidateHAOwnerJobCheckResponse(response HAOwnerJobCheckResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing owner job check schema_version")
 	}
-	if !HAOwnerJobDecisionComplete(response.Decision) {
-		return fmt.Errorf("missing owner job decision fields")
+	if err := validateHAOwnerJobDecision(response.Decision); err != nil {
+		return fmt.Errorf("invalid owner job decision: %w", err)
 	}
 	return nil
 }
@@ -1328,6 +1328,67 @@ func HAReadDecisionComplete(decision HAReadDecision) bool {
 		HAReadDecisionConsistencyValid(decision.Consistency)
 }
 
+func validateHAReadDecision(decision HAReadDecision) error {
+	if !HAReadDecisionComplete(decision) {
+		return fmt.Errorf("missing read decision fields")
+	}
+	if decision.AppliedLsn > decision.ReceivedLsn {
+		return fmt.Errorf("read decision inconsistent: applied_lsn=%d exceeds received_lsn=%d", decision.AppliedLsn, decision.ReceivedLsn)
+	}
+	if decision.SafeReadLsn > decision.AppliedLsn {
+		return fmt.Errorf("read decision inconsistent: safe_read_lsn=%d exceeds applied_lsn=%d", decision.SafeReadLsn, decision.AppliedLsn)
+	}
+	if decision.MetadataAppliedLsn > 0 && decision.MetadataAppliedLsn > decision.AppliedLsn {
+		return fmt.Errorf("read decision inconsistent: metadata_applied_lsn=%d exceeds applied_lsn=%d", decision.MetadataAppliedLsn, decision.AppliedLsn)
+	}
+	if decision.ServeLsn > 0 {
+		if decision.ServeLsn > decision.SafeReadLsn {
+			return fmt.Errorf("read decision inconsistent: serve_lsn=%d exceeds safe_read_lsn=%d", decision.ServeLsn, decision.SafeReadLsn)
+		}
+		if decision.MetadataAppliedLsn > 0 && decision.ServeLsn > decision.MetadataAppliedLsn {
+			return fmt.Errorf("read decision inconsistent: serve_lsn=%d exceeds metadata_applied_lsn=%d", decision.ServeLsn, decision.MetadataAppliedLsn)
+		}
+	}
+
+	expectedMissing := haSaturatingSub(decision.RequiredLsn, decision.SafeReadLsn)
+	if decision.MissingLsnCount != expectedMissing {
+		return fmt.Errorf("read decision inconsistent: missing_lsn_count=%d expected=%d", decision.MissingLsnCount, expectedMissing)
+	}
+	requiredMetadataLSN := decision.RequiredMetadataLsn
+	if requiredMetadataLSN == 0 {
+		requiredMetadataLSN = decision.RequiredLsn
+	}
+	appliedMetadataLSN := decision.MetadataAppliedLsn
+	if appliedMetadataLSN == 0 {
+		appliedMetadataLSN = decision.SafeReadLsn
+	}
+	expectedMetadataMissing := haSaturatingSub(requiredMetadataLSN, appliedMetadataLSN)
+	if decision.MetadataMissingLsnCount != expectedMetadataMissing {
+		return fmt.Errorf("read decision inconsistent: metadata_missing_lsn_count=%d expected=%d", decision.MetadataMissingLsnCount, expectedMetadataMissing)
+	}
+
+	switch decision.Consistency {
+	case HAReadDecisionConsistencyPrimary:
+		if decision.Action != HAReadDecisionActionRouteToPrimary {
+			return fmt.Errorf("read decision inconsistent: primary consistency action=%q", decision.Action)
+		}
+		if decision.ServeLsn != 0 || decision.MissingLsnCount != 0 || decision.MetadataMissingLsnCount != 0 {
+			return fmt.Errorf("read decision inconsistent: primary consistency should not serve or wait locally")
+		}
+	case HAReadDecisionConsistencyStaleOK:
+		if decision.Action != HAReadDecisionActionServeStandby {
+			return fmt.Errorf("read decision inconsistent: stale_ok action=%q", decision.Action)
+		}
+	case HAReadDecisionConsistencyAtLeastLSN:
+		switch decision.Action {
+		case HAReadDecisionActionServeStandby, HAReadDecisionActionWaitForApply, HAReadDecisionActionWaitForMetadata:
+		default:
+			return fmt.Errorf("read decision inconsistent: at_least_lsn action=%q", decision.Action)
+		}
+	}
+	return nil
+}
+
 func HAReadDecisionActionValid(action HAReadDecisionAction) bool {
 	switch action {
 	case HAReadDecisionActionServeStandby,
@@ -1358,6 +1419,33 @@ func HAWriteDecisionComplete(decision HAWriteDecision) bool {
 		HAPromotionHandoffCompleteOrEmpty(decision.PromotionHandoff)
 }
 
+func validateHAWriteDecision(decision HAWriteDecision) error {
+	if !HAWriteDecisionComplete(decision) {
+		return fmt.Errorf("missing write decision fields")
+	}
+	if err := validateHANextLSN("write decision", decision.DurableLsn, decision.NextLsn); err != nil {
+		return err
+	}
+
+	promoted := false
+	switch decision.Role {
+	case HAWriteDecisionRolePrimary:
+		if decision.Action != HAWriteDecisionActionAllowWrite {
+			return fmt.Errorf("write decision inconsistent: primary role action=%q", decision.Action)
+		}
+	case HAWriteDecisionRoleStandby:
+		if decision.Action != HAWriteDecisionActionRejectReadOnly {
+			return fmt.Errorf("write decision inconsistent: standby role action=%q", decision.Action)
+		}
+	case HAWriteDecisionRolePromotedStandby:
+		if decision.Action != HAWriteDecisionActionOpenPromotedPrimary {
+			return fmt.Errorf("write decision inconsistent: promoted_standby role action=%q", decision.Action)
+		}
+		promoted = true
+	}
+	return validateHAPromotionHandoffForGate("write decision", promoted, decision.Identity, decision.DurableLsn, decision.NextLsn, decision.PromotionHandoff)
+}
+
 func HAWriteDecisionRoleValid(role HAWriteDecisionRole) bool {
 	switch role {
 	case HAWriteDecisionRolePrimary, HAWriteDecisionRoleStandby, HAWriteDecisionRolePromotedStandby:
@@ -1384,6 +1472,33 @@ func HAOwnerJobDecisionComplete(decision HAOwnerJobDecision) bool {
 		HAOwnerJobDecisionActionValid(decision.Action) &&
 		HAIdentityComplete(decision.Identity) &&
 		HAPromotionHandoffCompleteOrEmpty(decision.PromotionHandoff)
+}
+
+func validateHAOwnerJobDecision(decision HAOwnerJobDecision) error {
+	if !HAOwnerJobDecisionComplete(decision) {
+		return fmt.Errorf("missing owner job decision fields")
+	}
+	if err := validateHANextLSN("owner job decision", decision.DurableLsn, decision.NextLsn); err != nil {
+		return err
+	}
+
+	promoted := false
+	switch decision.Role {
+	case HAOwnerJobDecisionRolePrimary:
+		if decision.Action != HAOwnerJobDecisionActionRun {
+			return fmt.Errorf("owner job decision inconsistent: primary role action=%q", decision.Action)
+		}
+	case HAOwnerJobDecisionRoleStandby:
+		if decision.Action != HAOwnerJobDecisionActionDisableOnStandby {
+			return fmt.Errorf("owner job decision inconsistent: standby role action=%q", decision.Action)
+		}
+	case HAOwnerJobDecisionRolePromotedStandby:
+		if decision.Action != HAOwnerJobDecisionActionOpenPromotedPrimary {
+			return fmt.Errorf("owner job decision inconsistent: promoted_standby role action=%q", decision.Action)
+		}
+		promoted = true
+	}
+	return validateHAPromotionHandoffForGate("owner job decision", promoted, decision.Identity, decision.DurableLsn, decision.NextLsn, decision.PromotionHandoff)
 }
 
 func HAOwnerJobDecisionKindValid(kind HAOwnerJobDecisionKind) bool {
@@ -1423,6 +1538,43 @@ func HAPromotionHandoffCompleteOrEmpty(handoff HAPromotionHandoff) bool {
 		return true
 	}
 	return HAIdentityComplete(handoff.Identity)
+}
+
+func validateHANextLSN(label string, durableLSN uint64, nextLSN uint64) error {
+	if durableLSN == ^uint64(0) {
+		return fmt.Errorf("%s inconsistent: durable_lsn overflows next_lsn", label)
+	}
+	expected := durableLSN + 1
+	if nextLSN != expected {
+		return fmt.Errorf("%s inconsistent: next_lsn=%d expected=%d", label, nextLSN, expected)
+	}
+	return nil
+}
+
+func validateHAPromotionHandoffForGate(label string, promoted bool, identity HAIdentity, durableLSN uint64, nextLSN uint64, handoff HAPromotionHandoff) error {
+	if !promoted {
+		if !HAPromotionHandoffEmpty(handoff) {
+			return fmt.Errorf("%s inconsistent: promotion_handoff present without promoted role", label)
+		}
+		return nil
+	}
+	if !HAIdentityComplete(handoff.Identity) {
+		return fmt.Errorf("%s inconsistent: missing promotion_handoff identity", label)
+	}
+	if handoff.Identity != identity {
+		return fmt.Errorf("%s inconsistent: promotion_handoff identity mismatch", label)
+	}
+	if handoff.SwitchLsn != durableLSN {
+		return fmt.Errorf("%s inconsistent: promotion_handoff switch_lsn=%d expected durable_lsn=%d", label, handoff.SwitchLsn, durableLSN)
+	}
+	if handoff.NextLsn != nextLSN {
+		return fmt.Errorf("%s inconsistent: promotion_handoff next_lsn=%d expected=%d", label, handoff.NextLsn, nextLSN)
+	}
+	return nil
+}
+
+func HAPromotionHandoffEmpty(handoff HAPromotionHandoff) bool {
+	return !HAIdentityComplete(handoff.Identity) && handoff.SwitchLsn == 0 && handoff.NextLsn == 0
 }
 
 func HAPromotionAssessmentComplete(assessment HAPromotionAssessment) bool {

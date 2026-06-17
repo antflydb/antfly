@@ -1071,8 +1071,29 @@ func TestValidateHAGateResponses(t *testing.T) {
 	if err := ValidateHAReadCheckResponse(read); err != nil {
 		t.Fatalf("ValidateHAReadCheckResponse returned error: %v", err)
 	}
-	read.Decision.Consistency = HAReadDecisionConsistency("unknown")
-	if err := ValidateHAReadCheckResponse(read); err == nil || !strings.Contains(err.Error(), "read decision fields") {
+	badReadProgress := read
+	badReadProgress.Decision.AppliedLsn = 10
+	if err := ValidateHAReadCheckResponse(badReadProgress); err == nil || !strings.Contains(err.Error(), "applied_lsn") {
+		t.Fatalf("invalid read progress error = %v, want applied_lsn error", err)
+	}
+	badReadMissing := read
+	badReadMissing.Decision.RequiredLsn = 11
+	if err := ValidateHAReadCheckResponse(badReadMissing); err == nil || !strings.Contains(err.Error(), "missing_lsn_count") {
+		t.Fatalf("invalid read missing count error = %v, want missing_lsn_count error", err)
+	}
+	badReadServe := read
+	badReadServe.Decision.ServeLsn = 10
+	if err := ValidateHAReadCheckResponse(badReadServe); err == nil || !strings.Contains(err.Error(), "serve_lsn") {
+		t.Fatalf("invalid read serve lsn error = %v, want serve_lsn error", err)
+	}
+	badReadPrimary := read
+	badReadPrimary.Decision.Consistency = HAReadDecisionConsistencyPrimary
+	if err := ValidateHAReadCheckResponse(badReadPrimary); err == nil || !strings.Contains(err.Error(), "primary consistency") {
+		t.Fatalf("invalid read primary action error = %v, want primary consistency error", err)
+	}
+	badReadFields := read
+	badReadFields.Decision.Consistency = HAReadDecisionConsistency("unknown")
+	if err := ValidateHAReadCheckResponse(badReadFields); err == nil || !strings.Contains(err.Error(), "read decision fields") {
 		t.Fatalf("invalid read decision error = %v, want read decision fields error", err)
 	}
 
@@ -1090,8 +1111,43 @@ func TestValidateHAGateResponses(t *testing.T) {
 	if err := ValidateHAWriteCheckResponse(write); err != nil {
 		t.Fatalf("ValidateHAWriteCheckResponse returned error: %v", err)
 	}
-	write.Decision.Identity = HAIdentity{}
-	if err := ValidateHAWriteCheckResponse(write); err == nil || !strings.Contains(err.Error(), "write decision fields") {
+	badWriteNext := write
+	badWriteNext.Decision.NextLsn = 12
+	if err := ValidateHAWriteCheckResponse(badWriteNext); err == nil || !strings.Contains(err.Error(), "next_lsn") {
+		t.Fatalf("invalid write next lsn error = %v, want next_lsn error", err)
+	}
+	badWriteAction := write
+	badWriteAction.Decision.Action = HAWriteDecisionActionAllowWrite
+	if err := ValidateHAWriteCheckResponse(badWriteAction); err == nil || !strings.Contains(err.Error(), "standby role action") {
+		t.Fatalf("invalid write role action error = %v, want standby role action error", err)
+	}
+	promotedIdentity := HAIdentity{ClusterId: 1, TimelineId: 4, Epoch: 5}
+	promotedWrite := HAWriteCheckResponse{
+		SchemaVersion: 1,
+		Decision: HAWriteDecision{
+			Action:     HAWriteDecisionActionOpenPromotedPrimary,
+			Role:       HAWriteDecisionRolePromotedStandby,
+			Identity:   promotedIdentity,
+			DurableLsn: 12,
+			NextLsn:    13,
+			PromotionHandoff: HAPromotionHandoff{
+				Identity:  promotedIdentity,
+				SwitchLsn: 12,
+				NextLsn:   13,
+			},
+		},
+	}
+	if err := ValidateHAWriteCheckResponse(promotedWrite); err != nil {
+		t.Fatalf("ValidateHAWriteCheckResponse promoted returned error: %v", err)
+	}
+	badWriteHandoff := promotedWrite
+	badWriteHandoff.Decision.PromotionHandoff.Identity.Epoch = 6
+	if err := ValidateHAWriteCheckResponse(badWriteHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff identity") {
+		t.Fatalf("invalid write handoff error = %v, want promotion_handoff identity error", err)
+	}
+	badWriteFields := write
+	badWriteFields.Decision.Identity = HAIdentity{}
+	if err := ValidateHAWriteCheckResponse(badWriteFields); err == nil || !strings.Contains(err.Error(), "write decision fields") {
 		t.Fatalf("invalid write decision error = %v, want write decision fields error", err)
 	}
 
@@ -1109,8 +1165,43 @@ func TestValidateHAGateResponses(t *testing.T) {
 	if err := ValidateHAOwnerJobCheckResponse(owner); err != nil {
 		t.Fatalf("ValidateHAOwnerJobCheckResponse returned error: %v", err)
 	}
-	owner.Decision.Kind = HAOwnerJobDecisionKind("unknown")
-	if err := ValidateHAOwnerJobCheckResponse(owner); err == nil || !strings.Contains(err.Error(), "owner job decision fields") {
+	badOwnerNext := owner
+	badOwnerNext.Decision.NextLsn = 12
+	if err := ValidateHAOwnerJobCheckResponse(badOwnerNext); err == nil || !strings.Contains(err.Error(), "next_lsn") {
+		t.Fatalf("invalid owner job next lsn error = %v, want next_lsn error", err)
+	}
+	badOwnerAction := owner
+	badOwnerAction.Decision.Role = HAOwnerJobDecisionRoleStandby
+	if err := ValidateHAOwnerJobCheckResponse(badOwnerAction); err == nil || !strings.Contains(err.Error(), "standby role action") {
+		t.Fatalf("invalid owner job role action error = %v, want standby role action error", err)
+	}
+	promotedOwner := HAOwnerJobCheckResponse{
+		SchemaVersion: 1,
+		Decision: HAOwnerJobDecision{
+			Action:     HAOwnerJobDecisionActionOpenPromotedPrimary,
+			Kind:       HAOwnerJobDecisionKindCompactionPublish,
+			Role:       HAOwnerJobDecisionRolePromotedStandby,
+			Identity:   promotedIdentity,
+			DurableLsn: 12,
+			NextLsn:    13,
+			PromotionHandoff: HAPromotionHandoff{
+				Identity:  promotedIdentity,
+				SwitchLsn: 12,
+				NextLsn:   13,
+			},
+		},
+	}
+	if err := ValidateHAOwnerJobCheckResponse(promotedOwner); err != nil {
+		t.Fatalf("ValidateHAOwnerJobCheckResponse promoted returned error: %v", err)
+	}
+	badOwnerHandoff := promotedOwner
+	badOwnerHandoff.Decision.PromotionHandoff.NextLsn = 14
+	if err := ValidateHAOwnerJobCheckResponse(badOwnerHandoff); err == nil || !strings.Contains(err.Error(), "promotion_handoff next_lsn") {
+		t.Fatalf("invalid owner job handoff error = %v, want promotion_handoff next_lsn error", err)
+	}
+	badOwnerFields := owner
+	badOwnerFields.Decision.Kind = HAOwnerJobDecisionKind("unknown")
+	if err := ValidateHAOwnerJobCheckResponse(badOwnerFields); err == nil || !strings.Contains(err.Error(), "owner job decision fields") {
 		t.Fatalf("invalid owner job decision error = %v, want owner job decision fields error", err)
 	}
 }
