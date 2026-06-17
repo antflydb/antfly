@@ -457,6 +457,20 @@ func requireHAJSON200[T any](operation string, statusCode int, body []byte, valu
 	}, nil
 }
 
+func requireHA2xx(operation string, statusCode int, body []byte, err error) error {
+	if err != nil {
+		return err
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return &HAAPIError{
+			Operation:  operation,
+			StatusCode: statusCode,
+			Body:       strings.TrimSpace(string(body)),
+		}
+	}
+	return nil
+}
+
 func haResponseValue[T any](response *HAResponse[T], err error) (*T, error) {
 	if err != nil {
 		return nil, err
@@ -476,6 +490,29 @@ func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusPar
 	return haResponseValue(c.PrimaryStatusResponse(ctx, params))
 }
 
+func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[ParsedHAPrimaryStatus], error) {
+	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	if err := requireHA2xx("get HA primary status", resp.StatusCode(), resp.Body, err); err != nil {
+		return nil, err
+	}
+	parsed, err := ParseHAPrimaryStatus(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("parse HA primary status: %w", err)
+	}
+	return &HAResponse[ParsedHAPrimaryStatus]{
+		Value:      parsed,
+		Body:       resp.Body,
+		StatusCode: resp.StatusCode(),
+	}, nil
+}
+
+func (c *HAClient) PrimaryStatusParsed(ctx context.Context, params *HAPrimaryStatusParams) (*ParsedHAPrimaryStatus, error) {
+	return haResponseValue(c.PrimaryStatusParsedResponse(ctx, params))
+}
+
 func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[HAStandbyStatusResponse], error) {
 	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, c.editors...)
 	if resp == nil {
@@ -486,6 +523,29 @@ func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyS
 
 func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
 	return haResponseValue(c.StandbyStatusResponse(ctx, params))
+}
+
+func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[HAStandbyStatusResponse], error) {
+	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	if err := requireHA2xx("get HA standby status", resp.StatusCode(), resp.Body, err); err != nil {
+		return nil, err
+	}
+	parsed, err := ParseHAStandbyStatus(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("parse HA standby status: %w", err)
+	}
+	return &HAResponse[HAStandbyStatusResponse]{
+		Value:      parsed,
+		Body:       resp.Body,
+		StatusCode: resp.StatusCode(),
+	}, nil
+}
+
+func (c *HAClient) StandbyStatusParsed(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
+	return haResponseValue(c.StandbyStatusParsedResponse(ctx, params))
 }
 
 func (c *HAClient) AppendCommitResponse(ctx context.Context, body CommitAppendRequest) (*HAResponse[HACommitAppendResponse], error) {

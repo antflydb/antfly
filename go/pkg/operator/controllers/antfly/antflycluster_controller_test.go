@@ -5055,7 +5055,7 @@ func TestObserveHAPrimaryAdminStatusDoesNotFallbackToCommandEndpoint(t *testing.
 	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).NotTo(Succeed())
 	g.Expect(requestCount).To(Equal(1))
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
-	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("HA admin API returned status 404"))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("get HA primary status returned status 404"))
 }
 
 func TestObserveHAPrimaryAdminStatusRejectsMismatchedIdentityScope(t *testing.T) {

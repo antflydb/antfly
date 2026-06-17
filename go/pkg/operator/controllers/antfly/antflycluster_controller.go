@@ -5936,15 +5936,11 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
-	response, err := adminClient.PrimaryStatusResponse(ctx, haPrimaryStatusParams(ha))
-	raw, err := haAdminSDKResponseRaw(response, err)
+	response, err := adminClient.PrimaryStatusParsedResponse(ctx, haPrimaryStatusParams(ha))
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
-	status, err := parseHAPrimaryStatusJSON(raw)
-	if err != nil {
-		return haObservedPrimaryStatus{}, err
-	}
+	status := haObservedPrimaryStatusFromAdminSDK(*response.Value)
 	if err := haValidateObservedStatusScope(status.Identity, ha); err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
@@ -5956,15 +5952,11 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
-	response, err := adminClient.StandbyStatusResponse(ctx, haStandbyStatusParams(upstreamLSN))
-	raw, err := haAdminSDKResponseRaw(response, err)
+	response, err := adminClient.StandbyStatusParsedResponse(ctx, haStandbyStatusParams(upstreamLSN))
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
-	observed, err := parseHAStandbyStatusJSONWithIdentity(raw, standbyName, slotName)
-	if err != nil {
-		return antflyv1.HAStandbyStatus{}, err
-	}
+	observed := haObservedStandbyStatusFromAdminSDK(*response.Value, standbyName, slotName)
 	if err := haValidateObservedStatusScope(observed.Identity, ha); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
@@ -6074,6 +6066,10 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	return haObservedPrimaryStatusFromAdminSDK(*parsed), nil
+}
+
+func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) haObservedPrimaryStatus {
 	snapshot := parsed.Response.Snapshot
 	status := haObservedPrimaryStatus{
 		Identity:   haObservedIdentityFromAdminSDK(snapshot.Identity),
@@ -6106,7 +6102,7 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 	if parsed.HasDurability {
 		status.Sync = haSyncStatusFromAdminDurability(snapshot.Durability)
 	}
-	return status, nil
+	return status
 }
 
 func haSyncStatusFromAdminDurability(durability adminsdk.HADurabilityDecision) *antflyv1.HASyncStatus {
@@ -6184,6 +6180,10 @@ func parseHAStandbyStatusJSONWithIdentity(raw []byte, standbyName string, slotNa
 	if err != nil {
 		return haObservedStandbyStatus{}, err
 	}
+	return haObservedStandbyStatusFromAdminSDK(*response, standbyName, slotName), nil
+}
+
+func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusResponse, standbyName string, slotName string) haObservedStandbyStatus {
 	snapshot := response.Snapshot
 	status := antflyv1.HAStandbyStatus{
 		Name:               standbyName,
@@ -6209,7 +6209,7 @@ func parseHAStandbyStatusJSONWithIdentity(raw []byte, standbyName string, slotNa
 	return haObservedStandbyStatus{
 		Status:   status,
 		Identity: haObservedIdentityFromAdminSDK(snapshot.Identity),
-	}, nil
+	}
 }
 
 func haObservedIdentityFromAdminSDK(identity adminsdk.HAIdentity) haObservedIdentity {

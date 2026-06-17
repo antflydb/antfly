@@ -1,6 +1,10 @@
 package admin
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -111,6 +115,62 @@ func TestHAStatusParserRejectsMissingStandbySafeReadFlag(t *testing.T) {
 	_, err := ParseHAStandbyStatus([]byte(body))
 	if err == nil {
 		t.Fatalf("ParseHAStandbyStatus returned nil error, want missing standby fields error")
+	}
+	if !strings.Contains(err.Error(), "standby status fields") {
+		t.Fatalf("error = %q, want standby status fields", err.Error())
+	}
+}
+
+func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haLegacyPrimaryStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	response, err := client.PrimaryStatusParsedResponse(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("PrimaryStatusParsedResponse returned error: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if len(response.Body) == 0 {
+		t.Fatalf("Body is empty, want raw response body")
+	}
+	if response.Value.Response.Snapshot.CurrentLsn != 12 || !response.Value.HasDurability {
+		t.Fatalf("parsed response = %+v, want current_lsn=12 with durability", response.Value)
+	}
+}
+
+func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, strings.Replace(haLegacyStandbyStatusJSON(), `"can_serve_safe_reads":true`, `"can_serve_safe_reads":null`, 1))
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.StandbyStatusParsedResponse(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("StandbyStatusParsedResponse returned nil error, want validation error")
 	}
 	if !strings.Contains(err.Error(), "standby status fields") {
 		t.Fatalf("error = %q, want standby status fields", err.Error())
