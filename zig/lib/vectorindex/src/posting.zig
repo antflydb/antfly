@@ -3302,10 +3302,19 @@ pub const PostingStore = struct {
         scratch: anytype,
         max_capacity: usize,
     ) !void {
+        const Scratch = std.meta.Child(@TypeOf(scratch));
         const needed = scratch.deltaRecordCount() + 1;
-        if (needed <= scratch.delta_records.len) return;
-        const doubled = scratch.delta_records.len *| 2;
-        try scratch.ensureDeltaRecordCapacity(alloc, @min(max_capacity, @max(needed, @max(doubled, @as(usize, 8)))));
+        if (comptime @hasField(Scratch, "delta_records")) {
+            if (needed <= scratch.delta_records.len) return;
+            const doubled = scratch.delta_records.len *| 2;
+            try scratch.ensureDeltaRecordCapacity(alloc, @min(max_capacity, @max(needed, @max(doubled, @as(usize, 8)))));
+        } else if (comptime @hasField(Scratch, "posting_delta_records")) {
+            if (needed <= scratch.posting_delta_records.len) return;
+            const doubled = scratch.posting_delta_records.len *| 2;
+            try scratch.ensureDeltaRecordCapacity(alloc, @min(max_capacity, @max(needed, @max(doubled, @as(usize, 8)))));
+        } else {
+            try scratch.ensureDeltaRecordCapacity(alloc, needed);
+        }
     }
 
     fn applySortedCompactOpsToSortedScratch(
