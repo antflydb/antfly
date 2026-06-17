@@ -1006,32 +1006,33 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 	operations := loadAdminOpenAPIOperations(t)
 	routes := []struct {
-		method string
-		path   string
+		method      string
+		path        string
+		operationID string
 	}{
-		{method: "GET", path: haAdminPrimaryStatusPath},
-		{method: "GET", path: haAdminStandbyStatusPath},
-		{method: "POST", path: haAdminCommitCheckPath},
-		{method: "POST", path: haAdminCommitAppendPath},
-		{method: "POST", path: haAdminReadCheckPath},
-		{method: "POST", path: haAdminWriteCheckPath},
-		{method: "POST", path: haAdminOwnerJobCheckPath},
-		{method: "GET", path: haAdminReplicationSlotsPath},
-		{method: "POST", path: haAdminReplicationSlotsPath},
-		{method: "DELETE", path: haAdminReplicationSlotPathPrefix + "{slot_name}"},
-		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotPausePathSuffix},
-		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotResumePathSuffix},
-		{method: "POST", path: haAdminBaseBackupsPath},
-		{method: "POST", path: haAdminBaseBackupsFinishPath},
-		{method: "POST", path: haAdminStandbyBootstrapPath},
-		{method: "POST", path: haAdminFencePath},
-		{method: "GET", path: haAdminFenceCurrentPath},
-		{method: "POST", path: haAdminPromotionAssessPath},
-		{method: "POST", path: haAdminPromotionCurrentFencePath},
-		{method: "POST", path: haAdminPromotionPath},
-		{method: "POST", path: haAdminRejoinAssessPath},
-		{method: "POST", path: haAdminRejoinRewindPath},
-		{method: "POST", path: haAdminRejoinReseedPath},
+		{method: "GET", path: haAdminPrimaryStatusPath, operationID: "getHAPrimaryStatus"},
+		{method: "GET", path: haAdminStandbyStatusPath, operationID: "getHAStandbyStatus"},
+		{method: "POST", path: haAdminCommitCheckPath, operationID: "checkHACommit"},
+		{method: "POST", path: haAdminCommitAppendPath, operationID: "appendHACommit"},
+		{method: "POST", path: haAdminReadCheckPath, operationID: "checkHARead"},
+		{method: "POST", path: haAdminWriteCheckPath, operationID: "checkHAWrite"},
+		{method: "POST", path: haAdminOwnerJobCheckPath, operationID: "checkHAOwnerJob"},
+		{method: "GET", path: haAdminReplicationSlotsPath, operationID: "listHAReplicationSlots"},
+		{method: "POST", path: haAdminReplicationSlotsPath, operationID: "createHAReplicationSlot"},
+		{method: "DELETE", path: haAdminReplicationSlotPathPrefix + "{slot_name}", operationID: "dropHAReplicationSlot"},
+		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotPausePathSuffix, operationID: "pauseHAReplicationSlot"},
+		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotResumePathSuffix, operationID: "resumeHAReplicationSlot"},
+		{method: "POST", path: haAdminBaseBackupsPath, operationID: "beginHABaseBackup"},
+		{method: "POST", path: haAdminBaseBackupsFinishPath, operationID: "finishHABaseBackup"},
+		{method: "POST", path: haAdminStandbyBootstrapPath, operationID: "bootstrapHAStandby"},
+		{method: "POST", path: haAdminFencePath, operationID: "acquireHAFence"},
+		{method: "GET", path: haAdminFenceCurrentPath, operationID: "getHACurrentFence"},
+		{method: "POST", path: haAdminPromotionAssessPath, operationID: "assessHAPromotion"},
+		{method: "POST", path: haAdminPromotionCurrentFencePath, operationID: "promoteHAWithCurrentFence"},
+		{method: "POST", path: haAdminPromotionPath, operationID: "promoteHA"},
+		{method: "POST", path: haAdminRejoinAssessPath, operationID: "assessHARejoin"},
+		{method: "POST", path: haAdminRejoinRewindPath, operationID: "rewindHARejoin"},
+		{method: "POST", path: haAdminRejoinReseedPath, operationID: "reseedHARejoin"},
 	}
 
 	for _, route := range routes {
@@ -1040,6 +1041,9 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 			key := route.method + " " + path
 			if operations[key] == "" {
 				t.Fatalf("operator HA admin route %s is missing from specs/openapi/antfly/admin.yaml", key)
+			}
+			if operations[key] != route.operationID {
+				t.Fatalf("operator HA admin route %s resolved to operationId %q, want %q", key, operations[key], route.operationID)
 			}
 		})
 	}
