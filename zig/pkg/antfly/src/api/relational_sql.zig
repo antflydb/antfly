@@ -65127,6 +65127,11 @@ fn appParityJoinedSourcePlanHasCounts(plan: []const u8, right_predicates: usize,
         appParityPlanHasExactUsizeToken(plan, ":on=", join_keys);
 }
 
+fn appParityWritePlanHasCounts(plan: []const u8, writes: usize, transforms: usize) bool {
+    return appParityPlanHasExactUsizeToken(plan, ":writes=", writes) and
+        appParityPlanHasExactUsizeToken(plan, ":transforms=", transforms);
+}
+
 fn appParityAppliedPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
     return appParityAppliedPlanIsStructured(plan) and
         appParityPlanHasExactBoolToken(plan, token, expected);
@@ -65417,6 +65422,52 @@ test "app parity joined source count coverage tokens are exact" {
 
     try std.testing.expect(coverage.update_joined_source_non_primary_semijoin);
     try std.testing.expect(coverage.delete_joined_source_correlated_semijoin);
+}
+
+test "app parity conflict write count coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO usage_records (id) VALUES ('a'), ('b') ON CONFLICT DO NOTHING",
+        .plan = "insert:table=usage_records:writes=10:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+        .resolver_exists = false,
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO NOTHING RETURNING *",
+        .plan = "insert:table=usage_records:writes=0:transforms=10:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
+        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=00x:returning_expr=0:conflict_where=1",
+    });
+
+    try std.testing.expect(!coverage.multi_row_conflict_do_nothing_duplicate_target);
+    try std.testing.expect(!coverage.conflict_do_nothing_returning_all);
+    try std.testing.expect(!coverage.conflict_guard_where_skip);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO usage_records (id) VALUES ('a'), ('b') ON CONFLICT DO NOTHING",
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+        .resolver_exists = false,
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO NOTHING RETURNING *",
+        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
+        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=1",
+    });
+
+    try std.testing.expect(coverage.multi_row_conflict_do_nothing_duplicate_target);
+    try std.testing.expect(coverage.conflict_do_nothing_returning_all);
+    try std.testing.expect(coverage.conflict_guard_where_skip);
 }
 
 test "app parity explain coverage tokens are exact" {
@@ -67318,15 +67369,15 @@ const AppParityCorpusCoverage = struct {
             self.multi_row_conflict_do_nothing_duplicate_target = self.multi_row_conflict_do_nothing_duplicate_target or (uses_multi_row_insert and
                 entry.resolver_exists == false and
                 std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null and
-                std.mem.indexOf(u8, entry.plan, "writes=1:transforms=0") != null);
+                appParityWritePlanHasCounts(entry.plan, 1, 0));
             self.conflict_returning_expression = self.conflict_returning_expression or appParityPlanHasNonZeroToken(entry.plan, ":returning_expr=");
             self.conflict_do_nothing_returning_all = self.conflict_do_nothing_returning_all or (uses_returning_all and
-                std.mem.indexOf(u8, entry.plan, "writes=0:transforms=0") != null and
+                appParityWritePlanHasCounts(entry.plan, 0, 0) and
                 std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null);
             self.conflict_guard_where = self.conflict_guard_where or uses_conflict_where;
             self.conflict_guard_where_skip = self.conflict_guard_where_skip or (uses_conflict_where and
-                std.mem.indexOf(u8, entry.plan, "writes=0:transforms=0") != null and
-                std.mem.indexOf(u8, entry.plan, "returning_rows=0") != null);
+                appParityWritePlanHasCounts(entry.plan, 0, 0) and
+                appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", 0));
             self.conflict_interval_update = self.conflict_interval_update or
                 std.mem.indexOf(u8, entry.sql, "INTERVAL '1 second'") != null;
             self.conflict_mixed_interval_update = self.conflict_mixed_interval_update or
