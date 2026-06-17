@@ -390,6 +390,118 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
+func TestReconcileHAAdminJobsDoesNotFallbackFromAdminAPIToCLIJob(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionCreateSlot),
+					Executor:     string(haActionExecutorAdminAPI),
+					AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("AdminAPI action without typed request inputs must not fall back or issue HTTP request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("marked AdminAPI"))
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(BeEmpty())
+}
+
+func TestReconcileHAAdminJobsRunsExplicitCLIJob(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image:              "antfly:test",
+			ImagePullPolicy:    "IfNotPresent",
+			ServiceAccountName: "antfly-ha-admin",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionCreateSlot),
+					Executor:     string(haActionExecutorCLIJob),
+					StandbyName:  "standby-a",
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("CLIJob action must not issue typed admin API request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	g.Expect(jobs.Items[0].Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+		"ha", "--ha-url", "http://primary-ha.default.svc:8081", "--", "slot", "create", "--slot", "standby-a",
+	}))
+}
+
 func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g := NewWithT(t)
 
