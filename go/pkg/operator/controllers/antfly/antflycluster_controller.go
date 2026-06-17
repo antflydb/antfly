@@ -5121,38 +5121,38 @@ type haRejoinAPIResultEnvelope struct {
 }
 
 type haRejoinAPIResult struct {
-	Action            string `json:"action"`
-	Reason            string `json:"reason"`
-	FormerNodeID      string `json:"former_node_id"`
-	TargetTimelineID  uint64 `json:"target_timeline_id"`
-	TargetEpoch       uint64 `json:"target_epoch"`
-	ForkLSN           uint64 `json:"fork_lsn"`
-	FormerLastLSN     uint64 `json:"former_last_lsn"`
-	RetainedFromLSN   uint64 `json:"retained_from_lsn"`
-	DataLossDiscarded bool   `json:"data_loss_discarded"`
+	Action            string  `json:"action"`
+	Reason            string  `json:"reason"`
+	FormerNodeID      string  `json:"former_node_id"`
+	TargetTimelineID  *uint64 `json:"target_timeline_id"`
+	TargetEpoch       *uint64 `json:"target_epoch"`
+	ForkLSN           *uint64 `json:"fork_lsn"`
+	FormerLastLSN     *uint64 `json:"former_last_lsn"`
+	RetainedFromLSN   *uint64 `json:"retained_from_lsn"`
+	DataLossDiscarded *bool   `json:"data_loss_discarded"`
 }
 
 type haRejoinAPIRewind struct {
-	NodeID            string `json:"node_id"`
-	ForkLSN           uint64 `json:"fork_lsn"`
-	PreviousLastLSN   uint64 `json:"previous_last_lsn"`
-	CurrentLastLSN    uint64 `json:"current_last_lsn"`
-	NextLSN           uint64 `json:"next_lsn"`
-	DiscardedLSNCount uint64 `json:"discarded_lsn_count"`
-	TargetTimelineID  uint64 `json:"target_timeline_id"`
-	TargetEpoch       uint64 `json:"target_epoch"`
-	DataLossDiscarded bool   `json:"data_loss_discarded"`
+	NodeID            string  `json:"node_id"`
+	ForkLSN           *uint64 `json:"fork_lsn"`
+	PreviousLastLSN   *uint64 `json:"previous_last_lsn"`
+	CurrentLastLSN    *uint64 `json:"current_last_lsn"`
+	NextLSN           *uint64 `json:"next_lsn"`
+	DiscardedLSNCount *uint64 `json:"discarded_lsn_count"`
+	TargetTimelineID  *uint64 `json:"target_timeline_id"`
+	TargetEpoch       *uint64 `json:"target_epoch"`
+	DataLossDiscarded *bool   `json:"data_loss_discarded"`
 }
 
 type haRejoinAPIReseed struct {
-	NodeID             string `json:"node_id"`
-	SlotName           string `json:"slot_name"`
-	TargetTimelineID   uint64 `json:"target_timeline_id"`
-	TargetEpoch        uint64 `json:"target_epoch"`
-	ForkLSN            uint64 `json:"fork_lsn"`
-	FormerLastLSN      uint64 `json:"former_last_lsn"`
-	ReseedRequired     bool   `json:"reseed_required"`
-	BaseBackupRequired bool   `json:"base_backup_required"`
+	NodeID             string  `json:"node_id"`
+	SlotName           string  `json:"slot_name"`
+	TargetTimelineID   *uint64 `json:"target_timeline_id"`
+	TargetEpoch        *uint64 `json:"target_epoch"`
+	ForkLSN            *uint64 `json:"fork_lsn"`
+	FormerLastLSN      *uint64 `json:"former_last_lsn"`
+	ReseedRequired     *bool   `json:"reseed_required"`
+	BaseBackupRequired *bool   `json:"base_backup_required"`
 }
 
 func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
@@ -5161,14 +5161,18 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		return haRejoinJobResult{}, false
 	}
 	assessment := envelope.Assessment
-	if strings.TrimSpace(assessment.Action) == "" ||
+	if !haRejoinAssessmentJSONComplete(assessment) ||
 		envelope.SchemaVersion == 0 ||
 		!haAdminActionReceiptPresent(envelope.Action) ||
-		strings.TrimSpace(assessment.FormerNodeID) == "" ||
-		assessment.TargetTimelineID == 0 ||
-		assessment.TargetEpoch == 0 {
+		haUint64JSONValue(assessment.TargetTimelineID) == 0 ||
+		haUint64JSONValue(assessment.TargetEpoch) == 0 {
 		return haRejoinJobResult{}, false
 	}
+	targetTimelineID := haUint64JSONValue(assessment.TargetTimelineID)
+	targetEpoch := haUint64JSONValue(assessment.TargetEpoch)
+	forkLSN := haUint64JSONValue(assessment.ForkLSN)
+	formerLastLSN := haUint64JSONValue(assessment.FormerLastLSN)
+	retainedFromLSN := haUint64JSONValue(assessment.RetainedFromLSN)
 	result := haRejoinJobResult{
 		SchemaVersion:     envelope.SchemaVersion,
 		ActionID:          strings.TrimSpace(envelope.Action.ActionID),
@@ -5179,55 +5183,100 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		Action:            strings.TrimSpace(assessment.Action),
 		Reason:            strings.TrimSpace(assessment.Reason),
 		FormerNodeID:      strings.TrimSpace(assessment.FormerNodeID),
-		TargetTimelineID:  assessment.TargetTimelineID,
-		TargetEpoch:       assessment.TargetEpoch,
-		ForkLSN:           assessment.ForkLSN,
-		FormerLastLSN:     assessment.FormerLastLSN,
-		RetainedFromLSN:   assessment.RetainedFromLSN,
-		DataLossDiscarded: assessment.DataLossDiscarded,
+		TargetTimelineID:  targetTimelineID,
+		TargetEpoch:       targetEpoch,
+		ForkLSN:           forkLSN,
+		FormerLastLSN:     formerLastLSN,
+		RetainedFromLSN:   retainedFromLSN,
+		DataLossDiscarded: haBoolJSONValue(assessment.DataLossDiscarded),
 	}
 	if rewind := envelope.Rewind; rewind != nil {
+		rewindForkLSN := haUint64JSONValue(rewind.ForkLSN)
+		rewindPreviousLastLSN := haUint64JSONValue(rewind.PreviousLastLSN)
+		rewindCurrentLastLSN := haUint64JSONValue(rewind.CurrentLastLSN)
+		rewindNextLSN := haUint64JSONValue(rewind.NextLSN)
+		rewindDiscardedLSNCount := haUint64JSONValue(rewind.DiscardedLSNCount)
+		rewindTargetTimelineID := haUint64JSONValue(rewind.TargetTimelineID)
+		rewindTargetEpoch := haUint64JSONValue(rewind.TargetEpoch)
 		if strings.TrimSpace(assessment.Action) != "rewind" ||
-			strings.TrimSpace(rewind.NodeID) == "" ||
+			!haRejoinRewindJSONComplete(*rewind) ||
 			strings.TrimSpace(rewind.NodeID) != strings.TrimSpace(assessment.FormerNodeID) ||
-			rewind.ForkLSN != assessment.ForkLSN ||
-			rewind.PreviousLastLSN != assessment.FormerLastLSN ||
-			rewind.TargetTimelineID != assessment.TargetTimelineID ||
-			rewind.TargetEpoch != assessment.TargetEpoch ||
-			rewind.CurrentLastLSN != assessment.ForkLSN ||
-			rewind.PreviousLastLSN < rewind.CurrentLastLSN ||
-			rewind.CurrentLastLSN == ^uint64(0) ||
-			rewind.NextLSN != rewind.CurrentLastLSN+1 ||
-			rewind.DiscardedLSNCount != rewind.PreviousLastLSN-rewind.CurrentLastLSN {
+			rewindForkLSN != forkLSN ||
+			rewindPreviousLastLSN != formerLastLSN ||
+			rewindTargetTimelineID != targetTimelineID ||
+			rewindTargetEpoch != targetEpoch ||
+			rewindCurrentLastLSN != forkLSN ||
+			rewindPreviousLastLSN < rewindCurrentLastLSN ||
+			rewindCurrentLastLSN == ^uint64(0) ||
+			rewindNextLSN != rewindCurrentLastLSN+1 ||
+			rewindDiscardedLSNCount != rewindPreviousLastLSN-rewindCurrentLastLSN {
 			return haRejoinJobResult{}, false
 		}
 		result.RewindExecuted = true
-		result.RewindPreviousLastLSN = rewind.PreviousLastLSN
-		result.RewindCurrentLastLSN = rewind.CurrentLastLSN
-		result.RewindNextLSN = rewind.NextLSN
-		result.RewindDiscardedLSNCount = rewind.DiscardedLSNCount
-		result.DataLossDiscarded = result.DataLossDiscarded || rewind.DataLossDiscarded
+		result.RewindPreviousLastLSN = rewindPreviousLastLSN
+		result.RewindCurrentLastLSN = rewindCurrentLastLSN
+		result.RewindNextLSN = rewindNextLSN
+		result.RewindDiscardedLSNCount = rewindDiscardedLSNCount
+		result.DataLossDiscarded = result.DataLossDiscarded || haBoolJSONValue(rewind.DataLossDiscarded)
 	}
 	if reseed := envelope.Reseed; reseed != nil {
+		reseedTargetTimelineID := haUint64JSONValue(reseed.TargetTimelineID)
+		reseedTargetEpoch := haUint64JSONValue(reseed.TargetEpoch)
+		reseedForkLSN := haUint64JSONValue(reseed.ForkLSN)
+		reseedFormerLastLSN := haUint64JSONValue(reseed.FormerLastLSN)
 		if strings.TrimSpace(assessment.Action) != "reseed" ||
-			strings.TrimSpace(reseed.NodeID) == "" ||
+			!haRejoinReseedJSONComplete(*reseed) ||
 			strings.TrimSpace(reseed.NodeID) != strings.TrimSpace(assessment.FormerNodeID) ||
-			strings.TrimSpace(reseed.SlotName) == "" ||
 			strings.TrimSpace(reseed.SlotName) != strings.TrimSpace(assessment.FormerNodeID) ||
-			reseed.TargetTimelineID != assessment.TargetTimelineID ||
-			reseed.TargetEpoch != assessment.TargetEpoch ||
-			reseed.ForkLSN != assessment.ForkLSN ||
-			reseed.FormerLastLSN != assessment.FormerLastLSN ||
-			!reseed.ReseedRequired ||
-			!reseed.BaseBackupRequired {
+			reseedTargetTimelineID != targetTimelineID ||
+			reseedTargetEpoch != targetEpoch ||
+			reseedForkLSN != forkLSN ||
+			reseedFormerLastLSN != formerLastLSN ||
+			!haBoolJSONValue(reseed.ReseedRequired) ||
+			!haBoolJSONValue(reseed.BaseBackupRequired) {
 			return haRejoinJobResult{}, false
 		}
 		result.ReseedExecuted = true
 		result.ReseedSlotName = strings.TrimSpace(reseed.SlotName)
-		result.ReseedRequired = reseed.ReseedRequired
-		result.ReseedBaseBackupRequired = reseed.BaseBackupRequired
+		result.ReseedRequired = haBoolJSONValue(reseed.ReseedRequired)
+		result.ReseedBaseBackupRequired = haBoolJSONValue(reseed.BaseBackupRequired)
 	}
 	return result, true
+}
+
+func haRejoinAssessmentJSONComplete(assessment haRejoinAPIResult) bool {
+	return strings.TrimSpace(assessment.Action) != "" &&
+		strings.TrimSpace(assessment.Reason) != "" &&
+		strings.TrimSpace(assessment.FormerNodeID) != "" &&
+		assessment.TargetTimelineID != nil &&
+		assessment.TargetEpoch != nil &&
+		assessment.ForkLSN != nil &&
+		assessment.FormerLastLSN != nil &&
+		assessment.RetainedFromLSN != nil &&
+		assessment.DataLossDiscarded != nil
+}
+
+func haRejoinRewindJSONComplete(rewind haRejoinAPIRewind) bool {
+	return strings.TrimSpace(rewind.NodeID) != "" &&
+		rewind.ForkLSN != nil &&
+		rewind.PreviousLastLSN != nil &&
+		rewind.CurrentLastLSN != nil &&
+		rewind.NextLSN != nil &&
+		rewind.DiscardedLSNCount != nil &&
+		rewind.TargetTimelineID != nil &&
+		rewind.TargetEpoch != nil &&
+		rewind.DataLossDiscarded != nil
+}
+
+func haRejoinReseedJSONComplete(reseed haRejoinAPIReseed) bool {
+	return strings.TrimSpace(reseed.NodeID) != "" &&
+		strings.TrimSpace(reseed.SlotName) != "" &&
+		reseed.TargetTimelineID != nil &&
+		reseed.TargetEpoch != nil &&
+		reseed.ForkLSN != nil &&
+		reseed.FormerLastLSN != nil &&
+		reseed.ReseedRequired != nil &&
+		reseed.BaseBackupRequired != nil
 }
 
 func haRejoinAdminActionResult(result haRejoinJobResult) *antflyv1.HAAdminActionResultStatus {
