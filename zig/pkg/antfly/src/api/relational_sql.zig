@@ -11491,6 +11491,10 @@ const Parser = struct {
             if (ctes.len > 0) self.alloc.free(ctes);
         }
 
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes;
+        defer self.available_ctes = previous_available_ctes;
+
         var final = try self.parseJoin();
         errdefer final.deinit(self.alloc);
         try self.resolveJoinSourcesForPlan(&final, ctes, &base_table_name);
@@ -11516,6 +11520,10 @@ const Parser = struct {
             }
             if (ctes.len > 0) self.alloc.free(ctes);
         }
+
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes;
+        defer self.available_ctes = previous_available_ctes;
 
         var final = try self.parseLateral();
         errdefer final.deinit(self.alloc);
@@ -12364,6 +12372,21 @@ const Parser = struct {
         defer freeTableAlias(self.alloc, right_table);
         if (std.mem.eql(u8, left_table.alias, right_table.alias)) return error.UnsupportedSqlShape;
 
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const previous_schema = self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        defer {
+            self.schema = previous_schema;
+            self.joined_source_schema = previous_joined_source_schema;
+        }
+        if (self.available_ctes.len != 0) {
+            const cte_base_schema = previous_joined_source_schema orelse previous_schema;
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, cte_base_schema, self.available_ctes);
+        }
+        self.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, left_table.name) orelse previous_schema;
+        self.joined_source_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, right_table.name) orelse previous_joined_source_schema orelse previous_schema;
+
         var on = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn).empty;
         errdefer {
             freeJoinOn(self.alloc, on.items);
@@ -12659,6 +12682,23 @@ const Parser = struct {
         const left_table = try self.parseTableAliasAlloc();
         defer freeTableAlias(self.alloc, left_table);
 
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const previous_schema = self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        defer {
+            self.schema = previous_schema;
+            self.joined_source_schema = previous_joined_source_schema;
+        }
+        if (self.available_ctes.len != 0) {
+            const cte_base_schema = previous_joined_source_schema orelse previous_schema;
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, cte_base_schema, self.available_ctes);
+        }
+        const left_source_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, left_table.name) orelse previous_schema;
+        const right_source_schema = previous_joined_source_schema orelse previous_schema;
+        self.schema = left_source_schema;
+        self.joined_source_schema = right_source_schema;
+
         try self.expectKeyword("left");
         _ = self.matchKeyword("outer");
         try self.expectKeyword("join");
@@ -12668,10 +12708,11 @@ const Parser = struct {
         var sub = Parser{
             .alloc = self.alloc,
             .tokens = self.tokens[self.pos..close_index],
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
+            .schema = left_source_schema,
+            .joined_source_schema = right_source_schema,
             .params = self.params,
             .unique_resolver = self.unique_resolver,
+            .available_ctes = self.available_ctes,
         };
         var lateral_subquery = try sub.parseLateralSubqueryAlloc(left_table.alias);
         errdefer freeLateralSubquery(self.alloc, lateral_subquery);
@@ -12682,6 +12723,11 @@ const Parser = struct {
         else
             try self.parseIdentifierOwned();
         defer self.alloc.free(lateral_alias);
+
+        self.joined_source_schema = .{
+            .storage_mode = .relational,
+            .relational_columns = lateral_subquery.output_columns,
+        };
 
         try self.expectKeyword("on");
         try self.expectKeyword("true");
@@ -12969,6 +13015,8 @@ const Parser = struct {
         lateral_subquery.expression_array_contains = &.{};
         lateral_subquery.correlations = &.{};
         lateral_subquery.order_by = &.{};
+        freeDdlRelationalColumns(self.alloc, lateral_subquery.output_columns);
+        lateral_subquery.output_columns = &.{};
         freeTableAlias(self.alloc, lateral_subquery.table);
         lateral_subquery.table = .{ .name = "", .alias = "" };
 
@@ -18061,6 +18109,7 @@ const Parser = struct {
 
     const LateralSubquery = struct {
         table: TableAlias,
+        output_columns: []const runtime_schema.RelationalColumn = &.{},
         predicates: []const runtime_schema.RelationalCheck = &.{},
         json_contains: []const db_mod.types.RelationalRowsJsonContainsPredicate = &.{},
         json_path_exists: []const db_mod.types.RelationalRowsJsonPathExistsPredicate = &.{},
@@ -18230,10 +18279,27 @@ const Parser = struct {
 
     fn parseLateralSubqueryAlloc(self: *@This(), left_alias: []const u8) !LateralSubquery {
         try self.expectKeyword("select");
-        const previous_schema = self.schema;
-        self.schema = self.joined_source_schema orelse self.schema;
+        const inferred_table_ref = try self.inferSelectSourceAliasAlloc();
+        defer if (inferred_table_ref) |value| freeTableAlias(self.alloc, value);
+        const left_schema = self.schema;
+        const right_base_schema = self.joined_source_schema orelse self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        defer self.joined_source_schema = previous_joined_source_schema;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        var right_parse_schema = right_base_schema;
+        if (inferred_table_ref) |value| {
+            if (findCteByName(self.available_ctes, value.name) != null) {
+                planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, right_base_schema, self.available_ctes);
+                right_parse_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            }
+        }
+        self.schema = right_parse_schema;
+        self.joined_source_schema = right_parse_schema;
         const select = try self.parseSelectList();
-        self.schema = previous_schema;
+        const output_columns = try self.selectOutputColumnsAlloc(select);
+        errdefer freeDdlRelationalColumns(self.alloc, output_columns);
+        self.schema = left_schema;
         defer {
             freeStringSlice(self.alloc, select.fields);
             freeJsonExtract(self.alloc, select.json_extract);
@@ -18248,6 +18314,9 @@ const Parser = struct {
         try self.expectKeyword("from");
         const right_table = try self.parseTableAliasAlloc();
         errdefer freeTableAlias(self.alloc, right_table);
+        if (inferred_table_ref) |value| {
+            if (!std.mem.eql(u8, right_table.name, value.name) or !std.mem.eql(u8, right_table.alias, value.alias)) return error.UnsupportedSqlShape;
+        }
 
         var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
         errdefer {
@@ -18376,6 +18445,7 @@ const Parser = struct {
 
         return .{
             .table = right_table,
+            .output_columns = output_columns,
             .predicates = try predicates.toOwnedSlice(self.alloc),
             .json_contains = try json_contains.toOwnedSlice(self.alloc),
             .json_path_exists = try json_path_exists.toOwnedSlice(self.alloc),
@@ -20276,6 +20346,125 @@ const Parser = struct {
             initialized += 1;
         }
         return out;
+    }
+
+    fn selectOutputColumnsAlloc(
+        self: *@This(),
+        select: SelectList,
+    ) ![]runtime_schema.RelationalColumn {
+        if (select.select_all) return error.UnsupportedSqlShape;
+        if (select.outputs.len == 0) return &.{};
+        const out = try self.alloc.alloc(runtime_schema.RelationalColumn, select.outputs.len);
+        var initialized: usize = 0;
+        errdefer {
+            clearDdlRelationalColumns(self.alloc, out[0..initialized]);
+            self.alloc.free(out);
+        }
+        for (select.outputs) |output| {
+            const column = try self.selectOutputColumnAlloc(select, output);
+            var column_transferred = false;
+            errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
+            if (aggregateOutputColumnExists(out[0..initialized], column.name)) return error.UnsupportedSqlShape;
+            out[initialized] = column;
+            column_transferred = true;
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn selectOutputColumnAlloc(
+        self: *@This(),
+        select: SelectList,
+        output: SelectOutputRef,
+    ) !runtime_schema.RelationalColumn {
+        return switch (output.kind) {
+            .field => blk: {
+                const field = select.fields[output.index];
+                const source = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
+                break :blk try self.projectedColumnAlloc(field, source.field_type, source.array_item_type, source.nullable);
+            },
+            .json_extract => blk: {
+                const projection = select.json_extract[output.index];
+                const field_type: runtime_schema.AntflyType = if (projection.as_text) .keyword else .json;
+                break :blk try self.projectedColumnAlloc(projection.output, field_type, null, true);
+            },
+            .array_length => blk: {
+                const projection = select.array_length[output.index];
+                break :blk try self.projectedColumnAlloc(projection.output, .numeric, null, true);
+            },
+            .coalesce => blk: {
+                const projection = select.coalesce[output.index];
+                const field_type = try self.coalesceOutputType(projection);
+                break :blk try self.projectedColumnAlloc(projection.output, field_type.field_type, field_type.array_item_type, true);
+            },
+            .field_alias => blk: {
+                const projection = select.field_aliases[output.index];
+                const source = relationalColumnForField(self.schema, projection.field, null) orelse return error.InvalidSqlCatalog;
+                break :blk try self.projectedColumnAlloc(projection.output, source.field_type, source.array_item_type, source.nullable);
+            },
+            .expression => blk: {
+                const projection = select.expressions[output.index];
+                break :blk try self.projectedColumnAlloc(projection.output, try self.rowExpressionOutputType(projection.expression), null, true);
+            },
+        };
+    }
+
+    const ProjectedColumnType = struct {
+        field_type: runtime_schema.AntflyType,
+        array_item_type: ?runtime_schema.AntflyType = null,
+    };
+
+    fn coalesceOutputType(
+        self: *@This(),
+        projection: db_mod.types.RelationalRowsCoalesceProjection,
+    ) !ProjectedColumnType {
+        for (projection.operands) |operand| {
+            switch (operand.kind) {
+                .field => {
+                    const source = relationalColumnForField(self.schema, operand.field, null) orelse return error.InvalidSqlCatalog;
+                    return .{ .field_type = source.field_type, .array_item_type = source.array_item_type };
+                },
+                .value => if (operand.value_json.len != 0) return try self.jsonValueProjectedType(operand.value_json),
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    fn jsonValueProjectedType(
+        self: *@This(),
+        value_json: []const u8,
+    ) !ProjectedColumnType {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+        defer parsed.deinit();
+        return switch (parsed.value) {
+            .string => .{ .field_type = .keyword },
+            .integer, .float => .{ .field_type = .numeric },
+            .bool => .{ .field_type = .boolean },
+            .array => .{ .field_type = .array, .array_item_type = .keyword },
+            .object => .{ .field_type = .json },
+            .null => error.UnsupportedSqlShape,
+            else => error.UnsupportedSqlShape,
+        };
+    }
+
+    fn projectedColumnAlloc(
+        self: *@This(),
+        name: []const u8,
+        field_type: runtime_schema.AntflyType,
+        array_item_type: ?runtime_schema.AntflyType,
+        nullable: bool,
+    ) !runtime_schema.RelationalColumn {
+        const owned_name = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned_name);
+        const owned_path = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned_path);
+        return .{
+            .name = owned_name,
+            .path = owned_path,
+            .field_type = field_type,
+            .array_item_type = array_item_type,
+            .nullable = nullable,
+        };
     }
 
     const SelectItem = union(enum) {
@@ -43300,6 +43489,7 @@ fn freeLateralCorrelations(alloc: std.mem.Allocator, values: []const db_mod.type
 
 fn freeLateralSubquery(alloc: std.mem.Allocator, value: Parser.LateralSubquery) void {
     if (value.table.name.len > 0 or value.table.alias.len > 0) freeTableAlias(alloc, value.table);
+    freeDdlRelationalColumns(alloc, value.output_columns);
     freeRelationalChecks(alloc, value.predicates);
     if (value.predicates.len > 0) alloc.free(value.predicates);
     freeJsonContains(alloc, value.json_contains);
@@ -61887,6 +62077,7 @@ fn joinFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredJoin) ![]u8 {
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ctes", lowered.ctes.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "left_source_cte", if (lowered.join.left.source_cte.len > 0) 1 else 0);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "right_source_cte", if (lowered.join.right.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.ctes);
     fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "left", left);
     fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "right", right);
     return fingerprint;
@@ -61928,6 +62119,9 @@ fn lateralFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredLateralPlan
             appParityLimitValue(lowered.plan.lateral.limit),
         },
     );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "left_source_cte", if (left.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "right_source_cte", if (right.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.ctes);
     fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "left", left);
     fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "right", right);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_pred", lowered.plan.lateral.match_expression_predicates.len);
@@ -72782,6 +72976,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
         },
         .{
+            .name = "cte column alias equality join",
+            .family = .join,
+            .summary = .{ .table_name = "usage_records", .ctes = 2, .join_on = 2, .join_select = 2, .order_by = 1, .limit = 3 },
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=3:ctes=2:left_source_cte=1:right_source_cte=1:cte0_alias=4:cte1_alias=3",
+            .sql = "WITH open_orders(order_id, order_tenant, customer_ref, order_amount) AS (SELECT id, tenant_id, customer_id, amount FROM usage_records WHERE kind = 'order'), active_customers(customer_ref, customer_tenant, customer_name) AS (SELECT id, tenant_id, name FROM usage_records WHERE kind = 'customer') SELECT o.order_id AS order_id, c.customer_name AS customer_name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.order_tenant = c.customer_tenant AND o.customer_ref = c.customer_ref ORDER BY order_id ASC LIMIT 3",
+        },
+        .{
             .name = "left join on side predicate",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
@@ -72920,6 +73121,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 2, .lateral_correlations = 1, .join_select = 2, .order_by = 2, .limit = 10, .offset = 3, .right_offset = 2 },
             .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=2:order_expr=0:limit=10:right_offset=2:offset=3",
             .sql = "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1 OFFSET 2) AS latest ON true WHERE org.kind = 'organization' ORDER BY 2 DESC NULLS FIRST LIMIT 10 OFFSET 3",
+        },
+        .{
+            .name = "cte column alias bounded lateral",
+            .family = .lateral,
+            .summary = .{ .table_name = "usage_records", .ctes = 2, .lateral_correlations = 1, .join_select = 2, .order_by = 1, .limit = 5 },
+            .plan = "lateral:left=usage_records:right=usage_records:ctes=2:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5:left_source_cte=1:right_source_cte=1:cte0_alias=2:cte1_alias=4",
+            .sql = "WITH orgs(org_id, org_kind) AS (SELECT id, kind FROM usage_records WHERE kind = 'organization'), balances(org_ref, balance_amount, created_time, balance_kind) AS (SELECT organization_id, amount, created_at, kind FROM usage_records WHERE kind = 'balance') SELECT org.org_id AS organization_id, latest.balance_amount AS latest_amount FROM orgs AS org LEFT JOIN LATERAL (SELECT balance_amount, created_time FROM balances AS bal WHERE bal.org_ref = org.org_id ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
         },
         .{
             .name = "bounded lateral structured side predicates",
@@ -84386,6 +84594,31 @@ test "postgres sql adapter lowers non recursive cte join and lateral plans" {
     try std.testing.expectEqualStrings("order_id", join.join.select[0].output);
     try std.testing.expectEqual(@as(u32, 3), join.join.limit.?);
 
+    var aliased_join = try lowerJoinAlloc(
+        alloc,
+        "WITH open_orders(order_id, order_tenant, customer_ref, order_amount) AS (SELECT id, tenant, customer_id, amount FROM usage_records WHERE kind = 'order'), active_customers(customer_ref, customer_tenant, customer_name) AS (SELECT id, tenant, name FROM usage_records WHERE kind = 'customer') SELECT o.order_id AS order_id, c.customer_name AS customer_name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.order_tenant = c.customer_tenant AND o.customer_ref = c.customer_ref ORDER BY order_id ASC LIMIT 3",
+        schema,
+        &.{},
+    );
+    defer aliased_join.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", aliased_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", aliased_join.right_table_name);
+    try std.testing.expectEqual(@as(usize, 2), aliased_join.ctes.len);
+    try std.testing.expectEqual(@as(usize, 4), aliased_join.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqualStrings("order_id", aliased_join.ctes[0].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", aliased_join.ctes[0].query.field_aliases[0].field);
+    try std.testing.expectEqual(@as(usize, 3), aliased_join.ctes[1].query.field_aliases.len);
+    try std.testing.expectEqualStrings("customer_ref", aliased_join.ctes[1].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", aliased_join.ctes[1].query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("open_orders", aliased_join.join.left.source_cte);
+    try std.testing.expectEqualStrings("active_customers", aliased_join.join.right.source_cte);
+    try std.testing.expectEqualStrings("order_tenant", aliased_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("customer_tenant", aliased_join.join.on[0].right_field);
+    try std.testing.expectEqualStrings("customer_ref", aliased_join.join.on[1].left_field);
+    try std.testing.expectEqualStrings("customer_ref", aliased_join.join.on[1].right_field);
+    try std.testing.expectEqualStrings("order_id", aliased_join.join.select[0].field);
+    try std.testing.expectEqualStrings("customer_name", aliased_join.join.select[1].field);
+
     var read_join = try lowerReadPlanAlloc(
         alloc,
         "WITH open_orders AS (SELECT id, tenant, customer_id FROM usage_records WHERE kind = 'order'), active_customers AS (SELECT id, tenant, name FROM usage_records WHERE kind = 'customer') SELECT o.id AS order_id, c.name AS customer_name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.tenant = c.tenant AND o.customer_id = c.id ORDER BY order_id ASC LIMIT 3",
@@ -84421,6 +84654,26 @@ test "postgres sql adapter lowers non recursive cte join and lateral plans" {
     try std.testing.expectEqualStrings("organization_id", lateral.plan.lateral.correlations[0].right_field);
     try std.testing.expectEqual(@as(u32, 1), lateral.plan.lateral.right.limit.?);
     try std.testing.expectEqual(@as(u32, 5), lateral.plan.lateral.limit.?);
+
+    var aliased_lateral = try lowerLateralPlanAlloc(
+        alloc,
+        "WITH orgs(org_id, org_kind) AS (SELECT id, kind FROM usage_records WHERE kind = 'organization'), balances(org_ref, balance_amount, created_time, balance_kind) AS (SELECT organization_id, amount, created_at, kind FROM usage_records WHERE kind = 'balance') SELECT org.org_id AS organization_id, latest.balance_amount AS latest_amount FROM orgs AS org LEFT JOIN LATERAL (SELECT balance_amount, created_time FROM balances AS bal WHERE bal.org_ref = org.org_id ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer aliased_lateral.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", aliased_lateral.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", aliased_lateral.right_table_name);
+    try std.testing.expectEqual(@as(usize, 2), aliased_lateral.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 2), aliased_lateral.plan.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqual(@as(usize, 4), aliased_lateral.plan.ctes[1].query.field_aliases.len);
+    try std.testing.expectEqualStrings("orgs", aliased_lateral.plan.lateral.left.source_cte);
+    try std.testing.expectEqualStrings("balances", aliased_lateral.plan.lateral.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), aliased_lateral.plan.lateral.correlations.len);
+    try std.testing.expectEqualStrings("org_id", aliased_lateral.plan.lateral.correlations[0].left_field);
+    try std.testing.expectEqualStrings("org_ref", aliased_lateral.plan.lateral.correlations[0].right_field);
+    try std.testing.expectEqualStrings("org_id", aliased_lateral.plan.lateral.select[0].field);
+    try std.testing.expectEqualStrings("balance_amount", aliased_lateral.plan.lateral.select[1].field);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinAlloc(
         alloc,

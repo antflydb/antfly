@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 839,
-  "entry_count": 839,
+  "source_entry_count": 841,
+  "entry_count": 841,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4198,6 +4198,20 @@
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
     },
     {
+      "name": "cte column alias equality join",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 2,
+        "order_by": 1,
+        "limit": 3,
+        "join_on": 2,
+        "join_select": 2
+      },
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=3:ctes=2:left_source_cte=1:right_source_cte=1:cte0_alias=4:cte1_alias=3",
+      "sql": "WITH open_orders(order_id, order_tenant, customer_ref, order_amount) AS (SELECT id, tenant_id, customer_id, amount FROM usage_records WHERE kind = 'order'), active_customers(customer_ref, customer_tenant, customer_name) AS (SELECT id, tenant_id, name FROM usage_records WHERE kind = 'customer') SELECT o.order_id AS order_id, c.customer_name AS customer_name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.order_tenant = c.customer_tenant AND o.customer_ref = c.customer_ref ORDER BY order_id ASC LIMIT 3"
+    },
+    {
       "name": "left join on side predicate",
       "family": "join",
       "summary": {
@@ -4458,6 +4472,20 @@
       },
       "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=2:order_expr=0:limit=10:right_offset=2:offset=3",
       "sql": "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1 OFFSET 2) AS latest ON true WHERE org.kind = 'organization' ORDER BY 2 DESC NULLS FIRST LIMIT 10 OFFSET 3"
+    },
+    {
+      "name": "cte column alias bounded lateral",
+      "family": "lateral",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 2,
+        "order_by": 1,
+        "limit": 5,
+        "join_select": 2,
+        "lateral_correlations": 1
+      },
+      "plan": "lateral:left=usage_records:right=usage_records:ctes=2:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5:left_source_cte=1:right_source_cte=1:cte0_alias=2:cte1_alias=4",
+      "sql": "WITH orgs(org_id, org_kind) AS (SELECT id, kind FROM usage_records WHERE kind = 'organization'), balances(org_ref, balance_amount, created_time, balance_kind) AS (SELECT organization_id, amount, created_at, kind FROM usage_records WHERE kind = 'balance') SELECT org.org_id AS organization_id, latest.balance_amount AS latest_amount FROM orgs AS org LEFT JOIN LATERAL (SELECT balance_amount, created_time FROM balances AS bal WHERE bal.org_ref = org.org_id ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5"
     },
     {
       "name": "bounded lateral structured side predicates",
