@@ -510,7 +510,9 @@ fn appendQueryU64(alloc: Allocator, old_uri: []u8, key: []const u8, value: u64) 
 
 fn appendQueryString(alloc: Allocator, old_uri: []u8, key: []const u8, value: []const u8) ![]u8 {
     const separator: []const u8 = if (std.mem.indexOfScalar(u8, old_uri, '?') == null) "?" else "&";
-    const next = try std.fmt.allocPrint(alloc, "{s}{s}{s}={s}", .{ old_uri, separator, key, value });
+    const encoded = try percentEncodeQueryValueAlloc(alloc, value);
+    defer alloc.free(encoded);
+    const next = try std.fmt.allocPrint(alloc, "{s}{s}{s}={s}", .{ old_uri, separator, key, encoded });
     alloc.free(old_uri);
     return next;
 }
@@ -543,6 +545,28 @@ fn failurePolicyQueryName(policy: primary_mod.FailurePolicy) []const u8 {
         .fail_closed => "fail-closed",
         .degrade_to_async => "degrade-to-async",
     };
+}
+
+fn percentEncodeQueryValueAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (raw) |byte| {
+        if (isQueryValueUnreserved(byte)) {
+            try out.append(alloc, byte);
+        } else {
+            var buf: [3]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{byte});
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn isQueryValueUnreserved(byte: u8) bool {
+    return (byte >= 'A' and byte <= 'Z') or
+        (byte >= 'a' and byte <= 'z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '-' or byte == '.' or byte == '_' or byte == '~';
 }
 
 fn i64FromU64(value: u64) !i64 {
@@ -1192,7 +1216,7 @@ test "storage.ha http client maps admin errors" {
 
 test "storage.ha http client renders primary status sync query with OpenAPI enum spelling" {
     const alloc = std.testing.allocator;
-    const standby_names = [_][]const u8{"standby-a"};
+    const standby_names = [_][]const u8{ "standby-a", "standby b%" };
     var uri = try alloc.dupe(u8, "http://ha-admin.test/admin/v1/ha/primary/status");
     uri = try appendQuerySyncPolicy(alloc, uri, .{
         .mode = .remote_write,
@@ -1208,6 +1232,7 @@ test "storage.ha http client renders primary status sync query with OpenAPI enum
     try expectContains(uri, "sync_required=1");
     try expectContains(uri, "sync_failure=fail-closed");
     try expectContains(uri, "sync_standby=standby-a");
+    try expectContains(uri, "sync_standby=standby%20b%25");
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

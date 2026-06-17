@@ -1001,6 +1001,7 @@ const QuerySyncPolicy = struct {
     owned_standby_names: []const []const u8 = &.{},
 
     fn deinit(self: *QuerySyncPolicy, alloc: Allocator) void {
+        for (self.owned_standby_names) |name| alloc.free(name);
         alloc.free(self.owned_standby_names);
         self.* = undefined;
     }
@@ -1012,7 +1013,10 @@ fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolic
     var required: usize = 1;
     var failure_policy: primary_mod.FailurePolicy = .block;
     var names = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer names.deinit(alloc);
+    errdefer {
+        freeQueryNames(alloc, names.items);
+        names.deinit(alloc);
+    }
 
     if (queryValue(query, "sync_mode")) |raw| mode = try parseDurabilityModeQuery(raw);
     if (queryValue(query, "sync_selection")) |raw| selection = try parseStandbySelectionQuery(raw);
@@ -1027,8 +1031,15 @@ fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolic
     while (iter.next()) |part| {
         const key, const value = splitQueryPart(part);
         if (std.mem.eql(u8, key, "sync_standby")) {
-            if (value.len == 0) return error.InvalidAdminRequest;
-            try names.append(alloc, value);
+            const decoded = try percentDecodeQueryValueAlloc(alloc, value);
+            if (decoded.len == 0) {
+                alloc.free(decoded);
+                return error.InvalidAdminRequest;
+            }
+            names.append(alloc, decoded) catch |err| {
+                alloc.free(decoded);
+                return err;
+            };
         }
     }
 
@@ -1065,6 +1076,46 @@ fn queryValue(query: []const u8, key: []const u8) ?[]const u8 {
 fn splitQueryPart(part: []const u8) struct { []const u8, []const u8 } {
     if (std.mem.indexOfScalar(u8, part, '=')) |idx| return .{ part[0..idx], part[idx + 1 ..] };
     return .{ part, "" };
+}
+
+fn freeQueryNames(alloc: Allocator, names: []const []const u8) void {
+    for (names) |name| alloc.free(name);
+}
+
+fn percentDecodeQueryValueAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var idx: usize = 0;
+    while (idx < encoded.len) {
+        const byte = encoded[idx];
+        if (byte == '+') {
+            try out.append(alloc, ' ');
+            idx += 1;
+            continue;
+        }
+        if (byte != '%') {
+            try out.append(alloc, byte);
+            idx += 1;
+            continue;
+        }
+        if (idx + 2 >= encoded.len) return error.InvalidAdminRequest;
+        const hi = hexValue(encoded[idx + 1]) orelse return error.InvalidAdminRequest;
+        const lo = hexValue(encoded[idx + 2]) orelse return error.InvalidAdminRequest;
+        try out.append(alloc, (hi << 4) | lo);
+        idx += 3;
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn hexValue(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
 }
 
 fn uint64Text(raw: []const u8) !u64 {
@@ -1879,6 +1930,28 @@ test "storage.ha http admin accepts absolute URIs" {
     var ready = try server.handle(.{ .method = .GET, .uri = "http://ha-admin.test/ha/v1/ready" });
     defer ready.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), ready.status);
+}
+
+test "storage.ha http admin decodes sync policy query values" {
+    const alloc = std.testing.allocator;
+    var sync = try buildSyncPolicyFromQuery(
+        alloc,
+        "sync_mode=remote-apply&sync_selection=first&sync_required=1&sync_failure=fail-closed&sync_standby=standby%20b%25&sync_standby=standby+c",
+    );
+    defer sync.deinit(alloc);
+
+    const policy = sync.policy orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(primary_mod.DurabilityMode.remote_apply, policy.mode);
+    try std.testing.expectEqual(primary_mod.StandbySelection.first, policy.selection);
+    try std.testing.expectEqual(primary_mod.FailurePolicy.fail_closed, policy.failure_policy);
+    try std.testing.expectEqual(@as(usize, 2), policy.standby_names.len);
+    try std.testing.expectEqualStrings("standby b%", policy.standby_names[0]);
+    try std.testing.expectEqualStrings("standby c", policy.standby_names[1]);
+
+    try std.testing.expectError(
+        error.InvalidAdminRequest,
+        buildSyncPolicyFromQuery(alloc, "sync_mode=remote-write&sync_standby=standby%XX"),
+    );
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
