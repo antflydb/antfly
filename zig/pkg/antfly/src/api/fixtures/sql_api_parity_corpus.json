@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 841,
-  "entry_count": 841,
+  "source_entry_count": 843,
+  "entry_count": 843,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -5809,6 +5809,20 @@
       "sql": "WITH ready_sources AS MATERIALIZED (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status"
     },
     {
+      "name": "cte column alias insert select expression assignment",
+      "family": "insert_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "order_by": 1,
+        "limit": 3,
+        "operations": 3,
+        "returning": 2
+      },
+      "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=1:source_limit=3:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1:cte0_alias=1",
+      "sql": "WITH ready_sources(source_id, source_status, next_amount) AS (SELECT id, lower(status), amount + 1 FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status"
+    },
+    {
       "name": "cross-table insert select source plan",
       "family": "insert_source",
       "summary": {
@@ -5835,6 +5849,21 @@
       "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=1:source_limit=2:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}",
       "sql": "WITH ready_archives AS (SELECT archive_id, lower(archive_status) AS status_key, archive_amount + 1 AS next_amount FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT archive_id, status_key, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status"
+    },
+    {
+      "name": "cross-table cte column alias insert select source plan",
+      "family": "insert_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "order_by": 1,
+        "limit": 2,
+        "operations": 3,
+        "returning": 2
+      },
+      "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=1:source_limit=2:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1:cte0_alias=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}",
+      "sql": "WITH ready_archives(source_id, source_status, next_amount) AS (SELECT archive_id, lower(archive_status), archive_amount + 1 FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status"
     },
     {
       "name": "schema-derived partial unique conflict upsert",

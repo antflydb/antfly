@@ -58229,6 +58229,37 @@ test "postgres sql adapter lowers insert values returning into row batch" {
         else => return error.TestUnexpectedResult,
     }
 
+    var insert_source_aliased_cte_plan = try lowerWritePlanAlloc(
+        alloc,
+        "WITH ready_sources(source_id, source_status, next_amount) AS (SELECT id, lower(status), amount + 1 FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_aliased_cte_plan.deinit(alloc);
+    switch (insert_source_aliased_cte_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_sources", insert_source.ctes[0].name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes[0].query.field_aliases.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.ctes[0].query.field_aliases[0].output);
+            try std.testing.expectEqualStrings("id", insert_source.ctes[0].query.field_aliases[0].field);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.ctes[0].query.expressions.len);
+            try std.testing.expectEqualStrings("source_status", insert_source.ctes[0].query.expressions[0].output);
+            try std.testing.expectEqualStrings("next_amount", insert_source.ctes[0].query.expressions[1].output);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqualStrings("ready_sources", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.insert_source.req.assignments[0].expression.field);
+            try std.testing.expectEqualStrings("source_status", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expectEqualStrings("next_amount", insert_source.insert_source.req.assignments[2].expression.field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 3), insert_source.insert_source.req.source.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var source_catalog = AppParitySourceSchemaCatalog.init("archived_records", source_schema_json);
     var cross_table_cte_plan = try lowerWritePlanWithCatalogAlloc(
         alloc,
@@ -58253,6 +58284,38 @@ test "postgres sql adapter lowers insert values returning into row batch" {
             try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
             try std.testing.expectEqual(@as(?u32, 2), insert_source.insert_source.req.source.limit);
             try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cross_table_aliased_cte_plan = try lowerWritePlanWithCatalogAlloc(
+        alloc,
+        "WITH ready_archives(source_id, source_status, next_amount) AS (SELECT archive_id, lower(archive_status), archive_amount + 1 FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+        source_catalog.iface(),
+    );
+    defer cross_table_aliased_cte_plan.deinit(alloc);
+    switch (cross_table_aliased_cte_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("archived_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.ctes[0].name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes[0].query.field_aliases.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.ctes[0].query.field_aliases[0].output);
+            try std.testing.expectEqualStrings("archive_id", insert_source.ctes[0].query.field_aliases[0].field);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.ctes[0].query.expressions.len);
+            try std.testing.expectEqualStrings("source_status", insert_source.ctes[0].query.expressions[0].output);
+            try std.testing.expectEqualStrings("next_amount", insert_source.ctes[0].query.expressions[1].output);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.insert_source.req.assignments[0].expression.field);
+            try std.testing.expectEqualStrings("source_status", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expectEqualStrings("next_amount", insert_source.insert_source.req.assignments[2].expression.field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 2), insert_source.insert_source.req.source.limit);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -73994,6 +74057,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "WITH ready_sources AS MATERIALIZED (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
         },
         .{
+            .name = "cte column alias insert select expression assignment",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .operations = 3, .order_by = 1, .limit = 3, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=1:source_limit=3:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1:cte0_alias=1",
+            .sql = "WITH ready_sources(source_id, source_status, next_amount) AS (SELECT id, lower(status), amount + 1 FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
+        },
+        .{
             .name = "cross-table insert select source plan",
             .family = .insert_source,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .operations = 3, .returning = 2 },
@@ -74012,6 +74082,16 @@ test "postgres sql adapter classifies application parity corpus" {
             \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"archive_id":{"type":"keyword"},"archive_status":{"type":"keyword"},"archive_amount":{"type":"numeric"}},"required":["archive_id"],"additionalProperties":false}}},"primary_key":{"columns":["archive_id"]}}
             ,
             .sql = "WITH ready_archives AS (SELECT archive_id, lower(archive_status) AS status_key, archive_amount + 1 AS next_amount FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT archive_id, status_key, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status",
+        },
+        .{
+            .name = "cross-table cte column alias insert select source plan",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .operations = 3, .order_by = 1, .limit = 2, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=1:source_limit=2:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1:cte0_alias=1",
+            .source_schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"archive_id":{"type":"keyword"},"archive_status":{"type":"keyword"},"archive_amount":{"type":"numeric"}},"required":["archive_id"],"additionalProperties":false}}},"primary_key":{"columns":["archive_id"]}}
+            ,
+            .sql = "WITH ready_archives(source_id, source_status, next_amount) AS (SELECT archive_id, lower(archive_status), archive_amount + 1 FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status",
         },
         .{
             .name = "schema-derived partial unique conflict upsert",
