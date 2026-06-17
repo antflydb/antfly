@@ -241,6 +241,7 @@ pub fn freeReceipt(alloc: Allocator, receipt: Receipt) void {
 }
 
 fn validateFenceRequest(request: FenceRequest) !void {
+    if (request.identity.timeline_id == 0 or request.identity.epoch == 0) return error.InvalidTimelineSwitch;
     if (request.old_primary_id.len == 0) return error.InvalidOldPrimaryId;
     if (request.promoted_node_id.len == 0) return error.InvalidPromotedNodeId;
     if (std.mem.eql(u8, request.old_primary_id, request.promoted_node_id)) return error.InvalidPromotedNodeId;
@@ -255,16 +256,26 @@ fn validateFenceRequest(request: FenceRequest) !void {
     }
 }
 
-fn validateReceipt(receipt: Receipt) !void {
+pub fn validateReceipt(receipt: Receipt) !void {
     if (receipt.old_primary_id.len == 0) return error.InvalidOldPrimaryId;
     if (receipt.promoted_node_id.len == 0) return error.InvalidPromotedNodeId;
+    if (receipt.token.len == 0) return error.InvalidFenceToken;
     if (std.mem.eql(u8, receipt.old_primary_id, receipt.promoted_node_id)) return error.InvalidPromotedNodeId;
     if (receipt.identity.timeline_id != receipt.new_timeline_id) return error.InvalidTimelineSwitch;
     if (receipt.identity.epoch != receipt.new_epoch) return error.InvalidTimelineSwitch;
+    if (receipt.parent_timeline_id == 0 or receipt.parent_epoch == 0) return error.InvalidTimelineSwitch;
     if (receipt.new_timeline_id <= receipt.parent_timeline_id) return error.InvalidTimelineSwitch;
     if (receipt.new_epoch <= receipt.parent_epoch) return error.InvalidTimelineSwitch;
     if (receipt.required_lsn == 0) return error.InvalidFenceLsn;
+    if (receipt.generation == 0) return error.NonMonotonicFenceGeneration;
     if (receipt.observed_lsn < receipt.required_lsn and !receipt.forced) return error.FenceRequiresForce;
+    if (receipt.old_primary_id.len > std.math.maxInt(u32) or
+        receipt.promoted_node_id.len > std.math.maxInt(u32) or
+        receipt.token.len > std.math.maxInt(u32) or
+        receipt.reason.len > std.math.maxInt(u32))
+    {
+        return error.FenceFieldTooLong;
+    }
 }
 
 fn sameFence(receipt: Receipt, request: FenceRequest) bool {
@@ -700,6 +711,28 @@ test "storage.ha fencing rejects stale parent generation on replay" {
     }
 
     try std.testing.expectError(error.FenceAlreadyHeld, Store.open(alloc, path.ptr, .{}));
+}
+
+test "storage.ha fencing rejects invalid durable receipt fields on replay" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "invalid-receipt-fields");
+    defer alloc.free(path);
+
+    {
+        var store = try Store.open(alloc, path.ptr, .{});
+        defer store.close();
+
+        const receipt = try store.acquirePromotionFence(baseRequest());
+        defer freeReceipt(alloc, receipt);
+
+        var empty_token = receipt;
+        empty_token.token = "";
+        const encoded = try encodeReceipt(alloc, .promotion_fence, empty_token);
+        defer alloc.free(encoded);
+        _ = try store.wal.append(encoded);
+    }
+
+    try std.testing.expectError(error.InvalidFenceToken, Store.open(alloc, path.ptr, .{}));
 }
 
 test "storage.ha fencing receipt drives standby promotion" {

@@ -1626,7 +1626,7 @@ fn parseFailurePolicyQuery(raw: []const u8) !primary_mod.FailurePolicy {
 }
 
 fn adminFenceReceiptFromOpenApi(receipt: admin_api.HAFenceReceipt) !fencing.Receipt {
-    return .{
+    const out = fencing.Receipt{
         .identity = try adminIdentityFromOpenApi(receipt.identity),
         .old_primary_id = receipt.old_primary_id,
         .promoted_node_id = receipt.promoted_node_id,
@@ -1641,6 +1641,8 @@ fn adminFenceReceiptFromOpenApi(receipt: admin_api.HAFenceReceipt) !fencing.Rece
         .token = receipt.token,
         .reason = receipt.reason,
     };
+    try fencing.validateReceipt(out);
+    return out;
 }
 
 fn adminIdentityFromOpenApi(identity: admin_api.HAIdentity) !standby_mod.Identity {
@@ -2465,6 +2467,23 @@ test "storage.ha http admin reports unsafe promotion as conflict" {
     try expectContains(unsafe_promote.body, "PromotionNotAllowed");
     try std.testing.expectEqual(@as(u64, 1), standby.identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+}
+
+test "storage.ha http admin rejects invalid rejoin fence receipt" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_assess,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"\",\"reason\":\"invalid\"}}",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    try expectContains(response.body, "invalid HA rejoin assessment request");
 }
 
 test "storage.ha http admin accepts whole instance identity" {
