@@ -282,7 +282,7 @@ pub const SearchScratch = struct {
     pub fn ensureVectorBatchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         const vector_count = try std.math.mul(usize, self.dims, needed);
         if (self.vector_batch.len < vector_count) {
-            self.vector_batch = try alloc.realloc(self.vector_batch, vector_count);
+            self.vector_batch = try alloc.realloc(self.vector_batch, nextScratchCapacity(self.vector_batch.len, vector_count));
             self.noteScratchAllocation(byteLen(self.vector_batch));
         }
     }
@@ -340,7 +340,7 @@ pub const SearchScratch = struct {
 
     pub fn ensureMemberIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.member_ids.len < needed) {
-            self.member_ids = try alloc.realloc(self.member_ids, needed);
+            self.member_ids = try alloc.realloc(self.member_ids, nextScratchCapacity(self.member_ids.len, needed));
             self.noteScratchAllocation(byteLen(self.member_ids));
         }
     }
@@ -365,7 +365,7 @@ pub const SearchScratch = struct {
 
     pub fn ensureDeltaRecordCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.posting_delta_records.len < needed) {
-            self.posting_delta_records = try alloc.realloc(self.posting_delta_records, needed);
+            self.posting_delta_records = try alloc.realloc(self.posting_delta_records, nextScratchCapacity(self.posting_delta_records.len, needed));
             self.noteScratchAllocation(byteLen(self.posting_delta_records));
         }
     }
@@ -709,6 +709,11 @@ fn allocateQueryStorage(alloc: Allocator, capacity: usize) ![]u64 {
     return try alloc.alloc(u64, words);
 }
 
+fn nextScratchCapacity(current: usize, needed: usize) usize {
+    const doubled = current *| 2;
+    return @max(needed, @max(doubled, @as(usize, 8)));
+}
+
 fn queryStorageByteLen(capacity: usize) usize {
     var offset: usize = 0;
     addQueryStorageSlice(usize, &offset, capacity);
@@ -830,6 +835,23 @@ test "SearchScratch grows distance capacity without vector fetch buffers" {
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expectEqual(vector_batch_len, scratch.vector_batch.len);
     try std.testing.expectEqual(vector_ids_len, scratch.vector_ids.len);
+}
+
+test "SearchScratch grows hot posting buffers geometrically" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureMemberIdCapacity(alloc, 3);
+    try std.testing.expectEqual(@as(usize, 8), scratch.member_ids.len);
+
+    try scratch.ensureVectorBatchCapacity(alloc, 3);
+    try std.testing.expectEqual(@as(usize, 16), scratch.vector_batch.len);
+
+    try scratch.ensureDeltaRecordCapacity(alloc, 1);
+    try std.testing.expectEqual(@as(usize, 8), scratch.posting_delta_records.len);
+    try scratch.ensureDeltaRecordCapacity(alloc, 9);
+    try std.testing.expectEqual(@as(usize, 16), scratch.posting_delta_records.len);
 }
 
 test "SearchScratch reports allocation pressure and retained bytes" {

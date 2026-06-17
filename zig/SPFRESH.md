@@ -134,7 +134,9 @@ Current status:
   arrays geometrically instead of reallocating all three arrays for each
   appended cached record. Query and fold overlay-append scratch uses the same
   geometric growth shape for appended-id/live arrays, reducing allocator churn
-  on hash-backed overlay replay.
+  on hash-backed overlay replay. Search scratch member-id, vector-batch, and
+  posting-delta-record buffers also grow geometrically across reused query
+  scratch handles.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
   repeated linear membership checks to a temporary removal set for larger
   postings/delete lists, preserving member order while avoiding quadratic CPU
