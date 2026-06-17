@@ -960,6 +960,74 @@ state and is not an execution model; it exists only to resolve syntax, names,
 parameters, and error classification before lowering into Antfly-native typed
 plans.
 
+The maintainable code shape is a small facade plus adapter-internal compiler
+modules rather than one growing parser file. The existing
+`api/relational_sql.zig` entrypoints should remain stable while implementation
+moves behind a `api/sql_adapter/` package:
+
+- `mod.zig`: public facade for the existing SQL lowering entrypoints and shared
+  deinit helpers.
+- `plan.zig`: adapter public plan structs, fingerprints, and ownership helpers
+  that callers already consume.
+- `token.zig`: token kinds, token source spans, keyword helpers, and simple
+  token predicates.
+- `lexer.zig`: PostgreSQL lexical handling for whitespace, comments, quoted
+  identifiers, strings, dollar-quoted literals, casts, operators, and bind
+  placeholders. Tokens should stay source-sliced except when decoding requires
+  owned text.
+- `ast.zig`: adapter-private PostgreSQL syntax AST nodes. These are never
+  stored durably and never passed to storage.
+- `parser.zig`: parser cursor, statement dispatch, and grammar entrypoints.
+- `grammar.zig`: handwritten grammar helpers today, or the checked-in
+  generated-parser wrapper later if a grammar generator is introduced.
+- `binder.zig`: schema/catalog lookup, parameter binding, name resolution,
+  output-column inference, and type validation.
+- `lower_expr.zig`: shared expression lowering into Antfly row-expression,
+  check, index-predicate, default, conflict-action, and returning-expression
+  ASTs.
+- `lower_select.zig`, `lower_dml.zig`, and `lower_ddl.zig`: statement-family
+  lowering into Antfly typed read plans, write plans, and catalog/schema plans.
+- `diagnostics.zig`: span-aware unsupported-shape diagnostics and stable
+  required-feature classification.
+- `corpus.zig`: SQL/API parity corpus helpers and fingerprint assertions, if
+  those remain implemented in Zig source instead of external fixtures.
+
+The internal flow is always:
+
+```text
+SQL text
+  -> lexer tokens with source spans
+  -> adapter-private PostgreSQL AST
+  -> binder and type checker over Antfly schema/catalog metadata
+  -> Antfly-native typed plans
+  -> API/storage execution
+```
+
+Raw SQL must not cross the binder/lowerer boundary. The adapter AST may retain
+PostgreSQL syntax details such as aliases, casts, conflict-target spelling, and
+DDL clauses, but the durable/backend contract remains typed Antfly structs.
+Plan structs should own only the normalized fields needed for execution,
+validation, rebuild, repair, and parity fingerprints.
+
+The split should happen incrementally to avoid a risky parser rewrite. First
+extract `token.zig` and `lexer.zig` behind the existing entrypoints, preserving
+the current zero-copy token behavior, source spans, dollar-quoted literal
+handling, and strict placeholder validation. Next extract the parser cursor and
+shared expression grammar, because expressions are reused by SELECT, DML, DDL
+checks, partial indexes, defaults, generated columns, conflict actions, and
+RETURNING. Then move statement families one at a time into AST plus binder plus
+lowerer modules, with the existing SQL/API parity tests as the acceptance gate.
+Only after those boundaries are stable should a generated grammar be considered.
+
+Efficiency follows those same boundaries. Lexer and parser data should be
+statement-scoped and arena-allocated where useful. Token text should reference
+the original SQL buffer unless unescaping or cast normalization requires owned
+text. AST nodes should avoid copying identifiers and literals until binding
+normalizes them. Final typed plans should own their execution data because they
+outlive the parser. Expression lowering should be shared instead of duplicating
+operator precedence, type checks, or function semantics across SELECT, DML, DDL,
+and index paths.
+
 Grammar coverage should land incrementally and remain fail-closed. Statement
 families can move from the current handwritten lowerers into the grammar one at
 a time: DDL and catalog operations, row queries, row-batch mutations, claimed
