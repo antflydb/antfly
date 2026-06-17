@@ -14,6 +14,9 @@
 
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
+pub const writer = @import("writer.zig");
+pub const reader = @import("reader.zig");
+pub const source = @import("source.zig");
 
 pub const ColumnKind = types.ColumnKind;
 pub const CellValue = types.CellValue;
@@ -21,13 +24,23 @@ pub const RowRef = types.RowRef;
 pub const Column = types.Column;
 pub const Fragment = types.Fragment;
 pub const freeFragment = types.freeFragment;
+pub const Builder = writer.Builder;
+pub const Reader = reader.Reader;
+pub const FragmentSource = source.FragmentSource;
+pub const MaterializedBatch = source.MaterializedBatch;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
 
 test "serverless row fragment module compiles" {
     _ = types;
     _ = codec;
+    _ = writer;
+    _ = reader;
+    _ = source;
     _ = Fragment;
+    _ = Builder;
+    _ = Reader;
+    _ = FragmentSource;
     _ = encodeAlloc;
     _ = decodeAlloc;
 }

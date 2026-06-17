@@ -17,9 +17,15 @@ pub const codec = @import("codec.zig");
 pub const store = @import("store.zig");
 pub const fs_store = @import("fs_store.zig");
 pub const remote_store = @import("remote_store.zig");
+pub const base_source = @import("base_source.zig");
 
 pub const ArtifactKind = types.ArtifactKind;
 pub const ArtifactRef = types.ArtifactRef;
+pub const BaseSourceKind = types.BaseSourceKind;
+pub const ExternalBaseFormat = types.ExternalBaseFormat;
+pub const AntflyFragmentBaseSource = types.AntflyFragmentBaseSource;
+pub const ExternalBaseSource = types.ExternalBaseSource;
+pub const BaseSourceDescriptor = types.BaseSourceDescriptor;
 pub const PublishedGenerationStats = types.PublishedGenerationStats;
 pub const ManifestStats = types.ManifestStats;
 pub const PublishedGeneration = types.PublishedGeneration;
@@ -39,8 +45,10 @@ test "serverless manifest module compiles" {
     _ = store;
     _ = fs_store;
     _ = remote_store;
+    _ = base_source;
     _ = ArtifactKind;
     _ = ArtifactRef;
+    _ = BaseSourceDescriptor;
     _ = PublishedGenerationStats;
     _ = ManifestStats;
     _ = PublishedGeneration;

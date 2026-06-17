@@ -1959,13 +1959,32 @@ pub const ApiHttpServer = struct {
             try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
         else
             try self.alloc.dupe(u8, "{}");
+        errdefer self.alloc.free(metadata_json);
+
+        var roles: [][]u8 = &.{};
+        errdefer freeOwnedStrings(self.alloc, roles);
+        var role_settings: []usermgr.RoleSetting = &.{};
+        errdefer {
+            for (role_settings) |*setting| setting.deinit(self.alloc);
+            if (role_settings.len > 0) self.alloc.free(role_settings);
+        }
+        if (self.cfg.user_manager) |manager| {
+            if (manager.hasUser(subject)) {
+                roles = try manager.getRolesForUser(subject);
+                role_settings = try manager.getEffectiveRoleSettings(subject);
+            }
+        }
+
+        const username = try self.alloc.dupe(u8, subject);
+        errdefer self.alloc.free(username);
 
         return .{
-            .username = try self.alloc.dupe(u8, subject),
+            .username = username,
             .permissions = permissions,
             .row_filter = row_filters,
             .metadata_json = metadata_json,
-            .roles = try self.alloc.alloc([]u8, 0),
+            .roles = roles,
+            .role_settings = role_settings,
         };
     }
 
@@ -9942,20 +9961,24 @@ test "auth row filter resolver expands username references" {
 
 test "auth row filter resolver expands metadata references" {
     const alloc = std.testing.allocator;
+    const role_settings = try alloc.alloc(usermgr.RoleSetting, 1);
+    role_settings[0] = try usermgr.RoleSetting.initOwned(alloc, "app.tenant_id", "acme");
     var identity = AuthenticatedIdentity{
         .username = try alloc.dupe(u8, "alice"),
         .metadata_json = try alloc.dupe(u8, "{\"tenant_id\":\"acme\",\"limits\":{\"tier\":\"gold\"}}"),
+        .role_settings = role_settings,
     };
     defer identity.deinit(alloc);
 
     const resolved = try resolveAuthRowFilterJson(
         alloc,
         identity,
-        "{\"conjuncts\":[{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}},{\"term\":{\"tier\":{\"$auth\":\"metadata.limits.tier\"}}}]}",
+        "{\"conjuncts\":[{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}},{\"term\":{\"setting_tenant\":{\"$auth\":\"settings.app.tenant_id\"}}},{\"term\":{\"tier\":{\"$auth\":\"metadata.limits.tier\"}}}]}",
     );
     defer alloc.free(resolved);
 
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"tenant_id\":\"acme\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"setting_tenant\":\"acme\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"tier\":\"gold\"") != null);
 }
 
@@ -11584,6 +11607,70 @@ test "api http server authenticates trusted principal" {
     try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
     try std.testing.expectEqualStrings("docs", identity.row_filter[0].table);
     try std.testing.expect(std.mem.indexOf(u8, identity.row_filter[0].filter, "\"tenant_id\":\"t1\"") != null);
+}
+
+test "api http server hydrates trusted principal role settings from antfly user manager" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    var auth = try initTestAuthManager(std.testing.allocator);
+    try bindTestAuthManager(std.testing.allocator, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(std.testing.allocator);
+    try auth.manager.createRoleSubject("role:app_writer");
+    try auth.manager.setRoleSetting("role:app_writer", "app.tenant_id", "acme");
+    try auth.manager.addRoleToUser("alice", "role:app_writer");
+
+    const secret = "trusted-principal-role-setting-secret";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"alice","tables":["docs"],"operations":["read"],"row_filter":{{"docs":{{"term":{{"tenant_id":{{"$auth":"settings.app.tenant_id"}}}}}}}},"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, payload);
+    defer std.testing.allocator.free(token);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+            .user_manager = &auth.manager,
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    var identity = try server.authenticateRequest(.{ .trusted_principal = token });
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("alice", identity.username);
+    try std.testing.expectEqual(@as(usize, 1), identity.role_settings.len);
+    try std.testing.expectEqualStrings("app.tenant_id", identity.role_settings[0].name);
+    try std.testing.expectEqualStrings("acme", identity.role_settings[0].value);
+
+    const resolved = try resolveEffectiveRowFilterJson(std.testing.allocator, identity, "docs");
+    defer std.testing.allocator.free(resolved.?);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"acme\"}}", resolved.?);
 }
 
 test "api http server treats only exact extension prefixes as admin routes" {

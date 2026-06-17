@@ -907,9 +907,20 @@ pub const UserManager = struct {
             _ = self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, setting_value }) catch {};
         };
 
+        var removed_old_values = std.ArrayList([]const u8).empty;
+        defer removed_old_values.deinit(self.alloc);
+        try removed_old_values.ensureTotalCapacity(self.alloc, existing_rules.len);
+        errdefer {
+            for (removed_old_values.items) |old_value| {
+                _ = self.enforcer.addNamedPolicy("p3", &.{ role_subject, setting_name, old_value }) catch {};
+            }
+        }
+
         for (existing_rules) |rule| {
             if (rule.fields.len < 3 or std.mem.eql(u8, rule.fields[2], setting_value)) continue;
-            _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, rule.fields[2] });
+            if (try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, rule.fields[2] })) {
+                removed_old_values.appendAssumeCapacity(rule.fields[2]);
+            }
         }
     }
 

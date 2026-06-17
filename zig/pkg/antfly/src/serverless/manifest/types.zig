@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const base_source = @import("base_source.zig");
 const catalog_types = @import("../catalog/types.zig");
 const search_sources = @import("../search_sources.zig");
 
@@ -39,6 +40,12 @@ pub const ArtifactRef = struct {
     byte_len: u64,
     checksum: []const u8,
 };
+
+pub const BaseSourceKind = base_source.BaseSourceKind;
+pub const ExternalBaseFormat = base_source.ExternalBaseFormat;
+pub const AntflyFragmentBaseSource = base_source.AntflyFragmentBaseSource;
+pub const ExternalBaseSource = base_source.ExternalBaseSource;
+pub const BaseSourceDescriptor = base_source.BaseSourceDescriptor;
 
 pub const PublishedGenerationStats = struct {
     document_count: u64 = 0,

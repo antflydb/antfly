@@ -2801,6 +2801,19 @@ pub fn build(b: *std.Build) void {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const lake_scaffold_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lake_scaffold_tests = b.addTest(.{
+        .root_module = lake_scaffold_test_mod,
+    });
+    const run_lake_scaffold_tests = b.addRunArtifact(lake_scaffold_tests);
+    const lake_scaffold_test_step = b.step("lake-scaffold-test", "Run Antfly-owned lake-native scaffold tests");
+    lake_scaffold_test_step.dependOn(&run_lake_scaffold_tests.step);
+    root_test_step.dependOn(&run_lake_scaffold_tests.step);
+
     const graph_metric_lifecycle_default_filters = [_][]const u8{
         "graph degree planned build publishes scores matching local runner",
         "graph pagerank planned build publishes scores matching local runner",
@@ -3758,6 +3771,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "api http server serves mcp and a2a protocol surfaces",
+            "api http server hydrates trusted principal role settings from antfly user manager",
             "auth row filter resolver expands username references",
             "auth row filter resolver expands metadata references",
             "auth row filter validator accepts username references",

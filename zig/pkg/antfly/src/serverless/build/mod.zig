@@ -18,6 +18,7 @@ pub const coordinator = @import("coordinator.zig");
 pub const impact_planner = @import("impact_planner.zig");
 pub const publication_plan = @import("publication_plan.zig");
 pub const retention = @import("retention.zig");
+pub const row_fragments = @import("row_fragments.zig");
 pub const vector_index = @import("vector_index.zig");
 
 pub const BuildResult = builder.BuildResult;
@@ -39,6 +40,9 @@ pub const TableDefinitionSnapshot = publication_plan.TableDefinitionSnapshot;
 pub const PublishRunStats = coordinator.PublishRunStats;
 pub const Pruner = retention.Pruner;
 pub const PruneResult = retention.PruneResult;
+pub const RowFragmentBuildOptions = row_fragments.BuildOptions;
+pub const buildRowFragmentFromBatchAlloc = row_fragments.buildFragmentFromBatchAlloc;
+pub const encodeRowFragmentFromBatchAlloc = row_fragments.encodeFragmentFromBatchAlloc;
 
 test "serverless build module compiles" {
     _ = builder;
@@ -47,6 +51,7 @@ test "serverless build module compiles" {
     _ = impact_planner;
     _ = publication_plan;
     _ = retention;
+    _ = row_fragments;
     _ = vector_index;
     _ = BuildResult;
     _ = Builder;
@@ -67,4 +72,7 @@ test "serverless build module compiles" {
     _ = PublishRunStats;
     _ = Pruner;
     _ = PruneResult;
+    _ = RowFragmentBuildOptions;
+    _ = buildRowFragmentFromBatchAlloc;
+    _ = encodeRowFragmentFromBatchAlloc;
 }

@@ -16,6 +16,36 @@
 //! execution. These are view types; concrete sources own the backing memory.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const SourceKind = enum {
+    relational_store,
+    json_materialized,
+    serverless_fragment,
+    external_parquet,
+    external_iceberg,
+    external_lance,
+};
+
+pub const NextBatchFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?ColumnBatch;
+pub const DeinitFn = *const fn (ctx: *anyopaque, alloc: Allocator) void;
+
+pub const Source = struct {
+    kind: SourceKind,
+    ctx: *anyopaque,
+    next_batch: NextBatchFn,
+    deinit_fn: ?DeinitFn = null,
+
+    pub fn next(self: Source, alloc: Allocator) !?ColumnBatch {
+        const batch = try self.next_batch(self.ctx, alloc);
+        if (batch) |got| try got.validate();
+        return batch;
+    }
+
+    pub fn deinit(self: Source, alloc: Allocator) void {
+        if (self.deinit_fn) |deinit_fn| deinit_fn(self.ctx, alloc);
+    }
+};
 
 pub const SnapshotRef = struct {
     table_id: []const u8,
@@ -151,4 +181,39 @@ test "column batch rejects mismatched column length" {
         .columns = &columns,
     };
     try std.testing.expectError(error.RowSourceColumnLengthMismatch, batch.validate());
+}
+
+test "row source validates batches returned by adapters" {
+    const TestSource = struct {
+        emitted: bool = false,
+
+        fn next(ctx: *anyopaque, alloc: Allocator) !?ColumnBatch {
+            _ = alloc;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.emitted) return null;
+            self.emitted = true;
+            const row_refs = &[_]RowRef{
+                .{ .relational_key = "row:a" },
+            };
+            const values = &[_]bool{true};
+            const columns = &[_]ColumnVector{
+                .{ .name = "active", .values = .{ .bool = values } },
+            };
+            return ColumnBatch{
+                .snapshot = .{ .table_id = "users", .snapshot_id = "snap-1" },
+                .row_refs = row_refs,
+                .columns = columns,
+            };
+        }
+    };
+
+    var state = TestSource{};
+    const source = Source{
+        .kind = .relational_store,
+        .ctx = &state,
+        .next_batch = TestSource.next,
+    };
+    const batch = (try source.next(std.testing.allocator)).?;
+    try std.testing.expectEqual(@as(usize, 1), batch.rowCount());
+    try std.testing.expect((try source.next(std.testing.allocator)) == null);
 }

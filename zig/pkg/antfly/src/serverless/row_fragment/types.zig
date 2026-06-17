@@ -58,6 +58,19 @@ pub const Column = struct {
     kind: ColumnKind,
     values: []CellValue,
 
+    pub fn validateCellKinds(self: Column) !void {
+        for (self.values) |value| {
+            switch (value) {
+                .null => {},
+                .bytes => if (self.kind != .bytes) return error.InvalidRowFragment,
+                .json => if (self.kind != .json) return error.InvalidRowFragment,
+                .i64 => if (self.kind != .i64) return error.InvalidRowFragment,
+                .f64 => if (self.kind != .f64) return error.InvalidRowFragment,
+                .bool => if (self.kind != .bool) return error.InvalidRowFragment,
+            }
+        }
+    }
+
     pub fn deinit(self: *Column, alloc: Allocator) void {
         alloc.free(self.name);
         for (self.values) |*value| value.deinit(alloc);
@@ -85,18 +98,13 @@ pub const Fragment = struct {
     }
 
     pub fn validate(self: Fragment) !void {
-        for (self.columns) |column| {
-            if (column.values.len != self.row_refs.len) return error.InvalidRowFragment;
-            for (column.values) |value| {
-                switch (value) {
-                    .null => {},
-                    .bytes => if (column.kind != .bytes) return error.InvalidRowFragment,
-                    .json => if (column.kind != .json) return error.InvalidRowFragment,
-                    .i64 => if (column.kind != .i64) return error.InvalidRowFragment,
-                    .f64 => if (column.kind != .f64) return error.InvalidRowFragment,
-                    .bool => if (column.kind != .bool) return error.InvalidRowFragment,
-                }
+        for (self.columns, 0..) |column, idx| {
+            if (column.name.len == 0) return error.InvalidRowFragment;
+            for (self.columns[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.name, column.name)) return error.InvalidRowFragment;
             }
+            if (column.values.len != self.row_refs.len) return error.InvalidRowFragment;
+            try column.validateCellKinds();
         }
     }
 };

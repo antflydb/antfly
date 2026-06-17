@@ -5012,19 +5012,19 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    extensions whose functions already lower to native Antfly expression nodes,
    such as `CREATE EXTENSION IF NOT EXISTS pgcrypto` and the dump-style
    `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public`, is an
-   adapter-only no-op with a stable `extension` reason. Other
-   `CREATE EXTENSION` statements lower to typed extension catalog intent that captures extension name and
-   idempotency, then fail closed until execution can route through the canonical
-   extension lifecycle described in `EXTENSIONS.md`. That integration should be
-   a SQL compatibility adapter over `extensions.lifecycle.installOnService`,
-   `updateOnService`, and `dropOnService`, not a second extension
-   implementation: the parser owns syntax and typed intent, while the adapter
-   resolves SQL names to package manifests, enforces strict `IF EXISTS` /
-   `IF NOT EXISTS` semantics, resolves PostgreSQL-facing names through manifest
-   `sql_names` aliases such as `"uuid-ossp"` -> `uuid_ossp` before installing a
-   package, rejects ambiguous SQL-name aliases, rejects transactional use until
-   metadata DDL has a unified boundary, and emits extension metadata transition
-   commands instead of mutating relational schema JSON. PL/pgSQL
+   adapter-only no-op with a stable `extension` reason. Other supported
+   `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`
+   statements lower to typed extension catalog intent and execute through the
+   canonical extension lifecycle described in `EXTENSIONS.md`. The SQL
+   compatibility adapter routes those plans to `extensions.lifecycle`
+   install/update/drop operations rather than implementing a second extension
+   path: the parser owns syntax and typed intent, while the adapter resolves SQL
+   names to package manifests, enforces strict `IF EXISTS` / `IF NOT EXISTS`
+   semantics, resolves PostgreSQL-facing names through manifest `sql_names`
+   aliases such as `"uuid-ossp"` -> `uuid_ossp` before installing a package,
+   rejects ambiguous SQL-name aliases, rejects transactional use until metadata
+   DDL has a unified boundary, and emits extension metadata transition commands
+   instead of mutating relational schema JSON. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

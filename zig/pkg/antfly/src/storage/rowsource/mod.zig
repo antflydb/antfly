@@ -14,6 +14,10 @@
 
 pub const types = @import("types.zig");
 
+pub const SourceKind = types.SourceKind;
+pub const NextBatchFn = types.NextBatchFn;
+pub const DeinitFn = types.DeinitFn;
+pub const Source = types.Source;
 pub const SnapshotRef = types.SnapshotRef;
 pub const ServerlessRowRef = types.ServerlessRowRef;
 pub const ExternalRowRef = types.ExternalRowRef;
@@ -26,6 +30,7 @@ pub const ColumnBatch = types.ColumnBatch;
 
 test "rowsource module compiles" {
     _ = types;
+    _ = Source;
     _ = SnapshotRef;
     _ = RowRef;
     _ = ColumnVector;
