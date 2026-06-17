@@ -14,6 +14,41 @@
 
 const std = @import("std");
 
+const lexer = @import("lexer.zig");
+const parser = @import("parser.zig");
+const token_mod = @import("token.zig");
+
+pub const Token = token_mod.Token;
+
+pub const RowSecurityAlterSyntax = struct {
+    table_identifier: []const u8,
+    enabled: bool,
+};
+
+pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAlterSyntax {
+    const start = pos.*;
+    var cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("table")) return null;
+    const table_token = cursor.matchToken(.identifier) orelse {
+        pos.* = start;
+        return error.UnsupportedSqlShape;
+    };
+    const enabled = if (cursor.matchKeyword("enable"))
+        true
+    else if (cursor.matchKeyword("disable"))
+        false
+    else {
+        pos.* = start;
+        return null;
+    };
+    try cursor.expectKeyword("row");
+    try cursor.expectKeyword("level");
+    try cursor.expectKeyword("security");
+    if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
+    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+    return .{ .table_identifier = table_token.text, .enabled = enabled };
+}
+
 pub fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
 }
@@ -263,4 +298,26 @@ pub fn sqlWindowTailClauseKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "offset") or
         std.ascii.eqlIgnoreCase(text, "fetch") or
         std.ascii.eqlIgnoreCase(text, "for");
+}
+
+test "sql adapter grammar parses alter row security" {
+    const alloc = std.testing.allocator;
+    var tokens = try lexer.tokenizeAlloc(alloc, "TABLE public.usage_records DISABLE ROW LEVEL SECURITY;");
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var pos: usize = 0;
+    const syntax = (try parseAlterRowSecurity(tokens.items, &pos)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!syntax.enabled);
+    try std.testing.expectEqualStrings("public.usage_records", syntax.table_identifier);
+    try std.testing.expectEqual(tokens.items.len, pos);
+}
+
+test "sql adapter grammar leaves non row security alter table to ddl parser" {
+    const alloc = std.testing.allocator;
+    var tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var pos: usize = 0;
+    try std.testing.expect((try parseAlterRowSecurity(tokens.items, &pos)) == null);
+    try std.testing.expectEqual(@as(usize, 0), pos);
 }

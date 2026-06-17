@@ -7440,23 +7440,12 @@ const Parser = struct {
     }
 
     fn parseAlterRowSecurityDdl(self: *@This()) !AlterRowSecurityPlan {
-        try self.expectKeyword("table");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
+        const syntax = (try sql_adapter.parseAlterRowSecurity(self.tokens, &self.pos)) orelse return error.UnsupportedSqlShape;
+        const table_name = try normalizeSqlObjectIdentifierAlloc(self.alloc, syntax.table_identifier);
         var table_name_transferred = false;
         errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        const enabled = if (self.matchKeyword("enable"))
-            true
-        else if (self.matchKeyword("disable"))
-            false
-        else
-            return error.UnsupportedSqlShape;
-        try self.expectKeyword("row");
-        try self.expectKeyword("level");
-        try self.expectKeyword("security");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
         table_name_transferred = true;
-        return .{ .table_name = table_name, .enabled = enabled };
+        return .{ .table_name = table_name, .enabled = syntax.enabled };
     }
 
     fn parseCreateRowSecurityPolicyDdl(self: *@This()) !CreateRowSecurityPolicyPlan {
