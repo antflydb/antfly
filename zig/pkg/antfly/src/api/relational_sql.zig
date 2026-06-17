@@ -59447,8 +59447,11 @@ fn unsupportedFingerprintAlloc(
     reason: []const u8,
 ) ![]u8 {
     const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
-    if (!sql_adapter.classificationReasonIsUnsupportedRequirement(diagnostic_reason)) return error.TestUnexpectedResult;
-    return try std.fmt.allocPrint(alloc, "unsupported:{s}:requires={s}", .{ family, reason });
+    const unsupported_family = std.meta.stringToEnum(sql_adapter.UnsupportedPlanFamily, family) orelse return error.TestUnexpectedResult;
+    return sql_adapter.unsupportedFingerprintAlloc(alloc, unsupported_family, diagnostic_reason) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
+        else => return err,
+    };
 }
 
 fn adapterNoopFingerprintAlloc(
@@ -59457,8 +59460,10 @@ fn adapterNoopFingerprintAlloc(
     reason: []const u8,
 ) ![]u8 {
     const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
-    if (!sql_adapter.classificationReasonIsAdapterNoop(diagnostic_reason)) return error.TestUnexpectedResult;
-    return try std.fmt.allocPrint(alloc, "adapter_noop:{s}:reason={s}", .{ family, reason });
+    return sql_adapter.adapterNoopFingerprintAlloc(alloc, family, diagnostic_reason) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
+        else => return err,
+    };
 }
 
 fn expectFailClosedUnsupported(result: anytype) !void {
@@ -63905,35 +63910,18 @@ fn appParityPlanMatchesReason(
 ) bool {
     const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return false;
     switch (family) {
-        .adapter_noop_ddl => {
-            if (!sql_adapter.classificationReasonIsAdapterNoop(diagnostic_reason)) return false;
-            if (!std.mem.startsWith(u8, plan, "adapter_noop:")) return false;
-            return appParityPlanHasExactStringToken(plan, ":reason=", reason);
-        },
+        .adapter_noop_ddl => return sql_adapter.adapterNoopPlanMatchesReason(plan, "ddl", diagnostic_reason),
         else => if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
-            if (!sql_adapter.classificationReasonIsUnsupportedRequirement(diagnostic_reason)) return false;
-            const prefix = "unsupported:";
-            if (!std.mem.startsWith(u8, plan, prefix)) return false;
-            const rest = plan[prefix.len..];
-            if (!std.mem.startsWith(u8, rest, unsupported_family) or
-                rest.len <= unsupported_family.len or
-                rest[unsupported_family.len] != ':')
-            {
-                return false;
-            }
-            return appParityPlanHasExactStringToken(plan, ":requires=", reason);
+            const unsupported = std.meta.stringToEnum(sql_adapter.UnsupportedPlanFamily, unsupported_family) orelse return false;
+            return sql_adapter.unsupportedPlanMatchesReason(plan, unsupported, diagnostic_reason);
         } else return true,
     }
 }
 
 fn appParityPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const u8) bool {
     if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
-        const unsupported_prefix = "unsupported:";
-        if (!std.mem.startsWith(u8, plan, unsupported_prefix)) return false;
-        const rest = plan[unsupported_prefix.len..];
-        return std.mem.startsWith(u8, rest, unsupported_family) and
-            rest.len > unsupported_family.len and
-            rest[unsupported_family.len] == ':';
+        const unsupported = std.meta.stringToEnum(sql_adapter.UnsupportedPlanFamily, unsupported_family) orelse return false;
+        return sql_adapter.unsupportedPlanMatchesFamily(plan, unsupported);
     }
 
     const prefix = switch (family) {

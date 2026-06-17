@@ -1017,12 +1017,15 @@ then belongs in `classifier.zig`, so raw SQL dispatch is owned by the adapter
 module before the large lowerers create typed plans. Stable unsupported-shape
 and adapter-noop reason tokens belong in `diagnostics.zig`; the parity corpus
 must reject unknown reason strings, and adapter-only reasons must not be reused
-as required-feature classifications. Next extract the parser cursor and shared
-expression grammar, because expressions are reused by SELECT, DML, DDL checks,
-partial indexes, defaults, generated columns, conflict actions, and RETURNING.
-Then move statement families one at a time into AST plus binder plus lowerer
-modules, with the existing SQL/API parity tests as the acceptance gate. Only
-after those boundaries are stable should a generated grammar be considered.
+as required-feature classifications. Golden-plan fingerprint helpers and
+unsupported/adapter-noop plan matching belong in `corpus.zig`, so fixture
+validation and generated corpus promotion share the same adapter-owned contract.
+Next extract the parser cursor and shared expression grammar, because
+expressions are reused by SELECT, DML, DDL checks, partial indexes, defaults,
+generated columns, conflict actions, and RETURNING. Then move statement
+families one at a time into AST plus binder plus lowerer modules, with the
+existing SQL/API parity tests as the acceptance gate. Only after those
+boundaries are stable should a generated grammar be considered.
 
 Efficiency follows those same boundaries. Lexer and parser data should be
 statement-scoped and arena-allocated where useful. Token text should reference

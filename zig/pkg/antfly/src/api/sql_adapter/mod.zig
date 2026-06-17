@@ -14,6 +14,7 @@
 
 pub const ast = @import("ast.zig");
 pub const classifier = @import("classifier.zig");
+pub const corpus = @import("corpus.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const grammar = @import("grammar.zig");
 pub const lexer = @import("lexer.zig");
@@ -32,6 +33,9 @@ pub const SqlValue = value.SqlValue;
 pub const SqlWriteStatementKind = classifier.SqlWriteStatementKind;
 pub const Token = token.Token;
 pub const TokenKind = token.TokenKind;
+pub const UnsupportedPlanFamily = corpus.UnsupportedPlanFamily;
+pub const adapterNoopFingerprintAlloc = corpus.adapterNoopFingerprintAlloc;
+pub const adapterNoopPlanMatchesReason = corpus.adapterNoopPlanMatchesReason;
 pub const arrayLengthDefaultOutput = grammar.arrayLengthDefaultOutput;
 pub const atEnd = parser.atEnd;
 pub const classificationReasonFromToken = diagnostics.classificationReasonFromToken;
@@ -92,3 +96,7 @@ pub const sqlKeywordIsTrimVariantFunction = grammar.sqlKeywordIsTrimVariantFunct
 pub const sqlKeywordIsUuidV4Function = grammar.sqlKeywordIsUuidV4Function;
 pub const sqlKeywordStartsScalarPredicate = grammar.sqlKeywordStartsScalarPredicate;
 pub const tokenizeAlloc = lexer.tokenizeAlloc;
+pub const unsupportedFingerprintAlloc = corpus.unsupportedFingerprintAlloc;
+pub const unsupportedPlanFamilyToken = corpus.unsupportedPlanFamilyToken;
+pub const unsupportedPlanMatchesFamily = corpus.unsupportedPlanMatchesFamily;
+pub const unsupportedPlanMatchesReason = corpus.unsupportedPlanMatchesReason;
