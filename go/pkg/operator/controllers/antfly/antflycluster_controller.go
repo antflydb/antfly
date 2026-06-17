@@ -5165,7 +5165,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 }
 
 func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Context, baseURL string, ha *antflyv1.HighAvailabilitySpec) (haObservedPrimaryStatus, error) {
-	raw, err := r.getHAAdminJSON(ctx, baseURL, "/admin/v1/ha/primary/status", haPrimaryStatusQuery(ha))
+	raw, err := r.getHAAdminJSON(ctx, baseURL, haAdminPrimaryStatusPath, haPrimaryStatusQuery(ha))
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
@@ -5173,7 +5173,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 }
 
 func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, baseURL string, standbyName string, slotName string, upstreamLSN uint64) (antflyv1.HAStandbyStatus, error) {
-	raw, err := r.getHAAdminJSON(ctx, baseURL, "/admin/v1/ha/standby/status", haStandbyStatusQuery(upstreamLSN))
+	raw, err := r.getHAAdminJSON(ctx, baseURL, haAdminStandbyStatusPath, haStandbyStatusQuery(upstreamLSN))
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}

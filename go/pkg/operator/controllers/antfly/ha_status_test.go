@@ -483,6 +483,41 @@ func TestPlanHAEscapesSlotNamesInAdminPaths(t *testing.T) {
 
 func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	operations := loadAdminOpenAPIOperations(t)
+	statusOperations := []struct {
+		name        string
+		method      string
+		path        string
+		openAPIPath string
+		operationID string
+	}{
+		{
+			name:        "primary status",
+			method:      "GET",
+			path:        haAdminPrimaryStatusPath,
+			openAPIPath: "/ha/primary/status",
+			operationID: "getHAPrimaryStatus",
+		},
+		{
+			name:        "standby status",
+			method:      "GET",
+			path:        haAdminStandbyStatusPath,
+			openAPIPath: "/ha/standby/status",
+			operationID: "getHAStandbyStatus",
+		},
+	}
+	for _, tt := range statusOperations {
+		t.Run(tt.name, func(t *testing.T) {
+			path := strings.TrimPrefix(tt.path, haAdminBasePath)
+			if path != tt.openAPIPath {
+				t.Fatalf("expected OpenAPI path %s, got %s", tt.openAPIPath, path)
+			}
+			key := tt.method + " " + path
+			if operations[key] != tt.operationID {
+				t.Fatalf("expected %s to resolve to operationId %s, got %q", key, tt.operationID, operations[key])
+			}
+		})
+	}
+
 	slotAction := func(kind haActionKind) haPlannedAction {
 		return haPlannedAction{Kind: kind, StandbyName: "standby-a", SlotName: "standby-a"}
 	}
@@ -579,7 +614,7 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 				t.Fatalf("expected typed admin operation for %s", tt.name)
 			}
 			path = strings.Replace(path, "/standby-a", "/{slot_name}", 1)
-			path = strings.TrimPrefix(path, "/admin/v1")
+			path = strings.TrimPrefix(path, haAdminBasePath)
 			if path != tt.openAPIPath {
 				t.Fatalf("expected OpenAPI path %s, got %s", tt.openAPIPath, path)
 			}

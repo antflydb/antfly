@@ -54,6 +54,25 @@ const (
 	haActionExecutorControllerAction haActionExecutor = "ControllerAction"
 )
 
+const (
+	haAdminBasePath                        = "/admin/v1"
+	haAdminHAPath                          = haAdminBasePath + "/ha"
+	haAdminPrimaryStatusPath               = haAdminHAPath + "/primary/status"
+	haAdminStandbyStatusPath               = haAdminHAPath + "/standby/status"
+	haAdminReplicationSlotsPath            = haAdminHAPath + "/replication-slots"
+	haAdminReplicationSlotPathPrefix       = haAdminReplicationSlotsPath + "/"
+	haAdminReplicationSlotPausePathSuffix  = "/pause"
+	haAdminReplicationSlotResumePathSuffix = "/resume"
+	haAdminBaseBackupsPath                 = haAdminHAPath + "/base-backups"
+	haAdminBaseBackupsFinishPath           = haAdminBaseBackupsPath + "/finish"
+	haAdminStandbyBootstrapPath            = haAdminHAPath + "/standby/bootstrap"
+	haAdminFencePath                       = haAdminHAPath + "/fence"
+	haAdminPromotionCurrentFencePath       = haAdminHAPath + "/promotion/current-fence"
+	haAdminRejoinAssessPath                = haAdminHAPath + "/rejoin/assess"
+	haAdminRejoinRewindPath                = haAdminHAPath + "/rejoin/rewind"
+	haAdminRejoinReseedPath                = haAdminHAPath + "/rejoin/reseed"
+)
+
 const haFencingLeaseDefaultDurationSeconds int32 = 30
 
 func haFencingLeaseRenewalRequeueAfter() time.Duration {
@@ -1084,35 +1103,35 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 func haAdminOperation(action haPlannedAction) (string, string) {
 	switch action.Kind {
 	case haActionCreateSlot:
-		return "POST", "/admin/v1/ha/replication-slots"
+		return "POST", haAdminReplicationSlotsPath
 	case haActionResumeSlot:
 		if slotName := haPlannedActionSlotName(action); slotName != "" {
-			return "PUT", "/admin/v1/ha/replication-slots/" + url.PathEscape(slotName) + "/resume"
+			return "PUT", haAdminReplicationSlotPathPrefix + url.PathEscape(slotName) + haAdminReplicationSlotResumePathSuffix
 		}
 	case haActionPauseSlot:
 		if slotName := haPlannedActionSlotName(action); slotName != "" {
-			return "PUT", "/admin/v1/ha/replication-slots/" + url.PathEscape(slotName) + "/pause"
+			return "PUT", haAdminReplicationSlotPathPrefix + url.PathEscape(slotName) + haAdminReplicationSlotPausePathSuffix
 		}
 	case haActionDropSlot:
 		if slotName := haPlannedActionSlotName(action); slotName != "" {
-			return "DELETE", "/admin/v1/ha/replication-slots/" + url.PathEscape(slotName)
+			return "DELETE", haAdminReplicationSlotPathPrefix + url.PathEscape(slotName)
 		}
 	case haActionSeedStandby, haActionMarkReseed:
-		return "POST", "/admin/v1/ha/base-backups"
+		return "POST", haAdminBaseBackupsPath
 	case haActionFinishStandbySeed:
-		return "POST", "/admin/v1/ha/base-backups/finish"
+		return "POST", haAdminBaseBackupsFinishPath
 	case haActionBootstrapStandbySeed:
-		return "POST", "/admin/v1/ha/standby/bootstrap"
+		return "POST", haAdminStandbyBootstrapPath
 	case haActionAcquireFence:
-		return "POST", "/admin/v1/ha/fence"
+		return "POST", haAdminFencePath
 	case haActionPromoteStandby:
-		return "POST", "/admin/v1/ha/promotion/current-fence"
+		return "POST", haAdminPromotionCurrentFencePath
 	case haActionDemoteFormerPrimary:
-		return "POST", "/admin/v1/ha/rejoin/assess"
+		return "POST", haAdminRejoinAssessPath
 	case haActionRewindFormerPrimary:
-		return "POST", "/admin/v1/ha/rejoin/rewind"
+		return "POST", haAdminRejoinRewindPath
 	case haActionReseedFormerPrimary:
-		return "POST", "/admin/v1/ha/rejoin/reseed"
+		return "POST", haAdminRejoinReseedPath
 	}
 	return "", ""
 }
