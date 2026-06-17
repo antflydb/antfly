@@ -1193,14 +1193,14 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 		action: haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "old-primary"},
 		want:   "http://old-primary-ha.default.svc:8081",
 	}, {
-		name:   "former primary reseed scheduling",
+		name:   "former primary reseed marks slot on original primary before promotion is recorded",
 		action: haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "old-primary"},
-		want:   "http://old-primary-ha.default.svc:8081",
+		want:   "http://primary-ha.default.svc:8081",
 	}, {
-		name:   "post-promotion former primary reseed still targets former primary",
+		name:   "post-promotion former primary reseed marks slot on promoted primary",
 		action: haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "old-primary"},
 		status: &antflyv1.HAStatus{LastPromotion: haCompletePromotionReceipt("primary-a", "standby-a")},
-		want:   "http://old-primary-ha.default.svc:8081",
+		want:   "http://standby-a-ha.default.svc:8081",
 	}, {
 		name:   "post-promotion primary scoped seed uses promoted primary node",
 		action: haPlannedAction{Kind: haActionSeedStandby, StandbyName: "old-primary"},
@@ -2678,8 +2678,8 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 
 	if len(cluster.Status.HAStatus.PlannedActions) != 2 ||
 		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) ||
-		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://old-primary-ha.default.svc:8081" ||
-		cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "old-primary" {
+		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "standby-a" {
 		t.Fatalf("expected forced promotion to require former-primary reseed, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	forcedCommand := strings.Join(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, " ")
