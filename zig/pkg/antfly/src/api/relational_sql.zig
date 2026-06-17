@@ -8668,6 +8668,12 @@ const Parser = struct {
         try validateSqlIdentifierListUnique(columns.items);
         try validateSqlUniqueExpressionListUnique(expressions.items);
 
+        if (self.matchKeyword("nulls")) {
+            if (!unique) return error.UnsupportedSqlShape;
+            if (self.matchKeyword("not")) return error.UnsupportedSqlShape;
+            try self.expectKeyword("distinct");
+        }
+
         var include_columns: []const []const u8 = &.{};
         var include_columns_owned = false;
         errdefer if (include_columns_owned) freeStringSlice(self.alloc, include_columns);
@@ -46922,6 +46928,31 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
+    var explicit_nulls_distinct = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_nulls_distinct_key ON usage_records (email) NULLS DISTINCT INCLUDE (tenant_id);",
+    );
+    defer explicit_nulls_distinct.deinit(alloc);
+    switch (explicit_nulls_distinct) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_email_nulls_distinct_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("email", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_email_nulls_distinct_idx ON usage_records (email) NULLS DISTINCT;",
+    ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (email);",
@@ -70741,6 +70772,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:include=2",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "CREATE UNIQUE INDEX usage_records_email_cover_key ON usage_records (email) INCLUDE (tenant_id, status);",
+        },
+        .{
+            .name = "schema explicit nulls distinct unique index",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
+            .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false",
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE UNIQUE INDEX usage_records_email_nulls_distinct_key ON usage_records (email) NULLS DISTINCT;",
         },
         .{
             .name = "schema concurrent partial index",
