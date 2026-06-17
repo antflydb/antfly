@@ -967,7 +967,7 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 		lastLSN = action.TargetLSN
 	}
 	args := []string{
-		"rejoin", "assess",
+		"rejoin", haFormerPrimaryRejoinSubcommand(action.Kind),
 		"--node-id", action.StandbyName,
 		"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
 		"--shard-id", strconv.FormatUint(identity.ShardID, 10),
@@ -1004,6 +1004,17 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 		args = append(args, "--fence-forced")
 	}
 	return args
+}
+
+func haFormerPrimaryRejoinSubcommand(kind haActionKind) string {
+	switch kind {
+	case haActionRewindFormerPrimary:
+		return "rewind"
+	case haActionReseedFormerPrimary:
+		return "reseed"
+	default:
+		return "assess"
+	}
 }
 
 func haPromotionReceipt(status *antflyv1.HAStatus) *antflyv1.HAPromotionStatus {

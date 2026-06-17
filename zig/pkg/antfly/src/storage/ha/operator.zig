@@ -743,7 +743,7 @@ fn appendFormerPrimaryRejoinCommand(
     const last_lsn = options.former_last_lsn orelse target_lsn;
 
     try appendArg(alloc, argv, "rejoin");
-    try appendArg(alloc, argv, "assess");
+    try appendArg(alloc, argv, formerPrimaryRejoinSubcommand(action.kind));
     try appendArg(alloc, argv, "--node-id");
     try appendArg(alloc, argv, node_id);
     try appendIdentityArgs(alloc, argv, owned_args, identity);
@@ -929,6 +929,14 @@ fn automaticFencingPrecondition(observed: FencingObservation) ?FencingPreconditi
         .holder = holder,
         .generation = generation,
         .reason = observed.reason,
+    };
+}
+
+fn formerPrimaryRejoinSubcommand(kind: ActionKind) []const u8 {
+    return switch (kind) {
+        .rewind_former_primary => "rewind",
+        .reseed_former_primary => "reseed",
+        else => "assess",
     };
 }
 
@@ -2286,7 +2294,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     defer rewind_command.deinit(alloc);
     var rewind_command_plan = try rewind_command.parsePlan(alloc);
     defer rewind_command_plan.deinit(alloc);
-    const rewind_rejoin = rewind_command_plan.command.rejoin_assess;
+    const rewind_rejoin = rewind_command_plan.command.rejoin_rewind;
     try std.testing.expectEqualStrings("primary-a", rewind_rejoin.former.node_id);
     try std.testing.expectEqual(@as(u64, 1), rewind_rejoin.former.identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 12), rewind_rejoin.former.last_lsn);
@@ -2338,8 +2346,8 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     defer reseed_command.deinit(alloc);
     var reseed_command_plan = try reseed_command.parsePlan(alloc);
     defer reseed_command_plan.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 11), reseed_command_plan.command.rejoin_assess.policy.retained_from_lsn);
-    try std.testing.expectEqualStrings("standby-b", reseed_command_plan.command.rejoin_assess.receipt.?.promoted_node_id);
+    try std.testing.expectEqual(@as(u64, 11), reseed_command_plan.command.rejoin_reseed.policy.retained_from_lsn);
+    try std.testing.expectEqualStrings("standby-b", reseed_command_plan.command.rejoin_reseed.receipt.?.promoted_node_id);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

@@ -587,6 +587,51 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	}
 }
 
+func TestHAFormerPrimaryAdminCommandUsesExecutableRejoinSubcommands(t *testing.T) {
+	identity := &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       1,
+		Epoch:            1,
+		CurrentPrimaryID: "primary-a",
+	}
+	status := &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  1,
+		ParentEpoch:       1,
+		NewTimelineID:     2,
+		NewEpoch:          2,
+		RequiredLSN:       10,
+		ObservedLSN:       10,
+		FenceGeneration:   4,
+		FenceToken:        "token",
+	}}
+	tests := []struct {
+		kind       haActionKind
+		subcommand string
+	}{
+		{kind: haActionDemoteFormerPrimary, subcommand: "assess"},
+		{kind: haActionRewindFormerPrimary, subcommand: "rewind"},
+		{kind: haActionReseedFormerPrimary, subcommand: "reseed"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.kind), func(t *testing.T) {
+			command := haFormerPrimaryAdminCommand(haPlannedAction{
+				Kind:            tt.kind,
+				StandbyName:     "primary-a",
+				TargetLSN:       10,
+				ObservedLSN:     11,
+				RetainedFromLSN: 8,
+			}, identity, status)
+			if len(command) < 2 || command[0] != "rejoin" || command[1] != tt.subcommand {
+				t.Fatalf("expected rejoin %s command, got %#v", tt.subcommand, command)
+			}
+		})
+	}
+}
+
 func loadAdminOpenAPIOperations(t *testing.T) map[string]string {
 	t.Helper()
 	_, file, _, ok := goruntime.Caller(0)
@@ -1196,7 +1241,6 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" {
 		t.Fatalf("expected rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-
 	cluster.Status.HAStatus.Fencing.Authority = antflyv1.HAFencingAuthorityStorageFence
 	reconciler.updateHAStatusAndConditions(cluster)
 
@@ -1228,7 +1272,6 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		cluster.Status.HAStatus.PlannedActions[1].StandbyName != "old-primary" {
 		t.Fatalf("expected reseed planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
-
 	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
 		NodeID:            "old-primary",
 		TargetTimelineID:  2,
@@ -1348,7 +1391,7 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	expected := []string{
-		"rejoin", "assess",
+		"rejoin", "rewind",
 		"--node-id", "old-primary",
 		"--cluster-id", "100",
 		"--shard-id", "10",
