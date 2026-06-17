@@ -171,6 +171,7 @@ pub const Client = struct {
             current_lsn,
             last_sent_lsn,
             next_lsn,
+            response.parsed.value.end_of_wal,
         );
         defer freeVerifiedFrames(self.alloc, frames);
 
@@ -407,12 +408,14 @@ fn decodeAndValidateFrames(
     current_lsn: u64,
     last_sent_lsn: u64,
     next_lsn: u64,
+    end_of_wal: bool,
 ) ![]VerifiedFrame {
     const response_from_lsn = try positiveUint64FromJson(response.from_lsn);
     if (response_from_lsn != requested_lsn) return error.ReplicationResponseLsnMismatch;
     if (last_sent_lsn > current_lsn) return error.ReplicationResponseLsnMismatch;
     if (next_lsn != try std.math.add(u64, last_sent_lsn, 1)) return error.ReplicationResponseLsnMismatch;
     if (next_lsn > try std.math.add(u64, current_lsn, 1)) return error.ReplicationResponseLsnMismatch;
+    if (end_of_wal != (next_lsn > current_lsn)) return error.ReplicationResponseEndOfWalMismatch;
 
     const encoded_bytes = try uint64FromJson(response.encoded_bytes);
     var actual_encoded_bytes: u64 = 0;
@@ -700,7 +703,7 @@ const CorruptFrameExecutor = struct {
 };
 
 const WrongIdentityBatchExecutor = struct {
-    const Mismatch = enum { epoch, previous_lsn, slot };
+    const Mismatch = enum { epoch, previous_lsn, slot, premature_end_of_wal };
 
     identity: standby_mod.Identity,
     mismatch: Mismatch = .epoch,
@@ -760,18 +763,19 @@ const WrongIdentityBatchExecutor = struct {
         defer alloc.free(first_frame);
         const second_frame = try base64TestAlloc(alloc, second);
         defer alloc.free(second_frame);
-        const records = [_]struct {
+        const first_record = struct {
             lsn: u64,
             kind: []const u8,
             payload_codec: []const u8,
             encoded: []const u8,
         }{
-            .{
-                .lsn = 1,
-                .kind = "batch-mutation",
-                .payload_codec = "raw",
-                .encoded = first_frame,
-            },
+            .lsn = 1,
+            .kind = "batch-mutation",
+            .payload_codec = "raw",
+            .encoded = first_frame,
+        };
+        const records = [_]@TypeOf(first_record){
+            first_record,
             .{
                 .lsn = 2,
                 .kind = "batch-mutation",
@@ -779,6 +783,10 @@ const WrongIdentityBatchExecutor = struct {
                 .encoded = second_frame,
             },
         };
+        const response_records = if (self.mismatch == .premature_end_of_wal) records[0..1] else records[0..];
+        const response_last_sent_lsn: u64 = if (self.mismatch == .premature_end_of_wal) 1 else 2;
+        const response_next_lsn: u64 = if (self.mismatch == .premature_end_of_wal) 2 else 3;
+        const response_encoded_bytes: usize = if (self.mismatch == .premature_end_of_wal) first.len else first.len + second.len;
 
         return try jsonTestResponse(alloc, .{
             .slot_name = if (self.mismatch == .slot) "standby-other" else "standby-a",
@@ -787,11 +795,11 @@ const WrongIdentityBatchExecutor = struct {
             .timeline_id = self.identity.timeline_id,
             .from_lsn = 1,
             .current_lsn = 2,
-            .last_sent_lsn = 2,
-            .next_lsn = 3,
+            .last_sent_lsn = response_last_sent_lsn,
+            .next_lsn = response_next_lsn,
             .end_of_wal = true,
-            .encoded_bytes = first.len + second.len,
-            .records = &records,
+            .encoded_bytes = response_encoded_bytes,
+            .records = response_records,
         });
     }
 };
@@ -1030,6 +1038,36 @@ test "storage.ha http replication client rejects slot mismatch before receive" {
     defer capture.deinit();
     try std.testing.expectError(
         error.ReplicationSlotMismatch,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
+}
+
+test "storage.ha http replication client rejects premature end-of-wal before receive" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "premature-end-of-wal");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var executor = WrongIdentityBatchExecutor{ .identity = identity, .mismatch = .premature_end_of_wal };
+    var client = Client.init(alloc, executor.executor());
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(
+        error.ReplicationResponseEndOfWalMismatch,
         client.replicateAvailable(
             "http://primary.internal.test",
             "standby-a",
