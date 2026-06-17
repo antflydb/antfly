@@ -3747,6 +3747,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		result, err := adminClient.AssessPromotionResponse(ctx, body)
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
+			err = haValidatePromotionAssessSDKResponse(result)
+		}
+		if err == nil {
 			err = requireHADirectPromotionAssessmentResult(action, raw)
 		}
 		return true, err
@@ -3759,6 +3762,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		result, err := adminClient.PromoteWithCurrentFenceResponse(ctx)
 		raw, err := haAdminSDKResponseRaw(result, err)
+		if err == nil {
+			err = haValidatePromotionSDKResponse(result)
+		}
 		if err == nil && !r.applyHADirectPromotionResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed promotion receipt", action.Kind)
 		}
@@ -3881,6 +3887,26 @@ func haValidateFenceSDKResponse(value *adminsdk.HAResponse[adminsdk.HAFenceRespo
 		return fmt.Errorf("HA admin fence response is nil")
 	}
 	if err := adminsdk.ValidateHAFenceResponse(*value.Value); err != nil {
+		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+	}
+	return nil
+}
+
+func haValidatePromotionAssessSDKResponse(value *adminsdk.HAResponse[adminsdk.HAPromotionAssessResponse]) error {
+	if value == nil || value.Value == nil {
+		return fmt.Errorf("HA admin promotion assess response is nil")
+	}
+	if err := adminsdk.ValidateHAPromotionAssessResponse(*value.Value); err != nil {
+		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+	}
+	return nil
+}
+
+func haValidatePromotionSDKResponse(value *adminsdk.HAResponse[adminsdk.HAPromotionResponse]) error {
+	if value == nil || value.Value == nil {
+		return fmt.Errorf("HA admin promotion response is nil")
+	}
+	if err := adminsdk.ValidateHAPromotionResponse(*value.Value); err != nil {
 		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
 	}
 	return nil

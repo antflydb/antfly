@@ -750,6 +750,66 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	}
 }
 
+func TestValidateHAPromotionResponses(t *testing.T) {
+	t.Parallel()
+
+	assessment := HAPromotionAssessment{
+		RequiredLsn:        8,
+		ReceivedLsn:        8,
+		AppliedLsn:         8,
+		HasRequiredLsn:     true,
+		CaughtUpToReceived: true,
+		FencingConfirmed:   true,
+		CanPromote:         true,
+		Safe:               true,
+	}
+	assess := HAPromotionAssessResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "promotion_assess:standby-a",
+			ActionKind: HAActionKindPromotionAssess,
+			Target:     "standby-a",
+			State:      HAActionStateAssessed,
+			NodeId:     "standby-a",
+		},
+		Assessment: assessment,
+	}
+	if err := ValidateHAPromotionAssessResponse(assess); err != nil {
+		t.Fatalf("ValidateHAPromotionAssessResponse returned error: %v", err)
+	}
+	assess.Assessment.RequiredLsn = 0
+	if err := ValidateHAPromotionAssessResponse(assess); err == nil || !strings.Contains(err.Error(), "assessment fields") {
+		t.Fatalf("missing assessment error = %v, want assessment fields error", err)
+	}
+
+	identity := HAIdentity{ClusterId: 1, ShardId: 2, TableId: 3, TimelineId: 4, Epoch: 5}
+	promotion := HAPromotionResponse{
+		SchemaVersion:   1,
+		Action:          HAActionReceipt{ActionId: "promotion:standby-a", ActionKind: HAActionKindPromotion, Target: "standby-a", State: HAActionStateApplied, NodeId: "standby-a"},
+		Assessment:      assessment,
+		FenceGeneration: 9,
+		FenceToken:      "fence-token",
+		Promotion: HAPromotionResult{
+			NodeId:      "standby-a",
+			SwitchLsn:   9,
+			OldIdentity: identity,
+			NewIdentity: HAIdentity{ClusterId: 1, ShardId: 2, TableId: 3, TimelineId: 6, Epoch: 7},
+		},
+	}
+	if err := ValidateHAPromotionResponse(promotion); err != nil {
+		t.Fatalf("ValidateHAPromotionResponse returned error: %v", err)
+	}
+	promotion.FenceToken = ""
+	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "fence_token") {
+		t.Fatalf("missing fence_token error = %v, want fence_token error", err)
+	}
+	promotion.FenceToken = "fence-token"
+	promotion.Promotion.SwitchLsn = 0
+	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "promotion result") {
+		t.Fatalf("missing promotion result error = %v, want promotion result error", err)
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

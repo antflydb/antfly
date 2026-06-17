@@ -70,7 +70,9 @@ type (
 	HAPrimaryStatusParamsSyncFail      = oapi.GetHAPrimaryStatusParamsSyncFailure
 	HAPrimaryStatusResponse            = oapi.HAPrimaryStatusResponse
 	HAPromotionAssessResponse          = oapi.HAPromotionAssessResponse
+	HAPromotionAssessment              = oapi.HAPromotionAssessment
 	HAPromotionResponse                = oapi.HAPromotionResponse
+	HAPromotionResult                  = oapi.HAPromotionResult
 	HAReadCheckResponse                = oapi.HAReadCheckResponse
 	HAReadDecision                     = oapi.HAReadDecision
 	HAReadDecisionAction               = oapi.HAReadDecisionAction
@@ -377,6 +379,52 @@ func ValidateHAFenceResponse(response HAFenceResponse) error {
 		return fmt.Errorf("missing fence response receipt fields")
 	}
 	return nil
+}
+
+func ValidateHAPromotionAssessResponse(response HAPromotionAssessResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing promotion assess schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing promotion assess action receipt")
+	}
+	if !HAPromotionAssessmentComplete(response.Assessment) {
+		return fmt.Errorf("missing promotion assessment fields")
+	}
+	return nil
+}
+
+func ValidateHAPromotionResponse(response HAPromotionResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing promotion response schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing promotion response action receipt")
+	}
+	if !HAPromotionAssessmentComplete(response.Assessment) {
+		return fmt.Errorf("missing promotion response assessment fields")
+	}
+	if !HAPromotionResultComplete(response.Promotion) {
+		return fmt.Errorf("missing promotion result fields")
+	}
+	if response.FenceGeneration == 0 {
+		return fmt.Errorf("missing promotion fence_generation")
+	}
+	if strings.TrimSpace(response.FenceToken) == "" {
+		return fmt.Errorf("missing promotion fence_token")
+	}
+	return nil
+}
+
+func HAPromotionAssessmentComplete(assessment HAPromotionAssessment) bool {
+	return assessment.RequiredLsn > 0
+}
+
+func HAPromotionResultComplete(result HAPromotionResult) bool {
+	return strings.TrimSpace(result.NodeId) != "" &&
+		result.SwitchLsn > 0 &&
+		HAIdentityComplete(result.OldIdentity) &&
+		HAIdentityComplete(result.NewIdentity)
 }
 
 func HAFenceReceiptComplete(receipt HAFenceReceipt) bool {
