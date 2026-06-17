@@ -6615,15 +6615,15 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 	case haActionSeedStandby, haActionMarkReseed:
 		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
 			haResultManifestMatches(result.ManifestID, expectedManifestID) &&
-			result.BackupLSN > 0 &&
+			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
 			result.StartRecordLSN > 0
 	case haActionFinishStandbySeed:
 		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
-			result.BackupLSN > 0 &&
+			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
 			result.EndRecordLSN > 0
 	case haActionBootstrapStandbySeed:
 		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
-			result.BackupLSN > 0 &&
+			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
 			result.CheckpointLSN > 0
 	case haActionAcquireFence:
 		return result.FenceGeneration > 0 &&
@@ -6870,6 +6870,13 @@ func haResultManifestMatches(resultManifestID string, expectedManifestID string)
 	}
 	expectedManifestID = strings.TrimSpace(expectedManifestID)
 	return expectedManifestID == "" || resultManifestID == expectedManifestID
+}
+
+func haResultBackupLSNMatches(resultBackupLSN uint64, expectedBackupLSN uint64) bool {
+	if resultBackupLSN == 0 {
+		return false
+	}
+	return expectedBackupLSN == 0 || resultBackupLSN == expectedBackupLSN
 }
 
 func haExpectedSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName string) string {

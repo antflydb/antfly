@@ -2389,6 +2389,31 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	actions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 
+	seedBeginAction := antflyv1.HAPlannedActionStatus{
+		Kind:          string(haActionSeedStandby),
+		StandbyName:   "standby-a",
+		SlotName:      "standby-a",
+		TargetLSN:     5,
+		AdminNodeID:   "primary-a",
+		AdminCommand:  []string{"seed", "begin", "--slot", "standby-a"},
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:  1,
+			ActionID:       "base_backup_begin:base-standby-a-5",
+			ActionKind:     "base_backup_begin",
+			ActionTarget:   "base-standby-a-5",
+			ActionState:    "applied",
+			ActionNodeID:   "primary-a",
+			SlotName:       "standby-a",
+			ManifestID:     "base-standby-a-5",
+			BackupLSN:      5,
+			StartRecordLSN: 5,
+		},
+	}
+	g.Expect(haAdminActionSucceededWithEvidence(seedBeginAction)).To(BeTrue())
+	seedBeginAction.AdminResult.BackupLSN = 4
+	g.Expect(haAdminActionSucceededWithEvidence(seedBeginAction)).To(BeFalse())
+
 	seedFileActions := []antflyv1.HAPlannedActionStatus{{
 		Kind:          string(haActionFinishStandbySeed),
 		StandbyName:   "standby-a",
@@ -2420,6 +2445,9 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeFalse())
 	seedFileActions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeTrue())
+	seedFileActions[0].AdminResult.BackupLSN = 4
+	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeFalse())
+	seedFileActions[0].AdminResult.BackupLSN = 5
 
 	seedFileActions[1].AdminJobPhase = haAdminJobPhaseSucceeded
 	seedFileActions[1].StandbyName = "standby-a"
@@ -2440,6 +2468,9 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeFalse())
 	seedFileActions[1].AdminResult.ActionNodeID = "standby-a"
 	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeTrue())
+	seedFileActions[1].AdminResult.BackupLSN = 4
+	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeFalse())
+	seedFileActions[1].AdminResult.BackupLSN = 5
 
 	promotionActions := []antflyv1.HAPlannedActionStatus{{
 		Kind:            string(haActionPromoteStandby),
@@ -2697,6 +2728,7 @@ func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T
 	action := antflyv1.HAPlannedActionStatus{
 		Kind:             string(haActionFinishStandbySeed),
 		SeedManifestPath: "/backup/base-standby-a-5.afha",
+		TargetLSN:        5,
 		AdminNodeID:      "primary-a",
 		AdminJobName:     haAdminDirectAPIName,
 		AdminJobPhase:    haAdminJobPhaseSucceeded,
@@ -2718,6 +2750,9 @@ func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T
 	action.AdminResult.ActionID = "base_backup_finish:base-standby-a-5"
 	action.AdminResult.ActionTarget = "base-standby-a-5"
 	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
+
+	action.AdminResult.BackupLSN = 4
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeFalse())
 }
 
 func TestHAPromotionAdminResultRequiresFenceScopeEvidence(t *testing.T) {
