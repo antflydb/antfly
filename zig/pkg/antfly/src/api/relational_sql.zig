@@ -65564,6 +65564,34 @@ test "app parity read cross-table source schema table tokens are exact" {
     try std.testing.expect(coverage.read_lateral_cross_table_source_schema_classifier);
 }
 
+test "app parity structured side-access coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .join,
+        .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1:left_json_contains=1x:right_json_exists=0",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .lateral,
+        .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1x",
+    });
+
+    try std.testing.expect(!coverage.join_structured_side_access);
+    try std.testing.expect(!coverage.lateral_structured_side_access);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .join,
+        .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1:left_json_contains=1:right_json_exists=0",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .lateral,
+        .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1",
+    });
+
+    try std.testing.expect(coverage.join_structured_side_access);
+    try std.testing.expect(coverage.lateral_structured_side_access);
+}
+
 test "app parity conflict write count coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -66705,8 +66733,8 @@ const AppParityCorpusCoverage = struct {
             .join => {
                 self.join = true;
                 self.join_structured_side_access = self.join_structured_side_access or
-                    std.mem.indexOf(u8, entry.plan, "left_json_contains=") != null or
-                    std.mem.indexOf(u8, entry.plan, "right_json_exists=") != null;
+                    appParityPlanHasNonZeroToken(entry.plan, ":left_json_contains=") or
+                    appParityPlanHasNonZeroToken(entry.plan, ":right_json_exists=");
                 self.join_on_side_predicate = self.join_on_side_predicate or
                     std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND c.kind = 'customer'") != null;
                 self.join_on_preserved_side_predicate = self.join_on_preserved_side_predicate or
@@ -66725,8 +66753,8 @@ const AppParityCorpusCoverage = struct {
             .lateral => {
                 self.lateral = true;
                 self.lateral_structured_side_access = self.lateral_structured_side_access or
-                    std.mem.indexOf(u8, entry.plan, "left_json_contains=") != null or
-                    std.mem.indexOf(u8, entry.plan, "right_json_exists=") != null;
+                    appParityPlanHasNonZeroToken(entry.plan, ":left_json_contains=") or
+                    appParityPlanHasNonZeroToken(entry.plan, ":right_json_exists=");
                 self.lateral_computed_pattern_side_filter = self.lateral_computed_pattern_side_filter or
                     uses_computed_pattern and
                         (appParityPlanHasNonZeroToken(entry.plan, ":left_expr_pred=") or
