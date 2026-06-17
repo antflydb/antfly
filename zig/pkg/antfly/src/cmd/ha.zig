@@ -23,6 +23,7 @@ var test_path_counter: u64 = 0;
 
 const LocalOptions = struct {
     remote_url: ?[]const u8 = null,
+    remote_token_env: ?[]const u8 = null,
     primary_log: ?[]const u8 = null,
     primary_slots: ?[]const u8 = null,
     primary_node_id: ?[]const u8 = null,
@@ -82,6 +83,10 @@ const ParsedArgs = struct {
     }
 };
 
+const RemoteOptions = struct {
+    bearer_token: ?[]const u8 = null,
+};
+
 pub fn run(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
@@ -119,11 +124,16 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
         {
             return error.HaRemoteCannotUseLocalHandles;
         }
+        const bearer_token = try resolveRemoteBearerToken(alloc, parsed.options);
+        defer if (bearer_token) |token| alloc.free(token);
         var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{});
         defer executor.deinit();
-        try runRemoteArgv(alloc, io, remote_url, parsed.command_args, executor.executor());
+        try runRemoteArgvWithOptions(alloc, io, remote_url, parsed.command_args, executor.executor(), .{
+            .bearer_token = bearer_token,
+        });
         return;
     }
+    if (parsed.options.remote_token_env != null) return error.HaTokenEnvRequiresRemote;
 
     var plan = try ha.admin_cli.parse(alloc, parsed.command_args);
     defer plan.deinit(alloc);
@@ -200,10 +210,23 @@ fn runRemoteArgv(
     command_args: []const []const u8,
     executor: http_common.RequestExecutor,
 ) !void {
+    return try runRemoteArgvWithOptions(alloc, io, remote_url, command_args, executor, .{});
+}
+
+fn runRemoteArgvWithOptions(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    remote_url: []const u8,
+    command_args: []const []const u8,
+    executor: http_common.RequestExecutor,
+    remote_options: RemoteOptions,
+) !void {
     var plan = try ha.admin_cli.parse(alloc, command_args);
     defer plan.deinit(alloc);
 
-    var client = ha.http_client.Client.init(alloc, executor);
+    var client = ha.http_client.Client.initWithOptions(alloc, executor, .{
+        .bearer_token = remote_options.bearer_token,
+    });
     if (try executeTypedRemote(alloc, io, &client, remote_url, plan)) return;
     if (!remoteCommandEndpointAllowed(plan.command, plan.output)) return error.HaRemoteTypedAdminRequired;
 
@@ -852,6 +875,9 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
         } else if (std.mem.eql(u8, arg, "--ha-url")) {
             command_start += 1;
             options.remote_url = try value(argv, &command_start, "--ha-url");
+        } else if (std.mem.eql(u8, arg, "--ha-token-env")) {
+            command_start += 1;
+            options.remote_token_env = try value(argv, &command_start, "--ha-token-env");
         } else if (std.mem.eql(u8, arg, "--primary-log")) {
             command_start += 1;
             options.primary_log = try value(argv, &command_start, "--primary-log");
@@ -917,6 +943,20 @@ fn value(argv: []const []const u8, idx: *usize, flag: []const u8) ![]const u8 {
     return out;
 }
 
+fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[]u8 {
+    const raw_env_var = options.remote_token_env orelse return null;
+    const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
+    if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
+
+    const env_var_z = try alloc.dupeZ(u8, env_var);
+    defer alloc.free(env_var_z);
+
+    const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.HAAdminTokenMissing;
+    const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
+    if (token.len == 0) return error.HAAdminTokenMissing;
+    return try alloc.dupe(u8, token);
+}
+
 fn parseU64(raw: []const u8) !u64 {
     return try std.fmt.parseInt(u64, raw, 10);
 }
@@ -927,6 +967,7 @@ fn printUsage(argv0: []const u8) void {
         \\
         \\local options:
         \\  --ha-url URL
+        \\  --ha-token-env NAME
         \\  --primary-log PATH
         \\  --primary-slots PATH
         \\  --primary-node-id NODE
@@ -942,7 +983,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --ha-epoch N
         \\
         \\examples:
-        \\  {s} ha --ha-url http://127.0.0.1:8081 -- status primary
+        \\  {s} ha --ha-url http://127.0.0.1:8081 --ha-token-env ANTFLY_HA_ADMIN_TOKEN -- status primary
         \\  {s} ha --primary-log primary.wal --primary-slots slots.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- slot list
         \\  {s} ha --standby-log standby.wal --standby-progress progress.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- status standby
         \\  {s} ha --primary-log primary.wal --primary-slots slots.wal --ha-cluster-id 1 --ha-shard-id 1 --ha-table-id 1 --ha-timeline-id 1 --ha-epoch 1 -- write check --role primary
@@ -982,13 +1023,15 @@ test "ha cmd parses local handles before admin command" {
 test "ha cmd parses remote admin URL before command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
-        "--ha-url", "http://127.0.0.1:8081",
-        "--",       "--table",
-        "status",   "primary",
+        "--ha-url",       "http://127.0.0.1:8081",
+        "--ha-token-env", "ANTFLY_HA_ADMIN_TOKEN",
+        "--",             "--table",
+        "status",         "primary",
     });
     defer parsed.deinit(alloc);
 
     try std.testing.expectEqualStrings("http://127.0.0.1:8081", parsed.options.remote_url.?);
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", parsed.options.remote_token_env.?);
     try std.testing.expectEqual(@as(usize, 3), parsed.command_args.len);
     try std.testing.expectEqualStrings("--table", parsed.command_args[0]);
     try std.testing.expectEqualStrings("status", parsed.command_args[1]);
@@ -1326,6 +1369,42 @@ test "ha cmd remote commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
 }
 
+test "ha cmd remote sends bearer token to authenticated admin route" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "remote-auth");
+    defer paths.deinit(alloc);
+
+    var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+
+    var server = ha.http_admin.Server.initWithOptions(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+    }, .{
+        .bearer_token = "secret-token",
+    });
+    defer server.deinit();
+    var recorder = RecordingExecutor.init(alloc, server.executor());
+    defer recorder.deinit();
+
+    try std.testing.expectError(error.HaAdminUnauthorized, runRemoteArgvWithOptions(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "status",
+        "primary",
+    }, recorder.executor(), .{}));
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try std.testing.expect(recorder.last_authorization == null);
+
+    try runRemoteArgvWithOptions(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "status",
+        "primary",
+    }, recorder.executor(), .{
+        .bearer_token = "secret-token",
+    });
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try std.testing.expectEqualStrings("Bearer secret-token", recorder.last_authorization.?);
+}
+
 test "ha cmd remote direct promotion uses typed admin route" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "remote-direct-promote");
@@ -1647,6 +1726,7 @@ const RecordingExecutor = struct {
     inner: http_common.RequestExecutor,
     last_method: ?http_common.Method = null,
     last_uri: ?[]u8 = null,
+    last_authorization: ?[]u8 = null,
 
     fn init(alloc: std.mem.Allocator, inner: http_common.RequestExecutor) RecordingExecutor {
         return .{
@@ -1657,6 +1737,7 @@ const RecordingExecutor = struct {
 
     fn deinit(self: *RecordingExecutor) void {
         if (self.last_uri) |uri| self.alloc.free(uri);
+        if (self.last_authorization) |authorization| self.alloc.free(authorization);
         self.* = undefined;
     }
 
@@ -1671,8 +1752,19 @@ const RecordingExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *RecordingExecutor = @ptrCast(@alignCast(ptr));
-        if (self.last_uri) |uri| self.alloc.free(uri);
+        if (self.last_uri) |uri| {
+            self.alloc.free(uri);
+            self.last_uri = null;
+        }
+        if (self.last_authorization) |authorization| {
+            self.alloc.free(authorization);
+            self.last_authorization = null;
+        }
         self.last_uri = try self.alloc.dupe(u8, req.uri);
+        self.last_authorization = if (req.authorization) |authorization|
+            try self.alloc.dupe(u8, authorization)
+        else
+            null;
         self.last_method = req.method;
         return try self.inner.execute(alloc, req);
     }

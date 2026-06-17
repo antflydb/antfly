@@ -508,6 +508,11 @@ from `spec.highAvailability.admin.tokenEnvVar`, defaulting to
 through `spec.highAvailability.runtime.adminTokenEnvVar`. Kubernetes should
 inject both process environments from Secrets; the operator should not need
 direct Secret read permissions merely to call the HA admin API.
+For human or break-glass operations, `antfly ha --ha-url <url>` with
+`--ha-token-env ANTFLY_HA_ADMIN_TOKEN` should resolve the token from the
+operator/admin environment and send the same bearer header to typed admin
+routes. Do not add a raw token CLI flag; tokens should not be exposed through
+process argv.
 
 The admin API is node-local even though it is typed and operator-facing. The
 operator must choose the target node deliberately:

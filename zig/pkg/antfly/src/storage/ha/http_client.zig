@@ -58,14 +58,24 @@ pub const PrimaryStatusOptions = struct {
     sync_policy: ?primary_mod.SyncPolicy = null,
 };
 
+pub const AuthOptions = struct {
+    bearer_token: ?[]const u8 = null,
+};
+
 pub const Client = struct {
     alloc: Allocator,
     executor: http_common.RequestExecutor,
+    auth: AuthOptions = .{},
 
     pub fn init(alloc: Allocator, executor: http_common.RequestExecutor) Client {
+        return initWithOptions(alloc, executor, .{});
+    }
+
+    pub fn initWithOptions(alloc: Allocator, executor: http_common.RequestExecutor, auth: AuthOptions) Client {
         return .{
             .alloc = alloc,
             .executor = executor,
+            .auth = auth,
         };
     }
 
@@ -555,7 +565,18 @@ pub const Client = struct {
         });
     }
 
-    fn executeWithRetry(self: *Client, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn executeWithRetry(self: *Client, raw_req: http_common.HttpRequest) !http_common.HttpResponse {
+        var req = raw_req;
+        var authorization: ?[]u8 = null;
+        defer if (authorization) |value| self.alloc.free(value);
+        if (self.auth.bearer_token) |raw_token| {
+            const token = std.mem.trim(u8, raw_token, " \t\r\n");
+            if (token.len > 0) {
+                authorization = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token});
+                req.authorization = authorization.?;
+            }
+        }
+
         var attempt: usize = 0;
         while (true) {
             return self.executor.execute(self.alloc, req) catch |err| switch (err) {
@@ -577,6 +598,7 @@ pub const Client = struct {
     fn mapStatus(status: u16) !void {
         if (status >= 200 and status < 300) return;
         if (status == 400) return error.InvalidHaCommand;
+        if (status == 401) return error.HaAdminUnauthorized;
         if (status == 404) return error.HaEndpointNotFound;
         if (status == 405) return error.UnsupportedOperation;
         if (status == 409) return error.HaCommandConflict;
@@ -1914,6 +1936,14 @@ test "storage.ha http client maps admin errors" {
     try std.testing.expectError(error.HaEndpointNotReady, client.checkReady("http://ha-admin.test"));
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{"identify"}));
     try std.testing.expectError(error.InvalidHaCommand, client.executeCommand("http://ha-admin.test", &.{"unknown"}));
+
+    var auth_server = http_admin.Server.initWithOptions(alloc, .{}, .{ .bearer_token = "secret-token" });
+    defer auth_server.deinit();
+    var unauthenticated_client = Client.init(alloc, auth_server.executor());
+    try std.testing.expectError(error.HaAdminUnauthorized, unauthenticated_client.getPrimaryStatus("http://ha-admin.test", .{}));
+
+    var authenticated_client = Client.initWithOptions(alloc, auth_server.executor(), .{ .bearer_token = "secret-token" });
+    try std.testing.expectError(error.HaCommandConflict, authenticated_client.getPrimaryStatus("http://ha-admin.test", .{}));
 }
 
 test "storage.ha http client renders primary status sync query with OpenAPI enum spelling" {
