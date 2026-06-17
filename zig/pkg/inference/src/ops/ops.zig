@@ -187,6 +187,16 @@ pub const GlinerLabelGruCombinedRequest = struct {
     hidden_size: usize,
 };
 
+pub const GlinerGatherConcatReluRequest = struct {
+    start: CT,
+    end: CT,
+    start_rows: []const u32,
+    end_rows: []const u32,
+    source_rows: usize,
+    rows: usize,
+    dim: usize,
+};
+
 pub const DenseMlp2Request = struct {
     input: CT,
     first_weight: CT,
@@ -844,6 +854,10 @@ pub const ComputeBackend = struct {
         /// [num_labels, hidden_size].
         glinerLabelGruCombined: ?*const fn (ctx: *anyopaque, request: *const GlinerLabelGruCombinedRequest) anyerror!?CT = null,
 
+        /// GLiNER span-head gather of start/end projected word rows, concat on
+        /// the last dimension, and ReLU. Backends may fuse the full strip.
+        glinerGatherConcatRelu: ?*const fn (ctx: *anyopaque, request: *const GlinerGatherConcatReluRequest) anyerror!?CT = null,
+
         /// Y = X @ W^T + bias. X:[rows, in_dim], W:[out_dim, in_dim], bias:[out_dim] → Y:[rows, out_dim]
         linear: *const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT,
 
@@ -913,6 +927,14 @@ pub const ComputeBackend = struct {
         /// otherwise the wrapper falls back to no-bias pair + add or two
         /// independent `linear` calls.
         linearPair: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!LinearPairResult = null,
+
+        /// Compute two biased ReLU linears that share the same input shape.
+        /// Backends may fuse projection, bias, and activation.
+        linearPairRelu: ?*const fn (ctx: *anyopaque, input: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?LinearPairResult = null,
+
+        /// Compute two biased linears with separate inputs but equal shapes.
+        /// This is useful after paired activations split the dataflow.
+        linearPairInputs: ?*const fn (ctx: *anyopaque, input_a: CT, input_b: CT, weight_a: CT, bias_a: CT, weight_b: CT, bias_b: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!?LinearPairResult = null,
 
         /// Compute three biased linears that share the same input shape.
         /// This is the Q/K/V fast path for encoders with separate projection
@@ -1884,6 +1906,66 @@ pub const ComputeBackend = struct {
         return .{ .first = first, .second = second };
     }
 
+    pub fn linearPairRelu(
+        self: *const ComputeBackend,
+        input: CT,
+        weight_a: CT,
+        bias_a: CT,
+        weight_b: CT,
+        bias_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) !LinearPairResult {
+        if (self.vtable.linearPairRelu) |linear_pair_relu| {
+            if (try linear_pair_relu(self.ptr, input, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim)) |fused| {
+                return fused;
+            }
+        }
+
+        const pair = try self.linearPair(input, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim);
+        var first_live = true;
+        var second_live = true;
+        errdefer if (first_live) self.free(pair.first);
+        errdefer if (second_live) self.free(pair.second);
+
+        const first = try self.relu(pair.first);
+        self.free(pair.first);
+        first_live = false;
+        var first_relu_live = true;
+        errdefer if (first_relu_live) self.free(first);
+
+        const second = try self.relu(pair.second);
+        self.free(pair.second);
+        second_live = false;
+        first_relu_live = false;
+        return .{ .first = first, .second = second };
+    }
+
+    pub fn linearPairInputs(
+        self: *const ComputeBackend,
+        input_a: CT,
+        input_b: CT,
+        weight_a: CT,
+        bias_a: CT,
+        weight_b: CT,
+        bias_b: CT,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) !LinearPairResult {
+        if (self.vtable.linearPairInputs) |linear_pair_inputs| {
+            if (try linear_pair_inputs(self.ptr, input_a, input_b, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim)) |fused| {
+                return fused;
+            }
+        }
+
+        const first = try self.linear(input_a, weight_a, bias_a, rows, in_dim, out_dim);
+        errdefer self.free(first);
+        const second = try self.linear(input_b, weight_b, bias_b, rows, in_dim, out_dim);
+        return .{ .first = first, .second = second };
+    }
+
     pub fn linearTriple(
         self: *const ComputeBackend,
         input: CT,
@@ -2189,6 +2271,11 @@ pub const ComputeBackend = struct {
 
     pub fn denseMlp2(self: *const ComputeBackend, request: *const DenseMlp2Request) !?CT {
         if (self.vtable.denseMlp2) |f| return f(self.ptr, request);
+        return null;
+    }
+
+    pub fn glinerGatherConcatRelu(self: *const ComputeBackend, request: *const GlinerGatherConcatReluRequest) !?CT {
+        if (self.vtable.glinerGatherConcatRelu) |f| return f(self.ptr, request);
         return null;
     }
 

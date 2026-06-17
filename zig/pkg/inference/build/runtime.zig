@@ -24,7 +24,8 @@ pub const BackendOptions = struct {
     onnx_root: []const u8 = "onnxruntime/unknown-unknown",
     enable_metal: bool = false,
     enable_cuda: bool = false,
-    cuda_artifacts: []const u8 = "portable",
+    cuda_artifacts: []const u8 = "fatbin",
+    cuda_libraries: []const u8 = "auto",
     enable_pjrt: bool = false,
     enable_native: bool = true,
     enable_system_blas: bool = false,
@@ -438,6 +439,7 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "enable_metal", backend.enable_metal);
     options.addOption(bool, "enable_cuda", backend.enable_cuda);
     options.addOption([]const u8, "cuda_artifacts", backend.cuda_artifacts);
+    options.addOption([]const u8, "cuda_libraries", backend.cuda_libraries);
     options.addOption(bool, "enable_pjrt", backend.enable_pjrt);
     options.addOption(bool, "enable_native", backend.enable_native);
     options.addOption(bool, "enable_system_blas", backend.enable_system_blas);
