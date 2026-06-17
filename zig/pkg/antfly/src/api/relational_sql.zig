@@ -6704,8 +6704,11 @@ const Parser = struct {
         } else if (self.matchKeyword("relative")) {
             direction = .relative;
             count = try self.parseCursorFetchCount();
+        } else if (self.peekCursorFetchCount()) {
+            direction = .forward;
+            count = try self.parseCursorFetchCount();
         }
-        if (!self.matchKeyword("from") and !self.matchKeyword("in")) return error.UnsupportedSqlShape;
+        _ = self.matchKeyword("from") or self.matchKeyword("in");
         const portal_name = try self.parseIdentifierOwned();
         var portal_transferred = false;
         errdefer if (!portal_transferred) self.alloc.free(portal_name);
@@ -6716,12 +6719,18 @@ const Parser = struct {
     }
 
     fn parseOptionalCursorFetchCount(self: *@This()) !?i64 {
-        if (self.peekKeyword("from")) return null;
+        if (self.peekKeyword("from") or self.peekKeyword("in")) return null;
         if (self.peekKeyword("all")) {
             try self.expectKeyword("all");
             return null;
         }
+        if (!self.peekCursorFetchCount()) return null;
         return try self.parseCursorFetchCount();
+    }
+
+    fn peekCursorFetchCount(self: *@This()) bool {
+        return self.peekKind(.number) or
+            (self.peekKind(.minus) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .number);
     }
 
     fn parseCursorFetchCount(self: *@This()) !i64 {
@@ -49637,6 +49646,27 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10", fetch_count_cursor_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, fetch_count_cursor));
 
+    var fetch_default_cursor = try lowerDdlPlanAlloc(alloc, "FETCH usage_cursor;");
+    defer fetch_default_cursor.deinit(alloc);
+    const fetch_default_cursor_fingerprint = try ddlFingerprintAlloc(alloc, fetch_default_cursor);
+    defer alloc.free(fetch_default_cursor_fingerprint);
+    try std.testing.expectEqualStrings("ddl:fetch_cursor:portal=usage_cursor:direction=next", fetch_default_cursor_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, fetch_default_cursor));
+
+    var fetch_bare_count_cursor = try lowerDdlPlanAlloc(alloc, "FETCH 10 usage_cursor;");
+    defer fetch_bare_count_cursor.deinit(alloc);
+    const fetch_bare_count_cursor_fingerprint = try ddlFingerprintAlloc(alloc, fetch_bare_count_cursor);
+    defer alloc.free(fetch_bare_count_cursor_fingerprint);
+    try std.testing.expectEqualStrings("ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10", fetch_bare_count_cursor_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, fetch_bare_count_cursor));
+
+    var fetch_forward_no_connector_cursor = try lowerDdlPlanAlloc(alloc, "FETCH FORWARD usage_cursor;");
+    defer fetch_forward_no_connector_cursor.deinit(alloc);
+    const fetch_forward_no_connector_cursor_fingerprint = try ddlFingerprintAlloc(alloc, fetch_forward_no_connector_cursor);
+    defer alloc.free(fetch_forward_no_connector_cursor_fingerprint);
+    try std.testing.expectEqualStrings("ddl:fetch_cursor:portal=usage_cursor:direction=forward", fetch_forward_no_connector_cursor_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, fetch_forward_no_connector_cursor));
+
     var close_cursor = try lowerDdlPlanAlloc(alloc, "CLOSE usage_cursor;");
     defer close_cursor.deinit(alloc);
     const close_cursor_fingerprint = try ddlFingerprintAlloc(alloc, close_cursor);
@@ -70609,6 +70639,27 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor", .operations = 10 },
             .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
             .sql = "FETCH FORWARD 10 IN usage_cursor",
+        },
+        .{
+            .name = "fetch cursor portal default shorthand protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor" },
+            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=next",
+            .sql = "FETCH usage_cursor",
+        },
+        .{
+            .name = "fetch cursor portal bare count protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor", .operations = 10 },
+            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
+            .sql = "FETCH 10 usage_cursor",
+        },
+        .{
+            .name = "fetch cursor portal forward no-connector protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor" },
+            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward",
+            .sql = "FETCH FORWARD usage_cursor",
         },
         .{
             .name = "close cursor portal protocol plan",
