@@ -1571,6 +1571,9 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 		if !standbyDesired(desired) || desired.Name == "" {
 			continue
 		}
+		if strings.TrimSpace(desired.AdminURL) == "" {
+			continue
+		}
 		if len(desired.RouteSelector) == 0 {
 			continue
 		}

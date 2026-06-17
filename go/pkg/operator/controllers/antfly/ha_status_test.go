@@ -2088,6 +2088,7 @@ func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{
 		Name:          "standby-b",
+		AdminURL:      "http://standby-b-ha.default.svc:8081",
 		RouteSelector: haTestRouteSelector("standby-b"),
 	})
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
@@ -2164,6 +2165,25 @@ func TestReconcileHAFencingLeaseSkipsWithoutSafeCandidate(t *testing.T) {
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected no fencing lease without safe candidate, got lease=%#v err=%v", lease, err)
+	}
+}
+
+func TestReconcileHAFencingLeaseSkipsCandidateWithoutAdminURL(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Standbys[0].AdminURL = ""
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no fencing lease without candidate admin URL, got lease=%#v err=%v", lease, err)
 	}
 }
 
@@ -2266,6 +2286,7 @@ func haCluster() *antflyv1.AntflyCluster {
 
 func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
 		Enabled:          true,
