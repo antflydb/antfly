@@ -59446,7 +59446,8 @@ fn unsupportedFingerprintAlloc(
     family: []const u8,
     reason: []const u8,
 ) ![]u8 {
-    if (reason.len == 0) return error.TestUnexpectedResult;
+    const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
+    if (!sql_adapter.classificationReasonIsUnsupportedRequirement(diagnostic_reason)) return error.TestUnexpectedResult;
     return try std.fmt.allocPrint(alloc, "unsupported:{s}:requires={s}", .{ family, reason });
 }
 
@@ -59455,7 +59456,8 @@ fn adapterNoopFingerprintAlloc(
     family: []const u8,
     reason: []const u8,
 ) ![]u8 {
-    if (reason.len == 0) return error.TestUnexpectedResult;
+    const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
+    if (!sql_adapter.classificationReasonIsAdapterNoop(diagnostic_reason)) return error.TestUnexpectedResult;
     return try std.fmt.allocPrint(alloc, "adapter_noop:{s}:reason={s}", .{ family, reason });
 }
 
@@ -63893,17 +63895,7 @@ fn appParityFixtureFamilyNeedsReason(family: AppParityCorpusPlanFamily) bool {
 }
 
 fn appParityStableReasonToken(reason: []const u8) bool {
-    if (reason.len == 0) return false;
-    for (reason) |ch| {
-        if ((ch >= 'a' and ch <= 'z') or
-            (ch >= '0' and ch <= '9') or
-            ch == '_')
-        {
-            continue;
-        }
-        return false;
-    }
-    return true;
+    return sql_adapter.classificationReasonTokenIsKnown(reason);
 }
 
 fn appParityPlanMatchesReason(
@@ -63911,13 +63903,15 @@ fn appParityPlanMatchesReason(
     plan: []const u8,
     reason: []const u8,
 ) bool {
-    if (reason.len == 0) return false;
+    const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return false;
     switch (family) {
         .adapter_noop_ddl => {
+            if (!sql_adapter.classificationReasonIsAdapterNoop(diagnostic_reason)) return false;
             if (!std.mem.startsWith(u8, plan, "adapter_noop:")) return false;
             return appParityPlanHasExactStringToken(plan, ":reason=", reason);
         },
         else => if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
+            if (!sql_adapter.classificationReasonIsUnsupportedRequirement(diagnostic_reason)) return false;
             const prefix = "unsupported:";
             if (!std.mem.startsWith(u8, plan, prefix)) return false;
             const rest = plan[prefix.len..];
@@ -66567,6 +66561,14 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "unknown stable unsupported reason",
+        .sql = "CREATE SEQUENCE usage_records_id_seq START WITH 1",
+        .family = .unsupported_ddl,
+        .classification_reason = "sequence_catalog_plan",
+        .plan = "unsupported:ddl:requires=sequence_catalog_plan",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "unsupported reason missing from plan",
         .sql = "TRUNCATE usage_records CASCADE",
         .family = .unsupported_write,
@@ -66979,6 +66981,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "unsupported:write:requires=multi_table_generation_barrier",
     }, &seen, alloc);
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "unsupported with adapter noop reason",
+        .sql = "TRUNCATE usage_records CASCADE",
+        .family = .unsupported_write,
+        .classification_reason = "session_setting",
+        .plan = "unsupported:write:requires=session_setting",
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid adapter noop reason",
         .sql = "SET client_encoding = 'UTF8'",
@@ -66986,6 +66996,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .classification_reason = "session_setting",
         .plan = "adapter_noop:ddl:reason=session_setting",
     }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "adapter noop with required feature reason",
+        .sql = "SET client_encoding = 'UTF8'",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "set_operation_plan",
+        .plan = "adapter_noop:ddl:reason=set_operation_plan",
+    }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
         .name = "valid unsupported insert setup sql",

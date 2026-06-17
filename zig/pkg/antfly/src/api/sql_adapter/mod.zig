@@ -14,6 +14,7 @@
 
 pub const ast = @import("ast.zig");
 pub const classifier = @import("classifier.zig");
+pub const diagnostics = @import("diagnostics.zig");
 pub const grammar = @import("grammar.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
@@ -23,6 +24,7 @@ pub const value = @import("value.zig");
 pub const SelectOutputKind = ast.SelectOutputKind;
 pub const SelectOutputRef = ast.SelectOutputRef;
 pub const SelectSetOperation = ast.SelectSetOperation;
+pub const SqlAdapterClassificationReason = diagnostics.SqlAdapterClassificationReason;
 pub const SqlStatementFamily = classifier.SqlStatementFamily;
 pub const SqlPatternQuantifier = ast.SqlPatternQuantifier;
 pub const SqlRowClaimClause = ast.SqlRowClaimClause;
@@ -32,6 +34,11 @@ pub const Token = token.Token;
 pub const TokenKind = token.TokenKind;
 pub const arrayLengthDefaultOutput = grammar.arrayLengthDefaultOutput;
 pub const atEnd = parser.atEnd;
+pub const classificationReasonFromToken = diagnostics.classificationReasonFromToken;
+pub const classificationReasonIsAdapterNoop = diagnostics.classificationReasonIsAdapterNoop;
+pub const classificationReasonIsUnsupportedRequirement = diagnostics.classificationReasonIsUnsupportedRequirement;
+pub const classificationReasonToken = diagnostics.classificationReasonToken;
+pub const classificationReasonTokenIsKnown = diagnostics.classificationReasonTokenIsKnown;
 pub const classifyStatementFamily = classifier.classifyStatementFamily;
 pub const classifyWriteStatement = classifier.classifyWriteStatement;
 pub const expectKeyword = parser.expectKeyword;
