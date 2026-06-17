@@ -3919,12 +3919,10 @@ type haPromotionAssessmentJSON struct {
 }
 
 type haDirectAdminActionResultJSON struct {
-	SchemaVersion uint32                   `json:"schema_version"`
-	Action        haAdminActionReceiptJSON `json:"action"`
-	SlotAction    string                   `json:"slot_action"`
-	Slot          struct {
-		SlotName string `json:"slot_name"`
-	} `json:"slot"`
+	SchemaVersion  uint32                    `json:"schema_version"`
+	Action         haAdminActionReceiptJSON  `json:"action"`
+	SlotAction     string                    `json:"slot_action"`
+	Slot           haReplicationSlotJSON     `json:"slot"`
 	SlotName       string                    `json:"slot_name"`
 	ManifestID     string                    `json:"manifest_id"`
 	BackupLSN      uint64                    `json:"backup_lsn"`
@@ -3953,6 +3951,18 @@ type haDirectAdminActionResultJSON struct {
 		Token            string `json:"token"`
 		Reason           string `json:"reason"`
 	} `json:"receipt"`
+}
+
+type haReplicationSlotJSON struct {
+	SlotName       string  `json:"slot_name"`
+	TimelineID     *uint64 `json:"timeline_id"`
+	RestartLSN     *uint64 `json:"restart_lsn"`
+	ReceivedLSN    *uint64 `json:"received_lsn"`
+	AppliedLSN     *uint64 `json:"applied_lsn"`
+	SafeReadLSN    *uint64 `json:"safe_read_lsn"`
+	Active         *bool   `json:"active"`
+	ReseedRequired *bool   `json:"reseed_required"`
+	CurrentLSN     *uint64 `json:"current_lsn"`
 }
 
 type haDirectAdminActionResultEnvelope struct {
@@ -4024,6 +4034,11 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		return nil, false
 	}
 	if topLevel && !haAdminActionReceiptPresent(result.Action) {
+		return nil, false
+	}
+	if topLevel &&
+		strings.HasPrefix(strings.TrimSpace(result.Action.ActionKind), "replication_slot_") &&
+		!haReplicationSlotJSONComplete(result.Slot) {
 		return nil, false
 	}
 	if strings.TrimSpace(result.Action.ActionKind) == "promotion_assess" &&
@@ -4100,6 +4115,19 @@ func haPromotionAssessmentJSONComplete(assessment haPromotionAssessmentJSON) boo
 		assessment.RequiresFencing != nil &&
 		assessment.RequiresForce != nil &&
 		assessment.CanPromote != nil
+}
+
+func haReplicationSlotJSONComplete(slot haReplicationSlotJSON) bool {
+	return strings.TrimSpace(slot.SlotName) != "" &&
+		slot.TimelineID != nil &&
+		haUint64JSONValue(slot.TimelineID) > 0 &&
+		slot.RestartLSN != nil &&
+		slot.ReceivedLSN != nil &&
+		slot.AppliedLSN != nil &&
+		slot.SafeReadLSN != nil &&
+		slot.Active != nil &&
+		slot.ReseedRequired != nil &&
+		slot.CurrentLSN != nil
 }
 
 func haUint64JSONValue(value *uint64) uint64 {

@@ -74,6 +74,35 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 	return string(body)
 }
 
+func haReplicationSlotActionResponseJSON(actionKind, slotAction, slotName, nodeID string) string {
+	body, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"action": map[string]any{
+			"action_id":   actionKind + ":" + slotName,
+			"action_kind": actionKind,
+			"target":      slotName,
+			"state":       "applied",
+			"node_id":     nodeID,
+		},
+		"slot_action": slotAction,
+		"slot": map[string]any{
+			"slot_name":       slotName,
+			"timeline_id":     4,
+			"restart_lsn":     5,
+			"received_lsn":    5,
+			"applied_lsn":     5,
+			"safe_read_lsn":   5,
+			"active":          true,
+			"reseed_required": false,
+			"current_lsn":     9,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
 func haPromotionAdminResult(generation uint64, token string, promotedNodeID string) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
 		ActionID:              "promotion:" + promotedNodeID,
@@ -288,7 +317,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+					Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
 				}, nil
 			case "/admin/v1/ha/base-backups":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -381,7 +410,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
 			}, nil
 		})},
 	}
@@ -778,7 +807,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMismatchedResultEvidence(t *testing
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-b"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+				Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-b"))),
 			}, nil
 		})},
 	}
@@ -1899,7 +1928,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+					Body:       io.NopCloser(strings.NewReader(haReplicationSlotActionResponseJSON("replication_slot_create", "create", "standby-a", "primary-a"))),
 				}, nil
 			case "/admin/v1/ha/base-backups":
 				return &http.Response{
@@ -3360,11 +3389,14 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(legacyBootstrap.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(legacyBootstrap.CheckpointLSN).To(Equal(uint64(7)))
 
-	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"replication_slot_pause:standby-a","action_kind":"replication_slot_pause","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
+	slot, ok := parseHADirectAdminActionResult([]byte(haReplicationSlotActionResponseJSON("replication_slot_pause", "pause", "standby-a", "primary-a")))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(slot.ActionID).To(Equal("replication_slot_pause:standby-a"))
 	g.Expect(slot.SlotAction).To(Equal("pause"))
 	g.Expect(slot.SlotName).To(Equal("standby-a"))
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"replication_slot_pause:standby-a","action_kind":"replication_slot_pause","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
+	g.Expect(ok).To(BeFalse())
 
 	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
 	g.Expect(ok).To(BeFalse())
