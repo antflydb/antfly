@@ -166,6 +166,7 @@ pub const Client = struct {
         const frames = try decodeAndValidateFrames(
             self.alloc,
             response.parsed.value,
+            standby.identity,
             requested_lsn,
             current_lsn,
             last_sent_lsn,
@@ -401,6 +402,7 @@ const VerifiedFrame = struct {
 fn decodeAndValidateFrames(
     alloc: Allocator,
     response: internal_api.HAStartReplicationResponse,
+    expected_identity: standby_mod.Identity,
     requested_lsn: u64,
     current_lsn: u64,
     last_sent_lsn: u64,
@@ -428,6 +430,7 @@ fn decodeAndValidateFrames(
         errdefer if (encoded.len > 0) alloc.free(encoded);
         const record = try replication_record.decode(encoded);
         try validateFrameMetadata(wire_frame, record);
+        try validateRecordIdentity(record, expected_identity);
 
         const frame_lsn = try positiveUint64FromJson(wire_frame.lsn);
         if (frame_lsn != expected_lsn or record.lsn != expected_lsn) {
@@ -468,6 +471,19 @@ fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplication
 fn validateFrameMetadata(frame: internal_api.openapi.types.HAReplicationFrame, record: replication_record.RecordView) !void {
     if (record.kind != replicationRecordKind(frame.kind)) return error.ReplicationFrameKindMismatch;
     if (record.payload_codec != replicationPayloadCodec(frame.payload_codec)) return error.ReplicationFramePayloadCodecMismatch;
+}
+
+fn validateRecordIdentity(record: replication_record.RecordView, expected: standby_mod.Identity) !void {
+    if (record.cluster_id != expected.cluster_id) return error.WrongCluster;
+    if (record.shard_id != expected.shard_id) return error.WrongShard;
+    if (record.table_id != expected.table_id) return error.WrongTable;
+    if (record.kind == .timeline_switch) {
+        if (record.timeline_id <= expected.timeline_id) return error.InvalidTimelineSwitch;
+        if (record.epoch <= expected.epoch) return error.InvalidTimelineSwitch;
+        return;
+    }
+    if (record.timeline_id != expected.timeline_id) return error.WrongTimeline;
+    if (record.epoch != expected.epoch) return error.WrongEpoch;
 }
 
 fn replicationRecordKind(kind: internal_api.openapi.types.HARecordKind) replication_record.RecordKind {
@@ -681,6 +697,100 @@ const CorruptFrameExecutor = struct {
     }
 };
 
+const WrongIdentityBatchExecutor = struct {
+    identity: standby_mod.Identity,
+
+    fn executor(self: *WrongIdentityBatchExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *WrongIdentityBatchExecutor = @ptrCast(@alignCast(ptr));
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_start)) {
+            return try self.startResponse(alloc);
+        }
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_status)) {
+            return try jsonTestResponse(alloc, .{ .unexpected_status_update = true });
+        }
+        return .{
+            .status = 404,
+            .body = try alloc.dupe(u8, "not found"),
+        };
+    }
+
+    fn startResponse(self: *WrongIdentityBatchExecutor, alloc: Allocator) !http_common.HttpResponse {
+        const first = try replication_record.encodeAlloc(alloc, .{
+            .kind = .batch_mutation,
+            .payload_codec = .raw,
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = self.identity.shard_id,
+            .table_id = self.identity.table_id,
+            .timeline_id = self.identity.timeline_id,
+            .epoch = self.identity.epoch,
+            .lsn = 1,
+            .previous_lsn = 0,
+            .payload = "one",
+        });
+        defer alloc.free(first);
+        const second = try replication_record.encodeAlloc(alloc, .{
+            .kind = .batch_mutation,
+            .payload_codec = .raw,
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = self.identity.shard_id,
+            .table_id = self.identity.table_id,
+            .timeline_id = self.identity.timeline_id,
+            .epoch = self.identity.epoch + 1,
+            .lsn = 2,
+            .previous_lsn = 1,
+            .payload = "wrong-epoch",
+        });
+        defer alloc.free(second);
+
+        const first_frame = try base64TestAlloc(alloc, first);
+        defer alloc.free(first_frame);
+        const second_frame = try base64TestAlloc(alloc, second);
+        defer alloc.free(second_frame);
+        const records = [_]struct {
+            lsn: u64,
+            kind: []const u8,
+            payload_codec: []const u8,
+            encoded: []const u8,
+        }{
+            .{
+                .lsn = 1,
+                .kind = "batch-mutation",
+                .payload_codec = "raw",
+                .encoded = first_frame,
+            },
+            .{
+                .lsn = 2,
+                .kind = "batch-mutation",
+                .payload_codec = "raw",
+                .encoded = second_frame,
+            },
+        };
+
+        return try jsonTestResponse(alloc, .{
+            .slot_name = "standby-a",
+            .identity = self.identity,
+            .record_format_version = replication_record.format_version,
+            .timeline_id = self.identity.timeline_id,
+            .from_lsn = 1,
+            .current_lsn = 2,
+            .last_sent_lsn = 2,
+            .next_lsn = 3,
+            .end_of_wal = true,
+            .encoded_bytes = first.len + second.len,
+            .records = &records,
+        });
+    }
+};
+
 fn base64TestAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
     const size = std.base64.standard.Encoder.calcSize(raw.len);
     const out = try alloc.alloc(u8, size);
@@ -825,6 +935,36 @@ test "storage.ha http replication client rejects frame metadata mismatch before 
     defer capture.deinit();
     try std.testing.expectError(
         error.ReplicationFrameKindMismatch,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
+}
+
+test "storage.ha http replication client rejects record identity mismatch before partial receive" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "frame-identity");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var executor = WrongIdentityBatchExecutor{ .identity = identity };
+    var client = Client.init(alloc, executor.executor());
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(
+        error.WrongEpoch,
         client.replicateAvailable(
             "http://primary.internal.test",
             "standby-a",
