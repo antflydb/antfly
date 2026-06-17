@@ -57,14 +57,24 @@ LTAP framing is a useful reference point for Antfly's long-term direction:
   vector/search serving, graph traversal, and analytical scans as long as they
   share one authoritative table snapshot model.
 
-Antfly should not try to become a full lakehouse warehouse. Its center of
-gravity is serving-grade retrieval and agent context over live governed data:
-hybrid search, vector retrieval, sparse retrieval, graph traversal, JSON/document
-semantics, row-level authorization, and algebraic materialization. The right
-positioning is therefore:
+Antfly should not start by promising arbitrary warehouse-platform completeness,
+but it should own more than a passive sidecar role. Its LSM storage, relational
+SQL lowering, full-text/vector/sparse/graph segments, serverless
+manifest/artifact model, and algebraic indexes already cover much of the
+infrastructure needed for adaptive analytical serving. The right positioning is
+therefore:
 
-> Antfly is the serving, retrieval, indexing, and agent context layer over
-> native Antfly rows and open lake tables.
+> Antfly is the adaptive analytical serving, retrieval, indexing, and agent
+> context layer over native Antfly rows and open lake tables.
+
+That means Antfly should own SQL as a serving/query contract, algebraic
+materialization as a latency accelerator, hybrid retrieval over live governed
+data, and serverless indexed execution over immutable object-storage fragments.
+It should defer generic warehouse platform promises such as arbitrary
+multi-terabyte ad hoc shuffle execution, Spark-style transformation pipelines,
+full BI warehouse compatibility, and full Iceberg compaction/vacuum/layout
+management until the lake-native serving path proves the necessary execution
+and operational machinery.
 
 The "one copy" claim needs precise language. Lake tables should have one
 authoritative base copy in Iceberg/Parquet/Lance or native Antfly relational
@@ -532,9 +542,10 @@ After the MVP:
 
 ## Long-Term Vision
 
-Antfly should become the serving index and query layer for operational and lake
-data, with one typed relational query contract across native Antfly rows,
-document-backed JSON, and external immutable files.
+Antfly should become an adaptive analytical serving and lake-native execution
+layer for operational and lake data, with one typed relational query contract
+across native Antfly rows, document-backed JSON, serverless Antfly fragments,
+and external immutable files.
 
 The durable product direction is adaptive ownership:
 
@@ -547,8 +558,24 @@ The durable product direction is adaptive ownership:
 - Hot aggregates become algebraic materializations.
 - Truly operational subsets can be promoted into native relational Antfly
   tables when users need Antfly to own write serving and transaction semantics.
+- Repeated analytical serving workloads can be promoted into Antfly serverless
+  fragments and materialized folds rather than repeatedly scanning external lake
+  files.
+
+This is not limited to "index beside someone else's lake." The long-term shape
+is one `RowSource` contract over several physical bases:
+
+- LSM-backed native relational rows for hot mutable serving.
+- Serverless Antfly segments for immutable object-storage serving.
+- Iceberg/Parquet external tables for existing enterprise lakes.
+- Lance-style external tables for vector-native lake data.
+- Future Antfly-native lake fragments optimized for stable row refs, range
+  reads, JSON subtree facts, vector payloads, and algebraic folds.
 
 Build lake query mode as an external relational row source first, not as an
 import pipeline. Importing Parquet into Antfly relational tables remains useful,
 but the differentiated path is querying object-store data in place while Antfly
-selectively owns the access paths that need serving-grade latency.
+selectively owns the access paths and fragments that need serving-grade
+latency. Over time, that can cover a meaningful subset of warehouse-shaped
+workloads, especially repeated agent and application queries, without making
+arbitrary warehouse replacement the day-one product promise.
