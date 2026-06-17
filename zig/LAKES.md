@@ -74,6 +74,67 @@ projection caches. Those are not source-of-truth copies when they are
 snapshot-keyed, freshness-checked, rebuildable, and garbage-collected with the
 same snapshot-retention rules as the base table.
 
+## Fit With Serverless Runtime
+
+The serverless runtime is the right physical substrate for lake query mode. It
+already has the object-store, immutable-manifest, artifact, range-read, cache,
+background-build, and query-session machinery that lake serving needs. The main
+difference is source ownership: current serverless publication builds Antfly
+artifacts from Antfly WAL/document mutations, while lake mode binds to
+user-owned external table snapshots and treats Antfly artifacts as derived
+sidecars.
+
+The mapping is direct:
+
+- A lake table snapshot or Iceberg snapshot maps to a serverless manifest
+  version.
+- Parquet files, row groups, delete files, and table metadata map to
+  manifest-attached external source metadata.
+- Antfly text, vector, sparse, graph, and algebraic accelerators map to
+  serverless artifacts.
+- Query execution pins one manifest version before reading artifacts, matching
+  the lake requirement that each query bind one immutable snapshot.
+- Artifact range reads and cache blocks map to Parquet footer, column-chunk,
+  page-index, and decoded-column cache reads.
+- Serverless build and impact planning map to sidecar freshness, rebuild,
+  reuse, and garbage-collection decisions.
+
+Lake mode should not force Parquet data files into the existing document
+artifact model. Instead, add an external base-source entry to the manifest:
+
+```zig
+pub const ExternalBaseSource = struct {
+    format: enum { parquet_prefix, iceberg, lance },
+    source_uri: []const u8,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+    file_inventory_artifact: ?[]const u8 = null,
+    row_group_metadata_artifact: ?[]const u8 = null,
+    delete_metadata_artifact: ?[]const u8 = null,
+};
+```
+
+The source metadata identifies the authoritative external rows. Serverless
+artifacts then remain rebuildable sidecars over those rows. A query over an
+external table opens the pinned manifest, resolves the external base source,
+uses object-store range reads to scan Parquet/Iceberg metadata and projected
+columns, and optionally intersects those rows with sidecar index candidates.
+
+The incremental serverless path is:
+
+1. Store external source bindings in table/catalog definitions.
+2. Attach external snapshot metadata to published manifests.
+3. Add file inventory and row-group metadata artifacts.
+4. Add a Parquet footer scanner over existing object-store range reads.
+5. Add `ExternalParquetRowSource` behind the relational row-plan executor.
+6. Build existing text/vector/sparse/graph sidecars from external row refs.
+7. Add Iceberg manifest and delete-file support.
+8. Extend cache classification for lake metadata, decoded column pages, and
+   broad-scan scratch so serving-critical index blocks stay protected.
+
+This keeps the logical design in relational/lake terms while reusing the
+serverless runtime as the physical serving layer.
+
 ## Fit With Relational Mode
 
 Lake query mode should be a row source for relational plans, not a separate
