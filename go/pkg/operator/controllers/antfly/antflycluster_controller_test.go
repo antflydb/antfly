@@ -2467,6 +2467,17 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 
 	promotion, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=promote_current_fence",
+		"assessment.required_lsn=12",
+		"assessment.received_lsn=13",
+		"assessment.applied_lsn=12",
+		"promotion.node_id=standby-a",
+		"promotion.switch_lsn=12",
+		"promotion.old_identity.timeline_id=4",
+		"promotion.old_identity.epoch=6",
+		"promotion.new_identity.timeline_id=5",
+		"promotion.new_identity.epoch=7",
+		"promotion.forced=false",
+		"promotion.data_loss_possible=false",
 		"fence_generation=4",
 		"fence_token=promotion-token",
 		"",
@@ -2474,6 +2485,20 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceToken).To(Equal("promotion-token"))
+	g.Expect(promotion.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(promotion.FenceParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(promotion.FenceNewTimelineID).To(Equal(uint64(5)))
+	g.Expect(promotion.FenceRequiredLSN).To(Equal(uint64(12)))
+	g.Expect(promotion.FenceObservedLSN).To(Equal(uint64(13)))
+
+	promotion, ok = parseHAAdminActionResultTable(strings.Join([]string{
+		"result=promote_current_fence",
+		"fence_generation=4",
+		"fence_token=promotion-token",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeFalse())
+	g.Expect(promotion).To(BeNil())
 
 	rejoin, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=rejoin_assess",

@@ -3948,6 +3948,13 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 	if result.FenceGeneration == 0 {
 		result.FenceGeneration, _ = parseHAResultUint(lines, "fence_generation")
 	}
+	if resultName == "promote_current_fence" || resultName == "promote" {
+		promotion, ok := parseHAPromotionJobResult(body)
+		if !ok {
+			return nil, false
+		}
+		return haPromotionAdminActionResult(promotion), true
+	}
 	if strings.HasPrefix(resultName, "rejoin_") {
 		rejoin, ok := parseHARejoinJobResult(body)
 		if !ok {
