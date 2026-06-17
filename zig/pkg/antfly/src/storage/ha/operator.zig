@@ -296,8 +296,9 @@ fn adminUrlForAction(spec: Spec, action: Action) ?[]const u8 {
 
         .demote_former_primary,
         .rewind_former_primary,
-        .reseed_former_primary,
         => standbyAdminUrl(spec, action.standby_name) orelse spec.primary_admin_url,
+
+        .reseed_former_primary => spec.primary_admin_url,
 
         .update_primary_endpoint => null,
     };
@@ -2348,6 +2349,39 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     defer reseed_command_plan.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 11), reseed_command_plan.command.rejoin_reseed.policy.retained_from_lsn);
     try std.testing.expectEqualStrings("standby-b", reseed_command_plan.command.rejoin_reseed.receipt.?.promoted_node_id);
+}
+
+test "storage.ha operator targets former primary rejoin admin APIs deliberately" {
+    const standbys = [_]StandbySpec{
+        .{ .name = "primary-a", .admin_url = "http://old-primary-ha.default.svc:8081" },
+        .{ .name = "standby-b", .admin_url = "http://standby-b-ha.default.svc:8081" },
+    };
+    const spec = Spec{
+        .mode = .hot_standby,
+        .primary_admin_url = "http://standby-b-ha.default.svc:8081",
+        .standbys = &standbys,
+    };
+
+    const assess_url = adminUrlForAction(spec, .{
+        .kind = .demote_former_primary,
+        .standby_name = "primary-a",
+        .reason = "FormerPrimaryRejectedUnfenced",
+    }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("http://old-primary-ha.default.svc:8081", assess_url);
+
+    const rewind_url = adminUrlForAction(spec, .{
+        .kind = .rewind_former_primary,
+        .standby_name = "primary-a",
+        .reason = "FormerPrimaryCanRewind",
+    }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("http://old-primary-ha.default.svc:8081", rewind_url);
+
+    const reseed_url = adminUrlForAction(spec, .{
+        .kind = .reseed_former_primary,
+        .standby_name = "primary-a",
+        .reason = "FormerPrimaryRequiresReseed",
+    }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("http://standby-b-ha.default.svc:8081", reseed_url);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
