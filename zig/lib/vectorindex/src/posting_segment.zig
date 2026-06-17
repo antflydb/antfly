@@ -713,6 +713,36 @@ pub const Catalog = struct {
         return try deltas.toOwnedSlice(alloc);
     }
 
+    pub fn appendDeltaRecords(
+        self: Catalog,
+        alloc: Allocator,
+        posting_id: PostingId,
+        min_generation: ?u64,
+        records: *std.ArrayListUnmanaged(posting.PostingDeltaRecord),
+    ) !void {
+        for (self.segments) |segment| {
+            if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (min_generation) |generation| {
+                if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= generation) continue;
+            }
+
+            var reader = try Reader.init(segment.data);
+            var iter = reader.deltas(posting_id);
+            while (try iter.next()) |delta_value| {
+                var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+                if (min_generation) |generation| {
+                    while (try delta_iter.next()) |record| {
+                        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                        try records.append(alloc, record);
+                    }
+                } else {
+                    try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
+                    while (try delta_iter.next()) |record| records.appendAssumeCapacity(record);
+                }
+            }
+        }
+    }
+
     fn getLatestExact(self: Catalog, posting_id: PostingId, kind: EntryKind) !?[]const u8 {
         var best_segment_id: u64 = 0;
         var best: ?[]const u8 = null;
@@ -1133,35 +1163,17 @@ pub const Snapshot = struct {
     }
 
     pub fn loadDeltaTail(self: Snapshot, alloc: Allocator, posting_id: PostingId) ![]posting.PostingDeltaRecord {
-        const delta_values = try self.catalog.collectDeltas(alloc, posting_id);
-        defer alloc.free(delta_values);
-
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
-        for (delta_values) |delta_value| {
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
-            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
-            while (try iterator.next()) |record| {
-                records.appendAssumeCapacity(record);
-            }
-        }
+        try self.catalog.appendDeltaRecords(alloc, posting_id, null, &records);
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
         return try records.toOwnedSlice(alloc);
     }
 
     pub fn loadDeltaTailAfterGeneration(self: Snapshot, alloc: Allocator, posting_id: PostingId, generation: u64) ![]posting.PostingDeltaRecord {
-        const delta_values = try self.catalog.collectDeltasAfterGeneration(alloc, posting_id, generation);
-        defer alloc.free(delta_values);
-
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
-        for (delta_values) |delta_value| {
-            var iterator = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
-            while (try iterator.next()) |record| {
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
-                try records.append(alloc, record);
-            }
-        }
+        try self.catalog.appendDeltaRecords(alloc, posting_id, generation, &records);
         std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
         return try records.toOwnedSlice(alloc);
     }
