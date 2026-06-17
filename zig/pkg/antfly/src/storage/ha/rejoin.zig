@@ -65,6 +65,11 @@ pub const Assessment = struct {
     former_node_id: []const u8,
     target_timeline_id: u64,
     target_epoch: u64,
+    parent_cluster_id: u64 = 0,
+    parent_shard_id: u64 = 0,
+    parent_table_id: u64 = 0,
+    parent_timeline_id: u64 = 0,
+    parent_epoch: u64 = 0,
     fork_lsn: u64,
     former_last_lsn: u64,
     retained_from_lsn: u64,
@@ -105,6 +110,11 @@ pub fn assessFormerPrimary(
         .former_node_id = former.node_id,
         .target_timeline_id = former.identity.timeline_id,
         .target_epoch = former.identity.epoch,
+        .parent_cluster_id = former.identity.cluster_id,
+        .parent_shard_id = former.identity.shard_id,
+        .parent_table_id = former.identity.table_id,
+        .parent_timeline_id = former.identity.timeline_id,
+        .parent_epoch = former.identity.epoch,
         .fork_lsn = former.last_lsn,
         .former_last_lsn = former.last_lsn,
         .retained_from_lsn = policy.retained_from_lsn,
@@ -123,6 +133,11 @@ pub fn assessFormerPrimary(
             .former_node_id = former.node_id,
             .target_timeline_id = fence.new_timeline_id,
             .target_epoch = fence.new_epoch,
+            .parent_cluster_id = fence.identity.cluster_id,
+            .parent_shard_id = fence.identity.shard_id,
+            .parent_table_id = fence.identity.table_id,
+            .parent_timeline_id = fence.parent_timeline_id,
+            .parent_epoch = fence.parent_epoch,
             .fork_lsn = fence.observed_lsn,
             .former_last_lsn = former.last_lsn,
             .retained_from_lsn = policy.retained_from_lsn,
@@ -153,6 +168,11 @@ pub fn assessFormerPrimary(
         .former_node_id = former.node_id,
         .target_timeline_id = fence.new_timeline_id,
         .target_epoch = fence.new_epoch,
+        .parent_cluster_id = fence.identity.cluster_id,
+        .parent_shard_id = fence.identity.shard_id,
+        .parent_table_id = fence.identity.table_id,
+        .parent_timeline_id = fence.parent_timeline_id,
+        .parent_epoch = fence.parent_epoch,
         .fork_lsn = fork_lsn,
         .former_last_lsn = former.last_lsn,
         .retained_from_lsn = policy.retained_from_lsn,
@@ -175,6 +195,7 @@ pub fn rewindReplicationLog(
     if (assessment.fork_lsn > 0) {
         var fork_entry = (try log.entryAt(alloc, assessment.fork_lsn)) orelse return error.WalNoLongerRetained;
         defer fork_entry.deinit(alloc);
+        try validateForkRecord(assessment, fork_entry.record);
     }
 
     try log.truncateAfter(assessment.fork_lsn);
@@ -199,11 +220,35 @@ fn reseed(reason: Reason, former: FormerPrimaryState, receipt: fencing.Receipt, 
         .former_node_id = former.node_id,
         .target_timeline_id = receipt.new_timeline_id,
         .target_epoch = receipt.new_epoch,
+        .parent_cluster_id = receipt.identity.cluster_id,
+        .parent_shard_id = receipt.identity.shard_id,
+        .parent_table_id = receipt.identity.table_id,
+        .parent_timeline_id = receipt.parent_timeline_id,
+        .parent_epoch = receipt.parent_epoch,
         .fork_lsn = receipt.observed_lsn,
         .former_last_lsn = former.last_lsn,
         .retained_from_lsn = policy.retained_from_lsn,
         .data_loss_discarded = false,
     };
+}
+
+fn validateForkRecord(assessment: Assessment, record: replication_record.RecordView) !void {
+    if (record.lsn != assessment.fork_lsn) return error.RejoinForkIdentityMismatch;
+    if (assessment.parent_cluster_id != 0 and record.cluster_id != assessment.parent_cluster_id) {
+        return error.RejoinForkIdentityMismatch;
+    }
+    if (assessment.parent_shard_id != 0 and record.shard_id != assessment.parent_shard_id) {
+        return error.RejoinForkIdentityMismatch;
+    }
+    if (assessment.parent_table_id != 0 and record.table_id != assessment.parent_table_id) {
+        return error.RejoinForkIdentityMismatch;
+    }
+    if (assessment.parent_timeline_id != 0 and record.timeline_id != assessment.parent_timeline_id) {
+        return error.RejoinForkIdentityMismatch;
+    }
+    if (assessment.parent_epoch != 0 and record.epoch != assessment.parent_epoch) {
+        return error.RejoinForkIdentityMismatch;
+    }
 }
 
 fn testPath(alloc: std.mem.Allocator, comptime name: []const u8) ![:0]u8 {
@@ -455,4 +500,36 @@ test "storage.ha rejoin rewind requires retained fork record" {
         error.WalNoLongerRetained,
         rewindReplicationLog(alloc, &log, assessment),
     );
+}
+
+test "storage.ha rejoin rewind rejects fork record identity mismatch" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "rewind-identity");
+    defer alloc.free(path);
+
+    var log = try replication_log.ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    var wrong_timeline = baseRecord(2, "wrong-parent");
+    wrong_timeline.timeline_id = 99;
+    _ = try log.append(alloc, wrong_timeline);
+    var suffix = baseRecord(3, "suffix");
+    suffix.previous_lsn = 2;
+    _ = try log.append(alloc, suffix);
+
+    var receipt = promotedReceipt();
+    receipt.required_lsn = 2;
+    receipt.observed_lsn = 2;
+    const assessment = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = log.lastLsn(),
+    }, receipt, .{ .retained_from_lsn = 1 });
+    try std.testing.expectEqual(Action.rewind, assessment.action);
+
+    try std.testing.expectError(
+        error.RejoinForkIdentityMismatch,
+        rewindReplicationLog(alloc, &log, assessment),
+    );
+    try std.testing.expectEqual(@as(u64, 3), log.lastLsn());
 }
