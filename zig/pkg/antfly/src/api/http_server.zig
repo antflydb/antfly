@@ -54,6 +54,8 @@ const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const admin_routes = @import("../admin/routes.zig");
+const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -258,6 +260,8 @@ pub const ApiHttpServerConfig = struct {
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
+    ha_admin_executor: ?http_common.RequestExecutor = null,
+    ha_internal_executor: ?http_common.RequestExecutor = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -1607,7 +1611,9 @@ pub const ApiHttpServer = struct {
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null) return false;
         if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
-        return !std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix);
+        if (std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix)) return false;
+        if (isHaInternalPath(path)) return false;
+        return true;
     }
 
     pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
@@ -1778,6 +1784,7 @@ pub const ApiHttpServer = struct {
             }
         }
 
+        if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
             const metadata_status = try self.source.status();
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
@@ -1839,6 +1846,18 @@ pub const ApiHttpServer = struct {
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
         if (try self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         return try textResponse(self.alloc, 404, "not found");
+    }
+
+    fn dispatchHaRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        if (isHaAdminPath(uri_parts.path)) {
+            const ha_exec = self.cfg.ha_admin_executor orelse return null;
+            return try ha_exec.execute(self.alloc, req);
+        }
+        if (isHaInternalPath(uri_parts.path)) {
+            const ha_exec = self.cfg.ha_internal_executor orelse return null;
+            return try ha_exec.execute(self.alloc, req);
+        }
+        return null;
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
@@ -6616,12 +6635,21 @@ fn unauthorizedResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (isHaAdminPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
     if (std.mem.eql(u8, path, routes.Routes.a2a) or std.mem.eql(u8, path, routes.Routes.agents_retrieval)) return true;
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
+}
+
+fn isHaAdminPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+}
+
+fn isHaInternalPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
 }
 
 pub const RequiredPermission = struct {
@@ -8614,6 +8642,193 @@ test "api http server requires auth on public routes when enabled" {
     var readyz = try server.handle(.{ .method = .GET, .uri = routes.Routes.readyz });
     defer readyz.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
+}
+
+test "api http server dispatches HA admin and internal executors" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const RecordingExecutor = struct {
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        calls: usize = 0,
+        last_method: ?http_common.Method = null,
+        last_uri: ?[]const u8 = null,
+        last_body: ?[]const u8 = null,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_method = req.method;
+            self.last_uri = req.uri;
+            self.last_body = req.body;
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = try self.alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var admin_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-admin\"}" };
+    var internal_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-internal\"}" };
+    var server = ApiHttpServer.init(alloc, .{
+        .ha_admin_executor = admin_exec.executor(),
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+
+    var admin_resp = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status ++ "?max_lag_lsn=0",
+    });
+    defer admin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
+    try std.testing.expectEqualStrings("{\"handler\":\"ha-admin\"}", admin_resp.body);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+    try std.testing.expectEqual(http_common.Method.GET, admin_exec.last_method.?);
+    try std.testing.expectEqualStrings(admin_routes.ha_primary_status ++ "?max_lag_lsn=0", admin_exec.last_uri.?);
+
+    var internal_resp = try server.handle(.{
+        .method = .POST,
+        .uri = internal_api_routes.ha_replication_status,
+        .body = "{\"slot_name\":\"standby-a\"}",
+    });
+    defer internal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expectEqualStrings("{\"handler\":\"ha-internal\"}", internal_resp.body);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+    try std.testing.expectEqual(http_common.Method.POST, internal_exec.last_method.?);
+    try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
+    try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
+
+    var missing = try server.handle(.{ .method = .GET, .uri = admin_routes.ha });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), missing.status);
+    try std.testing.expectEqual(@as(usize, 2), admin_exec.calls);
+}
+
+test "api http server protects HA admin routes while exempting HA internal routes" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const RecordingExecutor = struct {
+        alloc: std.mem.Allocator,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "text/plain"),
+                .body = try self.alloc.dupe(u8, "ha"),
+            };
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var reader = try auth.manager.createUser("reader", "reader", &.{});
+    defer reader.deinit(alloc);
+
+    var admin_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin),
+    };
+    defer admin_permission[0].deinit(alloc);
+    var admin = try auth.manager.createUser("admin", "admin", &admin_permission);
+    defer admin.deinit(alloc);
+
+    var source = FakeSource{};
+    var admin_exec = RecordingExecutor{ .alloc = alloc };
+    var internal_exec = RecordingExecutor{ .alloc = alloc };
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .ha_admin_executor = admin_exec.executor(),
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+
+    var unauthorized = try server.handle(.{ .method = .GET, .uri = admin_routes.ha_primary_status });
+    defer unauthorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(reader_auth);
+    var forbidden = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = reader_auth,
+    });
+    defer forbidden.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
+    defer alloc.free(admin_auth);
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = admin_auth,
+    });
+    defer authorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), authorized.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+
+    var internal = try server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+    });
+    defer internal.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
 }
 
 test "api http server auth fixture can be moved before binding" {

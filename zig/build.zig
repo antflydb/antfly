@@ -3354,6 +3354,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
+            "api http server dispatches HA admin and internal executors",
+            "api http server protects HA admin routes while exempting HA internal routes",
             "api http server forbids non-admin secret access when auth is enabled",
             "api http server query builder requires table read permission when auth is enabled",
             "api http server restricts runtime schema debug to admins when auth is enabled",
