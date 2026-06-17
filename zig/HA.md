@@ -453,7 +453,9 @@ The implementation path is:
    HTTP contract, generated request parsing helpers, and shared route/type
    surface; storage HA modules own execution against local WAL, slots, fences,
    promotion state, and rejoin state; and
-5. have the CLI and `go/pkg/operator` call the typed `/admin/v1/ha` contract.
+5. generate the same admin OpenAPI contract into `go/pkg/sdk/admin`, keep a
+   small hand-written Go wrapper around the generated client, and have the CLI
+   and `go/pkg/operator` call that typed `/admin/v1/ha` wrapper.
 
 The generated Zig module for this spec should remain the admin contract module
 (`antfly_admin_openapi`) and should be surfaced through
@@ -483,6 +485,13 @@ Recommended split:
 - CLI: a thin client over `/admin/v1/ha` for remote operations, plus local
   offline helpers where useful. CLI output should be derived from the same typed
   responses the admin API returns.
+- Go SDK: generated client/types under `go/pkg/sdk/admin/oapi`, with a
+  hand-written `go/pkg/sdk/admin` wrapper that normalizes the admin base URL,
+  installs auth/request editors, exposes stable HA methods, returns typed
+  responses plus raw response bodies where receipts must be audited, and maps
+  non-2xx responses into operation-aware errors. The operator should import
+  this package for executable admin operations instead of duplicating an HTTP
+  client, hard-coding paths, or parsing CLI output.
 
 The admin API is node-local even though it is typed and operator-facing. The
 operator must choose the target node deliberately:
@@ -639,6 +648,13 @@ and either rewind or reseed.
   local/offline helpers only where direct filesystem access is required.
 - Keep CLI table and JSON output aligned with admin API response schemas so
   humans, tests, and the operator observe the same fields.
+- Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
+  `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
+  operations following the style of the other SDK APIs.
+- Make both the CLI and operator consume the `go/pkg/sdk/admin` HA wrapper for
+  remote admin operations. Any CLI-only code path must be limited to local
+  filesystem recovery, pod-local volume manipulation, or explicit break-glass
+  workflows.
 
 ### Phase 9: Operator Integration
 
@@ -655,9 +671,12 @@ be validated against that operator package.
 - Treat `specs/openapi/antfly/admin.yaml` plus `zig/pkg/antfly/src/admin/` as
   the operator-facing contract source for admin HTTP method/path, request, and
   response fields.
-- Generate or hand-maintain any Go operator admin client/types from that admin
-  OpenAPI contract, not from `specs/openapi/antfly/internal.yaml` and not from
-  CLI output parsing.
+- Generate the Go admin client/types from that admin OpenAPI contract into
+  `go/pkg/sdk/admin/oapi`, wrap them in `go/pkg/sdk/admin`, and have
+  `go/pkg/operator` import that wrapper for executable `/admin/v1/ha` calls.
+  The operator may keep path constants only for status display and plan
+  summaries; live calls and request/response decoding should go through the
+  SDK wrapper.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.

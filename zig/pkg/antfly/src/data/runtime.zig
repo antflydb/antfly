@@ -1417,6 +1417,12 @@ pub const DataServerConfig = struct {
     query_async_limit: std.Io.Limit = .limited(8),
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
+    ha: DataServerHAConfig = .{},
+};
+
+pub const DataServerHAConfig = struct {
+    admin_context: ?antfly.ha.admin_exec.Context = null,
+    internal_primary: ?*antfly.ha.primary.Primary = null,
 };
 
 pub const StoreRegistrationConfig = struct {
@@ -1727,6 +1733,9 @@ pub const DataServer = struct {
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
+    ha_cfg: DataServerHAConfig = .{},
+    ha_admin_server: ?antfly.ha.http_admin.Server = null,
+    ha_internal_server: ?antfly.ha.http_internal.Server = null,
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -1845,6 +1854,7 @@ pub const DataServer = struct {
             ),
             .status_source = status_source,
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -1875,6 +1885,7 @@ pub const DataServer = struct {
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -1905,6 +1916,7 @@ pub const DataServer = struct {
             ),
             .status_source = antfly.public_api.http_server.StatusSource.fromMetadataHttpService(svc),
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -1920,6 +1932,7 @@ pub const DataServer = struct {
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
         api_server_cfg.backend_runtime = self.backend_runtime;
+        self.attachHaExecutors(&api_server_cfg);
         if (self.query_io_impl == null) {
             self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
                 .async_limit = self.query_async_limit,
@@ -1983,6 +1996,22 @@ pub const DataServer = struct {
             self.write_source.source(),
         );
         self.http_server.?.antfly_provider = self.read_source.antfly_provider;
+    }
+
+    fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
+        if (api_server_cfg.ha_admin_executor == null) {
+            if (self.ha_cfg.admin_context) |ctx| {
+                self.ha_admin_server = antfly.ha.http_admin.Server.init(self.alloc, ctx);
+                api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
+            }
+        }
+        if (api_server_cfg.ha_internal_executor == null) {
+            const primary = self.ha_cfg.internal_primary orelse if (self.ha_cfg.admin_context) |ctx| ctx.primary else null;
+            if (primary) |handle| {
+                self.ha_internal_server = antfly.ha.http_internal.Server.init(self.alloc, handle);
+                api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+            }
+        }
     }
 
     pub fn setAntflyProvider(
@@ -2164,6 +2193,7 @@ pub const DataServer = struct {
         self.clearProvisionedStartupCatchUpTarget();
         if (self.listener) |*listener| listener.deinit();
         if (self.http_server) |*http_server| http_server.deinit();
+        if (self.ha_admin_server) |*server| server.deinit();
         if (self.data_raft) |raft| {
             raft.stop();
             raft.deinit();
@@ -2196,6 +2226,8 @@ pub const DataServer = struct {
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
         self.listener = null;
         self.http_server = null;
+        self.ha_admin_server = null;
+        self.ha_internal_server = null;
         self.data_raft = null;
         self.data_raft_factory = null;
         self.data_raft_apply = null;
@@ -5743,6 +5775,7 @@ pub const DataServer = struct {
             ),
             .status_source = remote_metadata.statusSource(),
             .api_server_cfg = cfg.api_server_cfg,
+            .ha_cfg = cfg.ha,
             .query_async_limit = cfg.query_async_limit,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
@@ -13215,6 +13248,115 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_ns 222") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_truncated_tail_bytes 66") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
+}
+
+test "data server wires configured HA executors into API server" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = ".",
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    try std.testing.expect(server.ha_admin_server != null);
+    try std.testing.expect(server.ha_internal_server != null);
+
+    var admin_resp = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_primary_status,
+    });
+    defer admin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
+
+    var internal_resp = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.internal.routes.ha_replication_identify,
+    });
+    defer internal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {

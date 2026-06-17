@@ -2852,6 +2852,7 @@ pub fn build(b: *std.Build) void {
         "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
+        "data server wires configured HA executors into API server",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
