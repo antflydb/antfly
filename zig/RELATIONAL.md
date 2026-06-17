@@ -1023,9 +1023,9 @@ validation and generated corpus promotion share the same adapter-owned contract.
 The shared parser cursor belongs in `parser.zig`, so checkpoint/restore,
 expect, match, peek, identifier-predicate matching, function-call detection,
 balanced-paren normalization, wrapped identifier operands, top-level boolean
-operator scans bounded by tail clauses, and end-of-input behavior are
-adapter-owned before statement-specific grammar moves out of the large lowerer
-file. Next extract the shared expression grammar, because
+operator scans bounded by tail clauses, top-level tail-clause index scans, and
+end-of-input behavior are adapter-owned before statement-specific grammar moves
+out of the large lowerer file. Next extract the shared expression grammar, because
 expressions are reused by SELECT, DML, DDL checks, partial indexes, defaults,
 generated columns, conflict actions, and RETURNING. The binder boundary should
 own catalog source lookup, cross-table source-name pre-scans for read,

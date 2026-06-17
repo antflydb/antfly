@@ -262,6 +262,28 @@ pub fn hasTopLevelOrBeforeTail(
     return false;
 }
 
+pub fn findTopLevelTailIndex(
+    tokens: []const Token,
+    start: usize,
+    comptime tail_clause_keyword: fn ([]const u8) bool,
+) usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => if (depth > 0) {
+                depth -= 1;
+            },
+            .identifier => if (depth == 0 and tail_clause_keyword(token.text)) return index,
+            .semicolon => if (depth == 0) return index,
+            else => {},
+        }
+    }
+    return tokens.len;
+}
+
 test "sql adapter parser cursor tracks shared token position" {
     var pos: usize = 0;
     const tokens = [_]Token{
@@ -352,4 +374,34 @@ test "sql adapter parser detects top-level OR before tail clauses" {
 
 fn testWhereTailKeyword(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "order");
+}
+
+test "sql adapter parser finds top-level tail clause index" {
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .text = "window" },
+        .{ .kind = .identifier, .text = "w" },
+        .{ .kind = .identifier, .text = "as" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "order" },
+        .{ .kind = .identifier, .text = "by" },
+        .{ .kind = .identifier, .text = "created_at" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .identifier, .text = "order" },
+        .{ .kind = .identifier, .text = "by" },
+    };
+    try std.testing.expectEqual(@as(usize, 8), findTopLevelTailIndex(tokens[0..], 0, testWhereTailKeyword));
+
+    const semicolon_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "window" },
+        .{ .kind = .identifier, .text = "w" },
+        .{ .kind = .identifier, .text = "as" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "partition" },
+        .{ .kind = .identifier, .text = "by" },
+        .{ .kind = .identifier, .text = "tenant_id" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .semicolon, .text = ";" },
+        .{ .kind = .identifier, .text = "order" },
+    };
+    try std.testing.expectEqual(@as(usize, 8), findTopLevelTailIndex(semicolon_tokens[0..], 0, testWhereTailKeyword));
 }

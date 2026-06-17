@@ -16280,29 +16280,7 @@ const Parser = struct {
     }
 
     fn topLevelWindowClauseEnd(self: *@This(), start: usize) usize {
-        var depth: usize = 0;
-        var i = start;
-        while (i < self.tokens.len) : (i += 1) {
-            const token = self.tokens[i];
-            switch (token.kind) {
-                .lparen => depth += 1,
-                .rparen => if (depth > 0) {
-                    depth -= 1;
-                },
-                .identifier => if (depth == 0 and windowTailClauseKeyword(token.text)) return i,
-                .semicolon => if (depth == 0) return i,
-                else => {},
-            }
-        }
-        return self.tokens.len;
-    }
-
-    fn windowTailClauseKeyword(text: []const u8) bool {
-        return std.ascii.eqlIgnoreCase(text, "order") or
-            std.ascii.eqlIgnoreCase(text, "limit") or
-            std.ascii.eqlIgnoreCase(text, "offset") or
-            std.ascii.eqlIgnoreCase(text, "fetch") or
-            std.ascii.eqlIgnoreCase(text, "for");
+        return sql_adapter.findTopLevelTailIndex(self.tokens, start, sql_adapter.sqlWindowTailClauseKeyword);
     }
 
     fn parseNamedWindowSpecsAlloc(self: *@This()) ![]const NamedWindowSpec {

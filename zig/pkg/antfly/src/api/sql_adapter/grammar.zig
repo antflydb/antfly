@@ -256,3 +256,11 @@ pub fn sqlWhereTailClauseKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "over") or
         std.ascii.eqlIgnoreCase(text, "lateral");
 }
+
+pub fn sqlWindowTailClauseKeyword(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "order") or
+        std.ascii.eqlIgnoreCase(text, "limit") or
+        std.ascii.eqlIgnoreCase(text, "offset") or
+        std.ascii.eqlIgnoreCase(text, "fetch") or
+        std.ascii.eqlIgnoreCase(text, "for");
+}
