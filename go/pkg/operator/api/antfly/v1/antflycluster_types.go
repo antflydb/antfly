@@ -662,6 +662,12 @@ type HARuntimeSpec struct {
 	// +optional
 	FencePath string `json:"fencePath,omitempty"`
 
+	// FormerPrimaryLogPath is the durable HA replication log used by former-primary rewind admin workflows.
+	// Set this on nodes that may need to rejoin after failover; for a primary this is usually the same path
+	// as primary.logPath.
+	// +optional
+	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
+
 	// Primary configures primary-side durable HA state. Defaults are under /antflydb/ha.
 	// +optional
 	Primary *HAPrimaryRuntimeSpec `json:"primary,omitempty"`

@@ -3677,6 +3677,12 @@ spec:
                           FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.
                           Defaults to /antflydb/ha/fence.wal.
                         type: string
+                      formerPrimaryLogPath:
+                        description: |-
+                          FormerPrimaryLogPath is the durable HA replication log used by former-primary rewind admin workflows.
+                          Set this on nodes that may need to rejoin after failover; for a primary this is usually the same path
+                          as primary.logPath.
+                        type: string
                       nodeID:
                         description: NodeID is the logical HA node id used in typed
                           admin receipts and fencing.

@@ -7652,8 +7652,9 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			CurrentPrimaryID: "primary-a",
 		},
 		Runtime: &antflyv1.HARuntimeSpec{
-			Role:   antflyv1.HARuntimeRolePrimary,
-			NodeID: "primary-a",
+			Role:                 antflyv1.HARuntimeRolePrimary,
+			NodeID:               "primary-a",
+			FormerPrimaryLogPath: "/antflydb/ha/primary.wal",
 		},
 		SyncPolicy: &antflyv1.HASyncPolicy{
 			Mode:          antflyv1.HADurabilityModeRemoteApply,
@@ -7674,6 +7675,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots "/antflydb/ha/slots"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id "primary-a"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-fence-wal "/antflydb/ha/fence.wal"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-former-primary-log "/antflydb/ha/primary.wal"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-cluster-id 100`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-shard-id 10`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-table-id 20`))
@@ -7687,9 +7689,10 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-failure "fail-closed"`))
 
 	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
-		Role:      antflyv1.HARuntimeRoleStandby,
-		NodeID:    "standby-a",
-		FencePath: "/antflydb/custom/fence.wal",
+		Role:                 antflyv1.HARuntimeRoleStandby,
+		NodeID:               "standby-a",
+		FencePath:            "/antflydb/custom/fence.wal",
+		FormerPrimaryLogPath: "/antflydb/custom/former-primary.wal",
 		Standby: &antflyv1.HAStandbyRuntimeSpec{
 			LogPath:      "/antflydb/custom/standby.wal",
 			ProgressPath: "/antflydb/custom/progress.wal",
@@ -7704,6 +7707,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress "/antflydb/custom/progress.wal"`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id "standby-a"`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-fence-wal "/antflydb/custom/fence.wal"`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-former-primary-log "/antflydb/custom/former-primary.wal"`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url "http://primary.default.svc:8080"`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot "standby-a"`))
 }

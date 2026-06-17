@@ -163,6 +163,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	if value := strings.TrimSpace(runtime.FencePath); value != "" {
 		fencePath = value
 	}
+	formerPrimaryLogPath := strings.TrimSpace(runtime.FormerPrimaryLogPath)
 	appendHAArg := func(name, value string) {
 		args.WriteString(" \\\n  ")
 		args.WriteString(name)
@@ -193,6 +194,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-primary-slots", slotsPath)
 		appendHAArg("--ha-primary-node-id", runtime.NodeID)
 		appendHAArg("--ha-fence-wal", fencePath)
+		if formerPrimaryLogPath != "" {
+			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
+		}
 		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
@@ -210,6 +214,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-standby-progress", progressPath)
 		appendHAArg("--ha-standby-node-id", runtime.NodeID)
 		appendHAArg("--ha-fence-wal", fencePath)
+		if formerPrimaryLogPath != "" {
+			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
+		}
 		if standby != nil && strings.TrimSpace(standby.UpstreamURL) != "" && strings.TrimSpace(standby.SlotName) != "" {
 			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)
 			appendHAArg("--ha-standby-slot", standby.SlotName)

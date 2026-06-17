@@ -1361,6 +1361,9 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	if strings.TrimSpace(runtime.FencePath) == "" && runtime.FencePath != "" {
 		errors = append(errors, "spec.highAvailability.runtime.fencePath must not be whitespace")
 	}
+	if strings.TrimSpace(runtime.FormerPrimaryLogPath) == "" && runtime.FormerPrimaryLogPath != "" {
+		errors = append(errors, "spec.highAvailability.runtime.formerPrimaryLogPath must not be whitespace")
+	}
 	if ha.Identity == nil {
 		errors = append(errors, "spec.highAvailability.runtime requires spec.highAvailability.identity")
 	}

@@ -67,6 +67,7 @@ spec:
       role: Primary
       nodeID: primary-a
       fencePath: /antflydb/ha/fence.wal
+      formerPrimaryLogPath: /antflydb/ha/primary.wal
       primary:
         logPath: /antflydb/ha/primary.wal
         slotsPath: /antflydb/ha/slots

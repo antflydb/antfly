@@ -653,14 +653,16 @@ and either rewind or reseed.
 - Keep CLI table and JSON output aligned with admin API response schemas so
   humans, tests, and the operator observe the same fields.
 - Wire the supported Zig `antfly swarm` runtime so a primary can be started with
-  durable HA replication log, slot store, promotion fence WAL, node id, and
-  identity flags. That runtime path should attach the same `/admin/v1/ha`
-  executor, durable fence store, and `/internal/v1/ha/replication` executor used
-  by tests and the CLI, rather than requiring a bespoke harness to expose
-  primary-side HA operations.
+  durable HA replication log, slot store, promotion fence WAL, optional
+  former-primary rewind log, node id, and identity flags. That runtime path
+  should attach the same `/admin/v1/ha` executor, durable fence store,
+  former-primary log handle, and `/internal/v1/ha/replication` executor used by
+  tests and the CLI, rather than requiring a bespoke harness to expose
+  primary-side HA operations or rejoin/rewind workflows.
 - Wire the supported Zig `antfly swarm` runtime so a standby can also be started
-  with a durable received-WAL log, progress WAL, promotion fence WAL, node id,
-  and identity flags. The standby runtime path should expose `/admin/v1/ha`
+  with a durable received-WAL log, progress WAL, promotion fence WAL, optional
+  former-primary rewind log, node id, and identity flags. The standby runtime
+  path should expose `/admin/v1/ha`
   status, read/write gate, bootstrap, and promotion operations against the real
   standby handle. Continuous pull/apply should then plug into the
   DataServer-managed standby DB open path so applied LSN only advances after
@@ -715,6 +717,12 @@ be validated against that operator package.
   current primary. Target reseed scheduling/slot marking at the current primary,
   then run any data-replacement step through a pod-local helper on the node being
   reseeded.
+- Expose a `highAvailability.runtime.formerPrimaryLogPath` operator field and
+  pass it to `antfly swarm --ha-former-primary-log` on nodes that may need
+  rewind/rejoin. For the original primary, this should usually be the same
+  durable file as `highAvailability.runtime.primary.logPath`; after failover it
+  becomes the former primary's local evidence for timeline divergence checks and
+  rewind decisions.
 - Use CLI-backed Kubernetes Jobs only for workflows that need pod-local mounted
   files, shared backup volumes, or explicit break-glass execution.
 - Publish lag, degraded, unhealthy, and reseed-required conditions.

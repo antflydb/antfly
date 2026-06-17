@@ -63,6 +63,7 @@ const CliConfig = struct {
     ha_primary_slots: ?[]const u8 = null,
     ha_primary_node_id: ?[]const u8 = null,
     ha_fence_wal: ?[]const u8 = null,
+    ha_former_primary_log: ?[]const u8 = null,
     ha_sync_mode: ?antfly.ha.primary.DurabilityMode = null,
     ha_sync_selection: ?antfly.ha.primary.StandbySelection = null,
     ha_sync_required: ?usize = null,
@@ -745,6 +746,8 @@ pub fn runFromIterator(
     defer if (ha_standby) |*standby| standby.close();
     var ha_fence_store = try openHAFenceStoreFromCli(alloc, setup_io.io(), cli);
     defer if (ha_fence_store) |*store| store.close();
+    var ha_former_primary_log = try openHAFormerPrimaryLogFromCli(alloc, setup_io.io(), cli);
+    defer if (ha_former_primary_log) |*log| log.close();
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -770,13 +773,14 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
-        .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null) .{
+        .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null or ha_former_primary_log != null) .{
             .admin_context = .{
                 .primary = if (ha_primary) |*primary| primary else null,
                 .primary_node_id = cli.ha_primary_node_id,
                 .standby = if (ha_standby) |*standby| standby else null,
                 .standby_node_id = cli.ha_standby_node_id,
                 .fence_store = if (ha_fence_store) |*store| store else null,
+                .former_primary_log = if (ha_former_primary_log) |*log| log else null,
             },
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_sync_policy = ha_sync_policy.policy,
@@ -1823,6 +1827,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_fence_wal = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-former-primary-log")) {
+            cfg.ha_former_primary_log = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-sync-mode")) {
             cfg.ha_sync_mode = try parseHASyncDurabilityMode(args.next() orelse return error.InvalidArguments);
             continue;
@@ -2069,6 +2077,7 @@ fn validateHARole(cli: CliConfig) !void {
     if (primary_requested and standby_requested) return error.HAMultipleRolesConfigured;
     if (haIdentityRequested(cli) and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_fence_wal != null and !primary_requested and !standby_requested) return error.HARoleMissing;
+    if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if ((primary_requested or standby_requested) and cli.ha_fence_wal == null) return error.HAFenceWalMissing;
     if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
 }
@@ -2189,6 +2198,18 @@ fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig)
     return try antfly.ha.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
 }
 
+fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.replication_log.ReplicationLog {
+    const former_primary_log_path = cli.ha_former_primary_log orelse return null;
+    if (!haPrimaryRequested(cli) and !haStandbyRequested(cli)) return error.HARoleMissing;
+
+    try ensureParent(io, former_primary_log_path);
+
+    const former_primary_log_z = try alloc.dupeZ(u8, former_primary_log_path);
+    defer alloc.free(former_primary_log_z);
+
+    return try antfly.ha.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
+}
+
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
 }
@@ -2266,6 +2287,7 @@ fn printUsage() void {
         \\  --ha-primary-slots <path>             HA primary replication slot store path
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
         \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
+        \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
         \\  --ha-sync-mode <mode>                 HA primary sync mode: async, remote-write, remote-apply
         \\  --ha-sync-selection <selection>       HA sync standby selection: any, first, all
         \\  --ha-sync-required <n>                HA sync required standby acknowledgements
@@ -2558,6 +2580,8 @@ test "parse cli accepts HA primary runtime flags" {
         "primary-a",
         "--ha-fence-wal",
         "/tmp/ha-fence.wal",
+        "--ha-former-primary-log",
+        "/tmp/ha-primary.log",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -2577,6 +2601,7 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqualStrings("/tmp/ha-slots.wal", cfg.ha_primary_slots.?);
     try std.testing.expectEqualStrings("primary-a", cfg.ha_primary_node_id.?);
     try std.testing.expectEqualStrings("/tmp/ha-fence.wal", cfg.ha_fence_wal.?);
+    try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_former_primary_log.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
@@ -2725,6 +2750,9 @@ test "swarm HA runtime rejects ambiguous role flags" {
     }));
     try std.testing.expectError(error.HARoleMissing, validateHARole(.{
         .ha_fence_wal = "/tmp/fence.wal",
+    }));
+    try std.testing.expectError(error.HARoleMissing, validateHARole(.{
+        .ha_former_primary_log = "/tmp/former-primary.wal",
     }));
     try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
