@@ -62,6 +62,11 @@ const CliConfig = struct {
     ha_primary_log: ?[]const u8 = null,
     ha_primary_slots: ?[]const u8 = null,
     ha_primary_node_id: ?[]const u8 = null,
+    ha_sync_mode: ?antfly.ha.primary.DurabilityMode = null,
+    ha_sync_selection: ?antfly.ha.primary.StandbySelection = null,
+    ha_sync_required: ?usize = null,
+    ha_sync_failure_policy: ?antfly.ha.primary.FailurePolicy = null,
+    ha_sync_standby_names: std.ArrayListUnmanaged([]const u8) = .empty,
     ha_standby_log: ?[]const u8 = null,
     ha_standby_progress: ?[]const u8 = null,
     ha_standby_node_id: ?[]const u8 = null,
@@ -73,6 +78,11 @@ const CliConfig = struct {
     ha_timeline_id: ?u64 = null,
     ha_epoch: ?u64 = null,
     help: bool = false,
+
+    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+        self.ha_sync_standby_names.deinit(alloc);
+        self.* = undefined;
+    }
 };
 
 const ResolvedPaths = struct {
@@ -600,7 +610,8 @@ pub fn runFromIterator(
     args: *std.process.Args.Iterator,
 ) !void {
     const alloc = init.gpa;
-    const cli = try parseCli(args);
+    var cli = try parseCli(alloc, args);
+    defer cli.deinit(alloc);
     if (cli.help) {
         printUsage();
         return;
@@ -725,6 +736,8 @@ pub fn runFromIterator(
     defer local_metadata.deinit();
 
     try validateHARole(cli);
+    var ha_sync_policy = try haSyncPolicyFromCli(alloc, cli);
+    defer ha_sync_policy.deinit(alloc);
     var ha_primary = try openHAPrimaryFromCli(alloc, setup_io.io(), cli);
     defer if (ha_primary) |*primary| primary.close();
     var ha_standby = try openHAStandbyFromCli(alloc, setup_io.io(), cli);
@@ -762,6 +775,7 @@ pub fn runFromIterator(
                 .standby_node_id = cli.ha_standby_node_id,
             },
             .internal_primary = if (ha_primary) |*primary| primary else null,
+            .primary_sync_policy = ha_sync_policy.policy,
             .standby_replication = try haStandbyReplicationConfigFromCli(cli),
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
@@ -1691,8 +1705,9 @@ var active_api_server: ?*antfly.public_api.http_server.ApiHttpServer = null;
 // CLI parsing
 // ---------------------------------------------------------------
 
-fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
+fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
     var cfg = CliConfig{};
+    errdefer cfg.deinit(alloc);
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cfg.help = true;
@@ -1798,6 +1813,26 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--ha-primary-node-id")) {
             cfg.ha_primary_node_id = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-sync-mode")) {
+            cfg.ha_sync_mode = try parseHASyncDurabilityMode(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-sync-selection")) {
+            cfg.ha_sync_selection = try parseHASyncStandbySelection(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-sync-required")) {
+            cfg.ha_sync_required = try parsePositiveUsize(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-sync-standby")) {
+            try cfg.ha_sync_standby_names.append(alloc, args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-sync-failure")) {
+            cfg.ha_sync_failure_policy = try parseHASyncFailurePolicy(args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--ha-standby-log")) {
@@ -2012,11 +2047,20 @@ fn haIdentityRequested(cli: CliConfig) bool {
         cli.ha_epoch != null;
 }
 
+fn haSyncPolicyRequested(cli: CliConfig) bool {
+    return cli.ha_sync_mode != null or
+        cli.ha_sync_selection != null or
+        cli.ha_sync_required != null or
+        cli.ha_sync_failure_policy != null or
+        cli.ha_sync_standby_names.items.len > 0;
+}
+
 fn validateHARole(cli: CliConfig) !void {
     const primary_requested = haPrimaryRequested(cli);
     const standby_requested = haStandbyRequested(cli);
     if (primary_requested and standby_requested) return error.HAMultipleRolesConfigured;
     if (haIdentityRequested(cli) and !primary_requested and !standby_requested) return error.HARoleMissing;
+    if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
@@ -2025,6 +2069,48 @@ fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HASta
         .upstream_base_uri = cli.ha_standby_upstream_url orelse return error.HAStandbyUpstreamUrlMissing,
         .slot_name = cli.ha_standby_slot orelse return error.HAStandbySlotMissing,
     };
+}
+
+const OwnedHASyncPolicy = struct {
+    policy: antfly.ha.primary.SyncPolicy = .{},
+    standby_names: []const []const u8 = &.{},
+
+    fn deinit(self: *OwnedHASyncPolicy, alloc: std.mem.Allocator) void {
+        if (self.standby_names.len > 0) alloc.free(self.standby_names);
+        self.* = undefined;
+    }
+};
+
+fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPolicy {
+    if (!haSyncPolicyRequested(cli)) return .{};
+    if (!haPrimaryRequested(cli)) return error.HASyncPolicyRequiresPrimary;
+
+    const names = try alloc.alloc([]const u8, cli.ha_sync_standby_names.items.len);
+    errdefer alloc.free(names);
+    @memcpy(names, cli.ha_sync_standby_names.items);
+
+    const policy = antfly.ha.primary.SyncPolicy{
+        .mode = cli.ha_sync_mode orelse .remote_write,
+        .selection = cli.ha_sync_selection orelse .any,
+        .required = cli.ha_sync_required orelse 1,
+        .standby_names = names,
+        .failure_policy = cli.ha_sync_failure_policy orelse .block,
+    };
+    try validateHASyncPolicy(policy);
+
+    return .{
+        .policy = policy,
+        .standby_names = names,
+    };
+}
+
+fn validateHASyncPolicy(policy: antfly.ha.primary.SyncPolicy) !void {
+    if (policy.required == 0) return error.InvalidHASyncPolicy;
+    if (policy.mode == .async) return;
+    if (policy.standby_names.len == 0) return error.InvalidHASyncPolicy;
+    if (policy.selection != .all and policy.required > policy.standby_names.len) {
+        return error.InvalidHASyncPolicy;
+    }
 }
 
 fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
@@ -2157,6 +2243,11 @@ fn printUsage() void {
         \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
         \\  --ha-primary-slots <path>             HA primary replication slot store path
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
+        \\  --ha-sync-mode <mode>                 HA primary sync mode: async, remote-write, remote-apply
+        \\  --ha-sync-selection <selection>       HA sync standby selection: any, first, all
+        \\  --ha-sync-required <n>                HA sync required standby acknowledgements
+        \\  --ha-sync-standby <name>              HA sync standby name; repeat for multiple standbys
+        \\  --ha-sync-failure <policy>            HA sync failure policy: block, fail-closed, degrade-to-async
         \\  --ha-standby-log <path>               Enable HA standby admin API with this received replication log path
         \\  --ha-standby-progress <path>          HA standby durable receive/apply progress WAL path
         \\  --ha-standby-node-id <id>             HA standby node id for typed admin receipts
@@ -2176,6 +2267,33 @@ fn parseBoolFlag(raw: []const u8) ?bool {
     if (std.mem.eql(u8, raw, "true")) return true;
     if (std.mem.eql(u8, raw, "false")) return false;
     return null;
+}
+
+fn parseHASyncDurabilityMode(raw: []const u8) !antfly.ha.primary.DurabilityMode {
+    if (std.mem.eql(u8, raw, "async")) return .async;
+    if (std.mem.eql(u8, raw, "remote_write") or std.mem.eql(u8, raw, "remote-write")) return .remote_write;
+    if (std.mem.eql(u8, raw, "remote_apply") or std.mem.eql(u8, raw, "remote-apply")) return .remote_apply;
+    return error.InvalidHASyncMode;
+}
+
+fn parseHASyncStandbySelection(raw: []const u8) !antfly.ha.primary.StandbySelection {
+    if (std.mem.eql(u8, raw, "any")) return .any;
+    if (std.mem.eql(u8, raw, "first")) return .first;
+    if (std.mem.eql(u8, raw, "all")) return .all;
+    return error.InvalidHASyncSelection;
+}
+
+fn parseHASyncFailurePolicy(raw: []const u8) !antfly.ha.primary.FailurePolicy {
+    if (std.mem.eql(u8, raw, "block")) return .block;
+    if (std.mem.eql(u8, raw, "fail_closed") or std.mem.eql(u8, raw, "fail-closed")) return .fail_closed;
+    if (std.mem.eql(u8, raw, "degrade_to_async") or std.mem.eql(u8, raw, "degrade-to-async")) return .degrade_to_async;
+    return error.InvalidHASyncFailurePolicy;
+}
+
+fn parsePositiveUsize(raw: []const u8) !usize {
+    const value = std.fmt.parseInt(usize, raw, 10) catch return error.InvalidArguments;
+    if (value == 0) return error.InvalidHASyncPolicy;
+    return value;
 }
 
 const RecordingRouteMethod = enum {
@@ -2371,14 +2489,16 @@ test "swarm runtime antfarm path guards keep api routes reserved" {
 test "parse cli accepts config path" {
     var argv = [_][*:0]const u8{ "--config", "antfly.json" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
 }
 
 test "parse cli accepts secret store path" {
     var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
 }
 
@@ -2396,7 +2516,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "/tmp/antfly-data",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
@@ -2424,7 +2545,8 @@ test "parse cli accepts HA primary runtime flags" {
         "4",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(haPrimaryRequested(cfg));
     try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_primary_log.?);
     try std.testing.expectEqualStrings("/tmp/ha-slots.wal", cfg.ha_primary_slots.?);
@@ -2434,6 +2556,50 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
     try std.testing.expectEqual(@as(u64, 3), cfg.ha_timeline_id.?);
     try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
+}
+
+test "parse cli accepts HA primary sync policy flags" {
+    var argv = [_][*:0]const u8{
+        "--ha-primary-log",
+        "/tmp/ha-primary.log",
+        "--ha-primary-slots",
+        "/tmp/ha-slots.wal",
+        "--ha-primary-node-id",
+        "primary-a",
+        "--ha-cluster-id",
+        "100",
+        "--ha-timeline-id",
+        "3",
+        "--ha-epoch",
+        "4",
+        "--ha-sync-mode",
+        "remote-apply",
+        "--ha-sync-selection",
+        "first",
+        "--ha-sync-required",
+        "2",
+        "--ha-sync-standby",
+        "standby-a",
+        "--ha-sync-standby",
+        "standby-b",
+        "--ha-sync-failure",
+        "fail-closed",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+
+    try validateHARole(cfg);
+    var sync_policy = try haSyncPolicyFromCli(std.testing.allocator, cfg);
+    defer sync_policy.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
+    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.first, sync_policy.policy.selection);
+    try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.required);
+    try std.testing.expectEqual(antfly.ha.primary.FailurePolicy.fail_closed, sync_policy.policy.failure_policy);
+    try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
+    try std.testing.expectEqualStrings("standby-a", sync_policy.policy.standby_names[0]);
+    try std.testing.expectEqualStrings("standby-b", sync_policy.policy.standby_names[1]);
 }
 
 test "parse cli accepts HA standby runtime flags" {
@@ -2460,7 +2626,8 @@ test "parse cli accepts HA standby runtime flags" {
         "4",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try validateHARole(cfg);
     try std.testing.expect(!haPrimaryRequested(cfg));
     try std.testing.expect(haStandbyRequested(cfg));
@@ -2524,6 +2691,14 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
         .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HASyncPolicyRequiresPrimary, validateHARole(.{
+        .ha_sync_mode = .remote_write,
+    }));
+    try std.testing.expectError(error.InvalidHASyncPolicy, haSyncPolicyFromCli(std.testing.allocator, .{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_sync_mode = .remote_write,
+        .ha_sync_required = 1,
     }));
 }
 
@@ -2593,7 +2768,8 @@ test "parse cli accepts inference budget overrides" {
         "1024",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-    const cfg = try parseCli(&iter);
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb);
     try std.testing.expectEqual(@as(usize, 12288), cfg.inference_backend_budget_mb);
     try std.testing.expectEqual(@as(usize, 16384), cfg.inference_combined_budget_mb);

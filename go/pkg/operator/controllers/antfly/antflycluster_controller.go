@@ -187,6 +187,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-primary-log", logPath)
 		appendHAArg("--ha-primary-slots", slotsPath)
 		appendHAArg("--ha-primary-node-id", runtime.NodeID)
+		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
 		logPath := defaultHAStandbyLogPath
@@ -219,6 +220,73 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	appendHAUint("--ha-timeline-id", identity.TimelineID)
 	appendHAUint("--ha-epoch", identity.Epoch)
 	return args.String()
+}
+
+func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncPolicy) {
+	if policy == nil || policy.Mode == "" || policy.Mode == antflyv1.HADurabilityModeAsync {
+		return
+	}
+	appendArg := func(name, value string) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(strconv.Quote(strings.TrimSpace(value)))
+	}
+	appendUint := func(name string, value int32) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(strconv.FormatInt(int64(value), 10))
+	}
+
+	appendArg("--ha-sync-mode", swarmHASyncMode(policy.Mode))
+	if policy.Selection != "" {
+		appendArg("--ha-sync-selection", swarmHAStandbySelection(policy.Selection))
+	}
+	if policy.Required > 0 {
+		appendUint("--ha-sync-required", policy.Required)
+	}
+	for _, name := range policy.StandbyNames {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			appendArg("--ha-sync-standby", trimmed)
+		}
+	}
+	if policy.FailurePolicy != "" {
+		appendArg("--ha-sync-failure", swarmHAFailurePolicy(policy.FailurePolicy))
+	}
+}
+
+func swarmHASyncMode(mode antflyv1.HADurabilityMode) string {
+	switch mode {
+	case antflyv1.HADurabilityModeRemoteApply:
+		return "remote-apply"
+	case antflyv1.HADurabilityModeRemoteWrite:
+		return "remote-write"
+	default:
+		return "async"
+	}
+}
+
+func swarmHAStandbySelection(selection antflyv1.HAStandbySelection) string {
+	switch selection {
+	case antflyv1.HAStandbySelectionFirst:
+		return "first"
+	case antflyv1.HAStandbySelectionAll:
+		return "all"
+	default:
+		return "any"
+	}
+}
+
+func swarmHAFailurePolicy(policy antflyv1.HAFailurePolicy) string {
+	switch policy {
+	case antflyv1.HAFailurePolicyFailClosed:
+		return "fail-closed"
+	case antflyv1.HAFailurePolicyDegradeToAsync:
+		return "degrade-to-async"
+	default:
+		return "block"
+	}
 }
 
 func secretStoreVolumeMounts(store *antflyv1.SecretStoreSpec) []corev1.VolumeMount {

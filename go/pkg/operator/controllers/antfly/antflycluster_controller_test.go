@@ -7597,6 +7597,13 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			Role:   antflyv1.HARuntimeRolePrimary,
 			NodeID: "primary-a",
 		},
+		SyncPolicy: &antflyv1.HASyncPolicy{
+			Mode:          antflyv1.HADurabilityModeRemoteApply,
+			Selection:     antflyv1.HAStandbySelectionFirst,
+			Required:      2,
+			StandbyNames:  []string{"standby-a", "standby-b"},
+			FailurePolicy: antflyv1.HAFailurePolicyFailClosed,
+		},
 	}
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
@@ -7613,6 +7620,12 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-table-id 20`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-timeline-id 1`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-epoch 2`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-mode "remote-apply"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-selection "first"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-required 2`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-a"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-b"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-failure "fail-closed"`))
 
 	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
 		Role:   antflyv1.HARuntimeRoleStandby,
