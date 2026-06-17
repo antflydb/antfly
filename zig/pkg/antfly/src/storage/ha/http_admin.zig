@@ -12,11 +12,11 @@
 // the Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! HTTP adapter for HA admin commands.
+//! HTTP adapter for HA admin operations.
 //!
-//! The storage HA command vocabulary lives in `admin_cli.zig`, and execution
-//! lives in `admin_exec.zig`. This adapter gives operators and future node
-//! servers a small HTTP surface without creating a second command contract.
+//! Typed `/admin/v1/ha` routes are the operator-facing control-plane contract.
+//! The legacy command endpoint remains only for replication compatibility
+//! commands that do not yet have a typed admin route.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -720,6 +720,9 @@ pub const Server = struct {
 
         var plan = admin_cli.parse(self.alloc, parsed.value.argv) catch return try textResponse(self.alloc, 400, "invalid HA command argv");
         defer plan.deinit(self.alloc);
+        if (!legacyCommandEndpointAllowed(plan.command, plan.output)) {
+            return try textResponse(self.alloc, 409, "TypedAdminAPIRequired");
+        }
 
         var rendered = admin_exec.executeAndRenderAlloc(self.alloc, self.ctx, plan) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
@@ -777,6 +780,18 @@ pub const Server = struct {
         return "standby";
     }
 };
+
+fn legacyCommandEndpointAllowed(command: admin_cli.Command, output: admin_cli.OutputFormat) bool {
+    if (output == .prometheus) return false;
+    return switch (command) {
+        .identify_system,
+        .start_replication,
+        .stream_once,
+        .standby_status_update,
+        => true,
+        else => false,
+    };
+}
 
 const SlotActionDocument = struct {
     schema_version: u32 = 1,
@@ -1765,16 +1780,26 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), ready.status);
     try std.testing.expectEqualStrings("ready", ready.body);
 
-    var create = try server.handle(.{
+    var identify = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer identify.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), identify.status);
+    try std.testing.expectEqualStrings("application/json", identify.content_type.?);
+    try expectContains(identify.body, "\"identify_system\"");
+
+    var rejected_command = try server.handle(.{
         .method = .POST,
         .uri = Routes.command,
         .content_type = "application/json",
         .body = "{\"argv\":[\"slot\",\"create\",\"standby-a\",\"--initial-lsn\",\"0\"]}",
     });
-    defer create.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), create.status);
-    try std.testing.expectEqualStrings("application/json", create.content_type.?);
-    try expectContains(create.body, "\"slot_name\":\"standby-a\"");
+    defer rejected_command.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), rejected_command.status);
+    try expectContains(rejected_command.body, "TypedAdminAPIRequired");
 
     var typed_status = try server.handle(.{
         .method = .GET,
@@ -1787,6 +1812,15 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_status.body, "\"snapshot\"");
     try expectContains(typed_status.body, "\"role\":\"primary\"");
     try expectContains(typed_status.body, "\"current_lsn\":0");
+
+    var typed_create_a = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_replication_slots,
+        .content_type = "application/json",
+        .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
+    });
+    defer typed_create_a.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_create_a.status);
 
     var typed_create = try server.handle(.{
         .method = .POST,
@@ -1881,9 +1915,9 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var duplicate_create = try server.handle(.{
         .method = .POST,
-        .uri = Routes.command,
+        .uri = admin_api.routes.ha_replication_slots,
         .content_type = "application/json",
-        .body = "{\"argv\":[\"slot\",\"create\",\"standby-a\",\"--initial-lsn\",\"0\"]}",
+        .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
     });
     defer duplicate_create.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), duplicate_create.status);
@@ -1960,9 +1994,9 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var invalid_seed = try server.handle(.{
         .method = .POST,
-        .uri = Routes.command,
+        .uri = admin_api.routes.ha_base_backups,
         .content_type = "application/json",
-        .body = "{\"argv\":[\"seed\",\"begin\",\"--slot\",\"standby-a\",\"--manifest-id\",\"\"]}",
+        .body = "{\"slot_name\":\"standby-a\",\"manifest_id\":\"\"}",
     });
     defer invalid_seed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_seed.status);
@@ -1982,9 +2016,9 @@ test "storage.ha http admin serves health and command endpoint" {
 
     var fail_closed_append = try server.handle(.{
         .method = .POST,
-        .uri = Routes.command,
+        .uri = admin_api.routes.ha_commit_append,
         .content_type = "application/json",
-        .body = "{\"argv\":[\"commit\",\"append\",\"--payload\",\"two\",\"--sync-mode\",\"remote-write\",\"--sync-standby\",\"standby-a\",\"--sync-failure\",\"fail-closed\"]}",
+        .body = "{\"payload\":\"two\",\"sync_policy\":{\"mode\":\"remote_write\",\"standby_names\":[\"standby-a\"],\"failure_policy\":\"fail_closed\"}}",
     });
     defer fail_closed_append.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), fail_closed_append.status);

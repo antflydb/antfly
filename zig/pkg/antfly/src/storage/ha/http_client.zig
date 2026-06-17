@@ -797,25 +797,19 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqualStrings("standby/a b%", encoded_dropped.parsed.value.slot.slot_name);
     try std.testing.expectEqual(@as(?bool, true), encoded_dropped.parsed.value.slot.dropped);
 
-    var created = try client.executeCommand("http://ha-admin.test/", &.{ "slot", "create", "standby-a", "--initial-lsn", "0" });
-    defer created.deinit(alloc);
-    try std.testing.expectEqualStrings("application/json", created.content_type);
-    try expectContains(created.body, "\"slot_name\":\"standby-a\"");
+    var stream_slot = try client.createReplicationSlot("http://ha-admin.test/", "standby-a", 0);
+    defer stream_slot.deinit(alloc);
+    try std.testing.expectEqualStrings("standby-a", stream_slot.parsed.value.slot.slot_name);
 
-    var appended = try client.executeCommand("http://ha-admin.test", &.{
-        "--table",
-        "commit",
-        "append",
-        "--payload",
-        "one",
-        "--sync-mode",
-        "async",
+    var appended = try client.appendCommit("http://ha-admin.test", .{
+        .payload = "one",
+        .shard_id = @intCast(identity.shard_id),
+        .table_id = @intCast(identity.table_id),
+        .sync_policy = .{ .mode = "async" },
     });
     defer appended.deinit(alloc);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", appended.content_type);
-    try expectContains(appended.body, "result=commit_append\n");
-    try expectContains(appended.body, "lsn=1\n");
-    try expectContains(appended.body, "action=acknowledge\n");
+    try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
+    try std.testing.expectEqualStrings("acknowledge", appended.parsed.value.gate.action);
 
     var streamed = try client.executeCommand("http://ha-admin.test", &.{ "--table", "stream", "once", "--slot", "standby-a" });
     defer streamed.deinit(alloc);
@@ -831,7 +825,7 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqual(@as(?i64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn);
     try std.testing.expectEqual(@as(?i64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn);
 
-    var operator_plan = try client.executeCommand("http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{
         "operator",
         "plan",
         "--standby",
@@ -856,62 +850,33 @@ test "storage.ha http client round trips admin commands" {
         "4",
         "--fence-reason",
         "LeaseAcquired",
-    });
-    defer operator_plan.deinit(alloc);
-    try std.testing.expectEqualStrings("application/json", operator_plan.content_type);
-    try expectContains(operator_plan.body, "\"operator_plan\"");
-    try expectContains(operator_plan.body, "\"automatic_promotion_allowed\":true");
-    try expectContains(operator_plan.body, "\"fencing_precondition\"");
-    try expectContains(operator_plan.body, "\"generation\":4");
-    try expectContains(operator_plan.body, "\"admin_method\":\"POST\"");
-    try expectContains(operator_plan.body, "\"admin_path\":\"/admin/v1/ha/fence\"");
-    try expectContains(operator_plan.body, "\"admin_path\":\"/admin/v1/ha/promotion/current-fence\"");
+    }));
 
-    var fenced = try client.executeCommand("http://ha-admin.test", &.{
-        "--table",
-        "fence",
-        "acquire",
-        "--cluster-id",
-        "100",
-        "--shard-id",
-        "10",
-        "--table-id",
-        "20",
-        "--timeline-id",
-        "1",
-        "--epoch",
-        "1",
-        "--old-primary-id",
-        "primary-a",
-        "--promoted-node-id",
-        "standby-a",
-        "--new-timeline-id",
-        "2",
-        "--new-epoch",
-        "2",
-        "--required-lsn",
-        "1",
-        "--observed-lsn",
-        "1",
-        "--reason",
-        "http-client-test",
-    });
+    const fence_request = admin_api.FenceAcquireRequest{
+        .identity = testAdminIdentity(),
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "http-client-test",
+    };
+    var fenced = try client.acquireFence("http://ha-admin.test", fence_request);
     defer fenced.deinit(alloc);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", fenced.content_type);
-    try expectContains(fenced.body, "result=fence_acquire\n");
-    try expectContains(fenced.body, "promoted_node_id=standby-a\n");
+    try std.testing.expectEqualStrings("fence_acquire", fenced.parsed.value.action.action_kind);
+    try std.testing.expectEqualStrings("standby-a", fenced.parsed.value.receipt.promoted_node_id);
 
-    var current_fence = try client.executeCommand("http://ha-admin.test", &.{ "--table", "fence", "current" });
+    var current_fence = try client.currentFence("http://ha-admin.test");
     defer current_fence.deinit(alloc);
-    try expectContains(current_fence.body, "result=fence_current\n");
-    try expectContains(current_fence.body, "held=true\n");
+    try std.testing.expect(current_fence.parsed.value.receipt != null);
 
-    var promoted = try client.executeCommand("http://ha-admin.test", &.{ "--table", "promote", "--current-fence" });
+    var promoted = try client.promoteWithCurrentFence("http://ha-admin.test");
     defer promoted.deinit(alloc);
-    try expectContains(promoted.body, "result=promote_current_fence\n");
-    try expectContains(promoted.body, "promotion.new_identity.timeline_id=2\n");
+    try std.testing.expectEqualStrings("promotion", promoted.parsed.value.action.action_kind);
+    try std.testing.expectEqual(@as(i64, 2), promoted.parsed.value.promotion.new_identity.timeline_id);
 
-    var rejoin_plan = try client.executeCommand("http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{
         "--table",
         "operator",
         "plan",
@@ -953,12 +918,7 @@ test "storage.ha http client round trips admin commands" {
         "token",
         "--receipt-reason",
         "http-client-test",
-    });
-    defer rejoin_plan.deinit(alloc);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", rejoin_plan.content_type);
-    try expectContains(rejoin_plan.body, "result=operator_plan\n");
-    try expectContains(rejoin_plan.body, "former_primary.action=rewind\n");
-    try expectContains(rejoin_plan.body, "former_primary.fork_lsn=1\n");
+    }));
 }
 
 test "storage.ha http client round trips typed commit operations" {
