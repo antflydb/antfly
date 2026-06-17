@@ -51098,6 +51098,10 @@ test "postgres sql adapter rejects unsupported ddl shapes explicitly" {
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
+        "CREATE UNIQUE INDEX audit_log_external_id_key ON audit_log (external_id) NULLS NOT DISTINCT",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
         "CREATE TRIGGER audit_row AFTER UPDATE ON usage_records EXECUTE FUNCTION audit_changes()",
     ));
     var drop_cascade = try lowerDdlPlanAlloc(alloc, "DROP TABLE usage_records CASCADE");
@@ -68166,6 +68170,7 @@ const AppParityCorpusCoverage = struct {
     schema_temporal_range_column_portion_update: bool = false,
     schema_temporal_range_column_portion_delete: bool = false,
     unsupported_ddl_system_time_temporal_table: bool = false,
+    unsupported_ddl_nulls_not_distinct_unique: bool = false,
     unsupported_duplicate_row_batch_target: bool = false,
     unsupported_duplicate_conflict_update_target: bool = false,
     unsupported_invalid_expression_conflict_target: bool = false,
@@ -69044,6 +69049,9 @@ const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
+            self.unsupported_ddl_nulls_not_distinct_unique = self.unsupported_ddl_nulls_not_distinct_unique or
+                (std.mem.eql(u8, entry.classification_reason, "nulls_not_distinct_unique") and
+                    std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
         } else if (entry.family == .unsupported_update) {
             self.unsupported_update_non_unique_point_selector = self.unsupported_update_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
         } else if (entry.family == .unsupported_update_source) {
@@ -70400,6 +70408,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.schema_temporal_range_column_portion_update);
         try std.testing.expect(self.schema_temporal_range_column_portion_delete);
         try std.testing.expect(self.unsupported_ddl_system_time_temporal_table);
+        try std.testing.expect(self.unsupported_ddl_nulls_not_distinct_unique);
     }
 };
 
@@ -70685,6 +70694,13 @@ test "postgres sql adapter classifies application parity corpus" {
             \\  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)
             \\) WITH SYSTEM VERSIONING;
             ,
+        },
+        .{
+            .name = "unsupported nulls not distinct unique index",
+            .family = .unsupported_ddl,
+            .plan = "unsupported:ddl:requires=nulls_not_distinct_unique",
+            .classification_reason = "nulls_not_distinct_unique",
+            .sql = "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;",
         },
         .{
             .name = "schema replace table",

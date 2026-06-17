@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 852,
-  "entry_count": 852,
+  "source_entry_count": 853,
+  "entry_count": 853,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -219,6 +219,13 @@
       "plan": "unsupported:ddl:requires=system_time_temporal_table",
       "classification_reason": "system_time_temporal_table",
       "sql": "CREATE TABLE account_prices_history (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)\n) WITH SYSTEM VERSIONING;"
+    },
+    {
+      "name": "unsupported nulls not distinct unique index",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=nulls_not_distinct_unique",
+      "classification_reason": "nulls_not_distinct_unique",
+      "sql": "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;"
     },
     {
       "name": "schema replace table",
