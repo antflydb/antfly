@@ -98,6 +98,17 @@ pub const Permission = struct {
     }
 };
 
+pub const PermissionChangeKind = enum {
+    grant,
+    revoke,
+};
+
+pub const PermissionChange = struct {
+    subject: []const u8,
+    permission: Permission,
+    kind: PermissionChangeKind,
+};
+
 pub const User = struct {
     username: []u8,
     password_hash: []u8,
@@ -691,6 +702,20 @@ pub const UserManager = struct {
         });
     }
 
+    pub fn subjectHasPermissionExact(self: *const UserManager, subject: []const u8, permission: Permission) !bool {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p", 0, &.{
+            subject,
+            permission.resource_type.slice(),
+            permission.resource,
+            permission.type.slice(),
+        });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        return rules.len > 0;
+    }
+
     pub fn removePermissionFromSubjectExact(self: *UserManager, subject: []const u8, permission: Permission) !void {
         _ = try self.enforcer.removeFilteredPolicy(0, &.{
             subject,
@@ -698,6 +723,40 @@ pub const UserManager = struct {
             permission.resource,
             permission.type.slice(),
         });
+    }
+
+    pub fn applyPermissionChangesAtomically(self: *UserManager, changes: []const PermissionChange) !void {
+        if (changes.len == 0) return;
+        const existed_before = try self.alloc.alloc(bool, changes.len);
+        defer self.alloc.free(existed_before);
+        for (changes, 0..) |change, i| {
+            existed_before[i] = try self.subjectHasPermissionExact(change.subject, change.permission);
+        }
+
+        var applied: usize = 0;
+        errdefer {
+            var i = applied;
+            while (i > 0) {
+                i -= 1;
+                const change = changes[i];
+                switch (change.kind) {
+                    .grant => {
+                        if (!existed_before[i]) self.removePermissionFromSubjectExact(change.subject, change.permission) catch {};
+                    },
+                    .revoke => {
+                        if (existed_before[i]) self.addPermissionToSubject(change.subject, change.permission) catch {};
+                    },
+                }
+            }
+        }
+
+        for (changes) |change| {
+            switch (change.kind) {
+                .grant => try self.addPermissionToSubject(change.subject, change.permission),
+                .revoke => try self.removePermissionFromSubjectExact(change.subject, change.permission),
+            }
+            applied += 1;
+        }
     }
 
     pub fn addPermissionToUser(self: *UserManager, username: []const u8, permission: Permission) !void {
@@ -852,6 +911,11 @@ pub const UserManager = struct {
         if (!self.users.contains(username)) return error.UserNotFound;
         const roles = try self.getRolesForUser(username);
         defer freeOwnedStrings(self.alloc, roles);
+        const direct_settings = try self.listRoleSettingsForSubject(username);
+        defer {
+            for (direct_settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(direct_settings);
+        }
 
         var merged = std.StringArrayHashMapUnmanaged([]u8){};
         defer {
@@ -863,8 +927,8 @@ pub const UserManager = struct {
             merged.deinit(self.alloc);
         }
 
-        for (roles) |role| try self.mergeRoleSettingsForSubject(&merged, role);
-        try self.mergeRoleSettingsForSubject(&merged, username);
+        for (roles) |role| try self.mergeInheritedRoleSettingsForSubject(&merged, role, direct_settings);
+        for (direct_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
 
         var out = std.ArrayList(RoleSetting).empty;
         errdefer {
@@ -878,10 +942,16 @@ pub const UserManager = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn mergeRoleSettingsForSubject(
+    const RoleSettingMergeMode = enum {
+        require_same_value,
+        replace,
+    };
+
+    fn mergeInheritedRoleSettingsForSubject(
         self: *const UserManager,
         merged: *std.StringArrayHashMapUnmanaged([]u8),
         subject: []const u8,
+        direct_settings: []const RoleSetting,
     ) !void {
         const settings = try self.listRoleSettingsForSubject(subject);
         defer {
@@ -889,16 +959,43 @@ pub const UserManager = struct {
             self.alloc.free(settings);
         }
         for (settings) |setting| {
-            if (merged.fetchOrderedRemove(setting.name)) |removed| {
-                self.alloc.free(removed.key);
-                self.alloc.free(removed.value);
-            }
-            try merged.put(
-                self.alloc,
-                try self.alloc.dupe(u8, setting.name),
-                try self.alloc.dupe(u8, setting.value),
-            );
+            if (roleSettingsContainName(direct_settings, setting.name)) continue;
+            try putRoleSetting(merged, self.alloc, setting.name, setting.value, .require_same_value);
         }
+    }
+
+    fn roleSettingsContainName(settings: []const RoleSetting, name: []const u8) bool {
+        for (settings) |setting| {
+            if (std.mem.eql(u8, setting.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn putRoleSetting(
+        merged: *std.StringArrayHashMapUnmanaged([]u8),
+        alloc: Allocator,
+        name: []const u8,
+        value: []const u8,
+        mode: RoleSettingMergeMode,
+    ) !void {
+        if (merged.get(name)) |existing| {
+            switch (mode) {
+                .require_same_value => {
+                    if (!std.mem.eql(u8, existing, value)) return error.RoleSettingConflict;
+                    return;
+                },
+                .replace => {},
+            }
+        }
+        if (merged.fetchOrderedRemove(name)) |removed| {
+            alloc.free(removed.key);
+            alloc.free(removed.value);
+        }
+        try merged.put(
+            alloc,
+            try alloc.dupe(u8, name),
+            try alloc.dupe(u8, value),
+        );
     }
 
     pub fn enableSqlRowSecurity(self: *UserManager, table: []const u8) !void {

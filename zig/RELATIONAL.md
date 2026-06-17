@@ -4498,16 +4498,22 @@ all three native permission bits. `GRANT`/`REVOKE ... ON ALL TABLES IN SCHEMA
 public` is catalog-aware: API execution enumerates the current public table
 names from the admin snapshot and applies the corresponding per-table native
 permissions, so future tables are not accidentally granted without an explicit
-catalog event. Non-public schema-wide targets fail closed until schema
-namespaces have first-class authorization semantics. A grant target that is
+catalog event. Multi-permission SQL grants and revokes are staged as one native
+auth-policy change batch and rollback on application failure, so expanded
+privileges do not leave partially-applied policy state. Non-public schema-wide
+targets fail closed until schema namespaces have first-class authorization
+semantics. A grant target that is
 already an Antfly user is applied directly to that user; otherwise SQL
 principals must resolve to a SQL-created `role:<name>` subject instead of being
 created implicitly by `GRANT`. `ALTER ROLE ... SET ...` persists the setting
 through the native auth policy store as role-owned metadata, removes that
 metadata when the role is dropped, and authentication exposes merged effective
-role settings after role inheritance plus direct user settings. Unsupported
-role-setting forms such as reset, database-scoped settings, and multi-token
-expressions still fail closed until they have explicit native semantics.
+role settings after role inheritance plus direct user settings. If inherited
+roles define the same setting with different values, effective-setting
+resolution fails closed; a direct user setting for the same key is an explicit
+override. Unsupported role-setting forms such as reset, database-scoped
+settings, and multi-token expressions still fail closed until they have
+explicit native semantics.
 
 `COPY FROM` and `COPY TO` lower to typed bulk import/export intent that captures
 table identity, column count, stream endpoint, direction, and format, then fails

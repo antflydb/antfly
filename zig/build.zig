@@ -3750,6 +3750,8 @@ pub fn build(b: *std.Build) void {
             "api http server serves user management routes when auth is enabled",
             "api http server applies authorization SQL DDL through user manager",
             "sql auth adapter creates roles and applies table grants through user manager",
+            "sql auth adapter resolves role setting conflicts deterministically",
+            "user manager applies permission change batches atomically",
             "sql auth adapter grants directly to existing antfly users",
             "sql auth adapter applies row security policies through user manager",
             "sql row security policies are inert until row security is enabled",

@@ -99,6 +99,8 @@ const PrivilegeChangeKind = enum {
     revoke,
 };
 
+const SqlPermissionChangeList = std.ArrayList(usermgr.PermissionChange);
+
 fn executePrivilegeChange(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
@@ -116,21 +118,24 @@ fn executePrivilegeChange(
 
     const subject = try principalSubjectAlloc(manager, alloc, plan.principal_name);
     defer alloc.free(subject);
+    var changes = SqlPermissionChangeList.empty;
+    defer freeSqlPermissionChanges(alloc, &changes);
 
     if (std.ascii.eqlIgnoreCase(plan.object_kind, "all_tables_in_schema")) {
         if (!std.ascii.eqlIgnoreCase(plan.object_name, "public")) return error.UnsupportedSqlShape;
         const table_names = catalog.public_table_names orelse return error.UnsupportedSqlShape;
         for (table_names) |table_name| {
             for (plan.privileges) |privilege_name| {
-                try executeSqlPrivilegeMapping(manager, alloc, subject, .table, table_name, privilege_name, kind);
+                try appendSqlPrivilegeMapping(alloc, &changes, subject, .table, table_name, privilege_name, kind);
             }
         }
     } else {
         const resource_target = try resourceTargetForSqlPrivilegeObject(plan.object_kind, plan.object_name);
         for (plan.privileges) |privilege_name| {
-            try executeSqlPrivilegeMapping(manager, alloc, subject, resource_target.resource_type, resource_target.resource_name, privilege_name, kind);
+            try appendSqlPrivilegeMapping(alloc, &changes, subject, resource_target.resource_type, resource_target.resource_name, privilege_name, kind);
         }
     }
+    try manager.applyPermissionChangesAtomically(changes.items);
     return try changedRecordAlloc(alloc);
 }
 
@@ -187,9 +192,9 @@ fn resourceTargetForSqlPrivilegeObject(object_kind: []const u8, object_name: []c
     return error.UnsupportedSqlShape;
 }
 
-fn executeSqlPrivilegeMapping(
-    manager: *usermgr.UserManager,
+fn appendSqlPrivilegeMapping(
     alloc: std.mem.Allocator,
+    changes: *SqlPermissionChangeList,
     subject: []const u8,
     resource_type: usermgr.ResourceType,
     resource_name: []const u8,
@@ -197,7 +202,7 @@ fn executeSqlPrivilegeMapping(
     kind: PrivilegeChangeKind,
 ) !void {
     if (std.ascii.eqlIgnoreCase(privilege_name, "select")) {
-        try executePermissionChange(manager, alloc, subject, resource_type, resource_name, .read, kind);
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .read, kind);
         return;
     }
     if (std.ascii.eqlIgnoreCase(privilege_name, "insert") or
@@ -205,13 +210,13 @@ fn executeSqlPrivilegeMapping(
         std.ascii.eqlIgnoreCase(privilege_name, "delete") or
         std.ascii.eqlIgnoreCase(privilege_name, "truncate"))
     {
-        try executePermissionChange(manager, alloc, subject, resource_type, resource_name, .write, kind);
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .write, kind);
         return;
     }
     if (std.ascii.eqlIgnoreCase(privilege_name, "all")) {
-        try executePermissionChange(manager, alloc, subject, resource_type, resource_name, .read, kind);
-        try executePermissionChange(manager, alloc, subject, resource_type, resource_name, .write, kind);
-        try executePermissionChange(manager, alloc, subject, resource_type, resource_name, .admin, kind);
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .read, kind);
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .write, kind);
+        try appendPermissionChange(alloc, changes, subject, resource_type, resource_name, .admin, kind);
         return;
     }
 }
@@ -260,21 +265,49 @@ fn authMetadataKeyForSqlSetting(setting_name: []const u8) []const u8 {
     return setting_name;
 }
 
-fn executePermissionChange(
-    manager: *usermgr.UserManager,
+fn appendPermissionChange(
     alloc: std.mem.Allocator,
+    changes: *SqlPermissionChangeList,
     subject: []const u8,
     resource_type: usermgr.ResourceType,
     resource_name: []const u8,
     permission_type: usermgr.PermissionType,
     kind: PrivilegeChangeKind,
 ) !void {
-    var permission = try usermgr.Permission.initOwned(alloc, resource_type, resource_name, permission_type);
-    defer permission.deinit(alloc);
-    switch (kind) {
-        .grant => try manager.addPermissionToSubject(subject, permission),
-        .revoke => try manager.removePermissionFromSubjectExact(subject, permission),
+    const change_kind: usermgr.PermissionChangeKind = switch (kind) {
+        .grant => .grant,
+        .revoke => .revoke,
+    };
+    for (changes.items) |change| {
+        if (change.kind == change_kind and
+            std.mem.eql(u8, change.subject, subject) and
+            change.permission.resource_type == resource_type and
+            change.permission.type == permission_type and
+            std.mem.eql(u8, change.permission.resource, resource_name))
+        {
+            return;
+        }
     }
+    const owned_subject = try alloc.dupe(u8, subject);
+    errdefer alloc.free(owned_subject);
+    const permission = try usermgr.Permission.initOwned(alloc, resource_type, resource_name, permission_type);
+    errdefer {
+        var mutable_permission = permission;
+        mutable_permission.deinit(alloc);
+    }
+    try changes.append(alloc, .{
+        .subject = owned_subject,
+        .permission = permission,
+        .kind = change_kind,
+    });
+}
+
+fn freeSqlPermissionChanges(alloc: std.mem.Allocator, changes: *SqlPermissionChangeList) void {
+    for (changes.items) |*change| {
+        alloc.free(@constCast(change.subject));
+        change.permission.deinit(alloc);
+    }
+    changes.deinit(alloc);
 }
 
 fn principalSubjectAlloc(
@@ -439,6 +472,84 @@ test "sql auth adapter creates roles and applies table grants through user manag
     var dropped_with_setting = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
     defer dropped_with_setting.deinit(alloc);
     try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "statement_timeout"));
+}
+
+test "sql auth adapter resolves role setting conflicts deterministically" {
+    const alloc = std.testing.allocator;
+
+    var store = usermgr.MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try usermgr.UserManager.init(
+        alloc,
+        store.iface(),
+        try usermgr.initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+
+    try manager.createRoleSubject("role:fast");
+    try manager.createRoleSubject("role:slow");
+    try manager.setRoleSetting("role:fast", "statement_timeout", "5s");
+    try manager.setRoleSetting("role:slow", "statement_timeout", "10s");
+    try manager.addRoleToUser("alice", "role:fast");
+    try manager.addRoleToUser("alice", "role:slow");
+
+    try std.testing.expectError(error.RoleSettingConflict, manager.getEffectiveRoleSettings("alice"));
+
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET statement_timeout = '3s';")).?;
+    defer altered.deinit(alloc);
+    const effective_settings = try manager.getEffectiveRoleSettings("alice");
+    defer {
+        for (effective_settings) |*setting| setting.deinit(alloc);
+        alloc.free(effective_settings);
+    }
+    try std.testing.expectEqual(@as(usize, 1), effective_settings.len);
+    try std.testing.expectEqualStrings("statement_timeout", effective_settings[0].name);
+    try std.testing.expectEqualStrings("3s", effective_settings[0].value);
+}
+
+test "user manager applies permission change batches atomically" {
+    const alloc = std.testing.allocator;
+
+    var store = usermgr.MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try usermgr.UserManager.init(
+        alloc,
+        store.iface(),
+        try usermgr.initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try manager.createRoleSubject("role:app_writer");
+    try manager.addRoleToUser("alice", "role:app_writer");
+
+    var read_docs = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer read_docs.deinit(alloc);
+    var write_docs = try usermgr.Permission.initOwned(alloc, .table, "docs", .write);
+    defer write_docs.deinit(alloc);
+    const grants = [_]usermgr.PermissionChange{
+        .{ .subject = "role:app_writer", .permission = read_docs, .kind = .grant },
+        .{ .subject = "role:app_writer", .permission = write_docs, .kind = .grant },
+    };
+    try manager.applyPermissionChangesAtomically(grants[0..]);
+    try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "docs", .write));
+
+    const revokes = [_]usermgr.PermissionChange{
+        .{ .subject = "role:app_writer", .permission = read_docs, .kind = .revoke },
+        .{ .subject = "role:app_writer", .permission = write_docs, .kind = .revoke },
+    };
+    try manager.applyPermissionChangesAtomically(revokes[0..]);
+    try std.testing.expect(!(try manager.enforce("alice", .table, "docs", .read)));
+    try std.testing.expect(!(try manager.enforce("alice", .table, "docs", .write)));
 }
 
 test "sql auth adapter grants directly to existing antfly users" {

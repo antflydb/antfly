@@ -105,11 +105,6 @@ fn packageNameForSqlExtension(
     version: ?[]const u8,
 ) ![]const u8 {
     if (try findPackageForSqlName(snapshot.extension_packages, extension_name, version)) |package| return package.name;
-
-    if (std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp")) {
-        if (try findPackageForSqlName(snapshot.extension_packages, "uuid_ossp", version)) |package| return package.name;
-    }
-
     return extension_name;
 }
 
@@ -273,6 +268,22 @@ test "sql extension adapter resolves package from manifest sql name" {
 
     try std.testing.expect(!applied.noop);
     try std.testing.expect(service.saw_uuid_ossp_package);
+}
+
+test "sql extension adapter requires manifest sql name aliases" {
+    const alloc = std.testing.allocator;
+    const uuid_without_sql_alias = extension_domain.PackageManifest{
+        .name = "uuid_ossp",
+        .version = "1.0.0",
+        .digest = "sha256:uuid",
+        .install = .{ .scopes_supported = &.{.cluster} },
+    };
+    var service = TestService{ .packages = &.{uuid_without_sql_alias} };
+
+    try std.testing.expectError(
+        error.PackageNotFound,
+        executeRelationalSqlDdlOnService(&service, alloc, "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';"),
+    );
 }
 
 test "sql extension adapter rejects ambiguous manifest sql names" {

@@ -260,7 +260,8 @@ name separately from the registered package catalog. Resolution first matches
 the package name, then manifest-declared `sql_names` aliases for PostgreSQL
 names that do not match Antfly package names, such as `"uuid-ossp"` resolving to
 package `uuid_ossp`. If more than one package name declares the same SQL alias,
-the SQL DDL fails as ambiguous. SQL `VERSION` maps to
+the SQL DDL fails as ambiguous. There are no hidden hard-coded SQL-name aliases;
+compatibility names must be visible in package manifests. SQL `VERSION` maps to
 `InstallExtensionRequest.version`; when omitted, lifecycle resolution chooses
 the latest package version already present in the package catalog. SQL should
 not accept an arbitrary package digest in v1. Digest trust comes from the
