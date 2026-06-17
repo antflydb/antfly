@@ -63,12 +63,90 @@ pub const Binding = struct {
     }
 };
 
+pub fn rowRefKindForSourceKind(source_kind: rowsource.SourceKind) RowRefKind {
+    return switch (source_kind) {
+        .relational_store, .json_materialized => .relational_key,
+        .serverless_fragment => .serverless,
+        .external_parquet, .external_iceberg, .external_lance => .external,
+    };
+}
+
+pub fn bindingFromSnapshot(
+    sidecar_kind: SidecarKind,
+    source_kind: rowsource.SourceKind,
+    snapshot: rowsource.SnapshotRef,
+    schema_fingerprint: []const u8,
+    column_bindings: []const []const u8,
+    index_config_hash: []const u8,
+) Binding {
+    return .{
+        .sidecar_kind = sidecar_kind,
+        .source_kind = source_kind,
+        .row_ref_kind = rowRefKindForSourceKind(source_kind),
+        .source_id = snapshot.table_id,
+        .snapshot_id = snapshot.snapshot_id,
+        .schema_fingerprint = schema_fingerprint,
+        .column_bindings = column_bindings,
+        .index_config_hash = index_config_hash,
+    };
+}
+
+pub fn validateBatchAgainstBinding(binding: Binding, batch: rowsource.ColumnBatch) !void {
+    try binding.validate();
+    try batch.validate();
+    if (binding.source_id.len != 0 and !std.mem.eql(u8, binding.source_id, batch.snapshot.table_id)) {
+        return error.SidecarSourceBindingMismatch;
+    }
+    if (!std.mem.eql(u8, binding.snapshot_id, batch.snapshot.snapshot_id)) {
+        return error.SidecarSourceBindingMismatch;
+    }
+    for (binding.column_bindings) |column| {
+        if (batch.findColumn(column) == null) return error.SidecarSourceBindingMismatch;
+    }
+    for (batch.row_refs) |row_ref| {
+        if (!rowRefMatchesKind(row_ref, binding.row_ref_kind)) return error.SidecarSourceBindingMismatch;
+    }
+}
+
 pub fn sameSourceSnapshot(a: Binding, b: Binding) bool {
     return a.source_kind == b.source_kind and
         a.row_ref_kind == b.row_ref_kind and
         std.mem.eql(u8, a.source_id, b.source_id) and
         std.mem.eql(u8, a.snapshot_id, b.snapshot_id) and
         std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint);
+}
+
+pub fn rowRefMatchesKind(row_ref: rowsource.RowRef, kind: RowRefKind) bool {
+    return switch (row_ref) {
+        .relational_key => kind == .relational_key,
+        .serverless => kind == .serverless,
+        .external => kind == .external,
+    };
+}
+
+pub fn rowRefKeyAlloc(alloc: std.mem.Allocator, row_ref: rowsource.RowRef) ![]u8 {
+    return switch (row_ref) {
+        .relational_key => |key| std.fmt.allocPrint(alloc, "rel:{d}:{s}", .{ key.len, key }),
+        .serverless => |value| std.fmt.allocPrint(
+            alloc,
+            "srv:{d}:{s}:{d}",
+            .{ value.fragment_id.len, value.fragment_id, value.row_ordinal },
+        ),
+        .external => |value| std.fmt.allocPrint(
+            alloc,
+            "ext:{d}:{s}:{d}:{s}:{d}:{s}:{d}:{d}",
+            .{
+                value.source_id.len,
+                value.source_id,
+                value.snapshot_id.len,
+                value.snapshot_id,
+                value.file_id.len,
+                value.file_id,
+                value.row_group_ordinal,
+                value.row_ordinal,
+            },
+        ),
+    };
 }
 
 test "sidecar source binding validates serverless and external sources" {
@@ -110,4 +188,78 @@ test "sidecar source binding validates serverless and external sources" {
         .index_config_hash = "sha256:algebraic",
     };
     try std.testing.expectError(error.InvalidSidecarSourceBinding, invalid_relational.validate());
+}
+
+test "sidecar source binding validates batches and creates stable row-ref keys" {
+    const alloc = std.testing.allocator;
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .serverless = .{ .fragment_id = "frag-a", .row_ordinal = 0 } },
+        .{ .serverless = .{ .fragment_id = "frag-a", .row_ordinal = 1 } },
+    };
+    const bodies = [_][]const u8{ "alpha", "bravo" };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "body", .values = .{ .bytes = &bodies } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-9" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+    const binding = bindingFromSnapshot(
+        .text,
+        .serverless_fragment,
+        batch.snapshot,
+        "schema-v1",
+        &[_][]const u8{"body"},
+        "sha256:text",
+    );
+
+    try validateBatchAgainstBinding(binding, batch);
+    const key = try rowRefKeyAlloc(alloc, row_refs[1]);
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("srv:6:frag-a:1", key);
+
+    var wrong_snapshot = batch;
+    wrong_snapshot.snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-10" };
+    try std.testing.expectError(error.SidecarSourceBindingMismatch, validateBatchAgainstBinding(binding, wrong_snapshot));
+}
+
+test "sidecar source binding validates external row-ref batches" {
+    const alloc = std.testing.allocator;
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .file_id = "file-a.parquet",
+            .row_group_ordinal = 2,
+            .row_ordinal = 42,
+        } },
+    };
+    const embeddings = [_][]const f32{&[_]f32{ 1.0, 0.0 }};
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "embedding", .values = .{ .vector_f32 = &embeddings } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "events", .snapshot_id = "iceberg-7" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+    const binding = bindingFromSnapshot(
+        .vector,
+        .external_iceberg,
+        batch.snapshot,
+        "schema-v2",
+        &[_][]const u8{"embedding"},
+        "sha256:vector",
+    );
+
+    try validateBatchAgainstBinding(binding, batch);
+    const key = try rowRefKeyAlloc(alloc, row_refs[0]);
+    defer alloc.free(key);
+    try std.testing.expectEqualStrings("ext:6:events:9:iceberg-7:14:file-a.parquet:2:42", key);
+
+    var missing_column = batch;
+    missing_column.columns = &.{};
+    try std.testing.expectError(error.SidecarSourceBindingMismatch, validateBatchAgainstBinding(binding, missing_column));
 }

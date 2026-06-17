@@ -1014,10 +1014,15 @@ extract `token.zig` and `lexer.zig` behind the existing entrypoints, preserving
 the current zero-copy token behavior, source spans, dollar-quoted literal
 handling, and strict placeholder validation. Statement-family classification
 then belongs in `classifier.zig`, so raw SQL dispatch is owned by the adapter
-module before the large lowerers create typed plans. Stable unsupported-shape
-and adapter-noop reason tokens belong in `diagnostics.zig`; the parity corpus
-must reject unknown reason strings, and adapter-only reasons must not be reused
-as required-feature classifications. Golden-plan fingerprint helpers and
+module before the large lowerers create typed plans. `WITH` dispatch must parse
+past the non-recursive CTE list and classify by the final statement rather than
+treating every CTE-backed write as an insert-source plan; CTE-backed
+`UPDATE`/`DELETE`/`MERGE` syntax can still fail closed until each family has a
+typed execution contract, but it must fail closed under the right native family.
+Stable unsupported-shape and adapter-noop reason tokens belong in
+`diagnostics.zig`; the parity corpus must reject unknown reason strings, and
+adapter-only reasons must not be reused as required-feature classifications.
+Golden-plan fingerprint helpers and
 unsupported/adapter-noop plan matching belong in `corpus.zig`, so fixture
 validation and generated corpus promotion share the same adapter-owned contract.
 The shared parser cursor belongs in `parser.zig`, so checkpoint/restore,
@@ -1102,6 +1107,12 @@ broader predicates and table-wide raw updates/deletes route through explicit
 claimed mutation-source plans. The point update/delete lowerers still fail
 closed for missing predicates so adapter callers cannot accidentally turn an
 identity mutation into an unclaimed scan.
+For CTE-backed writes, adapter classification is based on the final statement
+after the non-recursive CTE list. `WITH ... INSERT` routes to insert-source
+lowering, while `WITH ... UPDATE`, `WITH ... DELETE`, and `WITH ... MERGE` route
+to their own write families and currently fail closed unless the corresponding
+typed CTE-backed execution shape is implemented. Recursive CTE-backed writes do
+not enter a write family until recursive stream semantics have a native plan.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.

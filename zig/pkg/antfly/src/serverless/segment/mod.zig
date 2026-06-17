@@ -23,7 +23,11 @@ pub const SidecarSourceRowRefKind = source_binding.RowRefKind;
 pub const freeEntries = types.freeEntries;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const sidecarBindingFromSnapshot = source_binding.bindingFromSnapshot;
+pub const validateSidecarBatchAgainstBinding = source_binding.validateBatchAgainstBinding;
 pub const sameSidecarSourceSnapshot = source_binding.sameSourceSnapshot;
+pub const sidecarRowRefKeyAlloc = source_binding.rowRefKeyAlloc;
+pub const sidecarRowRefKindForSourceKind = source_binding.rowRefKindForSourceKind;
 
 test "serverless segment module compiles" {
     _ = types;
@@ -34,5 +38,9 @@ test "serverless segment module compiles" {
     _ = freeEntries;
     _ = encodeAlloc;
     _ = decodeAlloc;
+    _ = sidecarBindingFromSnapshot;
+    _ = validateSidecarBatchAgainstBinding;
     _ = sameSidecarSourceSnapshot;
+    _ = sidecarRowRefKeyAlloc;
+    _ = sidecarRowRefKindForSourceKind;
 }

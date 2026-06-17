@@ -367,7 +367,7 @@ Antfly sidecar indexes/materializations
 one RowSource/SQL contract
 ```
 
-The concrete scaffold:
+The 10-step Antfly-owned implementation plan:
 
 1. Add a shared `RowSource` layer.
 
@@ -444,15 +444,36 @@ The concrete scaffold:
    Antfly-owned storage should not be coupled to Iceberg's protocol, and Iceberg
    should not block Antfly-native fragments.
 
-10. Stage the implementation.
+10. Stage the implementation as owned milestones.
 
-   Land the pieces in this order: `rowsource/types.zig`; JSON adapter for the
-   existing row-query executor; `serverless/row_fragment` codec tests; publisher
-   from relational rows to row fragments; query path through
-   `ServerlessFragmentRowSource`; sidecar text/vector indexes over serverless
-   row refs; one algebraic segment for a simple group-by aggregate; external
-   Parquet/Iceberg row sources; and adaptive promotion from external scans to
-   Antfly row fragments/materializations.
+   Land the pieces in this order:
+
+   - `rowsource/types.zig` with the stable `SnapshotRef`, `RowRef`,
+     `ColumnVector`, and `ColumnBatch` contract.
+   - JSON and relational adapters so the existing row-query executor can run
+     unchanged while the column-batch executor matures.
+   - `serverless/row_fragment` codec, reader, writer, and format tests.
+   - A relational-to-row-fragment publisher that turns Antfly-owned LSM and
+     relational rows into immutable serverless fragments.
+   - A `ServerlessFragmentRowSource` query path that proves SQL/row plans can
+     read Antfly-owned object-storage fragments.
+   - Sidecar text, vector, sparse, and graph indexes keyed by serverless row
+     refs and pinned source snapshots.
+   - One algebraic segment for a simple group-by aggregate, then expression
+     folds and adaptive aggregate recommendations.
+   - External Parquet and Iceberg row sources behind the same `RowSource`
+     contract.
+   - Adaptive promotion from external scans to Antfly row fragments, hot
+     projections, or materialized folds.
+   - Operational hardening: manifest compatibility, snapshot garbage
+     collection, explain plans, rebuild tooling, and cache accounting.
+
+The owned milestones matter because they let Antfly become useful even before
+the full external lake ecosystem is complete. Steps 1 through 7 create a
+standalone Antfly lake-native serving path over Antfly-owned immutable
+fragments. Steps 8 through 10 make that path interoperable with Iceberg,
+Parquet, and Lance-style data without making those protocols the center of
+Antfly's storage design.
 
 ## Object Storage Reads
 

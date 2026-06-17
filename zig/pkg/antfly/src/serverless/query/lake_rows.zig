@@ -56,6 +56,86 @@ pub const GroupByResult = struct {
     }
 };
 
+pub const CellValue = union(rowsource.ColumnKind) {
+    bytes: []u8,
+    json: []u8,
+    i64: i64,
+    f64: f64,
+    bool: bool,
+    vector_f32: []f32,
+
+    pub fn deinit(self: *CellValue, alloc: Allocator) void {
+        switch (self.*) {
+            .bytes => |value| alloc.free(value),
+            .json => |value| alloc.free(value),
+            .vector_f32 => |value| alloc.free(value),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ProjectedCell = struct {
+    name: []u8,
+    value: ?CellValue,
+
+    pub fn deinit(self: *ProjectedCell, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.value) |*value| value.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const ProjectedRow = struct {
+    row_ref: rowsource.RowRef,
+    cells: []ProjectedCell,
+
+    pub fn deinit(self: *ProjectedRow, alloc: Allocator) void {
+        for (self.cells) |*cell| cell.deinit(alloc);
+        alloc.free(self.cells);
+        self.* = undefined;
+    }
+
+    pub fn find(self: ProjectedRow, name: []const u8) ?ProjectedCell {
+        for (self.cells) |cell| {
+            if (std.mem.eql(u8, cell.name, name)) return cell;
+        }
+        return null;
+    }
+};
+
+pub const HydrateResult = struct {
+    rows: []ProjectedRow,
+
+    pub fn deinit(self: *HydrateResult, alloc: Allocator) void {
+        for (self.rows) |*row| row.deinit(alloc);
+        alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const PredicateOp = enum {
+    eq_bytes,
+    eq_i64,
+    eq_bool,
+};
+
+pub const Predicate = struct {
+    column: []const u8,
+    op: PredicateOp,
+    bytes_value: []const u8 = &.{},
+    i64_value: i64 = 0,
+    bool_value: bool = false,
+};
+
+pub const ScanRequest = struct {
+    projected_columns: []const []const u8,
+    predicate: ?Predicate = null,
+    limit: ?usize = null,
+};
+
+pub const ScanResult = HydrateResult;
+
 pub fn executeGroupByAlloc(
     alloc: Allocator,
     source: rowsource.Source,
@@ -71,9 +151,105 @@ pub fn executeGroupByAlloc(
     return try resultFromSourceAlloc(alloc, source, request);
 }
 
+pub fn scanRowsAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    request: ScanRequest,
+) !ScanResult {
+    try validateScanRequest(request);
+
+    var rows = std.ArrayListUnmanaged(ProjectedRow).empty;
+    errdefer {
+        for (rows.items) |*row| row.deinit(alloc);
+        rows.deinit(alloc);
+    }
+
+    if (request.limit != null and request.limit.? == 0) {
+        return .{ .rows = try rows.toOwnedSlice(alloc) };
+    }
+
+    while (try source.next(alloc)) |batch| {
+        const predicate_column = if (request.predicate) |predicate|
+            batch.findColumn(predicate.column) orelse return error.RowSourceColumnNotFound
+        else
+            null;
+
+        for (0..batch.rowCount()) |row_idx| {
+            if (request.predicate) |predicate| {
+                if (!try predicateMatches(predicate, predicate_column.?, row_idx)) continue;
+            }
+            try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, request.projected_columns));
+            if (limitReached(rows.items.len, request.limit)) break;
+        }
+        if (limitReached(rows.items.len, request.limit)) break;
+    }
+
+    return .{ .rows = try rows.toOwnedSlice(alloc) };
+}
+
+pub fn hydrateRowsAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    wanted_refs: []const rowsource.RowRef,
+    projected_columns: []const []const u8,
+) !HydrateResult {
+    if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0) };
+    if (projected_columns.len == 0) return error.InvalidLakeRowsQuery;
+
+    var rows = std.ArrayListUnmanaged(ProjectedRow).empty;
+    errdefer {
+        for (rows.items) |*row| row.deinit(alloc);
+        rows.deinit(alloc);
+    }
+
+    while (try source.next(alloc)) |batch| {
+        for (batch.row_refs, 0..) |row_ref, row_idx| {
+            if (!containsRowRef(wanted_refs, row_ref)) continue;
+            try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, projected_columns));
+            if (rows.items.len == wanted_refs.len) break;
+        }
+        if (rows.items.len == wanted_refs.len) break;
+    }
+
+    return .{ .rows = try rows.toOwnedSlice(alloc) };
+}
+
 fn validateRequest(request: GroupByRequest) !void {
     if (request.group_column.len == 0) return error.InvalidLakeRowsQuery;
     if (request.op != .count and request.value_column.len == 0) return error.InvalidLakeRowsQuery;
+}
+
+fn validateScanRequest(request: ScanRequest) !void {
+    if (request.projected_columns.len == 0) return error.InvalidLakeRowsQuery;
+    for (request.projected_columns) |column| {
+        if (column.len == 0) return error.InvalidLakeRowsQuery;
+    }
+    if (request.predicate) |predicate| {
+        if (predicate.column.len == 0) return error.InvalidLakeRowsQuery;
+    }
+}
+
+fn limitReached(row_count: usize, limit: ?usize) bool {
+    return limit != null and row_count >= limit.?;
+}
+
+fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_idx: usize) !bool {
+    if (column.nulls.isNull(row_idx)) return false;
+    return switch (predicate.op) {
+        .eq_bytes => switch (column.values) {
+            .bytes => |items| std.mem.eql(u8, items[row_idx], predicate.bytes_value),
+            .json => |items| std.mem.eql(u8, items[row_idx], predicate.bytes_value),
+            else => error.UnsupportedLakeRowsPredicateColumnKind,
+        },
+        .eq_i64 => switch (column.values) {
+            .i64 => |items| items[row_idx] == predicate.i64_value,
+            else => error.UnsupportedLakeRowsPredicateColumnKind,
+        },
+        .eq_bool => switch (column.values) {
+            .bool => |items| items[row_idx] == predicate.bool_value,
+            else => error.UnsupportedLakeRowsPredicateColumnKind,
+        },
+    };
 }
 
 fn materializedMatches(reader: algebraic_segment.Reader, request: GroupByRequest) bool {
@@ -190,6 +366,76 @@ fn compareGroupResult(_: void, lhs: GroupResult, rhs: GroupResult) bool {
     return std.mem.lessThan(u8, lhs.key, rhs.key);
 }
 
+fn projectRowAlloc(
+    alloc: Allocator,
+    batch: rowsource.ColumnBatch,
+    row_idx: usize,
+    projected_columns: []const []const u8,
+) !ProjectedRow {
+    const cells = try alloc.alloc(ProjectedCell, projected_columns.len);
+    errdefer alloc.free(cells);
+    var initialized: usize = 0;
+    errdefer {
+        for (cells[0..initialized]) |*cell| cell.deinit(alloc);
+    }
+
+    for (projected_columns, cells) |name, *out| {
+        const column = batch.findColumn(name) orelse return error.RowSourceColumnNotFound;
+        out.* = .{
+            .name = try alloc.dupe(u8, name),
+            .value = if (column.nulls.isNull(row_idx)) null else try cloneCellValueAlloc(alloc, column.values, row_idx),
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .row_ref = batch.row_refs[row_idx],
+        .cells = cells,
+    };
+}
+
+fn cloneCellValueAlloc(
+    alloc: Allocator,
+    values: rowsource.ColumnValues,
+    row_idx: usize,
+) !CellValue {
+    return switch (values) {
+        .bytes => |items| .{ .bytes = try alloc.dupe(u8, items[row_idx]) },
+        .json => |items| .{ .json = try alloc.dupe(u8, items[row_idx]) },
+        .i64 => |items| .{ .i64 = items[row_idx] },
+        .f64 => |items| .{ .f64 = items[row_idx] },
+        .bool => |items| .{ .bool = items[row_idx] },
+        .vector_f32 => |items| .{ .vector_f32 = try alloc.dupe(f32, items[row_idx]) },
+    };
+}
+
+fn containsRowRef(haystack: []const rowsource.RowRef, needle: rowsource.RowRef) bool {
+    for (haystack) |candidate| {
+        if (rowRefsEqual(candidate, needle)) return true;
+    }
+    return false;
+}
+
+fn rowRefsEqual(a: rowsource.RowRef, b: rowsource.RowRef) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .relational_key => |key| std.mem.eql(u8, key, b.relational_key),
+        .serverless => |value| blk: {
+            const other = b.serverless;
+            break :blk std.mem.eql(u8, value.fragment_id, other.fragment_id) and
+                value.row_ordinal == other.row_ordinal;
+        },
+        .external => |value| blk: {
+            const other = b.external;
+            break :blk std.mem.eql(u8, value.source_id, other.source_id) and
+                std.mem.eql(u8, value.snapshot_id, other.snapshot_id) and
+                std.mem.eql(u8, value.file_id, other.file_id) and
+                value.row_group_ordinal == other.row_group_ordinal and
+                value.row_ordinal == other.row_ordinal;
+        },
+    };
+}
+
 test "lake rows group-by scans RowSource batches" {
     const alloc = std.testing.allocator;
     const local = @import("../../storage/rowsource/local.zig");
@@ -274,4 +520,165 @@ test "lake rows group-by can use algebraic segment materialization" {
     try std.testing.expectEqual(@as(usize, 1), result.groups.len);
     try std.testing.expectEqual(@as(i64, 42), result.find("t1").?.sum_i64);
     try std.testing.expectEqual(.algebraic_segment, result.source);
+}
+
+test "lake rows scans projected local rows with a predicate" {
+    const alloc = std.testing.allocator;
+    const local = @import("../../storage/rowsource/local.zig");
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .relational_key = "row:a" },
+        .{ .relational_key = "row:b" },
+        .{ .relational_key = "row:c" },
+    };
+    const tenants = [_][]const u8{ "t1", "t2", "t2" };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const active = [_]bool{ true, true, false };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+        .{ .name = "active", .values = .{ .bool = &active } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "lsm-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try local.relationalStoreSource(&batches);
+
+    const projection = [_][]const u8{ "amount", "active" };
+    var result = try scanRowsAlloc(alloc, batch_source.rowSource(), .{
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "tenant",
+            .op = .eq_bytes,
+            .bytes_value = "t2",
+        },
+        .limit = 1,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(true, result.rows[0].find("active").?.value.?.bool);
+}
+
+test "lake rows scans external rows through the same projection contract" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+
+    const binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(binding, "file-a.parquet", 0, 1),
+        try external.makeRowRef(binding, "file-b.parquet", 1, 0),
+    };
+    const tenants = [_][]const u8{ "t1", "t2", "t2" };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(binding, &batches);
+
+    const projection = [_][]const u8{"amount"};
+    var result = try scanRowsAlloc(alloc, batch_source.rowSource(), .{
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "tenant",
+            .op = .eq_bytes,
+            .bytes_value = "t2",
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expect(rowRefsEqual(row_refs[2], result.rows[1].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+}
+
+test "lake rows hydrates projected cells by row ref" {
+    const alloc = std.testing.allocator;
+    const local = @import("../../storage/rowsource/local.zig");
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .relational_key = "row:a" },
+        .{ .relational_key = "row:b" },
+    };
+    const amounts = [_]i64{ 10, 20 };
+    const attrs = [_][]const u8{ "{\"tier\":\"free\"}", "{\"tier\":\"pro\"}" };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+        .{ .name = "attrs", .values = .{ .json = &attrs } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "lsm-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try local.relationalStoreSource(&batches);
+
+    const wanted = [_]rowsource.RowRef{.{ .relational_key = "row:b" }};
+    const projection = [_][]const u8{ "amount", "attrs" };
+    var result = try hydrateRowsAlloc(alloc, batch_source.rowSource(), &wanted, &projection);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(wanted[0], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqualStrings("{\"tier\":\"pro\"}", result.rows[0].find("attrs").?.value.?.json);
+}
+
+test "lake rows hydrates projected cells from serverless row fragments" {
+    const alloc = std.testing.allocator;
+    const row_fragment = @import("../row_fragment/mod.zig");
+
+    var fragment = row_fragment.Fragment{
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .row_refs = try alloc.alloc(row_fragment.RowRef, 2),
+        .columns = try alloc.alloc(row_fragment.Column, 1),
+    };
+    defer fragment.deinit(alloc);
+    fragment.row_refs[0] = .{ .key = try alloc.dupe(u8, "row:a"), .ordinal = 0 };
+    fragment.row_refs[1] = .{ .key = try alloc.dupe(u8, "row:b"), .ordinal = 1 };
+    fragment.columns[0] = .{
+        .name = try alloc.dupe(u8, "amount"),
+        .kind = .i64,
+        .values = try alloc.alloc(row_fragment.CellValue, 2),
+    };
+    fragment.columns[0].values[0] = .{ .i64 = 10 };
+    fragment.columns[0].values[1] = .{ .i64 = 20 };
+
+    var fragment_source = row_fragment.FragmentSource.init(
+        .{ .table_id = "orders", .snapshot_id = "manifest-7" },
+        "frag-1",
+        &fragment,
+    );
+    defer fragment_source.deinit(alloc);
+
+    const wanted = [_]rowsource.RowRef{.{ .serverless = .{
+        .fragment_id = "frag-1",
+        .row_ordinal = 1,
+    } }};
+    const projection = [_][]const u8{"amount"};
+    var result = try hydrateRowsAlloc(alloc, fragment_source.rowSource(), &wanted, &projection);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(wanted[0], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
 }

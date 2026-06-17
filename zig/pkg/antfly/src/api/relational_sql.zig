@@ -86027,12 +86027,36 @@ test "postgres sql adapter rejects unsupported application shapes explicitly" {
     defer commented_update.deinit(alloc);
     try std.testing.expectEqualStrings("users", commented_update.table_name);
     try std.testing.expectEqual(@as(u32, 1), commented_update.batch.transformed);
+    {
+        var with_update_tokens = try tokenizeAlloc(alloc, "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)");
+        defer freeTokens(alloc, &with_update_tokens);
+        try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.update, sql_adapter.classifyWriteStatement(with_update_tokens.items).?);
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanAlloc(
+        alloc,
+        "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)",
+        schema,
+        &.{},
+        .{ .unique_resolver = resolver_ctx.resolver() },
+    ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDeleteAlloc(
         alloc,
         "DELETE FROM users WHERE organization_id = 'o1'",
         schema,
         &.{},
         resolver_ctx.resolver(),
+    ));
+    {
+        var with_delete_tokens = try tokenizeAlloc(alloc, "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)");
+        defer freeTokens(alloc, &with_delete_tokens);
+        try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.delete, sql_adapter.classifyWriteStatement(with_delete_tokens.items).?);
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanAlloc(
+        alloc,
+        "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)",
+        schema,
+        &.{},
+        .{ .unique_resolver = resolver_ctx.resolver() },
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverAlloc(
         alloc,
