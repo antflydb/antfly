@@ -412,6 +412,31 @@ func TestHAClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
 	}
 }
 
+func TestHAClientCurrentFenceAcceptsEmptyReceiptReason(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/v1/ha/fence/current" {
+			t.Fatalf("path = %s, want /admin/v1/ha/fence/current", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"schema_version":1,"held":true,"receipt":{"identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":5},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":2,"parent_epoch":3,"new_timeline_id":4,"new_epoch":5,"required_lsn":8,"observed_lsn":8,"generation":9,"forced":false,"token":"fence-token","reason":""}}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.CurrentFence(context.Background())
+	if err != nil {
+		t.Fatalf("CurrentFence returned error: %v", err)
+	}
+	if !resp.Held || resp.Receipt.Reason != "" {
+		t.Fatalf("CurrentFence response = %#v, want held receipt with empty reason", resp)
+	}
+}
+
 func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	t.Parallel()
 
@@ -864,6 +889,11 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	}
 	if err := ValidateHAFenceResponse(response); err != nil {
 		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
+	}
+	emptyReason := response
+	emptyReason.Receipt.Reason = ""
+	if err := ValidateHAFenceResponse(emptyReason); err != nil {
+		t.Fatalf("ValidateHAFenceResponse with empty reason returned error: %v", err)
 	}
 	wrongActionNode := response
 	wrongActionNode.Action.NodeId = "standby-b"

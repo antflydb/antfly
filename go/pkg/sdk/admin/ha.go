@@ -1701,8 +1701,7 @@ func HAFenceReceiptComplete(receipt HAFenceReceipt) bool {
 		receipt.NewEpoch > 0 &&
 		receipt.RequiredLsn > 0 &&
 		receipt.Generation > 0 &&
-		strings.TrimSpace(receipt.Token) != "" &&
-		strings.TrimSpace(receipt.Reason) != ""
+		strings.TrimSpace(receipt.Token) != ""
 }
 
 func HAFenceReceiptEmpty(receipt HAFenceReceipt) bool {

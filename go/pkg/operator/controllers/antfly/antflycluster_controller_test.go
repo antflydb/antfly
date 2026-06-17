@@ -4221,6 +4221,10 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(openAPIFence.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIFence.FenceToken).To(Equal("ha-fence-token"))
 
+	emptyReasonFence, ok := parseHADirectAdminActionResult([]byte(strings.Replace(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token"), `"reason":"LeaseAcquired"`, `"reason":""`, 1)))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(emptyReasonFence.FenceReason).To(Equal(""))
+
 	_, ok = parseHADirectAdminActionResult([]byte(haFenceResponseJSONWithoutReceiptPath("forced")))
 	g.Expect(ok).To(BeFalse())
 
