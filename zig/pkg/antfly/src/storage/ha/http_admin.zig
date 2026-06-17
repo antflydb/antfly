@@ -539,12 +539,14 @@ pub const Server = struct {
         defer if (current) |*result| result.deinit(self.alloc);
 
         if (current) |result| {
-            return try self.handleTypedJson(CurrentFenceDocument{
+            return try self.handleTypedJson(admin_api.HACurrentFenceResponse{
+                .schema_version = 1,
                 .held = true,
-                .receipt = result.receipt,
+                .receipt = try adminFenceReceipt(result.receipt),
             });
         }
-        return try self.handleTypedJson(CurrentFenceDocument{
+        return try self.handleTypedJson(admin_api.HACurrentFenceResponse{
+            .schema_version = 1,
             .held = false,
             .receipt = null,
         });
@@ -559,11 +561,18 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        var receipt = try actionReceiptAlloc(self.alloc, "fence_acquire", result.receipt.promoted_node_id, "applied", result.receipt.promoted_node_id);
-        defer receipt.deinit(self.alloc);
-        return try self.handleTypedJson(FenceDocument{
-            .action = receipt,
-            .receipt = result.receipt,
+        const action_id = try std.fmt.allocPrint(self.alloc, "fence_acquire:{s}", .{result.receipt.promoted_node_id});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HAFenceResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "fence_acquire",
+                .target = result.receipt.promoted_node_id,
+                .state = "applied",
+                .node_id = result.receipt.promoted_node_id,
+            },
+            .receipt = try adminFenceReceipt(result.receipt),
         });
     }
 
@@ -893,18 +902,6 @@ const OwnerJobCheckDocument = struct {
     decision: owner_job_gate.Decision,
 };
 
-const FenceDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    receipt: fencing.Receipt,
-};
-
-const CurrentFenceDocument = struct {
-    schema_version: u32 = 1,
-    held: bool,
-    receipt: ?fencing.Receipt,
-};
-
 const ActionReceiptDocument = struct {
     action_id: []const u8,
     action_kind: []const u8,
@@ -1036,6 +1033,24 @@ fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
         .table_id = try adminI64(identity.table_id),
         .timeline_id = try adminI64(identity.timeline_id),
         .epoch = try adminI64(identity.epoch),
+    };
+}
+
+fn adminFenceReceipt(receipt: fencing.Receipt) !admin_api.HAFenceReceipt {
+    return .{
+        .identity = try adminIdentity(receipt.identity),
+        .old_primary_id = receipt.old_primary_id,
+        .promoted_node_id = receipt.promoted_node_id,
+        .parent_timeline_id = try adminI64(receipt.parent_timeline_id),
+        .parent_epoch = try adminI64(receipt.parent_epoch),
+        .new_timeline_id = try adminI64(receipt.new_timeline_id),
+        .new_epoch = try adminI64(receipt.new_epoch),
+        .required_lsn = try adminI64(receipt.required_lsn),
+        .observed_lsn = try adminI64(receipt.observed_lsn),
+        .generation = try adminI64(receipt.generation),
+        .forced = receipt.forced,
+        .token = receipt.token,
+        .reason = receipt.reason,
     };
 }
 
