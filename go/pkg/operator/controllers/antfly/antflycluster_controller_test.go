@@ -1996,6 +1996,9 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		LastPromotion: &antflyv1.HAPromotionStatus{
 			OldPrimaryID:      "primary-a",
 			PromotedStandbyID: "standby-a",
+			ClusterID:         100,
+			ShardID:           10,
+			TableID:           20,
 			ParentTimelineID:  4,
 			ParentEpoch:       6,
 			NewTimelineID:     5,
@@ -2087,6 +2090,9 @@ func TestHAFormerPrimaryActionRequiresPromotionReceiptEvidence(t *testing.T) {
 		LastPromotion: &antflyv1.HAPromotionStatus{
 			OldPrimaryID:      "primary-a",
 			PromotedStandbyID: "standby-a",
+			ClusterID:         100,
+			ShardID:           10,
+			TableID:           20,
 			ParentTimelineID:  4,
 			ParentEpoch:       6,
 			NewTimelineID:     5,
@@ -2606,6 +2612,9 @@ func TestHAPrimaryRouteActionRequiresMatchingPromotionEvidence(t *testing.T) {
 		LastPromotion: &antflyv1.HAPromotionStatus{
 			OldPrimaryID:      "primary-a",
 			PromotedStandbyID: "standby-a",
+			ClusterID:         100,
+			ShardID:           10,
+			TableID:           20,
 			ParentTimelineID:  4,
 			ParentEpoch:       6,
 			NewTimelineID:     5,
@@ -2660,6 +2669,8 @@ func TestHAPrimaryRouteActionRequiresDirectPromotionResultToMatchRecordedPromoti
 			FenceGeneration:       7,
 			FenceToken:            "ha-fence-token",
 			FenceClusterID:        100,
+			FenceShardID:          10,
+			FenceTableID:          20,
 			FenceOldPrimaryID:     "primary-a",
 			FencePromotedNodeID:   "standby-a",
 			FenceParentTimelineID: 4,
@@ -2686,6 +2697,9 @@ func TestHAPrimaryRouteActionRequiresDirectPromotionResultToMatchRecordedPromoti
 		LastPromotion: &antflyv1.HAPromotionStatus{
 			OldPrimaryID:      "primary-a",
 			PromotedStandbyID: "standby-a",
+			ClusterID:         100,
+			ShardID:           10,
+			TableID:           20,
 			ParentTimelineID:  4,
 			ParentEpoch:       6,
 			NewTimelineID:     5,
@@ -2704,6 +2718,11 @@ func TestHAPrimaryRouteActionRequiresDirectPromotionResultToMatchRecordedPromoti
 
 	status.LastPromotion.NewTimelineID = 5
 	status.LastPromotion.FenceToken = "different-token"
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 1)).To(BeFalse())
+
+	status.LastPromotion.FenceToken = "ha-fence-token"
+	promote.AdminResult.FenceTableID = 21
+	actions = []antflyv1.HAPlannedActionStatus{promote, route}
 	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 1)).To(BeFalse())
 }
 
@@ -3489,6 +3508,9 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(promotion).NotTo(BeNil())
 	g.Expect(promotion.OldPrimaryID).To(Equal("primary-a"))
 	g.Expect(promotion.PromotedStandbyID).To(Equal("standby-a"))
+	g.Expect(promotion.ClusterID).To(Equal(uint64(100)))
+	g.Expect(promotion.ShardID).To(Equal(uint64(10)))
+	g.Expect(promotion.TableID).To(Equal(uint64(20)))
 	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
 	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))

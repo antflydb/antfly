@@ -453,6 +453,9 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 		LastPromotion: &antflyv1.HAPromotionStatus{
 			OldPrimaryID:      "primary-a",
 			PromotedStandbyID: "standby-a",
+			ClusterID:         100,
+			ShardID:           10,
+			TableID:           20,
 			ParentTimelineID:  4,
 			ParentEpoch:       6,
 			NewTimelineID:     5,
@@ -491,6 +494,16 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 	}
 
 	status.LastPromotion.FenceToken = "ha-fence-token"
+	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
+	previous.AdminResult.FenceTableID = 21
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+	notPreserved = haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected promotion evidence with mismatched identity scope to be dropped, got %#v", notPreserved)
+	}
+
 	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
 	previous.AdminResult.FenceOldPrimaryID = "different-primary"
 	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}

@@ -1940,6 +1940,18 @@ type HAFormerPrimaryStatus struct {
 
 // HAPromotionStatus reports a completed HA promotion.
 type HAPromotionStatus struct {
+	// ClusterID is the replicated cluster identity of the promotion scope.
+	// +optional
+	ClusterID uint64 `json:"clusterID,omitempty"`
+
+	// ShardID is the replicated shard identity of the promotion scope. Zero means whole-instance or default shard scope.
+	// +optional
+	ShardID uint64 `json:"shardID,omitempty"`
+
+	// TableID is the replicated table identity of the promotion scope. Zero means whole-instance or default table scope.
+	// +optional
+	TableID uint64 `json:"tableID,omitempty"`
+
 	OldPrimaryID string `json:"oldPrimaryID,omitempty"`
 
 	PromotedStandbyID string `json:"promotedStandbyID,omitempty"`

@@ -4437,6 +4437,9 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, *action) {
 		now := metav1.Now()
 		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+			ClusterID:         identity.ClusterID,
+			ShardID:           identity.ShardID,
+			TableID:           identity.TableID,
 			OldPrimaryID:      identity.CurrentPrimaryID,
 			PromotedStandbyID: action.StandbyName,
 			FenceAuthority:    action.FenceAuthority,
@@ -4576,6 +4579,9 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 		}
 		now := metav1.Now()
 		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+			ClusterID:         identity.ClusterID,
+			ShardID:           identity.ShardID,
+			TableID:           identity.TableID,
 			OldPrimaryID:      identity.CurrentPrimaryID,
 			PromotedStandbyID: action.StandbyName,
 			ParentTimelineID:  identity.TimelineID,
@@ -4845,6 +4851,9 @@ func (r *AntflyClusterReconciler) haAdminJobLogBody(ctx context.Context, cluster
 
 func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
 	return status != nil &&
+		(status.ClusterID == 0 || status.ClusterID == identity.ClusterID) &&
+		(status.ClusterID == 0 || status.ShardID == identity.ShardID) &&
+		(status.ClusterID == 0 || status.TableID == identity.TableID) &&
 		status.OldPrimaryID == identity.CurrentPrimaryID &&
 		status.PromotedStandbyID == action.StandbyName &&
 		status.ParentTimelineID == identity.TimelineID &&
@@ -5550,6 +5559,15 @@ func parseHAResultBool(lines map[string]string, key string) (bool, bool) {
 }
 
 func applyHAPromotionJobResult(promotion *antflyv1.HAPromotionStatus, result haPromotionJobResult) {
+	if result.NewClusterID != 0 {
+		promotion.ClusterID = result.NewClusterID
+		promotion.ShardID = result.NewShardID
+		promotion.TableID = result.NewTableID
+	} else if result.ParentClusterID != 0 {
+		promotion.ClusterID = result.ParentClusterID
+		promotion.ShardID = result.ParentShardID
+		promotion.TableID = result.ParentTableID
+	}
 	promotion.ParentTimelineID = result.ParentTimelineID
 	promotion.ParentEpoch = result.ParentEpoch
 	promotion.NewTimelineID = result.NewTimelineID
@@ -6569,6 +6587,10 @@ func haPrimaryRouteActionMatchesPromotionResult(status *antflyv1.HAStatus, actio
 			(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
 			(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
 			(promotion.FenceToken == "" || promotion.FenceToken == result.FenceToken) &&
+			result.FenceClusterID != 0 &&
+			(promotion.ClusterID == 0 || promotion.ClusterID == result.FenceClusterID) &&
+			(promotion.ClusterID == 0 || promotion.ShardID == result.FenceShardID) &&
+			(promotion.ClusterID == 0 || promotion.TableID == result.FenceTableID) &&
 			(promotion.ParentTimelineID == 0 || promotion.ParentTimelineID == result.FenceParentTimelineID) &&
 			(promotion.ParentEpoch == 0 || promotion.ParentEpoch == result.FenceParentEpoch) &&
 			(promotion.NewTimelineID == 0 || promotion.NewTimelineID == result.FenceNewTimelineID) &&
@@ -6622,6 +6644,9 @@ func haPromotionActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, act
 		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(action.StandbyName) &&
 		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(result.FencePromotedNodeID) &&
 		result.FenceClusterID != 0 &&
+		(promotion.ClusterID == 0 || promotion.ClusterID == result.FenceClusterID) &&
+		(promotion.ClusterID == 0 || promotion.ShardID == result.FenceShardID) &&
+		(promotion.ClusterID == 0 || promotion.TableID == result.FenceTableID) &&
 		(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
 		(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
 		promotion.FenceGeneration == result.FenceGeneration &&
