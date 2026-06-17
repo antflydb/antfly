@@ -3331,7 +3331,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/replication-slots", body)
 		if err == nil {
-			applyHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionPauseSlot):
@@ -3341,7 +3341,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/pause", nil)
 		if err == nil {
-			applyHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionResumeSlot):
@@ -3351,7 +3351,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/resume", nil)
 		if err == nil {
-			applyHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionDropSlot):
@@ -3361,7 +3361,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodDelete, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName), nil)
 		if err == nil {
-			applyHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionSeedStandby), string(haActionMarkReseed):
@@ -3375,7 +3375,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
 		if err == nil {
-			applyHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionAcquireFence):
@@ -3385,7 +3385,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/fence", body)
 		if err == nil {
-			applyHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionPromoteStandby):
@@ -3598,15 +3598,26 @@ type haDirectAdminActionResultEnvelope struct {
 	} `json:"result"`
 }
 
-func applyHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) {
+func requireHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) error {
+	if applyHADirectAdminActionResult(action, raw) {
+		return nil
+	}
+	if action == nil || !haActionRequiresAdminResult(haActionKind(action.Kind)) {
+		return nil
+	}
+	return fmt.Errorf("HA admin action %s succeeded without typed result evidence", action.Kind)
+}
+
+func applyHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) bool {
 	if action == nil {
-		return
+		return false
 	}
 	result, ok := parseHADirectAdminActionResult(raw)
 	if !ok {
-		return
+		return false
 	}
 	action.AdminResult = result
+	return true
 }
 
 func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultStatus, bool) {
