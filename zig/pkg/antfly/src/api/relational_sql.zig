@@ -65424,6 +65424,26 @@ test "app parity joined source count coverage tokens are exact" {
     try std.testing.expect(coverage.delete_joined_source_correlated_semijoin);
 }
 
+test "app parity CTE chain coverage count tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .sql = "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
+        .plan = "query:table=usage_records:ctes=20:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none",
+    });
+
+    try std.testing.expect(!coverage.query_cte_chain);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .sql = "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
+        .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none",
+    });
+
+    try std.testing.expect(coverage.query_cte_chain);
+}
+
 test "app parity conflict write count coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -66489,7 +66509,7 @@ const AppParityCorpusCoverage = struct {
                 self.query = true;
                 self.cte_query = self.cte_query or uses_cte_stream;
                 self.query_distinct_on = self.query_distinct_on or appParityPlanHasNonZeroToken(entry.plan, ":distinct_on=");
-                self.query_cte_chain = self.query_cte_chain or std.mem.indexOf(u8, entry.plan, ":ctes=2:") != null;
+                self.query_cte_chain = self.query_cte_chain or appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 2);
                 self.query_cte_structured_access = self.query_cte_structured_access or std.mem.indexOf(u8, entry.plan, ":cte0_") != null;
                 self.query_cte_expression_access = self.query_cte_expression_access or
                     (std.mem.indexOf(u8, entry.plan, ":cte0_expr_") != null or

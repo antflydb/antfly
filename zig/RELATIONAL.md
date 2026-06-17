@@ -5384,7 +5384,10 @@ CTE summaries are self-anchored to the typed fingerprint. A fixture may carry
 `ctes` only when its golden plan includes an exact `ctes` token with the same
 value. Point writes and other plans whose runner does not materialize CTE state
 therefore cannot claim CTE coverage through generic summary metadata, and stale
-CTE counts fail before the fixture can be used as parity evidence.
+CTE counts fail before the fixture can be used as parity evidence. Coverage
+accounting for chained CTEs reads the same exact numeric token, so
+suffix-looking values such as `ctes=20` cannot satisfy the two-CTE coverage
+requirement.
 
 Temporal DDL summaries are first-class fixture metadata instead of comments in
 SQL text. `temporal_periods`, `temporal_primary_key`, `temporal_unique`, and
