@@ -35,6 +35,11 @@ pub fn executeRelationalSqlDdlOnUserManager(
             .grant_privilege => |grant| return try executePrivilegeChange(manager, alloc, grant, .grant),
             .revoke_privilege => |revoke| return try executePrivilegeChange(manager, alloc, revoke, .revoke),
         },
+        .row_security_catalog => |row_security_plan| switch (row_security_plan) {
+            .alter_table => |alter| return try executeAlterRowSecurity(alloc, alter),
+            .create_policy => |create| return try executeCreateRowSecurityPolicy(manager, alloc, create),
+            .drop_policy => |drop| return try executeDropRowSecurityPolicy(manager, alloc, drop),
+        },
         else => return null,
     }
 }
@@ -94,6 +99,40 @@ fn executePrivilegeChange(
     return try changedRecordAlloc(alloc);
 }
 
+fn executeAlterRowSecurity(
+    alloc: std.mem.Allocator,
+    plan: relational_sql.AlterRowSecurityPlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (!plan.enabled) return error.UnsupportedSqlShape;
+    return try changedRecordAlloc(alloc);
+}
+
+fn executeCreateRowSecurityPolicy(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: relational_sql.CreateRowSecurityPolicyPlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
+    defer alloc.free(filter_json);
+    try manager.createSqlRowSecurityPolicy(plan.policy_name, plan.table_name, filter_json);
+    return try changedRecordAlloc(alloc);
+}
+
+fn executeDropRowSecurityPolicy(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: relational_sql.DropRowSecurityPolicyPlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    manager.dropSqlRowSecurityPolicy(plan.policy_name, plan.table_name) catch |err| switch (err) {
+        error.RowFilterNotFound => {
+            if (plan.if_exists) return try noopRecordAlloc(alloc);
+            return err;
+        },
+        else => return err,
+    };
+    return try changedRecordAlloc(alloc);
+}
+
 fn resourceTypeForSqlObjectKind(object_kind: []const u8) !usermgr.ResourceType {
     if (std.ascii.eqlIgnoreCase(object_kind, "table")) return .table;
     if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .user;
@@ -141,6 +180,37 @@ fn sqlPrivilegeMappingCount(privilege_name: []const u8) usize {
     }
     if (std.ascii.eqlIgnoreCase(privilege_name, "all")) return 3;
     return 0;
+}
+
+fn rowSecurityFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    predicate: relational_sql.RowSecurityPolicyPredicate,
+) ![]u8 {
+    return switch (predicate) {
+        .current_setting_equals => |current_setting| try currentSettingRowFilterJsonAlloc(alloc, current_setting),
+    };
+}
+
+fn currentSettingRowFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    predicate: relational_sql.RowSecurityCurrentSettingPredicate,
+) ![]u8 {
+    const auth_metadata_key = authMetadataKeyForSqlSetting(predicate.setting_name);
+    if (auth_metadata_key.len == 0) return error.UnsupportedSqlShape;
+    const field_json = try std.json.stringifyAlloc(alloc, predicate.field, .{});
+    defer alloc.free(field_json);
+    const auth_path = try std.fmt.allocPrint(alloc, "metadata.{s}", .{auth_metadata_key});
+    defer alloc.free(auth_path);
+    const auth_path_json = try std.json.stringifyAlloc(alloc, auth_path, .{});
+    defer alloc.free(auth_path_json);
+    return try std.fmt.allocPrint(alloc, "{{\"term\":{{{s}:{{\"$auth\":{s}}}}}}}", .{ field_json, auth_path_json });
+}
+
+fn authMetadataKeyForSqlSetting(setting_name: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, setting_name, "app.") and setting_name.len > "app.".len) {
+        return setting_name["app.".len..];
+    }
+    return setting_name;
 }
 
 fn executePermissionChange(
@@ -297,4 +367,53 @@ test "sql auth adapter grants directly to existing antfly users" {
 
     try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
     try std.testing.expect(!(try manager.roleSubjectExists("role:alice")));
+}
+
+test "sql auth adapter applies row security policies through user manager" {
+    const alloc = std.testing.allocator;
+
+    var store = usermgr.MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try usermgr.UserManager.init(
+        alloc,
+        store.iface(),
+        try usermgr.initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUserWithMetadata("alice", "secret", &.{}, "{\"tenant_id\":\"acme\"}");
+    defer user.deinit(alloc);
+
+    var enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
+    defer enabled.deinit(alloc);
+
+    var created = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));")).?;
+    defer created.deinit(alloc);
+
+    const stored = try manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"$auth\":\"metadata.tenant_id\"") != null);
+
+    const filters = try manager.getRowFilters("alice");
+    defer {
+        for (filters) |*entry| entry.deinit(alloc);
+        alloc.free(filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("usage_records", filters[0].table);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"$auth\":\"metadata.tenant_id\"") != null);
+
+    try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;"));
+
+    var dropped = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;")).?;
+    defer dropped.deinit(alloc);
+    try std.testing.expectError(error.RowFilterNotFound, manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records"));
+
+    var missing = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY IF EXISTS usage_records_tenant_policy ON usage_records;")).?;
+    defer missing.deinit(alloc);
+    try std.testing.expect(missing.noop);
 }

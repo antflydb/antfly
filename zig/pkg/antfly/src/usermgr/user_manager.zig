@@ -32,6 +32,7 @@ pub const default_rbac_model_text =
 ;
 
 const sql_role_catalog_subject = "__antfly_sql_role_catalog__";
+const sql_row_security_policy_subject_prefix = "__antfly_sql_rls_policy__:";
 
 pub const ResourceType = enum {
     table,
@@ -757,6 +758,48 @@ pub const UserManager = struct {
         return rules.len > 0;
     }
 
+    pub fn createSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8) !void {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        if (self.getSubjectRowFilter(subject, table)) |existing| {
+            self.alloc.free(existing);
+            return error.PolicyExists;
+        } else |err| switch (err) {
+            error.RowFilterNotFound => {},
+            else => return err,
+        }
+        try self.setSubjectRowFilter(subject, table, filter_json);
+    }
+
+    pub fn dropSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8) !void {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        try self.removeSubjectRowFilter(subject, table);
+    }
+
+    pub fn getSqlRowSecurityPolicy(self: *const UserManager, policy_name: []const u8, table: []const u8) ![]u8 {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        return try self.getSubjectRowFilter(subject, table);
+    }
+
+    fn mergeSqlRowSecurityPolicyFilters(self: *const UserManager, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            if (!isSqlRowSecurityPolicySubject(rule.fields[0])) continue;
+            const entry = RowFilterEntry{
+                .table = @constCast(rule.fields[1]),
+                .filter = @constCast(rule.fields[2]),
+            };
+            try mergeRowFilterEntry(self.alloc, merged, entry);
+        }
+    }
+
     pub fn addRoleToUser(self: *UserManager, username: []const u8, role: []const u8) !void {
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addRoleToSubject(username, role);
@@ -957,6 +1000,8 @@ pub const UserManager = struct {
         for (listed) |entry| {
             try mergeRowFilterEntry(self.alloc, &merged, entry);
         }
+
+        try self.mergeSqlRowSecurityPolicyFilters(&merged);
 
         for (roles) |role| {
             const role_filters = try self.listSubjectRowFilters(role);
@@ -1225,6 +1270,7 @@ fn putAuthSubject(
 ) !void {
     if (subject.len == 0) return;
     if (std.mem.eql(u8, subject, sql_role_catalog_subject)) return;
+    if (isSqlRowSecurityPolicySubject(subject)) return;
     const owned_subject = try alloc.dupe(u8, subject);
     errdefer alloc.free(owned_subject);
     const gop = try subjects.getOrPut(alloc, owned_subject);
@@ -1237,6 +1283,15 @@ fn putAuthSubject(
     }
     gop.key_ptr.* = owned_subject;
     gop.value_ptr.* = kind;
+}
+
+fn sqlRowSecurityPolicySubjectAlloc(alloc: Allocator, policy_name: []const u8) ![]u8 {
+    if (policy_name.len == 0) return error.InvalidRole;
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ sql_row_security_policy_subject_prefix, policy_name });
+}
+
+fn isSqlRowSecurityPolicySubject(subject: []const u8) bool {
+    return std.mem.startsWith(u8, subject, sql_row_security_policy_subject_prefix);
 }
 
 fn combineLayeredRowFilters(
