@@ -8778,6 +8778,10 @@ spec:
                                 LSN returned by seed bootstrap.
                               format: int64
                               type: integer
+                            dataLossDiscarded:
+                              description: DataLossDiscarded reports whether rewind
+                                would discard former-primary data.
+                              type: boolean
                             endRecordLSN:
                               description: EndRecordLSN is the durable backup_end
                                 record LSN returned by seed finish.
@@ -8792,10 +8796,37 @@ spec:
                               description: FenceToken is the opaque promotion fence
                                 receipt token returned by fence operations.
                               type: string
+                            forkLSN:
+                              description: ForkLSN is the timeline fork LSN returned
+                                by a rejoin assessment.
+                              format: int64
+                              type: integer
+                            formerLastLSN:
+                              description: FormerLastLSN is the former primary's last
+                                observed LSN returned by a rejoin assessment.
+                              format: int64
+                              type: integer
+                            formerNodeID:
+                              description: FormerNodeID is the former-primary node
+                                id returned by a rejoin assessment.
+                              type: string
                             manifestID:
                               description: ManifestID is the base-backup manifest/action
                                 id returned by seed operations.
                               type: string
+                            rejoinAction:
+                              description: RejoinAction is the former-primary rejoin
+                                action returned by a rejoin assessment.
+                              type: string
+                            rejoinReason:
+                              description: RejoinReason is the former-primary rejoin
+                                reason returned by a rejoin assessment.
+                              type: string
+                            retainedFromLSN:
+                              description: RetainedFromLSN is the earliest retained
+                                WAL LSN used by a rejoin assessment.
+                              format: int64
+                              type: integer
                             schemaVersion:
                               description: SchemaVersion is the response schema version
                                 returned by the HA admin API.
@@ -8812,6 +8843,16 @@ spec:
                             startRecordLSN:
                               description: StartRecordLSN is the durable backup_start
                                 record LSN returned by seed begin.
+                              format: int64
+                              type: integer
+                            targetEpoch:
+                              description: TargetEpoch is the promoted epoch returned
+                                by a rejoin assessment.
+                              format: int64
+                              type: integer
+                            targetTimelineID:
+                              description: TargetTimelineID is the promoted timeline
+                                returned by a rejoin assessment.
                               format: int64
                               type: integer
                           type: object

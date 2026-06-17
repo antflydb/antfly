@@ -856,6 +856,16 @@ func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/rejoin/assess"}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RejoinAction).To(Equal("rewind"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RejoinReason).To(Equal("parent_timeline_retained"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FormerNodeID).To(Equal("primary-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.TargetTimelineID).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.TargetEpoch).To(Equal(uint64(7)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ForkLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FormerLastLSN).To(Equal(uint64(13)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RetainedFromLSN).To(Equal(uint64(8)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.DataLossDiscarded).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Fenced).To(BeTrue())
@@ -1238,6 +1248,42 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 		FenceToken:      "ha-fence-token",
 	}
 	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeTrue())
+
+	rejoinActions := []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionRewindFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+		AdminCommand:    []string{"rejoin", "assess"},
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+	}, {
+		Kind:      string(haActionUpdatePrimaryRoute),
+		DependsOn: string(haActionRewindFormerPrimary),
+	}}
+	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeFalse())
+
+	rejoinActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		RejoinAction:     "reseed",
+		FormerNodeID:     "primary-a",
+		TargetTimelineID: 5,
+		TargetEpoch:      7,
+		ForkLSN:          12,
+		FormerLastLSN:    13,
+		RetainedFromLSN:  8,
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeFalse())
+
+	rejoinActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		RejoinAction:     "rewind",
+		FormerNodeID:     "primary-a",
+		TargetTimelineID: 5,
+		TargetEpoch:      7,
+		ForkLSN:          12,
+		FormerLastLSN:    13,
+		RetainedFromLSN:  8,
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeTrue())
 }
 
 func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
@@ -1930,6 +1976,30 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceToken).To(Equal("promotion-token"))
+
+	rejoin, ok := parseHAAdminActionResultTable(strings.Join([]string{
+		"result=rejoin_assess",
+		"action=rewind",
+		"reason=parent_timeline_retained",
+		"former_node_id=primary-a",
+		"target_timeline_id=5",
+		"target_epoch=7",
+		"fork_lsn=12",
+		"former_last_lsn=13",
+		"retained_from_lsn=8",
+		"data_loss_discarded=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(rejoin.RejoinAction).To(Equal("rewind"))
+	g.Expect(rejoin.RejoinReason).To(Equal("parent_timeline_retained"))
+	g.Expect(rejoin.FormerNodeID).To(Equal("primary-a"))
+	g.Expect(rejoin.TargetTimelineID).To(Equal(uint64(5)))
+	g.Expect(rejoin.TargetEpoch).To(Equal(uint64(7)))
+	g.Expect(rejoin.ForkLSN).To(Equal(uint64(12)))
+	g.Expect(rejoin.FormerLastLSN).To(Equal(uint64(13)))
+	g.Expect(rejoin.RetainedFromLSN).To(Equal(uint64(8)))
+	g.Expect(rejoin.DataLossDiscarded).To(BeTrue())
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {

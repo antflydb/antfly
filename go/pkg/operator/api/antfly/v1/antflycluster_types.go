@@ -1609,6 +1609,42 @@ type HAAdminActionResultStatus struct {
 	// FenceToken is the opaque promotion fence receipt token returned by fence operations.
 	// +optional
 	FenceToken string `json:"fenceToken,omitempty"`
+
+	// RejoinAction is the former-primary rejoin action returned by a rejoin assessment.
+	// +optional
+	RejoinAction string `json:"rejoinAction,omitempty"`
+
+	// RejoinReason is the former-primary rejoin reason returned by a rejoin assessment.
+	// +optional
+	RejoinReason string `json:"rejoinReason,omitempty"`
+
+	// FormerNodeID is the former-primary node id returned by a rejoin assessment.
+	// +optional
+	FormerNodeID string `json:"formerNodeID,omitempty"`
+
+	// TargetTimelineID is the promoted timeline returned by a rejoin assessment.
+	// +optional
+	TargetTimelineID uint64 `json:"targetTimelineID,omitempty"`
+
+	// TargetEpoch is the promoted epoch returned by a rejoin assessment.
+	// +optional
+	TargetEpoch uint64 `json:"targetEpoch,omitempty"`
+
+	// ForkLSN is the timeline fork LSN returned by a rejoin assessment.
+	// +optional
+	ForkLSN uint64 `json:"forkLSN,omitempty"`
+
+	// FormerLastLSN is the former primary's last observed LSN returned by a rejoin assessment.
+	// +optional
+	FormerLastLSN uint64 `json:"formerLastLSN,omitempty"`
+
+	// RetainedFromLSN is the earliest retained WAL LSN used by a rejoin assessment.
+	// +optional
+	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
+
+	// DataLossDiscarded reports whether rewind would discard former-primary data.
+	// +optional
+	DataLossDiscarded bool `json:"dataLossDiscarded,omitempty"`
 }
 
 // HAPrimaryRouteStatus reports the operator-facing primary endpoint target.
