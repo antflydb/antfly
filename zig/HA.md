@@ -448,10 +448,11 @@ The implementation path is:
 2. regenerate the Zig admin OpenAPI bindings;
 3. re-export shared request/response types and route constants from the Zig
    admin package rooted at `zig/pkg/antfly/src/admin/`;
-4. implement the node-local handler by consuming those admin package types and
-   route constants, keeping HA admin routing and request/response glue under
-   `zig/pkg/antfly/src/admin/` rather than scattering it through unrelated
-   HTTP modules; and
+4. implement node-local behavior by consuming those admin package types and
+   route constants from the HA storage adapter. The admin package owns the
+   HTTP contract, generated request parsing helpers, and shared route/type
+   surface; storage HA modules own execution against local WAL, slots, fences,
+   promotion state, and rejoin state; and
 5. have the CLI and `go/pkg/operator` call the typed `/admin/v1/ha` contract.
 
 The generated Zig module for this spec should remain the admin contract module
@@ -607,12 +608,15 @@ and either rewind or reseed.
   the dedicated `specs/openapi/antfly/admin.yaml` OpenAPI spec, separate from
   public DB and `/internal/v1` specs.
 - Generate and re-export Zig admin request/response types from that spec, and
-  keep admin routing, request parsing, response generation, and shared route
-  constants in `zig/pkg/antfly/src/admin/`.
+  keep generated request parsing helpers and shared route/type constants in
+  `zig/pkg/antfly/src/admin/`.
 - Keep `specs/openapi/antfly/admin.yaml` and `zig/pkg/antfly/src/admin/` as the
   only source locations for HA admin HTTP contract definitions. Public DB specs
   and `/internal/v1` specs may reference HA concepts only as clients of the
   contract, not as owners of HA operator actions.
+- Implement node-local admin behavior in the HA runtime by importing
+  `zig/pkg/antfly/src/admin/` types and routes, not by hard-coding new
+  `/admin/v1/ha` paths or request/response schemas in storage modules.
 - Add a CI or unit-test guard that fails when a documented `/admin/v1/ha`
   route is implemented without a matching `operationId` in
   `specs/openapi/antfly/admin.yaml`.
