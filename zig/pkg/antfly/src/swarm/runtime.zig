@@ -64,6 +64,7 @@ const CliConfig = struct {
     ha_primary_node_id: ?[]const u8 = null,
     ha_fence_wal: ?[]const u8 = null,
     ha_former_primary_log: ?[]const u8 = null,
+    ha_admin_token_env: ?[]const u8 = null,
     ha_sync_mode: ?antfly.ha.primary.DurabilityMode = null,
     ha_sync_selection: ?antfly.ha.primary.StandbySelection = null,
     ha_sync_required: ?usize = null,
@@ -748,6 +749,8 @@ pub fn runFromIterator(
     defer if (ha_fence_store) |*store| store.close();
     var ha_former_primary_log = try openHAFormerPrimaryLogFromCli(alloc, setup_io.io(), cli);
     defer if (ha_former_primary_log) |*log| log.close();
+    const ha_admin_bearer_token = try resolveHAAdminBearerTokenFromCli(alloc, cli);
+    defer if (ha_admin_bearer_token) |token| alloc.free(token);
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -782,6 +785,7 @@ pub fn runFromIterator(
                 .fence_store = if (ha_fence_store) |*store| store else null,
                 .former_primary_log = if (ha_former_primary_log) |*log| log else null,
             },
+            .admin_bearer_token = ha_admin_bearer_token,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_sync_policy = ha_sync_policy.policy,
             .standby_replication = try haStandbyReplicationConfigFromCli(cli),
@@ -1831,6 +1835,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.ha_former_primary_log = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-admin-token-env")) {
+            cfg.ha_admin_token_env = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-sync-mode")) {
             cfg.ha_sync_mode = try parseHASyncDurabilityMode(args.next() orelse return error.InvalidArguments);
             continue;
@@ -2078,6 +2086,10 @@ fn validateHARole(cli: CliConfig) !void {
     if (haIdentityRequested(cli) and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_fence_wal != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
+    if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
+    if (cli.ha_admin_token_env) |env_var| {
+        if (std.mem.trim(u8, env_var, " \t\r\n").len == 0) return error.HAAdminTokenEnvMissing;
+    }
     if ((primary_requested or standby_requested) and cli.ha_fence_wal == null) return error.HAFenceWalMissing;
     if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
 }
@@ -2210,6 +2222,20 @@ fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliC
     return try antfly.ha.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
 }
 
+fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]u8 {
+    const raw_env_var = cli.ha_admin_token_env orelse return null;
+    const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
+    if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
+
+    const env_var_z = try alloc.dupeZ(u8, env_var);
+    defer alloc.free(env_var_z);
+
+    const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.HAAdminTokenMissing;
+    const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
+    if (token.len == 0) return error.HAAdminTokenMissing;
+    return try alloc.dupe(u8, token);
+}
+
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
 }
@@ -2288,6 +2314,7 @@ fn printUsage() void {
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
         \\  --ha-fence-wal <path>                 Durable HA promotion fence WAL path
         \\  --ha-former-primary-log <path>        Durable HA log used by former-primary rewind admin workflows
+        \\  --ha-admin-token-env <name>           Require Authorization: Bearer token from this environment variable for /admin/v1/ha
         \\  --ha-sync-mode <mode>                 HA primary sync mode: async, remote-write, remote-apply
         \\  --ha-sync-selection <selection>       HA sync standby selection: any, first, all
         \\  --ha-sync-required <n>                HA sync required standby acknowledgements
@@ -2582,6 +2609,8 @@ test "parse cli accepts HA primary runtime flags" {
         "/tmp/ha-fence.wal",
         "--ha-former-primary-log",
         "/tmp/ha-primary.log",
+        "--ha-admin-token-env",
+        "ANTFLY_HA_ADMIN_TOKEN",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -2602,6 +2631,7 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqualStrings("primary-a", cfg.ha_primary_node_id.?);
     try std.testing.expectEqualStrings("/tmp/ha-fence.wal", cfg.ha_fence_wal.?);
     try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_former_primary_log.?);
+    try std.testing.expectEqualStrings("ANTFLY_HA_ADMIN_TOKEN", cfg.ha_admin_token_env.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
@@ -2753,6 +2783,14 @@ test "swarm HA runtime rejects ambiguous role flags" {
     }));
     try std.testing.expectError(error.HARoleMissing, validateHARole(.{
         .ha_former_primary_log = "/tmp/former-primary.wal",
+    }));
+    try std.testing.expectError(error.HARoleMissing, validateHARole(.{
+        .ha_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN",
+    }));
+    try std.testing.expectError(error.HAAdminTokenEnvMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_admin_token_env = " \t ",
     }));
     try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",

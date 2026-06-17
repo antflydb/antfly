@@ -54,11 +54,21 @@ pub const CommandRequest = struct {
 pub const Server = struct {
     alloc: Allocator,
     ctx: admin_exec.Context,
+    auth: AuthOptions = .{},
+
+    pub const AuthOptions = struct {
+        bearer_token: ?[]const u8 = null,
+    };
 
     pub fn init(alloc: Allocator, ctx: admin_exec.Context) Server {
+        return initWithOptions(alloc, ctx, .{});
+    }
+
+    pub fn initWithOptions(alloc: Allocator, ctx: admin_exec.Context, auth: AuthOptions) Server {
         return .{
             .alloc = alloc,
             .ctx = ctx,
+            .auth = auth,
         };
     }
 
@@ -77,6 +87,9 @@ pub const Server = struct {
 
     pub fn handle(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const path = requestPath(req.uri);
+        if (isTypedAdminRoute(path) and !self.authorized(req)) {
+            return try textResponse(self.alloc, 401, "unauthorized");
+        }
         switch (req.method) {
             .GET => {
                 if (std.mem.eql(u8, path, Routes.health)) {
@@ -185,6 +198,14 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 404, "not found");
             },
         }
+    }
+
+    fn authorized(self: *const Server, req: http_common.HttpRequest) bool {
+        const token = self.auth.bearer_token orelse return true;
+        if (token.len == 0) return true;
+        const authorization = req.authorization orelse req.header("authorization") orelse return false;
+        if (!std.mem.startsWith(u8, authorization, "Bearer ")) return false;
+        return std.mem.eql(u8, authorization["Bearer ".len..], token);
     }
 
     fn replicationSlotNameFromPath(self: *Server, path: []const u8, suffix: []const u8) !?[]u8 {
@@ -1295,6 +1316,10 @@ fn knownRoute(path: []const u8) bool {
         admin_api.routes.replicationSlotNameFromPath(path, "") != null or
         admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix) != null or
         admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix) != null;
+}
+
+fn isTypedAdminRoute(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, admin_api.routes.ha) and knownRoute(path);
 }
 
 fn generatedRoutePathAlloc(alloc: Allocator, generated_path: []const u8) ![]u8 {
@@ -2489,6 +2514,38 @@ test "storage.ha http admin rejects invalid rejoin fence receipt" {
 
     try std.testing.expectEqual(@as(u16, 400), response.status);
     try expectContains(response.body, "invalid HA rejoin assessment request");
+}
+
+test "storage.ha http admin enforces optional bearer token on typed admin routes" {
+    const alloc = std.testing.allocator;
+    var server = Server.initWithOptions(alloc, .{}, .{ .bearer_token = "secret-token" });
+    defer server.deinit();
+
+    var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
+    defer health.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), health.status);
+
+    var missing = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), missing.status);
+    try expectContains(missing.body, "unauthorized");
+
+    var wrong = try server.handle(.{
+        .method = .GET,
+        .uri = admin_api.routes.ha_primary_status,
+        .authorization = "Bearer wrong-token",
+    });
+    defer wrong.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), wrong.status);
+
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = admin_api.routes.ha_primary_status,
+        .authorization = "Bearer secret-token",
+    });
+    defer authorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), authorized.status);
+    try expectContains(authorized.body, "PrimaryUnavailable");
 }
 
 test "storage.ha http admin rejects invalid fence request identity and bounds" {

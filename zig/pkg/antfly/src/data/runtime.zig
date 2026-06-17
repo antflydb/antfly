@@ -1422,6 +1422,7 @@ pub const DataServerConfig = struct {
 
 pub const DataServerHAConfig = struct {
     admin_context: ?antfly.ha.admin_exec.Context = null,
+    admin_bearer_token: ?[]const u8 = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
     primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
     standby_replication: ?HAStandbyReplicationConfig = null,
@@ -2173,7 +2174,9 @@ pub const DataServer = struct {
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
         if (api_server_cfg.ha_admin_executor == null) {
             if (self.ha_cfg.admin_context) |ctx| {
-                self.ha_admin_server = antfly.ha.http_admin.Server.init(self.alloc, ctx);
+                self.ha_admin_server = antfly.ha.http_admin.Server.initWithOptions(self.alloc, ctx, .{
+                    .bearer_token = self.ha_cfg.admin_bearer_token,
+                });
                 api_server_cfg.ha_admin_executor = self.ha_admin_server.?.executor();
             }
         }

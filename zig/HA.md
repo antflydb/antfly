@@ -497,6 +497,18 @@ Recommended split:
   or parsing CLI output. The wrapper is the compatibility boundary for Go
   control-plane code; generated `oapi` symbols are a transport detail.
 
+Admin authentication should be explicit but operationally simple. The Antfly
+runtime may be started with `--ha-admin-token-env <name>`; when set, the Zig
+process reads a bearer token from that environment variable at startup and
+requires `Authorization: Bearer <token>` on typed `/admin/v1/ha` routes. Health
+checks and node-to-node `/internal/v1` replication traffic are separate from
+this control-plane auth path. The operator should read its outbound bearer token
+from `spec.highAvailability.admin.tokenEnvVar`, defaulting to
+`ANTFLY_HA_ADMIN_TOKEN`, and the Antfly pods should receive the same token
+through `spec.highAvailability.runtime.adminTokenEnvVar`. Kubernetes should
+inject both process environments from Secrets; the operator should not need
+direct Secret read permissions merely to call the HA admin API.
+
 The admin API is node-local even though it is typed and operator-facing. The
 operator must choose the target node deliberately:
 
@@ -654,17 +666,19 @@ and either rewind or reseed.
   humans, tests, and the operator observe the same fields.
 - Wire the supported Zig `antfly swarm` runtime so a primary can be started with
   durable HA replication log, slot store, promotion fence WAL, optional
-  former-primary rewind log, node id, and identity flags. That runtime path
-  should attach the same `/admin/v1/ha` executor, durable fence store,
-  former-primary log handle, and `/internal/v1/ha/replication` executor used by
-  tests and the CLI, rather than requiring a bespoke harness to expose
-  primary-side HA operations or rejoin/rewind workflows.
+  former-primary rewind log, optional admin bearer-token env var, node id, and
+  identity flags. That runtime path should attach the same `/admin/v1/ha`
+  executor, durable fence store, former-primary log handle, admin auth
+  enforcement, and `/internal/v1/ha/replication` executor used by tests and the
+  CLI, rather than requiring a bespoke harness to expose primary-side HA
+  operations or rejoin/rewind workflows.
 - Wire the supported Zig `antfly swarm` runtime so a standby can also be started
   with a durable received-WAL log, progress WAL, promotion fence WAL, optional
-  former-primary rewind log, node id, and identity flags. The standby runtime
-  path should expose `/admin/v1/ha`
-  status, read/write gate, bootstrap, and promotion operations against the real
-  standby handle. Continuous pull/apply should then plug into the
+  former-primary rewind log, optional admin bearer-token env var, node id, and
+  identity flags. The standby runtime path should expose `/admin/v1/ha` status,
+  read/write gate, bootstrap, and promotion operations against the real standby
+  handle, guarded by the same admin auth policy as primary nodes. Continuous
+  pull/apply should then plug into the
   DataServer-managed standby DB open path so applied LSN only advances after
   replicated records are applied to storage. Every provisioned writer DB opened
   by that DataServer path must carry the same HA write gate as the node's admin
@@ -710,6 +724,10 @@ be validated against that operator package.
   `ANTFLY_HA_ADMIN_TOKEN`. Kubernetes should inject that variable into the
   operator pod from a Secret; the operator should not require broad direct
   Secret read permissions just to make HA admin API calls.
+- Support runtime-side admin auth by passing `--ha-admin-token-env` from
+  `spec.highAvailability.runtime.adminTokenEnvVar`. Antfly pods should receive
+  the same token through `spec.swarm.envFrom` or explicit env injection, and the
+  process should fail closed if the configured env var is missing or empty.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.

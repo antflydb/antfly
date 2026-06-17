@@ -1960,6 +1960,32 @@ func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t 
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:             HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "bad-token-env",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid runtime admin token environment variable to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.adminTokenEnvVar") {
+		t.Fatalf("expected runtime.adminTokenEnvVar validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationSource(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

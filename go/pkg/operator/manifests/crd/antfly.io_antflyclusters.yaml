@@ -3672,6 +3672,11 @@ spec:
                     description: Runtime configures the local Zig antfly swarm HA
                       runtime role and durable WAL paths.
                     properties:
+                      adminTokenEnvVar:
+                        description: |-
+                          AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
+                          When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
+                        type: string
                       fencePath:
                         description: |-
                           FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.

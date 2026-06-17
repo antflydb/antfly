@@ -164,6 +164,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		fencePath = value
 	}
 	formerPrimaryLogPath := strings.TrimSpace(runtime.FormerPrimaryLogPath)
+	adminTokenEnvVar := strings.TrimSpace(runtime.AdminTokenEnvVar)
 	appendHAArg := func(name, value string) {
 		args.WriteString(" \\\n  ")
 		args.WriteString(name)
@@ -197,6 +198,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		if formerPrimaryLogPath != "" {
 			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
 		}
+		if adminTokenEnvVar != "" {
+			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
+		}
 		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
@@ -216,6 +220,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-fence-wal", fencePath)
 		if formerPrimaryLogPath != "" {
 			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
+		}
+		if adminTokenEnvVar != "" {
+			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
 		}
 		if standby != nil && strings.TrimSpace(standby.UpstreamURL) != "" && strings.TrimSpace(standby.SlotName) != "" {
 			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)

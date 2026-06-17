@@ -7,6 +7,15 @@ type: Opaque
 stringData:
   token: replace-with-a-random-admin-token
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: antfly-ha-admin-token
+  namespace: default
+type: Opaque
+stringData:
+  token: replace-with-a-random-admin-token
+---
 apiVersion: antfly.io/v1
 kind: AntflyCluster
 metadata:
@@ -34,6 +43,9 @@ spec:
       port: 9021
     health:
       port: 4200
+    envFrom:
+    - secretRef:
+        name: antfly-ha-admin-token
     resources:
       cpu: "1000m"
       memory: "2Gi"
@@ -68,6 +80,7 @@ spec:
       nodeID: primary-a
       fencePath: /antflydb/ha/fence.wal
       formerPrimaryLogPath: /antflydb/ha/primary.wal
+      adminTokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
       primary:
         logPath: /antflydb/ha/primary.wal
         slotsPath: /antflydb/ha/slots
@@ -130,6 +143,9 @@ spec:
       port: 9021
     health:
       port: 4200
+    envFrom:
+    - secretRef:
+        name: antfly-ha-admin-token
     resources:
       cpu: "1000m"
       memory: "2Gi"
@@ -163,6 +179,7 @@ spec:
       role: Standby
       nodeID: standby-a
       fencePath: /antflydb/ha/fence.wal
+      adminTokenEnvVar: ANTFLY_HA_ADMIN_TOKEN
       standby:
         logPath: /antflydb/ha/standby.wal
         progressPath: /antflydb/ha/standby-progress.wal

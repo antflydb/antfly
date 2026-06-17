@@ -668,6 +668,11 @@ type HARuntimeSpec struct {
 	// +optional
 	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
 
+	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
+	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
+	// +optional
+	AdminTokenEnvVar string `json:"adminTokenEnvVar,omitempty"`
+
 	// Primary configures primary-side durable HA state. Defaults are under /antflydb/ha.
 	// +optional
 	Primary *HAPrimaryRuntimeSpec `json:"primary,omitempty"`
