@@ -212,6 +212,9 @@ const (
 	// ReasonHASyncPolicyUnsatisfied indicates synchronous HA durability is not satisfied.
 	ReasonHASyncPolicyUnsatisfied = "HASyncPolicyUnsatisfied"
 
+	// ReasonHAPrimaryAdminUnavailable indicates the primary HA admin endpoint could not be observed.
+	ReasonHAPrimaryAdminUnavailable = "HAPrimaryAdminUnavailable"
+
 	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
 	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"
 

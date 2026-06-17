@@ -1380,6 +1380,14 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 	degraded := haSyncPolicyDegraded(ha, plan)
 	if degraded {
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionTrue, antflyv1.ReasonHASyncPolicyUnsatisfied, "Synchronous HA policy is not currently satisfied")
+	} else if haPrimaryAdminUnavailable(cluster.Status.HAStatus) {
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAPrimaryAdminUnavailable,
+			fmt.Sprintf("Primary HA admin endpoint is unreachable: %s", strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError)),
+		)
 	} else {
 		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionFalse, "HASyncPolicySatisfied", "Synchronous HA policy is satisfied or not configured")
 	}

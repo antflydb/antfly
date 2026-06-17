@@ -907,6 +907,44 @@ func TestUpdateHAStatusReportsReseedAndDegradedSync(t *testing.T) {
 	}
 }
 
+func TestUpdateHAStatusReportsPrimaryAdminUnavailable(t *testing.T) {
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN:            10,
+		PrimaryAdminReachable: false,
+		PrimaryAdminLastError: "primary admin refused connection",
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:              "standby-a",
+			SlotName:          "standby-a",
+			Active:            true,
+			ReceivedLSN:       10,
+			AppliedLSN:        10,
+			SafeReadLSN:       10,
+			CanServeSafeReads: true,
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil ||
+		degraded.Status != metav1.ConditionTrue ||
+		degraded.Reason != antflyv1.ReasonHAPrimaryAdminUnavailable ||
+		!strings.Contains(degraded.Message, "primary admin refused connection") {
+		t.Fatalf("expected primary admin unavailable degraded condition, got %#v", degraded)
+	}
+
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PrimaryAdminLastError = ""
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionFalse || degraded.Reason != "HASyncPolicySatisfied" {
+		t.Fatalf("expected primary admin degraded condition to clear, got %#v", degraded)
+	}
+}
+
 func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
