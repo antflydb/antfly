@@ -3577,12 +3577,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			body.InitialLsn = action.TargetLSN
 		}
 		result, err := adminClient.CreateReplicationSlotResponse(ctx, body)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateReplicationSlotActionSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
 		}
 		return true, err
 	case string(haActionPauseSlot):
@@ -3597,12 +3594,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		result, err := adminClient.PauseReplicationSlotResponse(ctx, slotName)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateReplicationSlotActionSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
 		}
 		return true, err
 	case string(haActionResumeSlot):
@@ -3617,12 +3611,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		result, err := adminClient.ResumeReplicationSlotResponse(ctx, slotName)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateReplicationSlotActionSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
 		}
 		return true, err
 	case string(haActionDropSlot):
@@ -3637,12 +3628,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			return true, err
 		}
 		result, err := adminClient.DropReplicationSlotResponse(ctx, slotName)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateReplicationSlotActionSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
 		}
 		return true, err
 	case string(haActionSeedStandby), string(haActionMarkReseed):
@@ -3665,12 +3653,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			ManifestId: manifestID,
 		}
 		result, err := adminClient.BeginBaseBackupResponse(ctx, body)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateBaseBackupBeginSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromBaseBackupBeginSDK(*value))
 		}
 		return true, err
 	case string(haActionFinishStandbySeed):
@@ -3685,12 +3670,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		body := adminsdk.BaseBackupManifestPathRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
 		result, err := adminClient.FinishBaseBackupResponse(ctx, body)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateBaseBackupFinishSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromBaseBackupFinishSDK(*value))
 		}
 		return true, err
 	case string(haActionBootstrapStandbySeed):
@@ -3708,12 +3690,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			body.ContentRoot = strings.TrimSpace(action.SeedContentRoot)
 		}
 		result, err := adminClient.BootstrapStandbyResponse(ctx, body)
-		raw, err := haAdminSDKResponseRaw(result, err)
+		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
-			err = haValidateStandbyBootstrapSDKResponse(result)
-		}
-		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromStandbyBootstrapSDK(*value))
 		}
 		return true, err
 	case string(haActionAcquireFence):
@@ -3849,44 +3828,65 @@ func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]b
 	return value.Body, nil
 }
 
-func haValidateReplicationSlotActionSDKResponse(value *adminsdk.HAResponse[adminsdk.HAReplicationSlotActionResponse]) error {
+func haAdminSDKResponseValue[T any](value *adminsdk.HAResponse[T], err error) (*T, error) {
+	if err != nil {
+		var apiErr *adminsdk.HAAPIError
+		if stderrors.As(err, &apiErr) {
+			return nil, fmt.Errorf("HA admin API returned status %d: %s", apiErr.StatusCode, strings.TrimSpace(apiErr.Body))
+		}
+		var validationErr *adminsdk.HAResponseValidationError
+		if stderrors.As(err, &validationErr) {
+			return nil, fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+		}
+		return nil, err
+	}
 	if value == nil || value.Value == nil {
-		return fmt.Errorf("HA admin replication slot action response is nil")
+		return nil, fmt.Errorf("HA admin SDK response is nil")
 	}
-	if err := adminsdk.ValidateHAReplicationSlotActionResponse(*value.Value); err != nil {
-		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
-	}
-	return nil
+	return value.Value, nil
 }
 
-func haValidateBaseBackupBeginSDKResponse(value *adminsdk.HAResponse[adminsdk.HABaseBackupBeginResponse]) error {
-	if value == nil || value.Value == nil {
-		return fmt.Errorf("HA admin base backup begin response is nil")
-	}
-	if err := adminsdk.ValidateHABaseBackupBeginResponse(*value.Value); err != nil {
-		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
-	}
-	return nil
+func haAdminActionResultFromReplicationSlotSDK(response adminsdk.HAReplicationSlotActionResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.SlotAction = strings.TrimSpace(string(response.SlotAction))
+	result.SlotName = strings.TrimSpace(response.Slot.SlotName)
+	return result
 }
 
-func haValidateBaseBackupFinishSDKResponse(value *adminsdk.HAResponse[adminsdk.HABaseBackupFinishResponse]) error {
-	if value == nil || value.Value == nil {
-		return fmt.Errorf("HA admin base backup finish response is nil")
-	}
-	if err := adminsdk.ValidateHABaseBackupFinishResponse(*value.Value); err != nil {
-		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
-	}
-	return nil
+func haAdminActionResultFromBaseBackupBeginSDK(response adminsdk.HABaseBackupBeginResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.SlotName = strings.TrimSpace(response.SlotName)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.StartRecordLSN = response.StartRecordLsn
+	return result
 }
 
-func haValidateStandbyBootstrapSDKResponse(value *adminsdk.HAResponse[adminsdk.HAStandbyBootstrapResponse]) error {
-	if value == nil || value.Value == nil {
-		return fmt.Errorf("HA admin standby bootstrap response is nil")
+func haAdminActionResultFromBaseBackupFinishSDK(response adminsdk.HABaseBackupFinishResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.EndRecordLSN = response.EndRecordLsn
+	return result
+}
+
+func haAdminActionResultFromStandbyBootstrapSDK(response adminsdk.HAStandbyBootstrapResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.CheckpointLSN = response.CheckpointLsn
+	return result
+}
+
+func haAdminActionResultFromReceipt(schemaVersion uint32, receipt adminsdk.HAActionReceipt) *antflyv1.HAAdminActionResultStatus {
+	return &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: schemaVersion,
+		ActionID:      strings.TrimSpace(receipt.ActionId),
+		ActionKind:    strings.TrimSpace(string(receipt.ActionKind)),
+		ActionTarget:  strings.TrimSpace(receipt.Target),
+		ActionState:   strings.TrimSpace(string(receipt.State)),
+		ActionNodeID:  strings.TrimSpace(receipt.NodeId),
 	}
-	if err := adminsdk.ValidateHAStandbyBootstrapResponse(*value.Value); err != nil {
-		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
-	}
-	return nil
 }
 
 func haValidateFenceSDKResponse(value *adminsdk.HAResponse[adminsdk.HAFenceResponse]) error {
@@ -4235,6 +4235,18 @@ func requireHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, ra
 	if applyHADirectAdminActionResult(action, raw) &&
 		haActionHasRequiredAdminResult(*action) &&
 		haDirectAdminActionReceiptMatches(*action) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without typed result evidence", action.Kind)
+}
+
+func requireHADirectAdminActionResultStatus(action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
+	if action == nil || !haActionRequiresAdminResult(haActionKind(action.Kind)) {
+		return nil
+	}
+	action.AdminResult = result
+	if haActionHasRequiredAdminResult(*action) && haDirectAdminActionReceiptMatches(*action) {
 		return nil
 	}
 	action.AdminResult = nil
