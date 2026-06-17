@@ -65,7 +65,7 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 			"generation":         generation,
 			"forced":             false,
 			"token":              token,
-			"reason":             "AutomaticFailoverReady",
+			"reason":             "LeaseAcquired",
 		},
 	})
 	if err != nil {
@@ -1224,7 +1224,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				g.Expect(payload["new_epoch"]).To(Equal(float64(7)))
 				g.Expect(payload["required_lsn"]).To(Equal(float64(12)))
 				g.Expect(payload["observed_lsn"]).To(Equal(float64(12)))
-				g.Expect(payload["reason"]).To(Equal("AutomaticFailoverReady"))
+				g.Expect(payload["reason"]).To(Equal("LeaseAcquired"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},

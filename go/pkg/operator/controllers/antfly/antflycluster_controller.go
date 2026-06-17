@@ -3782,9 +3782,9 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 	if identity == nil || identity.CurrentPrimaryID == "" || strings.TrimSpace(action.StandbyName) == "" {
 		return haFenceAcquireRequest{}, false
 	}
-	reason := action.Reason
+	reason := action.FenceReason
 	if strings.TrimSpace(reason) == "" {
-		reason = action.FenceReason
+		reason = action.Reason
 	}
 	return haFenceAcquireRequest{
 		Identity:       haAdminIdentityRequestFromSpec(identity),

@@ -1061,6 +1061,20 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 		t.Fatalf("unexpected fence identity JSON: %#v", fenceIdentity)
 	}
 
+	fencedReason, ok := haFenceAcquireBody(cluster, antflyv1.HAPlannedActionStatus{
+		StandbyName: "standby-a",
+		TargetLSN:   12,
+		FenceReason: "LeaseAcquired",
+		Reason:      "AutomaticFailoverReady",
+	})
+	if !ok {
+		t.Fatal("expected fence request body with fence reason")
+	}
+	fencedReasonJSON := marshalJSONMap(t, fencedReason)
+	if fencedReasonJSON["reason"] != "LeaseAcquired" {
+		t.Fatalf("expected fence request to prefer observed fence reason, got %#v", fencedReasonJSON)
+	}
+
 	rejoin, ok := haRejoinAssessBody(cluster, antflyv1.HAPlannedActionStatus{
 		StandbyName:     "primary-a",
 		TargetLSN:       12,
