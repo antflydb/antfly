@@ -1139,7 +1139,10 @@ func TestUpdateHAStatusReportsPrimaryAdminUnavailable(t *testing.T) {
 
 func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t *testing.T) {
 	cluster := haCluster()
-	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
@@ -1373,9 +1376,47 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 }
 
+func TestUpdateHAStatusBlocksAutomaticPromotionWhenAdminExecutionDisabled(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: false,
+	}
+	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
+	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked when admin execution is disabled")
+	}
+	failover := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse ||
+		failover.Reason != antflyv1.ReasonHAAutomaticFailoverExecutionDisabled {
+		t.Fatalf("expected admin-execution-disabled condition, got %#v", failover)
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+			t.Fatalf("expected no automatic promotion actions when admin execution is disabled, got %#v", cluster.Status.HAStatus.PlannedActions)
+		}
+	}
+}
+
 func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T) {
 	cluster := haCluster()
-	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
 		Enabled:          true,
@@ -1405,7 +1446,10 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T
 
 func TestUpdateHAStatusBlocksAutomaticPromotionWithoutStandbyAdminURL(t *testing.T) {
 	cluster := haCluster()
-	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
 		Enabled:          true,
@@ -1435,6 +1479,10 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithoutStandbyAdminURL(t *testing
 
 func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromotion(t *testing.T) {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
@@ -1975,6 +2023,10 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 
 func TestUpdateHAStatusDoesNotReplanRecordedPromotion(t *testing.T) {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
@@ -2318,6 +2370,10 @@ func haCluster() *antflyv1.AntflyCluster {
 
 func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
 	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{

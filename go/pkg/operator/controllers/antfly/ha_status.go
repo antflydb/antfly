@@ -1499,6 +1499,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if ha == nil || ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled {
 		return ""
 	}
+	if !haAutomaticFailoverExecutionEnabled(ha) {
+		return ""
+	}
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return ""
 	}
@@ -1669,6 +1672,9 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	if ha == nil || ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled {
 		return antflyv1.ReasonHAAutomaticFailoverDisabled
 	}
+	if !haAutomaticFailoverExecutionEnabled(ha) {
+		return antflyv1.ReasonHAAutomaticFailoverExecutionDisabled
+	}
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return antflyv1.ReasonHAFencingAuthorityMissing
 	}
@@ -1691,6 +1697,10 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 		return antflyv1.ReasonHASyncPolicyUnsatisfied
 	}
 	return antflyv1.ReasonHANoHealthyStandby
+}
+
+func haAutomaticFailoverExecutionEnabled(ha *antflyv1.HighAvailabilitySpec) bool {
+	return ha != nil && ha.Admin != nil && ha.Admin.ExecutePlannedActions
 }
 
 func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {

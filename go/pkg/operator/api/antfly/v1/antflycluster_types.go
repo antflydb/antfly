@@ -254,6 +254,9 @@ const (
 	// ReasonHAAutomaticFailoverDisabled indicates automatic failover is disabled.
 	ReasonHAAutomaticFailoverDisabled = "HAAutomaticFailoverDisabled"
 
+	// ReasonHAAutomaticFailoverExecutionDisabled indicates automatic failover cannot execute planned admin actions.
+	ReasonHAAutomaticFailoverExecutionDisabled = "HAAutomaticFailoverExecutionDisabled"
+
 	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
 	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"
 
