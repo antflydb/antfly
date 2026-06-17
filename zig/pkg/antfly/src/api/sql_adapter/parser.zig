@@ -161,6 +161,17 @@ pub fn atEnd(tokens: []const Token, pos: usize) bool {
     return pos >= tokens.len;
 }
 
+pub fn tokensStartWithKeyword(tokens: []const Token, keyword: []const u8) bool {
+    return tokens.len > 0 and tokens[0].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[0].text, keyword);
+}
+
+pub fn consumeCteMaterializationHint(tokens: []const Token, pos: *usize) !void {
+    if (matchKeyword(tokens, pos, "materialized")) return;
+    if (matchKeyword(tokens, pos, "not") and !matchKeyword(tokens, pos, "materialized")) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 pub fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
     var depth: usize = 0;
     for (tokens, 0..) |token, i| {
@@ -309,6 +320,33 @@ test "sql adapter parser cursor tracks shared token position" {
     try std.testing.expect(cursor.peekFunctionCallIf(testKeywordIsLower));
     try cursor.advance(2);
     try std.testing.expect(cursor.atEnd());
+}
+
+test "sql adapter parser consumes shared keyword helpers" {
+    const materialized_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "materialized" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(tokensStartWithKeyword(materialized_tokens[0..], "materialized"));
+    var materialized_pos: usize = 0;
+    try consumeCteMaterializationHint(materialized_tokens[0..], &materialized_pos);
+    try std.testing.expectEqual(@as(usize, 1), materialized_pos);
+
+    const not_materialized_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "not" },
+        .{ .kind = .identifier, .text = "materialized" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var not_materialized_pos: usize = 0;
+    try consumeCteMaterializationHint(not_materialized_tokens[0..], &not_materialized_pos);
+    try std.testing.expectEqual(@as(usize, 2), not_materialized_pos);
+
+    const invalid_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "not" },
+        .{ .kind = .identifier, .text = "ready" },
+    };
+    var invalid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, consumeCteMaterializationHint(invalid_tokens[0..], &invalid_pos));
 }
 
 fn testKeywordIsFrom(text: []const u8) bool {

@@ -2400,7 +2400,7 @@ pub fn lowerSelectAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -2442,7 +2442,7 @@ pub fn lowerQueryPlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -2729,17 +2729,17 @@ fn parseCreateTableAsPopulationSqlAlloc(
     tokens: []const Token,
 ) !ParsedRelationPopulationSql {
     var index: usize = 1;
-    const target_lifetime: ?RelationLifetimeKind = if (consumeKeyword(tokens, &index, "temporary") or consumeKeyword(tokens, &index, "temp"))
+    const target_lifetime: ?RelationLifetimeKind = if (sql_adapter.matchKeyword(tokens, &index, "temporary") or sql_adapter.matchKeyword(tokens, &index, "temp"))
         .temporary
-    else if (consumeKeyword(tokens, &index, "unlogged"))
+    else if (sql_adapter.matchKeyword(tokens, &index, "unlogged"))
         .unlogged
     else
         null;
-    if (!consumeKeyword(tokens, &index, "table")) return error.UnsupportedSqlShape;
+    if (!sql_adapter.matchKeyword(tokens, &index, "table")) return error.UnsupportedSqlShape;
     var if_not_exists = false;
-    if (consumeKeyword(tokens, &index, "if")) {
-        try expectTokenKeyword(tokens, &index, "not");
-        try expectTokenKeyword(tokens, &index, "exists");
+    if (sql_adapter.matchKeyword(tokens, &index, "if")) {
+        try sql_adapter.expectKeyword(tokens, &index, "not");
+        try sql_adapter.expectKeyword(tokens, &index, "exists");
         if_not_exists = true;
     }
     if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
@@ -2747,7 +2747,7 @@ fn parseCreateTableAsPopulationSqlAlloc(
     var target_transferred = false;
     errdefer if (!target_transferred) alloc.free(target);
     index += 1;
-    if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+    if (!sql_adapter.matchKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
     if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
     const select_start = try tokenStartOffset(sql, tokens[index]);
     const source_sql = try alloc.dupe(u8, sql[select_start..]);
@@ -2759,10 +2759,6 @@ fn parseCreateTableAsPopulationSqlAlloc(
         .if_not_exists = if_not_exists,
         .source_sql = source_sql,
     };
-}
-
-fn expectTokenKeyword(tokens: []const Token, index: *usize, keyword: []const u8) !void {
-    try sql_adapter.expectKeyword(tokens, index, keyword);
 }
 
 fn tokenStartOffset(sql: []const u8, token: Token) !usize {
@@ -2886,10 +2882,6 @@ fn isSqlIdentifierByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
-fn sqlTokensStartWithKeyword(tokens: []const Token, keyword: []const u8) bool {
-    return tokens.len > 0 and tokens[0].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[0].text, keyword);
-}
-
 pub fn lowerWindowPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -2899,7 +2891,7 @@ pub fn lowerWindowPlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -3979,7 +3971,7 @@ pub fn lowerAggregatePlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -4021,7 +4013,7 @@ pub fn lowerJoinWithSchemasAlloc(
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -4064,7 +4056,7 @@ pub fn lowerLateralPlanWithSchemasAlloc(
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -4854,17 +4846,6 @@ fn addRelationalPrimaryKeyAlloc(
     try validatePrimaryKeyColumns(schema.relational_columns, primary_key);
     try validatePrimaryKeyTemporalCatalog(schema.periods, primary_key);
     schema.primary_key = try cloneDdlPrimaryKey(alloc, primary_key);
-}
-
-fn consumeKeyword(tokens: []const Token, index: *usize, keyword: []const u8) bool {
-    return sql_adapter.matchKeyword(tokens, index, keyword);
-}
-
-fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) !void {
-    if (consumeKeyword(tokens, index, "materialized")) return;
-    if (consumeKeyword(tokens, index, "not") and !consumeKeyword(tokens, index, "materialized")) {
-        return error.UnsupportedSqlShape;
-    }
 }
 
 const AppParitySourceSchemaCatalog = struct {
@@ -10141,10 +10122,7 @@ const Parser = struct {
     }
 
     fn parseOptionalCteMaterializationHint(self: *@This()) !void {
-        if (self.matchKeyword("materialized")) return;
-        if (self.matchKeyword("not")) {
-            try self.expectKeyword("materialized");
-        }
+        try sql_adapter.consumeCteMaterializationHint(self.tokens, &self.pos);
     }
 
     fn parseOptionalCteColumnAliasesAlloc(self: *@This()) ![]const []const u8 {
@@ -13100,7 +13078,7 @@ const Parser = struct {
         if (planned_ctes.len == 0) return null;
         const from_index = sql_adapter.findTopLevelKeyword(self.tokens[start..end], "from") orelse return null;
         var source_index = start + from_index + 1;
-        _ = consumeKeyword(self.tokens, &source_index, "only");
+        _ = sql_adapter.matchKeyword(self.tokens, &source_index, "only");
         if (source_index >= end or self.tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
         return relational_rows.rowsPlannedCteSchema(planned_ctes, self.tokens[source_index].text);
     }
