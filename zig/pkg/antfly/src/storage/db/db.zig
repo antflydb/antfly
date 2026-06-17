@@ -4135,9 +4135,8 @@ pub const DB = struct {
             .checkpoint,
             .manifest,
             .truncate,
-            => try self.markHAReplicationRecordApplied(record.lsn),
             .timeline_switch,
-            => return error.HAReplicationRecordApplyUnsupported,
+            => try self.markHAReplicationRecordApplied(record.lsn),
             _ => return error.HAReplicationRecordApplyUnsupported,
         }
     }
@@ -38024,6 +38023,42 @@ test "storage.ha db persists applied replication marker across reopen" {
         error.ReplayIndexUnavailable,
         replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1),
     );
+}
+
+test "storage.ha db applies timeline switch as durable replication boundary" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+
+    const switch_record = ha_replication_record_mod.RecordView{
+        .kind = .timeline_switch,
+        .payload_codec = .json,
+        .cluster_id = 252,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 2,
+        .epoch = 2,
+        .lsn = 7,
+        .previous_lsn = 6,
+        .payload =
+        \\{"parent_timeline_id":1,"new_timeline_id":2,"parent_epoch":1,"new_epoch":2,"required_lsn":6,"forced":false,"data_loss_possible":false}
+        ,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.applyHAReplicationRecord(switch_record);
+        try std.testing.expectEqual(@as(u64, 7), try db.haAppliedReplicationLsn());
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
+    try reopened.applyHAReplicationRecord(switch_record);
+    try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
 }
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
