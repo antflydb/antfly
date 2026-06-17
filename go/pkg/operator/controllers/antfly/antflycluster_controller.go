@@ -6899,6 +6899,8 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		SeedRoot     string   `json:"seedContentRoot,omitempty"`
 		AdminURL     string   `json:"adminURL,omitempty"`
 		AdminNodeID  string   `json:"adminNodeID,omitempty"`
+		AdminMethod  string   `json:"adminMethod,omitempty"`
+		AdminPath    string   `json:"adminPath,omitempty"`
 		AdminCommand []string `json:"adminCommand,omitempty"`
 		Reason       string   `json:"reason,omitempty"`
 	}{
@@ -6921,6 +6923,8 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		SeedRoot:     action.SeedContentRoot,
 		AdminURL:     action.AdminURL,
 		AdminNodeID:  action.AdminNodeID,
+		AdminMethod:  action.AdminMethod,
+		AdminPath:    action.AdminPath,
 		AdminCommand: action.AdminCommand,
 		Reason:       action.Reason,
 	})

@@ -2169,6 +2169,18 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	fenced.FenceHolder = "standby-a"
 	fenced.FenceAuthority = antflyv1.HAFencingAuthorityExternal
 	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
+
+	typed := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionCreateSlot),
+		AdminMethod: http.MethodPost,
+		AdminPath:   "/admin/v1/ha/replication-slots",
+	}
+	typedHash := haAdminActionHash(typed)
+	typed.AdminMethod = http.MethodPut
+	g.Expect(haAdminActionHash(typed)).NotTo(Equal(typedHash))
+	typed.AdminMethod = http.MethodPost
+	typed.AdminPath = "/admin/v1/ha/replication-slots/standby-a"
+	g.Expect(haAdminActionHash(typed)).NotTo(Equal(typedHash))
 }
 
 func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
