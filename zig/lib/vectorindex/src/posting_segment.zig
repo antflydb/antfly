@@ -929,6 +929,7 @@ pub const LazyDirectorySnapshot = struct {
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
+            if (best_record != null and entry.meta.max_delta_sequence < best_sequence) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             const manifest_entry = ManifestEntry{
