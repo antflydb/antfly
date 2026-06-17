@@ -1001,15 +1001,50 @@ components:
           minimum: 1
         decision:
           $ref: "#/components/schemas/HAOwnerJobDecision"
+    HAActionReceipt:
+      type: object
+      required: [action_id, action_kind, target, state]
+      additionalProperties: false
+      properties:
+        action_id:
+          type: string
+          minLength: 1
+          description: Stable action correlation id derived from the acted-on HA resource and boundary values.
+        action_kind:
+          type: string
+          enum:
+            - replication_slot_create
+            - replication_slot_pause
+            - replication_slot_resume
+            - replication_slot_drop
+            - base_backup_begin
+            - base_backup_finish
+            - standby_bootstrap
+            - fence_acquire
+            - promotion
+            - rejoin_assess
+            - rejoin_rewind
+            - rejoin_reseed
+          description: Typed HA action that produced this response.
+        target:
+          type: string
+          minLength: 1
+          description: Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
+        state:
+          type: string
+          enum: [assessed, applied, already_applied]
+          description: Idempotency state for this action response.
     HAReplicationSlotActionResponse:
       type: object
-      required: [schema_version, slot_action, slot]
+      required: [schema_version, action, slot_action, slot]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         slot_action:
           type: string
           enum: [create, pause, resume, drop]
@@ -1030,13 +1065,15 @@ components:
             $ref: "#/components/schemas/HAReplicationSlot"
     HABaseBackupBeginResponse:
       type: object
-      required: [schema_version, slot_name, manifest_id, backup_lsn, start_record_lsn]
+      required: [schema_version, action, slot_name, manifest_id, backup_lsn, start_record_lsn]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         slot_name:
           type: string
           minLength: 1
@@ -1057,13 +1094,15 @@ components:
           description: Durable `backup_start` record LSN.
     HABaseBackupFinishResponse:
       type: object
-      required: [schema_version, manifest_id, backup_lsn, end_record_lsn]
+      required: [schema_version, action, manifest_id, backup_lsn, end_record_lsn]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         manifest_id:
           type: string
           minLength: 1
@@ -1078,13 +1117,15 @@ components:
           description: Durable `backup_end` record LSN.
     HAStandbyBootstrapResponse:
       type: object
-      required: [schema_version, manifest_id, backup_lsn, checkpoint_lsn]
+      required: [schema_version, action, manifest_id, backup_lsn, checkpoint_lsn]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         manifest_id:
           type: string
           minLength: 1
@@ -1099,13 +1140,15 @@ components:
           description: Standby checkpoint LSN after manifest validation.
     HAFenceResponse:
       type: object
-      required: [schema_version, receipt]
+      required: [schema_version, action, receipt]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         receipt:
           $ref: "#/components/schemas/HAFenceReceipt"
     HACurrentFenceResponse:
@@ -1135,13 +1178,15 @@ components:
           $ref: "#/components/schemas/HAPromotionAssessment"
     HAPromotionResponse:
       type: object
-      required: [schema_version, assessment, promotion, fence_generation, fence_token, forced]
+      required: [schema_version, action, assessment, promotion, fence_generation, fence_token, forced]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         assessment:
           $ref: "#/components/schemas/HAPromotionAssessment"
         promotion:
@@ -1157,13 +1202,15 @@ components:
           type: boolean
     HARejoinAssessResponse:
       type: object
-      required: [schema_version, assessment]
+      required: [schema_version, action, assessment]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         assessment:
           $ref: "#/components/schemas/HARejoinAssessment"
         rewind:

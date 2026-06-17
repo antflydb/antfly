@@ -27,6 +27,7 @@ pub const HACommitAppendResponse = types.HACommitAppendResponse;
 pub const HAReadCheckResponse = types.HAReadCheckResponse;
 pub const HAWriteCheckResponse = types.HAWriteCheckResponse;
 pub const HAOwnerJobCheckResponse = types.HAOwnerJobCheckResponse;
+pub const HAActionReceipt = types.HAActionReceipt;
 pub const HAReplicationSlotActionResponse = types.HAReplicationSlotActionResponse;
 pub const HAReplicationSlotListResponse = types.HAReplicationSlotListResponse;
 pub const HABaseBackupBeginResponse = types.HABaseBackupBeginResponse;

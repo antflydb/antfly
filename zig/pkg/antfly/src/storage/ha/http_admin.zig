@@ -248,8 +248,10 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
+        var receipt = try actionReceiptAlloc(self.alloc, "replication_slot_create", parsed.value.slot_name, "applied");
+        defer receipt.deinit(self.alloc);
         return switch (result) {
-            .create => |slot| try self.handleTypedJson(slotActionDocument("create", slot, null)),
+            .create => |slot| try self.handleTypedJson(slotActionDocument(receipt, "create", slot, null)),
             else => unreachable,
         };
     }
@@ -265,11 +267,19 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
+        const action_kind = switch (action) {
+            .create => "replication_slot_create",
+            .pause => "replication_slot_pause",
+            .@"resume" => "replication_slot_resume",
+            .drop => "replication_slot_drop",
+        };
+        var receipt = try actionReceiptAlloc(self.alloc, action_kind, slot_name, "applied");
+        defer receipt.deinit(self.alloc);
         return switch (result) {
             .create => unreachable,
-            .pause => |slot| try self.handleTypedJson(slotActionDocument("pause", slot, slot.dropped)),
-            .@"resume" => |slot| try self.handleTypedJson(slotActionDocument("resume", slot, slot.dropped)),
-            .drop => |slot| try self.handleTypedJson(slotActionDocument("drop", slot, slot.dropped)),
+            .pause => |slot| try self.handleTypedJson(slotActionDocument(receipt, "pause", slot, slot.dropped)),
+            .@"resume" => |slot| try self.handleTypedJson(slotActionDocument(receipt, "resume", slot, slot.dropped)),
+            .drop => |slot| try self.handleTypedJson(slotActionDocument(receipt, "drop", slot, slot.dropped)),
         };
     }
 
@@ -409,7 +419,10 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
+        var receipt = try actionReceiptAlloc(self.alloc, "base_backup_begin", result.manifest_id, "applied");
+        defer receipt.deinit(self.alloc);
         return try self.handleTypedJson(BaseBackupBeginDocument{
+            .action = receipt,
             .slot_name = result.slot_name,
             .manifest_id = result.manifest_id,
             .backup_lsn = result.backup_lsn,
@@ -437,11 +450,16 @@ pub const Server = struct {
         };
         defer result.deinit(self.alloc);
         return switch (result) {
-            .seed_finish => |seed| try self.handleTypedJson(BaseBackupFinishDocument{
-                .manifest_id = seed.manifest_id,
-                .backup_lsn = seed.backup_lsn,
-                .end_record_lsn = seed.end_record_lsn,
-            }),
+            .seed_finish => |seed| blk: {
+                var receipt = try actionReceiptAlloc(self.alloc, "base_backup_finish", seed.manifest_id, "applied");
+                defer receipt.deinit(self.alloc);
+                break :blk try self.handleTypedJson(BaseBackupFinishDocument{
+                    .action = receipt,
+                    .manifest_id = seed.manifest_id,
+                    .backup_lsn = seed.backup_lsn,
+                    .end_record_lsn = seed.end_record_lsn,
+                });
+            },
             else => unreachable,
         };
     }
@@ -467,11 +485,16 @@ pub const Server = struct {
         };
         defer result.deinit(self.alloc);
         return switch (result) {
-            .seed_bootstrap => |seed| try self.handleTypedJson(StandbyBootstrapDocument{
-                .manifest_id = seed.manifest_id,
-                .backup_lsn = seed.backup_lsn,
-                .checkpoint_lsn = seed.checkpoint_lsn,
-            }),
+            .seed_bootstrap => |seed| blk: {
+                var receipt = try actionReceiptAlloc(self.alloc, "standby_bootstrap", seed.manifest_id, "applied");
+                defer receipt.deinit(self.alloc);
+                break :blk try self.handleTypedJson(StandbyBootstrapDocument{
+                    .action = receipt,
+                    .manifest_id = seed.manifest_id,
+                    .backup_lsn = seed.backup_lsn,
+                    .checkpoint_lsn = seed.checkpoint_lsn,
+                });
+            },
             else => unreachable,
         };
     }
@@ -504,7 +527,12 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        return try self.handleTypedJson(FenceDocument{ .receipt = result.receipt });
+        var receipt = try actionReceiptAlloc(self.alloc, "fence_acquire", result.receipt.promoted_node_id, "applied");
+        defer receipt.deinit(self.alloc);
+        return try self.handleTypedJson(FenceDocument{
+            .action = receipt,
+            .receipt = result.receipt,
+        });
     }
 
     fn handleAdminAssessPromotion(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -550,7 +578,9 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        return try self.handleTypedJson(promotionDocument(result));
+        var document = try promotionDocument(self.alloc, result);
+        defer document.action.deinit(self.alloc);
+        return try self.handleTypedJson(document);
     }
 
     fn handleAdminPromote(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -563,7 +593,9 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        return try self.handleTypedJson(promotionDocument(result));
+        var document = try promotionDocument(self.alloc, result);
+        defer document.action.deinit(self.alloc);
+        return try self.handleTypedJson(document);
     }
 
     fn handleAdminAssessRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -626,7 +658,10 @@ pub const Server = struct {
                     const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                         return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                     };
+                    var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_rewind", assessment.former_node_id, "applied");
+                    defer action_receipt.deinit(self.alloc);
                     return try self.handleTypedJson(RejoinRewindDocument{
+                        .action = action_receipt,
                         .assessment = assessment,
                         .rewind = rewind,
                     });
@@ -637,7 +672,10 @@ pub const Server = struct {
                     const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                         return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                     };
+                    var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied");
+                    defer action_receipt.deinit(self.alloc);
                     return try self.handleTypedJson(RejoinReseedDocument{
+                        .action = action_receipt,
                         .assessment = assessment,
                         .reseed = reseed,
                     });
@@ -645,7 +683,12 @@ pub const Server = struct {
             }
         }
 
-        return try self.handleTypedJson(RejoinAssessDocument{ .assessment = assessment });
+        var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_assess", assessment.former_node_id, "assessed");
+        defer action_receipt.deinit(self.alloc);
+        return try self.handleTypedJson(RejoinAssessDocument{
+            .action = action_receipt,
+            .assessment = assessment,
+        });
     }
 
     fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
@@ -717,12 +760,14 @@ pub const Server = struct {
 
 const SlotActionDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     slot_action: []const u8,
     slot: SlotDocument,
 };
 
 const BaseBackupBeginDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     slot_name: []const u8,
     manifest_id: []const u8,
     backup_lsn: u64,
@@ -731,6 +776,7 @@ const BaseBackupBeginDocument = struct {
 
 const BaseBackupFinishDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     manifest_id: []const u8,
     backup_lsn: u64,
     end_record_lsn: u64,
@@ -738,6 +784,7 @@ const BaseBackupFinishDocument = struct {
 
 const StandbyBootstrapDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     manifest_id: []const u8,
     backup_lsn: u64,
     checkpoint_lsn: u64,
@@ -777,6 +824,7 @@ const OwnerJobCheckDocument = struct {
 
 const FenceDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     receipt: fencing.Receipt,
 };
 
@@ -793,6 +841,7 @@ const PromotionAssessDocument = struct {
 
 const PromotionDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     assessment: status_mod.PromotionAssessment,
     promotion: PromotionResultDocument,
     fence_generation: u64,
@@ -811,23 +860,57 @@ const PromotionResultDocument = struct {
 
 const RejoinAssessDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     assessment: rejoin.Assessment,
 };
 
 const RejoinRewindDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     assessment: rejoin.Assessment,
     rewind: rejoin.RewindResult,
 };
 
 const RejoinReseedDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     assessment: rejoin.Assessment,
     reseed: rejoin.ReseedResult,
 };
 
-fn promotionDocument(result: ha_admin.FencedPromotionResult) PromotionDocument {
+const ActionReceiptDocument = struct {
+    action_id: []const u8,
+    action_kind: []const u8,
+    target: []const u8,
+    state: []const u8,
+
+    fn deinit(self: *ActionReceiptDocument, alloc: Allocator) void {
+        alloc.free(self.action_id);
+        alloc.free(self.target);
+        self.* = undefined;
+    }
+};
+
+fn actionReceiptAlloc(
+    alloc: Allocator,
+    action_kind: []const u8,
+    target: []const u8,
+    state: []const u8,
+) !ActionReceiptDocument {
     return .{
+        .action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ action_kind, target }),
+        .action_kind = action_kind,
+        .target = try alloc.dupe(u8, target),
+        .state = state,
+    };
+}
+
+fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !PromotionDocument {
+    const target = result.promoted_node_id;
+    var action = try actionReceiptAlloc(alloc, "promotion", target, "applied");
+    errdefer action.deinit(alloc);
+    return .{
+        .action = action,
         .assessment = result.assessment,
         .promotion = .{
             .node_id = result.promoted_node_id,
@@ -890,8 +973,14 @@ fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]
     return slots;
 }
 
-fn slotActionDocument(action: []const u8, slot: anytype, dropped: ?bool) SlotActionDocument {
+fn slotActionDocument(
+    action_receipt: ActionReceiptDocument,
+    action: []const u8,
+    slot: anytype,
+    dropped: ?bool,
+) SlotActionDocument {
     return .{
+        .action = action_receipt,
         .slot_action = action,
         .slot = .{
             .slot_name = slot.slot_name,
@@ -1488,6 +1577,9 @@ test "storage.ha http admin executes typed former primary log rewind when config
     defer rewind.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), rewind.status);
     try std.testing.expectEqualStrings("application/json", rewind.content_type.?);
+    try expectContains(rewind.body, "\"action_kind\":\"rejoin_rewind\"");
+    try expectContains(rewind.body, "\"action_id\":\"rejoin_rewind:primary-a\"");
+    try expectContains(rewind.body, "\"state\":\"applied\"");
     try expectContains(rewind.body, "\"assessment\"");
     try expectContains(rewind.body, "\"rewind\"");
     try expectContains(rewind.body, "\"node_id\":\"primary-a\"");
@@ -1527,6 +1619,9 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try expectContains(response.body, "\"action_kind\":\"rejoin_reseed\"");
+    try expectContains(response.body, "\"action_id\":\"rejoin_reseed:primary-a\"");
+    try expectContains(response.body, "\"state\":\"applied\"");
     try expectContains(response.body, "\"assessment\"");
     try expectContains(response.body, "\"action\":\"reseed\"");
     try expectContains(response.body, "\"reseed\"");
@@ -1596,6 +1691,9 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_create.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_create.status);
     try std.testing.expectEqualStrings("application/json", typed_create.content_type.?);
+    try expectContains(typed_create.body, "\"action_kind\":\"replication_slot_create\"");
+    try expectContains(typed_create.body, "\"action_id\":\"replication_slot_create:standby-b\"");
+    try expectContains(typed_create.body, "\"state\":\"applied\"");
     try expectContains(typed_create.body, "\"slot_action\":\"create\"");
     try expectContains(typed_create.body, "\"slot_name\":\"standby-b\"");
 
@@ -1620,6 +1718,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_pause.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_pause.status);
     try std.testing.expectEqualStrings("application/json", typed_pause.content_type.?);
+    try expectContains(typed_pause.body, "\"action_kind\":\"replication_slot_pause\"");
     try expectContains(typed_pause.body, "\"slot_action\":\"pause\"");
     try expectContains(typed_pause.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_pause.body, "\"active\":false");
@@ -1633,6 +1732,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_resume.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_resume.status);
     try std.testing.expectEqualStrings("application/json", typed_resume.content_type.?);
+    try expectContains(typed_resume.body, "\"action_kind\":\"replication_slot_resume\"");
     try expectContains(typed_resume.body, "\"slot_action\":\"resume\"");
     try expectContains(typed_resume.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_resume.body, "\"active\":true");
@@ -1646,6 +1746,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_drop.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_drop.status);
     try std.testing.expectEqualStrings("application/json", typed_drop.content_type.?);
+    try expectContains(typed_drop.body, "\"action_kind\":\"replication_slot_drop\"");
     try expectContains(typed_drop.body, "\"slot_action\":\"drop\"");
     try expectContains(typed_drop.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_drop.body, "\"dropped\":true");
@@ -1800,6 +1901,8 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
     try std.testing.expectEqualStrings("application/json", typed_fence.content_type.?);
     try expectContains(typed_fence.body, "\"schema_version\":1");
+    try expectContains(typed_fence.body, "\"action_kind\":\"fence_acquire\"");
+    try expectContains(typed_fence.body, "\"action_id\":\"fence_acquire:standby-a\"");
     try expectContains(typed_fence.body, "\"receipt\"");
     try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 
@@ -1824,6 +1927,8 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_unfenced.status);
     try std.testing.expectEqualStrings("application/json", typed_rejoin_unfenced.content_type.?);
     try expectContains(typed_rejoin_unfenced.body, "\"schema_version\":1");
+    try expectContains(typed_rejoin_unfenced.body, "\"action_kind\":\"rejoin_assess\"");
+    try expectContains(typed_rejoin_unfenced.body, "\"state\":\"assessed\"");
     try expectContains(typed_rejoin_unfenced.body, "\"assessment\"");
     try expectContains(typed_rejoin_unfenced.body, "\"action\":\"reject_unfenced\"");
     try expectContains(typed_rejoin_unfenced.body, "\"reason\":\"no_fence\"");
@@ -1884,6 +1989,8 @@ test "storage.ha http admin serves health and command endpoint" {
     defer typed_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
     try std.testing.expectEqualStrings("application/json", typed_promote.content_type.?);
+    try expectContains(typed_promote.body, "\"action_kind\":\"promotion\"");
+    try expectContains(typed_promote.body, "\"action_id\":\"promotion:standby-a\"");
     try expectContains(typed_promote.body, "\"promotion\"");
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"fence_generation\":1");
@@ -1955,6 +2062,7 @@ test "storage.ha http admin accepts whole instance identity" {
     });
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
+    try expectContains(typed_fence.body, "\"action_kind\":\"fence_acquire\"");
     try expectContains(typed_fence.body, "\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0");
     try expectContains(typed_fence.body, "\"forced\":true");
 
@@ -1965,6 +2073,7 @@ test "storage.ha http admin accepts whole instance identity" {
     });
     defer typed_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
+    try expectContains(typed_promote.body, "\"action_kind\":\"promotion\"");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"forced\":true");
@@ -1995,6 +2104,8 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try std.testing.expectEqual(@as(u16, 200), typed_begin.status);
     try std.testing.expectEqualStrings("application/json", typed_begin.content_type.?);
     try expectContains(typed_begin.body, "\"schema_version\":1");
+    try expectContains(typed_begin.body, "\"action_kind\":\"base_backup_begin\"");
+    try expectContains(typed_begin.body, "\"action_id\":\"base_backup_begin:base-http\"");
     try expectContains(typed_begin.body, "\"slot_name\":\"standby-seed\"");
     try expectContains(typed_begin.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_begin.body, "\"backup_lsn\":1");
@@ -2033,6 +2144,8 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try std.testing.expectEqual(@as(u16, 200), typed_finish.status);
     try std.testing.expectEqualStrings("application/json", typed_finish.content_type.?);
     try expectContains(typed_finish.body, "\"schema_version\":1");
+    try expectContains(typed_finish.body, "\"action_kind\":\"base_backup_finish\"");
+    try expectContains(typed_finish.body, "\"action_id\":\"base_backup_finish:base-http\"");
     try expectContains(typed_finish.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_finish.body, "\"end_record_lsn\":3");
 
@@ -2052,6 +2165,8 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     try std.testing.expectEqual(@as(u16, 200), typed_bootstrap.status);
     try std.testing.expectEqualStrings("application/json", typed_bootstrap.content_type.?);
     try expectContains(typed_bootstrap.body, "\"schema_version\":1");
+    try expectContains(typed_bootstrap.body, "\"action_kind\":\"standby_bootstrap\"");
+    try expectContains(typed_bootstrap.body, "\"action_id\":\"standby_bootstrap:base-http\"");
     try expectContains(typed_bootstrap.body, "\"manifest_id\":\"base-http\"");
     try expectContains(typed_bootstrap.body, "\"checkpoint_lsn\":2");
     try std.testing.expectEqual(@as(u64, 3), standby.nextReceiveLsn());

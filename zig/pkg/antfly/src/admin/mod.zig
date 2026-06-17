@@ -68,6 +68,7 @@ pub const HAOwnerJobDecision = openapi.HAOwnerJobDecision;
 pub const HACommitGate = openapi.HACommitGate;
 pub const HAReplicationSlot = openapi.HAReplicationSlot;
 pub const HACommandResult = openapi.HACommandResult;
+pub const HAActionReceipt = openapi.HAActionReceipt;
 
 test {
     _ = openapi;
@@ -75,4 +76,5 @@ test {
     _ = ServerRouter;
     _ = HAPromotionResponse;
     _ = HARejoinAssessResponse;
+    _ = HAActionReceipt;
 }

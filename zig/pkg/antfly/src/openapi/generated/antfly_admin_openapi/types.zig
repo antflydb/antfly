@@ -66,32 +66,15 @@ pub const PromotionAssessRequest = struct {
     use_current_fence: ?bool = null,
 };
 
-pub const HABaseBackupBeginResponse = struct {
-    schema_version: i64,
-    /// Stable standby replication slot reserved for the base backup.
-    slot_name: []const u8,
-    /// Stable base-backup manifest id for retry and action correlation.
-    manifest_id: []const u8,
-    /// LSN reserved as the base-backup start boundary.
-    backup_lsn: i64,
-    /// Durable `backup_start` record LSN.
-    start_record_lsn: i64,
-};
-
-pub const HABaseBackupFinishResponse = struct {
-    schema_version: i64,
-    manifest_id: []const u8,
-    backup_lsn: i64,
-    /// Durable `backup_end` record LSN.
-    end_record_lsn: i64,
-};
-
-pub const HAStandbyBootstrapResponse = struct {
-    schema_version: i64,
-    manifest_id: []const u8,
-    backup_lsn: i64,
-    /// Standby checkpoint LSN after manifest validation.
-    checkpoint_lsn: i64,
+pub const HAActionReceipt = struct {
+    /// Stable action correlation id derived from the acted-on HA resource and boundary values.
+    action_id: []const u8,
+    /// Typed HA action that produced this response.
+    action_kind: []const u8,
+    /// Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
+    target: []const u8,
+    /// Idempotency state for this action response.
+    state: []const u8,
 };
 
 pub const HARejoinRewindResult = struct {
@@ -300,6 +283,37 @@ pub const HAPromotionHandoff = struct {
     next_lsn: i64,
 };
 
+pub const HABaseBackupBeginResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    /// Stable standby replication slot reserved for the base backup.
+    slot_name: []const u8,
+    /// Stable base-backup manifest id for retry and action correlation.
+    manifest_id: []const u8,
+    /// LSN reserved as the base-backup start boundary.
+    backup_lsn: i64,
+    /// Durable `backup_start` record LSN.
+    start_record_lsn: i64,
+};
+
+pub const HABaseBackupFinishResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    manifest_id: []const u8,
+    backup_lsn: i64,
+    /// Durable `backup_end` record LSN.
+    end_record_lsn: i64,
+};
+
+pub const HAStandbyBootstrapResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    manifest_id: []const u8,
+    backup_lsn: i64,
+    /// Standby checkpoint LSN after manifest validation.
+    checkpoint_lsn: i64,
+};
+
 pub const HAPromotionAssessResponse = struct {
     schema_version: i64,
     assessment: HAPromotionAssessment,
@@ -307,6 +321,7 @@ pub const HAPromotionAssessResponse = struct {
 
 pub const HARejoinAssessResponse = struct {
     schema_version: i64,
+    action: HAActionReceipt,
     assessment: HARejoinAssessment,
     /// Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
     rewind: ?HARejoinRewindResult = null,
@@ -336,6 +351,7 @@ pub const HAReadCheckResponse = struct {
 
 pub const HAReplicationSlotActionResponse = struct {
     schema_version: i64,
+    action: HAActionReceipt,
     slot_action: []const u8,
     slot: HAReplicationSlot,
 };
@@ -360,6 +376,7 @@ pub const RejoinAssessRequest = struct {
 
 pub const HAFenceResponse = struct {
     schema_version: i64,
+    action: HAActionReceipt,
     receipt: HAFenceReceipt,
 };
 
@@ -371,6 +388,7 @@ pub const HACurrentFenceResponse = struct {
 
 pub const HAPromotionResponse = struct {
     schema_version: i64,
+    action: HAActionReceipt,
     assessment: HAPromotionAssessment,
     promotion: HAPromotionResult,
     fence_generation: i64,
