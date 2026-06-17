@@ -162,6 +162,23 @@ pub fn renderJsonAlloc(alloc: Allocator, result: Result) ![]u8 {
 
 fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Result) ![]u8 {
     return switch (result) {
+        .slot => |slot_result| {
+            if (primaryActionNodeID(maybe_ctx)) |node_id| return try renderSlotActionJsonAlloc(alloc, node_id, slot_result);
+            return try renderJsonAlloc(alloc, result);
+        },
+        .slot_list => |snapshot| try renderSlotListJsonAlloc(alloc, snapshot),
+        .seed_begin => |response| {
+            if (primaryActionNodeID(maybe_ctx)) |node_id| return try renderSeedBeginJsonAlloc(alloc, node_id, response);
+            return try renderJsonAlloc(alloc, result);
+        },
+        .seed_finish => |response| {
+            if (primaryActionNodeID(maybe_ctx)) |node_id| return try renderSeedFinishJsonAlloc(alloc, node_id, response);
+            return try renderJsonAlloc(alloc, result);
+        },
+        .seed_bootstrap => |response| {
+            if (standbyActionNodeID(maybe_ctx)) |node_id| return try renderSeedBootstrapJsonAlloc(alloc, node_id, response);
+            return try renderJsonAlloc(alloc, result);
+        },
         .primary_status => |snapshot| try renderPrimaryStatusJsonAlloc(alloc, snapshot),
         .standby_status => |snapshot| try renderStandbyStatusJsonAlloc(alloc, snapshot),
         .commit_check => |gate| try renderCommitCheckJsonAlloc(alloc, gate),
@@ -169,6 +186,8 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
         .read_check => |decision| try renderReadCheckJsonAlloc(alloc, decision),
         .write_check => |decision| try renderWriteCheckJsonAlloc(alloc, decision),
         .owner_job_check => |decision| try renderOwnerJobCheckJsonAlloc(alloc, decision),
+        .fence_acquire => |fence_result| try renderFenceAcquireJsonAlloc(alloc, fence_result),
+        .fence_current => |maybe_fence_result| try renderFenceCurrentJsonAlloc(alloc, maybe_fence_result),
         .promote_assess => |assessment| {
             if (standbyActionNodeID(maybe_ctx)) |node_id| {
                 if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) {
@@ -177,8 +196,96 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
             }
             return try renderJsonAlloc(alloc, result);
         },
+        .promote_current_fence => |promotion_result| try renderPromotionJsonAlloc(alloc, promotion_result),
+        .promote => |promotion_result| try renderPromotionJsonAlloc(alloc, promotion_result),
+        .rejoin_assess => |assessment| try renderRejoinAssessJsonAlloc(alloc, assessment),
+        .rejoin_rewind => |rewind_result| try renderRejoinRewindJsonAlloc(alloc, rewind_result),
+        .rejoin_reseed => |reseed_result| {
+            if (primaryActionNodeID(maybe_ctx)) |node_id| return try renderRejoinReseedJsonAlloc(alloc, node_id, reseed_result);
+            return try renderJsonAlloc(alloc, result);
+        },
         else => try renderJsonAlloc(alloc, result),
     };
+}
+
+fn renderSlotActionJsonAlloc(alloc: Allocator, node_id: []const u8, result: admin.SlotResult) ![]u8 {
+    const action_kind = switch (result) {
+        .create => "replication_slot_create",
+        .pause => "replication_slot_pause",
+        .@"resume" => "replication_slot_resume",
+        .drop => "replication_slot_drop",
+    };
+    const slot_name = switch (result) {
+        inline else => |slot| slot.slot_name,
+    };
+    const slot_action = switch (result) {
+        .create => "create",
+        .pause => "pause",
+        .@"resume" => "resume",
+        .drop => "drop",
+    };
+    const action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ action_kind, slot_name });
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAReplicationSlotActionResponse{
+        .schema_version = 1,
+        .action = .{
+            .action_id = action_id,
+            .action_kind = action_kind,
+            .target = slot_name,
+            .state = "applied",
+            .node_id = node_id,
+        },
+        .slot_action = slot_action,
+        .slot = switch (result) {
+            inline else => |slot| try adminReplicationSlot(slot, if (@hasField(@TypeOf(slot), "dropped")) slot.dropped else null),
+        },
+    }, .{});
+}
+
+fn renderSlotListJsonAlloc(alloc: Allocator, snapshot: status.PrimarySnapshot) ![]u8 {
+    const slots = try adminReplicationSlots(alloc, snapshot);
+    defer alloc.free(slots);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAReplicationSlotListResponse{
+        .schema_version = 1,
+        .slots = slots,
+    }, .{});
+}
+
+fn renderSeedBeginJsonAlloc(alloc: Allocator, node_id: []const u8, response: primary_mod.BaseBackupStartResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "base_backup_begin:{s}", .{response.manifest_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HABaseBackupBeginResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "base_backup_begin", response.manifest_id, "applied", node_id),
+        .slot_name = response.slot_name,
+        .manifest_id = response.manifest_id,
+        .backup_lsn = try adminI64(response.backup_lsn),
+        .start_record_lsn = try adminI64(response.start_record_lsn),
+    }, .{});
+}
+
+fn renderSeedFinishJsonAlloc(alloc: Allocator, node_id: []const u8, response: SeedFinishResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "base_backup_finish:{s}", .{response.manifest_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HABaseBackupFinishResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "base_backup_finish", response.manifest_id, "applied", node_id),
+        .manifest_id = response.manifest_id,
+        .backup_lsn = try adminI64(response.backup_lsn),
+        .end_record_lsn = try adminI64(response.end_record_lsn),
+    }, .{});
+}
+
+fn renderSeedBootstrapJsonAlloc(alloc: Allocator, node_id: []const u8, response: SeedBootstrapResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "standby_bootstrap:{s}", .{response.manifest_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAStandbyBootstrapResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "standby_bootstrap", response.manifest_id, "applied", node_id),
+        .manifest_id = response.manifest_id,
+        .backup_lsn = try adminI64(response.backup_lsn),
+        .checkpoint_lsn = try adminI64(response.checkpoint_lsn),
+    }, .{});
 }
 
 fn renderPrimaryStatusJsonAlloc(alloc: Allocator, snapshot: status.PrimarySnapshot) ![]u8 {
@@ -233,6 +340,77 @@ fn renderOwnerJobCheckJsonAlloc(alloc: Allocator, decision: owner_job_gate.Decis
     }, .{});
 }
 
+fn renderFenceAcquireJsonAlloc(alloc: Allocator, result: admin.FenceReceiptResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "fence_acquire:{s}", .{result.receipt.promoted_node_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAFenceResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "fence_acquire", result.receipt.promoted_node_id, "applied", result.receipt.promoted_node_id),
+        .receipt = try adminFenceReceipt(result.receipt),
+    }, .{});
+}
+
+fn renderFenceCurrentJsonAlloc(alloc: Allocator, maybe_result: ?admin.FenceReceiptResult) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HACurrentFenceResponse{
+        .schema_version = 1,
+        .held = maybe_result != null,
+        .receipt = if (maybe_result) |result| try adminFenceReceipt(result.receipt) else null,
+    }, .{});
+}
+
+fn renderPromotionJsonAlloc(alloc: Allocator, result: admin.FencedPromotionResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "promotion:{s}", .{result.promoted_node_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAPromotionResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "promotion", result.promoted_node_id, "applied", result.promoted_node_id),
+        .assessment = try adminPromotionAssessment(result.assessment),
+        .promotion = .{
+            .node_id = result.promoted_node_id,
+            .switch_lsn = try adminI64(result.promotion.switch_lsn),
+            .old_identity = try adminIdentity(result.promotion.old_identity),
+            .new_identity = try adminIdentity(result.promotion.new_identity),
+            .forced = result.promotion.forced,
+            .data_loss_possible = result.promotion.data_loss_possible,
+        },
+        .fence_generation = try adminI64(result.fence_generation),
+        .fence_token = result.fence_token,
+        .forced = result.forced,
+    }, .{});
+}
+
+fn renderRejoinAssessJsonAlloc(alloc: Allocator, assessment: rejoin.Assessment) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "rejoin_assess:{s}", .{assessment.former_node_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HARejoinAssessResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "rejoin_assess", assessment.former_node_id, "assessed", assessment.former_node_id),
+        .assessment = try adminRejoinAssessment(assessment),
+    }, .{});
+}
+
+fn renderRejoinRewindJsonAlloc(alloc: Allocator, result: RejoinRewindResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "rejoin_rewind:{s}", .{result.assessment.former_node_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HARejoinAssessResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "rejoin_rewind", result.assessment.former_node_id, "applied", result.assessment.former_node_id),
+        .assessment = try adminRejoinAssessment(result.assessment),
+        .rewind = try adminRejoinRewindResult(result.rewind),
+    }, .{});
+}
+
+fn renderRejoinReseedJsonAlloc(alloc: Allocator, node_id: []const u8, result: RejoinReseedResult) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "rejoin_reseed:{s}", .{result.assessment.former_node_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HARejoinAssessResponse{
+        .schema_version = 1,
+        .action = adminActionReceipt(action_id, "rejoin_reseed", result.assessment.former_node_id, "applied", node_id),
+        .assessment = try adminRejoinAssessment(result.assessment),
+        .reseed = try adminRejoinReseedResult(result.reseed),
+    }, .{});
+}
+
 fn renderPromotionAssessJsonAlloc(
     alloc: Allocator,
     node_id: []const u8,
@@ -273,6 +451,58 @@ fn adminPromotionAssessment(assessment: status.PromotionAssessment) !admin_api.H
 fn adminI64(value: u64) !i64 {
     if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.AdminOpenAPIIntegerOverflow;
     return @intCast(value);
+}
+
+fn adminActionReceipt(
+    action_id: []const u8,
+    action_kind: []const u8,
+    target: []const u8,
+    state: []const u8,
+    node_id: []const u8,
+) admin_api.HAActionReceipt {
+    return .{
+        .action_id = action_id,
+        .action_kind = action_kind,
+        .target = target,
+        .state = state,
+        .node_id = node_id,
+    };
+}
+
+fn adminReplicationSlot(slot: anytype, dropped: ?bool) !admin_api.HAReplicationSlot {
+    return .{
+        .slot_name = slot.slot_name,
+        .timeline_id = try adminI64(slot.timeline_id),
+        .restart_lsn = try adminI64(slot.restart_lsn),
+        .received_lsn = try adminI64(slot.received_lsn),
+        .applied_lsn = try adminI64(slot.applied_lsn),
+        .safe_read_lsn = try adminI64(slot.safe_read_lsn),
+        .active = slot.active,
+        .reseed_required = slot.reseed_required,
+        .last_error = slot.last_error,
+        .current_lsn = try adminI64(slot.current_lsn),
+        .dropped = dropped,
+    };
+}
+
+fn adminReplicationSlots(alloc: Allocator, snapshot: status.PrimarySnapshot) ![]admin_api.HAReplicationSlot {
+    const slots = try alloc.alloc(admin_api.HAReplicationSlot, snapshot.slots.len);
+    errdefer alloc.free(slots);
+    for (snapshot.slots, 0..) |slot, idx| {
+        slots[idx] = .{
+            .slot_name = slot.name,
+            .timeline_id = try adminI64(slot.timeline_id),
+            .restart_lsn = try adminI64(slot.restart_lsn),
+            .received_lsn = try adminI64(slot.received_lsn),
+            .applied_lsn = try adminI64(slot.applied_lsn),
+            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
+            .active = slot.active,
+            .reseed_required = slot.reseed_required,
+            .last_error = slot.last_error,
+            .current_lsn = try adminI64(snapshot.current_lsn),
+        };
+    }
+    return slots;
 }
 
 fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
@@ -413,6 +643,65 @@ fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPro
         .identity = try adminIdentity(handoff.identity),
         .switch_lsn = try adminI64(handoff.switch_lsn),
         .next_lsn = try adminI64(handoff.next_lsn),
+    };
+}
+
+fn adminFenceReceipt(receipt: fencing.Receipt) !admin_api.HAFenceReceipt {
+    return .{
+        .identity = try adminIdentity(receipt.identity),
+        .old_primary_id = receipt.old_primary_id,
+        .promoted_node_id = receipt.promoted_node_id,
+        .parent_timeline_id = try adminI64(receipt.parent_timeline_id),
+        .parent_epoch = try adminI64(receipt.parent_epoch),
+        .new_timeline_id = try adminI64(receipt.new_timeline_id),
+        .new_epoch = try adminI64(receipt.new_epoch),
+        .required_lsn = try adminI64(receipt.required_lsn),
+        .observed_lsn = try adminI64(receipt.observed_lsn),
+        .generation = try adminI64(receipt.generation),
+        .forced = receipt.forced,
+        .token = receipt.token,
+        .reason = receipt.reason,
+    };
+}
+
+fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAssessment {
+    return .{
+        .action = @tagName(assessment.action),
+        .reason = @tagName(assessment.reason),
+        .former_node_id = assessment.former_node_id,
+        .target_timeline_id = try adminI64(assessment.target_timeline_id),
+        .target_epoch = try adminI64(assessment.target_epoch),
+        .fork_lsn = try adminI64(assessment.fork_lsn),
+        .former_last_lsn = try adminI64(assessment.former_last_lsn),
+        .retained_from_lsn = try adminI64(assessment.retained_from_lsn),
+        .data_loss_discarded = assessment.data_loss_discarded,
+    };
+}
+
+fn adminRejoinRewindResult(result: rejoin.RewindResult) !admin_api.HARejoinRewindResult {
+    return .{
+        .node_id = result.node_id,
+        .fork_lsn = try adminI64(result.fork_lsn),
+        .previous_last_lsn = try adminI64(result.previous_last_lsn),
+        .current_last_lsn = try adminI64(result.current_last_lsn),
+        .next_lsn = try adminI64(result.next_lsn),
+        .discarded_lsn_count = try adminI64(result.discarded_lsn_count),
+        .target_timeline_id = try adminI64(result.target_timeline_id),
+        .target_epoch = try adminI64(result.target_epoch),
+        .data_loss_discarded = result.data_loss_discarded,
+    };
+}
+
+fn adminRejoinReseedResult(result: rejoin.ReseedResult) !admin_api.HARejoinReseedResult {
+    return .{
+        .node_id = result.node_id,
+        .slot_name = result.slot_name,
+        .target_timeline_id = try adminI64(result.target_timeline_id),
+        .target_epoch = try adminI64(result.target_epoch),
+        .fork_lsn = try adminI64(result.fork_lsn),
+        .former_last_lsn = try adminI64(result.former_last_lsn),
+        .reseed_required = result.reseed_required,
+        .base_backup_required = result.base_backup_required,
     };
 }
 
@@ -1707,6 +1996,12 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(resumed_table, "action.action_id=replication_slot_resume:standby-a\n");
     try expectContains(resumed_table, "slot_action=resume\n");
     try expectContains(resumed_table, "last_error=IntentionalApplyFailure\n");
+    const resumed_json = try renderJsonWithContextAlloc(alloc, .{ .primary_node_id = "primary-a" }, resumed);
+    defer alloc.free(resumed_json);
+    try expectContains(resumed_json, "\"schema_version\":1");
+    try expectContains(resumed_json, "\"action_kind\":\"replication_slot_resume\"");
+    try expectContains(resumed_json, "\"node_id\":\"primary-a\"");
+    try expectContains(resumed_json, "\"slot_action\":\"resume\"");
 
     var primary_status_plan = try admin_cli.parse(alloc, &.{
         "status",
@@ -1995,6 +2290,13 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     try expectContains(rewind_table, "assessment.action=rewind\n");
     try expectContains(rewind_table, "rewind.node_id=primary-a\n");
     try expectContains(rewind_table, "rewind.discarded_lsn_count=2\n");
+    const rewind_json = try renderJsonWithContextAlloc(alloc, null, rewind_result);
+    defer alloc.free(rewind_json);
+    try expectContains(rewind_json, "\"schema_version\":1");
+    try expectContains(rewind_json, "\"action_kind\":\"rejoin_rewind\"");
+    try expectContains(rewind_json, "\"assessment\"");
+    try expectContains(rewind_json, "\"rewind\"");
+    try expectContains(rewind_json, "\"discarded_lsn_count\":2");
 
     var reseed_plan = try admin_cli.parse(alloc, &.{
         "--table",
@@ -2053,6 +2355,14 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     try expectContains(reseed_table, "assessment.action=reseed\n");
     try expectContains(reseed_table, "reseed.node_id=primary-a\n");
     try expectContains(reseed_table, "reseed.slot_name=primary-a\n");
+    const reseed_json = try renderJsonWithContextAlloc(alloc, .{ .primary_node_id = "standby-a" }, reseed_result);
+    defer alloc.free(reseed_json);
+    try expectContains(reseed_json, "\"schema_version\":1");
+    try expectContains(reseed_json, "\"action_kind\":\"rejoin_reseed\"");
+    try expectContains(reseed_json, "\"node_id\":\"standby-a\"");
+    try expectContains(reseed_json, "\"assessment\"");
+    try expectContains(reseed_json, "\"reseed\"");
+    try expectContains(reseed_json, "\"slot_name\":\"primary-a\"");
 }
 
 test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
@@ -2079,6 +2389,12 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     try expectContains(begin_table, "action.state=applied\n");
     try expectContains(begin_table, "slot_name=standby-a\n");
     try expectContains(begin_table, "manifest_id=base-0001\n");
+    const begin_json = try renderJsonWithContextAlloc(alloc, .{ .primary_node_id = "primary-a" }, begun);
+    defer alloc.free(begin_json);
+    try expectContains(begin_json, "\"schema_version\":1");
+    try expectContains(begin_json, "\"action_kind\":\"base_backup_begin\"");
+    try expectContains(begin_json, "\"node_id\":\"primary-a\"");
+    try expectContains(begin_json, "\"slot_name\":\"standby-a\"");
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
 
     const files = seedFiles();
@@ -2112,6 +2428,12 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     defer alloc.free(finish_table);
     try expectContains(finish_table, "action.action_id=base_backup_finish:base-0001\n");
     try expectContains(finish_table, "end_record_lsn=3\n");
+    const finish_json = try renderJsonWithContextAlloc(alloc, .{ .primary_node_id = "primary-a" }, finished);
+    defer alloc.free(finish_json);
+    try expectContains(finish_json, "\"schema_version\":1");
+    try expectContains(finish_json, "\"action_kind\":\"base_backup_finish\"");
+    try expectContains(finish_json, "\"node_id\":\"primary-a\"");
+    try expectContains(finish_json, "\"end_record_lsn\":3");
 
     var bootstrap_plan = try admin_cli.parse(alloc, &.{ "seed", "bootstrap", "--manifest", manifest_path, "--content-root", paths.backup_root });
     defer bootstrap_plan.deinit(alloc);
@@ -2131,6 +2453,12 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     const context_table_body = try renderTableForContextAlloc(alloc, .{ .standby_node_id = "standby-a" }, bootstrapped);
     defer alloc.free(context_table_body);
     try expectContains(context_table_body, "action.node_id=standby-a\n");
+    const bootstrap_json = try renderJsonWithContextAlloc(alloc, .{ .standby_node_id = "standby-a" }, bootstrapped);
+    defer alloc.free(bootstrap_json);
+    try expectContains(bootstrap_json, "\"schema_version\":1");
+    try expectContains(bootstrap_json, "\"action_kind\":\"standby_bootstrap\"");
+    try expectContains(bootstrap_json, "\"node_id\":\"standby-a\"");
+    try expectContains(bootstrap_json, "\"checkpoint_lsn\":2");
 }
 
 test "storage.ha admin exec streams one local replication session" {
@@ -2332,6 +2660,12 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(fence_table, "action.state=applied\n");
     try expectContains(fence_table, "promoted_node_id=standby-a\n");
     try expectContains(fence_table, "generation=1\n");
+    const fence_json = try renderJsonWithContextAlloc(alloc, null, fenced);
+    defer alloc.free(fence_json);
+    try expectContains(fence_json, "\"schema_version\":1");
+    try expectContains(fence_json, "\"action_kind\":\"fence_acquire\"");
+    try expectContains(fence_json, "\"receipt\"");
+    try expectContains(fence_json, "\"promoted_node_id\":\"standby-a\"");
 
     var current_fence_plan = try admin_cli.parse(alloc, &.{ "--table", "fence", "current" });
     defer current_fence_plan.deinit(alloc);
@@ -2343,6 +2677,11 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(current_fence_table, "result=fence_current\n");
     try expectContains(current_fence_table, "held=true\n");
     try expectContains(current_fence_table, "old_primary_id=primary-a\n");
+    const current_fence_json = try renderJsonWithContextAlloc(alloc, null, current_fence);
+    defer alloc.free(current_fence_json);
+    try expectContains(current_fence_json, "\"schema_version\":1");
+    try expectContains(current_fence_json, "\"held\":true");
+    try expectContains(current_fence_json, "\"receipt\"");
 
     var direct_assess_plan = try admin_cli.parse(alloc, &.{ "--table", "promote", "assess", "--required-lsn", "1", "--fencing-confirmed" });
     defer direct_assess_plan.deinit(alloc);
@@ -2403,6 +2742,12 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(promoted_table, "action.state=applied\n");
     try expectContains(promoted_table, "promotion.node_id=standby-a\n");
     try expectContains(promoted_table, "promotion.new_identity.timeline_id=2\n");
+    const promoted_json = try renderJsonWithContextAlloc(alloc, null, promoted);
+    defer alloc.free(promoted_json);
+    try expectContains(promoted_json, "\"schema_version\":1");
+    try expectContains(promoted_json, "\"action_kind\":\"promotion\"");
+    try expectContains(promoted_json, "\"promotion\"");
+    try expectContains(promoted_json, "\"fence_token\":\"");
 
     var rejoin_plan = try admin_cli.parse(alloc, &.{
         "rejoin",              "assess",
@@ -2425,6 +2770,12 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(rejoin_table, "action.action_kind=rejoin_assess\n");
     try expectContains(rejoin_table, "action.target=primary-a\n");
     try expectContains(rejoin_table, "action.state=assessed\n");
+    const rejoin_json = try renderJsonWithContextAlloc(alloc, null, rejoin_result);
+    defer alloc.free(rejoin_json);
+    try expectContains(rejoin_json, "\"schema_version\":1");
+    try expectContains(rejoin_json, "\"action_kind\":\"rejoin_assess\"");
+    try expectContains(rejoin_json, "\"assessment\"");
+    try expectContains(rejoin_json, "\"action\":\"reject_unfenced\"");
 
     const read_json = try renderJsonAlloc(alloc, read);
     defer alloc.free(read_json);
