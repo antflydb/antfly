@@ -602,8 +602,8 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        var document = try promotionDocument(self.alloc, result);
-        defer document.action.deinit(self.alloc);
+        const document = try promotionDocument(self.alloc, result);
+        defer self.alloc.free(document.action.action_id);
         return try self.handleTypedJson(document);
     }
 
@@ -617,8 +617,8 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        var document = try promotionDocument(self.alloc, result);
-        defer document.action.deinit(self.alloc);
+        const document = try promotionDocument(self.alloc, result);
+        defer self.alloc.free(document.action.action_id);
         return try self.handleTypedJson(document);
     }
 
@@ -909,25 +909,6 @@ const CurrentFenceDocument = struct {
     receipt: ?fencing.Receipt,
 };
 
-const PromotionDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    assessment: status_mod.PromotionAssessment,
-    promotion: PromotionResultDocument,
-    fence_generation: u64,
-    fence_token: []const u8,
-    forced: bool,
-};
-
-const PromotionResultDocument = struct {
-    node_id: []const u8,
-    switch_lsn: u64,
-    old_identity: standby_mod.Identity,
-    new_identity: standby_mod.Identity,
-    forced: bool,
-    data_loss_possible: bool,
-};
-
 const ActionReceiptDocument = struct {
     action_id: []const u8,
     action_kind: []const u8,
@@ -958,22 +939,29 @@ fn actionReceiptAlloc(
     };
 }
 
-fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !PromotionDocument {
+fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !admin_api.HAPromotionResponse {
     const target = result.promoted_node_id;
-    var action = try actionReceiptAlloc(alloc, "promotion", target, "applied", result.promoted_node_id);
-    errdefer action.deinit(alloc);
+    const action_id = try std.fmt.allocPrint(alloc, "promotion:{s}", .{target});
+    errdefer alloc.free(action_id);
     return .{
-        .action = action,
-        .assessment = result.assessment,
+        .schema_version = 1,
+        .action = .{
+            .action_id = action_id,
+            .action_kind = "promotion",
+            .target = target,
+            .state = "applied",
+            .node_id = result.promoted_node_id,
+        },
+        .assessment = try adminPromotionAssessment(result.assessment),
         .promotion = .{
             .node_id = result.promoted_node_id,
-            .switch_lsn = result.promotion.switch_lsn,
-            .old_identity = result.promotion.old_identity,
-            .new_identity = result.promotion.new_identity,
+            .switch_lsn = try adminI64(result.promotion.switch_lsn),
+            .old_identity = try adminIdentity(result.promotion.old_identity),
+            .new_identity = try adminIdentity(result.promotion.new_identity),
             .forced = result.promotion.forced,
             .data_loss_possible = result.promotion.data_loss_possible,
         },
-        .fence_generation = result.fence_generation,
+        .fence_generation = try adminI64(result.fence_generation),
         .fence_token = result.fence_token,
         .forced = result.forced,
     };
@@ -1042,6 +1030,16 @@ fn adminRejoinReseedResult(result: rejoin.ReseedResult) !admin_api.HARejoinResee
         .former_last_lsn = try adminI64(result.former_last_lsn),
         .reseed_required = result.reseed_required,
         .base_backup_required = result.base_backup_required,
+    };
+}
+
+fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
+    return .{
+        .cluster_id = try adminI64(identity.cluster_id),
+        .shard_id = try adminI64(identity.shard_id),
+        .table_id = try adminI64(identity.table_id),
+        .timeline_id = try adminI64(identity.timeline_id),
+        .epoch = try adminI64(identity.epoch),
     };
 }
 
