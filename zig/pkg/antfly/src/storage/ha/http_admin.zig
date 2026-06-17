@@ -626,9 +626,9 @@ pub const Server = struct {
                     return try textResponse(self.alloc, 400, "invalid HA promotion assessment request");
                 };
             }
-            command.check.fencing_confirmed = parsed.value.fencing_confirmed orelse false;
-            command.check.force = parsed.value.force orelse false;
-            command.use_current_fence = parsed.value.use_current_fence orelse false;
+            command.check.fencing_confirmed = parsed.value.fencing_confirmed;
+            command.check.force = parsed.value.force;
+            command.use_current_fence = parsed.value.use_current_fence;
         }
         const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
 
@@ -730,7 +730,7 @@ pub const Server = struct {
             .last_lsn = last_lsn,
         }, receipt, .{
             .retained_from_lsn = retained_from_lsn,
-            .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion orelse false,
+            .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion,
         });
 
         if (expected_action) |expected| {
@@ -1477,7 +1477,7 @@ fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing
         .new_epoch = try positiveUint64FromJson(request.new_epoch),
         .required_lsn = try positiveUint64FromJson(request.required_lsn),
         .observed_lsn = try uint64FromJson(request.observed_lsn),
-        .force = request.force orelse false,
+        .force = request.force,
         .reason = request.reason orelse "",
     };
 }
@@ -1883,7 +1883,7 @@ test "storage.ha http admin executes typed former primary log rewind when config
     defer server.deinit();
 
     const body =
-        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
+        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
     var rewind = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
@@ -1922,7 +1922,7 @@ test "storage.ha http admin rejects typed former primary rewind on node without 
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), response.status);
@@ -1946,7 +1946,7 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_reseed,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -1974,7 +1974,7 @@ test "storage.ha http admin rejects typed former primary reseed on node without 
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_reseed,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), response.status);
@@ -2331,7 +2331,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_fence,
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"reason\":\"http-admin-test\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"http-admin-test\"}",
     });
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
@@ -2358,7 +2358,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_assess,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":1,\"retained_from_lsn\":0}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":1,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false}",
     });
     defer typed_rejoin_unfenced.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_unfenced.status);
@@ -2374,7 +2374,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_assess,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer typed_rejoin_fenced.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_fenced.status);
@@ -2387,7 +2387,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer typed_rejoin_rewind.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), typed_rejoin_rewind.status);
@@ -2397,7 +2397,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_reseed,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer typed_rejoin_reseed_mismatch.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), typed_rejoin_reseed_mismatch.status);
@@ -2407,7 +2407,7 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_promotion_assess,
         .content_type = "application/json",
-        .body = "{\"use_current_fence\":true}",
+        .body = "{\"required_lsn\":1,\"fencing_confirmed\":false,\"force\":false,\"use_current_fence\":true}",
     });
     defer typed_promote_assess.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote_assess.status);
@@ -2457,7 +2457,7 @@ test "storage.ha http admin reports unsafe promotion as conflict" {
         .method = .POST,
         .uri = admin_api.routes.ha_fence,
         .content_type = "application/json",
-        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"reason\":\"unsafe-promotion-test\"}",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"force\":false,\"reason\":\"unsafe-promotion-test\"}",
     });
     defer typed_fence.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_fence.status);

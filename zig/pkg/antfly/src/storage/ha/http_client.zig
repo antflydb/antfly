@@ -662,7 +662,7 @@ fn validatePromotionResponse(
         if (promotion.new_identity.epoch != expected.new_epoch) return error.AdminPromotionResponseMismatch;
         if (response.assessment.required_lsn != expected.required_lsn) return error.AdminPromotionResponseMismatch;
         if (response.assessment.received_lsn < expected.observed_lsn) return error.AdminPromotionResponseMismatch;
-        if (response.forced != (expected.force orelse false)) return error.AdminPromotionResponseMismatch;
+        if (response.forced != expected.force) return error.AdminPromotionResponseMismatch;
     }
 }
 
@@ -1071,6 +1071,7 @@ test "storage.ha http client round trips admin commands" {
         .new_epoch = 2,
         .required_lsn = 1,
         .observed_lsn = 1,
+        .force = false,
         .reason = "http-client-test",
     };
     var fenced = try client.acquireFence("http://ha-admin.test", fence_request);
@@ -1414,6 +1415,7 @@ test "storage.ha http client round trips typed safety operations" {
         .new_epoch = 2,
         .required_lsn = 1,
         .observed_lsn = 1,
+        .force = false,
         .reason = "typed-client-test",
     };
     var fence = try client.acquireFence("http://ha-admin.test", fence_request);
@@ -1428,6 +1430,9 @@ test "storage.ha http client round trips typed safety operations" {
     try std.testing.expectEqualStrings("primary-a", current.parsed.value.receipt.?.old_primary_id);
 
     var assessment = try client.assessPromotion("http://ha-admin.test", .{
+        .required_lsn = 1,
+        .fencing_confirmed = false,
+        .force = false,
         .use_current_fence = true,
     });
     defer assessment.deinit(alloc);
@@ -1448,6 +1453,7 @@ test "storage.ha http client round trips typed safety operations" {
         .identity = testAdminIdentity(),
         .last_lsn = 2,
         .retained_from_lsn = 0,
+        .allow_rewind_after_forced_promotion = false,
         .receipt = fence.parsed.value.receipt,
     });
     defer rejoin.deinit(alloc);
@@ -1464,6 +1470,7 @@ test "storage.ha http client round trips typed safety operations" {
         .identity = testAdminIdentity(),
         .last_lsn = 2,
         .retained_from_lsn = 0,
+        .allow_rewind_after_forced_promotion = false,
         .receipt = fence.parsed.value.receipt,
     });
     defer rewind.deinit(alloc);
@@ -1479,6 +1486,7 @@ test "storage.ha http client round trips typed safety operations" {
         .identity = testAdminIdentity(),
         .last_lsn = 2,
         .retained_from_lsn = 0,
+        .allow_rewind_after_forced_promotion = false,
         .receipt = fence.parsed.value.receipt,
     }));
 }
@@ -1497,6 +1505,7 @@ test "storage.ha http client rejects mismatched rejoin admin responses" {
         .identity = testAdminIdentity(),
         .last_lsn = 2,
         .retained_from_lsn = 0,
+        .allow_rewind_after_forced_promotion = false,
         .receipt = testFenceReceipt(),
     }));
 }
@@ -1518,6 +1527,7 @@ test "storage.ha http client rejects mismatched promotion admin responses" {
         .new_epoch = 2,
         .required_lsn = 1,
         .observed_lsn = 1,
+        .force = false,
         .reason = "http-client-test",
     }));
 }

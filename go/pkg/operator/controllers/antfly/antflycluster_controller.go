@@ -43,6 +43,7 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	"github.com/antflydb/antfly/go/pkg/operator/controllers/internal/poddiagnostics"
+	adminsdk "github.com/antflydb/antfly/go/pkg/sdk/admin"
 )
 
 // AntflyClusterReconciler reconciles an AntflyCluster object
@@ -3411,24 +3412,28 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	if err := haValidatePlannedActionAdminOperation(*action); err != nil {
 		return true, err
 	}
+	adminClient, err := r.haAdminSDKClient(action.AdminURL)
+	if err != nil {
+		return true, err
+	}
 	switch action.Kind {
 	case string(haActionCreateSlot):
 		slotName := haActionSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		body := haReplicationSlotCreateRequest{SlotName: slotName}
+		body := adminsdk.ReplicationSlotCreateRequest{SlotName: slotName}
 		if action.TargetLSN > 0 {
-			body.InitialLSN = action.TargetLSN
+			body.InitialLsn = action.TargetLSN
 		}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		result, err := adminClient.CreateReplicationSlotResponse(ctx, body)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3438,14 +3443,14 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
+		result, err := adminClient.PauseReplicationSlotResponse(ctx, slotName)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3455,14 +3460,14 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
+		result, err := adminClient.ResumeReplicationSlotResponse(ctx, slotName)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3472,14 +3477,14 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
+		result, err := adminClient.DropReplicationSlotResponse(ctx, slotName)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3493,18 +3498,18 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if manifestID == "" {
 			return true, fmt.Errorf("HA admin action %s requires nonzero target LSN to create seed manifest", action.Kind)
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		body := haBaseBackupStartRequest{
+		body := adminsdk.BaseBackupStartRequest{
 			SlotName:   slotName,
-			ManifestID: manifestID,
+			ManifestId: manifestID,
 		}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		result, err := adminClient.BeginBaseBackupResponse(ctx, body)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3513,15 +3518,15 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if strings.TrimSpace(action.SeedManifestPath) == "" {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		body := haBaseBackupManifestPathRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		body := adminsdk.BaseBackupManifestPathRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
+		result, err := adminClient.FinishBaseBackupResponse(ctx, body)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3530,18 +3535,18 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if strings.TrimSpace(action.SeedManifestPath) == "" {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		body := haStandbyBootstrapRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
+		body := adminsdk.StandbyBootstrapRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
 		if strings.TrimSpace(action.SeedContentRoot) != "" {
 			body.ContentRoot = strings.TrimSpace(action.SeedContentRoot)
 		}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		result, err := adminClient.BootstrapStandbyResponse(ctx, body)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3551,41 +3556,41 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		result, err := adminClient.AcquireFenceResponse(ctx, haFenceAcquireAdminSDKRequest(body))
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectFenceAcquireResult(cluster, action, raw)
 		}
 		return true, err
 	case string(haActionAssessPromotion):
 		body := haPromotionAssessBody(*action)
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		result, err := adminClient.AssessPromotionResponse(ctx, haPromotionAssessAdminSDKRequest(body))
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectPromotionAssessmentResult(action, raw)
 		}
 		return true, err
 	case string(haActionPromoteStandby):
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
+		result, err := adminClient.PromoteWithCurrentFenceResponse(ctx)
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil && !r.applyHADirectPromotionResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed promotion receipt", action.Kind)
 		}
@@ -3595,20 +3600,115 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
-		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
-		if !ok {
+		if !haPlannedActionHasDirectAdminOperation(*action) {
 			return false, nil
 		}
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		var result *adminsdk.HAResponse[adminsdk.HARejoinAssessResponse]
+		switch haActionKind(action.Kind) {
+		case haActionRewindFormerPrimary:
+			result, err = adminClient.RewindRejoinResponse(ctx, haRejoinAssessAdminSDKRequest(body))
+		case haActionReseedFormerPrimary:
+			result, err = adminClient.ReseedRejoinResponse(ctx, haRejoinAssessAdminSDKRequest(body))
+		default:
+			result, err = adminClient.AssessRejoinResponse(ctx, haRejoinAssessAdminSDKRequest(body))
+		}
+		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil && !r.applyHADirectRejoinAssessResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed rejoin assessment", action.Kind)
 		}
 		return true, err
 	default:
 		return false, nil
+	}
+}
+
+func (r *AntflyClusterReconciler) haAdminSDKClient(baseURL string) (*adminsdk.HAClient, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, fmt.Errorf("HA admin API execution requires adminURL")
+	}
+	return adminsdk.NewHAClient(baseURL, r.httpClient())
+}
+
+func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatus) bool {
+	_, _, ok := haPlannedActionDirectAdminOperation(action)
+	return ok
+}
+
+func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]byte, error) {
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, fmt.Errorf("HA admin SDK response is nil")
+	}
+	return value.Body, nil
+}
+
+func haAdminSDKIdentity(identity haAdminIdentityRequest) adminsdk.HAIdentity {
+	return adminsdk.HAIdentity{
+		ClusterId:  identity.ClusterID,
+		ShardId:    identity.ShardID,
+		TableId:    identity.TableID,
+		TimelineId: identity.TimelineID,
+		Epoch:      identity.Epoch,
+	}
+}
+
+func haFenceAcquireAdminSDKRequest(body haFenceAcquireRequest) adminsdk.FenceAcquireRequest {
+	return adminsdk.FenceAcquireRequest{
+		Identity:       haAdminSDKIdentity(body.Identity),
+		OldPrimaryId:   body.OldPrimaryID,
+		PromotedNodeId: body.PromotedNodeID,
+		NewTimelineId:  body.NewTimelineID,
+		NewEpoch:       body.NewEpoch,
+		RequiredLsn:    body.RequiredLSN,
+		ObservedLsn:    body.ObservedLSN,
+		Force:          body.Force,
+		Reason:         body.Reason,
+	}
+}
+
+func haPromotionAssessAdminSDKRequest(body haPromotionAssessRequest) adminsdk.PromotionAssessRequest {
+	return adminsdk.PromotionAssessRequest{
+		RequiredLsn:      body.RequiredLSN,
+		FencingConfirmed: body.FencingConfirmed,
+		Force:            body.Force,
+		UseCurrentFence:  body.UseCurrentFence,
+	}
+}
+
+func haFenceReceiptAdminSDKRequest(receipt *haFenceReceiptRequest) adminsdk.HAFenceReceipt {
+	if receipt == nil {
+		return adminsdk.HAFenceReceipt{}
+	}
+	return adminsdk.HAFenceReceipt{
+		Identity:         haAdminSDKIdentity(receipt.Identity),
+		OldPrimaryId:     receipt.OldPrimaryID,
+		PromotedNodeId:   receipt.PromotedNodeID,
+		ParentTimelineId: receipt.ParentTimelineID,
+		ParentEpoch:      receipt.ParentEpoch,
+		NewTimelineId:    receipt.NewTimelineID,
+		NewEpoch:         receipt.NewEpoch,
+		RequiredLsn:      receipt.RequiredLSN,
+		ObservedLsn:      receipt.ObservedLSN,
+		Generation:       receipt.Generation,
+		Forced:           receipt.Forced,
+		Token:            receipt.Token,
+		Reason:           receipt.Reason,
+	}
+}
+
+func haRejoinAssessAdminSDKRequest(body haRejoinAssessRequest) adminsdk.RejoinAssessRequest {
+	return adminsdk.RejoinAssessRequest{
+		NodeId:                          body.NodeID,
+		Identity:                        haAdminSDKIdentity(body.Identity),
+		LastLsn:                         body.LastLSN,
+		RetainedFromLsn:                 body.RetainedFromLSN,
+		AllowRewindAfterForcedPromotion: body.AllowRewindAfterForcedPromotion,
+		Receipt:                         haFenceReceiptAdminSDKRequest(body.Receipt),
 	}
 }
 

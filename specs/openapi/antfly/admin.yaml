@@ -778,6 +778,7 @@ components:
         - new_epoch
         - required_lsn
         - observed_lsn
+        - force
       additionalProperties: false
       properties:
         identity:
@@ -878,6 +879,7 @@ components:
         - identity
         - last_lsn
         - retained_from_lsn
+        - allow_rewind_after_forced_promotion
       additionalProperties: false
       properties:
         node_id:
@@ -904,6 +906,11 @@ components:
           description: Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     PromotionAssessRequest:
       type: object
+      required:
+        - required_lsn
+        - fencing_confirmed
+        - force
+        - use_current_fence
       additionalProperties: false
       properties:
         required_lsn:

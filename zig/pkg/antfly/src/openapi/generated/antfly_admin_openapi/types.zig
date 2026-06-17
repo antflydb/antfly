@@ -60,10 +60,10 @@ pub const HAIdentity = struct {
 };
 
 pub const PromotionAssessRequest = struct {
-    required_lsn: ?i64 = null,
-    fencing_confirmed: ?bool = null,
-    force: ?bool = null,
-    use_current_fence: ?bool = null,
+    required_lsn: ?i64,
+    fencing_confirmed: bool,
+    force: bool,
+    use_current_fence: bool,
 };
 
 pub const HAActionReceipt = struct {
@@ -241,7 +241,7 @@ pub const FenceAcquireRequest = struct {
     new_epoch: i64,
     required_lsn: i64,
     observed_lsn: i64,
-    force: ?bool = null,
+    force: bool,
     reason: ?[]const u8 = null,
 };
 
@@ -379,7 +379,7 @@ pub const RejoinAssessRequest = struct {
     last_lsn: i64,
     /// Earliest parent-timeline WAL LSN still retained for rewind.
     retained_from_lsn: i64,
-    allow_rewind_after_forced_promotion: ?bool = null,
+    allow_rewind_after_forced_promotion: bool,
     /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     receipt: ?HAFenceReceipt = null,
 };

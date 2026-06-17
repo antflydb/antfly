@@ -1,0 +1,359 @@
+package admin
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
+)
+
+const adminV1Path = "/admin/v1"
+
+type (
+	HAActionReceipt                 = oapi.HAActionReceipt
+	HABaseBackupBeginResponse       = oapi.HABaseBackupBeginResponse
+	HABaseBackupFinishResponse      = oapi.HABaseBackupFinishResponse
+	HACurrentFenceResponse          = oapi.HACurrentFenceResponse
+	HAFenceReceipt                  = oapi.HAFenceReceipt
+	HAFenceResponse                 = oapi.HAFenceResponse
+	HAIdentity                      = oapi.HAIdentity
+	HAPrimaryStatusParams           = oapi.GetHAPrimaryStatusParams
+	HAPrimaryStatusResponse         = oapi.HAPrimaryStatusResponse
+	HAPromotionAssessResponse       = oapi.HAPromotionAssessResponse
+	HAPromotionResponse             = oapi.HAPromotionResponse
+	HARejoinAssessResponse          = oapi.HARejoinAssessResponse
+	HAReplicationSlotActionResponse = oapi.HAReplicationSlotActionResponse
+	HAReplicationSlotListResponse   = oapi.HAReplicationSlotListResponse
+	HAStandbyBootstrapResponse      = oapi.HAStandbyBootstrapResponse
+	HAStandbyStatusParams           = oapi.GetHAStandbyStatusParams
+	HAStandbyStatusResponse         = oapi.HAStandbyStatusResponse
+
+	BaseBackupManifestPathRequest = oapi.BaseBackupManifestPathRequest
+	BaseBackupStartRequest        = oapi.BaseBackupStartRequest
+	FenceAcquireRequest           = oapi.FenceAcquireRequest
+	PromotionAssessRequest        = oapi.PromotionAssessRequest
+	RejoinAssessRequest           = oapi.RejoinAssessRequest
+	ReplicationSlotCreateRequest  = oapi.ReplicationSlotCreateRequest
+	StandbyBootstrapRequest       = oapi.StandbyBootstrapRequest
+)
+
+// HAClient is a typed client for the stable /admin/v1/ha API.
+type HAClient struct {
+	client  *oapi.ClientWithResponses
+	editors []oapi.RequestEditorFn
+}
+
+// HAResponse keeps the typed response and the original response body together.
+// The raw body is useful for callers that must validate field presence, not
+// just decoded values.
+type HAResponse[T any] struct {
+	Value      *T
+	Body       []byte
+	StatusCode int
+}
+
+// HAAPIError describes a non-2xx HA admin API response.
+type HAAPIError struct {
+	Operation  string
+	StatusCode int
+	Body       string
+}
+
+func (e *HAAPIError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("%s returned status %d", e.Operation, e.StatusCode)
+	}
+	return fmt.Sprintf("%s returned status %d: %s", e.Operation, e.StatusCode, e.Body)
+}
+
+// NewHAClient creates a typed HA admin client. The base URL may be either the
+// Antfly server root or an explicit /admin/v1 admin API root.
+func NewHAClient(baseURL string, httpClient *http.Client) (*HAClient, error) {
+	opts := []oapi.ClientOption{}
+	if httpClient != nil {
+		opts = append(opts, oapi.WithHTTPClient(httpClient))
+	}
+	return NewHAClientWithOptions(baseURL, opts...)
+}
+
+// NewHAClientWithOptions creates a typed HA admin client with generated-client options.
+func NewHAClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*HAClient, error) {
+	client, err := oapi.NewClientWithResponses(normalizeAdminBaseURL(baseURL), opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &HAClient{client: client}, nil
+}
+
+// WithToken configures bearer-token authentication for HA admin requests.
+func (c *HAClient) WithToken(token string) *HAClient {
+	token = strings.TrimSpace(token)
+	c.editors = nil
+	if token != "" {
+		c.editors = append(c.editors, func(_ context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+token)
+			return nil
+		})
+	}
+	return c
+}
+
+// Client returns the underlying generated client for low-level operations.
+func (c *HAClient) Client() *oapi.ClientWithResponses {
+	return c.client
+}
+
+func normalizeAdminBaseURL(baseURL string) string {
+	trimmed := strings.TrimRight(baseURL, "/")
+	return strings.TrimSuffix(trimmed, adminV1Path) + adminV1Path
+}
+
+func requireHAJSON200[T any](operation string, statusCode int, body []byte, value *T, err error) (*HAResponse[T], error) {
+	if err != nil {
+		return nil, err
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return nil, &HAAPIError{
+			Operation:  operation,
+			StatusCode: statusCode,
+			Body:       strings.TrimSpace(string(body)),
+		}
+	}
+	if value == nil {
+		return nil, &HAAPIError{
+			Operation:  operation,
+			StatusCode: statusCode,
+			Body:       strings.TrimSpace(string(body)),
+		}
+	}
+	return &HAResponse[T]{
+		Value:      value,
+		Body:       body,
+		StatusCode: statusCode,
+	}, nil
+}
+
+func haResponseValue[T any](response *HAResponse[T], err error) (*T, error) {
+	if err != nil {
+		return nil, err
+	}
+	return response.Value, nil
+}
+
+func (c *HAClient) PrimaryStatusResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[HAPrimaryStatusResponse], error) {
+	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("get HA primary status", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusParams) (*HAPrimaryStatusResponse, error) {
+	return haResponseValue(c.PrimaryStatusResponse(ctx, params))
+}
+
+func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[HAStandbyStatusResponse], error) {
+	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("get HA standby status", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
+	return haResponseValue(c.StandbyStatusResponse(ctx, params))
+}
+
+func (c *HAClient) ListReplicationSlotsResponse(ctx context.Context) (*HAResponse[HAReplicationSlotListResponse], error) {
+	resp, err := c.client.ListHAReplicationSlotsWithResponse(ctx, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("list HA replication slots", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) ListReplicationSlots(ctx context.Context) (*HAReplicationSlotListResponse, error) {
+	return haResponseValue(c.ListReplicationSlotsResponse(ctx))
+}
+
+func (c *HAClient) CreateReplicationSlotResponse(ctx context.Context, body ReplicationSlotCreateRequest) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	resp, err := c.client.CreateHAReplicationSlotWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("create HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) CreateReplicationSlot(ctx context.Context, body ReplicationSlotCreateRequest) (*HAReplicationSlotActionResponse, error) {
+	return haResponseValue(c.CreateReplicationSlotResponse(ctx, body))
+}
+
+func (c *HAClient) PauseReplicationSlotResponse(ctx context.Context, slotName string) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	resp, err := c.client.PauseHAReplicationSlotWithResponse(ctx, slotName, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("pause HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) PauseReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
+	return haResponseValue(c.PauseReplicationSlotResponse(ctx, slotName))
+}
+
+func (c *HAClient) ResumeReplicationSlotResponse(ctx context.Context, slotName string) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	resp, err := c.client.ResumeHAReplicationSlotWithResponse(ctx, slotName, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("resume HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) ResumeReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
+	return haResponseValue(c.ResumeReplicationSlotResponse(ctx, slotName))
+}
+
+func (c *HAClient) DropReplicationSlotResponse(ctx context.Context, slotName string) (*HAResponse[HAReplicationSlotActionResponse], error) {
+	resp, err := c.client.DropHAReplicationSlotWithResponse(ctx, slotName, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("drop HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) DropReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
+	return haResponseValue(c.DropReplicationSlotResponse(ctx, slotName))
+}
+
+func (c *HAClient) BeginBaseBackupResponse(ctx context.Context, body BaseBackupStartRequest) (*HAResponse[HABaseBackupBeginResponse], error) {
+	resp, err := c.client.BeginHABaseBackupWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("begin HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) BeginBaseBackup(ctx context.Context, body BaseBackupStartRequest) (*HABaseBackupBeginResponse, error) {
+	return haResponseValue(c.BeginBaseBackupResponse(ctx, body))
+}
+
+func (c *HAClient) FinishBaseBackupResponse(ctx context.Context, body BaseBackupManifestPathRequest) (*HAResponse[HABaseBackupFinishResponse], error) {
+	resp, err := c.client.FinishHABaseBackupWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("finish HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) FinishBaseBackup(ctx context.Context, body BaseBackupManifestPathRequest) (*HABaseBackupFinishResponse, error) {
+	return haResponseValue(c.FinishBaseBackupResponse(ctx, body))
+}
+
+func (c *HAClient) BootstrapStandbyResponse(ctx context.Context, body StandbyBootstrapRequest) (*HAResponse[HAStandbyBootstrapResponse], error) {
+	resp, err := c.client.BootstrapHAStandbyWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("bootstrap HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) BootstrapStandby(ctx context.Context, body StandbyBootstrapRequest) (*HAStandbyBootstrapResponse, error) {
+	return haResponseValue(c.BootstrapStandbyResponse(ctx, body))
+}
+
+func (c *HAClient) AcquireFenceResponse(ctx context.Context, body FenceAcquireRequest) (*HAResponse[HAFenceResponse], error) {
+	resp, err := c.client.AcquireHAFenceWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("acquire HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) AcquireFence(ctx context.Context, body FenceAcquireRequest) (*HAFenceResponse, error) {
+	return haResponseValue(c.AcquireFenceResponse(ctx, body))
+}
+
+func (c *HAClient) CurrentFenceResponse(ctx context.Context) (*HAResponse[HACurrentFenceResponse], error) {
+	resp, err := c.client.GetHACurrentFenceWithResponse(ctx, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("get current HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) CurrentFence(ctx context.Context) (*HACurrentFenceResponse, error) {
+	return haResponseValue(c.CurrentFenceResponse(ctx))
+}
+
+func (c *HAClient) AssessPromotionResponse(ctx context.Context, body PromotionAssessRequest) (*HAResponse[HAPromotionAssessResponse], error) {
+	resp, err := c.client.AssessHAPromotionWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("assess HA promotion", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) AssessPromotion(ctx context.Context, body PromotionAssessRequest) (*HAPromotionAssessResponse, error) {
+	return haResponseValue(c.AssessPromotionResponse(ctx, body))
+}
+
+func (c *HAClient) PromoteResponse(ctx context.Context, body FenceAcquireRequest) (*HAResponse[HAPromotionResponse], error) {
+	resp, err := c.client.PromoteHAWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("promote HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) Promote(ctx context.Context, body FenceAcquireRequest) (*HAPromotionResponse, error) {
+	return haResponseValue(c.PromoteResponse(ctx, body))
+}
+
+func (c *HAClient) PromoteWithCurrentFenceResponse(ctx context.Context) (*HAResponse[HAPromotionResponse], error) {
+	resp, err := c.client.PromoteHAWithCurrentFenceWithResponse(ctx, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("promote HA standby with current fence", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) PromoteWithCurrentFence(ctx context.Context) (*HAPromotionResponse, error) {
+	return haResponseValue(c.PromoteWithCurrentFenceResponse(ctx))
+}
+
+func (c *HAClient) AssessRejoinResponse(ctx context.Context, body RejoinAssessRequest) (*HAResponse[HARejoinAssessResponse], error) {
+	resp, err := c.client.AssessHARejoinWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("assess HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) AssessRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
+	return haResponseValue(c.AssessRejoinResponse(ctx, body))
+}
+
+func (c *HAClient) RewindRejoinResponse(ctx context.Context, body RejoinAssessRequest) (*HAResponse[HARejoinAssessResponse], error) {
+	resp, err := c.client.RewindHARejoinWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("rewind HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) RewindRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
+	return haResponseValue(c.RewindRejoinResponse(ctx, body))
+}
+
+func (c *HAClient) ReseedRejoinResponse(ctx context.Context, body RejoinAssessRequest) (*HAResponse[HARejoinAssessResponse], error) {
+	resp, err := c.client.ReseedHARejoinWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("reseed HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) ReseedRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
+	return haResponseValue(c.ReseedRejoinResponse(ctx, body))
+}
