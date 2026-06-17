@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 860,
-  "entry_count": 860,
+  "source_entry_count": 863,
+  "entry_count": 863,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -888,6 +888,16 @@
       },
       "plan": "ddl:create_extension:extension=postgis:if_not_exists=false:version=3.4.0",
       "sql": "CREATE EXTENSION postgis VERSION '3.4.0';"
+    },
+    {
+      "name": "create quoted sql-name extension catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_extension",
+        "table_name": "uuid-ossp"
+      },
+      "plan": "ddl:create_extension:extension=uuid-ossp:if_not_exists=false:version=1.0.0",
+      "sql": "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';"
     },
     {
       "name": "alter extension update catalog ddl",
@@ -9219,6 +9229,28 @@
       },
       "plan": "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
       "sql": "REVOKE INSERT ON TABLE usage_records FROM app_writer"
+    },
+    {
+      "name": "grant public schema tables privilege catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "grant_privilege",
+        "table_name": "public",
+        "operations": 1
+      },
+      "plan": "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+      "sql": "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer"
+    },
+    {
+      "name": "revoke public schema tables privilege catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "revoke_privilege",
+        "table_name": "public",
+        "operations": 1
+      },
+      "plan": "ddl:revoke_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+      "sql": "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer"
     },
     {
       "name": "create role catalog ddl",

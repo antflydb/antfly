@@ -70558,6 +70558,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE EXTENSION postgis VERSION '3.4.0';",
         },
         .{
+            .name = "create quoted sql-name extension catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_extension, .table_name = "uuid-ossp" },
+            .plan = "ddl:create_extension:extension=uuid-ossp:if_not_exists=false:version=1.0.0",
+            .sql = "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';",
+        },
+        .{
             .name = "alter extension update catalog ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_extension_update, .table_name = "postgis" },
@@ -75901,6 +75908,20 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .revoke_privilege, .table_name = "usage_records", .operations = 1 },
             .plan = "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
             .sql = "REVOKE INSERT ON TABLE usage_records FROM app_writer",
+        },
+        .{
+            .name = "grant public schema tables privilege catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .grant_privilege, .table_name = "public", .operations = 1 },
+            .plan = "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+            .sql = "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer",
+        },
+        .{
+            .name = "revoke public schema tables privilege catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .revoke_privilege, .table_name = "public", .operations = 1 },
+            .plan = "ddl:revoke_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+            .sql = "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer",
         },
         .{
             .name = "create role catalog ddl",
