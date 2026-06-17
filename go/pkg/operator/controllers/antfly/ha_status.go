@@ -926,7 +926,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 		if slotName == "" {
 			slotName = action.StandbyName
 		}
-		if slotName == "" {
+		if slotName == "" || action.TargetLSN == 0 {
 			return nil
 		}
 		return []string{"seed", "begin", "--slot", slotName, "--manifest-id", fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)}

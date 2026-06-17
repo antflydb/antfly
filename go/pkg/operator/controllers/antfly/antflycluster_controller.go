@@ -3456,13 +3456,17 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
+		manifestID := haSeedBeginManifestID(*action, slotName)
+		if manifestID == "" {
+			return true, fmt.Errorf("HA admin action %s requires nonzero target LSN to create seed manifest", action.Kind)
+		}
 		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
 		if !ok {
 			return false, nil
 		}
 		body := map[string]any{
 			"slot_name":   slotName,
-			"manifest_id": haSeedBeginManifestID(*action, slotName),
+			"manifest_id": manifestID,
 		}
 		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
@@ -3731,6 +3735,10 @@ func haSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName strin
 				return manifestID
 			}
 		}
+	}
+	slotName = strings.TrimSpace(slotName)
+	if slotName == "" || action.TargetLSN == 0 {
+		return ""
 	}
 	return fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)
 }

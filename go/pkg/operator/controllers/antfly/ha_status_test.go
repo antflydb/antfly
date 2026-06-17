@@ -811,6 +811,25 @@ func TestHAFormerPrimaryAdminCommandUsesExecutableRejoinSubcommands(t *testing.T
 	}
 }
 
+func TestHASeedAdminCommandRequiresTargetLSN(t *testing.T) {
+	command := haAdminCommand(haPlannedAction{
+		Kind:     haActionSeedStandby,
+		SlotName: "standby-a",
+	}, nil, nil)
+	if command != nil {
+		t.Fatalf("expected seed command without target LSN to be suppressed, got %#v", command)
+	}
+
+	command = haAdminCommand(haPlannedAction{
+		Kind:      haActionSeedStandby,
+		SlotName:  "standby-a",
+		TargetLSN: 5,
+	}, nil, nil)
+	if !reflect.DeepEqual(command, []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "base-standby-a-5"}) {
+		t.Fatalf("unexpected seed command: %#v", command)
+	}
+}
+
 func loadAdminOpenAPIOperations(t *testing.T) map[string]string {
 	t.Helper()
 	_, file, _, ok := goruntime.Caller(0)
