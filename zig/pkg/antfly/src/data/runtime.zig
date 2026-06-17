@@ -2120,6 +2120,22 @@ pub const DataServer = struct {
         return null;
     }
 
+    fn haOwnerJobCanRun(
+        self: *DataServer,
+        kind: antfly.ha.owner_job_gate.JobKind,
+    ) bool {
+        const ctx = self.ha_cfg.admin_context orelse return true;
+        if (ctx.primary) |primary| {
+            const decision = antfly.ha.owner_job_gate.evaluatePrimary(primary, .{ .kind = kind }) catch return false;
+            return decision.canRun();
+        }
+        if (ctx.standby) |standby| {
+            const decision = antfly.ha.owner_job_gate.evaluateStandby(standby, .{ .kind = kind }) catch return false;
+            return decision.canRun();
+        }
+        return true;
+    }
+
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
         if (api_server_cfg.ha_admin_executor == null) {
             if (self.ha_cfg.admin_context) |ctx| {
@@ -2393,6 +2409,7 @@ pub const DataServer = struct {
     }
 
     fn runLsmMaintenanceForegroundRound(self: *DataServer) !void {
+        if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         _ = self.write_source.runLsmMaintenanceRound() catch |err| switch (err) {
             error.ReadOnly,
             error.FileNotFound,
@@ -2404,6 +2421,7 @@ pub const DataServer = struct {
     }
 
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
+        if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = platform_time.monotonicNs();
         if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) return;
         if (self.resourcePressureDefersBackgroundMaintenance()) {
@@ -2424,6 +2442,7 @@ pub const DataServer = struct {
     }
 
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        if (!self.haOwnerJobCanRun(.compaction_publish)) return false;
         if (self.write_source.lsmMaintenanceScoreBestEffort() > 0) {
             self.lsm_maintenance_obsolete_reclaim_due_ns.store(0, .release);
             return true;
@@ -2478,6 +2497,10 @@ pub const DataServer = struct {
                 continue;
             }
             if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
+                sleepLsmMaintenanceWorker();
+                continue;
+            }
+            if (!self.haOwnerJobCanRun(.compaction_publish)) {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
@@ -13504,6 +13527,7 @@ test "data server wires configured HA executors into API server" {
 
     try std.testing.expect(server.ha_admin_server != null);
     try std.testing.expect(server.ha_internal_server != null);
+    try std.testing.expect(server.haOwnerJobCanRun(.compaction_publish));
 
     var admin_resp = try server.http_server.?.handle(.{
         .method = .GET,
@@ -13629,6 +13653,10 @@ test "data server propagates standby HA write gate into provisioned write source
         error.HAReadRequiresPrimary,
         server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index),
     );
+    try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
+    try server.runLsmMaintenanceForegroundRound();
+    try server.requestLsmMaintenanceBackground();
+    try std.testing.expect(server.lsm_maintenance_thread == null);
 }
 
 test "data server applies routed HA replication records through standby write gate" {
