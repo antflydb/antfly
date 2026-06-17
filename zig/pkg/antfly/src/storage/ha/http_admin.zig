@@ -428,14 +428,21 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        var receipt = try actionReceiptAlloc(self.alloc, "base_backup_begin", result.manifest_id, "applied", node_id);
-        defer receipt.deinit(self.alloc);
-        return try self.handleTypedJson(BaseBackupBeginDocument{
-            .action = receipt,
+        const action_id = try std.fmt.allocPrint(self.alloc, "base_backup_begin:{s}", .{result.manifest_id});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HABaseBackupBeginResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "base_backup_begin",
+                .target = result.manifest_id,
+                .state = "applied",
+                .node_id = node_id,
+            },
             .slot_name = result.slot_name,
             .manifest_id = result.manifest_id,
-            .backup_lsn = result.backup_lsn,
-            .start_record_lsn = result.start_record_lsn,
+            .backup_lsn = try adminI64(result.backup_lsn),
+            .start_record_lsn = try adminI64(result.start_record_lsn),
         });
     }
 
@@ -461,13 +468,20 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .seed_finish => |seed| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "base_backup_finish", seed.manifest_id, "applied", node_id);
-                defer receipt.deinit(self.alloc);
-                break :blk try self.handleTypedJson(BaseBackupFinishDocument{
-                    .action = receipt,
+                const action_id = try std.fmt.allocPrint(self.alloc, "base_backup_finish:{s}", .{seed.manifest_id});
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(admin_api.HABaseBackupFinishResponse{
+                    .schema_version = 1,
+                    .action = .{
+                        .action_id = action_id,
+                        .action_kind = "base_backup_finish",
+                        .target = seed.manifest_id,
+                        .state = "applied",
+                        .node_id = node_id,
+                    },
                     .manifest_id = seed.manifest_id,
-                    .backup_lsn = seed.backup_lsn,
-                    .end_record_lsn = seed.end_record_lsn,
+                    .backup_lsn = try adminI64(seed.backup_lsn),
+                    .end_record_lsn = try adminI64(seed.end_record_lsn),
                 });
             },
             else => unreachable,
@@ -497,13 +511,20 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .seed_bootstrap => |seed| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "standby_bootstrap", seed.manifest_id, "applied", node_id);
-                defer receipt.deinit(self.alloc);
-                break :blk try self.handleTypedJson(StandbyBootstrapDocument{
-                    .action = receipt,
+                const action_id = try std.fmt.allocPrint(self.alloc, "standby_bootstrap:{s}", .{seed.manifest_id});
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(admin_api.HAStandbyBootstrapResponse{
+                    .schema_version = 1,
+                    .action = .{
+                        .action_id = action_id,
+                        .action_kind = "standby_bootstrap",
+                        .target = seed.manifest_id,
+                        .state = "applied",
+                        .node_id = node_id,
+                    },
                     .manifest_id = seed.manifest_id,
-                    .backup_lsn = seed.backup_lsn,
-                    .checkpoint_lsn = seed.checkpoint_lsn,
+                    .backup_lsn = try adminI64(seed.backup_lsn),
+                    .checkpoint_lsn = try adminI64(seed.checkpoint_lsn),
                 });
             },
             else => unreachable,
@@ -838,31 +859,6 @@ const SlotActionDocument = struct {
     action: ActionReceiptDocument,
     slot_action: []const u8,
     slot: SlotDocument,
-};
-
-const BaseBackupBeginDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    slot_name: []const u8,
-    manifest_id: []const u8,
-    backup_lsn: u64,
-    start_record_lsn: u64,
-};
-
-const BaseBackupFinishDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    manifest_id: []const u8,
-    backup_lsn: u64,
-    end_record_lsn: u64,
-};
-
-const StandbyBootstrapDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    manifest_id: []const u8,
-    backup_lsn: u64,
-    checkpoint_lsn: u64,
 };
 
 const CommitCheckDocument = struct {
