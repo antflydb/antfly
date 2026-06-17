@@ -6604,7 +6604,37 @@ func haAdminActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action 
 	if haFormerPrimaryActionKind(action.Kind) {
 		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)
 	}
+	if action.Kind == string(haActionPromoteStandby) {
+		return haPromotionActionSucceededWithStatusEvidence(status, action)
+	}
 	return haAdminActionSucceededWithEvidence(action)
+}
+
+func haPromotionActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if !haAdminActionSucceededWithEvidence(action) {
+		return false
+	}
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return true
+	}
+	result := action.AdminResult
+	return result != nil &&
+		!promotion.Forced &&
+		!promotion.DataLossPossible &&
+		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(action.StandbyName) &&
+		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(result.FencePromotedNodeID) &&
+		(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
+		(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
+		promotion.FenceGeneration == result.FenceGeneration &&
+		promotion.FenceToken == result.FenceToken &&
+		promotion.ParentTimelineID == result.FenceParentTimelineID &&
+		promotion.ParentEpoch == result.FenceParentEpoch &&
+		promotion.NewTimelineID == result.FenceNewTimelineID &&
+		promotion.NewEpoch == result.FenceNewEpoch &&
+		haPromotionRequiredLSN(promotion) == result.FenceRequiredLSN &&
+		haPromotionObservedLSN(promotion) >= result.FenceRequiredLSN &&
+		result.FenceObservedLSN >= result.FenceRequiredLSN
 }
 
 func haActionRequiresAdminResult(kind haActionKind) bool {

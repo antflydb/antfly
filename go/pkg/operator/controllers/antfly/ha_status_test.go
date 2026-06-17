@@ -429,6 +429,68 @@ func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(
 	}
 }
 
+func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromotion(t *testing.T) {
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		Phase:           string(haActionPhasePromote),
+		Executor:        string(haActionExecutorAdminAPI),
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 7,
+		AdminURL:        "http://standby-a-ha.default.svc:8081",
+		AdminNodeID:     "standby-a",
+		AdminMethod:     "POST",
+		AdminPath:       haAdminPromotionCurrentFencePath,
+		Reason:          "AutomaticFailoverReady",
+	}
+	previous := action
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
+
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			RequiredLSN:       12,
+			ObservedLSN:       13,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   7,
+			FenceToken:        "ha-fence-token",
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{previous},
+	}
+
+	preserved := haPreservePlannedActionExecution(action, status)
+	if preserved.AdminJobName != haAdminDirectAPIName ||
+		preserved.AdminJobPhase != haAdminJobPhaseSucceeded ||
+		preserved.AdminResult == nil {
+		t.Fatalf("expected matching promotion execution state to survive replan, got %#v", preserved)
+	}
+
+	status.LastPromotion.NewTimelineID = 6
+	notPreserved := haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected mismatched promotion execution state to be dropped, got %#v", notPreserved)
+	}
+
+	status.LastPromotion.NewTimelineID = 5
+	status.LastPromotion.FenceToken = "different-token"
+	notPreserved = haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected stale promotion token evidence to be dropped, got %#v", notPreserved)
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
