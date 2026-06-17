@@ -4,14 +4,14 @@
 const std = @import("std");
 
 pub const ReplicationSlotCreateRequest = struct {
-    /// Stable standby replication slot name.
+    /// Stable standby replication slot name. Any non-empty UTF-8 name up to 128 bytes is accepted.
     slot_name: []const u8,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
     initial_lsn: ?i64 = null,
 };
 
 pub const BaseBackupStartRequest = struct {
-    /// Stable standby replication slot name to reserve for the base backup.
+    /// Stable standby replication slot name to reserve for the base backup. Any non-empty UTF-8 name up to 128 bytes is accepted.
     slot_name: []const u8,
     /// Operator-chosen stable id for the base-backup manifest.
     manifest_id: []const u8,

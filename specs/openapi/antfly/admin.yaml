@@ -487,12 +487,11 @@ components:
       name: slot_name
       in: path
       required: true
-      description: Stable standby replication slot name.
+      description: Stable standby replication slot name. Path values are percent-encoded; any non-empty UTF-8 name up to 128 bytes is accepted.
       schema:
         type: string
         minLength: 1
         maxLength: 128
-        pattern: "^[A-Za-z0-9._-]+$"
   responses:
     BadRequest:
       description: Invalid admin request.
@@ -520,10 +519,9 @@ components:
       properties:
         slot_name:
           type: string
-          description: Stable standby replication slot name.
+          description: Stable standby replication slot name. Any non-empty UTF-8 name up to 128 bytes is accepted.
           minLength: 1
           maxLength: 128
-          pattern: "^[A-Za-z0-9._-]+$"
         initial_lsn:
           type: integer
           format: uint64
@@ -537,10 +535,9 @@ components:
       properties:
         slot_name:
           type: string
-          description: Stable standby replication slot name to reserve for the base backup.
+          description: Stable standby replication slot name to reserve for the base backup. Any non-empty UTF-8 name up to 128 bytes is accepted.
           minLength: 1
           maxLength: 128
-          pattern: "^[A-Za-z0-9._-]+$"
         manifest_id:
           type: string
           description: Operator-chosen stable id for the base-backup manifest.
