@@ -702,6 +702,54 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 	}
 }
 
+func TestValidateHAFenceResponse(t *testing.T) {
+	t.Parallel()
+
+	response := HAFenceResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "fence_acquire:standby-a",
+			ActionKind: HAActionKindFenceAcquire,
+			Target:     "standby-a",
+			State:      HAActionStateApplied,
+			NodeId:     "standby-a",
+		},
+		Receipt: HAFenceReceipt{
+			Identity: HAIdentity{
+				ClusterId:  1,
+				ShardId:    2,
+				TableId:    3,
+				TimelineId: 4,
+				Epoch:      5,
+			},
+			OldPrimaryId:     "primary-a",
+			PromotedNodeId:   "standby-a",
+			ParentTimelineId: 4,
+			ParentEpoch:      5,
+			NewTimelineId:    6,
+			NewEpoch:         7,
+			RequiredLsn:      8,
+			ObservedLsn:      8,
+			Generation:       9,
+			Forced:           false,
+			Token:            "fence-token",
+			Reason:           "manual",
+		},
+	}
+	if err := ValidateHAFenceResponse(response); err != nil {
+		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
+	}
+	response.Receipt.Token = ""
+	if err := ValidateHAFenceResponse(response); err == nil || !strings.Contains(err.Error(), "receipt fields") {
+		t.Fatalf("missing token error = %v, want receipt fields error", err)
+	}
+	response.Receipt.Token = "fence-token"
+	response.Action.NodeId = ""
+	if err := ValidateHAFenceResponse(response); err == nil || !strings.Contains(err.Error(), "action receipt") {
+		t.Fatalf("missing action receipt error = %v, want action receipt error", err)
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

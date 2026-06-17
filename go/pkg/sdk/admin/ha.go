@@ -366,6 +366,39 @@ func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) err
 	return nil
 }
 
+func ValidateHAFenceResponse(response HAFenceResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing fence response schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing fence response action receipt")
+	}
+	if !HAFenceReceiptComplete(response.Receipt) {
+		return fmt.Errorf("missing fence response receipt fields")
+	}
+	return nil
+}
+
+func HAFenceReceiptComplete(receipt HAFenceReceipt) bool {
+	return HAIdentityComplete(receipt.Identity) &&
+		strings.TrimSpace(receipt.OldPrimaryId) != "" &&
+		strings.TrimSpace(receipt.PromotedNodeId) != "" &&
+		receipt.ParentTimelineId > 0 &&
+		receipt.ParentEpoch > 0 &&
+		receipt.NewTimelineId > 0 &&
+		receipt.NewEpoch > 0 &&
+		receipt.RequiredLsn > 0 &&
+		receipt.Generation > 0 &&
+		strings.TrimSpace(receipt.Token) != "" &&
+		strings.TrimSpace(receipt.Reason) != ""
+}
+
+func HAIdentityComplete(identity HAIdentity) bool {
+	return identity.ClusterId > 0 &&
+		identity.TimelineId > 0 &&
+		identity.Epoch > 0
+}
+
 func HAActionReceiptPresent(receipt HAActionReceipt) bool {
 	return strings.TrimSpace(receipt.ActionId) != "" &&
 		strings.TrimSpace(string(receipt.ActionKind)) != "" &&

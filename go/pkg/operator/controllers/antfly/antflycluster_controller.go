@@ -3730,6 +3730,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		result, err := adminClient.AcquireFenceResponse(ctx, body)
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
+			err = haValidateFenceSDKResponse(result)
+		}
+		if err == nil {
 			err = requireHADirectFenceAcquireResult(cluster, action, raw)
 		}
 		return true, err
@@ -3868,6 +3871,16 @@ func haValidateStandbyBootstrapSDKResponse(value *adminsdk.HAResponse[adminsdk.H
 		return fmt.Errorf("HA admin standby bootstrap response is nil")
 	}
 	if err := adminsdk.ValidateHAStandbyBootstrapResponse(*value.Value); err != nil {
+		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+	}
+	return nil
+}
+
+func haValidateFenceSDKResponse(value *adminsdk.HAResponse[adminsdk.HAFenceResponse]) error {
+	if value == nil || value.Value == nil {
+		return fmt.Errorf("HA admin fence response is nil")
+	}
+	if err := adminsdk.ValidateHAFenceResponse(*value.Value); err != nil {
 		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
 	}
 	return nil
