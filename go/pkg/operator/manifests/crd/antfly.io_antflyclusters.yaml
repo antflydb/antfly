@@ -8785,6 +8785,10 @@ spec:
                               description: ActionKind is the typed HA admin action
                                 kind that produced this result.
                               type: string
+                            actionNodeID:
+                              description: ActionNodeID is the node id of the node-local
+                                HA admin endpoint that produced this result.
+                              type: string
                             actionState:
                               description: ActionState is the idempotency state returned
                                 by the HA admin action.
@@ -8991,8 +8995,9 @@ spec:
                             before this action runs.
                           type: string
                         executor:
-                          description: Executor identifies whether the operator or
-                            an HA admin command executes this action.
+                          description: Executor identifies whether typed /admin/v1,
+                            a CLI-backed Job, or the Kubernetes controller executes
+                            this action.
                           type: string
                         fenceAuthority:
                           description: HAFencingAuthority selects the authority used

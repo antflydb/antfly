@@ -48,7 +48,9 @@ const max_manifest_file_bytes = 256 * 1024 * 1024;
 
 pub const Context = struct {
     primary: ?*primary_mod.Primary = null,
+    primary_node_id: ?[]const u8 = null,
     standby: ?*standby_mod.Standby = null,
+    standby_node_id: ?[]const u8 = null,
     fence_store: ?*fencing.Store = null,
     former_primary_log: ?*replication_log.ReplicationLog = null,
 };

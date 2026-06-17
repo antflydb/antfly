@@ -75,6 +75,8 @@ pub const HAActionReceipt = struct {
     target: []const u8,
     /// Idempotency state for this action response.
     state: []const u8,
+    /// Node id for the node-local admin endpoint that produced this receipt.
+    node_id: []const u8,
 };
 
 pub const HARejoinRewindResult = struct {

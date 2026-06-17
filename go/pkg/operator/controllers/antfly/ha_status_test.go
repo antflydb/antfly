@@ -200,6 +200,7 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 		ActionKind:    "replication_slot_create",
 		ActionTarget:  "standby-a",
 		ActionState:   "applied",
+		ActionNodeID:  "primary-a",
 		SlotAction:    "create",
 		SlotName:      "standby-a",
 	}
@@ -256,6 +257,7 @@ func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t 
 		ActionKind:    "replication_slot_create",
 		ActionTarget:  "standby-a",
 		ActionState:   "applied",
+		ActionNodeID:  "primary-a",
 		SlotAction:    "create",
 		SlotName:      "standby-a",
 	}

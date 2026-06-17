@@ -1003,7 +1003,7 @@ components:
           $ref: "#/components/schemas/HAOwnerJobDecision"
     HAActionReceipt:
       type: object
-      required: [action_id, action_kind, target, state]
+      required: [action_id, action_kind, target, state, node_id]
       additionalProperties: false
       properties:
         action_id:
@@ -1034,6 +1034,10 @@ components:
           type: string
           enum: [assessed, applied, already_applied]
           description: Idempotency state for this action response.
+        node_id:
+          type: string
+          minLength: 1
+          description: Node id for the node-local admin endpoint that produced this receipt.
     HAReplicationSlotActionResponse:
       type: object
       required: [schema_version, action, slot_action, slot]

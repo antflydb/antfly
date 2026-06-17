@@ -1642,6 +1642,10 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	ActionState string `json:"actionState,omitempty"`
 
+	// ActionNodeID is the node id of the node-local HA admin endpoint that produced this result.
+	// +optional
+	ActionNodeID string `json:"actionNodeID,omitempty"`
+
 	// SlotAction is the executed replication slot action.
 	// +optional
 	SlotAction string `json:"slotAction,omitempty"`

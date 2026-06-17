@@ -89,6 +89,7 @@ test "admin facade re-exports HA action receipt result types" {
     const reseed_info = @typeInfo(HARejoinReseedResult);
 
     try @import("std").testing.expect(receipt_info == .@"struct");
+    try @import("std").testing.expect(@hasField(HAActionReceipt, "node_id"));
     try @import("std").testing.expect(rewind_info == .@"struct");
     try @import("std").testing.expect(reseed_info == .@"struct");
     try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "action"));

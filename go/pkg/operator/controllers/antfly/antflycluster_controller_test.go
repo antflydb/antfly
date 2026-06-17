@@ -44,6 +44,7 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 			"action_kind": "fence_acquire",
 			"target":      promotedNodeID,
 			"state":       "applied",
+			"node_id":     oldPrimaryID,
 		},
 		"receipt": map[string]any{
 			"identity": map[string]any{
@@ -79,6 +80,7 @@ func haPromotionAdminResult(generation uint64, token string, promotedNodeID stri
 		ActionKind:            "promotion",
 		ActionTarget:          promotedNodeID,
 		ActionState:           "applied",
+		ActionNodeID:          promotedNodeID,
 		FenceGeneration:       generation,
 		FenceToken:            token,
 		FenceClusterID:        100,
@@ -280,7 +282,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -291,7 +293,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
@@ -372,7 +374,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 			}, nil
 		})},
 	}
@@ -773,6 +775,7 @@ func TestUpdateHAAdminJobExecutionConditionReportsMismatchedDirectAdminReceipt(t
 						ActionKind:    "replication_slot_create",
 						ActionTarget:  "standby-b",
 						ActionState:   "applied",
+						ActionNodeID:  "primary-a",
 						SlotAction:    "create",
 						SlotName:      "standby-a",
 					},
@@ -972,7 +975,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -1339,7 +1342,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
 			}, nil
 		})},
 	}
@@ -1636,13 +1639,13 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups":
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups/finish":
 				var body map[string]any
@@ -1651,7 +1654,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
 				}, nil
 			case "/admin/v1/ha/standby/bootstrap":
 				var body map[string]any
@@ -1661,7 +1664,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
@@ -1812,6 +1815,7 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	actions[0].AdminResult.ActionKind = "replication_slot_create"
 	actions[0].AdminResult.ActionTarget = "standby-a"
 	actions[0].AdminResult.ActionState = "applied"
+	actions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 
 	seedFileActions := []antflyv1.HAPlannedActionStatus{{
@@ -2018,6 +2022,7 @@ func TestHADirectAdminActionDependenciesRequireVersionedActionReceipt(t *testing
 	actions[0].AdminResult.ActionKind = "replication_slot_create"
 	actions[0].AdminResult.ActionTarget = "standby-a"
 	actions[0].AdminResult.ActionState = "applied"
+	actions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 
 	actions[0].AdminResult.SchemaVersion = 0
@@ -2052,6 +2057,7 @@ func TestHAImplicitDependenciesRequireTypedAdminActionWithoutCLIArgv(t *testing.
 		ActionKind:    "replication_slot_create",
 		ActionTarget:  "standby-a",
 		ActionState:   "applied",
+		ActionNodeID:  "primary-a",
 		SlotAction:    "create",
 		SlotName:      "standby-a",
 	}
@@ -2072,6 +2078,7 @@ func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T
 			ActionKind:    "base_backup_finish",
 			ActionTarget:  "base-standby-b-5",
 			ActionState:   "applied",
+			ActionNodeID:  "primary-a",
 			ManifestID:    "base-standby-a-5",
 			BackupLSN:     5,
 			EndRecordLSN:  5,
@@ -2231,6 +2238,7 @@ func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) 
 				ActionKind:    tt.wantKind,
 				ActionTarget:  tt.wantTarget,
 				ActionState:   tt.wantState,
+				ActionNodeID:  "node-a",
 			}
 			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
 
@@ -2317,7 +2325,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:operator-base-standby-a-7","action_kind":"base_backup_begin","target":"operator-base-standby-a-7","state":"applied"},"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:operator-base-standby-a-7","action_kind":"base_backup_begin","target":"operator-base-standby-a-7","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
 			}, nil
 		})},
 	}
@@ -2963,7 +2971,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(openAPIResult.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(openAPIResult.ActionID).To(Equal("promotion:standby-a"))
@@ -3014,7 +3022,7 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	seed, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
+	seed, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(seed.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(seed.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
@@ -3026,10 +3034,10 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(seed.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(seed.StartRecordLSN).To(Equal(uint64(5)))
 
-	_, ok = parseHADirectAdminActionResult([]byte(`{"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
+	_, ok = parseHADirectAdminActionResult([]byte(`{"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
 	g.Expect(ok).To(BeFalse())
 
-	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
+	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(finish.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
 	g.Expect(finish.ActionKind).To(Equal("base_backup_finish"))
@@ -3049,7 +3057,7 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(legacyFinish.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(legacyFinish.EndRecordLSN).To(Equal(uint64(8)))
 
-	bootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
+	bootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(bootstrap.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
 	g.Expect(bootstrap.ManifestID).To(Equal("base-standby-a-5"))
@@ -3066,7 +3074,7 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(legacyBootstrap.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(legacyBootstrap.CheckpointLSN).To(Equal(uint64(7)))
 
-	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"replication_slot_pause:standby-a","action_kind":"replication_slot_pause","target":"standby-a","state":"applied"},"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
+	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"replication_slot_pause:standby-a","action_kind":"replication_slot_pause","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(slot.ActionID).To(Equal("replication_slot_pause:standby-a"))
 	g.Expect(slot.SlotAction).To(Equal("pause"))
@@ -3475,7 +3483,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(result.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(result.ActionID).To(Equal("rejoin_rewind:primary-a"))
@@ -3525,7 +3533,7 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_reseed:primary-a","action_kind":"rejoin_reseed","target":"primary-a","state":"applied"},"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"node_id":"primary-a","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_reseed:primary-a","action_kind":"rejoin_reseed","target":"primary-a","state":"applied","node_id":"primary-a"},"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"node_id":"primary-a","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(result.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(result.ActionID).To(Equal("rejoin_reseed:primary-a"))

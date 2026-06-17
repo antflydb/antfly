@@ -248,7 +248,7 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        var receipt = try actionReceiptAlloc(self.alloc, "replication_slot_create", parsed.value.slot_name, "applied");
+        var receipt = try actionReceiptAlloc(self.alloc, "replication_slot_create", parsed.value.slot_name, "applied", self.primaryNodeID());
         defer receipt.deinit(self.alloc);
         return switch (result) {
             .create => |slot| try self.handleTypedJson(slotActionDocument(receipt, "create", slot, null)),
@@ -273,7 +273,7 @@ pub const Server = struct {
             .@"resume" => "replication_slot_resume",
             .drop => "replication_slot_drop",
         };
-        var receipt = try actionReceiptAlloc(self.alloc, action_kind, slot_name, "applied");
+        var receipt = try actionReceiptAlloc(self.alloc, action_kind, slot_name, "applied", self.primaryNodeID());
         defer receipt.deinit(self.alloc);
         return switch (result) {
             .create => unreachable,
@@ -419,7 +419,7 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        var receipt = try actionReceiptAlloc(self.alloc, "base_backup_begin", result.manifest_id, "applied");
+        var receipt = try actionReceiptAlloc(self.alloc, "base_backup_begin", result.manifest_id, "applied", self.primaryNodeID());
         defer receipt.deinit(self.alloc);
         return try self.handleTypedJson(BaseBackupBeginDocument{
             .action = receipt,
@@ -451,7 +451,7 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .seed_finish => |seed| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "base_backup_finish", seed.manifest_id, "applied");
+                var receipt = try actionReceiptAlloc(self.alloc, "base_backup_finish", seed.manifest_id, "applied", self.primaryNodeID());
                 defer receipt.deinit(self.alloc);
                 break :blk try self.handleTypedJson(BaseBackupFinishDocument{
                     .action = receipt,
@@ -486,7 +486,7 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .seed_bootstrap => |seed| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "standby_bootstrap", seed.manifest_id, "applied");
+                var receipt = try actionReceiptAlloc(self.alloc, "standby_bootstrap", seed.manifest_id, "applied", self.standbyNodeID());
                 defer receipt.deinit(self.alloc);
                 break :blk try self.handleTypedJson(StandbyBootstrapDocument{
                     .action = receipt,
@@ -527,7 +527,7 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        var receipt = try actionReceiptAlloc(self.alloc, "fence_acquire", result.receipt.promoted_node_id, "applied");
+        var receipt = try actionReceiptAlloc(self.alloc, "fence_acquire", result.receipt.promoted_node_id, "applied", self.primaryNodeID());
         defer receipt.deinit(self.alloc);
         return try self.handleTypedJson(FenceDocument{
             .action = receipt,
@@ -659,7 +659,7 @@ pub const Server = struct {
                 const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
-                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_rewind", assessment.former_node_id, "applied");
+                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_rewind", assessment.former_node_id, "applied", assessment.former_node_id);
                 defer action_receipt.deinit(self.alloc);
                 return try self.handleTypedJson(RejoinRewindDocument{
                     .action = action_receipt,
@@ -673,7 +673,7 @@ pub const Server = struct {
                 const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
-                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied");
+                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied", self.primaryNodeID());
                 defer action_receipt.deinit(self.alloc);
                 return try self.handleTypedJson(RejoinReseedDocument{
                     .action = action_receipt,
@@ -683,7 +683,7 @@ pub const Server = struct {
             }
         }
 
-        var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_assess", assessment.former_node_id, "assessed");
+        var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_assess", assessment.former_node_id, "assessed", assessment.former_node_id);
         defer action_receipt.deinit(self.alloc);
         return try self.handleTypedJson(RejoinAssessDocument{
             .action = action_receipt,
@@ -755,6 +755,20 @@ pub const Server = struct {
 
     fn ready(self: *const Server) bool {
         return self.ctx.primary != null or self.ctx.standby != null or self.ctx.fence_store != null;
+    }
+
+    fn primaryNodeID(self: *const Server) []const u8 {
+        if (self.ctx.primary_node_id) |node_id| {
+            if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) return node_id;
+        }
+        return "primary";
+    }
+
+    fn standbyNodeID(self: *const Server) []const u8 {
+        if (self.ctx.standby_node_id) |node_id| {
+            if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) return node_id;
+        }
+        return "standby";
     }
 };
 
@@ -883,6 +897,7 @@ const ActionReceiptDocument = struct {
     action_kind: []const u8,
     target: []const u8,
     state: []const u8,
+    node_id: []const u8,
 
     fn deinit(self: *ActionReceiptDocument, alloc: Allocator) void {
         alloc.free(self.action_id);
@@ -896,18 +911,20 @@ fn actionReceiptAlloc(
     action_kind: []const u8,
     target: []const u8,
     state: []const u8,
+    node_id: []const u8,
 ) !ActionReceiptDocument {
     return .{
         .action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ action_kind, target }),
         .action_kind = action_kind,
         .target = try alloc.dupe(u8, target),
         .state = state,
+        .node_id = node_id,
     };
 }
 
 fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !PromotionDocument {
     const target = result.promoted_node_id;
-    var action = try actionReceiptAlloc(alloc, "promotion", target, "applied");
+    var action = try actionReceiptAlloc(alloc, "promotion", target, "applied", result.promoted_node_id);
     errdefer action.deinit(alloc);
     return .{
         .action = action,
@@ -1678,7 +1695,13 @@ test "storage.ha http admin serves health and command endpoint" {
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
 
-    var server = Server.init(alloc, .{ .primary = &primary, .standby = &standby, .fence_store = &fence_store });
+    var server = Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+        .fence_store = &fence_store,
+    });
     defer server.deinit();
 
     var health = try server.handle(.{ .method = .GET, .uri = Routes.health });
@@ -1726,6 +1749,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_create.body, "\"action_kind\":\"replication_slot_create\"");
     try expectContains(typed_create.body, "\"action_id\":\"replication_slot_create:standby-b\"");
     try expectContains(typed_create.body, "\"state\":\"applied\"");
+    try expectContains(typed_create.body, "\"node_id\":\"primary-a\"");
     try expectContains(typed_create.body, "\"slot_action\":\"create\"");
     try expectContains(typed_create.body, "\"slot_name\":\"standby-b\"");
 
@@ -1751,6 +1775,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_pause.status);
     try std.testing.expectEqualStrings("application/json", typed_pause.content_type.?);
     try expectContains(typed_pause.body, "\"action_kind\":\"replication_slot_pause\"");
+    try expectContains(typed_pause.body, "\"node_id\":\"primary-a\"");
     try expectContains(typed_pause.body, "\"slot_action\":\"pause\"");
     try expectContains(typed_pause.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_pause.body, "\"active\":false");
@@ -1765,6 +1790,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_resume.status);
     try std.testing.expectEqualStrings("application/json", typed_resume.content_type.?);
     try expectContains(typed_resume.body, "\"action_kind\":\"replication_slot_resume\"");
+    try expectContains(typed_resume.body, "\"node_id\":\"primary-a\"");
     try expectContains(typed_resume.body, "\"slot_action\":\"resume\"");
     try expectContains(typed_resume.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_resume.body, "\"active\":true");
@@ -1779,6 +1805,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_drop.status);
     try std.testing.expectEqualStrings("application/json", typed_drop.content_type.?);
     try expectContains(typed_drop.body, "\"action_kind\":\"replication_slot_drop\"");
+    try expectContains(typed_drop.body, "\"node_id\":\"primary-a\"");
     try expectContains(typed_drop.body, "\"slot_action\":\"drop\"");
     try expectContains(typed_drop.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_drop.body, "\"dropped\":true");
