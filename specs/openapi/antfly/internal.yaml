@@ -280,6 +280,8 @@ components:
       type: object
       required:
         - slot_name
+        - identity
+        - record_format_version
         - timeline_id
         - from_lsn
         - current_lsn
@@ -292,6 +294,12 @@ components:
         slot_name:
           type: string
           minLength: 1
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        record_format_version:
+          type: integer
+          format: uint32
+          minimum: 1
         timeline_id:
           type: integer
           format: uint64

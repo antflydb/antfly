@@ -176,6 +176,8 @@ pub const Server = struct {
 
 const StartReplicationDocument = struct {
     slot_name: []const u8,
+    identity: standby_mod.Identity,
+    record_format_version: u16,
     timeline_id: u64,
     from_lsn: u64,
     current_lsn: u64,
@@ -224,6 +226,8 @@ fn startReplicationDocument(alloc: Allocator, response: replication_api.StartRep
 
     return .{
         .slot_name = response.slot_name,
+        .identity = response.identity,
+        .record_format_version = response.record_format_version,
         .timeline_id = response.timeline_id,
         .from_lsn = response.from_lsn,
         .current_lsn = response.current_lsn,
@@ -431,6 +435,9 @@ test "storage.ha internal http adapter serves replication pull and status update
     });
     defer start.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), start.status);
+    try expectContains(start.body, "\"identity\"");
+    try expectContains(start.body, "\"record_format_version\":1");
+    try expectContains(start.body, "\"timeline_id\":1");
     try expectContains(start.body, "\"last_sent_lsn\":1");
     try expectContains(start.body, "\"next_lsn\":2");
     try expectContains(start.body, "\"end_of_wal\":false");

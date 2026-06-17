@@ -156,6 +156,7 @@ pub const Client = struct {
         }
         var response = try self.startReplication(base_uri, slot_name, standby.nextReceiveLsn(), options);
         defer response.deinit();
+        try verifyStartReplicationResponse(response.parsed.value, standby.identity);
 
         const current_lsn = try uint64FromJson(response.parsed.value.current_lsn);
         const last_sent_lsn = try uint64FromJson(response.parsed.value.last_sent_lsn);
@@ -400,6 +401,14 @@ fn verifyIdentity(actual: anytype, expected: standby_mod.Identity) !void {
     if (try positiveUint64FromJson(actual.epoch) != expected.epoch) return error.WrongEpoch;
 }
 
+fn verifyStartReplicationResponse(response: anytype, expected: standby_mod.Identity) !void {
+    try verifyIdentity(response.identity, expected);
+    const format_version = try positiveUint64FromJson(response.record_format_version);
+    if (format_version != replication_record.format_version) return error.UnsupportedReplicationFormat;
+    const timeline_id = try positiveUint64FromJson(response.timeline_id);
+    if (timeline_id != expected.timeline_id) return error.WrongTimeline;
+}
+
 fn uint64FromJson(value: i64) !u64 {
     if (value < 0) return error.InvalidInternalReplicationResponse;
     return @intCast(value);
@@ -594,6 +603,17 @@ test "storage.ha http replication client verifies upstream identity before strea
             &capture,
             ApplyCapture.apply,
             .{},
+        ),
+    );
+    try std.testing.expectError(
+        error.WrongCluster,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
         ),
     );
 

@@ -153,6 +153,8 @@ pub const HAReplicationFrame = struct {
 
 pub const HAStartReplicationResponse = struct {
     slot_name: []const u8,
+    identity: HAIdentity,
+    record_format_version: i64,
     timeline_id: i64,
     from_lsn: i64,
     current_lsn: i64,

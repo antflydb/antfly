@@ -103,6 +103,8 @@ pub const ReplicationFrame = struct {
 
 pub const StartReplicationResponse = struct {
     slot_name: []const u8,
+    identity: primary_mod.Identity,
+    record_format_version: u16,
     timeline_id: u64,
     from_lsn: u64,
     current_lsn: u64,
@@ -264,6 +266,8 @@ pub fn startReplication(
     const owned_slot_name = try alloc.dupe(u8, request.slot_name);
     return .{
         .slot_name = owned_slot_name,
+        .identity = primary.identity,
+        .record_format_version = replication_record.format_version,
         .timeline_id = slot.timeline_id,
         .from_lsn = request.from_lsn,
         .current_lsn = current_lsn,
@@ -420,6 +424,8 @@ test "storage.ha replication api starts replication with record and byte batchin
         });
         defer batch.deinit(alloc);
         try std.testing.expectEqualStrings("standby-a", batch.slot_name);
+        try std.testing.expectEqual(identity, batch.identity);
+        try std.testing.expectEqual(replication_record.format_version, batch.record_format_version);
         try std.testing.expectEqual(@as(usize, 2), batch.records.len);
         try std.testing.expectEqual(@as(u64, 1), batch.records[0].lsn);
         try std.testing.expectEqual(@as(u64, 2), batch.last_sent_lsn);
