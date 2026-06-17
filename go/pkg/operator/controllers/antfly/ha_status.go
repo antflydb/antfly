@@ -639,7 +639,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			SeedManifestPath: action.SeedManifestPath,
 			SeedContentRoot:  action.SeedContentRoot,
 			AdminCommand:     haAdminCommand(action, haReplicationIdentity(ha), status),
-			AdminURL:         haAdminURL(action, ha),
+			AdminURL:         haAdminURL(action, ha, status),
 			AdminNodeID:      haAdminNodeID(action, ha, status),
 			AdminMethod:      adminMethod,
 			AdminPath:        adminPath,
@@ -1095,24 +1095,18 @@ func haPromotionObservedLSN(promotion *antflyv1.HAPromotionStatus) uint64 {
 	return promotion.SwitchLSN
 }
 
-func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) string {
+func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
 	if ha == nil {
 		return ""
 	}
 	switch action.Kind {
 	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
-		if ha.Admin == nil {
-			return ""
-		}
-		return ha.Admin.PrimaryURL
+		return haCurrentPrimaryAdminURL(ha, status)
 	case haActionAcquireFence:
 		if url := haStandbyAdminURL(ha, action.StandbyName); url != "" {
 			return url
 		}
-		if ha.Admin == nil {
-			return ""
-		}
-		return ha.Admin.PrimaryURL
+		return haCurrentPrimaryAdminURL(ha, status)
 	case haActionBootstrapStandbySeed:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionPromoteStandby:
@@ -1120,13 +1114,22 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionReseedFormerPrimary:
-		if ha.Admin == nil {
-			return ""
-		}
-		return ha.Admin.PrimaryURL
+		return haCurrentPrimaryAdminURL(ha, status)
 	default:
 		return ""
 	}
+}
+
+func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	if promoted := haCurrentPrimaryNodeID(ha, status); promoted != "" {
+		if url := haStandbyAdminURL(ha, promoted); url != "" {
+			return url
+		}
+	}
+	if ha != nil && ha.Admin != nil {
+		return ha.Admin.PrimaryURL
+	}
+	return ""
 }
 
 func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {

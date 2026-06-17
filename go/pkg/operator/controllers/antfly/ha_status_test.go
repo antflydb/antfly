@@ -792,6 +792,7 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 	tests := []struct {
 		name   string
 		action haPlannedAction
+		status *antflyv1.HAStatus
 		want   string
 	}{{
 		name:   "primary scoped slot",
@@ -814,6 +815,16 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 		action: haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "old-primary"},
 		want:   "http://primary-ha.default.svc:8081",
 	}, {
+		name:   "post-promotion primary scoped reseed uses promoted primary node",
+		action: haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "old-primary"},
+		status: &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-a"}},
+		want:   "http://standby-a-ha.default.svc:8081",
+	}, {
+		name:   "post-promotion primary scoped seed uses promoted primary node",
+		action: haPlannedAction{Kind: haActionSeedStandby, StandbyName: "old-primary"},
+		status: &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-a"}},
+		want:   "http://standby-a-ha.default.svc:8081",
+	}, {
 		name:   "former primary rewind without node url",
 		action: haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "missing-old-primary"},
 		want:   "",
@@ -821,10 +832,43 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := haAdminURL(tt.action, ha); got != tt.want {
+			if got := haAdminURL(tt.action, ha, tt.status); got != tt.want {
 				t.Fatalf("expected %q, got %q", tt.want, got)
 			}
 		})
+	}
+}
+
+func TestHAPlannedActionStatusTargetsPromotedPrimaryAdminURL(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}, {
+			Name:     "standby-a",
+			AdminURL: "http://standby-a-ha.default.svc:8081",
+		}},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			CurrentPrimaryID: "old-primary",
+		},
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			PromotedStandbyID: "standby-a",
+		},
+	}
+	planned := haPlannedActionStatuses([]haPlannedAction{{
+		Kind:        haActionSeedStandby,
+		StandbyName: "old-primary",
+		SlotName:    "old-primary",
+		TargetLSN:   12,
+	}}, ha, status)
+
+	if len(planned) != 1 ||
+		planned[0].AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		planned[0].AdminNodeID != "standby-a" {
+		t.Fatalf("expected primary-scoped action to target promoted primary admin URL and node id, got %#v", planned)
 	}
 }
 
