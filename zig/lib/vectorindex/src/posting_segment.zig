@@ -2455,6 +2455,7 @@ pub const Writer = struct {
 
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(self.alloc);
+        try out.ensureTotalCapacity(self.alloc, try encodedSegmentSizeForPendingEntries(self.entries.items));
         var index_entries = try std.ArrayListUnmanaged(IndexEntry).initCapacity(self.alloc, self.entries.items.len);
         defer index_entries.deinit(self.alloc);
 
@@ -2495,6 +2496,15 @@ pub const Writer = struct {
         };
     }
 };
+
+fn encodedSegmentSizeForPendingEntries(entries: []const PendingEntry) !usize {
+    const index_bytes = std.math.mul(usize, entries.len, index_entry_size) catch return error.PostingSegmentTooLarge;
+    var total = std.math.add(usize, index_bytes, footer_size) catch return error.PostingSegmentTooLarge;
+    for (entries) |entry| {
+        total = std.math.add(usize, total, entry.value.len) catch return error.PostingSegmentTooLarge;
+    }
+    return total;
+}
 
 pub const DirectoryBatchWriter = struct {
     alloc: Allocator,
