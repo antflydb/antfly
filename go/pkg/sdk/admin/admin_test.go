@@ -863,6 +863,16 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	if err := ValidateHAPromotionAssessResponse(assess); err != nil {
 		t.Fatalf("ValidateHAPromotionAssessResponse returned error: %v", err)
 	}
+	wrongAssessNode := assess
+	wrongAssessNode.Action.NodeId = "standby-b"
+	if err := ValidateHAPromotionAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+		t.Fatalf("wrong promotion assess executor error = %v, want executor node mismatch", err)
+	}
+	inconsistentAssess := assess
+	inconsistentAssess.Assessment.HasRequiredLsn = false
+	if err := ValidateHAPromotionAssessResponse(inconsistentAssess); err == nil || !strings.Contains(err.Error(), "has_required_lsn") {
+		t.Fatalf("inconsistent promotion assessment error = %v, want has_required_lsn mismatch", err)
+	}
 	assess.Assessment.RequiredLsn = 0
 	if err := ValidateHAPromotionAssessResponse(assess); err == nil || !strings.Contains(err.Error(), "assessment fields") {
 		t.Fatalf("missing assessment error = %v, want assessment fields error", err)
@@ -884,6 +894,21 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	}
 	if err := ValidateHAPromotionResponse(promotion); err != nil {
 		t.Fatalf("ValidateHAPromotionResponse returned error: %v", err)
+	}
+	wrongPromotionNode := promotion
+	wrongPromotionNode.Action.NodeId = "standby-b"
+	if err := ValidateHAPromotionResponse(wrongPromotionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+		t.Fatalf("wrong promotion node error = %v, want action node mismatch", err)
+	}
+	wrongSwitchLSN := promotion
+	wrongSwitchLSN.Promotion.SwitchLsn = 10
+	if err := ValidateHAPromotionResponse(wrongSwitchLSN); err == nil || !strings.Contains(err.Error(), "switch_lsn") {
+		t.Fatalf("wrong promotion switch_lsn error = %v, want switch_lsn mismatch", err)
+	}
+	wrongIdentity := promotion
+	wrongIdentity.Promotion.NewIdentity.ClusterId = 99
+	if err := ValidateHAPromotionResponse(wrongIdentity); err == nil || !strings.Contains(err.Error(), "identity scope") {
+		t.Fatalf("wrong promotion identity error = %v, want identity scope mismatch", err)
 	}
 	promotion.FenceToken = ""
 	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "fence_token") {

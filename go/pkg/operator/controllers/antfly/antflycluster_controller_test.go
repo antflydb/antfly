@@ -1707,6 +1707,7 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(SatisfyAny(
 				ContainSubstring("safe typed promotion assessment"),
 				ContainSubstring("promotion assessment field evidence"),
+				ContainSubstring("promotion assessment"),
 			))
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
 		})

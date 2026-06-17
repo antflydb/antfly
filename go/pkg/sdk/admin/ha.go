@@ -619,6 +619,12 @@ func ValidateHAPromotionAssessResponse(response HAPromotionAssessResponse) error
 	if !HAPromotionAssessmentComplete(response.Assessment) {
 		return fmt.Errorf("missing promotion assessment fields")
 	}
+	if err := validateHAPromotionAssessmentConsistency(response.Assessment); err != nil {
+		return err
+	}
+	if err := validateHAPromotionAssessReceiptCorrelation(response); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -651,6 +657,99 @@ func ValidateHAPromotionResponse(response HAPromotionResponse) error {
 	}
 	if strings.TrimSpace(response.FenceToken) == "" {
 		return fmt.Errorf("missing promotion fence_token")
+	}
+	if err := validateHAPromotionAssessmentConsistency(response.Assessment); err != nil {
+		return err
+	}
+	if err := validateHAPromotionReceiptCorrelation(response); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateHAPromotionAssessReceiptCorrelation(response HAPromotionAssessResponse) error {
+	action := response.Action
+	target := strings.TrimSpace(action.Target)
+	if action.ActionKind != HAActionKindPromotionAssess {
+		return fmt.Errorf("promotion assess response action kind mismatch")
+	}
+	if action.State != HAActionStateAssessed {
+		return fmt.Errorf("promotion assess response action state mismatch")
+	}
+	if strings.TrimSpace(action.NodeId) != target {
+		return fmt.Errorf("promotion assess response executor node mismatch")
+	}
+	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+target {
+		return fmt.Errorf("promotion assess response action id does not match action kind and target")
+	}
+	return nil
+}
+
+func validateHAPromotionReceiptCorrelation(response HAPromotionResponse) error {
+	action := response.Action
+	promotion := response.Promotion
+	nodeID := strings.TrimSpace(promotion.NodeId)
+	if action.ActionKind != HAActionKindPromotion {
+		return fmt.Errorf("promotion response action kind mismatch")
+	}
+	if action.State != HAActionStateApplied {
+		return fmt.Errorf("promotion response action state mismatch")
+	}
+	if strings.TrimSpace(action.Target) != nodeID || strings.TrimSpace(action.NodeId) != nodeID {
+		return fmt.Errorf("promotion response action node mismatch")
+	}
+	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+nodeID {
+		return fmt.Errorf("promotion response action id does not match action kind and target")
+	}
+	if promotion.SwitchLsn != response.Assessment.ReceivedLsn+1 {
+		return fmt.Errorf("promotion response switch_lsn does not follow received_lsn")
+	}
+	if !response.Assessment.FencingConfirmed || !response.Assessment.CanPromote {
+		return fmt.Errorf("promotion response assessment is not promotable")
+	}
+	if response.Forced != promotion.Forced || response.Forced != response.Assessment.Force {
+		return fmt.Errorf("promotion response forced fields mismatch")
+	}
+	if promotion.DataLossPossible != response.Assessment.DataLossPossible {
+		return fmt.Errorf("promotion response data_loss_possible mismatch")
+	}
+	if promotion.OldIdentity.ClusterId != promotion.NewIdentity.ClusterId ||
+		promotion.OldIdentity.ShardId != promotion.NewIdentity.ShardId ||
+		promotion.OldIdentity.TableId != promotion.NewIdentity.TableId {
+		return fmt.Errorf("promotion response identity scope mismatch")
+	}
+	if promotion.NewIdentity.TimelineId <= promotion.OldIdentity.TimelineId ||
+		promotion.NewIdentity.Epoch <= promotion.OldIdentity.Epoch {
+		return fmt.Errorf("promotion response new identity does not advance")
+	}
+	return nil
+}
+
+func validateHAPromotionAssessmentConsistency(assessment HAPromotionAssessment) error {
+	if assessment.HasRequiredLsn != (assessment.ReceivedLsn >= assessment.RequiredLsn) {
+		return fmt.Errorf("promotion assessment has_required_lsn mismatch")
+	}
+	if assessment.CaughtUpToReceived != (assessment.AppliedLsn >= assessment.ReceivedLsn) {
+		return fmt.Errorf("promotion assessment caught_up_to_received mismatch")
+	}
+	dataLossPossible := !assessment.HasRequiredLsn ||
+		!assessment.CaughtUpToReceived ||
+		assessment.AppliedLsn < assessment.RequiredLsn
+	if assessment.DataLossPossible != dataLossPossible {
+		return fmt.Errorf("promotion assessment data_loss_possible mismatch")
+	}
+	if assessment.Safe != (assessment.FencingConfirmed && !assessment.DataLossPossible) {
+		return fmt.Errorf("promotion assessment safe mismatch")
+	}
+	if assessment.RequiresFencing != (!assessment.FencingConfirmed && !assessment.Force) {
+		return fmt.Errorf("promotion assessment requires_fencing mismatch")
+	}
+	if assessment.RequiresForce != (assessment.DataLossPossible && !assessment.Force) {
+		return fmt.Errorf("promotion assessment requires_force mismatch")
+	}
+	canPromote := !assessment.RequiresFencing && (!assessment.RequiresForce || assessment.Force)
+	if assessment.CanPromote != canPromote {
+		return fmt.Errorf("promotion assessment can_promote mismatch")
 	}
 	return nil
 }
