@@ -33,6 +33,7 @@ var test_path_counter: u64 = 0;
 pub const ReplicateOptions = struct {
     max_records: usize = 0,
     max_encoded_bytes: usize = 0,
+    verify_upstream: bool = true,
 };
 
 pub const Result = struct {
@@ -119,6 +120,28 @@ pub const Client = struct {
         try mapStatus(resp.response.status);
     }
 
+    pub fn createReplicationSlotForStandby(
+        self: *Client,
+        base_uri: []const u8,
+        slot_name: []const u8,
+        initial_lsn: ?u64,
+        standby: *const standby_mod.Standby,
+    ) !void {
+        try self.verifyCompatibleUpstream(base_uri, standby);
+        try self.createReplicationSlot(base_uri, slot_name, initial_lsn);
+    }
+
+    pub fn verifyCompatibleUpstream(
+        self: *Client,
+        base_uri: []const u8,
+        standby: *const standby_mod.Standby,
+    ) !void {
+        const identified = try self.identifySystem(base_uri);
+        try verifyIdentity(identified.identity, standby.identity);
+        const format_version = try positiveUint64FromJson(identified.record_format_version);
+        if (format_version != replication_record.format_version) return error.UnsupportedReplicationFormat;
+    }
+
     pub fn replicateAvailable(
         self: *Client,
         base_uri: []const u8,
@@ -128,6 +151,9 @@ pub const Client = struct {
         apply_fn: standby_mod.ApplyFn,
         options: ReplicateOptions,
     ) !Result {
+        if (options.verify_upstream) {
+            try self.verifyCompatibleUpstream(base_uri, standby);
+        }
         var response = try self.startReplication(base_uri, slot_name, standby.nextReceiveLsn(), options);
         defer response.deinit();
 
@@ -181,6 +207,11 @@ pub const Client = struct {
         var current_lsn: u64 = progress.received_lsn;
         var last_sent_lsn: u64 = progress.received_lsn;
         var next_lsn: u64 = standby.nextReceiveLsn();
+        var batch_options = options;
+        if (batch_options.verify_upstream) {
+            try self.verifyCompatibleUpstream(base_uri, standby);
+            batch_options.verify_upstream = false;
+        }
 
         while (true) {
             const result = try self.replicateAvailable(
@@ -189,7 +220,7 @@ pub const Client = struct {
                 standby,
                 apply_ctx,
                 apply_fn,
-                options,
+                batch_options,
             );
             iterations += 1;
             received_count += result.received_count;
@@ -361,6 +392,14 @@ fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplication
     return out;
 }
 
+fn verifyIdentity(actual: anytype, expected: standby_mod.Identity) !void {
+    if (try positiveUint64FromJson(actual.cluster_id) != expected.cluster_id) return error.WrongCluster;
+    if (try uint64FromJson(actual.shard_id) != expected.shard_id) return error.WrongShard;
+    if (try uint64FromJson(actual.table_id) != expected.table_id) return error.WrongTable;
+    if (try positiveUint64FromJson(actual.timeline_id) != expected.timeline_id) return error.WrongTimeline;
+    if (try positiveUint64FromJson(actual.epoch) != expected.epoch) return error.WrongEpoch;
+}
+
 fn uint64FromJson(value: i64) !u64 {
     if (value < 0) return error.InvalidInternalReplicationResponse;
     return @intCast(value);
@@ -481,7 +520,7 @@ test "storage.ha http replication client pulls applies and acknowledges standby 
     try std.testing.expectEqual(@as(i64, 100), identified.identity.cluster_id);
     try std.testing.expectEqual(@as(i64, 1), identified.record_format_version);
 
-    try client.createReplicationSlot("http://primary.internal.test", "standby-a", 0);
+    try client.createReplicationSlotForStandby("http://primary.internal.test", "standby-a", 0, &standby);
     _ = try primary.append(.{ .payload = "one" });
     _ = try primary.append(.{ .payload = "two" });
 
@@ -518,6 +557,51 @@ test "storage.ha http replication client pulls applies and acknowledges standby 
         .standby_names = &names,
     });
     try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+}
+
+test "storage.ha http replication client verifies upstream identity before streaming" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "identity-preflight");
+    defer paths.deinit(alloc);
+    const standby_identity = testIdentity();
+    var primary_identity = standby_identity;
+    primary_identity.cluster_id += 1;
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, primary_identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, standby_identity, .{});
+    defer standby.close();
+
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+
+    try std.testing.expectError(
+        error.WrongCluster,
+        client.createReplicationSlotForStandby("http://primary.internal.test", "standby-a", 0, &standby),
+    );
+
+    try client.createReplicationSlot("http://primary.internal.test", "standby-a", 0);
+    _ = try primary.append(.{ .payload = "wrong-cluster" });
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(
+        error.WrongCluster,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{},
+        ),
+    );
+
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
 }
 
 test "storage.ha http replication client reports durable receive progress when apply fails" {
