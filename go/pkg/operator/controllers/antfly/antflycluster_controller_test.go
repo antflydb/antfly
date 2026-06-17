@@ -2399,6 +2399,52 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haPlannedActionDependenciesSucceeded(reseedActions, 1)).To(BeTrue())
 }
 
+func TestHAPrimaryRouteActionRequiresMatchingPromotionEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionUpdatePrimaryRoute),
+		RouteTo:         "standby-a",
+		TargetLSN:       12,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 7,
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			SwitchLSN:         12,
+			RequiredLSN:       12,
+			ObservedLSN:       12,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   7,
+			FenceToken:        "ha-fence-token",
+		},
+	}
+	actions := []antflyv1.HAPlannedActionStatus{action}
+
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 0)).To(BeTrue())
+
+	status.LastPromotion.PromotedStandbyID = "standby-b"
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 0)).To(BeFalse())
+
+	status.LastPromotion.PromotedStandbyID = "standby-a"
+	status.LastPromotion.FenceGeneration = 6
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 0)).To(BeFalse())
+
+	status.LastPromotion.FenceGeneration = 7
+	status.LastPromotion.Forced = true
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 0)).To(BeFalse())
+
+	status.LastPromotion.Forced = false
+	status.LastPromotion.DataLossPossible = true
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 0)).To(BeFalse())
+}
+
 func TestHACLIActionDependenciesRequireMatchingActionReceipt(t *testing.T) {
 	g := NewWithT(t)
 
@@ -2894,6 +2940,18 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-b")
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = haPromotionAdminResult(6, "ha-fence-token", "standby-a")
 	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
 	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))

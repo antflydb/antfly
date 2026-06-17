@@ -6376,6 +6376,9 @@ func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, c
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			return nil
 		}
+		if !haPrimaryRouteActionHasPromotionEvidence(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+			return nil
+		}
 		if action.RouteTo == "" {
 			return nil
 		}
@@ -6467,6 +6470,71 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 		return haAdminActionSucceededWithEvidence(dependency)
 	}
 	return false
+}
+
+func haPrimaryRouteActionHasPromotionEvidence(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
+	if index < 0 || index >= len(actions) {
+		return false
+	}
+	action := actions[index]
+	if action.Kind != string(haActionUpdatePrimaryRoute) || action.RouteTo == "" || action.RouteTo == "primary" {
+		return true
+	}
+	if haPrimaryRouteActionMatchesRecordedPromotion(status, action) {
+		return true
+	}
+	for i := index - 1; i >= 0; i-- {
+		dependency := actions[i]
+		if dependency.Kind != string(haActionPromoteStandby) {
+			continue
+		}
+		return haAdminActionSucceededWithEvidence(dependency) &&
+			haPrimaryRouteActionMatchesPromotionResult(action, dependency.AdminResult)
+	}
+	return false
+}
+
+func haPrimaryRouteActionMatchesRecordedPromotion(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil ||
+		promotion.Forced ||
+		promotion.DataLossPossible ||
+		strings.TrimSpace(promotion.PromotedStandbyID) != strings.TrimSpace(action.RouteTo) {
+		return false
+	}
+	if action.FenceAuthority != "" && promotion.FenceAuthority != action.FenceAuthority {
+		return false
+	}
+	if action.FenceGeneration != 0 && promotion.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	if action.TargetLSN != 0 {
+		return haPromotionRequiredLSN(promotion) == action.TargetLSN &&
+			haPromotionObservedLSN(promotion) >= action.TargetLSN
+	}
+	return true
+}
+
+func haPrimaryRouteActionMatchesPromotionResult(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil ||
+		result.FenceForced ||
+		result.PromotionForce ||
+		result.PromotionDataLossPossible ||
+		strings.TrimSpace(result.FencePromotedNodeID) != strings.TrimSpace(action.RouteTo) ||
+		strings.TrimSpace(result.FenceToken) == "" {
+		return false
+	}
+	if action.FenceGeneration != 0 && result.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	if action.FenceAuthority != "" && result.FenceGeneration == 0 {
+		return false
+	}
+	if action.TargetLSN != 0 {
+		return result.FenceRequiredLSN == action.TargetLSN &&
+			result.FenceObservedLSN >= action.TargetLSN
+	}
+	return result.FenceRequiredLSN > 0 && result.FenceObservedLSN >= result.FenceRequiredLSN
 }
 
 func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) bool {
