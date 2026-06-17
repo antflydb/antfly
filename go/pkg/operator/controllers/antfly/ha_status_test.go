@@ -662,6 +662,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
+	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
 		ShardID:          10,
@@ -886,8 +887,39 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 }
 
+func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin connection refused"
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked without a standby route selector")
+	}
+	failover := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse || failover.Reason != antflyv1.ReasonHAPrimaryRouteSelectorMissing {
+		t.Fatalf("expected route-selector-missing condition, got %#v", failover)
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+			t.Fatalf("expected no automatic promotion actions without route selector, got %#v", cluster.Status.HAStatus.PlannedActions)
+		}
+	}
+}
+
 func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromotion(t *testing.T) {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
 		Mode:         antflyv1.HADurabilityModeRemoteApply,
 		Required:     1,
@@ -1514,7 +1546,10 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 
 func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
-	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{Name: "standby-b"})
+	cluster.Spec.HighAvailability.Standbys = append(cluster.Spec.HighAvailability.Standbys, antflyv1.HAStandbySpec{
+		Name:          "standby-b",
+		RouteSelector: haTestRouteSelector("standby-b"),
+	})
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryLSN:            12,
 		PrimaryAdminReachable: false,
@@ -1691,11 +1726,20 @@ func haCluster() *antflyv1.AntflyCluster {
 
 func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
 	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
 		Enabled:          true,
 		FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
 	}
 	return cluster
+}
+
+func haTestRouteSelector(component string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/name":      "antfly-database",
+		"app.kubernetes.io/component": component,
+		"app.kubernetes.io/instance":  "antfly",
+	}
 }
 
 func caughtUpHAStatus() *antflyv1.HAStatus {

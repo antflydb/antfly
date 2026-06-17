@@ -144,6 +144,7 @@ type haPlan struct {
 	ReadSafeStandbyCount      int32
 	ReseedRequiredCount       int32
 	FencingReady              bool
+	PromotionRouteReady       bool
 	PromotionBoundaryReady    bool
 	PromotionAlreadyRecorded  bool
 	PromotionStandbyName      string
@@ -460,6 +461,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.SyncPolicy = haEvaluateSyncPolicy(ha, status)
 	plan.SyncPolicyDegraded = plan.SyncPolicy.Degraded
 	plan.FencingReady = haFencingReady(ha, status)
+	plan.PromotionRouteReady = haPromotionRouteReady(ha, status)
 	plan.PrimaryAdminUnavailable = haPrimaryAdminUnavailable(status)
 	plan.PromotionBoundaryReady = haPromotionBoundaryReady(status)
 	plan.PromotionAlreadyRecorded = haPromotionAlreadyRecorded(ha, status)
@@ -1365,6 +1367,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if plan.PromotionAlreadyRecorded {
 		return ""
 	}
+	if !plan.PromotionRouteReady {
+		return ""
+	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return ""
 	}
@@ -1417,6 +1422,9 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 	requireApply := ha.AutomaticFailover.RequireRemoteApply == nil || *ha.AutomaticFailover.RequireRemoteApply
 	for _, desired := range ha.Standbys {
 		if !standbyDesired(desired) || desired.Name == "" {
+			continue
+		}
+		if len(desired.RouteSelector) == 0 {
 			continue
 		}
 		standby, ok := standbys[desired.Name]
@@ -1481,6 +1489,25 @@ func haFencingReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus
 	return true
 }
 
+func haPromotionRouteReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) bool {
+	if ha == nil || ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled || status == nil {
+		return false
+	}
+	return haStandbyRouteSelectorConfigured(ha, status.Fencing.Holder)
+}
+
+func haStandbyRouteSelectorConfigured(ha *antflyv1.HighAvailabilitySpec, standbyName string) bool {
+	if ha == nil || standbyName == "" {
+		return false
+	}
+	for _, standby := range ha.Standbys {
+		if standbyDesired(standby) && standby.Name == standbyName {
+			return len(standby.RouteSelector) > 0
+		}
+	}
+	return false
+}
+
 func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) string {
 	if plan.AutomaticPromotionAllowed {
 		return "HAFencedPromotionReady"
@@ -1502,6 +1529,9 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	}
 	if plan.PromotionAlreadyRecorded {
 		return antflyv1.ReasonHAPromotionAlreadyRecorded
+	}
+	if !plan.PromotionRouteReady {
+		return antflyv1.ReasonHAPrimaryRouteSelectorMissing
 	}
 	if haSyncPolicyDegraded(ha, plan) {
 		return antflyv1.ReasonHASyncPolicyUnsatisfied
