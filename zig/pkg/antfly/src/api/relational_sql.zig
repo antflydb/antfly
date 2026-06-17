@@ -62329,7 +62329,7 @@ fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
         .delete_joined_source,
         .merge_mutation,
         => true,
-        .explain => std.mem.startsWith(u8, entry.plan, "explain:kind=write:"),
+        .explain => appParityExplainPlanHasKind(entry.plan, "write"),
         else => false,
     };
 }
@@ -62375,14 +62375,14 @@ fn appParityFixtureConflictWhereSummaryMatchesPlan(entry: AppParityCorpusEntry, 
 
 fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
     return entry.family == .explain and
-        std.mem.startsWith(u8, entry.plan, "explain:kind=write:") and
+        appParityExplainPlanHasKind(entry.plan, "write") and
         std.mem.indexOf(u8, entry.plan, inner_prefix) != null;
 }
 
 fn appParityReadPlanHasPrefix(entry: AppParityCorpusEntry, read_prefix: []const u8) bool {
     return (entry.family == .read and std.mem.startsWith(u8, entry.plan, read_prefix)) or
         (entry.family == .explain and
-            std.mem.startsWith(u8, entry.plan, "explain:kind=read:") and
+            appParityExplainPlanHasKind(entry.plan, "read") and
             std.mem.indexOf(u8, entry.plan, read_prefix) != null);
 }
 
@@ -65097,11 +65097,22 @@ fn appParityPlanHasExactStringToken(plan: []const u8, token: []const u8, expecte
     };
 }
 
+fn appParityPlanHasStringToken(plan: []const u8, token: []const u8) bool {
+    return switch (appParityPlanScanStringToken(plan, token)) {
+        .value => |value| value.len > 0,
+        .absent, .invalid => false,
+    };
+}
+
 fn appParityPlanHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_values: []const []const u8) bool {
     for (expected_values) |expected| {
         if (appParityPlanHasExactStringToken(plan, token, expected)) return true;
     }
     return false;
+}
+
+fn appParityExplainPlanHasKind(plan: []const u8, expected: []const u8) bool {
+    return appParityPlanHasExactStringToken(plan, "explain:kind=", expected);
 }
 
 fn appParityPlanHasToken(plan: []const u8, token: []const u8) bool {
@@ -65186,6 +65197,30 @@ test "app parity ddl submode coverage tokens are exact" {
     const population = "relation_population:mode=create_table_as_extra:target=usage_archive:source=read:query:query:table=usage_records";
     try std.testing.expect(!appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as"));
     try std.testing.expect(appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as_extra"));
+}
+
+test "app parity explain coverage tokens are exact" {
+    const write_suffix = AppParityCorpusEntry{
+        .family = .explain,
+        .summary = .{ .returning = 1 },
+        .plan = "explain:kind=write_extra:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+    };
+    try std.testing.expect(!appParityExplainPlanHasKind(write_suffix.plan, "write"));
+    try std.testing.expect(!appParityFixtureAllowsReturningSummary(write_suffix));
+    try std.testing.expect(!appParityExplainWriteInnerHasPrefix(write_suffix, ":inner=insert:"));
+
+    const read_suffix = AppParityCorpusEntry{
+        .family = .explain,
+        .plan = "explain:kind=read_extra:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=0:select=1:order=0:limit=none:claim=none",
+    };
+    try std.testing.expect(!appParityReadPlanHasPrefix(read_suffix, "read:query:"));
+
+    const options = "explain:kind=read:analyze=true_extra:inner=read:query:query:table=usage_records:format=:verbose=1:costs=0";
+    try std.testing.expect(appParityExplainPlanHasKind(options, "read"));
+    try std.testing.expect(!appParityPlanHasExactBoolToken(options, ":analyze=", true));
+    try std.testing.expect(!appParityPlanHasStringToken(options, ":format="));
+    try std.testing.expect(appParityPlanUsizeTokenValue(options, ":verbose=") != null);
+    try std.testing.expect(appParityPlanUsizeTokenValue(options, ":costs=") != null);
 }
 
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {
@@ -66314,12 +66349,12 @@ const AppParityCorpusCoverage = struct {
             },
             .explain => {
                 self.explain = true;
-                self.explain_write = self.explain_write or appParityPlanHasToken(entry.plan, "explain:kind=write:");
+                self.explain_write = self.explain_write or appParityExplainPlanHasKind(entry.plan, "write");
                 self.explain_options = self.explain_options or
-                    appParityPlanHasToken(entry.plan, ":format=") or
-                    appParityPlanHasToken(entry.plan, ":verbose=") or
-                    appParityPlanHasToken(entry.plan, ":costs=");
-                self.explain_analyze = self.explain_analyze or appParityPlanHasToken(entry.plan, ":analyze=true:");
+                    appParityPlanHasStringToken(entry.plan, ":format=") or
+                    appParityPlanUsizeTokenValue(entry.plan, ":verbose=") != null or
+                    appParityPlanUsizeTokenValue(entry.plan, ":costs=") != null;
+                self.explain_analyze = self.explain_analyze or appParityPlanHasExactBoolToken(entry.plan, ":analyze=", true);
             },
             .relation_population => {
                 self.relation_population_select_into = self.relation_population_select_into or

@@ -5411,6 +5411,10 @@ identity allocator `kind`, comment `kind`, transaction `starter`, advisory-lock
 `action`, and relation-population `mode` likewise reads exact string tokens, so
 suffix-like values such as `kind=table_extra` cannot satisfy a `kind=table`
 coverage requirement.
+`EXPLAIN` fixture metadata and coverage use the same exact-token rule for
+`explain:kind`, `analyze`, and option tokens such as `format`, `verbose`, and
+`costs`; malformed option values or suffix-like `kind=write_extra` values cannot
+claim write/read-plan coverage.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 
