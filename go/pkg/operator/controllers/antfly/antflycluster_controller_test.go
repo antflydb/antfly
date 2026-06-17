@@ -2106,6 +2106,19 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 		FenceToken:      "ha-fence-token",
 	}
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
+
+	cluster.Status.HAStatus.PlannedActions[1].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		RejoinAction:     "reject_unfenced",
+		RejoinReason:     "no_fence",
+		FormerNodeID:     "primary-a",
+		TargetTimelineID: 5,
+		TargetEpoch:      7,
+		ForkLSN:          12,
+		FormerLastLSN:    11,
+		RetainedFromLSN:  8,
+	}
+	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.ParentTimelineID).To(Equal(uint64(4)))
@@ -2117,7 +2130,9 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.FenceHolder).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionDemoteFormerPrimary)))
-	g.Expect(cluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("PromotionPlanned"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("no_fence"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.AssessedAction).To(Equal("reject_unfenced"))
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.AssessedReason).To(Equal("no_fence"))
 }
 
 func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
@@ -2145,6 +2160,13 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					AdminCommand:  []string{"rejoin", "assess"},
 					AdminJobName:  "demote-job",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						RejoinAction:     "reject_unfenced",
+						RejoinReason:     "no_fence",
+						FormerNodeID:     "primary-a",
+						TargetTimelineID: 5,
+						TargetEpoch:      7,
+					},
 				}},
 			},
 		},

@@ -3996,7 +3996,8 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 	if cluster.Status.HAStatus == nil {
 		return
 	}
-	for i, action := range cluster.Status.HAStatus.PlannedActions {
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
 		if !haFormerPrimaryActionKind(action.Kind) ||
 			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			action.AdminJobName == "" {
@@ -4005,11 +4006,21 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			continue
 		}
+		if action.AdminResult == nil {
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+		}
+		if !haAdminActionSucceededWithEvidence(*action) {
+			return
+		}
+		result, ok := haRejoinJobResultFromAdminResult(action.AdminResult)
+		if !ok {
+			return
+		}
 		if cluster.Status.HAStatus.FormerPrimary == nil {
 			cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: action.StandbyName}
 		}
-		applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, action, cluster.Status.HAStatus.LastPromotion)
-		r.updateHAFormerPrimaryStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.FormerPrimary)
+		applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, *action, cluster.Status.HAStatus.LastPromotion)
+		applyHARejoinJobResult(cluster.Status.HAStatus.FormerPrimary, result)
 		return
 	}
 }
@@ -4018,21 +4029,6 @@ func haFormerPrimaryActionKind(kind string) bool {
 	return kind == string(haActionDemoteFormerPrimary) ||
 		kind == string(haActionRewindFormerPrimary) ||
 		kind == string(haActionReseedFormerPrimary)
-}
-
-func (r *AntflyClusterReconciler) updateHAFormerPrimaryStatusFromAdminJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, former *antflyv1.HAFormerPrimaryStatus) {
-	if r.KubeClient == nil || former == nil {
-		return
-	}
-	body, ok := r.haAdminJobLogBody(ctx, cluster, action.AdminJobName)
-	if !ok {
-		return
-	}
-	result, ok := parseHARejoinJobResult(body)
-	if !ok {
-		return
-	}
-	applyHARejoinJobResult(former, result)
 }
 
 func applyHAFormerPrimaryActionStatus(former *antflyv1.HAFormerPrimaryStatus, action antflyv1.HAPlannedActionStatus, promotion *antflyv1.HAPromotionStatus) {
@@ -4368,6 +4364,27 @@ func applyHARejoinAdminActionResult(status *antflyv1.HAAdminActionResultStatus, 
 	status.FormerLastLSN = result.FormerLastLSN
 	status.RetainedFromLSN = result.RetainedFromLSN
 	status.DataLossDiscarded = result.DataLossDiscarded
+}
+
+func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus) (haRejoinJobResult, bool) {
+	if result == nil ||
+		strings.TrimSpace(result.RejoinAction) == "" ||
+		strings.TrimSpace(result.FormerNodeID) == "" ||
+		result.TargetTimelineID == 0 ||
+		result.TargetEpoch == 0 {
+		return haRejoinJobResult{}, false
+	}
+	return haRejoinJobResult{
+		Action:            strings.TrimSpace(result.RejoinAction),
+		Reason:            strings.TrimSpace(result.RejoinReason),
+		FormerNodeID:      strings.TrimSpace(result.FormerNodeID),
+		TargetTimelineID:  result.TargetTimelineID,
+		TargetEpoch:       result.TargetEpoch,
+		ForkLSN:           result.ForkLSN,
+		FormerLastLSN:     result.FormerLastLSN,
+		RetainedFromLSN:   result.RetainedFromLSN,
+		DataLossDiscarded: result.DataLossDiscarded,
+	}, true
 }
 
 func applyHARejoinJobResult(former *antflyv1.HAFormerPrimaryStatus, result haRejoinJobResult) {
