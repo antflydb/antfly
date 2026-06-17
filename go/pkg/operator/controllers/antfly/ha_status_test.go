@@ -337,6 +337,88 @@ func TestHAPlannedActionStatusesDropInvalidDirectAdminSuccess(t *testing.T) {
 	}
 }
 
+func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}},
+	}
+	action := haPlannedAction{
+		Kind:            haActionRewindFormerPrimary,
+		StandbyName:     "old-primary",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 3,
+		Reason:          "FormerPrimaryNeedsRewind",
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			SwitchLSN:         12,
+			RequiredLSN:       12,
+			ObservedLSN:       12,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   3,
+			FenceToken:        "ha-fence-token",
+		},
+	}
+
+	initial := haPlannedActionStatuses([]haPlannedAction{action}, ha, status)
+	if len(initial) != 1 {
+		t.Fatalf("expected one planned action, got %#v", initial)
+	}
+	previous := initial[0]
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:           1,
+		ActionID:                "rejoin_rewind:old-primary",
+		ActionKind:              "rejoin_rewind",
+		ActionTarget:            "old-primary",
+		ActionState:             "applied",
+		ActionNodeID:            "old-primary",
+		RejoinAction:            "rewind",
+		FormerNodeID:            "old-primary",
+		TargetTimelineID:        5,
+		TargetEpoch:             7,
+		ForkLSN:                 12,
+		FormerLastLSN:           13,
+		RetainedFromLSN:         8,
+		RewindExecuted:          true,
+		RewindPreviousLastLSN:   13,
+		RewindCurrentLastLSN:    12,
+		RewindNextLSN:           13,
+		RewindDiscardedLSNCount: 1,
+	}
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+
+	preserved := haPlannedActionStatuses([]haPlannedAction{action}, ha, status)
+	if preserved[0].AdminJobName != haAdminDirectAPIName ||
+		preserved[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+		preserved[0].AdminResult == nil ||
+		preserved[0].AdminResult.RejoinAction != "rewind" {
+		t.Fatalf("expected matching former-primary execution state to survive replan, got %#v", preserved[0])
+	}
+
+	status.LastPromotion.FenceToken = ""
+	notPreserved := haPlannedActionStatuses([]haPlannedAction{action}, ha, status)
+	if notPreserved[0].AdminJobName != "" ||
+		notPreserved[0].AdminJobPhase != "" ||
+		notPreserved[0].AdminResult != nil {
+		t.Fatalf("expected former-primary execution state without promotion receipt to be dropped, got %#v", notPreserved[0])
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},

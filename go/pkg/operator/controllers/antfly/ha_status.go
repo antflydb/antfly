@@ -676,6 +676,11 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		if !haSamePlannedActionOperation(action, previous) {
 			continue
 		}
+		if previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
+			haFormerPrimaryActionKind(previous.Kind) &&
+			!haFormerPrimaryActionSucceededWithPromotionEvidence(status, previous) {
+			return action
+		}
 		if previous.AdminJobName == haAdminDirectAPIName &&
 			previous.AdminJobPhase == haAdminJobPhaseSucceeded &&
 			!haAdminActionSucceededWithEvidence(previous) {
