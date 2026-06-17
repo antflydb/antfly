@@ -3783,6 +3783,15 @@ func haDirectPromotionResultMatchesAction(result haPromotionJobResult, identity 
 	if result.ParentTimelineID != identity.TimelineID || result.ParentEpoch != identity.Epoch {
 		return false
 	}
+	if result.NewTimelineID != identity.TimelineID+1 || result.NewEpoch != identity.Epoch+1 {
+		return false
+	}
+	if action.TargetLSN > 0 && (result.SwitchLSN != action.TargetLSN || result.RequiredLSN != action.TargetLSN) {
+		return false
+	}
+	if result.ObservedLSN < result.RequiredLSN {
+		return false
+	}
 	if action.FenceGeneration > 0 && result.FenceGeneration != action.FenceGeneration {
 		return false
 	}
@@ -3842,7 +3851,7 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antfl
 	if !ok {
 		return false
 	}
-	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
+	if !haDirectRejoinResultMatchesAction(result, cluster.Status.HAStatus, action) {
 		return false
 	}
 	if cluster.Status.HAStatus.FormerPrimary == nil {
@@ -3850,6 +3859,31 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antfl
 	}
 	applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, action, cluster.Status.HAStatus.LastPromotion)
 	applyHARejoinJobResult(cluster.Status.HAStatus.FormerPrimary, result)
+	return true
+}
+
+func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
+		return false
+	}
+	if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
+		return false
+	}
+	if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
+		return false
+	}
+	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
+		return false
+	}
+	if status != nil && status.LastPromotion != nil {
+		promotion := status.LastPromotion
+		if promotion.NewTimelineID > 0 && result.TargetTimelineID != promotion.NewTimelineID {
+			return false
+		}
+		if promotion.NewEpoch > 0 && result.TargetEpoch != promotion.NewEpoch {
+			return false
+		}
+	}
 	return true
 }
 

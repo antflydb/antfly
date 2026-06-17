@@ -720,6 +720,43 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
 }
 
+func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
+	g := NewWithT(t)
+
+	identity := &antflyv1.HAReplicationIdentitySpec{
+		TimelineID: 4,
+		Epoch:      6,
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		TargetLSN:       12,
+		FenceGeneration: 3,
+	}
+	result := haPromotionJobResult{
+		SwitchLSN:        12,
+		RequiredLSN:      12,
+		ObservedLSN:      13,
+		ParentTimelineID: 4,
+		ParentEpoch:      6,
+		NewTimelineID:    5,
+		NewEpoch:         7,
+		FenceGeneration:  3,
+	}
+
+	g.Expect(haDirectPromotionResultMatchesAction(result, identity, action)).To(BeTrue())
+
+	mismatchedLSN := result
+	mismatchedLSN.SwitchLSN = 11
+	g.Expect(haDirectPromotionResultMatchesAction(mismatchedLSN, identity, action)).To(BeFalse())
+
+	mismatchedTimeline := result
+	mismatchedTimeline.NewTimelineID = 6
+	g.Expect(haDirectPromotionResultMatchesAction(mismatchedTimeline, identity, action)).To(BeFalse())
+
+	unappliedBoundary := result
+	unappliedBoundary.ObservedLSN = 10
+	g.Expect(haDirectPromotionResultMatchesAction(unappliedBoundary, identity, action)).To(BeFalse())
+}
+
 func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 	g := NewWithT(t)
 
@@ -911,6 +948,45 @@ func TestReconcileHAAdminJobsRejectsDirectRejoinMismatchedAssessment(t *testing.
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
+}
+
+func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
+	g := NewWithT(t)
+
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			NewTimelineID: 5,
+			NewEpoch:      7,
+		},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+	}
+	result := haRejoinJobResult{
+		FormerNodeID:     "primary-a",
+		TargetTimelineID: 5,
+		TargetEpoch:      7,
+		ForkLSN:          12,
+		FormerLastLSN:    13,
+		RetainedFromLSN:  8,
+	}
+
+	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
+
+	wrongTimeline := result
+	wrongTimeline.TargetTimelineID = 6
+	g.Expect(haDirectRejoinResultMatchesAction(wrongTimeline, status, action)).To(BeFalse())
+
+	wrongFork := result
+	wrongFork.ForkLSN = 11
+	g.Expect(haDirectRejoinResultMatchesAction(wrongFork, status, action)).To(BeFalse())
+
+	wrongObserved := result
+	wrongObserved.FormerLastLSN = 12
+	g.Expect(haDirectRejoinResultMatchesAction(wrongObserved, status, action)).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
