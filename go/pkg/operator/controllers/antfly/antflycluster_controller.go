@@ -4062,6 +4062,17 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 	if !haPromotionResultMatchesAction(result, identity, action) {
 		return false
 	}
+	if !haJobResultActionReceiptMatches(
+		result.ActionID,
+		result.ActionKind,
+		result.ActionTarget,
+		result.ActionState,
+		"promotion",
+		strings.TrimSpace(action.StandbyName),
+		"applied",
+	) {
+		return false
+	}
 	action.AdminResult = haPromotionAdminActionResult(result)
 	if cluster.Status.HAStatus.LastPromotion == nil ||
 		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, *action) {
@@ -4221,6 +4232,30 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antfl
 }
 
 func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	var expectedActionKind string
+	expectedActionState := "applied"
+	switch haActionKind(action.Kind) {
+	case haActionDemoteFormerPrimary:
+		expectedActionKind = "rejoin_assess"
+		expectedActionState = "assessed"
+	case haActionRewindFormerPrimary:
+		expectedActionKind = "rejoin_rewind"
+	case haActionReseedFormerPrimary:
+		expectedActionKind = "rejoin_reseed"
+	default:
+		return false
+	}
+	if !haJobResultActionReceiptMatches(
+		result.ActionID,
+		result.ActionKind,
+		result.ActionTarget,
+		result.ActionState,
+		expectedActionKind,
+		strings.TrimSpace(action.StandbyName),
+		expectedActionState,
+	) {
+		return false
+	}
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary && !result.RewindExecuted {
 		return false
 	}
@@ -4253,6 +4288,24 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 		}
 	}
 	return true
+}
+
+func haJobResultActionReceiptMatches(actionID, actionKind, actionTarget, actionState, expectedKind, expectedTarget, expectedState string) bool {
+	actionID = strings.TrimSpace(actionID)
+	actionKind = strings.TrimSpace(actionKind)
+	actionTarget = strings.TrimSpace(actionTarget)
+	actionState = strings.TrimSpace(actionState)
+	expectedKind = strings.TrimSpace(expectedKind)
+	expectedTarget = strings.TrimSpace(expectedTarget)
+	expectedState = strings.TrimSpace(expectedState)
+	if actionID == "" || actionKind == "" || actionTarget == "" || actionState == "" ||
+		expectedKind == "" || expectedTarget == "" || expectedState == "" {
+		return false
+	}
+	return actionKind == expectedKind &&
+		actionTarget == expectedTarget &&
+		actionState == expectedState &&
+		actionID == expectedKind+":"+expectedTarget
 }
 
 func haPromotionFenceReason(action antflyv1.HAPlannedActionStatus) string {

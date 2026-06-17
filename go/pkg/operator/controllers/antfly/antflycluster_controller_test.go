@@ -719,7 +719,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -744,6 +744,9 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("promotion:standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionKind).To(Equal("promotion"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionState).To(Equal("applied"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceToken).To(Equal("ha-fence-token"))
 
@@ -948,6 +951,10 @@ func TestHAPromotionResultMatchesPlannedBoundary(t *testing.T) {
 		FenceGeneration: 3,
 	}
 	result := haPromotionJobResult{
+		ActionID:         "promotion:standby-a",
+		ActionKind:       "promotion",
+		ActionTarget:     "standby-a",
+		ActionState:      "applied",
 		PromotedNodeID:   "standby-a",
 		SwitchLSN:        12,
 		RequiredLSN:      12,
@@ -1075,7 +1082,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
 			}, nil
 		})},
 	}
@@ -1085,6 +1092,9 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionID).To(Equal("rejoin_rewind:primary-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionKind).To(Equal("rejoin_rewind"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionState).To(Equal("applied"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RejoinAction).To(Equal("rewind"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RejoinReason).To(Equal("parent_timeline_retained"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FormerNodeID).To(Equal("primary-a"))
@@ -1260,6 +1270,7 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		},
 	}
 	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionRewindFormerPrimary),
 		StandbyName:     "primary-a",
 		TargetLSN:       12,
 		ObservedLSN:     13,
@@ -1274,10 +1285,12 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		RetainedFromLSN:  8,
 	}
 
-	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
-
-	action.Kind = string(haActionRewindFormerPrimary)
 	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeFalse())
+	result.ActionID = "rejoin_rewind:primary-a"
+	result.ActionKind = "rejoin_rewind"
+	result.ActionTarget = "primary-a"
+	result.ActionState = "applied"
+	result.Action = "rewind"
 	result.RewindExecuted = true
 	result.RewindPreviousLastLSN = 13
 	result.RewindCurrentLastLSN = 12
@@ -1286,6 +1299,10 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
 
 	reseedResult := haRejoinJobResult{
+		ActionID:         "rejoin_reseed:primary-a",
+		ActionKind:       "rejoin_reseed",
+		ActionTarget:     "primary-a",
+		ActionState:      "applied",
 		Action:           "reseed",
 		FormerNodeID:     "primary-a",
 		TargetTimelineID: 5,
