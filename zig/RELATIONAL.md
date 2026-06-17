@@ -5451,9 +5451,13 @@ The checked-in SQL/API parity fixture also carries root `fixture_format`,
 `source_entry_count`, `entry_count`, and `skipped_entries` fields.
 Fixture-backed gates reject missing or mismatched format versions, truncated
 entry arrays, duplicate skipped names, skipped/emitted name overlap, and
-source-count drift, so future corpus schema changes, fixture membership changes,
-or intentional fixture omissions must be explicit and regenerated through the
-fixture-promotion step rather than silently parsed as the current contract.
+source-count drift. The promoter can list skipped entries while a local corpus
+change is being developed, but the checked-in fixture must keep
+`skipped_entries` empty; any source entry that cannot be emitted must be fixed,
+reclassified, or removed before the fixture-backed gate accepts it. Future corpus
+schema changes and fixture membership changes must still be explicit and
+regenerated through the fixture-promotion step rather than silently parsed as
+the current contract.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 

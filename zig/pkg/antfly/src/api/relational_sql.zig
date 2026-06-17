@@ -74656,6 +74656,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     };
     try std.testing.expect(entries.items.len > 0);
     try std.testing.expectEqual(expected_entry_count, entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), skipped_entries.len);
     try std.testing.expectEqual(source_entry_count, entries.items.len + skipped_entries.len);
 
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
