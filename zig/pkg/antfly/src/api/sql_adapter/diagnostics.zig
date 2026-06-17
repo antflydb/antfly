@@ -16,6 +16,7 @@ const std = @import("std");
 
 pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
+    cte_mutation_source_plan,
     deferrable_primary_key,
     deferrable_unique_constraint,
     duplicate_conflict_update_target,
@@ -69,6 +70,7 @@ pub fn classificationReasonIsUnsupportedRequirement(reason: SqlAdapterClassifica
 
 test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_plan"));
+    try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_lock_mode_plan, classificationReasonFromToken("row_lock_mode_plan").?);
     try std.testing.expectEqualStrings("multi_table_generation_barrier", classificationReasonToken(.multi_table_generation_barrier));
     try std.testing.expect(classificationReasonIsAdapterNoop(.session_setting));

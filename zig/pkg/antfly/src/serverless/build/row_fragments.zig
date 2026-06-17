@@ -22,6 +22,7 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 pub const BuildOptions = struct {
     schema_fingerprint: []const u8,
     projected_columns: ?[]const []const u8 = null,
+    max_dictionary_samples: usize = 16,
 };
 
 pub fn buildFragmentFromBatchAlloc(
@@ -63,6 +64,26 @@ pub fn encodeFragmentFromBatchAlloc(
     var fragment = try buildFragmentFromBatchAlloc(alloc, batch, options);
     defer fragment.deinit(alloc);
     return row_fragment.encodeAlloc(alloc, fragment);
+}
+
+pub fn buildFragmentStatsFromBatchAlloc(
+    alloc: Allocator,
+    batch: rowsource.ColumnBatch,
+    options: BuildOptions,
+) !row_fragment.FragmentStats {
+    var fragment = try buildFragmentFromBatchAlloc(alloc, batch, options);
+    defer fragment.deinit(alloc);
+    return try row_fragment.buildStatsAlloc(alloc, fragment, options.max_dictionary_samples);
+}
+
+pub fn encodeFragmentStatsFromBatchAlloc(
+    alloc: Allocator,
+    batch: rowsource.ColumnBatch,
+    options: BuildOptions,
+) ![]u8 {
+    var stats = try buildFragmentStatsFromBatchAlloc(alloc, batch, options);
+    defer stats.deinit(alloc);
+    return try row_fragment.encodeStatsAlloc(alloc, stats);
 }
 
 fn appendColumnFromVector(
@@ -154,4 +175,44 @@ test "row fragment publisher builds projected fragment from column batch" {
     try std.testing.expectEqual(@as(usize, 1), fragment.columns.len);
     try std.testing.expectEqualStrings("amount", fragment.columns[0].name);
     try std.testing.expectEqual(@as(i64, 20), fragment.columns[0].values[1].i64);
+}
+
+test "row fragment publisher builds stats for projected columns" {
+    const alloc = std.testing.allocator;
+    const row_refs = [_]rowsource.RowRef{
+        .{ .relational_key = "row:a" },
+        .{ .relational_key = "row:b" },
+        .{ .relational_key = "row:c" },
+    };
+    const amounts = [_]i64{ 30, 10, 20 };
+    const tenants = [_][]const u8{ "t2", "t1", "t2" };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "tenant", .values = .{ .bytes = &tenants } },
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "snap-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+
+    const projection = [_][]const u8{"amount"};
+    var stats = try buildFragmentStatsFromBatchAlloc(alloc, batch, .{
+        .schema_fingerprint = "schema-v1",
+        .projected_columns = &projection,
+    });
+    defer stats.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u64, 3), stats.row_count);
+    try std.testing.expect(stats.findColumn("tenant") == null);
+    const amount = stats.findColumn("amount").?;
+    try std.testing.expectEqual(@as(i64, 10), amount.min.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), amount.max.?.i64);
+
+    const encoded = try encodeFragmentStatsFromBatchAlloc(alloc, batch, .{
+        .schema_fingerprint = "schema-v1",
+        .projected_columns = &projection,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"amount\"") != null);
 }

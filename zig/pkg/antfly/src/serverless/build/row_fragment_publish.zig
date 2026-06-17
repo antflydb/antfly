@@ -26,7 +26,9 @@ const rowsource = @import("../../storage/rowsource/types.zig");
 pub const PublishOptions = struct {
     schema_fingerprint: []const u8,
     artifact_name: []const u8 = &.{},
+    stats_artifact_name: []const u8 = &.{},
     projected_columns: ?[]const []const u8 = null,
+    max_dictionary_samples: usize = 16,
 };
 
 pub const PublishResult = struct {
@@ -50,11 +52,22 @@ pub fn publishBatchAlloc(
     const encoded = try row_fragments.encodeFragmentFromBatchAlloc(alloc, batch, .{
         .schema_fingerprint = options.schema_fingerprint,
         .projected_columns = options.projected_columns,
+        .max_dictionary_samples = options.max_dictionary_samples,
     });
     defer alloc.free(encoded);
 
     var metadata = try artifacts.put(encoded);
     defer metadata.deinit(alloc);
+
+    const encoded_stats = try row_fragments.encodeFragmentStatsFromBatchAlloc(alloc, batch, .{
+        .schema_fingerprint = options.schema_fingerprint,
+        .projected_columns = options.projected_columns,
+        .max_dictionary_samples = options.max_dictionary_samples,
+    });
+    defer alloc.free(encoded_stats);
+
+    var stats_metadata = try artifacts.put(encoded_stats);
+    defer stats_metadata.deinit(alloc);
 
     const published = [_]row_fragment_manifest.PublishedArtifact{
         .{
@@ -64,6 +77,14 @@ pub fn publishBatchAlloc(
             .name = options.artifact_name,
         },
     };
+    const published_stats = [_]row_fragment_manifest.PublishedArtifact{
+        .{
+            .artifact_id = stats_metadata.artifact_id,
+            .byte_len = stats_metadata.byte_len,
+            .checksum = stats_metadata.checksum,
+            .name = options.stats_artifact_name,
+        },
+    };
 
     return .{
         .plan = try row_fragment_manifest.planAlloc(
@@ -71,7 +92,7 @@ pub fn publishBatchAlloc(
             batch.snapshot.snapshot_id,
             options.schema_fingerprint,
             &published,
-            &.{},
+            &published_stats,
         ),
     };
 }
@@ -219,8 +240,15 @@ test "row fragment publisher writes artifact and returns manifest plan" {
     try std.testing.expectEqualStrings("orders.rows", artifact.name);
     try std.testing.expectEqualStrings("mem:0", artifact.artifact_id);
     try std.testing.expectEqualStrings("mem:0", result.plan.base_source.antfly_row_fragments.row_fragment_artifacts[0]);
+    try std.testing.expectEqualStrings("mem:1", result.plan.base_source.antfly_row_fragments.row_fragment_stats_artifacts[0]);
 
     const encoded = try artifacts.getAlloc(artifact.artifact_id);
     defer alloc.free(encoded);
     try std.testing.expect(encoded.len > 0);
+
+    const stats_artifact = result.plan.artifacts[1];
+    try std.testing.expectEqualStrings("mem:1", stats_artifact.artifact_id);
+    const encoded_stats = try artifacts.getAlloc(stats_artifact.artifact_id);
+    defer alloc.free(encoded_stats);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_stats, "\"name\":\"amount\"") != null);
 }

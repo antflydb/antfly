@@ -67354,6 +67354,8 @@ const AppParityCorpusCoverage = struct {
     unsupported_read_row_lock_target: bool = false,
     unsupported_update_source_row_lock_target: bool = false,
     unsupported_update_joined_source_row_lock_target: bool = false,
+    unsupported_update_joined_source_cte_mutation: bool = false,
+    unsupported_delete_joined_source_cte_mutation: bool = false,
     update_identity_rewrite: bool = false,
     unsupported_update_non_unique_point_selector: bool = false,
     unsupported_delete_non_unique_point_selector: bool = false,
@@ -68442,8 +68444,16 @@ const AppParityCorpusCoverage = struct {
             self.unsupported_update_joined_source_row_lock_target = self.unsupported_update_joined_source_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
+            self.unsupported_update_joined_source_cte_mutation = self.unsupported_update_joined_source_cte_mutation or
+                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH ") and
+                    std.mem.indexOf(u8, entry.sql, " UPDATE ") != null);
         } else if (entry.family == .unsupported_delete_joined_source) {
             self.unsupported_delete_joined_multi_output_subquery_selector = self.unsupported_delete_joined_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
+            self.unsupported_delete_joined_source_cte_mutation = self.unsupported_delete_joined_source_cte_mutation or
+                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH ") and
+                    std.mem.indexOf(u8, entry.sql, " DELETE ") != null);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -69351,6 +69361,8 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_row_lock_target);
         try std.testing.expect(self.unsupported_update_source_row_lock_target);
         try std.testing.expect(self.unsupported_update_joined_source_row_lock_target);
+        try std.testing.expect(self.unsupported_update_joined_source_cte_mutation);
+        try std.testing.expect(self.unsupported_delete_joined_source_cte_mutation);
         try std.testing.expect(self.update_identity_rewrite);
         try std.testing.expect(self.unsupported_update_non_unique_point_selector);
         try std.testing.expect(self.unsupported_delete_non_unique_point_selector);
@@ -76495,6 +76507,20 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "unsupported:update_joined_source:requires=row_lock_mode_plan",
             .classification_reason = "row_lock_mode_plan",
             .sql = "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
+        },
+        .{
+            .name = "unsupported cte-backed joined update mutation source",
+            .family = .unsupported_update_joined_source,
+            .plan = "unsupported:update_joined_source:requires=cte_mutation_source_plan",
+            .classification_reason = "cte_mutation_source_plan",
+            .sql = "WITH ready_sources AS (SELECT id FROM archived_records WHERE status = 'ready') UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM ready_sources) RETURNING id",
+        },
+        .{
+            .name = "unsupported cte-backed joined delete mutation source",
+            .family = .unsupported_delete_joined_source,
+            .plan = "unsupported:delete_joined_source:requires=cte_mutation_source_plan",
+            .classification_reason = "cte_mutation_source_plan",
+            .sql = "WITH stale_sources AS (SELECT id FROM archived_records WHERE status = 'stale') DELETE FROM usage_records WHERE id IN (SELECT id FROM stale_sources) RETURNING id",
         },
         .{
             .name = "joined update mixed-side match expression",

@@ -19,6 +19,7 @@ pub const fs_store = @import("fs_store.zig");
 pub const remote_store = @import("remote_store.zig");
 pub const artifact_ref = @import("artifact_ref.zig");
 pub const base_source = @import("base_source.zig");
+pub const compatibility = @import("compatibility.zig");
 
 pub const ArtifactKind = types.ArtifactKind;
 pub const ArtifactRef = types.ArtifactRef;
@@ -27,6 +28,8 @@ pub const ExternalBaseFormat = types.ExternalBaseFormat;
 pub const AntflyFragmentBaseSource = types.AntflyFragmentBaseSource;
 pub const ExternalBaseSource = types.ExternalBaseSource;
 pub const BaseSourceDescriptor = types.BaseSourceDescriptor;
+pub const LakeManifestCompatibilityPolicy = compatibility.Policy;
+pub const LakeManifestCompatibilityReport = compatibility.Report;
 pub const PublishedGenerationStats = types.PublishedGenerationStats;
 pub const ManifestStats = types.ManifestStats;
 pub const PublishedGeneration = types.PublishedGeneration;
@@ -39,6 +42,7 @@ pub const PublishResult = store.PublishResult;
 pub const ManifestStore = store.ManifestStore;
 pub const FsStore = fs_store.FsStore;
 pub const RemoteStore = remote_store.RemoteStore;
+pub const checkLakeManifestCompatibility = compatibility.checkLakeBaseSource;
 
 test "serverless manifest module compiles" {
     _ = types;
@@ -48,9 +52,12 @@ test "serverless manifest module compiles" {
     _ = remote_store;
     _ = artifact_ref;
     _ = base_source;
+    _ = compatibility;
     _ = ArtifactKind;
     _ = ArtifactRef;
     _ = BaseSourceDescriptor;
+    _ = LakeManifestCompatibilityPolicy;
+    _ = LakeManifestCompatibilityReport;
     _ = PublishedGenerationStats;
     _ = ManifestStats;
     _ = PublishedGeneration;
@@ -63,4 +70,5 @@ test "serverless manifest module compiles" {
     _ = ManifestStore;
     _ = FsStore;
     _ = RemoteStore;
+    _ = checkLakeManifestCompatibility;
 }

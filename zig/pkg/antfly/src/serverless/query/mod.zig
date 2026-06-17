@@ -22,6 +22,7 @@ pub const cache = @import("cache.zig");
 pub const indexed_reader = @import("indexed_reader.zig");
 pub const graph_reader = @import("graph_reader.zig");
 pub const lake_rows = @import("lake_rows.zig");
+pub const lake_explain = @import("lake_explain.zig");
 
 pub const QueryRuntime = runtime.QueryRuntime;
 pub const QuerySession = runtime.QuerySession;
@@ -62,6 +63,10 @@ pub const LakeRowsPredicate = lake_rows.Predicate;
 pub const LakeRowsPredicateOp = lake_rows.PredicateOp;
 pub const LakeRowsScanRequest = lake_rows.ScanRequest;
 pub const LakeRowsScanResult = lake_rows.ScanResult;
+pub const LakeExplainOperation = lake_explain.Operation;
+pub const LakeExplainRequest = lake_explain.Request;
+pub const LakeExplainPlan = lake_explain.Plan;
+pub const explainLakeQuery = lake_explain.explain;
 pub const executeLakeRowsGroupByAlloc = lake_rows.executeGroupByAlloc;
 pub const hydrateLakeRowsAlloc = lake_rows.hydrateRowsAlloc;
 pub const scanLakeRowsAlloc = lake_rows.scanRowsAlloc;
@@ -89,6 +94,7 @@ test "serverless query module compiles" {
     _ = indexed_reader;
     _ = graph_reader;
     _ = lake_rows;
+    _ = lake_explain;
     _ = QueryRuntime;
     _ = QuerySession;
     _ = QueryRequest;
@@ -128,6 +134,10 @@ test "serverless query module compiles" {
     _ = LakeRowsPredicateOp;
     _ = LakeRowsScanRequest;
     _ = LakeRowsScanResult;
+    _ = LakeExplainOperation;
+    _ = LakeExplainRequest;
+    _ = LakeExplainPlan;
+    _ = explainLakeQuery;
     _ = executeLakeRowsGroupByAlloc;
     _ = hydrateLakeRowsAlloc;
     _ = scanLakeRowsAlloc;

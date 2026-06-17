@@ -69,6 +69,8 @@ pub const publishRowFragmentBatchAlloc = row_fragment_publish.publishBatchAlloc;
 pub const RowFragmentBuildOptions = row_fragments.BuildOptions;
 pub const buildRowFragmentFromBatchAlloc = row_fragments.buildFragmentFromBatchAlloc;
 pub const encodeRowFragmentFromBatchAlloc = row_fragments.encodeFragmentFromBatchAlloc;
+pub const buildRowFragmentStatsFromBatchAlloc = row_fragments.buildFragmentStatsFromBatchAlloc;
+pub const encodeRowFragmentStatsFromBatchAlloc = row_fragments.encodeFragmentStatsFromBatchAlloc;
 
 test "serverless build module compiles" {
     _ = algebraic_manifest;
@@ -127,4 +129,6 @@ test "serverless build module compiles" {
     _ = RowFragmentBuildOptions;
     _ = buildRowFragmentFromBatchAlloc;
     _ = encodeRowFragmentFromBatchAlloc;
+    _ = buildRowFragmentStatsFromBatchAlloc;
+    _ = encodeRowFragmentStatsFromBatchAlloc;
 }
