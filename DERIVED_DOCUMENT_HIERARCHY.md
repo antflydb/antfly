@@ -313,7 +313,7 @@ The synchronous precompute path still uses the compatibility `Result.units` API.
 
 ### Source Payload Limits
 
-Inline `data:` sources are preflighted before persistence and before async replay. Valid data URIs whose decoded size is greater than the configured remote-content maximum are rejected with the same oversized-stream error used by remote fetches.
+Inline `data:` sources for document-extraction asset inputs, including rendered source templates, are preflighted before persistence and before async replay. Valid data URIs whose decoded size is greater than the configured remote-content maximum are rejected with the same oversized-stream error used by remote fetches.
 
 This is intentionally separate from resource management. A hard source limit prevents a single oversized inline PDF from being persisted, decoded, or routed in the first place. Resource-manager pressure only controls work that is otherwise within the configured document size envelope.
 

@@ -468,7 +468,15 @@ func createTableWithIndexes(ctx context.Context, antflyURL string, token string,
 	if resp.StatusCode >= 300 {
 		var buf bytes.Buffer
 		_, _ = buf.ReadFrom(resp.Body)
-		log.Printf("Warning: Failed to create table (may already exist): HTTP %d %s\n", resp.StatusCode, strings.TrimSpace(buf.String()))
+		body := strings.TrimSpace(buf.String())
+		if resp.StatusCode == http.StatusConflict {
+			log.Printf("Table already exists: HTTP %d %s\n\n", resp.StatusCode, body)
+		} else {
+			if body == "" {
+				body = http.StatusText(resp.StatusCode)
+			}
+			return fmt.Errorf("create table %q failed: HTTP %d %s", tableName, resp.StatusCode, body)
+		}
 	} else {
 		fmt.Printf("Table created with indexes: document_units, document_text, document_vectors\n\n")
 	}

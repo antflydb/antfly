@@ -125,27 +125,6 @@ fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
 }
 
-fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
-    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
-        if (remote_content) |remote| {
-            if (remote.security) |security| {
-                if (security.max_download_size_bytes) |value| return value;
-            }
-        }
-    }
-    return template_remote.default_remote_fetch_max_download_size_bytes;
-}
-
-fn documentExtractionSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
-    if (!std.mem.startsWith(u8, source_text, "data:")) return false;
-    const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
-    return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
-}
-
-fn validateDocumentExtractionInlineSourceSize(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !void {
-    if (try documentExtractionSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
-}
-
 fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void {
     var has_document_extraction_asset = false;
     for (db.core.index_manager.enrichments.items) |entry| {
@@ -172,22 +151,22 @@ fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void
         if (entry.source_template.len > 0) {
             const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch continue;
             defer db.alloc.free(rendered);
-            try validateDocumentExtractionInlineSourceSize(db.remote_content, rendered);
+            try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
             continue;
         }
 
         const source = parsed.value.object.get(entry.source_field) orelse continue;
         if (source != .string) continue;
-        try validateDocumentExtractionInlineSourceSize(db.remote_content, source.string);
+        try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
     }
 }
 
 test "document extraction inline source size uses remote content limit" {
     const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
     var remote_content = scraping.RemoteContentConfig{ .security = security };
-    try std.testing.expect(try documentExtractionSourceTooLarge(&remote_content, "data:text/plain;base64,aGVsbG8="));
-    try std.testing.expect(!try documentExtractionSourceTooLarge(&remote_content, "data:text/plain;base64,Zm9v"));
-    try std.testing.expect(!try documentExtractionSourceTooLarge(&remote_content, "data:"));
+    try std.testing.expect(try document_extraction_mod.inlineDataUriSourceTooLarge(&remote_content, "data:text/plain;base64,aGVsbG8="));
+    try std.testing.expect(!try document_extraction_mod.inlineDataUriSourceTooLarge(&remote_content, "data:text/plain;base64,Zm9v"));
+    try std.testing.expect(!try document_extraction_mod.inlineDataUriSourceTooLarge(&remote_content, "data:"));
 }
 
 test "document extraction templated inline source size is rejected before persistence" {
@@ -15696,7 +15675,7 @@ fn extractAssetSourceValue(
     if (request.source_template.len > 0) {
         const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
         errdefer alloc.free(rendered);
-        try validateDocumentExtractionInlineSourceSize(db.remote_content, rendered);
+        try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
         return @constCast(rendered);
     }
 
@@ -15707,13 +15686,13 @@ fn extractAssetSourceValue(
     return switch (source) {
         .null => null,
         .string => |value| blk: {
-            try validateDocumentExtractionInlineSourceSize(db.remote_content, value);
+            try document_extraction_mod.validateInlineSourceSize(db.remote_content, value);
             break :blk try alloc.dupe(u8, value);
         },
         else => blk: {
             const rendered = try std.json.Stringify.valueAlloc(alloc, source, .{});
             errdefer alloc.free(rendered);
-            try validateDocumentExtractionInlineSourceSize(db.remote_content, rendered);
+            try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
             break :blk rendered;
         },
     };

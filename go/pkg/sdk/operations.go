@@ -393,29 +393,41 @@ func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions)
 	cursorEstimate := strings.Repeat("x", longestID)
 	pages := make([]map[string]any, 0, (len(records)+maxRecords-1)/maxRecords)
 	page := make(map[string]any, pageCapacity)
+	sizer, err := newLinearMergeRequestSizer(cursorEstimate, opts.DryRun, opts.SyncLevel)
+	if err != nil {
+		return nil, err
+	}
+	pageRecordBytes := int64(0)
 
 	for _, id := range ids {
 		if len(page) >= maxRecords {
-			pages = append(pages, page)
-			page = make(map[string]any, pageCapacity)
-		}
-
-		candidate := cloneRecordPage(page)
-		candidate[id] = records[id]
-		if opts.MaxRequestBytes > 0 && len(page) > 0 {
-			size, err := linearMergeRequestSize(candidate, cursorEstimate, opts.DryRun, opts.SyncLevel)
-			if err != nil {
+			if err := validateLinearMergePageSize(page, cursorEstimate, opts); err != nil {
 				return nil, err
 			}
-			if size > opts.MaxRequestBytes {
+			pages = append(pages, page)
+			page = make(map[string]any, pageCapacity)
+			pageRecordBytes = 0
+		}
+
+		entrySize, err := linearMergeRecordEntrySize(id, records[id])
+		if err != nil {
+			return nil, err
+		}
+		candidateSize := sizer.requestSize(pageRecordBytes, len(page), entrySize)
+		if opts.MaxRequestBytes > 0 && len(page) > 0 {
+			if candidateSize > opts.MaxRequestBytes {
+				if err := validateLinearMergePageSize(page, cursorEstimate, opts); err != nil {
+					return nil, err
+				}
 				pages = append(pages, page)
 				page = make(map[string]any, pageCapacity)
-				candidate = map[string]any{id: records[id]}
+				pageRecordBytes = 0
+				candidateSize = sizer.requestSize(0, 0, entrySize)
 			}
 		}
 
-		if opts.MaxRequestBytes > 0 {
-			size, err := linearMergeRequestSize(candidate, cursorEstimate, opts.DryRun, opts.SyncLevel)
+		if opts.MaxRequestBytes > 0 && candidateSize > opts.MaxRequestBytes {
+			size, err := linearMergeRequestSize(map[string]any{id: records[id]}, cursorEstimate, opts.DryRun, opts.SyncLevel)
 			if err != nil {
 				return nil, err
 			}
@@ -424,20 +436,63 @@ func SortedLinearMergePages(records map[string]any, opts LinearMergePageOptions)
 			}
 		}
 		page[id] = records[id]
+		pageRecordBytes += entrySize
 	}
 
 	if len(page) > 0 {
+		if err := validateLinearMergePageSize(page, cursorEstimate, opts); err != nil {
+			return nil, err
+		}
 		pages = append(pages, page)
 	}
 	return pages, nil
 }
 
-func cloneRecordPage(page map[string]any) map[string]any {
-	cloned := make(map[string]any, len(page)+1)
-	for key, value := range page {
-		cloned[key] = value
+type linearMergeRequestSizer struct {
+	emptyRequestBytes int64
+}
+
+func newLinearMergeRequestSizer(lastMergedID string, dryRun bool, syncLevel SyncLevel) (linearMergeRequestSizer, error) {
+	size, err := linearMergeRequestSize(map[string]any{}, lastMergedID, dryRun, syncLevel)
+	if err != nil {
+		return linearMergeRequestSizer{}, err
 	}
-	return cloned
+	return linearMergeRequestSizer{emptyRequestBytes: size}, nil
+}
+
+func (s linearMergeRequestSizer) requestSize(existingRecordBytes int64, existingRecords int, nextRecordBytes int64) int64 {
+	recordCount := existingRecords + 1
+	commaBytes := int64(0)
+	if recordCount > 1 {
+		commaBytes = int64(recordCount - 1)
+	}
+	return s.emptyRequestBytes + existingRecordBytes + nextRecordBytes + commaBytes
+}
+
+func linearMergeRecordEntrySize(id string, record any) (int64, error) {
+	key, err := json.Marshal(id)
+	if err != nil {
+		return 0, err
+	}
+	value, err := json.Marshal(record)
+	if err != nil {
+		return 0, err
+	}
+	return int64(len(key) + 1 + len(value)), nil
+}
+
+func validateLinearMergePageSize(page map[string]any, lastMergedID string, opts LinearMergePageOptions) error {
+	if opts.MaxRequestBytes <= 0 {
+		return nil
+	}
+	size, err := linearMergeRequestSize(page, lastMergedID, opts.DryRun, opts.SyncLevel)
+	if err != nil {
+		return err
+	}
+	if size > opts.MaxRequestBytes {
+		return fmt.Errorf("linear merge page encodes to %d bytes, exceeding max request size %d", size, opts.MaxRequestBytes)
+	}
+	return nil
 }
 
 func linearMergeRequestSize(records map[string]any, lastMergedID string, dryRun bool, syncLevel SyncLevel) (int64, error) {

@@ -455,3 +455,34 @@ func TestSortedLinearMergePagesRejectsSingleOversizedRecord(t *testing.T) {
 		t.Fatalf("SortedLinearMergePages error = %v, want oversized record error", err)
 	}
 }
+
+func TestLinearMergeRequestSizerMatchesEncodedSize(t *testing.T) {
+	records := map[string]any{
+		"a": map[string]any{"text": "alpha", "n": 1},
+		"b": map[string]any{"text": "bravo", "n": 2},
+	}
+	sizer, err := newLinearMergeRequestSizer("cursor", true, SyncLevelFullIndex)
+	if err != nil {
+		t.Fatalf("newLinearMergeRequestSizer: %v", err)
+	}
+
+	total := int64(0)
+	count := 0
+	for _, id := range []string{"a", "b"} {
+		entrySize, err := linearMergeRecordEntrySize(id, records[id])
+		if err != nil {
+			t.Fatalf("linearMergeRecordEntrySize: %v", err)
+		}
+		total += entrySize
+		count++
+	}
+
+	got := sizer.emptyRequestBytes + total + int64(count-1)
+	want, err := linearMergeRequestSize(records, "cursor", true, SyncLevelFullIndex)
+	if err != nil {
+		t.Fatalf("linearMergeRequestSize: %v", err)
+	}
+	if got != want {
+		t.Fatalf("estimated size = %d, want encoded size %d", got, want)
+	}
+}

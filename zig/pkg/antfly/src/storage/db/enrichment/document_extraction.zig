@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
     struct {
         pub const reader = struct {
@@ -70,8 +71,37 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
     }
 else
     @import("antfly_pdf");
+const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+    @import("../scraping_stub.zig")
+else
+    @import("antfly_scraping");
+const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+    @import("../template_remote_stub.zig")
+else
+    @import("../../../template_remote.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
+    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+        if (remote_content) |remote| {
+            if (remote.security) |security| {
+                if (security.max_download_size_bytes) |value| return value;
+            }
+        }
+    }
+    return template_remote.default_remote_fetch_max_download_size_bytes;
+}
+
+pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
+    if (!std.mem.startsWith(u8, source_text, "data:")) return false;
+    const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
+    return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
+}
+
+pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !void {
+    if (try inlineDataUriSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
+}
 
 pub const TextRegion = struct {
     span: [2]u32,

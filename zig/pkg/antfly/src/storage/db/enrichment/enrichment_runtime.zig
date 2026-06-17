@@ -100,25 +100,6 @@ const transient_embed_retry_base_sleep_ns: u64 = 250 * std.time.ns_per_ms;
 const transient_embed_retry_max_sleep_ns: u64 = 5 * std.time.ns_per_s;
 const transient_worker_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 
-fn effectiveRemoteContentMaxDownloadSize(config: Config) u64 {
-    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
-        if (config.remote_content) |remote| {
-            if (remote.security) |security| {
-                if (security.max_download_size_bytes) |value| return value;
-            }
-        }
-    }
-    return template_remote.default_remote_fetch_max_download_size_bytes;
-}
-
-fn validateInlineDataUriSourceSize(config: Config, source_text: []const u8) !void {
-    if (!std.mem.startsWith(u8, source_text, "data:")) return;
-    const decoded_len = scraping.dataUriDecodedSize(source_text) catch return;
-    if (@as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(config)) {
-        return error.StreamTooLong;
-    }
-}
-
 const GeneratedReplayWindow = struct {
     alloc: Allocator,
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
@@ -6386,7 +6367,6 @@ fn extractSourceText(
             alloc.free(rendered);
             return null;
         }
-        try validateInlineDataUriSourceSize(config, rendered);
         return rendered;
     }
 
@@ -6416,7 +6396,7 @@ fn extractAssetSourceValue(
             alloc.free(rendered);
             return null;
         }
-        try validateInlineDataUriSourceSize(config, rendered);
+        try document_extraction_mod.validateInlineSourceSize(config.remote_content, rendered);
         return rendered;
     }
 
@@ -6427,13 +6407,13 @@ fn extractAssetSourceValue(
     return switch (source) {
         .null => null,
         .string => |value| blk: {
-            try validateInlineDataUriSourceSize(config, value);
+            try document_extraction_mod.validateInlineSourceSize(config.remote_content, value);
             break :blk try alloc.dupe(u8, value);
         },
         else => blk: {
             const rendered = try std.json.Stringify.valueAlloc(alloc, source, .{});
             errdefer alloc.free(rendered);
-            try validateInlineDataUriSourceSize(config, rendered);
+            try document_extraction_mod.validateInlineSourceSize(config.remote_content, rendered);
             break :blk rendered;
         },
     };
