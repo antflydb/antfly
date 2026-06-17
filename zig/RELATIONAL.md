@@ -5443,7 +5443,10 @@ the fingerprint.
 `EXPLAIN` fixture metadata and coverage use the same exact-token rule for
 `explain:kind`, `analyze`, and option tokens such as `format`, `verbose`, and
 `costs`; malformed option values or suffix-like `kind=write_extra` values cannot
-claim write/read-plan coverage.
+claim write/read-plan coverage. Wrapped read/write coverage is satisfied only
+from a single `inner=` payload whose plan starts with the expected typed-plan
+family; stray family-looking text elsewhere in the explain fingerprint cannot
+claim coverage.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 

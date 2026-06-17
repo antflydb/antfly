@@ -62374,16 +62374,18 @@ fn appParityFixtureConflictWhereSummaryMatchesPlan(entry: AppParityCorpusEntry, 
 }
 
 fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
+    const inner_token = ":inner=";
+    if (!std.mem.startsWith(u8, inner_prefix, inner_token)) return false;
     return entry.family == .explain and
         appParityExplainPlanHasKind(entry.plan, "write") and
-        std.mem.indexOf(u8, entry.plan, inner_prefix) != null;
+        appParityExplainPlanInnerStartsWith(entry.plan, inner_prefix[inner_token.len..]);
 }
 
 fn appParityReadPlanHasPrefix(entry: AppParityCorpusEntry, read_prefix: []const u8) bool {
     return (entry.family == .read and std.mem.startsWith(u8, entry.plan, read_prefix)) or
         (entry.family == .explain and
             appParityExplainPlanHasKind(entry.plan, "read") and
-            std.mem.indexOf(u8, entry.plan, read_prefix) != null);
+            appParityExplainPlanInnerStartsWith(entry.plan, read_prefix));
 }
 
 fn appParityFixtureAllowsMutationTransformSummary(entry: AppParityCorpusEntry) bool {
@@ -65140,6 +65142,13 @@ fn appParityExplainPlanHasKind(plan: []const u8, expected: []const u8) bool {
     return appParityPlanHasExactStringToken(plan, "explain:kind=", expected);
 }
 
+fn appParityExplainPlanInnerStartsWith(plan: []const u8, inner_prefix: []const u8) bool {
+    const inner_token = ":inner=";
+    const inner_index = std.mem.indexOf(u8, plan, inner_token) orelse return false;
+    if (std.mem.indexOfPos(u8, plan, inner_index + inner_token.len, inner_token) != null) return false;
+    return std.mem.startsWith(u8, plan[inner_index + inner_token.len ..], inner_prefix);
+}
+
 fn appParityJoinedSourcePlanHasCounts(plan: []const u8, right_predicates: usize, join_keys: usize) bool {
     return appParityPlanHasExactUsizeToken(plan, ":right_pred=", right_predicates) and
         appParityPlanHasExactUsizeToken(plan, ":on=", join_keys);
@@ -65755,11 +65764,24 @@ test "app parity explain coverage tokens are exact" {
     try std.testing.expect(!appParityFixtureAllowsReturningSummary(write_suffix));
     try std.testing.expect(!appParityExplainWriteInnerHasPrefix(write_suffix, ":inner=insert:"));
 
+    const duplicate_inner = AppParityCorpusEntry{
+        .family = .explain,
+        .summary = .{ .returning = 1 },
+        .plan = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:inner=update_source:table=usage_records",
+    };
+    try std.testing.expect(!appParityExplainWriteInnerHasPrefix(duplicate_inner, ":inner=insert:"));
+
     const read_suffix = AppParityCorpusEntry{
         .family = .explain,
         .plan = "explain:kind=read_extra:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=0:select=1:order=0:limit=none:claim=none",
     };
     try std.testing.expect(!appParityReadPlanHasPrefix(read_suffix, "read:query:"));
+
+    const read_stray_prefix = AppParityCorpusEntry{
+        .family = .explain,
+        .plan = "explain:kind=read:analyze=false:detail=read:query:inner=read:join:join:type=inner:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=none",
+    };
+    try std.testing.expect(!appParityReadPlanHasPrefix(read_stray_prefix, "read:query:"));
 
     const options = "explain:kind=read:analyze=true_extra:inner=read:query:query:table=usage_records:format=:verbose=1:costs=0";
     try std.testing.expect(appParityExplainPlanHasKind(options, "read"));
