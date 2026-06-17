@@ -247,6 +247,7 @@ pub const Server = struct {
             if (value < 0) return try textResponse(self.alloc, 400, "invalid HA replication slot request");
             break :blk @intCast(value);
         } else null;
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
 
         const result = ha_admin.applySlotAction(primary, .create, .{
             .slot_name = parsed.value.slot_name,
@@ -254,7 +255,7 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        var receipt = try actionReceiptAlloc(self.alloc, "replication_slot_create", parsed.value.slot_name, "applied", self.primaryNodeID());
+        var receipt = try actionReceiptAlloc(self.alloc, "replication_slot_create", parsed.value.slot_name, "applied", node_id);
         defer receipt.deinit(self.alloc);
         return switch (result) {
             .create => |slot| try self.handleTypedJson(slotActionDocument(receipt, "create", slot, null)),
@@ -268,6 +269,7 @@ pub const Server = struct {
         action: ha_admin.SlotAction,
     ) !http_common.HttpResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
         const result = ha_admin.applySlotAction(primary, action, .{
             .slot_name = slot_name,
         }) catch |err| {
@@ -279,7 +281,7 @@ pub const Server = struct {
             .@"resume" => "replication_slot_resume",
             .drop => "replication_slot_drop",
         };
-        var receipt = try actionReceiptAlloc(self.alloc, action_kind, slot_name, "applied", self.primaryNodeID());
+        var receipt = try actionReceiptAlloc(self.alloc, action_kind, slot_name, "applied", node_id);
         defer receipt.deinit(self.alloc);
         return switch (result) {
             .create => unreachable,
@@ -418,6 +420,7 @@ pub const Server = struct {
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup request");
         defer parsed.deinit();
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
 
         const result = ha_admin.beginBaseBackup(primary, .{
             .slot_name = parsed.value.slot_name,
@@ -425,7 +428,7 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        var receipt = try actionReceiptAlloc(self.alloc, "base_backup_begin", result.manifest_id, "applied", self.primaryNodeID());
+        var receipt = try actionReceiptAlloc(self.alloc, "base_backup_begin", result.manifest_id, "applied", node_id);
         defer receipt.deinit(self.alloc);
         return try self.handleTypedJson(BaseBackupBeginDocument{
             .action = receipt,
@@ -443,6 +446,7 @@ pub const Server = struct {
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup finish request");
         defer parsed.deinit();
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
 
         var plan = admin_cli.Plan{
             .output = .json,
@@ -457,7 +461,7 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .seed_finish => |seed| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "base_backup_finish", seed.manifest_id, "applied", self.primaryNodeID());
+                var receipt = try actionReceiptAlloc(self.alloc, "base_backup_finish", seed.manifest_id, "applied", node_id);
                 defer receipt.deinit(self.alloc);
                 break :blk try self.handleTypedJson(BaseBackupFinishDocument{
                     .action = receipt,
@@ -477,6 +481,7 @@ pub const Server = struct {
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA standby bootstrap request");
         defer parsed.deinit();
+        const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
 
         var plan = admin_cli.Plan{
             .output = .json,
@@ -492,7 +497,7 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .seed_bootstrap => |seed| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "standby_bootstrap", seed.manifest_id, "applied", self.standbyNodeID());
+                var receipt = try actionReceiptAlloc(self.alloc, "standby_bootstrap", seed.manifest_id, "applied", node_id);
                 defer receipt.deinit(self.alloc);
                 break :blk try self.handleTypedJson(StandbyBootstrapDocument{
                     .action = receipt,
@@ -676,10 +681,11 @@ pub const Server = struct {
             if (expected == .reseed) {
                 const primary = self.ctx.primary orelse
                     return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+                const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
                 const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
-                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied", self.primaryNodeID());
+                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied", node_id);
                 defer action_receipt.deinit(self.alloc);
                 return try self.handleTypedJson(RejoinReseedDocument{
                     .action = action_receipt,
@@ -766,18 +772,18 @@ pub const Server = struct {
         return self.ctx.primary != null or self.ctx.standby != null or self.ctx.fence_store != null;
     }
 
-    fn primaryNodeID(self: *const Server) []const u8 {
+    fn primaryNodeID(self: *const Server) ?[]const u8 {
         if (self.ctx.primary_node_id) |node_id| {
             if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) return node_id;
         }
-        return "primary";
+        return null;
     }
 
-    fn standbyNodeID(self: *const Server) []const u8 {
+    fn standbyNodeID(self: *const Server) ?[]const u8 {
         if (self.ctx.standby_node_id) |node_id| {
             if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) return node_id;
         }
-        return "standby";
+        return null;
     }
 };
 
@@ -1706,7 +1712,7 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
     defer primary.close();
     try primary.createSlot("primary-a", 0);
 
-    var server = Server.init(alloc, .{ .primary = &primary });
+    var server = Server.init(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" });
     defer server.deinit();
 
     var response = try server.handle(.{
@@ -2248,7 +2254,12 @@ test "storage.ha http admin serves typed base backup seed endpoints" {
     var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
     defer standby.close();
 
-    var server = Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    var server = Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    });
     defer server.deinit();
 
     var typed_begin = try server.handle(.{
@@ -2373,6 +2384,31 @@ test "storage.ha http admin returns route method and command errors" {
     defer unavailable.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), unavailable.status);
     try expectContains(unavailable.body, "PrimaryUnavailable");
+}
+
+test "storage.ha http admin requires node id before typed action receipts" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "missing-node-id");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+
+    var server = Server.init(alloc, .{ .primary = &primary });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_replication_slots,
+        .content_type = "application/json",
+        .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try expectContains(response.body, "PrimaryNodeIDUnavailable");
+    try std.testing.expect(primary.slot("standby-a") == null);
 }
 
 test "storage.ha http admin returns method errors for generated admin routes" {

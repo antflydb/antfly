@@ -734,7 +734,13 @@ test "storage.ha http client round trips admin commands" {
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
 
-    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby, .fence_store = &fence_store });
+    var server = http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+        .fence_store = &fence_store,
+    });
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
@@ -930,7 +936,7 @@ test "storage.ha http client round trips typed commit operations" {
     var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
     defer primary.close();
 
-    var server = http_admin.Server.init(alloc, .{ .primary = &primary });
+    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" });
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
@@ -993,7 +999,12 @@ test "storage.ha http client round trips typed gate operations" {
     var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
     defer standby.close();
 
-    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    var server = http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    });
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
@@ -1072,7 +1083,12 @@ test "storage.ha http client round trips typed seed operations" {
     var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
     defer standby.close();
 
-    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby });
+    var server = http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+    });
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
@@ -1168,7 +1184,9 @@ test "storage.ha http client round trips typed safety operations" {
 
     var server = http_admin.Server.init(alloc, .{
         .primary = &primary,
+        .primary_node_id = "primary-a",
         .standby = &standby,
+        .standby_node_id = "standby-a",
         .fence_store = &fence_store,
         .former_primary_log = &former_log,
     });
