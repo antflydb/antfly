@@ -1192,6 +1192,7 @@ pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     try validateManifest(manifest);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, try encodedManifestSize(manifest));
     try out.appendSlice(alloc, &manifest_magic);
     try appendU16(alloc, &out, version);
     try appendU32(alloc, &out, @intCast(manifest.segments.len));
@@ -1201,6 +1202,18 @@ pub fn encodeManifestAlloc(alloc: Allocator, manifest: Manifest) ![]u8 {
     }
     try appendU32(alloc, &out, manifestChecksum(out.items));
     return try out.toOwnedSlice(alloc);
+}
+
+fn encodedManifestSize(manifest: Manifest) !usize {
+    var total = std.math.add(usize, manifest_header_size, manifest_checksum_size) catch return error.PostingSegmentManifestTooLarge;
+    for (manifest.segments) |entry| {
+        total = std.math.add(usize, total, manifestEntryEncodedSize(entry)) catch return error.PostingSegmentManifestTooLarge;
+    }
+    return total;
+}
+
+fn manifestEntryEncodedSize(entry: ManifestEntry) usize {
+    return 8 * @sizeOf(u64) + 2 * @sizeOf(u32) + entry.path.len;
 }
 
 pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
