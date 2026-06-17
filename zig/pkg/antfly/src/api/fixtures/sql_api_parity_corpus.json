@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 843,
-  "entry_count": 843,
+  "source_entry_count": 847,
+  "entry_count": 847,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -7141,6 +7141,36 @@
       "sql": "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 RETURNING *"
     },
     {
+      "name": "temporal timestamp portion price update",
+      "family": "update_source",
+      "summary": {
+        "table_name": "products",
+        "predicates": 1,
+        "operations": 1,
+        "returning": 0,
+        "returning_all": true,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=1:temporal=1",
+      "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tsrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
+      "sql": "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMP '2025-02-01 12:30:00' TO TIMESTAMP '2025-02-02 15:45:00' SET price = 18.5 WHERE product_id = 1 RETURNING *"
+    },
+    {
+      "name": "temporal timestamptz portion price update",
+      "family": "update_source",
+      "summary": {
+        "table_name": "products",
+        "predicates": 1,
+        "operations": 1,
+        "returning": 0,
+        "returning_all": true,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=1:temporal=1",
+      "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tstzrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
+      "sql": "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-02-01T01:30:00+01:30' TO TIMESTAMPTZ '2025-02-02T02:45:00-05:00' SET price = 19.5 WHERE product_id = 1 RETURNING *"
+    },
+    {
       "name": "claimed cleanup delete",
       "family": "delete_source",
       "summary": {
@@ -7269,6 +7299,34 @@
       "plan": "delete_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
       "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
       "sql": "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 RETURNING *"
+    },
+    {
+      "name": "temporal timestamp portion price delete",
+      "family": "delete_source",
+      "summary": {
+        "table_name": "products",
+        "predicates": 1,
+        "returning": 0,
+        "returning_all": true,
+        "row_claim_skip_locked": false
+      },
+      "plan": "delete_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
+      "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tsrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
+      "sql": "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMP '2025-04-01 08:00:00' TO TIMESTAMP '2025-04-02 09:30:00' WHERE product_id = 2 RETURNING *"
+    },
+    {
+      "name": "temporal timestamptz portion price delete",
+      "family": "delete_source",
+      "summary": {
+        "table_name": "products",
+        "predicates": 1,
+        "returning": 0,
+        "returning_all": true,
+        "row_claim_skip_locked": false
+      },
+      "plan": "delete_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
+      "apply_setup_sql": ["CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tstzrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));"],
+      "sql": "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-04-01T08:00:00+02:00' TO TIMESTAMPTZ '2025-04-02T09:30:00-04:00' WHERE product_id = 2 RETURNING *"
     },
     {
       "name": "claimed cleanup delete alias qualified returning fields",

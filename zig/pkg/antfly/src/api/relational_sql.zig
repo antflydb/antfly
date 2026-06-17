@@ -75009,6 +75009,26 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 RETURNING *",
         },
         .{
+            .name = "temporal timestamp portion price update",
+            .family = .update_source,
+            .summary = .{ .table_name = "products", .predicates = 1, .operations = 1, .returning = 0, .returning_all = true, .row_claim_skip_locked = false },
+            .plan = "update_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=1:temporal=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tsrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
+            },
+            .sql = "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMP '2025-02-01 12:30:00' TO TIMESTAMP '2025-02-02 15:45:00' SET price = 18.5 WHERE product_id = 1 RETURNING *",
+        },
+        .{
+            .name = "temporal timestamptz portion price update",
+            .family = .update_source,
+            .summary = .{ .table_name = "products", .predicates = 1, .operations = 1, .returning = 0, .returning_all = true, .row_claim_skip_locked = false },
+            .plan = "update_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=0:returning_expr=0:returning_all=1:temporal=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tstzrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
+            },
+            .sql = "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-02-01T01:30:00+01:30' TO TIMESTAMPTZ '2025-02-02T02:45:00-05:00' SET price = 19.5 WHERE product_id = 1 RETURNING *",
+        },
+        .{
             .name = "claimed cleanup delete",
             .family = .delete_source,
             .summary = .{ .table_name = "usage_records", .predicates = 2, .order_by = 1, .limit = 10, .offset = 7, .returning = 1, .row_claim_skip_locked = false },
@@ -75079,6 +75099,26 @@ test "postgres sql adapter classifies application parity corpus" {
                 "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
             },
             .sql = "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 RETURNING *",
+        },
+        .{
+            .name = "temporal timestamp portion price delete",
+            .family = .delete_source,
+            .summary = .{ .table_name = "products", .predicates = 1, .returning = 0, .returning_all = true, .row_claim_skip_locked = false },
+            .plan = "delete_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tsrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
+            },
+            .sql = "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMP '2025-04-01 08:00:00' TO TIMESTAMP '2025-04-02 09:30:00' WHERE product_id = 2 RETURNING *",
+        },
+        .{
+            .name = "temporal timestamptz portion price delete",
+            .family = .delete_source,
+            .summary = .{ .table_name = "products", .predicates = 1, .returning = 0, .returning_all = true, .row_claim_skip_locked = false },
+            .plan = "delete_source:table=products:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=1:temporal=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE products (product_id int NOT NULL, product_name text NOT NULL, price numeric, valid_at tstzrange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
+            },
+            .sql = "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-04-01T08:00:00+02:00' TO TIMESTAMPTZ '2025-04-02T09:30:00-04:00' WHERE product_id = 2 RETURNING *",
         },
         .{
             .name = "claimed cleanup delete alias qualified returning fields",
@@ -79368,6 +79408,58 @@ test "postgres sql adapter lowers temporal portion mutation sources" {
     try std.testing.expectEqualStrings("1743465600000000000", range_delete.mutation.req.temporal_portion.?.from_json);
     try std.testing.expectEqualStrings("1746057600000000000", range_delete.mutation.req.temporal_portion.?.to_json);
     try std.testing.expect(range_delete.mutation.req.returning_all);
+
+    var timestamp_update = try lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMP '2025-02-01 12:30:00' TO TIMESTAMP '2025-02-02 15:45:00' SET price = 18.5 WHERE product_id = 1 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamp_update.deinit(alloc);
+    try std.testing.expect(timestamp_update.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamp_update.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1738413000000000000", timestamp_update.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1738511100000000000", timestamp_update.mutation.req.temporal_portion.?.to_json);
+
+    var timestamptz_update = try lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-02-01T01:30:00+01:30' TO TIMESTAMPTZ '2025-02-02T02:45:00-05:00' SET price = 19.5 WHERE product_id = 1 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamptz_update.deinit(alloc);
+    try std.testing.expect(timestamptz_update.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamptz_update.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1738368000000000000", timestamptz_update.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1738482300000000000", timestamptz_update.mutation.req.temporal_portion.?.to_json);
+
+    var timestamp_delete = try lowerDeleteMutationSourceAlloc(
+        alloc,
+        "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMP '2025-04-01 08:00:00' TO TIMESTAMP '2025-04-02 09:30:00' WHERE product_id = 2 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamp_delete.deinit(alloc);
+    try std.testing.expect(timestamp_delete.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamp_delete.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1743494400000000000", timestamp_delete.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1743586200000000000", timestamp_delete.mutation.req.temporal_portion.?.to_json);
+
+    var timestamptz_delete = try lowerDeleteMutationSourceAlloc(
+        alloc,
+        "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-04-01T08:00:00+02:00' TO TIMESTAMPTZ '2025-04-02T09:30:00-04:00' WHERE product_id = 2 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamptz_delete.deinit(alloc);
+    try std.testing.expect(timestamptz_delete.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamptz_delete.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1743487200000000000", timestamptz_delete.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1743600600000000000", timestamptz_delete.mutation.req.temporal_portion.?.to_json);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateMutationSourceAlloc(
         alloc,
