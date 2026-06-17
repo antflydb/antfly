@@ -1,0 +1,172 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the Elastic License 2.0 is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+// the Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Adapters from committed DB effects into the HA replication stream.
+//!
+//! The HA wire format is a stable replication envelope. Existing DB-specific
+//! effect encodings, such as the derived/change journal payload, are nested as
+//! payloads instead of becoming the HA record header itself.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const change_journal = @import("../db/derived/change_journal.zig");
+const primary_mod = @import("primary.zig");
+const replication_record = @import("replication_record.zig");
+
+var test_path_counter: u64 = 0;
+
+pub const AppendDerivedEffectOptions = struct {
+    shard_id: ?u64 = null,
+    table_id: ?u64 = null,
+    commit_timestamp_ns: i64 = 0,
+};
+
+pub fn appendDerivedChangeRecord(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    record: change_journal.Record,
+    options: AppendDerivedEffectOptions,
+) !u64 {
+    const payload = try change_journal.encodeRecord(alloc, record);
+    defer alloc.free(payload);
+
+    return try appendEncodedDerivedChangeRecord(primary, payload, options);
+}
+
+pub fn appendEncodedDerivedChangeRecord(
+    primary: *primary_mod.Primary,
+    encoded_change_record: []const u8,
+    options: AppendDerivedEffectOptions,
+) !u64 {
+    if (!change_journal.looksLikeBinaryRecord(encoded_change_record)) {
+        return error.UnsupportedDerivedEffectPayload;
+    }
+
+    return try primary.append(.{
+        .kind = .derived_effect,
+        .payload_codec = .binary,
+        .shard_id = options.shard_id,
+        .table_id = options.table_id,
+        .commit_timestamp_ns = options.commit_timestamp_ns,
+        .payload = encoded_change_record,
+    });
+}
+
+pub fn decodeDerivedChangeRecord(
+    alloc: Allocator,
+    record: replication_record.RecordView,
+) !change_journal.DecodedRecord {
+    if (record.kind != .derived_effect) return error.NotDerivedEffectRecord;
+    if (record.payload_codec != .binary) return error.UnsupportedDerivedEffectCodec;
+    return try change_journal.decodeRecord(alloc, record.payload);
+}
+
+fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
+    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
+    const raw = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/ha-effects-" ++ name ++ "-{d}-{d}",
+        .{ std.testing.random_seed, nonce },
+    );
+    defer alloc.free(raw);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
+    return try alloc.dupeZ(u8, raw);
+}
+
+test "storage.ha effects appends derived change journal payload as HA derived effect" {
+    const alloc = std.testing.allocator;
+    const log_path = try testPath(alloc, "log");
+    defer alloc.free(log_path);
+    const slots_path = try testPath(alloc, "slots");
+    defer alloc.free(slots_path);
+
+    var primary = try primary_mod.Primary.open(alloc, log_path.ptr, slots_path.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 7,
+        .table_id = 11,
+        .timeline_id = 3,
+        .epoch = 4,
+    }, .{});
+    defer primary.close();
+
+    const lsn = try appendDerivedChangeRecord(alloc, &primary, .{
+        .sequence = 42,
+        .changed_doc_keys = &.{"doc-a"},
+        .changed_artifact_keys = &.{"artifact-a"},
+        .target_hints = &.{ .dense_vector, .graph },
+    }, .{ .commit_timestamp_ns = 1234 });
+    try std.testing.expectEqual(@as(u64, 1), lsn);
+
+    var entry = (try primary.log.entryAt(alloc, lsn)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(replication_record.RecordKind.derived_effect, entry.record.kind);
+    try std.testing.expectEqual(replication_record.PayloadCodec.binary, entry.record.payload_codec);
+    try std.testing.expectEqual(@as(u64, 100), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 7), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
+    try std.testing.expectEqual(@as(i64, 1234), entry.record.commit_timestamp_ns);
+
+    var decoded = try decodeDerivedChangeRecord(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 42), decoded.record.sequence);
+    try std.testing.expectEqualStrings("doc-a", decoded.record.changed_doc_keys[0]);
+    try std.testing.expectEqualStrings("artifact-a", decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.target_hints.len);
+    try std.testing.expectEqual(change_journal.TargetHint.dense_vector, decoded.record.target_hints[0]);
+    try std.testing.expectEqual(change_journal.TargetHint.graph, decoded.record.target_hints[1]);
+}
+
+test "storage.ha effects rejects non-derived HA records when decoding derived payloads" {
+    const record = replication_record.Record{
+        .kind = .batch_mutation,
+        .payload_codec = .binary,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "",
+    };
+    try std.testing.expectError(
+        error.NotDerivedEffectRecord,
+        decodeDerivedChangeRecord(std.testing.allocator, record),
+    );
+}
+
+test "storage.ha effects rejects non-binary encoded change records before append" {
+    var primary: primary_mod.Primary = undefined;
+    try std.testing.expectError(
+        error.UnsupportedDerivedEffectPayload,
+        appendEncodedDerivedChangeRecord(&primary, "{}", .{}),
+    );
+}
+
+test "storage.ha effects rejects unsupported derived effect payload codecs" {
+    const record = replication_record.Record{
+        .kind = .derived_effect,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "{}",
+    };
+    try std.testing.expectError(
+        error.UnsupportedDerivedEffectCodec,
+        decodeDerivedChangeRecord(std.testing.allocator, record),
+    );
+}

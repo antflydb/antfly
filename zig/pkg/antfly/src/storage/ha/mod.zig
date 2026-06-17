@@ -35,6 +35,7 @@ pub const chaos = @import("chaos.zig");
 pub const metrics = @import("metrics.zig");
 pub const admin_cli = @import("admin_cli.zig");
 pub const compat = @import("compat.zig");
+pub const effects = @import("effects.zig");
 pub const http_admin = @import("http_admin.zig");
 pub const http_internal = @import("http_internal.zig");
 pub const http_replication_client = @import("http_replication_client.zig");
@@ -64,6 +65,7 @@ test {
     _ = metrics;
     _ = admin_cli;
     _ = compat;
+    _ = effects;
     _ = http_admin;
     _ = http_internal;
     _ = http_replication_client;
