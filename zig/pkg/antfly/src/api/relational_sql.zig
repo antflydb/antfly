@@ -10690,8 +10690,8 @@ const Parser = struct {
                 if (!querySupportsSimpleUnionRewrite(rhs)) return error.UnsupportedSqlShape;
             },
             .intersect, .except => {
-                if (!querySupportsSimpleIntersectExceptRewrite(lhs, op)) return error.UnsupportedSqlShape;
-                if (!querySupportsSimpleIntersectExceptRewrite(rhs, op)) return error.UnsupportedSqlShape;
+                if (!querySupportsSimpleIntersectExceptRewrite(lhs)) return error.UnsupportedSqlShape;
+                if (!querySupportsSimpleIntersectExceptRewrite(rhs)) return error.UnsupportedSqlShape;
                 if (op == .intersect and
                     (lhs.expression_or_predicates.len > 0 or rhs.expression_or_predicates.len > 0) and
                     (lhs.in_predicates.len > 0 or rhs.in_predicates.len > 0))
@@ -43398,10 +43398,7 @@ fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryReques
     return true;
 }
 
-fn querySupportsSimpleIntersectExceptRewrite(
-    query: db_mod.types.RelationalRowsQueryRequest,
-    op: SelectSetOperation,
-) bool {
+fn querySupportsSimpleIntersectExceptRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
     if (!queryHasOnlySimpleIntersectExceptPredicateSurface(query)) return false;
     if (query.expression_or_predicates.len != 0) {
         if (query.predicates.len != 0 or query.or_predicates.len != 0 or query.in_predicates.len != 0 or query.expression_predicates.len != 0) return false;
@@ -43411,7 +43408,6 @@ fn querySupportsSimpleIntersectExceptRewrite(
     {
         return false;
     }
-    if (query.in_predicates.len != 0 and query.expression_predicates.len != 0 and op != .except) return false;
     return true;
 }
 
@@ -74173,6 +74169,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
         },
         .{
+            .name = "query intersect scalar in expression set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .expression_predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
             .name = "query intersect scalar or set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .select = 1 },
@@ -74507,6 +74510,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "read intersect scalar in expression set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .expression_predicates = 1, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
         },
         .{
             .name = "read intersect scalar or set operation",
@@ -82821,6 +82831,21 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(@as(usize, 1), in_intersect.query.predicates.len);
     try std.testing.expectEqualStrings("[\"open\",\"pending\"]", in_intersect.query.in_predicates[0].values_json);
     try std.testing.expectEqualStrings("enabled", in_intersect.query.predicates[0].field);
+
+    var in_expression_intersect = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_expression_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_intersect.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_intersect.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_intersect.query.predicates.len);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", in_expression_intersect.query.in_predicates[0].values_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_intersect.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_intersect.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", in_expression_intersect.query.predicates[0].field);
 
     var or_intersect = try lowerSelectAlloc(
         alloc,
