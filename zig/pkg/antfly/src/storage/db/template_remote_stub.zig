@@ -26,9 +26,11 @@ pub const RenderError = error{
 
 pub const RenderConfig = struct {};
 
+pub const default_remote_fetch_max_download_size_bytes: u64 = 4 << 20;
+
 const remote_fetch_security = scraping.ContentSecurityConfig{
     .block_private_ips = true,
-    .max_download_size_bytes = 4 << 20,
+    .max_download_size_bytes = default_remote_fetch_max_download_size_bytes,
 };
 
 pub const RenderJsonToTextFn = *const fn (

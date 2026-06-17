@@ -30,9 +30,9 @@ fi
 
 # Build the example
 echo -e "${GREEN}Building docsaf...${NC}"
-cd ../..
-go build -o examples/docsaf/docsaf ./examples/docsaf
-cd examples/docsaf
+cd ../../go/pkg/docsaf
+go build -o ../../../examples/docsaf/docsaf ./cmd/docsaf
+cd ../../../examples/docsaf
 
 echo -e "${GREEN}✓ Build complete${NC}"
 echo ""
