@@ -343,6 +343,7 @@ pub const Primary = struct {
             };
         }
         if (policy.required == 0) return error.InvalidSyncPolicy;
+        if (policy.selection != .all and policy.required > policy.standby_names.len) return error.InvalidSyncPolicy;
         if (policy.standby_names.len == 0) return decisionForUnsatisfied(target_lsn, policy, 0, policy.required, 0);
 
         const counts = switch (policy.selection) {
@@ -1170,6 +1171,40 @@ test "storage.ha primary first priority policy waits for the first eligible stan
     try std.testing.expectEqual(DurabilityStatus.satisfied, decision.status);
     try std.testing.expectEqual(@as(usize, 1), decision.candidate_count);
     try std.testing.expectEqual(@as(usize, 1), decision.satisfied_count);
+}
+
+test "storage.ha primary rejects impossible named synchronous quorum policies" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-sync-quorum");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+
+    const names = [_][]const u8{"standby-a"};
+    try std.testing.expectError(error.InvalidSyncPolicy, primary.evaluateDurability(1, .{
+        .mode = .remote_write,
+        .selection = .any,
+        .required = 2,
+        .standby_names = &names,
+    }));
+    try std.testing.expectError(error.InvalidSyncPolicy, primary.evaluateDurability(1, .{
+        .mode = .remote_apply,
+        .selection = .first,
+        .required = 2,
+        .standby_names = &names,
+    }));
+
+    const all_decision = try primary.evaluateDurability(1, .{
+        .mode = .remote_apply,
+        .selection = .all,
+        .required = 2,
+        .standby_names = &names,
+    });
+    try std.testing.expectEqual(@as(usize, 1), all_decision.required_count);
 }
 
 test "storage.ha primary refuses streaming from reseed or expired slots" {

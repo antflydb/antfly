@@ -2209,6 +2209,16 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(inactive_stream.body, "SlotInactive");
     try primary.resumeSlot("standby-a");
 
+    var invalid_sync_policy = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_commit_check,
+        .content_type = "application/json",
+        .body = "{\"target_lsn\":1,\"sync_policy\":{\"mode\":\"remote_write\",\"selection\":\"any\",\"required\":2,\"standby_names\":[\"standby-a\"]}}",
+    });
+    defer invalid_sync_policy.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_sync_policy.status);
+    try expectContains(invalid_sync_policy.body, "InvalidSyncPolicy");
+
     var fail_closed_append = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_commit_append,
