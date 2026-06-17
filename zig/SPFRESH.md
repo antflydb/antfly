@@ -100,7 +100,9 @@ Current status:
   instead of reallocating one record at a time. Cached sorted replay now also
   converts its buffered compact records into the overlay plan when that cap is
   exceeded and continues from the current record, avoiding a full replay
-  restart on large cached tails.
+  restart on large cached tails. Sorted replay and compact base materialization
+  size temporary output buffers from deduped live operations rather than raw
+  tail length, so tombstone-heavy tails do not inflate scratch allocation.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full

@@ -687,7 +687,7 @@ pub const PostingFormat = struct {
     ) !usize {
         var base_iter = try BaseMemberIterator.init(base_data);
         stableSortCompactDeltaRecordsByVector(scratch);
-        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + scratch.compactDeltaRecordCount());
+        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + dedupedLiveSortedCompactDeltaRecordCount(scratch));
         const out = scratch.member_ids;
         var out_count: usize = 0;
         var maybe_base = try base_iter.next();
@@ -748,7 +748,7 @@ pub const PostingFormat = struct {
         ops: []PostingDeltaOp,
     ) !usize {
         stableSortCompactOpsByVector(ids, ops);
-        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + ids.len);
+        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + dedupedLiveSortedCompactOpCount(ids, ops));
         const base_members = scratch.member_ids[0..base_member_count];
         const out = overlayAppendedIds(scratch);
         var out_count: usize = 0;
@@ -790,7 +790,7 @@ pub const PostingFormat = struct {
         records: []PostingDeltaRecord,
     ) !usize {
         stableSortDeltaRecordsByVector(records);
-        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + records.len);
+        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + dedupedLiveSortedDeltaRecordCount(records));
         const base_members = scratch.member_ids[0..base_member_count];
         const out = overlayAppendedIds(scratch);
         var out_count: usize = 0;
@@ -823,6 +823,51 @@ pub const PostingFormat = struct {
         try scratch.ensureMemberIdCapacity(alloc, out_count);
         @memcpy(scratch.member_ids[0..out_count], out[0..out_count]);
         return out_count;
+    }
+
+    fn dedupedLiveSortedCompactDeltaRecordCount(scratch: anytype) usize {
+        var count: usize = 0;
+        var index: usize = 0;
+        while (index < scratch.compact_delta_count) {
+            const vector_id = scratch.compact_delta_ids[index];
+            var last_op = scratch.compact_delta_ops[index];
+            index += 1;
+            while (index < scratch.compact_delta_count and scratch.compact_delta_ids[index] == vector_id) : (index += 1) {
+                last_op = scratch.compact_delta_ops[index];
+            }
+            if (last_op != .tombstone) count += 1;
+        }
+        return count;
+    }
+
+    fn dedupedLiveSortedCompactOpCount(ids: []const VectorId, ops: []const PostingDeltaOp) usize {
+        var count: usize = 0;
+        var index: usize = 0;
+        while (index < ids.len) {
+            const vector_id = ids[index];
+            var last_op = ops[index];
+            index += 1;
+            while (index < ids.len and ids[index] == vector_id) : (index += 1) {
+                last_op = ops[index];
+            }
+            if (last_op != .tombstone) count += 1;
+        }
+        return count;
+    }
+
+    fn dedupedLiveSortedDeltaRecordCount(records: []const PostingDeltaRecord) usize {
+        var count: usize = 0;
+        var index: usize = 0;
+        while (index < records.len) {
+            const vector_id = records[index].vector_id;
+            var last_op = records[index].op;
+            index += 1;
+            while (index < records.len and records[index].vector_id == vector_id) : (index += 1) {
+                last_op = records[index].op;
+            }
+            if (last_op != .tombstone) count += 1;
+        }
+        return count;
     }
 
     pub fn stableSortCompactOpsByVector(ids: []VectorId, ops: []PostingDeltaOp) void {
@@ -2691,7 +2736,7 @@ pub const PostingStore = struct {
     ) !usize {
         var base_iter = try PostingFormat.BaseMemberIterator.init(base_data);
         stableSortCompactDeltaRecordsByVector(scratch);
-        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + scratch.compactDeltaRecordCount());
+        try scratch.ensureMemberIdCapacity(alloc, base_iter.memberCount() + PostingFormat.dedupedLiveSortedCompactDeltaRecordCount(scratch));
         const out = scratch.member_ids;
         var out_count: usize = 0;
         var maybe_base = try base_iter.next();
@@ -3148,7 +3193,7 @@ pub const PostingStore = struct {
         ops: []PostingDeltaOp,
     ) !usize {
         stableSortCompactOpsByVector(ids, ops);
-        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + ids.len);
+        try scratch.ensurePostingOverlayAppendCapacity(alloc, base_member_count + PostingFormat.dedupedLiveSortedCompactOpCount(ids, ops));
         const base_members = scratch.member_ids[0..base_member_count];
         const out = PostingFormat.overlayAppendedIds(scratch);
         var out_count: usize = 0;
@@ -6299,6 +6344,75 @@ test "posting store canonical query replay uses sorted scratch records for mediu
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_removed_members.count());
     try std.testing.expectEqual(@as(usize, 0), scratch.posting_overlay_appended_positions.count());
     try std.testing.expectEqual(@as(u64, records.len), profile.posting_delta_replay_records);
+}
+
+test "posting sorted delta replay sizes output scratch by deduped live records" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30, 40 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+
+    var records = [_]PostingDeltaRecord{
+        .{ .sequence = 1, .op = .insert, .vector_id = 100 },
+        .{ .sequence = 2, .op = .tombstone, .vector_id = 100 },
+        .{ .sequence = 3, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = 4, .op = .tombstone, .vector_id = 999 },
+    };
+
+    const out_count = try PostingFormat.applySortedDeltaRecordsToSortedScratch(alloc, &scratch, base_members.len, records[0..]);
+
+    const expected = [_]VectorId{ 10, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqual(@as(usize, base_members.len), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting sorted compact op replay sizes output scratch by deduped live ops" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30, 40 };
+    try scratch.ensureMemberIdCapacity(alloc, base_members.len);
+    @memcpy(scratch.member_ids[0..base_members.len], base_members[0..]);
+
+    var ids = [_]VectorId{ 100, 100, 20, 999 };
+    var ops = [_]PostingDeltaOp{ .insert, .tombstone, .tombstone, .tombstone };
+
+    const out_count = try PostingStore.applySortedCompactOpsToSortedScratch(alloc, &scratch, base_members.len, ids[0..], ops[0..]);
+
+    const expected = [_]VectorId{ 10, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqual(@as(usize, base_members.len), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
+}
+
+test "posting compact base materialization sizes output scratch by deduped live ops" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const base_members = [_]VectorId{ 10, 20, 30, 40 };
+    const encoded_len = try PostingFormat.encodedBaseSizeForMembers(base_members[0..]);
+    const base_data_buf = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(base_data_buf);
+    const base_data = try PostingFormat.encodeBaseMembersInto(base_data_buf, 9, 1, base_members[0..]);
+
+    try scratch.ensureCompactDeltaCapacity(alloc, 4);
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 1, .op = .insert, .vector_id = 100 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 2, .op = .tombstone, .vector_id = 100 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 3, .op = .tombstone, .vector_id = 20 });
+    scratch.appendCompactDeltaRecordAssumeCapacity(.{ .sequence = 4, .op = .tombstone, .vector_id = 999 });
+
+    const out_count = try PostingStore.materializeSortedBaseWithCompactDeltaRecords(alloc, &scratch, base_data);
+
+    const expected = [_]VectorId{ 10, 30, 40 };
+    try std.testing.expectEqual(@as(usize, expected.len), out_count);
+    try std.testing.expectEqual(@as(usize, base_members.len), scratch.member_ids.len);
+    try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
 }
 
 test "posting store cached sorted replay continues with overlay plan after compact threshold" {
