@@ -2874,11 +2874,18 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	_, ok = parseHADirectAdminActionResult([]byte(`{"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
 	g.Expect(ok).To(BeFalse())
 
-	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
+	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(finish.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
+	g.Expect(finish.ActionKind).To(Equal("base_backup_finish"))
+	g.Expect(finish.ActionTarget).To(Equal("base-standby-a-5"))
+	g.Expect(finish.ActionState).To(Equal("applied"))
 	g.Expect(finish.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(finish.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
+	g.Expect(ok).To(BeFalse())
 
 	legacyFinish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"seed_finish":{"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}}}`))
 	g.Expect(ok).To(BeTrue())
@@ -2887,11 +2894,15 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(legacyFinish.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(legacyFinish.EndRecordLSN).To(Equal(uint64(8)))
 
-	bootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
+	bootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(bootstrap.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
 	g.Expect(bootstrap.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(bootstrap.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(bootstrap.CheckpointLSN).To(Equal(uint64(7)))
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
+	g.Expect(ok).To(BeFalse())
 
 	legacyBootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"seed_bootstrap":{"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}}}`))
 	g.Expect(ok).To(BeTrue())
@@ -2900,10 +2911,14 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(legacyBootstrap.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(legacyBootstrap.CheckpointLSN).To(Equal(uint64(7)))
 
-	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
+	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"replication_slot_pause:standby-a","action_kind":"replication_slot_pause","target":"standby-a","state":"applied"},"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(slot.ActionID).To(Equal("replication_slot_pause:standby-a"))
 	g.Expect(slot.SlotAction).To(Equal("pause"))
 	g.Expect(slot.SlotName).To(Equal("standby-a"))
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
+	g.Expect(ok).To(BeFalse())
 
 	fence, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"fence_acquire":{"receipt":{"generation":3,"token":"legacy-token"}}}}`))
 	g.Expect(ok).To(BeTrue())

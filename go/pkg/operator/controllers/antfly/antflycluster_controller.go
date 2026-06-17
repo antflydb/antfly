@@ -3826,8 +3826,9 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 	if err := json.Unmarshal(raw, &direct); err != nil {
 		return nil, false
 	}
+	topLevel := haDirectAdminActionResultHasCorrelationFields(direct)
 	result := &direct
-	if !haDirectAdminActionResultHasCorrelationFields(direct) {
+	if !topLevel {
 		var envelope haDirectAdminActionResultEnvelope
 		if err := json.Unmarshal(raw, &envelope); err != nil {
 			return nil, false
@@ -3851,6 +3852,9 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		}
 	}
 	if result.SchemaVersion == 0 {
+		return nil, false
+	}
+	if topLevel && !haAdminActionReceiptPresent(result.Action) {
 		return nil, false
 	}
 	status := &antflyv1.HAAdminActionResultStatus{
