@@ -2459,6 +2459,82 @@ func TestParseHARejoinJobResult(t *testing.T) {
 	g.Expect(result.RetainedFromLSN).To(Equal(uint64(8)))
 	g.Expect(result.DataLossDiscarded).To(BeTrue())
 
+	rewindExecuted, ok := parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_rewind",
+		"assessment.action=rewind",
+		"assessment.reason=parent_timeline_retained",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=8",
+		"assessment.data_loss_discarded=true",
+		"rewind.fork_lsn=12",
+		"rewind.previous_last_lsn=13",
+		"rewind.current_last_lsn=12",
+		"rewind.next_lsn=13",
+		"rewind.discarded_lsn_count=1",
+		"rewind.target_timeline_id=5",
+		"rewind.target_epoch=7",
+		"rewind.data_loss_discarded=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(rewindExecuted.Action).To(Equal("rewind"))
+	g.Expect(rewindExecuted.RewindExecuted).To(BeTrue())
+	g.Expect(rewindExecuted.RewindPreviousLastLSN).To(Equal(uint64(13)))
+	g.Expect(rewindExecuted.RewindCurrentLastLSN).To(Equal(uint64(12)))
+	g.Expect(rewindExecuted.RewindNextLSN).To(Equal(uint64(13)))
+	g.Expect(rewindExecuted.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+
+	adminResult, ok := parseHAAdminActionResultTable(strings.Join([]string{
+		"result=rejoin_rewind",
+		"assessment.action=rewind",
+		"assessment.reason=parent_timeline_retained",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=8",
+		"assessment.data_loss_discarded=true",
+		"rewind.fork_lsn=12",
+		"rewind.previous_last_lsn=13",
+		"rewind.current_last_lsn=12",
+		"rewind.next_lsn=13",
+		"rewind.discarded_lsn_count=1",
+		"rewind.target_timeline_id=5",
+		"rewind.target_epoch=7",
+		"rewind.data_loss_discarded=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(adminResult.RejoinAction).To(Equal("rewind"))
+	g.Expect(adminResult.RewindExecuted).To(BeTrue())
+	g.Expect(adminResult.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+
+	_, ok = parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_rewind",
+		"assessment.action=rewind",
+		"assessment.reason=parent_timeline_retained",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=8",
+		"rewind.fork_lsn=11",
+		"rewind.previous_last_lsn=13",
+		"rewind.current_last_lsn=11",
+		"rewind.next_lsn=12",
+		"rewind.discarded_lsn_count=2",
+		"rewind.target_timeline_id=5",
+		"rewind.target_epoch=7",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeFalse())
+
 	former := &antflyv1.HAFormerPrimaryStatus{}
 	applyHARejoinJobResult(former, result)
 	g.Expect(former.NodeID).To(Equal("primary-a"))
@@ -2485,6 +2561,78 @@ func TestParseHARejoinJobResult(t *testing.T) {
 	g.Expect(former.ReseedRequired).To(BeTrue())
 	g.Expect(former.Diverged).To(BeTrue())
 	g.Expect(former.Reason).To(Equal("parent_timeline_wal_expired"))
+
+	reseedExecuted, ok := parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_reseed",
+		"assessment.action=reseed",
+		"assessment.reason=parent_timeline_wal_expired",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=14",
+		"assessment.data_loss_discarded=false",
+		"reseed.slot_name=primary-a",
+		"reseed.target_timeline_id=5",
+		"reseed.target_epoch=7",
+		"reseed.fork_lsn=12",
+		"reseed.former_last_lsn=13",
+		"reseed.reseed_required=true",
+		"reseed.base_backup_required=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(reseedExecuted.Action).To(Equal("reseed"))
+	g.Expect(reseedExecuted.ReseedExecuted).To(BeTrue())
+	g.Expect(reseedExecuted.ReseedSlotName).To(Equal("primary-a"))
+	g.Expect(reseedExecuted.ReseedRequired).To(BeTrue())
+	g.Expect(reseedExecuted.ReseedBaseBackupRequired).To(BeTrue())
+
+	adminResult, ok = parseHAAdminActionResultTable(strings.Join([]string{
+		"result=rejoin_reseed",
+		"assessment.action=reseed",
+		"assessment.reason=parent_timeline_wal_expired",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=14",
+		"reseed.slot_name=primary-a",
+		"reseed.target_timeline_id=5",
+		"reseed.target_epoch=7",
+		"reseed.fork_lsn=12",
+		"reseed.former_last_lsn=13",
+		"reseed.reseed_required=true",
+		"reseed.base_backup_required=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(adminResult.RejoinAction).To(Equal("reseed"))
+	g.Expect(adminResult.ReseedExecuted).To(BeTrue())
+	g.Expect(adminResult.ReseedSlotName).To(Equal("primary-a"))
+
+	_, ok = parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_reseed",
+		"assessment.action=reseed",
+		"assessment.reason=parent_timeline_wal_expired",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=14",
+		"reseed.slot_name=other",
+		"reseed.target_timeline_id=5",
+		"reseed.target_epoch=7",
+		"reseed.fork_lsn=12",
+		"reseed.former_last_lsn=13",
+		"reseed.reseed_required=true",
+		"reseed.base_backup_required=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeFalse())
 }
 
 func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {

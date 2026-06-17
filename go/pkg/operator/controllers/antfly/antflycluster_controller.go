@@ -3925,7 +3925,7 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 	if result.FenceGeneration == 0 {
 		result.FenceGeneration, _ = parseHAResultUint(lines, "fence_generation")
 	}
-	if resultName == "rejoin_assess" {
+	if strings.HasPrefix(resultName, "rejoin_") {
 		rejoin, ok := parseHARejoinJobResult(body)
 		if !ok {
 			return nil, false
@@ -4467,34 +4467,116 @@ type haRejoinJobResult struct {
 
 func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 	lines := parseHATableLines(body)
-	if lines["result"] != "rejoin_assess" {
+	resultName := strings.TrimSpace(lines["result"])
+	var assessmentPrefix string
+	switch resultName {
+	case "rejoin_assess":
+		assessmentPrefix = ""
+	case "rejoin_rewind", "rejoin_reseed":
+		assessmentPrefix = "assessment."
+	default:
 		return haRejoinJobResult{}, false
 	}
 	result := haRejoinJobResult{
-		Action:       strings.TrimSpace(lines["action"]),
-		Reason:       strings.TrimSpace(lines["reason"]),
-		FormerNodeID: strings.TrimSpace(lines["former_node_id"]),
+		Action:       strings.TrimSpace(lines[assessmentPrefix+"action"]),
+		Reason:       strings.TrimSpace(lines[assessmentPrefix+"reason"]),
+		FormerNodeID: strings.TrimSpace(lines[assessmentPrefix+"former_node_id"]),
 	}
 	if result.Action == "" || result.FormerNodeID == "" {
 		return haRejoinJobResult{}, false
 	}
 	var ok bool
-	if result.TargetTimelineID, ok = parseHAResultUint(lines, "target_timeline_id"); !ok {
+	if result.TargetTimelineID, ok = parseHAResultUint(lines, assessmentPrefix+"target_timeline_id"); !ok {
 		return haRejoinJobResult{}, false
 	}
-	if result.TargetEpoch, ok = parseHAResultUint(lines, "target_epoch"); !ok {
+	if result.TargetEpoch, ok = parseHAResultUint(lines, assessmentPrefix+"target_epoch"); !ok {
 		return haRejoinJobResult{}, false
 	}
-	if result.ForkLSN, ok = parseHAResultUint(lines, "fork_lsn"); !ok {
+	if result.ForkLSN, ok = parseHAResultUint(lines, assessmentPrefix+"fork_lsn"); !ok {
 		return haRejoinJobResult{}, false
 	}
-	if result.FormerLastLSN, ok = parseHAResultUint(lines, "former_last_lsn"); !ok {
+	if result.FormerLastLSN, ok = parseHAResultUint(lines, assessmentPrefix+"former_last_lsn"); !ok {
 		return haRejoinJobResult{}, false
 	}
-	if result.RetainedFromLSN, ok = parseHAResultUint(lines, "retained_from_lsn"); !ok {
+	if result.RetainedFromLSN, ok = parseHAResultUint(lines, assessmentPrefix+"retained_from_lsn"); !ok {
 		return haRejoinJobResult{}, false
 	}
-	result.DataLossDiscarded, _ = parseHAResultBool(lines, "data_loss_discarded")
+	result.DataLossDiscarded, _ = parseHAResultBool(lines, assessmentPrefix+"data_loss_discarded")
+	switch resultName {
+	case "rejoin_rewind":
+		if strings.TrimSpace(result.Action) != "rewind" {
+			return haRejoinJobResult{}, false
+		}
+		rewindForkLSN, ok := parseHAResultUint(lines, "rewind.fork_lsn")
+		if !ok || rewindForkLSN != result.ForkLSN {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindPreviousLastLSN, ok = parseHAResultUint(lines, "rewind.previous_last_lsn"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindCurrentLastLSN, ok = parseHAResultUint(lines, "rewind.current_last_lsn"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindNextLSN, ok = parseHAResultUint(lines, "rewind.next_lsn"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindDiscardedLSNCount, ok = parseHAResultUint(lines, "rewind.discarded_lsn_count"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		rewindTargetTimelineID, ok := parseHAResultUint(lines, "rewind.target_timeline_id")
+		if !ok || rewindTargetTimelineID != result.TargetTimelineID {
+			return haRejoinJobResult{}, false
+		}
+		rewindTargetEpoch, ok := parseHAResultUint(lines, "rewind.target_epoch")
+		if !ok || rewindTargetEpoch != result.TargetEpoch {
+			return haRejoinJobResult{}, false
+		}
+		rewindDataLossDiscarded, _ := parseHAResultBool(lines, "rewind.data_loss_discarded")
+		if result.RewindPreviousLastLSN != result.FormerLastLSN ||
+			result.RewindCurrentLastLSN != result.ForkLSN ||
+			result.RewindPreviousLastLSN < result.RewindCurrentLastLSN ||
+			result.RewindCurrentLastLSN == ^uint64(0) ||
+			result.RewindNextLSN != result.RewindCurrentLastLSN+1 ||
+			result.RewindDiscardedLSNCount != result.RewindPreviousLastLSN-result.RewindCurrentLastLSN {
+			return haRejoinJobResult{}, false
+		}
+		result.RewindExecuted = true
+		result.DataLossDiscarded = result.DataLossDiscarded || rewindDataLossDiscarded
+	case "rejoin_reseed":
+		if strings.TrimSpace(result.Action) != "reseed" {
+			return haRejoinJobResult{}, false
+		}
+		result.ReseedSlotName = strings.TrimSpace(lines["reseed.slot_name"])
+		reseedTargetTimelineID, ok := parseHAResultUint(lines, "reseed.target_timeline_id")
+		if !ok || reseedTargetTimelineID != result.TargetTimelineID {
+			return haRejoinJobResult{}, false
+		}
+		reseedTargetEpoch, ok := parseHAResultUint(lines, "reseed.target_epoch")
+		if !ok || reseedTargetEpoch != result.TargetEpoch {
+			return haRejoinJobResult{}, false
+		}
+		reseedForkLSN, ok := parseHAResultUint(lines, "reseed.fork_lsn")
+		if !ok || reseedForkLSN != result.ForkLSN {
+			return haRejoinJobResult{}, false
+		}
+		reseedFormerLastLSN, ok := parseHAResultUint(lines, "reseed.former_last_lsn")
+		if !ok || reseedFormerLastLSN != result.FormerLastLSN {
+			return haRejoinJobResult{}, false
+		}
+		if result.ReseedRequired, ok = parseHAResultBool(lines, "reseed.reseed_required"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.ReseedBaseBackupRequired, ok = parseHAResultBool(lines, "reseed.base_backup_required"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.ReseedSlotName == "" ||
+			result.ReseedSlotName != strings.TrimSpace(result.FormerNodeID) ||
+			!result.ReseedRequired ||
+			!result.ReseedBaseBackupRequired {
+			return haRejoinJobResult{}, false
+		}
+		result.ReseedExecuted = true
+	}
 	return result, true
 }
 
