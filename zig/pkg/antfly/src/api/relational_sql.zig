@@ -11045,7 +11045,7 @@ const Parser = struct {
             return;
         }
         if (rhs.expression_or_predicates.len > 0) {
-            const groups = try cloneExpressionPredicateGroupsAlloc(self.alloc, rhs.expression_or_predicates);
+            const groups = try cloneSimpleExpressionSetQueryBranchesAlloc(self.alloc, rhs);
             freeExpressionPredicateGroups(self.alloc, lhs.query.expression_not_predicates);
             if (lhs.query.expression_not_predicates.len > 0) self.alloc.free(lhs.query.expression_not_predicates);
             lhs.query.expression_not_predicates = groups;
@@ -43457,7 +43457,7 @@ fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryReques
     }
     if (query.in_predicates.len > 0 and query.or_predicates.len > 0) return false;
     if (query.expression_or_predicates.len != 0) {
-        if (query.in_predicates.len == 0 and (query.predicates.len != 0 or query.expression_predicates.len != 0)) return false;
+        if (query.or_predicates.len != 0) return false;
     }
     return true;
 }
@@ -43466,7 +43466,6 @@ fn querySupportsSimpleIntersectExceptRewrite(query: db_mod.types.RelationalRowsQ
     if (!queryHasOnlySimpleIntersectExceptPredicateSurface(query)) return false;
     if (query.expression_or_predicates.len != 0) {
         if (query.or_predicates.len != 0) return false;
-        if (query.in_predicates.len == 0 and (query.predicates.len != 0 or query.expression_predicates.len != 0)) return false;
     }
     if (query.or_predicates.len != 0 and
         (query.predicates.len != 0 or query.in_predicates.len != 0 or query.expression_predicates.len != 0))
@@ -44345,7 +44344,12 @@ fn expressionConditionsFromSimpleExpressionSetQueryBranchAlloc(
 ) ![]const db_mod.types.RelationalRowsExpressionCondition {
     if (query.expression_or_predicates.len > 0) {
         if (index >= query.expression_or_predicates.len) return error.UnsupportedSqlShape;
-        return try cloneExpressionConditionsAlloc(alloc, query.expression_or_predicates[index].conditions);
+        const base_conditions = try expressionConditionsFromSimpleSetQueryAlloc(alloc, query);
+        defer {
+            freeExpressionConditions(alloc, base_conditions);
+            if (base_conditions.len > 0) alloc.free(base_conditions);
+        }
+        return try cloneExpressionConditionsConcatAlloc(alloc, base_conditions, query.expression_or_predicates[index].conditions);
     }
     if (query.or_predicates.len > 0) {
         if (index >= query.or_predicates.len) return error.UnsupportedSqlShape;
@@ -74352,6 +74356,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
         },
         .{
+            .name = "query union all mixed expression or disjoint set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        },
+        .{
             .name = "query union scalar in set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
@@ -74378,6 +74389,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
             .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
             .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "query union mixed expression or set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
         },
         .{
             .name = "query intersect scalar in set operation",
@@ -74415,6 +74433,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'",
         },
         .{
+            .name = "query intersect mixed expression or set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending')",
+        },
+        .{
             .name = "query except scalar in set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .access_not_predicates = 1, .select = 1 },
@@ -74434,6 +74459,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_or_predicates = 1, .expression_not_predicates = 2, .select = 1 },
             .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=1:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'",
+        },
+        .{
+            .name = "query except mixed expression or set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_not_predicates = 2, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
         },
         .{
             .name = "query except scalar in expression set operation",
@@ -74758,6 +74790,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
         },
         .{
+            .name = "read union all mixed expression or disjoint set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        },
+        .{
             .name = "read union scalar in set operation",
             .family = .read,
             .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
@@ -74784,6 +74823,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
             .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "read union mixed expression or set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
         },
         .{
             .name = "read intersect scalar in set operation",
@@ -74821,6 +74867,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'",
         },
         .{
+            .name = "read intersect mixed expression or set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending')",
+        },
+        .{
             .name = "read except scalar in set operation",
             .family = .read,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .access_not_predicates = 1, .select = 1 },
@@ -74840,6 +74893,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_or_predicates = 1, .expression_not_predicates = 2, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=1:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'",
+        },
+        .{
+            .name = "read except mixed expression or set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_not_predicates = 2, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
         },
         .{
             .name = "read except scalar in expression set operation",
@@ -83176,6 +83236,25 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("\"pending\"", disjoint_expression_or_union.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
     try std.testing.expectEqualStrings("\"closed\"", disjoint_expression_or_union.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
 
+    var disjoint_mixed_expression_or_union = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_mixed_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_mixed_expression_or_union.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_mixed_expression_or_union.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_mixed_expression_or_union.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", disjoint_mixed_expression_or_union.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"active\"", disjoint_mixed_expression_or_union.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_mixed_expression_or_union.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_mixed_expression_or_union.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_mixed_expression_or_union.query.expression_or_predicates[1].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_mixed_expression_or_union.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_mixed_expression_or_union.query.expression_or_predicates[2].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_mixed_expression_or_union.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+
     var distinct_in_union = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
@@ -83240,6 +83319,23 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("\"open\"", expression_or_union.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
     try std.testing.expectEqualStrings("\"pending\"", expression_or_union.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
     try std.testing.expectEqualStrings("enabled", expression_or_union.query.expression_or_predicates[2].conditions[0].lhs.field);
+
+    var mixed_expression_or_union = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), mixed_expression_or_union.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), mixed_expression_or_union.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_union.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", mixed_expression_or_union.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"active\"", mixed_expression_or_union.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_or_union.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", mixed_expression_or_union.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", mixed_expression_or_union.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", mixed_expression_or_union.query.expression_or_predicates[2].conditions[0].lhs.field);
 
     var in_intersect = try lowerSelectAlloc(
         alloc,
@@ -83390,6 +83486,23 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("\"deleted\"", expression_or_except.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
     try std.testing.expectEqualStrings("\"archived\"", expression_or_except.query.expression_not_predicates[1].conditions[0].rhs[0].value_json);
 
+    var mixed_expression_or_except = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_or_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_expression_or_except.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", mixed_expression_or_except.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_except.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_except.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", mixed_expression_or_except.query.expression_not_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", mixed_expression_or_except.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_or_except.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"deleted\"", mixed_expression_or_except.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"archived\"", mixed_expression_or_except.query.expression_not_predicates[1].conditions[1].rhs[0].value_json);
+
     var in_expression_except = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'",
@@ -83422,6 +83535,23 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_intersect.query.expression_or_predicates[0].conditions[1].lhs.kind);
     try std.testing.expectEqualStrings("\"deleted\"", expression_or_intersect.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
     try std.testing.expectEqualStrings("\"archived\"", expression_or_intersect.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+
+    var mixed_expression_or_intersect = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending')",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_or_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), mixed_expression_or_intersect.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_intersect.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), mixed_expression_or_intersect.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("enabled", mixed_expression_or_intersect.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("status", mixed_expression_or_intersect.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"active\"", mixed_expression_or_intersect.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_or_intersect.query.expression_or_predicates[0].conditions[2].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", mixed_expression_or_intersect.query.expression_or_predicates[0].conditions[2].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", mixed_expression_or_intersect.query.expression_or_predicates[1].conditions[2].rhs[0].value_json);
 
     var expression_projection_intersect = try lowerSelectAlloc(
         alloc,
