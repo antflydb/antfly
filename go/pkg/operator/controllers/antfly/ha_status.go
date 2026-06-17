@@ -1633,7 +1633,7 @@ func haFencingReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus
 	if fencing.Holder == "" || fencing.Generation == 0 {
 		return false
 	}
-	if !desiredStandbyNamed(ha, fencing.Holder) {
+	if !haStandbyAdminURLConfigured(ha, fencing.Holder) {
 		return false
 	}
 	return true
@@ -1647,15 +1647,19 @@ func haPromotionRouteReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.H
 }
 
 func haStandbyRouteSelectorConfigured(ha *antflyv1.HighAvailabilitySpec, standbyName string) bool {
-	if ha == nil || standbyName == "" {
+	standby, ok := desiredStandbySpecByName(ha, standbyName)
+	if !ok {
 		return false
 	}
-	for _, standby := range ha.Standbys {
-		if standbyDesired(standby) && standby.Name == standbyName {
-			return len(standby.RouteSelector) > 0
-		}
+	return len(standby.RouteSelector) > 0
+}
+
+func haStandbyAdminURLConfigured(ha *antflyv1.HighAvailabilitySpec, standbyName string) bool {
+	standby, ok := desiredStandbySpecByName(ha, standbyName)
+	if !ok {
+		return false
 	}
-	return false
+	return strings.TrimSpace(standby.AdminURL) != ""
 }
 
 func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) string {
@@ -2065,15 +2069,20 @@ func standbyDesired(standby antflyv1.HAStandbySpec) bool {
 }
 
 func desiredStandbyNamed(ha *antflyv1.HighAvailabilitySpec, name string) bool {
+	_, ok := desiredStandbySpecByName(ha, name)
+	return ok
+}
+
+func desiredStandbySpecByName(ha *antflyv1.HighAvailabilitySpec, name string) (antflyv1.HAStandbySpec, bool) {
 	if ha == nil || name == "" {
-		return false
+		return antflyv1.HAStandbySpec{}, false
 	}
 	for _, standby := range ha.Standbys {
 		if standbyDesired(standby) && standby.Name == name {
-			return true
+			return standby, true
 		}
 	}
-	return false
+	return antflyv1.HAStandbySpec{}, false
 }
 
 func standbySlotName(standby antflyv1.HAStandbySpec) string {
