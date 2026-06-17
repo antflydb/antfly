@@ -52,6 +52,8 @@ pub const HACurrentFenceResponse = openapi.HACurrentFenceResponse;
 pub const HAPromotionAssessResponse = openapi.HAPromotionAssessResponse;
 pub const HAPromotionResponse = openapi.HAPromotionResponse;
 pub const HARejoinAssessResponse = openapi.HARejoinAssessResponse;
+pub const HARejoinRewindResult = openapi.HARejoinRewindResult;
+pub const HARejoinReseedResult = openapi.HARejoinReseedResult;
 
 pub const HAPromotionAssessment = openapi.HAPromotionAssessment;
 pub const HAPromotionResult = openapi.HAPromotionResult;
@@ -76,5 +78,20 @@ test {
     _ = ServerRouter;
     _ = HAPromotionResponse;
     _ = HARejoinAssessResponse;
+    _ = HARejoinRewindResult;
+    _ = HARejoinReseedResult;
     _ = HAActionReceipt;
+}
+
+test "admin facade re-exports HA action receipt result types" {
+    const receipt_info = @typeInfo(HAActionReceipt);
+    const rewind_info = @typeInfo(HARejoinRewindResult);
+    const reseed_info = @typeInfo(HARejoinReseedResult);
+
+    try @import("std").testing.expect(receipt_info == .@"struct");
+    try @import("std").testing.expect(rewind_info == .@"struct");
+    try @import("std").testing.expect(reseed_info == .@"struct");
+    try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "action"));
+    try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "rewind"));
+    try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "reseed"));
 }

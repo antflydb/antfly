@@ -23,6 +23,7 @@ const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
+const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
 
@@ -603,6 +604,7 @@ fn i64FromU64(value: u64) !i64 {
 const TestPaths = struct {
     primary_log: [:0]u8,
     primary_slots: [:0]u8,
+    former_primary_log: [:0]u8,
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
     fence_wal: [:0]u8,
@@ -611,6 +613,7 @@ const TestPaths = struct {
     fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
+        alloc.free(self.former_primary_log);
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
         alloc.free(self.fence_wal);
@@ -624,6 +627,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(primary_log);
     const primary_slots = try allocPrintPath(alloc, name, "primary-slots", nonce);
     defer alloc.free(primary_slots);
+    const former_primary_log = try allocPrintPath(alloc, name, "former-primary-log", nonce);
+    defer alloc.free(former_primary_log);
     const standby_log = try allocPrintPath(alloc, name, "standby-log", nonce);
     defer alloc.free(standby_log);
     const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
@@ -637,6 +642,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), former_primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
@@ -645,6 +651,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
         .primary_slots = try alloc.dupeZ(u8, primary_slots),
+        .former_primary_log = try alloc.dupeZ(u8, former_primary_log),
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
         .fence_wal = try alloc.dupeZ(u8, fence_wal),
@@ -1172,8 +1179,39 @@ test "storage.ha http client round trips typed safety operations" {
     defer standby.close();
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
+    var former_log = try replication_log.ReplicationLog.open(paths.former_primary_log.ptr, .{});
+    defer former_log.close();
+    _ = try former_log.append(alloc, .{
+        .kind = .batch_mutation,
+        .payload_codec = .raw,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "one",
+    });
+    _ = try former_log.append(alloc, .{
+        .kind = .batch_mutation,
+        .payload_codec = .raw,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = 2,
+        .previous_lsn = 1,
+        .payload = "diverged",
+    });
 
-    var server = http_admin.Server.init(alloc, .{ .primary = &primary, .standby = &standby, .fence_store = &fence_store });
+    var server = http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .standby = &standby,
+        .fence_store = &fence_store,
+        .former_primary_log = &former_log,
+    });
     defer server.deinit();
     var client = Client.init(alloc, server.executor());
 
@@ -1238,7 +1276,10 @@ test "storage.ha http client round trips typed safety operations" {
     });
     defer rewind.deinit(alloc);
     try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
-    try std.testing.expect(rewind.parsed.value.rewind == null);
+    try std.testing.expect(rewind.parsed.value.rewind != null);
+    try std.testing.expectEqual(@as(i64, 2), rewind.parsed.value.rewind.?.previous_last_lsn);
+    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.current_last_lsn);
+    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.discarded_lsn_count);
 
     try std.testing.expectError(error.HaCommandConflict, client.reseedRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",
