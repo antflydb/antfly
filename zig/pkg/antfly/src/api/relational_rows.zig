@@ -1908,7 +1908,7 @@ pub fn parseRowsMutationSourceRequest(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "op", "source", "rewrite_identity", "patch", "patch_expr", "increment", "increment_expr", "json_set", "array_update", "temporal_portion", "returning", "returning_expressions" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "op", "source", "rewrite_identity", "restart_identity", "patch", "patch_expr", "increment", "increment_expr", "json_set", "array_update", "temporal_portion", "returning", "returning_expressions" });
 
     const op_value = parsed.value.object.get("op") orelse return error.InvalidRowsRequest;
     if (op_value != .string) return error.InvalidRowsRequest;
@@ -1920,6 +1920,8 @@ pub fn parseRowsMutationSourceRequest(
         return error.InvalidRowsRequest;
     const rewrite_identity = (try parseOptionalBool(parsed.value.object.get("rewrite_identity"))) orelse false;
     if (rewrite_identity and kind != .update) return error.InvalidRowsRequest;
+    const restart_identity = (try parseOptionalBool(parsed.value.object.get("restart_identity"))) orelse false;
+    if (restart_identity and kind != .delete) return error.InvalidRowsRequest;
 
     const source_value = parsed.value.object.get("source") orelse return error.InvalidRowsRequest;
     if (source_value != .object) return error.InvalidRowsRequest;
@@ -1930,6 +1932,7 @@ pub fn parseRowsMutationSourceRequest(
     if (source.row_claim == null) return error.InvalidRowsRequest;
     if (source.row_claim.?.owner_id.len == 0 or source.row_claim.?.lease_ms == 0) return error.InvalidRowsRequest;
     if (source.source_cte.len != 0) return error.InvalidRowsRequest;
+    if (restart_identity and !rowsQueryIsClaimedWholeTableMutationSource(source)) return error.InvalidRowsRequest;
 
     var operations: []db_mod.types.TransformOp = &.{};
     var patch_expressions: []db_mod.types.RelationalRowsExpressionAssignment = &.{};
@@ -1956,6 +1959,7 @@ pub fn parseRowsMutationSourceRequest(
 
     const temporal_portion = try parseRowsTemporalPortionAlloc(alloc, schema, parsed.value.object.get("temporal_portion"));
     errdefer if (temporal_portion) |portion| freeRowsTemporalPortion(alloc, portion);
+    if (restart_identity and temporal_portion != null) return error.InvalidRowsRequest;
 
     const returning = try parseMutationSourceReturningAlloc(alloc, schema, parsed.value.object.get("returning"), parsed.value.object.get("returning_expressions"));
     errdefer {
@@ -1967,11 +1971,13 @@ pub fn parseRowsMutationSourceRequest(
         }
         if (returning.expressions.len > 0) alloc.free(returning.expressions);
     }
+    if (restart_identity and (returning.all or returning.fields.len != 0 or returning.expressions.len != 0)) return error.InvalidRowsRequest;
 
     return .{ .req = .{
         .kind = kind,
         .source = source,
         .rewrite_identity = rewrite_identity,
+        .restart_identity = restart_identity,
         .operations = operations,
         .patch_expressions = patch_expressions,
         .increment_expressions = increment_expressions,
@@ -1981,6 +1987,40 @@ pub fn parseRowsMutationSourceRequest(
         .returning_expressions = returning.expressions,
         .returning_all = returning.all,
     } };
+}
+
+fn rowsQueryIsClaimedWholeTableMutationSource(source: db_mod.types.RelationalRowsQueryRequest) bool {
+    return source.row_claim != null and
+        source.source_cte.len == 0 and
+        source.predicates.len == 0 and
+        source.array_any.len == 0 and
+        source.array_contains.len == 0 and
+        source.array_eq.len == 0 and
+        source.in_predicates.len == 0 and
+        source.json_contains.len == 0 and
+        source.json_path_eq.len == 0 and
+        source.json_path_exists.len == 0 and
+        source.text_patterns.len == 0 and
+        source.or_predicates.len == 0 and
+        source.not_predicates.len == 0 and
+        source.access_or_predicates.len == 0 and
+        source.access_not_predicates.len == 0 and
+        source.expression_predicates.len == 0 and
+        source.expression_or_predicates.len == 0 and
+        source.expression_not_predicates.len == 0 and
+        source.expression_array_contains.len == 0 and
+        source.select.len == 0 and
+        source.json_extract.len == 0 and
+        source.array_length.len == 0 and
+        source.coalesce.len == 0 and
+        source.field_aliases.len == 0 and
+        source.expressions.len == 0 and
+        source.distinct_on.len == 0 and
+        source.distinct_on_expressions.len == 0 and
+        source.order_by.len == 0 and
+        source.doc_key_range == null and
+        source.limit == null and
+        source.offset == 0;
 }
 
 fn parseRowsTemporalPortionAlloc(
@@ -21543,6 +21583,33 @@ test "relational rows mutation source contract parses claimed update plans" {
     try std.testing.expectEqual(@as(usize, 0), table_emptying_request.req.returning.len);
     try std.testing.expectEqual(@as(usize, 0), table_emptying_request.req.returning_expressions.len);
     try std.testing.expect(!table_emptying_request.req.returning_all);
+    try std.testing.expect(!table_emptying_request.req.restart_identity);
+
+    var restart_identity_request = try parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"delete\",\"restart_identity\":true,\"source\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:truncate\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}}",
+        schema,
+    );
+    defer restart_identity_request.deinit(std.testing.allocator);
+    try std.testing.expect(restart_identity_request.req.restart_identity);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, restart_identity_request.req.kind);
+    try std.testing.expectEqual(@as(usize, 0), restart_identity_request.req.source.predicates.len);
+
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"update\",\"restart_identity\":true,\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:mutation\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"delete\",\"restart_identity\":true,\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:truncate\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsMutationSourceRequest(
+        std.testing.allocator,
+        "{\"op\":\"delete\",\"restart_identity\":true,\"source\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:truncate\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"returning\":[\"id\"]}",
+        schema,
+    ));
 
     var ranged_request = try parseRowsMutationSourceRequest(
         std.testing.allocator,

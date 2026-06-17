@@ -17607,6 +17607,7 @@ pub const DB = struct {
         if (req.source.source_cte.len != 0) return error.UnsupportedQueryRequest;
         if (relationalRowsQueryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
         try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req.source);
+        if (req.restart_identity) return error.UnsupportedQueryRequest;
         if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
         try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, &.{});

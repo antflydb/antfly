@@ -1498,6 +1498,7 @@ pub const RelationalRowsMutationSourceRequest = struct {
     kind: RelationalRowsMutationKind,
     source: RelationalRowsQueryRequest = .{},
     rewrite_identity: bool = false,
+    restart_identity: bool = false,
     operations: []const TransformOp = &.{},
     patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
     increment_expressions: []const RelationalRowsExpressionAssignment = &.{},

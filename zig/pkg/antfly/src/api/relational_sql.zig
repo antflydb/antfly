@@ -14014,6 +14014,7 @@ const Parser = struct {
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsMutationSourceRequest(self.alloc, body_json, self.schema);
         errdefer mutation.deinit(self.alloc);
+        mutation.req.restart_identity = restart_identity;
 
         return .{
             .table_name = table_name,
@@ -61917,7 +61918,7 @@ fn deleteSourceFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredMutati
     const with_or = try appendNonZeroUsizeFingerprintAlloc(alloc, with_in, "source_or", source.or_predicates.len);
     const with_not = try appendNonZeroUsizeFingerprintAlloc(alloc, with_or, "source_not", source.not_predicates.len);
     const with_temporal = try appendTrueBoolFingerprintAlloc(alloc, with_not, "temporal", lowered.mutation.req.temporal_portion != null);
-    const with_restart_identity = try appendTrueBoolFingerprintAlloc(alloc, with_temporal, "restart_identity", lowered.restart_identity);
+    const with_restart_identity = try appendTrueBoolFingerprintAlloc(alloc, with_temporal, "restart_identity", lowered.mutation.req.restart_identity);
     return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, with_restart_identity, source);
 }
 
@@ -82375,6 +82376,7 @@ test "postgres sql adapter lowers truncate into claimed table-emptying mutation 
     try std.testing.expectEqual(@as(?u32, null), restart_identity.mutation.req.source.limit);
     try std.testing.expect(restart_identity.mutation.req.source.row_claim != null);
     try std.testing.expect(restart_identity.restart_identity);
+    try std.testing.expect(restart_identity.mutation.req.restart_identity);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceAlloc(
         alloc,
