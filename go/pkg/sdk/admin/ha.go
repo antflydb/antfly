@@ -381,6 +381,33 @@ func ValidateHAReplicationSlotListResponse(response HAReplicationSlotListRespons
 	return nil
 }
 
+func ValidateHAReplicationSlotActionResponseEvidence(raw []byte) error {
+	var response haReplicationSlotActionResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if !haReplicationSlotEvidenceComplete(response.Slot) {
+		return fmt.Errorf("missing replication slot action slot field evidence")
+	}
+	return nil
+}
+
+func ValidateHAReplicationSlotListResponseEvidence(raw []byte) error {
+	var response haReplicationSlotListResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.Slots == nil {
+		return fmt.Errorf("missing replication slot list slots field evidence")
+	}
+	for i, slot := range *response.Slots {
+		if !haReplicationSlotEvidenceComplete(slot) {
+			return fmt.Errorf("missing replication slot list slot field evidence at index %d", i)
+		}
+	}
+	return nil
+}
+
 func ValidateHABaseBackupBeginResponse(response HABaseBackupBeginResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing base backup begin schema_version")
@@ -402,6 +429,17 @@ func ValidateHABaseBackupBeginResponse(response HABaseBackupBeginResponse) error
 	}
 	if err := validateHAActionReceiptTarget(response.Action, HABaseBackupBeginReceiptExpectation(), response.ManifestId, "base backup begin"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ValidateHABaseBackupBeginResponseEvidence(raw []byte) error {
+	var response haBaseBackupBeginResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.BackupLsn == nil || response.StartRecordLsn == nil {
+		return fmt.Errorf("missing base backup begin field evidence")
 	}
 	return nil
 }
@@ -428,6 +466,17 @@ func ValidateHABaseBackupFinishResponse(response HABaseBackupFinishResponse) err
 	return nil
 }
 
+func ValidateHABaseBackupFinishResponseEvidence(raw []byte) error {
+	var response haBaseBackupFinishResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.BackupLsn == nil || response.EndRecordLsn == nil {
+		return fmt.Errorf("missing base backup finish field evidence")
+	}
+	return nil
+}
+
 func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing standby bootstrap schema_version")
@@ -446,6 +495,17 @@ func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) err
 	}
 	if err := validateHAActionReceiptTarget(response.Action, HAStandbyBootstrapReceiptExpectation(), response.ManifestId, "standby bootstrap"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ValidateHAStandbyBootstrapResponseEvidence(raw []byte) error {
+	var response haStandbyBootstrapResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.BackupLsn == nil || response.CheckpointLsn == nil {
+		return fmt.Errorf("missing standby bootstrap field evidence")
 	}
 	return nil
 }
@@ -973,6 +1033,39 @@ type haPromotionResponseEvidence struct {
 	Promotion  haPromotionResultEvidence     `json:"promotion"`
 }
 
+type haReplicationSlotEvidence struct {
+	RestartLsn     *uint64 `json:"restart_lsn"`
+	ReceivedLsn    *uint64 `json:"received_lsn"`
+	AppliedLsn     *uint64 `json:"applied_lsn"`
+	SafeReadLsn    *uint64 `json:"safe_read_lsn"`
+	Active         *bool   `json:"active"`
+	ReseedRequired *bool   `json:"reseed_required"`
+	CurrentLsn     *uint64 `json:"current_lsn"`
+}
+
+type haReplicationSlotActionResponseEvidence struct {
+	Slot haReplicationSlotEvidence `json:"slot"`
+}
+
+type haReplicationSlotListResponseEvidence struct {
+	Slots *[]haReplicationSlotEvidence `json:"slots"`
+}
+
+type haBaseBackupBeginResponseEvidence struct {
+	BackupLsn      *uint64 `json:"backup_lsn"`
+	StartRecordLsn *uint64 `json:"start_record_lsn"`
+}
+
+type haBaseBackupFinishResponseEvidence struct {
+	BackupLsn    *uint64 `json:"backup_lsn"`
+	EndRecordLsn *uint64 `json:"end_record_lsn"`
+}
+
+type haStandbyBootstrapResponseEvidence struct {
+	BackupLsn     *uint64 `json:"backup_lsn"`
+	CheckpointLsn *uint64 `json:"checkpoint_lsn"`
+}
+
 type haFenceReceiptIdentityEvidence struct {
 	ClusterId  *uint64 `json:"cluster_id"`
 	ShardId    *uint64 `json:"shard_id"`
@@ -1061,6 +1154,16 @@ func haPromotionAssessmentEvidenceComplete(assessment haPromotionAssessmentEvide
 
 func haPromotionResultEvidenceComplete(result haPromotionResultEvidence) bool {
 	return result.DataLossPossible != nil && result.Forced != nil
+}
+
+func haReplicationSlotEvidenceComplete(slot haReplicationSlotEvidence) bool {
+	return slot.RestartLsn != nil &&
+		slot.ReceivedLsn != nil &&
+		slot.AppliedLsn != nil &&
+		slot.SafeReadLsn != nil &&
+		slot.Active != nil &&
+		slot.ReseedRequired != nil &&
+		slot.CurrentLsn != nil
 }
 
 func haFenceReceiptEvidenceComplete(receipt haFenceReceiptEvidence) bool {
@@ -2053,7 +2156,7 @@ func (c *HAClient) ListReplicationSlotsResponse(ctx context.Context) (*HARespons
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("list HA replication slots", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotListResponse)
+	return requireHAJSON200ValidatedEvidence("list HA replication slots", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotListResponse, ValidateHAReplicationSlotListResponseEvidence)
 }
 
 func (c *HAClient) ListReplicationSlots(ctx context.Context) (*HAReplicationSlotListResponse, error) {
@@ -2065,7 +2168,7 @@ func (c *HAClient) CreateReplicationSlotResponse(ctx context.Context, body Repli
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("create HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
+	return requireHAJSON200ValidatedEvidence("create HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse, ValidateHAReplicationSlotActionResponseEvidence)
 }
 
 func (c *HAClient) CreateReplicationSlot(ctx context.Context, body ReplicationSlotCreateRequest) (*HAReplicationSlotActionResponse, error) {
@@ -2077,7 +2180,7 @@ func (c *HAClient) PauseReplicationSlotResponse(ctx context.Context, slotName st
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("pause HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
+	return requireHAJSON200ValidatedEvidence("pause HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse, ValidateHAReplicationSlotActionResponseEvidence)
 }
 
 func (c *HAClient) PauseReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
@@ -2089,7 +2192,7 @@ func (c *HAClient) ResumeReplicationSlotResponse(ctx context.Context, slotName s
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("resume HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
+	return requireHAJSON200ValidatedEvidence("resume HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse, ValidateHAReplicationSlotActionResponseEvidence)
 }
 
 func (c *HAClient) ResumeReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
@@ -2101,7 +2204,7 @@ func (c *HAClient) DropReplicationSlotResponse(ctx context.Context, slotName str
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("drop HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
+	return requireHAJSON200ValidatedEvidence("drop HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse, ValidateHAReplicationSlotActionResponseEvidence)
 }
 
 func (c *HAClient) DropReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
@@ -2113,7 +2216,7 @@ func (c *HAClient) BeginBaseBackupResponse(ctx context.Context, body BaseBackupS
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("begin HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHABaseBackupBeginResponse)
+	return requireHAJSON200ValidatedEvidence("begin HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHABaseBackupBeginResponse, ValidateHABaseBackupBeginResponseEvidence)
 }
 
 func (c *HAClient) BeginBaseBackup(ctx context.Context, body BaseBackupStartRequest) (*HABaseBackupBeginResponse, error) {
@@ -2125,7 +2228,7 @@ func (c *HAClient) FinishBaseBackupResponse(ctx context.Context, body BaseBackup
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("finish HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHABaseBackupFinishResponse)
+	return requireHAJSON200ValidatedEvidence("finish HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHABaseBackupFinishResponse, ValidateHABaseBackupFinishResponseEvidence)
 }
 
 func (c *HAClient) FinishBaseBackup(ctx context.Context, body BaseBackupManifestPathRequest) (*HABaseBackupFinishResponse, error) {
@@ -2137,7 +2240,7 @@ func (c *HAClient) BootstrapStandbyResponse(ctx context.Context, body StandbyBoo
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("bootstrap HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyBootstrapResponse)
+	return requireHAJSON200ValidatedEvidence("bootstrap HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyBootstrapResponse, ValidateHAStandbyBootstrapResponseEvidence)
 }
 
 func (c *HAClient) BootstrapStandby(ctx context.Context, body StandbyBootstrapRequest) (*HAStandbyBootstrapResponse, error) {

@@ -165,6 +165,45 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientCreateReplicationSlotRejectsMissingEvidence(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"schema_version":1,
+			"slot_action":"create",
+			"action":{
+				"action_id":"replication_slot_create:standby-a",
+				"action_kind":"replication_slot_create",
+				"target":"standby-a",
+				"state":"applied",
+				"node_id":"primary-a"
+			},
+			"slot":{
+				"slot_name":"standby-a",
+				"timeline_id":1,
+				"restart_lsn":7,
+				"received_lsn":7,
+				"applied_lsn":7,
+				"safe_read_lsn":7,
+				"active":true,
+				"current_lsn":7
+			}
+		}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.CreateReplicationSlot(context.Background(), ReplicationSlotCreateRequest{SlotName: "standby-a"})
+	if err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+		t.Fatalf("CreateReplicationSlot error = %v, want slot field evidence error", err)
+	}
+}
+
 func TestHAClientGateOperationsUseAdminAPI(t *testing.T) {
 	t.Parallel()
 
@@ -975,6 +1014,46 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 
 func TestValidateHAResponseEvidence(t *testing.T) {
 	t.Parallel()
+
+	slot := `{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":false,"reseed_required":false,"current_lsn":0}}`
+	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(slot)); err != nil {
+		t.Fatalf("ValidateHAReplicationSlotActionResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAReplicationSlotActionResponseEvidence([]byte(strings.Replace(slot, `,"active":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+		t.Fatalf("missing slot active evidence error = %v, want slot field evidence error", err)
+	}
+	slotList := `{"schema_version":1,"slots":[{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":false,"reseed_required":false,"current_lsn":0}]}`
+	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(slotList)); err != nil {
+		t.Fatalf("ValidateHAReplicationSlotListResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "slots field evidence") {
+		t.Fatalf("missing slot list evidence error = %v, want slots field evidence error", err)
+	}
+	if err := ValidateHAReplicationSlotListResponseEvidence([]byte(strings.Replace(slotList, `,"current_lsn":0`, "", 1))); err == nil || !strings.Contains(err.Error(), "slot field evidence") {
+		t.Fatalf("missing slot current_lsn evidence error = %v, want slot field evidence error", err)
+	}
+
+	begin := `{"schema_version":1,"action":{"action_id":"base_backup_begin:manifest-a","action_kind":"base_backup_begin","target":"manifest-a","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"manifest-a","backup_lsn":7,"start_record_lsn":8}`
+	if err := ValidateHABaseBackupBeginResponseEvidence([]byte(begin)); err != nil {
+		t.Fatalf("ValidateHABaseBackupBeginResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHABaseBackupBeginResponseEvidence([]byte(strings.Replace(begin, `,"start_record_lsn":8`, "", 1))); err == nil || !strings.Contains(err.Error(), "base backup begin field evidence") {
+		t.Fatalf("missing base backup begin evidence error = %v, want field evidence error", err)
+	}
+	finish := `{"schema_version":1,"action":{"action_id":"base_backup_finish:manifest-a","action_kind":"base_backup_finish","target":"manifest-a","state":"applied","node_id":"primary-a"},"manifest_id":"manifest-a","backup_lsn":7,"end_record_lsn":9}`
+	if err := ValidateHABaseBackupFinishResponseEvidence([]byte(finish)); err != nil {
+		t.Fatalf("ValidateHABaseBackupFinishResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHABaseBackupFinishResponseEvidence([]byte(strings.Replace(finish, `,"end_record_lsn":9`, "", 1))); err == nil || !strings.Contains(err.Error(), "base backup finish field evidence") {
+		t.Fatalf("missing base backup finish evidence error = %v, want field evidence error", err)
+	}
+	bootstrap := `{"schema_version":1,"action":{"action_id":"standby_bootstrap:manifest-a","action_kind":"standby_bootstrap","target":"manifest-a","state":"applied","node_id":"standby-a"},"manifest_id":"manifest-a","backup_lsn":7,"checkpoint_lsn":10}`
+	if err := ValidateHAStandbyBootstrapResponseEvidence([]byte(bootstrap)); err != nil {
+		t.Fatalf("ValidateHAStandbyBootstrapResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAStandbyBootstrapResponseEvidence([]byte(strings.Replace(bootstrap, `,"checkpoint_lsn":10`, "", 1))); err == nil || !strings.Contains(err.Error(), "standby bootstrap field evidence") {
+		t.Fatalf("missing standby bootstrap evidence error = %v, want field evidence error", err)
+	}
 
 	fence := `{"schema_version":1,"action":{"action_id":"fence_acquire:standby-a","action_kind":"fence_acquire","target":"standby-a","state":"applied","node_id":"standby-a"},"receipt":{"identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":2,"parent_epoch":3,"new_timeline_id":4,"new_epoch":5,"required_lsn":8,"observed_lsn":8,"generation":9,"forced":false,"token":"fence-token","reason":""}}`
 	if err := ValidateHAFenceResponseEvidence([]byte(fence)); err != nil {
