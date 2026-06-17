@@ -56,6 +56,12 @@ pub const Identity = struct {
     epoch: u64,
 };
 
+pub fn validateIdentity(identity: Identity) !void {
+    if (identity.cluster_id == 0) return error.InvalidIdentity;
+    if (identity.timeline_id == 0) return error.InvalidIdentity;
+    if (identity.epoch == 0) return error.InvalidIdentity;
+}
+
 pub const Progress = struct {
     received_lsn: u64 = 0,
     applied_lsn: u64 = 0,
@@ -123,6 +129,8 @@ pub const Standby = struct {
         identity: Identity,
         options: OpenOptions,
     ) !Standby {
+        try validateIdentity(identity);
+
         var receive_log = try replication_log.ReplicationLog.open(receive_log_path, options.receive_log_options);
         const progress_wal = wal_mod.WAL.open(progress_wal_path, options.progress_wal_options) catch |err| {
             receive_log.close();
@@ -732,6 +740,36 @@ const TimelineSwitchPayload = struct {
     forced: bool,
     data_loss_possible: bool,
 };
+
+test "storage.ha standby rejects invalid open identity" {
+    const alloc = std.testing.allocator;
+    const valid = Identity{ .cluster_id = 10, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "invalid-open-identity");
+    defer paths.deinit(alloc);
+
+    var zero_cluster = valid;
+    zero_cluster.cluster_id = 0;
+    try std.testing.expectError(error.InvalidIdentity, Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, zero_cluster, .{}));
+
+    var zero_timeline = valid;
+    zero_timeline.timeline_id = 0;
+    try std.testing.expectError(error.InvalidIdentity, Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, zero_timeline, .{}));
+
+    var zero_epoch = valid;
+    zero_epoch.epoch = 0;
+    try std.testing.expectError(error.InvalidIdentity, Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, zero_epoch, .{}));
+}
+
+test "storage.ha standby allows whole instance shard table identity" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "whole-instance-identity");
+    defer paths.deinit(alloc);
+
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+    try std.testing.expectEqual(@as(u64, 1), standby.nextReceiveLsn());
+}
 
 test "storage.ha standby receives applies and persists progress across reopen" {
     const alloc = std.testing.allocator;

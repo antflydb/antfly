@@ -122,6 +122,8 @@ pub const Primary = struct {
         identity: Identity,
         options: OpenOptions,
     ) !Primary {
+        try standby_mod.validateIdentity(identity);
+
         var log = try replication_log.ReplicationLog.open(log_path, options.replication_log_options);
         const slots = slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options) catch |err| {
             log.close();
@@ -642,6 +644,36 @@ fn testIdentity() Identity {
 }
 
 fn noOpApply(_: *anyopaque, _: replication_record.RecordView) anyerror!void {}
+
+test "storage.ha primary rejects invalid open identity" {
+    const alloc = std.testing.allocator;
+    const valid = testIdentity();
+    const paths = try testPaths(alloc, "invalid-open-identity");
+    defer paths.deinit(alloc);
+
+    var zero_cluster = valid;
+    zero_cluster.cluster_id = 0;
+    try std.testing.expectError(error.InvalidIdentity, Primary.open(alloc, paths.log.ptr, paths.slots.ptr, zero_cluster, .{}));
+
+    var zero_timeline = valid;
+    zero_timeline.timeline_id = 0;
+    try std.testing.expectError(error.InvalidIdentity, Primary.open(alloc, paths.log.ptr, paths.slots.ptr, zero_timeline, .{}));
+
+    var zero_epoch = valid;
+    zero_epoch.epoch = 0;
+    try std.testing.expectError(error.InvalidIdentity, Primary.open(alloc, paths.log.ptr, paths.slots.ptr, zero_epoch, .{}));
+}
+
+test "storage.ha primary allows whole instance shard table identity" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 100, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "whole-instance-identity");
+    defer paths.deinit(alloc);
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    try std.testing.expectEqual(@as(u64, 1), primary.nextLsn());
+}
 
 test "storage.ha primary appends streams and persists standby status" {
     const alloc = std.testing.allocator;
