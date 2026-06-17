@@ -3381,11 +3381,15 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
 		body := map[string]any{"slot_name": slotName}
 		if action.TargetLSN > 0 {
 			body["initial_lsn"] = action.TargetLSN
 		}
-		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/replication-slots", body)
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3395,7 +3399,11 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/pause", nil)
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3405,7 +3413,11 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPut, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName)+"/resume", nil)
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3415,7 +3427,11 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodDelete, action.AdminURL, "/admin/v1/ha/replication-slots/"+url.PathEscape(slotName), nil)
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3425,11 +3441,15 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if slotName == "" {
 			return false, nil
 		}
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
 		body := map[string]any{
 			"slot_name":   slotName,
 			"manifest_id": haSeedBeginManifestID(*action, slotName),
 		}
-		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/base-backups", body)
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3439,13 +3459,21 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
-		raw, err := r.postHAAdminJSONRaw(ctx, action.AdminURL, "/admin/v1/ha/fence", body)
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
 	case string(haActionPromoteStandby):
-		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPost, action.AdminURL, "/admin/v1/ha/promotion/current-fence", nil)
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil && !r.applyHADirectPromotionResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed promotion receipt", action.Kind)
 		}
@@ -3455,11 +3483,11 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return true, err
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
 		}
-		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPost, action.AdminURL, "/admin/v1/ha/rejoin/assess", encoded)
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil && !r.applyHADirectRejoinAssessResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed rejoin assessment", action.Kind)
 		}
@@ -3467,6 +3495,21 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	default:
 		return false, nil
 	}
+}
+
+func haPlannedActionDirectAdminOperation(action antflyv1.HAPlannedActionStatus) (string, string, bool) {
+	method := strings.TrimSpace(action.AdminMethod)
+	apiPath := strings.TrimSpace(action.AdminPath)
+	if method != "" && apiPath != "" {
+		return method, apiPath, true
+	}
+	method, apiPath = haAdminOperation(haPlannedAction{
+		Kind:             haActionKind(action.Kind),
+		StandbyName:      action.StandbyName,
+		SlotName:         action.SlotName,
+		SeedManifestPath: action.SeedManifestPath,
+	})
+	return method, apiPath, method != "" && apiPath != ""
 }
 
 func haPlannedActionSupportsDirectAdminAPI(kind haActionKind) bool {
@@ -4597,11 +4640,15 @@ func (r *AntflyClusterReconciler) postHAAdminJSON(ctx context.Context, baseURL s
 }
 
 func (r *AntflyClusterReconciler) postHAAdminJSONRaw(ctx context.Context, baseURL string, apiPath string, body any) ([]byte, error) {
+	return r.requestHAAdminJSONBodyRaw(ctx, http.MethodPost, baseURL, apiPath, body)
+}
+
+func (r *AntflyClusterReconciler) requestHAAdminJSONBodyRaw(ctx context.Context, method string, baseURL string, apiPath string, body any) ([]byte, error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	return r.requestHAAdminJSONRaw(ctx, http.MethodPost, baseURL, apiPath, raw)
+	return r.requestHAAdminJSONRaw(ctx, method, baseURL, apiPath, raw)
 }
 
 func (r *AntflyClusterReconciler) requestHAAdminNoBody(ctx context.Context, method string, baseURL string, apiPath string) error {
