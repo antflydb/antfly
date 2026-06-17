@@ -71,6 +71,8 @@ pub const HACommitGate = openapi.HACommitGate;
 pub const HAReplicationSlot = openapi.HAReplicationSlot;
 pub const HAActionReceipt = openapi.HAActionReceipt;
 
+const std = @import("std");
+
 test {
     _ = openapi;
     _ = routes;
@@ -82,16 +84,80 @@ test {
     _ = HAActionReceipt;
 }
 
+test "admin facade mirrors generated HA OpenAPI contract types" {
+    inline for (ha_contract_type_names) |name| {
+        try expectFacadeTypeAlias(name);
+    }
+}
+
 test "admin facade re-exports HA action receipt result types" {
     const receipt_info = @typeInfo(HAActionReceipt);
     const rewind_info = @typeInfo(HARejoinRewindResult);
     const reseed_info = @typeInfo(HARejoinReseedResult);
 
-    try @import("std").testing.expect(receipt_info == .@"struct");
-    try @import("std").testing.expect(@hasField(HAActionReceipt, "node_id"));
-    try @import("std").testing.expect(rewind_info == .@"struct");
-    try @import("std").testing.expect(reseed_info == .@"struct");
-    try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "action"));
-    try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "rewind"));
-    try @import("std").testing.expect(@hasField(HARejoinAssessResponse, "reseed"));
+    try std.testing.expect(receipt_info == .@"struct");
+    try std.testing.expect(@hasField(HAActionReceipt, "node_id"));
+    try std.testing.expect(rewind_info == .@"struct");
+    try std.testing.expect(reseed_info == .@"struct");
+    try std.testing.expect(@hasField(HARejoinAssessResponse, "action"));
+    try std.testing.expect(@hasField(HARejoinAssessResponse, "rewind"));
+    try std.testing.expect(@hasField(HARejoinAssessResponse, "reseed"));
+}
+
+const ha_contract_type_names = [_][]const u8{
+    "ReplicationSlotCreateRequest",
+    "BaseBackupStartRequest",
+    "BaseBackupManifestPathRequest",
+    "StandbyBootstrapRequest",
+    "HASyncPolicy",
+    "CommitCheckRequest",
+    "CommitAppendRequest",
+    "ReadCheckRequest",
+    "WriteCheckRequest",
+    "OwnerJobCheckRequest",
+    "HAIdentity",
+    "FenceAcquireRequest",
+    "HAFenceReceipt",
+    "PromotionAssessRequest",
+    "RejoinAssessRequest",
+    "HAPrimaryStatusResponse",
+    "HAStandbyStatusResponse",
+    "HACommitCheckResponse",
+    "HACommitAppendResponse",
+    "HAReadCheckResponse",
+    "HAWriteCheckResponse",
+    "HAOwnerJobCheckResponse",
+    "HAReplicationSlotActionResponse",
+    "HAReplicationSlotListResponse",
+    "HABaseBackupBeginResponse",
+    "HABaseBackupFinishResponse",
+    "HAStandbyBootstrapResponse",
+    "HAFenceResponse",
+    "HACurrentFenceResponse",
+    "HAPromotionAssessResponse",
+    "HAPromotionResponse",
+    "HARejoinAssessResponse",
+    "HARejoinRewindResult",
+    "HARejoinReseedResult",
+    "HAPromotionAssessment",
+    "HAPromotionResult",
+    "HARejoinAssessment",
+    "HAPrimarySnapshot",
+    "HAStandbySnapshot",
+    "HASlotSnapshot",
+    "HARetentionSnapshot",
+    "HADurabilityDecision",
+    "HAReadDecision",
+    "HAPromotionHandoff",
+    "HAWriteDecision",
+    "HAOwnerJobDecision",
+    "HACommitGate",
+    "HAReplicationSlot",
+    "HAActionReceipt",
+};
+
+fn expectFacadeTypeAlias(comptime name: []const u8) !void {
+    try std.testing.expect(@hasDecl(@This(), name));
+    try std.testing.expect(@hasDecl(openapi, name));
+    try std.testing.expect(@field(@This(), name) == @field(openapi, name));
 }
