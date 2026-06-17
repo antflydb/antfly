@@ -4319,7 +4319,6 @@ pub fn runtimeSchemaFromCreateTablePlanAlloc(
     alloc: std.mem.Allocator,
     plan: CreateTablePlan,
 ) !runtime_schema.TableSchema {
-    if (plan.replace_existing and plan.if_not_exists) return error.InvalidSqlCatalog;
     try validateRelationalColumnCatalog(plan.columns);
     try validateRelationalPeriodCatalog(plan.columns, plan.periods);
     if (plan.primary_key) |primary_key| {
@@ -5493,10 +5492,6 @@ const Parser = struct {
                 }
                 if (!self.peekKeyword("table")) return error.UnsupportedSqlShape;
                 var create_table = try self.parseCreateTableDdl();
-                if (create_table.if_not_exists) {
-                    create_table.deinit(self.alloc);
-                    return error.UnsupportedSqlShape;
-                }
                 create_table.replace_existing = true;
                 return .{ .create_table = create_table };
             }
@@ -48627,6 +48622,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expect(replaced_runtime.primary_key != null);
     try std.testing.expectEqualStrings("id", replaced_runtime.primary_key.?.columns[0]);
 
+    var replace_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, status text);");
+    defer replace_if_not_exists.deinit(alloc);
+    const replace_if_not_exists_plan = switch (replace_if_not_exists) {
+        .create_table => |create_table| create_table,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(replace_if_not_exists_plan.replace_existing);
+    try std.testing.expect(replace_if_not_exists_plan.if_not_exists);
+    var replaced_if_not_exists = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_if_not_exists);
+    defer replaced_if_not_exists.deinit(alloc);
+    try std.testing.expect(replaced_if_not_exists.requires_rebuild);
+    try std.testing.expect(replaced_if_not_exists.validation_required);
+    try std.testing.expect(replaced_if_not_exists.rewrite_required);
+    var replaced_if_not_exists_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced_if_not_exists.schema_json);
+    defer replaced_if_not_exists_parsed.deinit(alloc);
+    const replaced_if_not_exists_runtime = try schema_api.deriveRuntimeTableSchema(alloc, replaced_if_not_exists_parsed);
+    defer runtime_schema.freeSchema(alloc, replaced_if_not_exists_runtime);
+    try std.testing.expectEqual(@as(usize, 2), replaced_if_not_exists_runtime.relational_columns.len);
+    try std.testing.expect(relationalColumnForField(replaced_if_not_exists_runtime, "status", null) != null);
+
     var parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
     defer parsed.deinit(alloc);
     const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
@@ -49423,10 +49438,24 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
 
 test "postgres sql adapter rejects unsupported ddl shapes explicitly" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var replace_if_not_exists = try lowerDdlPlanAlloc(
         alloc,
         "CREATE OR REPLACE TABLE IF NOT EXISTS audit_log (id uuid PRIMARY KEY)",
-    ));
+    );
+    defer replace_if_not_exists.deinit(alloc);
+    const replace_if_not_exists_plan = switch (replace_if_not_exists) {
+        .create_table => |create_table| create_table,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(replace_if_not_exists_plan.replace_existing);
+    try std.testing.expect(replace_if_not_exists_plan.if_not_exists);
+    const replace_if_not_exists_fingerprint = try ddlFingerprintAlloc(alloc, replace_if_not_exists);
+    defer alloc.free(replace_if_not_exists_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:create_table:table=audit_log:columns=1:unique=0:fk=0:checks=0:if_not_exists=true:replace=true:pk=1",
+        replace_if_not_exists_fingerprint,
+    );
+
     var no_primary_key = try lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE audit_log (id uuid, payload jsonb)",
@@ -68823,6 +68852,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "CREATE OR REPLACE TABLE usage_records (id uuid PRIMARY KEY);",
+        },
+        .{
+            .name = "schema replace table if not exists",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 2 },
+            .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true:replace=true:pk=1",
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE OR REPLACE TABLE IF NOT EXISTS usage_records (id uuid PRIMARY KEY, status text);",
         },
         .{
             .name = "schema partial index",
