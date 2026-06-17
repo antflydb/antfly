@@ -527,7 +527,7 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer result.deinit(self.alloc);
-        var receipt = try actionReceiptAlloc(self.alloc, "fence_acquire", result.receipt.promoted_node_id, "applied", self.primaryNodeID());
+        var receipt = try actionReceiptAlloc(self.alloc, "fence_acquire", result.receipt.promoted_node_id, "applied", result.receipt.promoted_node_id);
         defer receipt.deinit(self.alloc);
         return try self.handleTypedJson(FenceDocument{
             .action = receipt,
@@ -1976,6 +1976,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_fence.body, "\"schema_version\":1");
     try expectContains(typed_fence.body, "\"action_kind\":\"fence_acquire\"");
     try expectContains(typed_fence.body, "\"action_id\":\"fence_acquire:standby-a\"");
+    try expectContains(typed_fence.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_fence.body, "\"receipt\"");
     try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 

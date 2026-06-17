@@ -44,7 +44,7 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 			"action_kind": "fence_acquire",
 			"target":      promotedNodeID,
 			"state":       "applied",
-			"node_id":     oldPrimaryID,
+			"node_id":     promotedNodeID,
 		},
 		"receipt": map[string]any{
 			"identity": map[string]any{
@@ -352,6 +352,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 					StandbyName: "standby-a",
 					TargetLSN:   5,
 					AdminURL:    "http://primary-ha.default.svc:8081",
+					AdminNodeID: "primary-a",
 					AdminMethod: "POST",
 					AdminPath:   "/admin/v1/ha/replication-slots",
 				}},
@@ -386,6 +387,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionNodeID).To(Equal("primary-a"))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -532,6 +534,7 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 					SlotName:     "standby-a",
 					AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
 					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
 				}},
 			},
 		},
@@ -595,6 +598,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
 					SlotName:     "standby-a",
 					AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
 					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
 				}},
 			},
 		},
@@ -651,6 +655,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMismatchedResultEvidence(t *testing
 					SlotName:     "standby-a",
 					AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
 					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
 				}},
 			},
 		},
@@ -663,7 +668,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMismatchedResultEvidence(t *testing
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-b"}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-b"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 			}, nil
 		})},
 	}
@@ -933,6 +938,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					Reason:          "AutomaticFailoverReady",
 					AdminCommand:    []string{"fence", "acquire"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
 				}, {
 					Kind:            string(haActionPromoteStandby),
 					DependsOn:       string(haActionAcquireFence),
@@ -943,6 +949,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
 				}},
 			},
 		},
@@ -1067,6 +1074,7 @@ func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
 					Reason:          "AutomaticFailoverReady",
 					AdminCommand:    []string{"fence", "acquire"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
 				}, {
 					Kind:            string(haActionPromoteStandby),
 					DependsOn:       string(haActionAcquireFence),
@@ -1077,6 +1085,7 @@ func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
 				}},
 			},
 		},
@@ -1550,6 +1559,7 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	result.ActionKind = "rejoin_rewind"
 	result.ActionTarget = "primary-a"
 	result.ActionState = "applied"
+	result.ActionNodeID = "primary-a"
 	result.Action = "rewind"
 	result.RewindExecuted = true
 	result.RewindPreviousLastLSN = 13
@@ -1563,6 +1573,7 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		ActionKind:       "rejoin_reseed",
 		ActionTarget:     "primary-a",
 		ActionState:      "applied",
+		ActionNodeID:     "primary-a",
 		Action:           "reseed",
 		FormerNodeID:     "primary-a",
 		TargetTimelineID: 5,
@@ -2241,6 +2252,13 @@ func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) 
 				ActionNodeID:  "node-a",
 			}
 			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
+
+			tt.action.AdminNodeID = "node-a"
+			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
+
+			tt.action.AdminResult.ActionNodeID = "node-b"
+			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeFalse())
+			tt.action.AdminResult.ActionNodeID = "node-a"
 
 			tt.action.AdminResult.ActionTarget = tt.wantTarget + "-other"
 			tt.action.AdminResult.ActionID = tt.wantKind + ":" + tt.action.AdminResult.ActionTarget

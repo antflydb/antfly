@@ -1585,6 +1585,10 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
 
+	// AdminNodeID is the node id expected in the typed HA admin action receipt from AdminURL.
+	// +optional
+	AdminNodeID string `json:"adminNodeID,omitempty"`
+
 	// AdminMethod is the HTTP method for the typed /admin/v1 operation that executes this action.
 	// +optional
 	AdminMethod string `json:"adminMethod,omitempty"`

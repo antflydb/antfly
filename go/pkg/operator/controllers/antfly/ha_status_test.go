@@ -1278,6 +1278,10 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://standby-a-ha.default.svc:8081" {
 		t.Fatalf("expected promote action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1])
 	}
+	if cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[1].AdminNodeID != "standby-a" {
+		t.Fatalf("expected fence/promote actions to require standby node receipts, got %#v", cluster.Status.HAStatus.PlannedActions[:2])
+	}
 	if cluster.Status.HAStatus.PlannedActions[2].AdminCommand != nil {
 		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
 	}
@@ -1300,6 +1304,9 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	}
 	if cluster.Status.HAStatus.PlannedActions[3].AdminURL != "" {
 		t.Fatalf("expected former-primary demote to require a former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[3])
+	}
+	if cluster.Status.HAStatus.PlannedActions[3].AdminNodeID != "primary-a" {
+		t.Fatalf("expected former-primary demote to require old primary node receipt, got %#v", cluster.Status.HAStatus.PlannedActions[3])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||

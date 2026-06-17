@@ -4126,6 +4126,9 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 	) {
 		return false
 	}
+	if !haDirectAdminActionNodeMatches(*action, result.ActionNodeID) {
+		return false
+	}
 	action.AdminResult = haPromotionAdminActionResult(result)
 	enrichHAPromotionAdminActionResult(action.AdminResult, identity, *action)
 	if cluster.Status.HAStatus.LastPromotion == nil ||
@@ -4335,6 +4338,9 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 		strings.TrimSpace(action.StandbyName),
 		expectedActionState,
 	) {
+		return false
+	}
+	if !haDirectAdminActionNodeMatches(action, result.ActionNodeID) {
 		return false
 	}
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary && !result.RewindExecuted {
@@ -5818,10 +5824,22 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 
 func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
 	result := action.AdminResult
-	if result == nil || result.SchemaVersion == 0 || strings.TrimSpace(result.ActionNodeID) == "" {
+	if result == nil || result.SchemaVersion == 0 {
+		return false
+	}
+	if !haDirectAdminActionNodeMatches(action, result.ActionNodeID) {
 		return false
 	}
 	return haAdminActionReceiptMatches(action)
+}
+
+func haDirectAdminActionNodeMatches(action antflyv1.HAPlannedActionStatus, resultNodeID string) bool {
+	resultNodeID = strings.TrimSpace(resultNodeID)
+	if resultNodeID == "" {
+		return false
+	}
+	expectedNodeID := strings.TrimSpace(action.AdminNodeID)
+	return expectedNodeID == "" || resultNodeID == expectedNodeID
 }
 
 func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
@@ -6217,6 +6235,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		SeedManifest string   `json:"seedManifestPath,omitempty"`
 		SeedRoot     string   `json:"seedContentRoot,omitempty"`
 		AdminURL     string   `json:"adminURL,omitempty"`
+		AdminNodeID  string   `json:"adminNodeID,omitempty"`
 		AdminCommand []string `json:"adminCommand,omitempty"`
 		Reason       string   `json:"reason,omitempty"`
 	}{
@@ -6238,6 +6257,7 @@ func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
 		SeedManifest: action.SeedManifestPath,
 		SeedRoot:     action.SeedContentRoot,
 		AdminURL:     action.AdminURL,
+		AdminNodeID:  action.AdminNodeID,
 		AdminCommand: action.AdminCommand,
 		Reason:       action.Reason,
 	})

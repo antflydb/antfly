@@ -488,7 +488,9 @@ This targeting rule is part of the production contract. A successful HTTP call
 to the wrong node is not enough evidence for failover automation; typed
 responses must include the acted-on node id, timeline, epoch, LSNs, fence token
 or receipt, and idempotency state so the operator can prove the intended node
-performed the intended step.
+performed the intended step. The Kubernetes operator should publish the expected
+node-local executor as `status.haStatus.plannedActions[].adminNodeID` and reject
+typed action receipts whose `action.node_id` does not match it.
 
 Kubernetes Jobs that run `antfly ha ...` are acceptable as a bootstrap mechanism
 for workflows that need pod-local volume mounts or shared backup files. They

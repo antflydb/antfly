@@ -640,6 +640,7 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			SeedContentRoot:  action.SeedContentRoot,
 			AdminCommand:     haAdminCommand(action, haReplicationIdentity(ha), status),
 			AdminURL:         haAdminURL(action, ha),
+			AdminNodeID:      haAdminNodeID(action, ha, status),
 			AdminMethod:      adminMethod,
 			AdminPath:        adminPath,
 			Reason:           action.Reason,
@@ -691,6 +692,7 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.FenceGeneration == b.FenceGeneration &&
 		a.FenceReason == b.FenceReason &&
 		a.AdminURL == b.AdminURL &&
+		a.AdminNodeID == b.AdminNodeID &&
 		a.AdminMethod == b.AdminMethod &&
 		a.AdminPath == b.AdminPath &&
 		a.SeedManifestPath == b.SeedManifestPath &&
@@ -766,6 +768,7 @@ func parseHAOperatorPlanAction(lines map[string]string, idx uint64) (antflyv1.HA
 		FenceHolder:      strings.TrimSpace(lines[prefix+"fence_holder"]),
 		FenceReason:      strings.TrimSpace(lines[prefix+"fence_reason"]),
 		AdminURL:         strings.TrimSpace(lines[prefix+"admin_url"]),
+		AdminNodeID:      strings.TrimSpace(lines[prefix+"admin_node_id"]),
 		AdminMethod:      strings.TrimSpace(lines[prefix+"admin_method"]),
 		AdminPath:        strings.TrimSpace(lines[prefix+"admin_path"]),
 		SeedManifestPath: strings.TrimSpace(lines[prefix+"seed_manifest_path"]),
@@ -1124,6 +1127,33 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 	default:
 		return ""
 	}
+}
+
+func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	switch action.Kind {
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
+		return haCurrentPrimaryNodeID(ha, status)
+	case haActionAcquireFence, haActionBootstrapStandbySeed, haActionPromoteStandby:
+		return strings.TrimSpace(action.StandbyName)
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
+		return strings.TrimSpace(action.StandbyName)
+	case haActionReseedFormerPrimary:
+		return haCurrentPrimaryNodeID(ha, status)
+	default:
+		return ""
+	}
+}
+
+func haCurrentPrimaryNodeID(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
+	if status != nil && status.LastPromotion != nil {
+		if promoted := strings.TrimSpace(status.LastPromotion.PromotedStandbyID); promoted != "" {
+			return promoted
+		}
+	}
+	if identity := haReplicationIdentity(ha); identity != nil {
+		return strings.TrimSpace(identity.CurrentPrimaryID)
+	}
+	return ""
 }
 
 func haAdminOperation(action haPlannedAction) (string, string) {
