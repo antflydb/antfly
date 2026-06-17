@@ -131,6 +131,60 @@ test "admin facade preserves HA failover receipt schema fields" {
     }
 }
 
+test "admin facade preserves HA status and gate schema fields" {
+    inline for (ha_primary_status_response_fields) |name| {
+        try expectFacadeStructField(HAPrimaryStatusResponse, name);
+    }
+    inline for (ha_standby_status_response_fields) |name| {
+        try expectFacadeStructField(HAStandbyStatusResponse, name);
+    }
+    inline for (ha_primary_snapshot_fields) |name| {
+        try expectFacadeStructField(HAPrimarySnapshot, name);
+    }
+    inline for (ha_standby_snapshot_fields) |name| {
+        try expectFacadeStructField(HAStandbySnapshot, name);
+    }
+    inline for (ha_slot_snapshot_fields) |name| {
+        try expectFacadeStructField(HASlotSnapshot, name);
+    }
+    inline for (ha_retention_snapshot_fields) |name| {
+        try expectFacadeStructField(HARetentionSnapshot, name);
+    }
+    inline for (ha_durability_decision_fields) |name| {
+        try expectFacadeStructField(HADurabilityDecision, name);
+    }
+    inline for (ha_commit_check_response_fields) |name| {
+        try expectFacadeStructField(HACommitCheckResponse, name);
+    }
+    inline for (ha_commit_append_response_fields) |name| {
+        try expectFacadeStructField(HACommitAppendResponse, name);
+    }
+    inline for (ha_commit_gate_fields) |name| {
+        try expectFacadeStructField(HACommitGate, name);
+    }
+    inline for (ha_read_check_response_fields) |name| {
+        try expectFacadeStructField(HAReadCheckResponse, name);
+    }
+    inline for (ha_read_decision_fields) |name| {
+        try expectFacadeStructField(HAReadDecision, name);
+    }
+    inline for (ha_write_check_response_fields) |name| {
+        try expectFacadeStructField(HAWriteCheckResponse, name);
+    }
+    inline for (ha_write_decision_fields) |name| {
+        try expectFacadeStructField(HAWriteDecision, name);
+    }
+    inline for (ha_owner_job_check_response_fields) |name| {
+        try expectFacadeStructField(HAOwnerJobCheckResponse, name);
+    }
+    inline for (ha_owner_job_decision_fields) |name| {
+        try expectFacadeStructField(HAOwnerJobDecision, name);
+    }
+    inline for (ha_promotion_handoff_fields) |name| {
+        try expectFacadeStructField(HAPromotionHandoff, name);
+    }
+}
+
 const ha_contract_type_names = [_][]const u8{
     "ReplicationSlotCreateRequest",
     "BaseBackupStartRequest",
@@ -260,6 +314,148 @@ const ha_rejoin_reseed_result_fields = [_][]const u8{
     "former_last_lsn",
     "reseed_required",
     "base_backup_required",
+};
+
+const ha_primary_status_response_fields = [_][]const u8{
+    "schema_version",
+    "snapshot",
+};
+
+const ha_standby_status_response_fields = [_][]const u8{
+    "schema_version",
+    "snapshot",
+};
+
+const ha_primary_snapshot_fields = [_][]const u8{
+    "role",
+    "identity",
+    "current_lsn",
+    "slots",
+    "retention",
+    "durability",
+};
+
+const ha_standby_snapshot_fields = [_][]const u8{
+    "role",
+    "identity",
+    "received_lsn",
+    "applied_lsn",
+    "safe_read_lsn",
+    "upstream_lsn",
+    "write_lag_lsn",
+    "receive_lag_lsn",
+    "apply_lag_lsn",
+    "unapplied_lsn_count",
+    "caught_up_to_received",
+    "can_serve_safe_reads",
+};
+
+const ha_slot_snapshot_fields = [_][]const u8{
+    "name",
+    "timeline_id",
+    "active",
+    "reseed_required",
+    "restart_lsn",
+    "received_lsn",
+    "applied_lsn",
+    "safe_read_lsn",
+    "write_lag_lsn",
+    "apply_lag_lsn",
+    "safe_read_lag_lsn",
+    "retention_lag_lsn",
+    "status",
+    "last_error",
+};
+
+const ha_retention_snapshot_fields = [_][]const u8{
+    "primary_lsn",
+    "oldest_restart_lsn",
+    "retained_lsn_count",
+    "active_slots",
+    "reseed_recommended",
+};
+
+const ha_durability_decision_fields = [_][]const u8{
+    "status",
+    "mode",
+    "selection",
+    "target_lsn",
+    "progress_lsn",
+    "missing_lsn_count",
+    "satisfied_count",
+    "required_count",
+    "candidate_count",
+};
+
+const ha_commit_check_response_fields = [_][]const u8{
+    "schema_version",
+    "gate",
+};
+
+const ha_commit_append_response_fields = [_][]const u8{
+    "schema_version",
+    "lsn",
+    "gate",
+};
+
+const ha_commit_gate_fields = [_][]const u8{
+    "target_lsn",
+    "action",
+    "durability",
+};
+
+const ha_read_check_response_fields = [_][]const u8{
+    "schema_version",
+    "decision",
+};
+
+const ha_read_decision_fields = [_][]const u8{
+    "action",
+    "consistency",
+    "required_lsn",
+    "required_metadata_lsn",
+    "received_lsn",
+    "applied_lsn",
+    "safe_read_lsn",
+    "metadata_applied_lsn",
+    "serve_lsn",
+    "missing_lsn_count",
+    "metadata_missing_lsn_count",
+};
+
+const ha_write_check_response_fields = [_][]const u8{
+    "schema_version",
+    "decision",
+};
+
+const ha_write_decision_fields = [_][]const u8{
+    "role",
+    "action",
+    "identity",
+    "durable_lsn",
+    "next_lsn",
+    "promotion_handoff",
+};
+
+const ha_owner_job_check_response_fields = [_][]const u8{
+    "schema_version",
+    "decision",
+};
+
+const ha_owner_job_decision_fields = [_][]const u8{
+    "kind",
+    "role",
+    "action",
+    "identity",
+    "durable_lsn",
+    "next_lsn",
+    "promotion_handoff",
+};
+
+const ha_promotion_handoff_fields = [_][]const u8{
+    "identity",
+    "switch_lsn",
+    "next_lsn",
 };
 
 fn expectFacadeTypeAlias(comptime name: []const u8) !void {
