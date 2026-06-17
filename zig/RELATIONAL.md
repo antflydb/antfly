@@ -5243,9 +5243,10 @@ typed stage that actually owns each field.
 
 Numeric summary tokens are delimiter-strict. A token value must end at the
 fingerprint boundary or before the next `:` separator; malformed hand-edits such
-as `select=1x` do not satisfy a `select = 1` summary. Numeric tokens are also
-single-assignment inside a fingerprint: duplicate occurrences of the same token
-are invalid even when a later duplicate has the expected value.
+as `select=1x` do not satisfy a `select = 1` summary. Numeric, string, and
+textual boolean tokens are also single-assignment inside a fingerprint:
+duplicate occurrences of the same token are invalid even when a later duplicate
+has the expected value.
 
 Row-stream predicate summaries are fingerprint-anchored for non-DDL typed read
 and source streams. Row-query plans, generic read-row plans, and `EXPLAIN`

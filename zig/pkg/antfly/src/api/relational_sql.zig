@@ -62170,9 +62170,28 @@ fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFami
     };
 }
 
-fn appParityPlanNonNoneStringTokenUsize(plan: []const u8, token: []const u8) usize {
-    if (!appParityPlanHasToken(plan, token)) return 0;
-    return if (appParityPlanHasExactStringToken(plan, token, "none")) 0 else 1;
+fn appParityPlanNonNoneStringTokenUsize(plan: []const u8, token: []const u8) ?usize {
+    return switch (appParityPlanScanStringToken(plan, token)) {
+        .absent => 0,
+        .value => |value| if (std.mem.eql(u8, value, "none")) 0 else 1,
+        .invalid => null,
+    };
+}
+
+fn appParityPlanNonNoneStringTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        sum += appParityPlanNonNoneStringTokenUsize(plan, token) orelse return false;
+    }
+    return sum == expected;
+}
+
+fn appParityPlanBoolTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        sum += appParityPlanBoolTokenUsize(plan, token) orelse return false;
+    }
+    return sum == expected;
 }
 
 fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
@@ -62187,13 +62206,13 @@ fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, 
         .alter_sequence,
         => appParityPlanHasExactUsizeToken(entry.plan, ":ops=", expected),
         .create_sequence => appParityPlanHasExactUsizeToken(entry.plan, ":options=", expected),
-        .identity_allocator => appParityPlanBoolTokenUsize(entry.plan, ":primary=") == expected,
+        .identity_allocator => (appParityPlanBoolTokenUsize(entry.plan, ":primary=") orelse return false) == expected,
         .create_function,
         .create_procedure,
         .drop_function,
         .drop_procedure,
         => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        .alter_role => appParityPlanNonNoneStringTokenUsize(entry.plan, ":setting=") == expected,
+        .alter_role => (appParityPlanNonNoneStringTokenUsize(entry.plan, ":setting=") orelse return false) == expected,
         .grant_privilege,
         .revoke_privilege,
         => appParityPlanHasExactUsizeToken(entry.plan, ":privileges=", expected),
@@ -62236,7 +62255,7 @@ fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, 
         .create_publication => appParityPlanHasExactUsizeToken(entry.plan, ":tables=", expected),
         .alter_publication => appParityPlanHasExactUsizeToken(entry.plan, ":add_tables=", expected),
         .create_subscription => appParityPlanHasExactUsizeToken(entry.plan, ":publications=", expected),
-        .notify_notification => appParityPlanBoolTokenUsize(entry.plan, ":payload=") == expected,
+        .notify_notification => (appParityPlanBoolTokenUsize(entry.plan, ":payload=") orelse return false) == expected,
         .create_collation,
         .create_operator,
         .create_aggregate,
@@ -62244,23 +62263,18 @@ fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, 
         .drop_operator,
         .drop_aggregate,
         => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        .vacuum_maintenance => appParityPlanBoolTokenUsize(entry.plan, ":full=") +
-            appParityPlanBoolTokenUsize(entry.plan, ":freeze=") +
-            appParityPlanBoolTokenUsize(entry.plan, ":verbose=") +
-            appParityPlanBoolTokenUsize(entry.plan, ":analyze=") == expected,
+        .vacuum_maintenance => appParityPlanBoolTokenSumMatches(entry.plan, &.{ ":full=", ":freeze=", ":verbose=", ":analyze=" }, expected),
         .analyze_maintenance => (appParityPlanUsizeTokenValue(entry.plan, ":columns=") orelse return false) +
-            appParityPlanBoolTokenUsize(entry.plan, ":verbose=") == expected,
-        .reindex_maintenance => appParityPlanBoolTokenUsize(entry.plan, ":concurrently=") == expected,
-        .cluster_maintenance => appParityPlanNonNoneStringTokenUsize(entry.plan, ":index=") == expected,
+            (appParityPlanBoolTokenUsize(entry.plan, ":verbose=") orelse return false) == expected,
+        .reindex_maintenance => (appParityPlanBoolTokenUsize(entry.plan, ":concurrently=") orelse return false) == expected,
+        .cluster_maintenance => (appParityPlanNonNoneStringTokenUsize(entry.plan, ":index=") orelse return false) == expected,
         .prepare_statement => appParityPlanHasExactUsizeToken(entry.plan, ":params=", expected),
         .execute_statement => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        .comment_metadata => appParityPlanBoolTokenUsize(entry.plan, ":comment=") == expected,
+        .comment_metadata => (appParityPlanBoolTokenUsize(entry.plan, ":comment=") orelse return false) == expected,
         .table_lock => appParityPlanHasExactUsizeToken(entry.plan, ":tables=", expected),
         .constraint_mode => (appParityPlanUsizeTokenValue(entry.plan, ":constraints=") orelse return false) +
-            appParityPlanBoolTokenUsize(entry.plan, ":all=") == expected,
-        .transaction_mode => appParityPlanNonNoneStringTokenUsize(entry.plan, ":isolation=") +
-            appParityPlanNonNoneStringTokenUsize(entry.plan, ":access=") +
-            appParityPlanNonNoneStringTokenUsize(entry.plan, ":deferrable=") == expected,
+            (appParityPlanBoolTokenUsize(entry.plan, ":all=") orelse return false) == expected,
+        .transaction_mode => appParityPlanNonNoneStringTokenSumMatches(entry.plan, &.{ ":isolation=", ":access=", ":deferrable=" }, expected),
         .advisory_lock => appParityPlanHasExactUsizeToken(entry.plan, ":keys=", expected),
         .fetch_cursor => appParityPlanHasExactUsizeToken(entry.plan, ":count=", expected) or expected == 0,
         .create_index,
@@ -62510,13 +62524,26 @@ fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
 }
 
 fn appParityPlanBoolTokenValue(plan: []const u8, token: []const u8) ?bool {
-    if (appParityPlanHasExactBoolToken(plan, token, true)) return true;
-    if (appParityPlanHasExactBoolToken(plan, token, false)) return false;
-    return null;
+    return switch (appParityPlanScanStringToken(plan, token)) {
+        .value => |value| blk: {
+            if (std.mem.eql(u8, value, "true")) break :blk true;
+            if (std.mem.eql(u8, value, "false")) break :blk false;
+            break :blk null;
+        },
+        .absent, .invalid => null,
+    };
 }
 
-fn appParityPlanBoolTokenUsize(plan: []const u8, token: []const u8) usize {
-    return if (appParityPlanBoolTokenValue(plan, token) orelse false) 1 else 0;
+fn appParityPlanBoolTokenUsize(plan: []const u8, token: []const u8) ?usize {
+    return switch (appParityPlanScanStringToken(plan, token)) {
+        .absent => 0,
+        .value => |value| blk: {
+            if (std.mem.eql(u8, value, "true")) break :blk 1;
+            if (std.mem.eql(u8, value, "false")) break :blk 0;
+            break :blk null;
+        },
+        .invalid => null,
+    };
 }
 
 fn appParityFixtureDdlSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
@@ -62528,7 +62555,7 @@ fn appParityFixtureDdlSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool
         .create_partitioned_table,
         => appParityPlanHasExactUsizeToken(entry.plan, ":columns=", expected),
         .identity_allocator => (appParityPlanUsizeTokenValue(entry.plan, ":columns=") orelse return false) +
-            appParityPlanBoolTokenUsize(entry.plan, ":primary=") == expected,
+            (appParityPlanBoolTokenUsize(entry.plan, ":primary=") orelse return false) == expected,
         .create_index => appParityPlanUsizeOptionalTokenSumMatches(entry.plan, &.{ ":columns=", ":expr=", ":generated_expr=" }, expected),
         .create_view,
         .create_materialized_view,
@@ -63595,6 +63622,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=serializable:access=none:deferrable=none",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "duplicate ddl transaction operations summary",
+        .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .transaction_mode, .operations = 2 },
+        .plan = "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=serializable:access=none:access=read_only:deferrable=none",
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid ddl transaction operations summary",
         .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
@@ -64420,6 +64455,14 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "duplicate temporal primary summary",
+        .sql = "CREATE TABLE products (product_id int NOT NULL, valid_at daterange NOT NULL, PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS));",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .table_name = "products", .select = 3, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 0 },
+        .plan = "ddl:create_table:table=products:columns=3:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=false:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "unsupported family plan mismatch",
         .sql = "DELETE FROM usage_records WHERE status = 'closed'",
         .family = .unsupported_delete,
@@ -64919,36 +64962,36 @@ fn appParityPlanUsizeOptionalTokenSumMatches(plan: []const u8, tokens: []const [
 }
 
 fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
-    const expected_text = if (expected) "true" else "false";
+    const value = appParityPlanBoolTokenValue(plan, token) orelse return false;
+    return value == expected;
+}
+
+const AppParityPlanStringTokenScan = union(enum) {
+    absent,
+    value: []const u8,
+    invalid,
+};
+
+fn appParityPlanScanStringToken(plan: []const u8, token: []const u8) AppParityPlanStringTokenScan {
     var start: usize = 0;
+    var found: ?[]const u8 = null;
     while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
         const value_start = index + token.len;
-        const value_end = value_start + expected_text.len;
-        if (value_end <= plan.len and
-            std.mem.eql(u8, plan[value_start..value_end], expected_text) and
-            (value_end == plan.len or plan[value_end] == ':'))
-        {
-            return true;
-        }
+        var value_end = value_start;
+        while (value_end < plan.len and plan[value_end] != ':') : (value_end += 1) {}
+        if (found != null) return .invalid;
+        found = plan[value_start..value_end];
         start = index + token.len;
     }
-    return false;
+    if (found) |value| return .{ .value = value };
+    return .absent;
 }
 
 fn appParityPlanHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const value_start = index + token.len;
-        const value_end = value_start + expected.len;
-        if (value_end <= plan.len and
-            std.mem.eql(u8, plan[value_start..value_end], expected) and
-            (value_end == plan.len or plan[value_end] == ':'))
-        {
-            return true;
-        }
-        start = index + token.len;
-    }
-    return false;
+    return switch (appParityPlanScanStringToken(plan, token)) {
+        .value => |value| std.mem.eql(u8, value, expected),
+        .absent, .invalid => false,
+    };
 }
 
 fn appParityPlanHasToken(plan: []const u8, token: []const u8) bool {
