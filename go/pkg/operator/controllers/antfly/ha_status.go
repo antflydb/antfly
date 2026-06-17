@@ -1140,10 +1140,8 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionAssessPromotion, haActionPromoteStandby:
 		return haStandbyAdminURL(ha, action.StandbyName)
-	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return haFormerPrimaryAdminURL(ha, action)
-	case haActionReseedFormerPrimary:
-		return haCurrentPrimaryAdminURL(ha, status)
 	default:
 		return ""
 	}
@@ -1181,10 +1179,8 @@ func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, st
 		return haCurrentPrimaryNodeID(ha, status)
 	case haActionAcquireFence, haActionBootstrapStandbySeed, haActionAssessPromotion, haActionPromoteStandby:
 		return strings.TrimSpace(action.StandbyName)
-	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return strings.TrimSpace(action.StandbyName)
-	case haActionReseedFormerPrimary:
-		return haCurrentPrimaryNodeID(ha, status)
 	default:
 		return ""
 	}
