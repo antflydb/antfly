@@ -454,8 +454,10 @@ The implementation path is:
    surface; storage HA modules own execution against local WAL, slots, fences,
    promotion state, and rejoin state; and
 5. generate the same admin OpenAPI contract into `go/pkg/sdk/admin`, keep a
-   small hand-written Go wrapper around the generated client, and have the CLI
-   and `go/pkg/operator` call that typed `/admin/v1/ha` wrapper.
+   small hand-written Go wrapper around the generated client, and have
+   `go/pkg/operator` and other Go automation call that typed `/admin/v1/ha`
+   wrapper. The supported Zig CLI should use the Zig admin bindings generated
+   from the same spec rather than importing or shelling through the Go SDK.
 
 The generated Zig module for this spec should remain the admin contract module
 (`antfly_admin_openapi`) and should be surfaced through
@@ -489,9 +491,11 @@ Recommended split:
   hand-written `go/pkg/sdk/admin` wrapper that normalizes the admin base URL,
   installs auth/request editors, exposes stable HA methods, returns typed
   responses plus raw response bodies where receipts must be audited, and maps
-  non-2xx responses into operation-aware errors. The operator should import
-  this package for executable admin operations instead of duplicating an HTTP
-  client, hard-coding paths, or parsing CLI output.
+  non-2xx responses into operation-aware errors. The Kubernetes operator should
+  import this wrapper for executable admin operations instead of duplicating an
+  HTTP client, hard-coding paths, importing generated `oapi` internals directly,
+  or parsing CLI output. The wrapper is the compatibility boundary for Go
+  control-plane code; generated `oapi` symbols are a transport detail.
 
 The admin API is node-local even though it is typed and operator-facing. The
 operator must choose the target node deliberately:
@@ -666,10 +670,15 @@ and either rewind or reseed.
 - Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
   `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
   operations following the style of the other SDK APIs.
-- Make both the CLI and operator consume the `go/pkg/sdk/admin` HA wrapper for
-  remote admin operations. Any CLI-only code path must be limited to local
-  filesystem recovery, pod-local volume manipulation, or explicit break-glass
-  workflows.
+- Make `go/pkg/operator` consume the `go/pkg/sdk/admin` HA wrapper for remote
+  admin operations. The operator should not import generated `oapi` internals
+  directly except in wrapper tests, and it should not maintain separate method
+  paths, request structs, response structs, retry classification, or auth header
+  plumbing for `/admin/v1/ha`.
+- Make the supported Zig CLI consume `zig/pkg/antfly/src/admin/` bindings and
+  route constants from the same `specs/openapi/antfly/admin.yaml` contract.
+  Any CLI-only code path must be limited to local filesystem recovery,
+  pod-local volume manipulation, or explicit break-glass workflows.
 
 ### Phase 9: Operator Integration
 
