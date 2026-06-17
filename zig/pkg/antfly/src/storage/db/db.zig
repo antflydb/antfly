@@ -33271,6 +33271,95 @@ test "db open quarantines dense index with unsupported artifact version" {
     try std.testing.expect(recovered.total_hits >= 1);
 }
 
+fn corruptNonEmptyFilesUnderDir(alloc: Allocator, root_path: []const u8) !usize {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer root_dir.close(io);
+
+    var walker = try root_dir.walk(alloc);
+    defer walker.deinit();
+
+    var corrupted: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_path, entry.path });
+        defer alloc.free(full_path);
+        const stat = try std.Io.Dir.cwd().statFile(io, full_path, .{});
+        if (stat.size == 0) continue;
+
+        const bytes = try alloc.alloc(u8, @intCast(stat.size));
+        defer alloc.free(bytes);
+        for (bytes, 0..) |*byte, i| {
+            byte.* = @truncate((i *% 131) +% 17);
+        }
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = full_path,
+            .data = bytes,
+        });
+        corrupted += 1;
+    }
+    return corrupted;
+}
+
+test "db drops quarantined dense index after persisted index directory corruption" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const path_slice = std.mem.span(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dv_corrupt",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_corrupt\"}}",
+    };
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const open_options: OpenOptions = .{
+        .enrichment = .{
+            .owner_id = "corrupt-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    {
+        var db = try DB.open(alloc, path_slice, open_options);
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try std.testing.expect(db.core.denseIndex("dv_corrupt") != null);
+    }
+
+    const index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_corrupt", .{path_slice});
+    defer alloc.free(index_path);
+    try std.testing.expect((try corruptNonEmptyFilesUnderDir(alloc, index_path)) > 0);
+
+    var db = try DB.open(alloc, path_slice, open_options);
+    defer db.close();
+
+    try std.testing.expect(db.core.denseIndex("dv_corrupt") == null);
+    _ = db.core.index_manager.loadFailure("dv_corrupt") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(try db.deleteIndex("dv_corrupt"));
+    try std.testing.expect(db.core.index_manager.loadFailure("dv_corrupt") == null);
+    try std.testing.expect(db.core.index_manager.get("dv_corrupt") == null);
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_impl.io(), index_path, .{}));
+}
+
 test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     const alloc = std.testing.allocator;
 
