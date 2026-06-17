@@ -85,6 +85,30 @@ pub const Record = struct {
 
 pub const RecordView = Record;
 
+fn decodeRecordKind(raw: u16) !RecordKind {
+    return switch (raw) {
+        @intFromEnum(RecordKind.batch_mutation) => .batch_mutation,
+        @intFromEnum(RecordKind.metadata_mutation) => .metadata_mutation,
+        @intFromEnum(RecordKind.derived_effect) => .derived_effect,
+        @intFromEnum(RecordKind.backup_start) => .backup_start,
+        @intFromEnum(RecordKind.backup_end) => .backup_end,
+        @intFromEnum(RecordKind.checkpoint) => .checkpoint,
+        @intFromEnum(RecordKind.manifest) => .manifest,
+        @intFromEnum(RecordKind.truncate) => .truncate,
+        @intFromEnum(RecordKind.timeline_switch) => .timeline_switch,
+        else => error.UnsupportedRecordKind,
+    };
+}
+
+fn decodePayloadCodec(raw: u16) !PayloadCodec {
+    return switch (raw) {
+        @intFromEnum(PayloadCodec.raw) => .raw,
+        @intFromEnum(PayloadCodec.json) => .json,
+        @intFromEnum(PayloadCodec.binary) => .binary,
+        else => error.UnsupportedPayloadCodec,
+    };
+}
+
 pub fn encodedLen(payload_len: usize) !usize {
     return std.math.add(usize, header_size, payload_len);
 }
@@ -152,8 +176,8 @@ pub fn decode(bytes: []const u8) !RecordView {
     if (stored_payload_crc != computed_payload_crc) return error.PayloadCrcMismatch;
 
     return .{
-        .kind = @enumFromInt(std.mem.readInt(u16, bytes[record_kind_offset..][0..2], .little)),
-        .payload_codec = @enumFromInt(std.mem.readInt(u16, bytes[payload_codec_offset..][0..2], .little)),
+        .kind = try decodeRecordKind(std.mem.readInt(u16, bytes[record_kind_offset..][0..2], .little)),
+        .payload_codec = try decodePayloadCodec(std.mem.readInt(u16, bytes[payload_codec_offset..][0..2], .little)),
         .flags = std.mem.readInt(u32, bytes[flags_offset..][0..4], .little),
         .cluster_id = std.mem.readInt(u64, bytes[cluster_id_offset..][0..8], .little),
         .shard_id = std.mem.readInt(u64, bytes[shard_id_offset..][0..8], .little),
@@ -271,4 +295,27 @@ test "ha replication record rejects unsupported versions and bad magic" {
     std.mem.writeInt(u16, encoded[version_offset..][0..2], format_version + 1, .little);
     std.mem.writeInt(u32, encoded[header_crc_offset..][0..4], Crc32.hash(encoded[0..header_crc_offset]), .little);
     try std.testing.expectError(error.UnsupportedVersion, decode(encoded));
+}
+
+test "ha replication record rejects unknown current-version kind and codec" {
+    var encoded = try encodeAlloc(std.testing.allocator, .{
+        .kind = .batch_mutation,
+        .payload_codec = .raw,
+        .cluster_id = 1,
+        .timeline_id = 2,
+        .epoch = 3,
+        .lsn = 4,
+        .previous_lsn = 3,
+        .payload = "mutation",
+    });
+    defer std.testing.allocator.free(encoded);
+
+    std.mem.writeInt(u16, encoded[record_kind_offset..][0..2], 0xffff, .little);
+    std.mem.writeInt(u32, encoded[header_crc_offset..][0..4], Crc32.hash(encoded[0..header_crc_offset]), .little);
+    try std.testing.expectError(error.UnsupportedRecordKind, decode(encoded));
+
+    std.mem.writeInt(u16, encoded[record_kind_offset..][0..2], @intFromEnum(RecordKind.batch_mutation), .little);
+    std.mem.writeInt(u16, encoded[payload_codec_offset..][0..2], 0xffff, .little);
+    std.mem.writeInt(u32, encoded[header_crc_offset..][0..4], Crc32.hash(encoded[0..header_crc_offset]), .little);
+    try std.testing.expectError(error.UnsupportedPayloadCodec, decode(encoded));
 }
