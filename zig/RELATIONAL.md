@@ -5418,9 +5418,11 @@ requires a well-formed exact `aggs=0` token. Table and source-table coverage
 also uses exact string tokens, so a fingerprint naming `products_extra` cannot
 claim coverage for `products`. Pagination coverage requires exact `limit`,
 `source_limit`, and true absence of `offset`/`source_offset` tokens for
-unbounded/null-pagination cases. DDL family coverage that is already represented
-by the typed `ddl_tag`, such as `table_clone`, is satisfied from that tag rather
-than a second string search over the fingerprint.
+unbounded/null-pagination cases. Joined mutation-source semijoin coverage
+requires exact `right_pred` and `on` count tokens instead of combined substring
+matches. DDL family coverage that is already represented by the typed `ddl_tag`,
+such as `table_clone`, is satisfied from that tag rather than a second string
+search over the fingerprint.
 `EXPLAIN` fixture metadata and coverage use the same exact-token rule for
 `explain:kind`, `analyze`, and option tokens such as `format`, `verbose`, and
 `costs`; malformed option values or suffix-like `kind=write_extra` values cannot

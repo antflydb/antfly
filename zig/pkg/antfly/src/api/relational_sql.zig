@@ -65122,6 +65122,11 @@ fn appParityExplainPlanHasKind(plan: []const u8, expected: []const u8) bool {
     return appParityPlanHasExactStringToken(plan, "explain:kind=", expected);
 }
 
+fn appParityJoinedSourcePlanHasCounts(plan: []const u8, right_predicates: usize, join_keys: usize) bool {
+    return appParityPlanHasExactUsizeToken(plan, ":right_pred=", right_predicates) and
+        appParityPlanHasExactUsizeToken(plan, ":on=", join_keys);
+}
+
 fn appParityAppliedPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
     return appParityAppliedPlanIsStructured(plan) and
         appParityPlanHasExactBoolToken(plan, token, expected);
@@ -65380,6 +65385,38 @@ test "app parity pagination coverage tokens are exact" {
     try std.testing.expect(coverage.query_set_operation_order_limit);
     try std.testing.expect(coverage.set_operation_fetch_tail);
     try std.testing.expect(coverage.update_source_nullable_pagination);
+}
+
+test "app parity joined source count coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .update_joined_source,
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
+        .plan = "update_joined_source:table=usage_records:source=archived_records:right_pred=0x:on=1:ops=1:returning=0:returning_expr=0",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .delete_joined_source,
+        .sql = "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
+        .plan = "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=20:returning=0:returning_expr=0",
+    });
+
+    try std.testing.expect(!coverage.update_joined_source_non_primary_semijoin);
+    try std.testing.expect(!coverage.delete_joined_source_correlated_semijoin);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .update_joined_source,
+        .sql = "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
+        .plan = "update_joined_source:table=usage_records:source=archived_records:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .delete_joined_source,
+        .sql = "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
+        .plan = "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=2:returning=0:returning_expr=0",
+    });
+
+    try std.testing.expect(coverage.update_joined_source_non_primary_semijoin);
+    try std.testing.expect(coverage.delete_joined_source_correlated_semijoin);
 }
 
 test "app parity explain coverage tokens are exact" {
@@ -66226,24 +66263,24 @@ const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
         self.update_joined_source_non_primary_semijoin = self.update_joined_source_non_primary_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=1:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 1));
         self.delete_joined_source_non_primary_semijoin = self.delete_joined_source_non_primary_semijoin or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=1:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 1));
         self.update_joined_source_correlated_semijoin = self.update_joined_source_correlated_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=2:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.delete_joined_source_correlated_semijoin = self.delete_joined_source_correlated_semijoin or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=2:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.update_joined_source_correlated_filtered_semijoin = self.update_joined_source_correlated_filtered_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = 'o1'") != null and
             std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=1:on=2:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 2));
         self.delete_joined_source_correlated_filtered_semijoin = self.delete_joined_source_correlated_filtered_semijoin or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = 'o1'") != null and
             std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=1:on=2:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 2));
         self.update_joined_source_semijoin_match_expression = self.update_joined_source_semijoin_match_expression or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
@@ -66253,11 +66290,11 @@ const AppParityCorpusCoverage = struct {
         self.update_joined_source_exists_semijoin = self.update_joined_source_exists_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
             std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = usage_records.id") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=1:on=1:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 1));
         self.delete_joined_source_exists_semijoin = self.delete_joined_source_exists_semijoin or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
             std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = usage_records.id") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=1:on=1:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 1));
         self.update_joined_source_exists_match_expression = self.update_joined_source_exists_match_expression or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
             std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
@@ -66268,10 +66305,10 @@ const AppParityCorpusCoverage = struct {
             appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.update_joined_source_row_value_semijoin = self.update_joined_source_row_value_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=2:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.delete_joined_source_row_value_semijoin = self.delete_joined_source_row_value_semijoin or (is_delete_joined_source and
             std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
-            std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=2:") != null);
+            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.update_joined_source_modulo_expression = self.update_joined_source_modulo_expression or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "MOD(source.quantity + usage_records.quantity, 7)") != null and
             std.mem.indexOf(u8, entry.sql, "quantity % 2") != null and
