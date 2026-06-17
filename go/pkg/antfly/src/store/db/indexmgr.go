@@ -50,6 +50,19 @@ var ErrPartialSuccess = errors.New(
 	"batch written to KV store and full-text WAL, indexes queued for async processing",
 )
 
+type indexOpenError struct {
+	name string
+	err  error
+}
+
+func (e *indexOpenError) Error() string {
+	return fmt.Sprintf("opening index %s: %v", e.name, e.err)
+}
+
+func (e *indexOpenError) Unwrap() error {
+	return e.err
+}
+
 const indexManagerPartitionSize = 1000
 
 var indexOpPool = sync.Pool{
@@ -777,7 +790,7 @@ func (im *IndexManager) Register(name string, rebuild bool, config indexes.Index
 	im.logger.Info("Opening index at registration", zap.String("name", name))
 	if err := index.Open(rebuild, im.schema, im.byteRange); err != nil {
 		im.indexes.Delete(name)
-		openErr := fmt.Errorf("opening index %s: %w", name, err)
+		openErr := &indexOpenError{name: name, err: err}
 		if closeErr := index.Close(); closeErr != nil {
 			return errors.Join(openErr, fmt.Errorf("closing failed index %s: %w", name, closeErr))
 		}

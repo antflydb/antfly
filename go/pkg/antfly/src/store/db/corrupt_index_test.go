@@ -16,6 +16,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"math/rand/v2"
 	"os"
@@ -146,4 +147,38 @@ func TestHealthyIndexDropStillWorks(t *testing.T) {
 	require.False(t, db.HasIndex("test_idx"))
 	require.False(t, db.HasIndexConfig("test_idx"))
 	require.NoDirExists(t, idxDir)
+}
+
+func TestOpenIndexConstructorErrorIsFatal(t *testing.T) {
+	dir := t.TempDir()
+	db := &DBImpl{
+		logger: zaptest.NewLogger(t),
+		indexes: map[string]indexes.IndexConfig{
+			"bad_idx": {
+				Name: "bad_idx",
+				Type: indexes.IndexType("unsupported"),
+			},
+		},
+	}
+	defer func() { _ = db.Close() }()
+
+	err := db.Open(dir, false, nil, types.Range{nil, []byte{0xFF}})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported index type")
+	require.False(t, db.IsIndexFailed("bad_idx"))
+}
+
+func TestAddIndexClearsFailedIndexMarker(t *testing.T) {
+	dir := t.TempDir()
+	db := &DBImpl{logger: zaptest.NewLogger(t)}
+	require.NoError(t, db.Open(dir, false, nil, types.Range{nil, []byte{0xFF}}))
+	t.Cleanup(func() { _ = db.Close() })
+
+	db.markIndexFailed("test_idx", errors.New("old open failure"))
+	require.True(t, db.IsIndexFailed("test_idx"))
+
+	cfg := indexes.NewFullTextIndexConfig("test_idx", true)
+	require.NoError(t, db.AddIndex(*cfg))
+	require.True(t, db.HasIndex("test_idx"))
+	require.False(t, db.IsIndexFailed("test_idx"))
 }

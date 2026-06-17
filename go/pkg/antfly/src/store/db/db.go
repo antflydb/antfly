@@ -590,6 +590,7 @@ func (db *DBImpl) AddIndex(config indexes.IndexConfig) error {
 		delete(db.indexes, config.Name)
 		return fmt.Errorf("saving indexes to pebble: %w", err)
 	}
+	delete(db.failedIndexes, config.Name)
 	return nil
 }
 
@@ -2278,6 +2279,10 @@ func (db *DBImpl) openIndex(dir string, recoverIndex bool) error {
 	for idx, conf := range db.indexes {
 		db.logger.Debug("Opening index", zap.String("index", idx), zap.Any("index_config", conf))
 		if err := db.getIndexManager().Register(idx, !recoverIndex, conf); err != nil {
+			var openErr *indexOpenError
+			if !errors.As(err, &openErr) {
+				return fmt.Errorf("registering preconfigured index %s: %w", idx, err)
+			}
 			// A single index that fails to open (for example a corrupt on-disk
 			// artifact) must not bring down the whole shard. Run degraded: keep
 			// the config so the index stays known and droppable, record the
