@@ -623,6 +623,13 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 			openAPIPath: "/ha/standby/status",
 			operationID: "getHAStandbyStatus",
 		},
+		{
+			name:        "promotion assessment",
+			method:      "POST",
+			path:        haAdminPromotionAssessPath,
+			openAPIPath: "/ha/promotion/assess",
+			operationID: "assessHAPromotion",
+		},
 	}
 	for _, tt := range statusOperations {
 		t.Run(tt.name, func(t *testing.T) {

@@ -68,6 +68,7 @@ const (
 	haAdminBaseBackupsFinishPath           = haAdminBaseBackupsPath + "/finish"
 	haAdminStandbyBootstrapPath            = haAdminHAPath + "/standby/bootstrap"
 	haAdminFencePath                       = haAdminHAPath + "/fence"
+	haAdminPromotionAssessPath             = haAdminHAPath + "/promotion/assess"
 	haAdminPromotionCurrentFencePath       = haAdminHAPath + "/promotion/current-fence"
 	haAdminRejoinAssessPath                = haAdminHAPath + "/rejoin/assess"
 	haAdminRejoinRewindPath                = haAdminHAPath + "/rejoin/rewind"
