@@ -590,7 +590,7 @@ pub const Server = struct {
 
     fn handleAdminAcquireFence(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
-        const fence = self.parseFenceRequest(req) catch {
+        const fence = self.parseAcquireFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA fence request");
         };
         var result = ha_admin.acquirePromotionFence(self.alloc, fence_store, fence) catch |err| {
@@ -676,7 +676,7 @@ pub const Server = struct {
     fn handleAdminPromote(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const fence_store = self.ctx.fence_store orelse return try textResponse(self.alloc, 409, "FenceStoreUnavailable");
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
-        const fence = self.parseFenceRequest(req) catch {
+        const fence = self.parsePromoteFenceRequest(req) catch {
             return try textResponse(self.alloc, 400, "invalid HA promotion request");
         };
         var result = ha_admin.promoteWithFence(self.alloc, fence_store, standby, .{ .fence = fence }) catch |err| {
@@ -803,9 +803,19 @@ pub const Server = struct {
         });
     }
 
-    fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
+    fn parseAcquireFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
         if (req.body.len == 0) return error.InvalidAdminRequest;
         var parsed = admin_api.server.parseAcquireHAFenceBody(
+            self.alloc,
+            req.body,
+        ) catch return error.InvalidAdminRequest;
+        defer parsed.deinit();
+        return adminFenceRequestFromOpenApi(parsed.value) catch return error.InvalidAdminRequest;
+    }
+
+    fn parsePromoteFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
+        if (req.body.len == 0) return error.InvalidAdminRequest;
+        var parsed = admin_api.server.parsePromoteHABody(
             self.alloc,
             req.body,
         ) catch return error.InvalidAdminRequest;
@@ -2499,6 +2509,42 @@ test "storage.ha http admin accepts whole instance identity" {
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"forced\":true");
+    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+}
+
+test "storage.ha http admin promotes from operation-specific fence request body" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "direct-promote-body");
+    defer paths.deinit(alloc);
+    const identity = standby_mod.Identity{
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{ .standby = &standby, .fence_store = &fence_store });
+    defer server.deinit();
+
+    var typed_promote = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_promotion,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"direct-promote\"}",
+    });
+    defer typed_promote.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
+    try expectContains(typed_promote.body, "\"action_kind\":\"promotion\"");
+    try expectContains(typed_promote.body, "\"action_id\":\"promotion:standby-a\"");
+    try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
+    try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
+    try expectContains(typed_promote.body, "\"forced\":true");
+    try expectContains(typed_promote.body, "\"data_loss_possible\":true");
     try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
 }
 
