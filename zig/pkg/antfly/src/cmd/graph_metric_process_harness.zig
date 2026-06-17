@@ -106,6 +106,9 @@ const ProcessHarnessReleaseSummary = struct {
     service_multipage_worker_pool_families: usize = 0,
     service_multipage_coordinator_takeover_families: usize = 0,
     service_multipage_worker_pool_takeover_families: usize = 0,
+    service_multipage_worker_phase_proofs: usize = 0,
+    service_multipage_coordinator_phase_proofs: usize = 0,
+    service_multipage_takeover_phase_proofs: usize = 0,
     service_cleanup_takeover_families: usize = 0,
     service_active_public_read_families: usize = 0,
     direct_publish_cleanup_families: usize = 0,
@@ -127,6 +130,9 @@ const required_process_harness_release_summary = ProcessHarnessReleaseSummary{
     .service_multipage_worker_pool_families = 4,
     .service_multipage_coordinator_takeover_families = 4,
     .service_multipage_worker_pool_takeover_families = 4,
+    .service_multipage_worker_phase_proofs = 27,
+    .service_multipage_coordinator_phase_proofs = 31,
+    .service_multipage_takeover_phase_proofs = 8,
     .service_cleanup_takeover_families = 4,
     .service_active_public_read_families = 4,
     .direct_publish_cleanup_families = 4,
@@ -144,6 +150,17 @@ fn recordDirectPageReclaimProof(summary: *ProcessHarnessReleaseSummary) void {
     summary.direct_page_reclaim_phase_proofs += 1;
     summary.direct_reclaimed_attempt_completion_phase_proofs += 1;
     summary.direct_stale_attempt_rejection_phase_proofs += 1;
+}
+
+fn recordServiceMultipagePhaseProofs(
+    summary: *ProcessHarnessReleaseSummary,
+    worker_phase_proofs: usize,
+    coordinator_phase_proofs: usize,
+    takeover_phase_proofs: usize,
+) void {
+    summary.service_multipage_worker_phase_proofs += worker_phase_proofs;
+    summary.service_multipage_coordinator_phase_proofs += coordinator_phase_proofs;
+    summary.service_multipage_takeover_phase_proofs += takeover_phase_proofs;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -484,6 +501,7 @@ pub fn main(init: std.process.Init) !void {
     release_summary.service_multipage_worker_pool_families += 1;
     release_summary.service_multipage_coordinator_takeover_families += 1;
     release_summary.service_multipage_worker_pool_takeover_families += 1;
+    recordServiceMultipagePhaseProofs(&release_summary, 4, 5, 2);
 
     const pagerank_service_owner_target_generation = try seedPageRankDb(alloc, pagerank_service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, pagerank_service_owner_db_path, "pagerank", pagerank_service_owner_target_generation);
@@ -522,6 +540,7 @@ pub fn main(init: std.process.Init) !void {
     release_summary.service_multipage_worker_pool_families += 1;
     release_summary.service_multipage_coordinator_takeover_families += 1;
     release_summary.service_multipage_worker_pool_takeover_families += 1;
+    recordServiceMultipagePhaseProofs(&release_summary, 7, 8, 2);
 
     const eigenvector_service_owner_target_generation = try seedEigenvectorDb(alloc, eigenvector_service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, eigenvector_service_owner_db_path, "eigenvector", eigenvector_service_owner_target_generation);
@@ -560,6 +579,7 @@ pub fn main(init: std.process.Init) !void {
     release_summary.service_multipage_worker_pool_families += 1;
     release_summary.service_multipage_coordinator_takeover_families += 1;
     release_summary.service_multipage_worker_pool_takeover_families += 1;
+    recordServiceMultipagePhaseProofs(&release_summary, 7, 8, 2);
 
     const hits_service_owner_target_generation = try seedHitsBackgroundDb(alloc, hits_service_owner_db_path);
     try verifyServiceTargetedMetricOwnerRestartProcess(alloc, init.io, antfly_exe, hits_service_owner_db_path, "hits_authority", hits_service_owner_target_generation);
@@ -598,6 +618,7 @@ pub fn main(init: std.process.Init) !void {
     release_summary.service_multipage_worker_pool_families += 1;
     release_summary.service_multipage_coordinator_takeover_families += 1;
     release_summary.service_multipage_worker_pool_takeover_families += 1;
+    recordServiceMultipagePhaseProofs(&release_summary, 9, 10, 2);
 
     const degree_service_active_public_read_initial_generation = try seedDegreeSearchDb(alloc, degree_service_active_public_read_db_path);
     try verifyDegreeServiceActiveProcessPublicReadFreshness(
@@ -851,6 +872,9 @@ fn hasServiceRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, requi
         summary.service_multipage_worker_pool_families == required.service_multipage_worker_pool_families and
         summary.service_multipage_coordinator_takeover_families == required.service_multipage_coordinator_takeover_families and
         summary.service_multipage_worker_pool_takeover_families == required.service_multipage_worker_pool_takeover_families and
+        summary.service_multipage_worker_phase_proofs == required.service_multipage_worker_phase_proofs and
+        summary.service_multipage_coordinator_phase_proofs == required.service_multipage_coordinator_phase_proofs and
+        summary.service_multipage_takeover_phase_proofs == required.service_multipage_takeover_phase_proofs and
         summary.service_cleanup_takeover_families == required.service_cleanup_takeover_families and
         summary.service_active_public_read_families == required.service_active_public_read_families;
 }
@@ -887,7 +911,7 @@ fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSu
         },
     );
     try out.print(
-        ",\"required_launch_families\":{d},\"launch_families\":{d},\"required_service_owner_restart_families\":{d},\"service_owner_restart_families\":{d},\"required_service_publish_cleanup_families\":{d},\"service_publish_cleanup_families\":{d},\"required_service_publish_failure_families\":{d},\"service_publish_failure_families\":{d},\"required_service_multipage_worker_pool_families\":{d},\"service_multipage_worker_pool_families\":{d},\"required_service_multipage_coordinator_takeover_families\":{d},\"service_multipage_coordinator_takeover_families\":{d},\"required_service_multipage_worker_pool_takeover_families\":{d},\"service_multipage_worker_pool_takeover_families\":{d},\"required_service_cleanup_takeover_families\":{d},\"service_cleanup_takeover_families\":{d},\"required_service_active_public_read_families\":{d},\"service_active_public_read_families\":{d}",
+        ",\"required_launch_families\":{d},\"launch_families\":{d},\"required_service_owner_restart_families\":{d},\"service_owner_restart_families\":{d},\"required_service_publish_cleanup_families\":{d},\"service_publish_cleanup_families\":{d},\"required_service_publish_failure_families\":{d},\"service_publish_failure_families\":{d},\"required_service_multipage_worker_pool_families\":{d},\"service_multipage_worker_pool_families\":{d},\"required_service_multipage_coordinator_takeover_families\":{d},\"service_multipage_coordinator_takeover_families\":{d},\"required_service_multipage_worker_pool_takeover_families\":{d},\"service_multipage_worker_pool_takeover_families\":{d},\"required_service_multipage_worker_phase_proofs\":{d},\"service_multipage_worker_phase_proofs\":{d},\"required_service_multipage_coordinator_phase_proofs\":{d},\"service_multipage_coordinator_phase_proofs\":{d},\"required_service_multipage_takeover_phase_proofs\":{d},\"service_multipage_takeover_phase_proofs\":{d},\"required_service_cleanup_takeover_families\":{d},\"service_cleanup_takeover_families\":{d},\"required_service_active_public_read_families\":{d},\"service_active_public_read_families\":{d}",
         .{
             required.launch_families,
             summary.launch_families,
@@ -903,6 +927,12 @@ fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSu
             summary.service_multipage_coordinator_takeover_families,
             required.service_multipage_worker_pool_takeover_families,
             summary.service_multipage_worker_pool_takeover_families,
+            required.service_multipage_worker_phase_proofs,
+            summary.service_multipage_worker_phase_proofs,
+            required.service_multipage_coordinator_phase_proofs,
+            summary.service_multipage_coordinator_phase_proofs,
+            required.service_multipage_takeover_phase_proofs,
+            summary.service_multipage_takeover_phase_proofs,
             required.service_cleanup_takeover_families,
             summary.service_cleanup_takeover_families,
             required.service_active_public_read_families,
