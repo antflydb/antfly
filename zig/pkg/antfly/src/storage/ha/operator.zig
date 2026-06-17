@@ -1031,7 +1031,7 @@ fn automaticFailoverReason(spec: Spec, observed: Observed, allowed: bool) []cons
     const fence_holder = fencing_observed.holder orelse return "FencingHolderMissing";
     _ = fencing_observed.generation orelse return "FencingGenerationMissing";
     if (!desiredStandbyNamed(spec, fence_holder)) return "FencingHolderNotDesired";
-    if (!standbyRouteSelectorConfigured(spec, fence_holder)) return "PrimaryRouteSelectorMissing";
+    if (!standbyRouteSelectorConfigured(spec, fence_holder)) return "HAPrimaryRouteSelectorMissing";
     if (automaticFailoverSlotReason(spec, primary, fence_holder)) |reason| return reason;
     return "NoEligibleStandby";
 }
@@ -1703,7 +1703,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     defer route_missing.deinit(alloc);
     try std.testing.expect(!route_missing.automatic_promotion_allowed);
     try std.testing.expectEqualStrings(
-        "PrimaryRouteSelectorMissing",
+        "HAPrimaryRouteSelectorMissing",
         (condition(route_missing, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
     for (route_missing.actions) |action| {
