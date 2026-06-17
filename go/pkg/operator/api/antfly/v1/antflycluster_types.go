@@ -1704,6 +1704,26 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	PromotionFenced bool `json:"promotionFenced,omitempty"`
 
+	// PromotionSafe reports whether a promotion assessment found no safety violation.
+	// +optional
+	PromotionSafe bool `json:"promotionSafe,omitempty"`
+
+	// PromotionForce reports whether a promotion assessment used force.
+	// +optional
+	PromotionForce bool `json:"promotionForce,omitempty"`
+
+	// PromotionDataLossPossible reports whether a promotion assessment found possible data loss.
+	// +optional
+	PromotionDataLossPossible bool `json:"promotionDataLossPossible,omitempty"`
+
+	// PromotionRequiresFencing reports whether a promotion assessment still needs fencing.
+	// +optional
+	PromotionRequiresFencing bool `json:"promotionRequiresFencing,omitempty"`
+
+	// PromotionRequiresForce reports whether a promotion assessment needs force to proceed.
+	// +optional
+	PromotionRequiresForce bool `json:"promotionRequiresForce,omitempty"`
+
 	// FenceGeneration is the promotion fence generation returned by fence operations.
 	// +optional
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`

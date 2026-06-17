@@ -1280,6 +1280,12 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionRequiredLSN).To(Equal(uint64(12)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionAppliedLSN).To(Equal(uint64(12)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionCanPromote).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionFenced).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionSafe).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionForce).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionDataLossPossible).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionRequiresFencing).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionRequiresForce).To(BeFalse())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult).NotTo(BeNil())
@@ -1328,6 +1334,18 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 		{
 			name: "missing force field",
 			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+		},
+		{
+			name: "forced assessment",
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+		},
+		{
+			name: "lossy force assessment",
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":true,"data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+		},
+		{
+			name: "requires force",
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":true,"can_promote":true}}`,
 		},
 	}
 

@@ -4053,39 +4053,44 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		return nil, false
 	}
 	status := &antflyv1.HAAdminActionResultStatus{
-		SchemaVersion:         result.SchemaVersion,
-		ActionID:              strings.TrimSpace(result.Action.ActionID),
-		ActionKind:            strings.TrimSpace(result.Action.ActionKind),
-		ActionTarget:          strings.TrimSpace(result.Action.Target),
-		ActionState:           strings.TrimSpace(result.Action.State),
-		ActionNodeID:          strings.TrimSpace(result.Action.NodeID),
-		SlotAction:            strings.TrimSpace(result.SlotAction),
-		SlotName:              strings.TrimSpace(result.SlotName),
-		ManifestID:            strings.TrimSpace(result.ManifestID),
-		BackupLSN:             result.BackupLSN,
-		StartRecordLSN:        result.StartRecordLSN,
-		EndRecordLSN:          result.EndRecordLSN,
-		CheckpointLSN:         result.CheckpointLSN,
-		PromotionRequiredLSN:  haUint64JSONValue(result.Assessment.RequiredLSN),
-		PromotionReceivedLSN:  haUint64JSONValue(result.Assessment.ReceivedLSN),
-		PromotionAppliedLSN:   haUint64JSONValue(result.Assessment.AppliedLSN),
-		PromotionCanPromote:   haBoolJSONValue(result.Assessment.CanPromote),
-		PromotionFenced:       haBoolJSONValue(result.Assessment.FencingConfirmed),
-		FenceGeneration:       haUint64JSONValue(result.Receipt.Generation),
-		FenceToken:            strings.TrimSpace(result.Receipt.Token),
-		FenceClusterID:        haUint64JSONValue(result.Receipt.Identity.ClusterID),
-		FenceShardID:          haUint64JSONValue(result.Receipt.Identity.ShardID),
-		FenceTableID:          haUint64JSONValue(result.Receipt.Identity.TableID),
-		FenceOldPrimaryID:     strings.TrimSpace(result.Receipt.OldPrimaryID),
-		FencePromotedNodeID:   strings.TrimSpace(result.Receipt.PromotedNodeID),
-		FenceParentTimelineID: haUint64JSONValue(result.Receipt.ParentTimelineID),
-		FenceParentEpoch:      haUint64JSONValue(result.Receipt.ParentEpoch),
-		FenceNewTimelineID:    haUint64JSONValue(result.Receipt.NewTimelineID),
-		FenceNewEpoch:         haUint64JSONValue(result.Receipt.NewEpoch),
-		FenceRequiredLSN:      haUint64JSONValue(result.Receipt.RequiredLSN),
-		FenceObservedLSN:      haUint64JSONValue(result.Receipt.ObservedLSN),
-		FenceForced:           haBoolJSONValue(result.Receipt.Forced),
-		FenceReason:           haStringJSONValue(result.Receipt.Reason),
+		SchemaVersion:             result.SchemaVersion,
+		ActionID:                  strings.TrimSpace(result.Action.ActionID),
+		ActionKind:                strings.TrimSpace(result.Action.ActionKind),
+		ActionTarget:              strings.TrimSpace(result.Action.Target),
+		ActionState:               strings.TrimSpace(result.Action.State),
+		ActionNodeID:              strings.TrimSpace(result.Action.NodeID),
+		SlotAction:                strings.TrimSpace(result.SlotAction),
+		SlotName:                  strings.TrimSpace(result.SlotName),
+		ManifestID:                strings.TrimSpace(result.ManifestID),
+		BackupLSN:                 result.BackupLSN,
+		StartRecordLSN:            result.StartRecordLSN,
+		EndRecordLSN:              result.EndRecordLSN,
+		CheckpointLSN:             result.CheckpointLSN,
+		PromotionRequiredLSN:      haUint64JSONValue(result.Assessment.RequiredLSN),
+		PromotionReceivedLSN:      haUint64JSONValue(result.Assessment.ReceivedLSN),
+		PromotionAppliedLSN:       haUint64JSONValue(result.Assessment.AppliedLSN),
+		PromotionCanPromote:       haBoolJSONValue(result.Assessment.CanPromote),
+		PromotionFenced:           haBoolJSONValue(result.Assessment.FencingConfirmed),
+		PromotionSafe:             haBoolJSONValue(result.Assessment.Safe),
+		PromotionForce:            haBoolJSONValue(result.Assessment.Force),
+		PromotionDataLossPossible: haBoolJSONValue(result.Assessment.DataLossPossible),
+		PromotionRequiresFencing:  haBoolJSONValue(result.Assessment.RequiresFencing),
+		PromotionRequiresForce:    haBoolJSONValue(result.Assessment.RequiresForce),
+		FenceGeneration:           haUint64JSONValue(result.Receipt.Generation),
+		FenceToken:                strings.TrimSpace(result.Receipt.Token),
+		FenceClusterID:            haUint64JSONValue(result.Receipt.Identity.ClusterID),
+		FenceShardID:              haUint64JSONValue(result.Receipt.Identity.ShardID),
+		FenceTableID:              haUint64JSONValue(result.Receipt.Identity.TableID),
+		FenceOldPrimaryID:         strings.TrimSpace(result.Receipt.OldPrimaryID),
+		FencePromotedNodeID:       strings.TrimSpace(result.Receipt.PromotedNodeID),
+		FenceParentTimelineID:     haUint64JSONValue(result.Receipt.ParentTimelineID),
+		FenceParentEpoch:          haUint64JSONValue(result.Receipt.ParentEpoch),
+		FenceNewTimelineID:        haUint64JSONValue(result.Receipt.NewTimelineID),
+		FenceNewEpoch:             haUint64JSONValue(result.Receipt.NewEpoch),
+		FenceRequiredLSN:          haUint64JSONValue(result.Receipt.RequiredLSN),
+		FenceObservedLSN:          haUint64JSONValue(result.Receipt.ObservedLSN),
+		FenceForced:               haBoolJSONValue(result.Receipt.Forced),
+		FenceReason:               haStringJSONValue(result.Receipt.Reason),
 	}
 	if status.SlotName == "" {
 		status.SlotName = strings.TrimSpace(result.Slot.SlotName)
@@ -6530,7 +6535,14 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 }
 
 func haPromotionAssessmentResultMatchesAction(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
-	if result == nil || !result.PromotionCanPromote || !result.PromotionFenced {
+	if result == nil ||
+		!result.PromotionCanPromote ||
+		!result.PromotionFenced ||
+		!result.PromotionSafe ||
+		result.PromotionForce ||
+		result.PromotionDataLossPossible ||
+		result.PromotionRequiresFencing ||
+		result.PromotionRequiresForce {
 		return false
 	}
 	if action.TargetLSN > 0 {

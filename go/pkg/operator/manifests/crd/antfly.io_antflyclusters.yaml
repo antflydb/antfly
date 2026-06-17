@@ -8917,9 +8917,17 @@ spec:
                               description: PromotionCanPromote reports whether a promotion
                                 assessment permits promotion.
                               type: boolean
+                            promotionDataLossPossible:
+                              description: PromotionDataLossPossible reports whether
+                                a promotion assessment found possible data loss.
+                              type: boolean
                             promotionFenced:
                               description: PromotionFenced reports whether promotion
                                 assessment observed a fence.
+                              type: boolean
+                            promotionForce:
+                              description: PromotionForce reports whether a promotion
+                                assessment used force.
                               type: boolean
                             promotionReceivedLSN:
                               description: PromotionReceivedLSN is the standby received
@@ -8931,6 +8939,18 @@ spec:
                                 checked by a promotion assessment.
                               format: int64
                               type: integer
+                            promotionRequiresFencing:
+                              description: PromotionRequiresFencing reports whether
+                                a promotion assessment still needs fencing.
+                              type: boolean
+                            promotionRequiresForce:
+                              description: PromotionRequiresForce reports whether
+                                a promotion assessment needs force to proceed.
+                              type: boolean
+                            promotionSafe:
+                              description: PromotionSafe reports whether a promotion
+                                assessment found no safety violation.
+                              type: boolean
                             rejoinAction:
                               description: RejoinAction is the former-primary rejoin
                                 action returned by a rejoin assessment.
