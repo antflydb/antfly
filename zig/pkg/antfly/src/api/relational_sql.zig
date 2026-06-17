@@ -63158,8 +63158,8 @@ fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
 fn appParityDdlFixtureAppliesFromEmptyCatalog(entry: AppParityCorpusEntry) !bool {
     if (entry.family != .ddl) return false;
     return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
-        .create_table => std.mem.indexOf(u8, entry.plan, ":if_not_exists=true") == null and
-            std.mem.indexOf(u8, entry.plan, ":replace=true") == null,
+        .create_table => !appParityPlanHasExactBoolToken(entry.plan, ":if_not_exists=", true) and
+            !appParityPlanHasExactBoolToken(entry.plan, ":replace=", true),
         else => false,
     };
 }
@@ -65148,6 +65148,29 @@ test "app parity claim coverage tokens are exact" {
     try std.testing.expect(appParityPlanHasAnyExactStringToken(no_key_nowait, ":claim=", &.{
         "no_key_update",
         "no_key_update_nowait",
+    }));
+}
+
+test "app parity create table empty-catalog detection uses exact bool tokens" {
+    try std.testing.expect(try appParityDdlFixtureAppliesFromEmptyCatalog(.{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:pk=1",
+    }));
+    try std.testing.expect(!try appParityDdlFixtureAppliesFromEmptyCatalog(.{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=true:pk=1",
+    }));
+    try std.testing.expect(!try appParityDdlFixtureAppliesFromEmptyCatalog(.{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
+    }));
+    try std.testing.expect(try appParityDdlFixtureAppliesFromEmptyCatalog(.{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=true_extra:pk=1",
     }));
 }
 

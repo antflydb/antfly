@@ -1475,7 +1475,11 @@ corpus. Coverage accounting reads those lifecycle facts from exact typed
 Schema-json-applied DDL fixture families
 (`CREATE TABLE`, `CREATE TABLE ... LIKE`, `CREATE INDEX`, `DROP INDEX`,
 supported `ALTER TABLE`, `DROP TABLE`, and table-owned update policies) are
-required to carry an `applied_plan` fingerprint on each fixture entry. `DROP
+required to carry an `applied_plan` fingerprint on each fixture entry. Plain
+`CREATE TABLE` fixture application starts from an empty catalog unless the
+typed plan has exact `if_not_exists=true` or `replace=true` tokens; idempotent
+and replacement forms must apply against the embedded base schema rather than a
+substring-matched approximation of those flags. `DROP
 TABLE` schema application removes the table catalog by producing an empty
 schema JSON result; multi-table dependency cleanup and generation promotion
 remain catalog workflow concerns.
@@ -5399,7 +5403,9 @@ metadata gate replays that setup SQL plus the fixture SQL through the typed DDL
 catalog applier and requires the stored `applied_plan` to equal the derived
 fingerprint. Coverage requirements for rebuild, validation, rewrite, and
 unvalidated constraint states are then satisfied from exact parsed fingerprint
-tokens.
+tokens. Base-schema selection for schema-applied `CREATE TABLE` fixtures also
+uses exact typed bool tokens for `if_not_exists` and `replace`, so stale or
+malformed flag-like substrings cannot redirect the catalog apply path.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 
