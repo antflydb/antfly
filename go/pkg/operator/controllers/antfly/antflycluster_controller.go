@@ -3708,9 +3708,11 @@ type haDirectAdminActionResultJSON struct {
 
 type haDirectAdminActionResultEnvelope struct {
 	Result struct {
-		Slot         *haDirectAdminActionResultJSON `json:"slot,omitempty"`
-		SeedBegin    *haDirectAdminActionResultJSON `json:"seed_begin,omitempty"`
-		FenceAcquire *haDirectAdminActionResultJSON `json:"fence_acquire,omitempty"`
+		Slot          *haDirectAdminActionResultJSON `json:"slot,omitempty"`
+		SeedBegin     *haDirectAdminActionResultJSON `json:"seed_begin,omitempty"`
+		SeedFinish    *haDirectAdminActionResultJSON `json:"seed_finish,omitempty"`
+		SeedBootstrap *haDirectAdminActionResultJSON `json:"seed_bootstrap,omitempty"`
+		FenceAcquire  *haDirectAdminActionResultJSON `json:"fence_acquire,omitempty"`
 	} `json:"result"`
 }
 
@@ -3753,6 +3755,10 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 			result = envelope.Result.Slot
 		case envelope.Result.SeedBegin != nil:
 			result = envelope.Result.SeedBegin
+		case envelope.Result.SeedFinish != nil:
+			result = envelope.Result.SeedFinish
+		case envelope.Result.SeedBootstrap != nil:
+			result = envelope.Result.SeedBootstrap
 		case envelope.Result.FenceAcquire != nil:
 			result = envelope.Result.FenceAcquire
 		default:

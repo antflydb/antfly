@@ -2097,11 +2097,25 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(finish.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
 
+	legacyFinish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"seed_finish":{"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(legacyFinish.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(legacyFinish.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(legacyFinish.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(legacyFinish.EndRecordLSN).To(Equal(uint64(8)))
+
 	bootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(bootstrap.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(bootstrap.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(bootstrap.CheckpointLSN).To(Equal(uint64(7)))
+
+	legacyBootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"seed_bootstrap":{"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(legacyBootstrap.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(legacyBootstrap.ManifestID).To(Equal("base-standby-a-5"))
+	g.Expect(legacyBootstrap.BackupLSN).To(Equal(uint64(5)))
+	g.Expect(legacyBootstrap.CheckpointLSN).To(Equal(uint64(7)))
 
 	slot, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_action":"pause","slot":{"slot_name":"standby-a"}}`))
 	g.Expect(ok).To(BeTrue())
