@@ -731,8 +731,16 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
 
     var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
     defer primary.close();
+    var standby = try ha.standby.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, testIdentity(), .{});
+    defer standby.close();
+    var fence_store = try ha.fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
 
-    var server = ha.http_admin.Server.init(alloc, .{ .primary = &primary });
+    var server = ha.http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .standby = &standby,
+        .fence_store = &fence_store,
+    });
     defer server.deinit();
     var recorder = RecordingExecutor.init(alloc, server.executor());
     defer recorder.deinit();
@@ -745,9 +753,7 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
-    try expectContains(recorder.last_uri.?, admin_api.routes.ha_replication_slots);
-    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_replication_slots);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--table",
@@ -758,9 +764,84 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
-    try expectContains(recorder.last_uri.?, admin_api.routes.ha_replication_slots);
-    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_replication_slots);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "seed",
+        "begin",
+        "--slot",
+        "standby-json",
+        "--manifest-id",
+        "base-standby-json-1",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_base_backups);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "status",
+        "primary",
+        "--max-lag-lsn",
+        "4",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "status",
+        "standby",
+        "--upstream-lsn",
+        "4",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_standby_status);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "fence",
+        "acquire",
+        "--cluster-id",
+        "10",
+        "--shard-id",
+        "20",
+        "--table-id",
+        "30",
+        "--timeline-id",
+        "1",
+        "--epoch",
+        "2",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-b",
+        "--new-timeline-id",
+        "2",
+        "--new-epoch",
+        "3",
+        "--required-lsn",
+        "0",
+        "--observed-lsn",
+        "0",
+        "--reason",
+        "operator-approved",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_fence);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "fence",
+        "current",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_fence_current);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "promote",
+        "assess",
+        "--required-lsn",
+        "0",
+        "--fencing-confirmed",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_assess);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "rejoin",              "assess",
@@ -774,9 +855,7 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
         "--retained-from-lsn", "8",
     }, recorder.executor());
 
-    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
-    try expectContains(recorder.last_uri.?, admin_api.routes.ha_rejoin_assess);
-    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_assess);
 }
 
 test "ha cmd renders typed JSON responses as dotted table fields" {
@@ -888,12 +967,14 @@ const TestPaths = struct {
     primary_slots: [:0]u8,
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
+    fence_wal: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
+        alloc.free(self.fence_wal);
     }
 };
 
@@ -907,6 +988,8 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_log);
     const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
     defer alloc.free(standby_progress);
+    const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
+    defer alloc.free(fence_wal);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -914,12 +997,14 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
         .primary_slots = try alloc.dupeZ(u8, primary_slots),
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
+        .fence_wal = try alloc.dupeZ(u8, fence_wal),
     };
 }
 
@@ -982,4 +1067,10 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
         std.debug.print("expected to find '{s}' in '{s}'\n", .{ needle, haystack });
         return error.TestExpectedSubstring;
     }
+}
+
+fn expectTypedRoute(recorder: *const RecordingExecutor, method: http_common.Method, path: []const u8) !void {
+    try std.testing.expectEqual(method, recorder.last_method.?);
+    try expectContains(recorder.last_uri.?, path);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
 }
