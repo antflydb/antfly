@@ -2682,8 +2682,7 @@ pub const DirectoryBatchWriter = struct {
 
     pub fn appendPostingBase(self: *DirectoryBatchWriter, base: posting.PostingBase) !void {
         const encoded = try posting.PostingFormat.encodeBase(self.alloc, base);
-        defer self.alloc.free(encoded);
-        try self.appendBase(base.posting_id, encoded);
+        try self.appendLatestPointOwned(base.posting_id, .base, encoded);
     }
 
     pub fn appendCentroidDirectory(self: *DirectoryBatchWriter, posting_id: PostingId, value: []const u8) !void {
@@ -2692,8 +2691,7 @@ pub const DirectoryBatchWriter = struct {
 
     pub fn appendCentroidDirectoryRecord(self: *DirectoryBatchWriter, record: posting.CentroidDirectoryRecord) !void {
         const encoded = try posting.CentroidDirectoryFormat.encode(self.alloc, record);
-        defer self.alloc.free(encoded);
-        try self.appendCentroidDirectory(record.posting_id, encoded);
+        try self.appendLatestPointOwned(record.posting_id, .centroid_directory, encoded);
     }
 
     pub fn appendDelta(self: *DirectoryBatchWriter, posting_id: PostingId, sequence: u64, value: []const u8) !void {
@@ -2856,6 +2854,35 @@ pub const DirectoryBatchWriter = struct {
         try self.notePendingAppend(value.len);
     }
 
+    fn appendLatestPointOwned(self: *DirectoryBatchWriter, posting_id: PostingId, kind: EntryKind, value: []u8) !void {
+        std.debug.assert(kind != .delta);
+        var owned = value;
+        errdefer if (owned.len != 0) self.alloc.free(owned);
+
+        if (try self.replacePendingPointOwned(posting_id, kind, owned)) {
+            owned = &.{};
+            return;
+        }
+
+        try self.prepareForAppend(owned.len);
+        const transferred = owned;
+        owned = &.{};
+        switch (kind) {
+            .base => try self.writer.appendOwnedEntry(.{
+                .posting_id = posting_id,
+                .kind = .base,
+                .sequence = 0,
+            }, transferred),
+            .centroid_directory => try self.writer.appendOwnedEntry(.{
+                .posting_id = posting_id,
+                .kind = .centroid_directory,
+                .sequence = 0,
+            }, transferred),
+            .delta => unreachable,
+        }
+        try self.notePendingAppend(transferred.len);
+    }
+
     fn pendingPointValue(self: *const DirectoryBatchWriter, posting_id: PostingId, kind: EntryKind) ?[]const u8 {
         std.debug.assert(kind != .delta);
         for (self.writer.entries.items) |entry| {
@@ -2984,6 +3011,26 @@ pub const DirectoryBatchWriter = struct {
             } else {
                 self.pending_value_bytes -= old_len - value.len;
             }
+            if (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes) {
+                _ = try self.flush();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn replacePendingPointOwned(self: *DirectoryBatchWriter, posting_id: PostingId, kind: EntryKind, value: []u8) !bool {
+        std.debug.assert(kind != .delta);
+        for (self.writer.entries.items) |*entry| {
+            if (entry.posting_id != posting_id or entry.kind != kind or entry.sequence != 0) continue;
+            const old_len = entry.value.len;
+            const next_pending_value_bytes = if (value.len >= old_len)
+                std.math.add(usize, self.pending_value_bytes, value.len - old_len) catch return error.PostingSegmentTooLarge
+            else
+                self.pending_value_bytes - (old_len - value.len);
+            self.alloc.free(entry.value);
+            entry.value = value;
+            self.pending_value_bytes = next_pending_value_bytes;
             if (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes) {
                 _ = try self.flush();
             }
