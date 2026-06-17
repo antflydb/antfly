@@ -65195,6 +65195,62 @@ test "app parity ddl submode coverage tokens are exact" {
     try std.testing.expect(appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as_extra"));
 }
 
+test "app parity ddl boolean coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true_extra",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_function },
+        .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true_extra:returns=trigger:language=plpgsql",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .drop_table },
+        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true_extra",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=10",
+        .sql = "TRUNCATE usage_records RESTART IDENTITY",
+    });
+
+    try std.testing.expect(!coverage.ddl_replace_table);
+    try std.testing.expect(!coverage.ddl_function_replace);
+    try std.testing.expect(!coverage.ddl_drop_table_cascade);
+    try std.testing.expect(!coverage.truncate_restart_identity);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_function },
+        .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .drop_table },
+        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=1",
+        .sql = "TRUNCATE usage_records RESTART IDENTITY",
+    });
+
+    try std.testing.expect(coverage.ddl_replace_table);
+    try std.testing.expect(coverage.ddl_function_replace);
+    try std.testing.expect(coverage.ddl_drop_table_cascade);
+    try std.testing.expect(coverage.truncate_restart_identity);
+}
+
 test "app parity explain coverage tokens are exact" {
     const write_suffix = AppParityCorpusEntry{
         .family = .explain,
@@ -66466,7 +66522,7 @@ const AppParityCorpusCoverage = struct {
                     std.mem.indexOf(u8, entry.plan, "truncate_source:table=usage_records") != null);
             self.truncate_restart_identity = self.truncate_restart_identity or
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
-                    std.mem.indexOf(u8, entry.plan, ":restart_identity=1") != null);
+                    appParityPlanHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
         } else if (entry.family == .unsupported_ddl) {
             self.unsupported_ddl_materialized_view_replace = self.unsupported_ddl_materialized_view_replace or
                 (std.mem.eql(u8, entry.classification_reason, "materialized_view_replace_if_not_exists") and
@@ -66505,7 +66561,7 @@ const AppParityCorpusCoverage = struct {
                     self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
                         (std.mem.indexOf(u8, entry.plan, ":temporal_fk=1") != null and
                             std.mem.indexOf(u8, entry.sql, " ON DELETE CASCADE") != null);
-                    self.ddl_replace_table = self.ddl_replace_table or std.mem.indexOf(u8, entry.plan, ":replace=true") != null;
+                    self.ddl_replace_table = self.ddl_replace_table or appParityPlanHasExactBoolToken(entry.plan, ":replace=", true);
                 },
                 .table_clone => self.ddl_table_clone = true,
                 .create_view => self.ddl_view_create = true,
@@ -66550,7 +66606,7 @@ const AppParityCorpusCoverage = struct {
                 .create_extension => self.ddl_extension_create = true,
                 .create_function => {
                     self.ddl_function_create = true;
-                    self.ddl_function_replace = self.ddl_function_replace or std.mem.indexOf(u8, entry.plan, ":replace=true") != null;
+                    self.ddl_function_replace = self.ddl_function_replace or appParityPlanHasExactBoolToken(entry.plan, ":replace=", true);
                 },
                 .drop_function => self.ddl_function_drop = true,
                 .create_procedure => self.ddl_procedure_create = true,
@@ -66631,7 +66687,7 @@ const AppParityCorpusCoverage = struct {
                 .drop_index => self.ddl_drop_index = true,
                 .drop_table => {
                     self.ddl_drop_table = true;
-                    self.ddl_drop_table_cascade = self.ddl_drop_table_cascade or std.mem.indexOf(u8, entry.plan, ":cascade=true") != null;
+                    self.ddl_drop_table_cascade = self.ddl_drop_table_cascade or appParityPlanHasExactBoolToken(entry.plan, ":cascade=", true);
                 },
                 .alter_table => {
                     self.ddl_alter_table = true;
