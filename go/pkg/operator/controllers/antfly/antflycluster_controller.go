@@ -4683,6 +4683,19 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 		if promotion.NewEpoch > 0 && result.TargetEpoch != promotion.NewEpoch {
 			return false
 		}
+		if promotion.ClusterID > 0 {
+			if result.ParentClusterID != promotion.ClusterID ||
+				result.ParentShardID != promotion.ShardID ||
+				result.ParentTableID != promotion.TableID {
+				return false
+			}
+		}
+		if promotion.ParentTimelineID > 0 && result.ParentTimelineID != promotion.ParentTimelineID {
+			return false
+		}
+		if promotion.ParentEpoch > 0 && result.ParentEpoch != promotion.ParentEpoch {
+			return false
+		}
 	}
 	return haRejoinResultMatchesPromotion(status, action, haRejoinAdminActionResult(result))
 }
@@ -5080,6 +5093,11 @@ type haRejoinJobResult struct {
 	FormerNodeID             string
 	TargetTimelineID         uint64
 	TargetEpoch              uint64
+	ParentClusterID          uint64
+	ParentShardID            uint64
+	ParentTableID            uint64
+	ParentTimelineID         uint64
+	ParentEpoch              uint64
 	ForkLSN                  uint64
 	FormerLastLSN            uint64
 	RetainedFromLSN          uint64
@@ -5125,6 +5143,24 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 		return haRejoinJobResult{}, false
 	}
 	if result.TargetEpoch, ok = parseHAResultUint(lines, assessmentPrefix+"target_epoch"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentClusterID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_cluster_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentShardID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_shard_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentTableID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_table_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentTimelineID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_timeline_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentEpoch, ok = parseHAResultUint(lines, assessmentPrefix+"parent_epoch"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentClusterID == 0 || result.ParentTimelineID == 0 || result.ParentEpoch == 0 {
 		return haRejoinJobResult{}, false
 	}
 	if result.ForkLSN, ok = parseHAResultUint(lines, assessmentPrefix+"fork_lsn"); !ok {
@@ -5237,6 +5273,11 @@ type haRejoinAPIResult struct {
 	FormerNodeID      string  `json:"former_node_id"`
 	TargetTimelineID  *uint64 `json:"target_timeline_id"`
 	TargetEpoch       *uint64 `json:"target_epoch"`
+	ParentClusterID   *uint64 `json:"parent_cluster_id"`
+	ParentShardID     *uint64 `json:"parent_shard_id"`
+	ParentTableID     *uint64 `json:"parent_table_id"`
+	ParentTimelineID  *uint64 `json:"parent_timeline_id"`
+	ParentEpoch       *uint64 `json:"parent_epoch"`
 	ForkLSN           *uint64 `json:"fork_lsn"`
 	FormerLastLSN     *uint64 `json:"former_last_lsn"`
 	RetainedFromLSN   *uint64 `json:"retained_from_lsn"`
@@ -5281,6 +5322,11 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 	}
 	targetTimelineID := haUint64JSONValue(assessment.TargetTimelineID)
 	targetEpoch := haUint64JSONValue(assessment.TargetEpoch)
+	parentClusterID := haUint64JSONValue(assessment.ParentClusterID)
+	parentShardID := haUint64JSONValue(assessment.ParentShardID)
+	parentTableID := haUint64JSONValue(assessment.ParentTableID)
+	parentTimelineID := haUint64JSONValue(assessment.ParentTimelineID)
+	parentEpoch := haUint64JSONValue(assessment.ParentEpoch)
 	forkLSN := haUint64JSONValue(assessment.ForkLSN)
 	formerLastLSN := haUint64JSONValue(assessment.FormerLastLSN)
 	retainedFromLSN := haUint64JSONValue(assessment.RetainedFromLSN)
@@ -5296,6 +5342,11 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		FormerNodeID:      strings.TrimSpace(assessment.FormerNodeID),
 		TargetTimelineID:  targetTimelineID,
 		TargetEpoch:       targetEpoch,
+		ParentClusterID:   parentClusterID,
+		ParentShardID:     parentShardID,
+		ParentTableID:     parentTableID,
+		ParentTimelineID:  parentTimelineID,
+		ParentEpoch:       parentEpoch,
 		ForkLSN:           forkLSN,
 		FormerLastLSN:     formerLastLSN,
 		RetainedFromLSN:   retainedFromLSN,
@@ -5363,6 +5414,14 @@ func haRejoinAssessmentJSONComplete(assessment haRejoinAPIResult) bool {
 		haRejoinAssessmentReasonJSONValid(assessment.Reason) &&
 		assessment.TargetTimelineID != nil &&
 		assessment.TargetEpoch != nil &&
+		assessment.ParentClusterID != nil &&
+		assessment.ParentShardID != nil &&
+		assessment.ParentTableID != nil &&
+		assessment.ParentTimelineID != nil &&
+		assessment.ParentEpoch != nil &&
+		haUint64JSONValue(assessment.ParentClusterID) > 0 &&
+		haUint64JSONValue(assessment.ParentTimelineID) > 0 &&
+		haUint64JSONValue(assessment.ParentEpoch) > 0 &&
 		assessment.ForkLSN != nil &&
 		assessment.FormerLastLSN != nil &&
 		assessment.RetainedFromLSN != nil &&

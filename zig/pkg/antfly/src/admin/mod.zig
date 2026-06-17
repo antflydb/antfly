@@ -123,6 +123,9 @@ test "admin facade preserves HA failover receipt schema fields" {
     inline for (ha_rejoin_assess_response_fields) |name| {
         try expectFacadeStructField(HARejoinAssessResponse, name);
     }
+    inline for (ha_rejoin_assessment_fields) |name| {
+        try expectFacadeStructField(HARejoinAssessment, name);
+    }
     inline for (ha_rejoin_rewind_result_fields) |name| {
         try expectFacadeStructField(HARejoinRewindResult, name);
     }
@@ -570,6 +573,23 @@ const ha_fence_response_fields = [_][]const u8{
     "schema_version",
     "action",
     "receipt",
+};
+
+const ha_rejoin_assessment_fields = [_][]const u8{
+    "action",
+    "reason",
+    "former_node_id",
+    "target_timeline_id",
+    "target_epoch",
+    "parent_cluster_id",
+    "parent_shard_id",
+    "parent_table_id",
+    "parent_timeline_id",
+    "parent_epoch",
+    "fork_lsn",
+    "former_last_lsn",
+    "retained_from_lsn",
+    "data_loss_discarded",
 };
 
 const ha_current_fence_response_fields = [_][]const u8{

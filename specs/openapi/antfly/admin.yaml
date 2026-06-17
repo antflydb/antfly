@@ -1390,6 +1390,11 @@ components:
         - former_node_id
         - target_timeline_id
         - target_epoch
+        - parent_cluster_id
+        - parent_shard_id
+        - parent_table_id
+        - parent_timeline_id
+        - parent_epoch
         - fork_lsn
         - former_last_lsn
         - retained_from_lsn
@@ -1423,6 +1428,31 @@ components:
           type: integer
           format: uint64
           minimum: 1
+        parent_cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Cluster identity of the retained parent-timeline fork record.
+        parent_shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Shard identity of the retained parent-timeline fork record.
+        parent_table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Table identity of the retained parent-timeline fork record.
+        parent_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Parent timeline that must contain the fork record before rewind.
+        parent_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Parent epoch that must contain the fork record before rewind.
         fork_lsn:
           type: integer
           format: uint64

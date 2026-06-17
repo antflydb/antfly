@@ -125,6 +125,16 @@ pub const HARejoinAssessment = struct {
     former_node_id: []const u8,
     target_timeline_id: i64,
     target_epoch: i64,
+    /// Cluster identity of the retained parent-timeline fork record.
+    parent_cluster_id: i64,
+    /// Shard identity of the retained parent-timeline fork record.
+    parent_shard_id: i64,
+    /// Table identity of the retained parent-timeline fork record.
+    parent_table_id: i64,
+    /// Parent timeline that must contain the fork record before rewind.
+    parent_timeline_id: i64,
+    /// Parent epoch that must contain the fork record before rewind.
+    parent_epoch: i64,
     fork_lsn: i64,
     former_last_lsn: i64,
     retained_from_lsn: i64,

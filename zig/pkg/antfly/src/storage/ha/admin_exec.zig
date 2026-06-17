@@ -675,6 +675,11 @@ fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAsses
         .former_node_id = assessment.former_node_id,
         .target_timeline_id = try adminI64(assessment.target_timeline_id),
         .target_epoch = try adminI64(assessment.target_epoch),
+        .parent_cluster_id = try adminI64(assessment.parent_cluster_id),
+        .parent_shard_id = try adminI64(assessment.parent_shard_id),
+        .parent_table_id = try adminI64(assessment.parent_table_id),
+        .parent_timeline_id = try adminI64(assessment.parent_timeline_id),
+        .parent_epoch = try adminI64(assessment.parent_epoch),
         .fork_lsn = try adminI64(assessment.fork_lsn),
         .former_last_lsn = try adminI64(assessment.former_last_lsn),
         .retained_from_lsn = try adminI64(assessment.retained_from_lsn),
@@ -1623,6 +1628,11 @@ fn appendRejoinAssessmentLines(
     try appendPrefixedLine(alloc, out, prefix, "former_node_id", assessment.former_node_id);
     try appendPrefixedU64Line(alloc, out, prefix, "target_timeline_id", assessment.target_timeline_id);
     try appendPrefixedU64Line(alloc, out, prefix, "target_epoch", assessment.target_epoch);
+    try appendPrefixedU64Line(alloc, out, prefix, "parent_cluster_id", assessment.parent_cluster_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "parent_shard_id", assessment.parent_shard_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "parent_table_id", assessment.parent_table_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "parent_timeline_id", assessment.parent_timeline_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "parent_epoch", assessment.parent_epoch);
     try appendPrefixedU64Line(alloc, out, prefix, "fork_lsn", assessment.fork_lsn);
     try appendPrefixedU64Line(alloc, out, prefix, "former_last_lsn", assessment.former_last_lsn);
     try appendPrefixedU64Line(alloc, out, prefix, "retained_from_lsn", assessment.retained_from_lsn);
