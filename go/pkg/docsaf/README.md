@@ -361,8 +361,9 @@ docsaf sync --source google-drive --drive-folder <folder-url> --inline-content -
 
 For private Drive folders, `--inline-content` is usually required unless Antfly
 can fetch the emitted Drive links directly. The CLI raises the default inline
-limit to 128 MiB for Google Drive sources; use `--max-inline-bytes` for larger
-files.
+limit to 100 MiB for Google Drive sources to match the Drive download cap. For
+larger files, stage the content behind Antfly-readable URLs and sync it with a
+source that does not require Drive downloads.
 
 #### Using with MinIO
 

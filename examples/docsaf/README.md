@@ -134,7 +134,7 @@ Source flags:
 - `--inline-content`: encode source bytes into `data:` URLs for local smoke
   tests and private sources.
 - `--max-inline-bytes`: maximum bytes per source row when using
-  `--inline-content`. Defaults to 3 MiB for filesystem sources and 128 MiB for
+  `--inline-content`. Defaults to 3 MiB for filesystem sources and 100 MiB for
   Google Drive sources.
 - `--id-prefix`: optional stable prefix for source document IDs.
 - `--include`: include pattern; repeatable and supports `**`.
@@ -187,8 +187,10 @@ Inline content is useful for small local tests only.
 For private Google Drive folders, use `--inline-content` unless Antfly can fetch
 the emitted Drive links directly. The CLI authenticates locally to traverse and
 download Drive files; the derived document extraction worker later reads the
-source row URL from Antfly. Drive sync raises the default inline limit to 128
-MiB; use `--max-inline-bytes` for larger files.
+source row URL from Antfly. Drive sync raises the default inline limit to 100
+MiB to match the Drive download cap. For larger files, stage the content behind
+Antfly-readable URLs and sync it with a source that does not require Drive
+downloads.
 
 The source-row design is documented in
 [`go/pkg/docsaf/DOCSAF.md`](../../go/pkg/docsaf/DOCSAF.md).

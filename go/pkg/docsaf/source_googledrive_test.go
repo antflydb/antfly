@@ -1,6 +1,7 @@
 package docsaf
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -298,6 +299,21 @@ func TestGoogleDriveSource_WorkspaceExportFormats(t *testing.T) {
 		if !workspaceSkipTypes[mimeType] {
 			t.Errorf("Expected %s to be in workspaceSkipTypes", mimeType)
 		}
+	}
+}
+
+func TestReadLimitedDriveContentRejectsOversize(t *testing.T) {
+	data, err := readLimitedDriveContent(strings.NewReader("12345"), 5)
+	if err != nil {
+		t.Fatalf("readLimitedDriveContent exact limit: %v", err)
+	}
+	if string(data) != "12345" {
+		t.Fatalf("data = %q, want 12345", data)
+	}
+
+	_, err = readLimitedDriveContent(strings.NewReader("123456"), 5)
+	if err == nil || !strings.Contains(err.Error(), "exceeds download limit of 5 bytes") {
+		t.Fatalf("readLimitedDriveContent oversize error = %v, want limit error", err)
 	}
 }
 

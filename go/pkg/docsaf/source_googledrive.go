@@ -19,7 +19,7 @@ import (
 	"google.golang.org/api/option"
 )
 
-// maxFileDownloadSize is the maximum size for a single file download (100MB).
+// maxFileDownloadSize is the maximum size for a single file download (100 MiB).
 const maxFileDownloadSize = 100 * 1024 * 1024
 
 // Workspace MIME types and the format to export them as.
@@ -377,7 +377,7 @@ func (s *GoogleDriveSource) downloadFile(ctx context.Context, file *drive.File) 
 		}
 		defer resp.Body.Close() //nolint:errcheck // best-effort close in deferred cleanup
 
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxFileDownloadSize))
+		data, err := readLimitedDriveContent(resp.Body, maxFileDownloadSize)
 		if err != nil {
 			return nil, "", fmt.Errorf("reading exported file %s: %w", file.Name, err)
 		}
@@ -391,13 +391,24 @@ func (s *GoogleDriveSource) downloadFile(ctx context.Context, file *drive.File) 
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close in deferred cleanup
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxFileDownloadSize))
+	data, err := readLimitedDriveContent(resp.Body, maxFileDownloadSize)
 	if err != nil {
 		return nil, "", fmt.Errorf("reading file %s: %w", file.Name, err)
 	}
 
 	contentType := DetectContentType(file.Name, data)
 	return data, contentType, nil
+}
+
+func readLimitedDriveContent(r io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("Google Drive file exceeds download limit of %d bytes", maxBytes)
+	}
+	return data, nil
 }
 
 // parseFolderID extracts a folder ID from a Google Drive URL or returns the input as-is.

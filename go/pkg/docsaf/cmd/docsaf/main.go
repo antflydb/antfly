@@ -20,7 +20,7 @@ import (
 const (
 	defaultDocsafMaxMergeRequestBytes  int64 = 48 << 20
 	defaultDocsafMaxInlineContentBytes int64 = 3 << 20
-	defaultDriveMaxInlineContentBytes  int64 = 128 << 20
+	defaultDriveMaxInlineContentBytes  int64 = 100 << 20
 )
 
 // StringSliceFlag allows repeated flags to build a slice.
