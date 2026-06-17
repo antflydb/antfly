@@ -1047,7 +1047,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
 			}, nil
 		})},
 	}
@@ -1066,6 +1066,11 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FormerLastLSN).To(Equal(uint64(13)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RetainedFromLSN).To(Equal(uint64(8)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.DataLossDiscarded).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindExecuted).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindPreviousLastLSN).To(Equal(uint64(13)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindCurrentLastLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindNextLSN).To(Equal(uint64(13)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.RewindDiscardedLSNCount).To(Equal(uint64(1)))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Fenced).To(BeTrue())
@@ -2419,6 +2424,38 @@ func TestParseHARejoinJobResult(t *testing.T) {
 	g.Expect(former.ReseedRequired).To(BeTrue())
 	g.Expect(former.Diverged).To(BeTrue())
 	g.Expect(former.Reason).To(Equal("parent_timeline_wal_expired"))
+}
+
+func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
+	g := NewWithT(t)
+
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(result.Action).To(Equal("rewind"))
+	g.Expect(result.RewindExecuted).To(BeTrue())
+	g.Expect(result.RewindPreviousLastLSN).To(Equal(uint64(13)))
+	g.Expect(result.RewindCurrentLastLSN).To(Equal(uint64(12)))
+	g.Expect(result.RewindNextLSN).To(Equal(uint64(13)))
+	g.Expect(result.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+	g.Expect(result.DataLossDiscarded).To(BeTrue())
+
+	status := haRejoinAdminActionResult(result)
+	g.Expect(status.RewindExecuted).To(BeTrue())
+	g.Expect(status.RewindPreviousLastLSN).To(Equal(uint64(13)))
+	g.Expect(status.RewindCurrentLastLSN).To(Equal(uint64(12)))
+	g.Expect(status.RewindNextLSN).To(Equal(uint64(13)))
+	g.Expect(status.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+
+	roundTripped, ok := haRejoinJobResultFromAdminResult(status)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(roundTripped.RewindExecuted).To(BeTrue())
+	g.Expect(roundTripped.RewindDiscardedLSNCount).To(Equal(uint64(1)))
+
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8},"rewind":{"fork_lsn":11,"previous_last_lsn":13,"current_last_lsn":11,"next_lsn":12,"discarded_lsn_count":2,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":false}}`))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	g.Expect(ok).To(BeFalse())
 }
 
 func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {

@@ -4435,15 +4435,20 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 }
 
 type haRejoinJobResult struct {
-	Action            string
-	Reason            string
-	FormerNodeID      string
-	TargetTimelineID  uint64
-	TargetEpoch       uint64
-	ForkLSN           uint64
-	FormerLastLSN     uint64
-	RetainedFromLSN   uint64
-	DataLossDiscarded bool
+	Action                  string
+	Reason                  string
+	FormerNodeID            string
+	TargetTimelineID        uint64
+	TargetEpoch             uint64
+	ForkLSN                 uint64
+	FormerLastLSN           uint64
+	RetainedFromLSN         uint64
+	DataLossDiscarded       bool
+	RewindExecuted          bool
+	RewindPreviousLastLSN   uint64
+	RewindCurrentLastLSN    uint64
+	RewindNextLSN           uint64
+	RewindDiscardedLSNCount uint64
 }
 
 func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
@@ -4480,7 +4485,8 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 }
 
 type haRejoinAPIResultEnvelope struct {
-	Assessment haRejoinAPIResult `json:"assessment"`
+	Assessment haRejoinAPIResult  `json:"assessment"`
+	Rewind     *haRejoinAPIRewind `json:"rewind,omitempty"`
 }
 
 type haRejoinAPIResult struct {
@@ -4492,6 +4498,17 @@ type haRejoinAPIResult struct {
 	ForkLSN           uint64 `json:"fork_lsn"`
 	FormerLastLSN     uint64 `json:"former_last_lsn"`
 	RetainedFromLSN   uint64 `json:"retained_from_lsn"`
+	DataLossDiscarded bool   `json:"data_loss_discarded"`
+}
+
+type haRejoinAPIRewind struct {
+	ForkLSN           uint64 `json:"fork_lsn"`
+	PreviousLastLSN   uint64 `json:"previous_last_lsn"`
+	CurrentLastLSN    uint64 `json:"current_last_lsn"`
+	NextLSN           uint64 `json:"next_lsn"`
+	DiscardedLSNCount uint64 `json:"discarded_lsn_count"`
+	TargetTimelineID  uint64 `json:"target_timeline_id"`
+	TargetEpoch       uint64 `json:"target_epoch"`
 	DataLossDiscarded bool   `json:"data_loss_discarded"`
 }
 
@@ -4507,7 +4524,7 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		assessment.TargetEpoch == 0 {
 		return haRejoinJobResult{}, false
 	}
-	return haRejoinJobResult{
+	result := haRejoinJobResult{
 		Action:            strings.TrimSpace(assessment.Action),
 		Reason:            strings.TrimSpace(assessment.Reason),
 		FormerNodeID:      strings.TrimSpace(assessment.FormerNodeID),
@@ -4517,7 +4534,28 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		FormerLastLSN:     assessment.FormerLastLSN,
 		RetainedFromLSN:   assessment.RetainedFromLSN,
 		DataLossDiscarded: assessment.DataLossDiscarded,
-	}, true
+	}
+	if rewind := envelope.Rewind; rewind != nil {
+		if assessment.Action != "rewind" ||
+			rewind.ForkLSN != assessment.ForkLSN ||
+			rewind.PreviousLastLSN != assessment.FormerLastLSN ||
+			rewind.TargetTimelineID != assessment.TargetTimelineID ||
+			rewind.TargetEpoch != assessment.TargetEpoch ||
+			rewind.CurrentLastLSN != assessment.ForkLSN ||
+			rewind.PreviousLastLSN < rewind.CurrentLastLSN ||
+			rewind.CurrentLastLSN == ^uint64(0) ||
+			rewind.NextLSN != rewind.CurrentLastLSN+1 ||
+			rewind.DiscardedLSNCount != rewind.PreviousLastLSN-rewind.CurrentLastLSN {
+			return haRejoinJobResult{}, false
+		}
+		result.RewindExecuted = true
+		result.RewindPreviousLastLSN = rewind.PreviousLastLSN
+		result.RewindCurrentLastLSN = rewind.CurrentLastLSN
+		result.RewindNextLSN = rewind.NextLSN
+		result.RewindDiscardedLSNCount = rewind.DiscardedLSNCount
+		result.DataLossDiscarded = result.DataLossDiscarded || rewind.DataLossDiscarded
+	}
+	return result, true
 }
 
 func haRejoinAdminActionResult(result haRejoinJobResult) *antflyv1.HAAdminActionResultStatus {
@@ -4539,6 +4577,11 @@ func applyHARejoinAdminActionResult(status *antflyv1.HAAdminActionResultStatus, 
 	status.FormerLastLSN = result.FormerLastLSN
 	status.RetainedFromLSN = result.RetainedFromLSN
 	status.DataLossDiscarded = result.DataLossDiscarded
+	status.RewindExecuted = result.RewindExecuted
+	status.RewindPreviousLastLSN = result.RewindPreviousLastLSN
+	status.RewindCurrentLastLSN = result.RewindCurrentLastLSN
+	status.RewindNextLSN = result.RewindNextLSN
+	status.RewindDiscardedLSNCount = result.RewindDiscardedLSNCount
 }
 
 func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus) (haRejoinJobResult, bool) {
@@ -4550,15 +4593,20 @@ func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus
 		return haRejoinJobResult{}, false
 	}
 	return haRejoinJobResult{
-		Action:            strings.TrimSpace(result.RejoinAction),
-		Reason:            strings.TrimSpace(result.RejoinReason),
-		FormerNodeID:      strings.TrimSpace(result.FormerNodeID),
-		TargetTimelineID:  result.TargetTimelineID,
-		TargetEpoch:       result.TargetEpoch,
-		ForkLSN:           result.ForkLSN,
-		FormerLastLSN:     result.FormerLastLSN,
-		RetainedFromLSN:   result.RetainedFromLSN,
-		DataLossDiscarded: result.DataLossDiscarded,
+		Action:                  strings.TrimSpace(result.RejoinAction),
+		Reason:                  strings.TrimSpace(result.RejoinReason),
+		FormerNodeID:            strings.TrimSpace(result.FormerNodeID),
+		TargetTimelineID:        result.TargetTimelineID,
+		TargetEpoch:             result.TargetEpoch,
+		ForkLSN:                 result.ForkLSN,
+		FormerLastLSN:           result.FormerLastLSN,
+		RetainedFromLSN:         result.RetainedFromLSN,
+		DataLossDiscarded:       result.DataLossDiscarded,
+		RewindExecuted:          result.RewindExecuted,
+		RewindPreviousLastLSN:   result.RewindPreviousLastLSN,
+		RewindCurrentLastLSN:    result.RewindCurrentLastLSN,
+		RewindNextLSN:           result.RewindNextLSN,
+		RewindDiscardedLSNCount: result.RewindDiscardedLSNCount,
 	}, true
 }
 

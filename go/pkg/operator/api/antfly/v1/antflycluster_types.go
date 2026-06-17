@@ -1700,6 +1700,26 @@ type HAAdminActionResultStatus struct {
 	// DataLossDiscarded reports whether rewind would discard former-primary data.
 	// +optional
 	DataLossDiscarded bool `json:"dataLossDiscarded,omitempty"`
+
+	// RewindExecuted reports that `/admin/v1/ha/rejoin/rewind` returned a concrete rewind result.
+	// +optional
+	RewindExecuted bool `json:"rewindExecuted,omitempty"`
+
+	// RewindPreviousLastLSN is the former-primary log tail before rewind execution.
+	// +optional
+	RewindPreviousLastLSN uint64 `json:"rewindPreviousLastLSN,omitempty"`
+
+	// RewindCurrentLastLSN is the former-primary log tail after rewind execution.
+	// +optional
+	RewindCurrentLastLSN uint64 `json:"rewindCurrentLastLSN,omitempty"`
+
+	// RewindNextLSN is the next append LSN after rewind execution.
+	// +optional
+	RewindNextLSN uint64 `json:"rewindNextLSN,omitempty"`
+
+	// RewindDiscardedLSNCount is the count of divergent former-primary LSNs discarded by rewind.
+	// +optional
+	RewindDiscardedLSNCount uint64 `json:"rewindDiscardedLSNCount,omitempty"`
 }
 
 // HAPrimaryRouteStatus reports the operator-facing primary endpoint target.

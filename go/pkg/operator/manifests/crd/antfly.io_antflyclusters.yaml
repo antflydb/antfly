@@ -8893,6 +8893,30 @@ spec:
                                 WAL LSN used by a rejoin assessment.
                               format: int64
                               type: integer
+                            rewindCurrentLastLSN:
+                              description: RewindCurrentLastLSN is the former-primary
+                                log tail after rewind execution.
+                              format: int64
+                              type: integer
+                            rewindDiscardedLSNCount:
+                              description: RewindDiscardedLSNCount is the count of
+                                divergent former-primary LSNs discarded by rewind.
+                              format: int64
+                              type: integer
+                            rewindExecuted:
+                              description: RewindExecuted reports that `/admin/v1/ha/rejoin/rewind`
+                                returned a concrete rewind result.
+                              type: boolean
+                            rewindNextLSN:
+                              description: RewindNextLSN is the next append LSN after
+                                rewind execution.
+                              format: int64
+                              type: integer
+                            rewindPreviousLastLSN:
+                              description: RewindPreviousLastLSN is the former-primary
+                                log tail before rewind execution.
+                              format: int64
+                              type: integer
                             schemaVersion:
                               description: SchemaVersion is the response schema version
                                 returned by the HA admin API.
