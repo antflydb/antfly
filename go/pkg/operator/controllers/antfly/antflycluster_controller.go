@@ -4101,6 +4101,9 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResult(cluster *antfl
 }
 
 func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if haActionKind(action.Kind) == haActionRewindFormerPrimary && !result.RewindExecuted {
+		return false
+	}
 	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
 		return false
 	}
@@ -4536,7 +4539,7 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		DataLossDiscarded: assessment.DataLossDiscarded,
 	}
 	if rewind := envelope.Rewind; rewind != nil {
-		if assessment.Action != "rewind" ||
+		if strings.TrimSpace(assessment.Action) != "rewind" ||
 			rewind.ForkLSN != assessment.ForkLSN ||
 			rewind.PreviousLastLSN != assessment.FormerLastLSN ||
 			rewind.TargetTimelineID != assessment.TargetTimelineID ||
@@ -5350,6 +5353,14 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 		}
 	case haActionRewindFormerPrimary:
 		if result.RejoinAction != "rewind" {
+			return false
+		}
+		if !result.RewindExecuted ||
+			result.RewindPreviousLastLSN == 0 ||
+			result.RewindCurrentLastLSN != result.ForkLSN ||
+			result.RewindNextLSN != result.ForkLSN+1 ||
+			result.RewindPreviousLastLSN < result.RewindCurrentLastLSN ||
+			result.RewindDiscardedLSNCount != result.RewindPreviousLastLSN-result.RewindCurrentLastLSN {
 			return false
 		}
 	case haActionReseedFormerPrimary:

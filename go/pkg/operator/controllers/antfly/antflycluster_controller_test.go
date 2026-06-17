@@ -1194,6 +1194,15 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 
 	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
 
+	action.Kind = string(haActionRewindFormerPrimary)
+	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeFalse())
+	result.RewindExecuted = true
+	result.RewindPreviousLastLSN = 13
+	result.RewindCurrentLastLSN = 12
+	result.RewindNextLSN = 13
+	result.RewindDiscardedLSNCount = 1
+	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
+
 	wrongTimeline := result
 	wrongTimeline.TargetTimelineID = 6
 	g.Expect(haDirectRejoinResultMatchesAction(wrongTimeline, status, action)).To(BeFalse())
@@ -1528,6 +1537,13 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 		FormerLastLSN:    13,
 		RetainedFromLSN:  8,
 	}
+	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeFalse())
+
+	rejoinActions[0].AdminResult.RewindExecuted = true
+	rejoinActions[0].AdminResult.RewindPreviousLastLSN = 13
+	rejoinActions[0].AdminResult.RewindCurrentLastLSN = 12
+	rejoinActions[0].AdminResult.RewindNextLSN = 13
+	rejoinActions[0].AdminResult.RewindDiscardedLSNCount = 1
 	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeTrue())
 }
 
