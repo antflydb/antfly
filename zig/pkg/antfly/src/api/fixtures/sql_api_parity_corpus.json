@@ -7660,10 +7660,14 @@
       "sql": "CREATE OR REPLACE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records WITH NO DATA"
     },
     {
-      "name": "unsupported create or replace materialized view if not exists catalog ddl",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=materialized_view_replace_if_not_exists",
-      "classification_reason": "materialized_view_replace_if_not_exists",
+      "name": "create or replace materialized view if not exists catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_materialized_view",
+        "table_name": "usage_records_mv",
+        "select": 2
+      },
+      "plan": "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=true:if_not_exists=true:populate=true",
       "sql": "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS usage_records_mv AS SELECT id, status FROM usage_records"
     },
     {

@@ -7619,7 +7619,6 @@ const Parser = struct {
         try self.expectKeyword("view");
         var if_not_exists = false;
         if (self.matchKeyword("if")) {
-            if (replace_existing) return error.UnsupportedSqlShape;
             try self.expectKeyword("not");
             try self.expectKeyword("exists");
             if_not_exists = true;
@@ -47398,7 +47397,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         replace_materialized_view_fingerprint,
     );
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_materialized_view));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS users_mv AS SELECT id, email FROM users;"));
+
+    var replace_if_absent_materialized_view = try lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS users_mv AS SELECT id, email FROM users;");
+    defer replace_if_absent_materialized_view.deinit(alloc);
+    const replace_if_absent_materialized_view_plan = switch (replace_if_absent_materialized_view) {
+        .materialized_view_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(replace_if_absent_materialized_view_plan.replace_existing);
+    try std.testing.expect(replace_if_absent_materialized_view_plan.if_not_exists);
+    try std.testing.expect(replace_if_absent_materialized_view_plan.populate_on_create);
+    const replace_if_absent_materialized_view_fingerprint = try ddlFingerprintAlloc(alloc, replace_if_absent_materialized_view);
+    defer alloc.free(replace_if_absent_materialized_view_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:create_materialized_view:view=users_mv:source=users:source_fields=2:fields=2:replace=true:if_not_exists=true:populate=true",
+        replace_if_absent_materialized_view_fingerprint,
+    );
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_if_absent_materialized_view));
 
     var refresh_materialized_view = try lowerDdlPlanAlloc(alloc, "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH DATA;");
     defer refresh_materialized_view.deinit(alloc);
@@ -66053,7 +66071,6 @@ const AppParityCorpusCoverage = struct {
     unsupported_query: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
-    unsupported_ddl_materialized_view_replace: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
@@ -67152,9 +67169,6 @@ const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
                     appParityPlanHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
         } else if (entry.family == .unsupported_ddl) {
-            self.unsupported_ddl_materialized_view_replace = self.unsupported_ddl_materialized_view_replace or
-                (std.mem.eql(u8, entry.classification_reason, "materialized_view_replace_if_not_exists") and
-                    std.mem.indexOf(u8, entry.sql, "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS") != null);
             self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
                 (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
                     std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
@@ -67959,7 +67973,6 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_query);
         try std.testing.expect(self.unsupported_read);
         try std.testing.expect(self.unsupported_ddl);
-        try std.testing.expect(self.unsupported_ddl_materialized_view_replace);
         try std.testing.expect(self.unsupported_write);
         try std.testing.expect(self.unsupported_insert);
         try std.testing.expect(self.unsupported_update);
@@ -73676,10 +73689,10 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE OR REPLACE MATERIALIZED VIEW usage_records_mv AS SELECT id, status FROM usage_records WITH NO DATA",
         },
         .{
-            .name = "unsupported create or replace materialized view if not exists catalog ddl",
-            .family = .unsupported_ddl,
-            .plan = "unsupported:ddl:requires=materialized_view_replace_if_not_exists",
-            .classification_reason = "materialized_view_replace_if_not_exists",
+            .name = "create or replace materialized view if not exists catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_materialized_view, .table_name = "usage_records_mv", .select = 2 },
+            .plan = "ddl:create_materialized_view:view=usage_records_mv:source=usage_records:source_fields=2:fields=2:replace=true:if_not_exists=true:populate=true",
             .sql = "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS usage_records_mv AS SELECT id, status FROM usage_records",
         },
         .{

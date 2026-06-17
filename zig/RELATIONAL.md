@@ -4161,9 +4161,11 @@ Materialized views use a separate native contract from plain views.
 materialized view name, replacement intent, source table, declared output
 fields, selected source fields, optional PostgreSQL column-list aliases,
 simple select-list aliases, `IF NOT EXISTS`, and whether the initial generation
-is populated.
-`CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS` fails closed because
-replacement and idempotent no-op semantics conflict at the catalog boundary.
+is populated. `CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS` lowers to the
+same typed definition with both flags preserved: catalog execution creates the
+materialized view when it is absent and replaces the existing definition when it
+is present, while still keeping population/refresh work in the materialized-view
+job family instead of applying SQL text directly.
 `REFRESH MATERIALIZED VIEW` records the target view plus `CONCURRENTLY` and
 populate/no-data policy, and `DROP MATERIALIZED VIEW` records typed removal
 metadata. The remaining production shape is the durable executor: output
