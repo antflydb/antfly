@@ -261,6 +261,26 @@ func HAReceiptMatches(receipt HAActionReceipt, expectation HAReceiptExpectation,
 	return actionID == expectedKind+":"+expectedTarget
 }
 
+// HAReceiptNodeMatches verifies that the node-local endpoint that returned a
+// receipt is the intended endpoint. Some compatibility paths can tolerate an
+// unset expected node id, but typed direct admin execution should require it.
+func HAReceiptNodeMatches(receipt HAActionReceipt, expectedNodeID string, requireExpectedNode bool) bool {
+	nodeID := strings.TrimSpace(receipt.NodeId)
+	if nodeID == "" {
+		return false
+	}
+	expectedNodeID = strings.TrimSpace(expectedNodeID)
+	if expectedNodeID == "" {
+		return !requireExpectedNode
+	}
+	return nodeID == expectedNodeID
+}
+
+func HAReceiptMatchesNode(receipt HAActionReceipt, expectation HAReceiptExpectation, expectedTarget string, expectedNodeID string, requireExpectedNode bool) bool {
+	return HAReceiptMatches(receipt, expectation, expectedTarget) &&
+		HAReceiptNodeMatches(receipt, expectedNodeID, requireExpectedNode)
+}
+
 func HAListReplicationSlotsOperation() HAOperation {
 	return HAOperation{Method: http.MethodGet, Path: HAReplicationSlotsPath}
 }

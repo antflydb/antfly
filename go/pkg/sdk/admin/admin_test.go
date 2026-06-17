@@ -558,6 +558,35 @@ func TestHAReceiptMatchesExpectedOperationAndTarget(t *testing.T) {
 	}
 }
 
+func TestHAReceiptMatchesNode(t *testing.T) {
+	t.Parallel()
+
+	expectation := HAReplicationSlotResumeReceiptExpectation()
+	receipt := HAActionReceipt{
+		ActionId:   "replication_slot_resume:standby-a",
+		ActionKind: HAActionKindReplicationSlotResume,
+		Target:     "standby-a",
+		State:      HAActionStateApplied,
+		NodeId:     "primary-a",
+	}
+	if !HAReceiptMatchesNode(receipt, expectation, "standby-a", "primary-a", true) {
+		t.Fatalf("HAReceiptMatchesNode returned false for exact matching node")
+	}
+	if HAReceiptMatchesNode(receipt, expectation, "standby-a", "primary-b", true) {
+		t.Fatalf("HAReceiptMatchesNode returned true for mismatched node")
+	}
+	if HAReceiptMatchesNode(receipt, expectation, "standby-a", "", true) {
+		t.Fatalf("HAReceiptMatchesNode returned true without required expected node")
+	}
+	if !HAReceiptMatchesNode(receipt, expectation, "standby-a", "", false) {
+		t.Fatalf("HAReceiptMatchesNode returned false for optional expected node")
+	}
+	receipt.NodeId = ""
+	if HAReceiptMatchesNode(receipt, expectation, "standby-a", "", false) {
+		t.Fatalf("HAReceiptMatchesNode returned true without receipt node id")
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

@@ -4564,7 +4564,7 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 	) {
 		return false
 	}
-	if !haDirectAdminActionNodeMatches(*action, result.ActionNodeID) {
+	if !adminsdk.HAReceiptNodeMatches(adminsdk.HAActionReceipt{NodeId: result.ActionNodeID}, action.AdminNodeID, true) {
 		return false
 	}
 	action.AdminResult = haPromotionAdminActionResult(result)
@@ -4797,7 +4797,7 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 	) {
 		return false
 	}
-	if !haDirectAdminActionNodeMatches(action, result.ActionNodeID) {
+	if !adminsdk.HAReceiptNodeMatches(adminsdk.HAActionReceipt{NodeId: result.ActionNodeID}, action.AdminNodeID, true) {
 		return false
 	}
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary && !result.RewindExecuted {
@@ -6659,48 +6659,29 @@ func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bo
 	if result == nil || result.SchemaVersion == 0 {
 		return false
 	}
-	if !haDirectAdminActionNodeMatches(action, result.ActionNodeID) {
-		return false
-	}
-	return haAdminActionReceiptMatches(action)
-}
-
-func haDirectAdminActionNodeMatches(action antflyv1.HAPlannedActionStatus, resultNodeID string) bool {
-	resultNodeID = strings.TrimSpace(resultNodeID)
-	if resultNodeID == "" {
-		return false
-	}
-	expectedNodeID := strings.TrimSpace(action.AdminNodeID)
-	return expectedNodeID != "" && resultNodeID == expectedNodeID
-}
-
-func haAdminActionNodeMatches(action antflyv1.HAPlannedActionStatus, resultNodeID string) bool {
-	resultNodeID = strings.TrimSpace(resultNodeID)
-	if resultNodeID == "" {
-		return false
-	}
-	expectedNodeID := strings.TrimSpace(action.AdminNodeID)
-	return expectedNodeID == "" || resultNodeID == expectedNodeID
+	return haAdminActionReceiptMatchesNode(action, true)
 }
 
 func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	return haAdminActionReceiptMatchesNode(action, false)
+}
+
+func haAdminActionReceiptMatchesNode(action antflyv1.HAPlannedActionStatus, requireExpectedNode bool) bool {
 	result := action.AdminResult
 	if result == nil {
 		return false
 	}
-	if !haAdminActionNodeMatches(action, result.ActionNodeID) {
-		return false
-	}
 	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
-	return haJobResultActionReceiptMatches(
-		result.ActionID,
-		result.ActionKind,
-		result.ActionTarget,
-		result.ActionState,
-		expectedKind,
-		expectedTarget,
-		expectedState,
-	)
+	return adminsdk.HAReceiptMatchesNode(adminsdk.HAActionReceipt{
+		ActionId:   result.ActionID,
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(result.ActionKind)),
+		Target:     result.ActionTarget,
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(result.ActionState)),
+		NodeId:     result.ActionNodeID,
+	}, adminsdk.HAReceiptExpectation{
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(expectedKind)),
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(expectedState)),
+	}, expectedTarget, action.AdminNodeID, requireExpectedNode)
 }
 
 func haDirectAdminActionReceiptExpectation(action antflyv1.HAPlannedActionStatus) (string, string, string) {
