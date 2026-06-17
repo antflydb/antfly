@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const db_mod = @import("../../storage/db/mod.zig");
+
 pub const SelectOutputKind = enum {
     field,
     json_extract,
@@ -31,4 +33,14 @@ pub const SelectSetOperation = enum {
     union_all,
     intersect,
     except,
+};
+
+pub const SqlPatternQuantifier = enum {
+    any,
+    all,
+};
+
+pub const SqlRowClaimClause = struct {
+    mode: db_mod.types.RowClaimMode,
+    wait_policy: db_mod.types.RowClaimWaitPolicy,
 };

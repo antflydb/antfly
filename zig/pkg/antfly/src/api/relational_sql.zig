@@ -32,6 +32,8 @@ pub const SqlValue = sql_adapter.SqlValue;
 const SelectOutputKind = sql_adapter.SelectOutputKind;
 const SelectOutputRef = sql_adapter.SelectOutputRef;
 const SelectSetOperation = sql_adapter.SelectSetOperation;
+const SqlPatternQuantifier = sql_adapter.SqlPatternQuantifier;
+const SqlRowClaimClause = sql_adapter.SqlRowClaimClause;
 const Token = sql_adapter.Token;
 const TokenKind = sql_adapter.TokenKind;
 const freeTokens = sql_adapter.freeTokens;
@@ -50,15 +52,6 @@ const AccessPredicateBranch = struct {
     json_path_exists: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate) = .empty,
     text_patterns: std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate) = .empty,
 };
-const SqlRowClaimClause = struct {
-    mode: db_mod.types.RowClaimMode,
-    wait_policy: db_mod.types.RowClaimWaitPolicy,
-};
-const SqlPatternQuantifier = enum {
-    any,
-    all,
-};
-
 const arrayLengthDefaultOutput = sql_adapter.arrayLengthDefaultOutput;
 const rowExpressionBoundaryKeyword = sql_adapter.rowExpressionBoundaryKeyword;
 const sqlAssignmentTailKeyword = sql_adapter.sqlAssignmentTailKeyword;
