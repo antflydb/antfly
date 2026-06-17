@@ -110,9 +110,9 @@ Current status:
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
   replay only final live operations, preserving existing output order while
-  avoiding repeated linear remove/shift work. Fold scratch compact-delta id/op
-  arrays also grow geometrically, which avoids one realloc per buffered compact
-  delta in append-heavy scans.
+  avoiding repeated linear remove/shift work. Fold scratch delta-record and
+  compact-delta id/op arrays also grow geometrically, which avoids one realloc
+  per buffered delta in append-heavy scans.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full

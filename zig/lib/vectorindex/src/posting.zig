@@ -1970,7 +1970,9 @@ pub const PostingStore = struct {
         appended_count: usize = 0,
 
         pub fn ensureDeltaRecordCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
-            if (self.delta_records.len < needed) self.delta_records = try alloc.realloc(self.delta_records, needed);
+            if (self.delta_records.len < needed) {
+                self.delta_records = try alloc.realloc(self.delta_records, PostingFormat.nextScratchCapacity(self.delta_records.len, needed));
+            }
         }
 
         pub fn deltaRecordCount(self: *const FoldScratch) usize {
@@ -4669,6 +4671,18 @@ test "posting fold scratch grows compact delta buffers geometrically" {
     try scratch.ensureCompactDeltaCapacity(alloc, 9);
     try std.testing.expectEqual(@as(usize, 16), scratch.compact_delta_ids.len);
     try std.testing.expectEqual(scratch.compact_delta_ids.len, scratch.compact_delta_ops.len);
+}
+
+test "posting fold scratch grows delta record buffer geometrically" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureDeltaRecordCapacity(alloc, 1);
+    try std.testing.expectEqual(@as(usize, 8), scratch.delta_records.len);
+
+    try scratch.ensureDeltaRecordCapacity(alloc, 9);
+    try std.testing.expectEqual(@as(usize, 16), scratch.delta_records.len);
 }
 
 test "posting base format round trips members" {
