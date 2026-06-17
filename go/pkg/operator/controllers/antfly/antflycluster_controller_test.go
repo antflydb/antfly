@@ -1116,6 +1116,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 			g.Expect(payload["node_id"]).To(Equal("primary-a"))
 			g.Expect(payload["last_lsn"]).To(Equal(float64(13)))
 			g.Expect(payload["retained_from_lsn"]).To(Equal(float64(8)))
+			g.Expect(payload["allow_rewind_after_forced_promotion"]).To(Equal(false))
 			identity := payload["identity"].(map[string]any)
 			g.Expect(identity["cluster_id"]).To(Equal(float64(100)))
 			g.Expect(identity["timeline_id"]).To(Equal(float64(4)))

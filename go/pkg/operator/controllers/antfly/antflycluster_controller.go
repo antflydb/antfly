@@ -3664,8 +3664,9 @@ func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 			"timeline_id": identity.TimelineID,
 			"epoch":       identity.Epoch,
 		},
-		"last_lsn":          lastLSN,
-		"retained_from_lsn": action.RetainedFromLSN,
+		"last_lsn":                            lastLSN,
+		"retained_from_lsn":                   action.RetainedFromLSN,
+		"allow_rewind_after_forced_promotion": false,
 	}
 	if receipt, ok := haRejoinFenceReceipt(cluster.Status.HAStatus, identity); ok {
 		body["receipt"] = receipt
