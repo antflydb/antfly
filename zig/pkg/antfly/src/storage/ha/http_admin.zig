@@ -97,7 +97,7 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, admin_api.routes.ha_fence_current)) {
                     return try self.handleAdminFenceCurrent();
                 }
-                if (knownFixedRoute(path)) {
+                if (knownRoute(path)) {
                     return try textResponse(self.alloc, 405, "method not allowed");
                 }
                 return try textResponse(self.alloc, 404, "not found");
@@ -154,7 +154,7 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed)) {
                     return try self.handleAdminReseedRejoin(req);
                 }
-                if (knownFixedRoute(path)) {
+                if (knownRoute(path)) {
                     return try textResponse(self.alloc, 405, "method not allowed");
                 }
                 return try textResponse(self.alloc, 404, "not found");
@@ -168,7 +168,7 @@ pub const Server = struct {
                     defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .@"resume");
                 }
-                if (knownFixedRoute(path)) {
+                if (knownRoute(path)) {
                     return try textResponse(self.alloc, 405, "method not allowed");
                 }
                 return try textResponse(self.alloc, 404, "not found");
@@ -178,7 +178,7 @@ pub const Server = struct {
                     defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .drop);
                 }
-                if (knownFixedRoute(path)) {
+                if (knownRoute(path)) {
                     return try textResponse(self.alloc, 405, "method not allowed");
                 }
                 return try textResponse(self.alloc, 404, "not found");
@@ -1060,6 +1060,51 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess) or
         std.mem.eql(u8, path, admin_api.routes.ha_rejoin_rewind) or
         std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed);
+}
+
+fn knownRoute(path: []const u8) bool {
+    return knownFixedRoute(path) or
+        admin_api.routes.replicationSlotNameFromPath(path, "") != null or
+        admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix) != null or
+        admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix) != null;
+}
+
+fn generatedRoutePathAlloc(alloc: Allocator, generated_path: []const u8) ![]u8 {
+    const slot_param = "{slot_name}";
+    if (std.mem.indexOf(u8, generated_path, slot_param)) |idx| {
+        return try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
+            admin_api.routes.base,
+            generated_path[0..idx],
+            "standby-a",
+            generated_path[idx + slot_param.len ..],
+        });
+    }
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ admin_api.routes.base, generated_path });
+}
+
+fn generatedRouteUnsupportedMethod(generated_path: []const u8) ?http_common.Method {
+    const candidates = [_]http_common.Method{ .GET, .POST, .PUT, .DELETE };
+    for (candidates) |candidate| {
+        if (!generatedRouteSupportsMethod(generated_path, methodText(candidate))) return candidate;
+    }
+    return null;
+}
+
+fn generatedRouteSupportsMethod(generated_path: []const u8, method: []const u8) bool {
+    for (admin_api.openapi.server.routes) |route| {
+        if (!std.mem.eql(u8, route.path, generated_path)) continue;
+        if (std.mem.eql(u8, route.method, method)) return true;
+    }
+    return false;
+}
+
+fn methodText(method: http_common.Method) []const u8 {
+    return switch (method) {
+        .GET => "GET",
+        .POST => "POST",
+        .PUT => "PUT",
+        .DELETE => "DELETE",
+    };
 }
 
 const GateRole = enum {
@@ -2294,6 +2339,25 @@ test "storage.ha http admin returns route method and command errors" {
     defer unavailable.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), unavailable.status);
     try expectContains(unavailable.body, "PrimaryUnavailable");
+}
+
+test "storage.ha http admin returns method errors for generated admin routes" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    for (admin_api.openapi.server.routes) |route| {
+        if (!std.mem.startsWith(u8, route.path, "/ha/")) continue;
+
+        const path = try generatedRoutePathAlloc(alloc, route.path);
+        defer alloc.free(path);
+
+        const method = generatedRouteUnsupportedMethod(route.path) orelse return error.TestExpectedUnsupportedMethod;
+        var response = try server.handle(.{ .method = method, .uri = path });
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 405), response.status);
+    }
 }
 
 test "storage.ha http admin exposes request executor" {
