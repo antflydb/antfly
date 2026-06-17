@@ -46,6 +46,8 @@ const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
+const ha_replication_record_mod = @import("../ha/replication_record.zig");
+const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
 const ha_write_gate_mod = @import("../ha/write_gate.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
@@ -3919,6 +3921,31 @@ pub const DB = struct {
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = true,
         });
+    }
+
+    pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
+        switch (record.kind) {
+            .batch_mutation => {
+                var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
+                defer decoded.deinit();
+                try self.batchReplicatedApply(decoded.value.request);
+            },
+            .derived_effect => return error.HADerivedEffectApplyUnsupported,
+            .metadata_mutation,
+            .backup_start,
+            .backup_end,
+            .checkpoint,
+            .manifest,
+            .truncate,
+            .timeline_switch,
+            => return error.HAReplicationRecordApplyUnsupported,
+            _ => return error.HAReplicationRecordApplyUnsupported,
+        }
+    }
+
+    pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: ha_replication_record_mod.RecordView) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ctx));
+        try self.applyHAReplicationRecord(record);
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
@@ -36777,6 +36804,92 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
+}
+
+test "storage.ha db applies batch mutation records through replication session callback" {
+    const alloc = std.testing.allocator;
+
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var primary_log_path_buf: [256]u8 = undefined;
+    const primary_log_path = tempPath(&primary_log_path_buf);
+    defer cleanupTempDir(primary_log_path);
+    var primary_slots_path_buf: [256]u8 = undefined;
+    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    defer cleanupTempDir(primary_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 251,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
+    defer primary.close();
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+    try primary.createSlot("standby-a", 0);
+
+    _ = try ha_effects_mod.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated-session\"}" }},
+        .sync_level = .full_index,
+    }, .{});
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+    });
+    defer standby_db.close();
+
+    const result = try ha_session_mod.replicateAvailable(
+        alloc,
+        &primary,
+        "standby-a",
+        &standby,
+        &standby_db,
+        DB.applyHAReplicationRecordCallback,
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.received_count);
+    try std.testing.expectEqual(@as(usize, 1), result.applied_count);
+    try std.testing.expectEqual(@as(u64, 1), result.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), result.progress.applied_lsn);
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+    var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated-session\"}", found.json);
+
+    const derived_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+    });
+    defer alloc.free(derived_payload);
+    const derived_record = ha_replication_record_mod.Record{
+        .kind = .derived_effect,
+        .payload_codec = .binary,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = 2,
+        .previous_lsn = 1,
+        .payload = derived_payload,
+    };
+    try std.testing.expectError(
+        error.HADerivedEffectApplyUnsupported,
+        standby_db.applyHAReplicationRecord(derived_record),
+    );
 }
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
