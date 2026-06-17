@@ -48,6 +48,8 @@ var test_path_counter: u64 = 0;
 const max_manifest_bytes = 64 * 1024 * 1024;
 const max_manifest_file_bytes = 256 * 1024 * 1024;
 
+pub const MetadataAppliedLsnFn = *const fn (ctx: *anyopaque) anyerror!u64;
+
 pub const Context = struct {
     primary: ?*primary_mod.Primary = null,
     primary_node_id: ?[]const u8 = null,
@@ -55,6 +57,8 @@ pub const Context = struct {
     standby_node_id: ?[]const u8 = null,
     fence_store: ?*fencing.Store = null,
     former_primary_log: ?*replication_log.ReplicationLog = null,
+    metadata_applied_lsn_ctx: ?*anyopaque = null,
+    metadata_applied_lsn_fn: ?MetadataAppliedLsnFn = null,
 };
 
 pub const SeedFinishResult = struct {
@@ -973,7 +977,7 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
             .commit_append = try commit_gate.appendAndEvaluate(try requirePrimary(ctx), command.append, command.policy),
         },
         .read_check => |request| .{
-            .read_check = try admin.evaluateStandbyRead(try requireStandby(ctx), request),
+            .read_check = try admin.evaluateStandbyRead(try requireStandby(ctx), try readRequestWithContext(ctx, request)),
         },
         .write_check => |command| .{
             .write_check = try executeWriteCheck(ctx, command),
@@ -1005,6 +1009,16 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
             .operator_plan = try executeOperatorPlan(alloc, try requirePrimary(ctx), command),
         },
     };
+}
+
+pub fn readRequestWithContext(ctx: Context, request: read_gate.Request) !read_gate.Request {
+    if (request.metadata_applied_lsn != null) return request;
+    const provider = ctx.metadata_applied_lsn_fn orelse return request;
+    const provider_ctx = ctx.metadata_applied_lsn_ctx orelse return error.MetadataAppliedLsnProviderMissingContext;
+
+    var enriched = request;
+    enriched.metadata_applied_lsn = try provider(provider_ctx);
+    return enriched;
 }
 
 fn executeRejoinRewind(alloc: Allocator, ctx: Context, command: admin_cli.RejoinAssessCommand) !Result {
@@ -2509,6 +2523,14 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     const paths = try testPaths(alloc, "promote");
     defer paths.deinit(alloc);
     const identity = testIdentity();
+    const MetadataProgress = struct {
+        lsn: u64,
+
+        fn load(ctx: *anyopaque) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.lsn;
+        }
+    };
 
     var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
     defer primary.close();
@@ -2584,6 +2606,29 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(metadata_read_table, "action=wait_for_metadata\n");
     try expectContains(metadata_read_table, "metadata_applied_lsn=0\n");
     try expectContains(metadata_read_table, "metadata_missing_lsn_count=1\n");
+
+    var provider_progress = MetadataProgress{ .lsn = 0 };
+    var provider_read_plan = try admin_cli.parse(alloc, &.{ "read", "check", "--at-least-lsn", "1" });
+    defer provider_read_plan.deinit(alloc);
+    var provider_read = try execute(alloc, .{
+        .standby = &standby,
+        .metadata_applied_lsn_ctx = &provider_progress,
+        .metadata_applied_lsn_fn = MetadataProgress.load,
+    }, provider_read_plan);
+    defer provider_read.deinit(alloc);
+    try std.testing.expectEqual(read_gate.Action.wait_for_metadata, provider_read.read_check.action);
+    try std.testing.expectEqual(@as(?u64, 0), provider_read.read_check.metadata_applied_lsn);
+    try std.testing.expectEqual(@as(u64, 1), provider_read.read_check.metadata_missing_lsn_count);
+
+    provider_progress.lsn = 1;
+    var provider_ready = try execute(alloc, .{
+        .standby = &standby,
+        .metadata_applied_lsn_ctx = &provider_progress,
+        .metadata_applied_lsn_fn = MetadataProgress.load,
+    }, provider_read_plan);
+    defer provider_ready.deinit(alloc);
+    try std.testing.expectEqual(read_gate.Action.serve_standby, provider_ready.read_check.action);
+    try std.testing.expectEqual(@as(?u64, 1), provider_ready.read_check.metadata_applied_lsn);
 
     var primary_write_plan = try admin_cli.parse(alloc, &.{ "--table", "write", "check", "--role", "primary" });
     defer primary_write_plan.deinit(alloc);

@@ -376,7 +376,10 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 400, "invalid HA read check request");
             };
         };
-        const decision = ha_admin.evaluateStandbyRead(standby, request) catch |err| {
+        const effective_request = admin_exec.readRequestWithContext(self.ctx, request) catch |err| {
+            return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+        };
+        const decision = ha_admin.evaluateStandbyRead(standby, effective_request) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         return try self.handleTypedJson(admin_api.HAReadCheckResponse{
@@ -1948,6 +1951,14 @@ test "storage.ha http admin serves health and command endpoint" {
     const paths = try testPaths(alloc, "command");
     defer paths.deinit(alloc);
     const identity = testIdentity();
+    const MetadataProgress = struct {
+        lsn: u64,
+
+        fn load(ctx: *anyopaque) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.lsn;
+        }
+    };
 
     var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
     defer primary.close();
@@ -1955,6 +1966,7 @@ test "storage.ha http admin serves health and command endpoint" {
     defer standby.close();
     var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
     defer fence_store.close();
+    var metadata_progress = MetadataProgress{ .lsn = 0 };
 
     var server = Server.init(alloc, .{
         .primary = &primary,
@@ -1962,6 +1974,8 @@ test "storage.ha http admin serves health and command endpoint" {
         .standby = &standby,
         .standby_node_id = "standby-a",
         .fence_store = &fence_store,
+        .metadata_applied_lsn_ctx = &metadata_progress,
+        .metadata_applied_lsn_fn = MetadataProgress.load,
     });
     defer server.deinit();
 
@@ -2143,6 +2157,30 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_standby_status.body, "\"role\":\"standby\"");
     try expectContains(typed_standby_status.body, "\"received_lsn\":1");
     try expectContains(typed_standby_status.body, "\"applied_lsn\":1");
+
+    var typed_read_wait_metadata = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_read_check,
+        .content_type = "application/json",
+        .body = "{\"consistency\":\"at_least_lsn\",\"required_lsn\":1}",
+    });
+    defer typed_read_wait_metadata.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_read_wait_metadata.status);
+    try expectContains(typed_read_wait_metadata.body, "\"action\":\"wait_for_metadata\"");
+    try expectContains(typed_read_wait_metadata.body, "\"metadata_applied_lsn\":0");
+    try expectContains(typed_read_wait_metadata.body, "\"metadata_missing_lsn_count\":1");
+
+    metadata_progress.lsn = 1;
+    var typed_read_ready = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_read_check,
+        .content_type = "application/json",
+        .body = "{\"consistency\":\"at_least_lsn\",\"required_lsn\":1}",
+    });
+    defer typed_read_ready.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_read_ready.status);
+    try expectContains(typed_read_ready.body, "\"action\":\"serve_standby\"");
+    try expectContains(typed_read_ready.body, "\"metadata_applied_lsn\":1");
 
     const typed_primary_policy_uri = try std.fmt.allocPrint(
         alloc,
