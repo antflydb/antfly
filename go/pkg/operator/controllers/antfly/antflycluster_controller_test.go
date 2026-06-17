@@ -295,6 +295,74 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 	g.Expect(observed).To(HaveLen(2))
 }
 
+func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:        string(haActionCreateSlot),
+					StandbyName: "standby-a",
+					TargetLSN:   5,
+					AdminURL:    "http://primary-ha.default.svc:8081",
+					AdminMethod: "POST",
+					AdminPath:   "/admin/v1/ha/replication-slots",
+				}},
+			},
+		},
+	}
+
+	var observed []string
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			observed = append(observed, req.Method+" "+req.URL.Path)
+			g.Expect(req.Method).To(Equal(http.MethodPost))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/replication-slots"))
+			var payload map[string]any
+			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+			g.Expect(payload["slot_name"]).To(Equal("standby-a"))
+			g.Expect(payload["initial_lsn"]).To(Equal(float64(5)))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+			}, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/replication-slots"}))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(BeEmpty())
+}
+
 func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g := NewWithT(t)
 

@@ -3312,7 +3312,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		action := &cluster.Status.HAStatus.PlannedActions[i]
-		if len(action.AdminCommand) == 0 || strings.TrimSpace(action.AdminURL) == "" {
+		if strings.TrimSpace(action.AdminURL) == "" {
 			continue
 		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
@@ -3334,6 +3334,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			} else {
 				action.AdminJobPhase = haAdminJobPhaseSucceeded
 			}
+			continue
+		}
+		if len(action.AdminCommand) == 0 {
 			continue
 		}
 
