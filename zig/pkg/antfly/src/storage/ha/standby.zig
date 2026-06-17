@@ -206,6 +206,7 @@ pub const Standby = struct {
         }
 
         if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
+        if (record.previous_lsn != self.progress.received_lsn) return error.UnexpectedPreviousLsn;
 
         const lsn = try self.receive_log.append(self.alloc, record);
         var next = self.progress;
@@ -813,6 +814,9 @@ test "storage.ha standby rejects wrong identity and receive gaps" {
     try std.testing.expectError(error.WrongTimeline, standby.receive(wrong_timeline));
 
     try std.testing.expectError(error.UnexpectedRecordLsn, standby.receive(baseRecord(identity, 2, "gap")));
+    var wrong_previous = baseRecord(identity, 1, "wrong-previous");
+    wrong_previous.previous_lsn = 9;
+    try std.testing.expectError(error.UnexpectedPreviousLsn, standby.receive(wrong_previous));
     _ = try standby.receive(baseRecord(identity, 1, "one"));
     try std.testing.expectError(error.RecordAlreadyReceived, standby.receive(baseRecord(identity, 1, "duplicate")));
 }

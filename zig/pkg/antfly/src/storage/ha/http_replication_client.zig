@@ -436,6 +436,7 @@ fn decodeAndValidateFrames(
         if (frame_lsn != expected_lsn or record.lsn != expected_lsn) {
             return error.ReplicationFrameLsnMismatch;
         }
+        if (record.previous_lsn != expected_lsn - 1) return error.UnexpectedPreviousLsn;
         actual_encoded_bytes = try std.math.add(u64, actual_encoded_bytes, encoded.len);
 
         frames[idx] = .{
@@ -698,7 +699,10 @@ const CorruptFrameExecutor = struct {
 };
 
 const WrongIdentityBatchExecutor = struct {
+    const Mismatch = enum { epoch, previous_lsn };
+
     identity: standby_mod.Identity,
+    mismatch: Mismatch = .epoch,
 
     fn executor(self: *WrongIdentityBatchExecutor) http_common.RequestExecutor {
         return .{
@@ -744,10 +748,10 @@ const WrongIdentityBatchExecutor = struct {
             .shard_id = self.identity.shard_id,
             .table_id = self.identity.table_id,
             .timeline_id = self.identity.timeline_id,
-            .epoch = self.identity.epoch + 1,
+            .epoch = if (self.mismatch == .epoch) self.identity.epoch + 1 else self.identity.epoch,
             .lsn = 2,
-            .previous_lsn = 1,
-            .payload = "wrong-epoch",
+            .previous_lsn = if (self.mismatch == .previous_lsn) 0 else 1,
+            .payload = if (self.mismatch == .previous_lsn) "wrong-previous" else "wrong-epoch",
         });
         defer alloc.free(second);
 
@@ -965,6 +969,36 @@ test "storage.ha http replication client rejects record identity mismatch before
     defer capture.deinit();
     try std.testing.expectError(
         error.WrongEpoch,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
+}
+
+test "storage.ha http replication client rejects previous lsn mismatch before partial receive" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "frame-previous-lsn");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var executor = WrongIdentityBatchExecutor{ .identity = identity, .mismatch = .previous_lsn };
+    var client = Client.init(alloc, executor.executor());
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(
+        error.UnexpectedPreviousLsn,
         client.replicateAvailable(
             "http://primary.internal.test",
             "standby-a",
