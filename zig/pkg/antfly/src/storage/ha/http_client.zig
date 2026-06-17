@@ -1238,6 +1238,7 @@ test "storage.ha http client round trips typed safety operations" {
     });
     defer rewind.deinit(alloc);
     try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
+    try std.testing.expect(rewind.parsed.value.rewind == null);
 
     try std.testing.expectError(error.HaCommandConflict, client.reseedRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",

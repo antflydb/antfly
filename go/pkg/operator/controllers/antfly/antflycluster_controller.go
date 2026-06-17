@@ -4507,6 +4507,10 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 		if strings.TrimSpace(result.Action) != "rewind" {
 			return haRejoinJobResult{}, false
 		}
+		rewindNodeID := strings.TrimSpace(lines["rewind.node_id"])
+		if rewindNodeID == "" || rewindNodeID != strings.TrimSpace(result.FormerNodeID) {
+			return haRejoinJobResult{}, false
+		}
 		rewindForkLSN, ok := parseHAResultUint(lines, "rewind.fork_lsn")
 		if !ok || rewindForkLSN != result.ForkLSN {
 			return haRejoinJobResult{}, false
@@ -4544,6 +4548,10 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 		result.DataLossDiscarded = result.DataLossDiscarded || rewindDataLossDiscarded
 	case "rejoin_reseed":
 		if strings.TrimSpace(result.Action) != "reseed" {
+			return haRejoinJobResult{}, false
+		}
+		reseedNodeID := strings.TrimSpace(lines["reseed.node_id"])
+		if reseedNodeID == "" || reseedNodeID != strings.TrimSpace(result.FormerNodeID) {
 			return haRejoinJobResult{}, false
 		}
 		result.ReseedSlotName = strings.TrimSpace(lines["reseed.slot_name"])
@@ -4599,6 +4607,7 @@ type haRejoinAPIResult struct {
 }
 
 type haRejoinAPIRewind struct {
+	NodeID            string `json:"node_id"`
 	ForkLSN           uint64 `json:"fork_lsn"`
 	PreviousLastLSN   uint64 `json:"previous_last_lsn"`
 	CurrentLastLSN    uint64 `json:"current_last_lsn"`
@@ -4610,6 +4619,7 @@ type haRejoinAPIRewind struct {
 }
 
 type haRejoinAPIReseed struct {
+	NodeID             string `json:"node_id"`
 	SlotName           string `json:"slot_name"`
 	TargetTimelineID   uint64 `json:"target_timeline_id"`
 	TargetEpoch        uint64 `json:"target_epoch"`
@@ -4644,6 +4654,8 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 	}
 	if rewind := envelope.Rewind; rewind != nil {
 		if strings.TrimSpace(assessment.Action) != "rewind" ||
+			strings.TrimSpace(rewind.NodeID) == "" ||
+			strings.TrimSpace(rewind.NodeID) != strings.TrimSpace(assessment.FormerNodeID) ||
 			rewind.ForkLSN != assessment.ForkLSN ||
 			rewind.PreviousLastLSN != assessment.FormerLastLSN ||
 			rewind.TargetTimelineID != assessment.TargetTimelineID ||
@@ -4664,6 +4676,8 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 	}
 	if reseed := envelope.Reseed; reseed != nil {
 		if strings.TrimSpace(assessment.Action) != "reseed" ||
+			strings.TrimSpace(reseed.NodeID) == "" ||
+			strings.TrimSpace(reseed.NodeID) != strings.TrimSpace(assessment.FormerNodeID) ||
 			strings.TrimSpace(reseed.SlotName) == "" ||
 			strings.TrimSpace(reseed.SlotName) != strings.TrimSpace(assessment.FormerNodeID) ||
 			reseed.TargetTimelineID != assessment.TargetTimelineID ||

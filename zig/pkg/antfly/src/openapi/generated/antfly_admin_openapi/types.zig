@@ -95,6 +95,8 @@ pub const HAStandbyBootstrapResponse = struct {
 };
 
 pub const HARejoinRewindResult = struct {
+    /// Former primary node id whose local log was rewound.
+    node_id: []const u8,
     fork_lsn: i64,
     previous_last_lsn: i64,
     current_last_lsn: i64,
@@ -106,6 +108,8 @@ pub const HARejoinRewindResult = struct {
 };
 
 pub const HARejoinReseedResult = struct {
+    /// Former primary node id scheduled for reseed.
+    node_id: []const u8,
     slot_name: []const u8,
     target_timeline_id: i64,
     target_epoch: i64,

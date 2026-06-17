@@ -1047,7 +1047,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`)),
 			}, nil
 		})},
 	}
@@ -2470,6 +2470,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.former_last_lsn=13",
 		"assessment.retained_from_lsn=8",
 		"assessment.data_loss_discarded=true",
+		"rewind.node_id=primary-a",
 		"rewind.fork_lsn=12",
 		"rewind.previous_last_lsn=13",
 		"rewind.current_last_lsn=12",
@@ -2499,6 +2500,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.former_last_lsn=13",
 		"assessment.retained_from_lsn=8",
 		"assessment.data_loss_discarded=true",
+		"rewind.node_id=primary-a",
 		"rewind.fork_lsn=12",
 		"rewind.previous_last_lsn=13",
 		"rewind.current_last_lsn=12",
@@ -2524,11 +2526,34 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.fork_lsn=12",
 		"assessment.former_last_lsn=13",
 		"assessment.retained_from_lsn=8",
+		"rewind.node_id=primary-a",
 		"rewind.fork_lsn=11",
 		"rewind.previous_last_lsn=13",
 		"rewind.current_last_lsn=11",
 		"rewind.next_lsn=12",
 		"rewind.discarded_lsn_count=2",
+		"rewind.target_timeline_id=5",
+		"rewind.target_epoch=7",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_rewind",
+		"assessment.action=rewind",
+		"assessment.reason=parent_timeline_retained",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=8",
+		"rewind.node_id=primary-b",
+		"rewind.fork_lsn=12",
+		"rewind.previous_last_lsn=13",
+		"rewind.current_last_lsn=12",
+		"rewind.next_lsn=13",
+		"rewind.discarded_lsn_count=1",
 		"rewind.target_timeline_id=5",
 		"rewind.target_epoch=7",
 		"",
@@ -2573,6 +2598,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.former_last_lsn=13",
 		"assessment.retained_from_lsn=14",
 		"assessment.data_loss_discarded=false",
+		"reseed.node_id=primary-a",
 		"reseed.slot_name=primary-a",
 		"reseed.target_timeline_id=5",
 		"reseed.target_epoch=7",
@@ -2599,6 +2625,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.fork_lsn=12",
 		"assessment.former_last_lsn=13",
 		"assessment.retained_from_lsn=14",
+		"reseed.node_id=primary-a",
 		"reseed.slot_name=primary-a",
 		"reseed.target_timeline_id=5",
 		"reseed.target_epoch=7",
@@ -2623,7 +2650,30 @@ func TestParseHARejoinJobResult(t *testing.T) {
 		"assessment.fork_lsn=12",
 		"assessment.former_last_lsn=13",
 		"assessment.retained_from_lsn=14",
+		"reseed.node_id=primary-a",
 		"reseed.slot_name=other",
+		"reseed.target_timeline_id=5",
+		"reseed.target_epoch=7",
+		"reseed.fork_lsn=12",
+		"reseed.former_last_lsn=13",
+		"reseed.reseed_required=true",
+		"reseed.base_backup_required=true",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHARejoinJobResult(strings.Join([]string{
+		"result=rejoin_reseed",
+		"assessment.action=reseed",
+		"assessment.reason=parent_timeline_wal_expired",
+		"assessment.former_node_id=primary-a",
+		"assessment.target_timeline_id=5",
+		"assessment.target_epoch=7",
+		"assessment.fork_lsn=12",
+		"assessment.former_last_lsn=13",
+		"assessment.retained_from_lsn=14",
+		"reseed.node_id=primary-b",
+		"reseed.slot_name=primary-a",
 		"reseed.target_timeline_id=5",
 		"reseed.target_epoch=7",
 		"reseed.fork_lsn=12",
@@ -2638,7 +2688,7 @@ func TestParseHARejoinJobResult(t *testing.T) {
 func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(result.Action).To(Equal("rewind"))
 	g.Expect(result.RewindExecuted).To(BeTrue())
@@ -2660,17 +2710,20 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g.Expect(roundTripped.RewindExecuted).To(BeTrue())
 	g.Expect(roundTripped.RewindDiscardedLSNCount).To(Equal(uint64(1)))
 
-	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8},"rewind":{"fork_lsn":11,"previous_last_lsn":13,"current_last_lsn":11,"next_lsn":12,"discarded_lsn_count":2,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":false}}`))
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8},"rewind":{"node_id":"primary-a","fork_lsn":11,"previous_last_lsn":13,"current_last_lsn":11,"next_lsn":12,"discarded_lsn_count":2,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":false}}`))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8},"rewind":{"node_id":"primary-b","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":false}}`))
 	g.Expect(ok).To(BeFalse())
 }
 
 func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"node_id":"primary-a","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(result.Action).To(Equal("reseed"))
 	g.Expect(result.ReseedExecuted).To(BeTrue())
@@ -2689,7 +2742,10 @@ func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g.Expect(roundTripped.ReseedExecuted).To(BeTrue())
 	g.Expect(roundTripped.ReseedSlotName).To(Equal("primary-a"))
 
-	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"reseed":{"slot_name":"other","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"reseed":{"node_id":"primary-a","slot_name":"other","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"reseed":{"node_id":"primary-b","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
 	g.Expect(ok).To(BeFalse())
 }
 

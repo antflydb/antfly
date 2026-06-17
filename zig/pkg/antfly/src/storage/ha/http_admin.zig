@@ -1474,6 +1474,7 @@ test "storage.ha http admin executes typed former primary log rewind when config
     try std.testing.expectEqualStrings("application/json", rewind.content_type.?);
     try expectContains(rewind.body, "\"assessment\"");
     try expectContains(rewind.body, "\"rewind\"");
+    try expectContains(rewind.body, "\"node_id\":\"primary-a\"");
     try expectContains(rewind.body, "\"discarded_lsn_count\":1");
     try std.testing.expectEqual(@as(u64, 2), former_log.lastLsn());
 
@@ -1513,6 +1514,7 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
     try expectContains(response.body, "\"assessment\"");
     try expectContains(response.body, "\"action\":\"reseed\"");
     try expectContains(response.body, "\"reseed\"");
+    try expectContains(response.body, "\"node_id\":\"primary-a\"");
     try expectContains(response.body, "\"slot_name\":\"primary-a\"");
     try expectContains(response.body, "\"base_backup_required\":true");
 
@@ -1833,6 +1835,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_rewind.status);
     try std.testing.expectEqualStrings("application/json", typed_rejoin_rewind.content_type.?);
     try expectContains(typed_rejoin_rewind.body, "\"action\":\"rewind\"");
+    try std.testing.expect(std.mem.indexOf(u8, typed_rejoin_rewind.body, "\"rewind\":") == null);
 
     var typed_rejoin_reseed_mismatch = try server.handle(.{
         .method = .POST,

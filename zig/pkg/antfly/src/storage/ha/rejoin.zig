@@ -72,6 +72,7 @@ pub const Assessment = struct {
 };
 
 pub const RewindResult = struct {
+    node_id: []const u8,
     fork_lsn: u64,
     previous_last_lsn: u64,
     current_last_lsn: u64,
@@ -83,6 +84,7 @@ pub const RewindResult = struct {
 };
 
 pub const ReseedResult = struct {
+    node_id: []const u8,
     slot_name: []const u8,
     target_timeline_id: u64,
     target_epoch: u64,
@@ -178,6 +180,7 @@ pub fn rewindReplicationLog(
     try log.truncateAfter(assessment.fork_lsn);
     const current_last_lsn = log.lastLsn();
     return .{
+        .node_id = assessment.former_node_id,
         .fork_lsn = assessment.fork_lsn,
         .previous_last_lsn = previous_last_lsn,
         .current_last_lsn = current_last_lsn,

@@ -293,6 +293,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         },
         .rejoin_rewind => |rewind_result| {
             try appendRejoinAssessmentLines(alloc, &out, "assessment", rewind_result.assessment);
+            try appendLine(alloc, &out, "rewind.node_id", rewind_result.rewind.node_id);
             try appendU64Line(alloc, &out, "rewind.fork_lsn", rewind_result.rewind.fork_lsn);
             try appendU64Line(alloc, &out, "rewind.previous_last_lsn", rewind_result.rewind.previous_last_lsn);
             try appendU64Line(alloc, &out, "rewind.current_last_lsn", rewind_result.rewind.current_last_lsn);
@@ -304,6 +305,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         },
         .rejoin_reseed => |reseed_result| {
             try appendRejoinAssessmentLines(alloc, &out, "assessment", reseed_result.assessment);
+            try appendLine(alloc, &out, "reseed.node_id", reseed_result.reseed.node_id);
             try appendLine(alloc, &out, "reseed.slot_name", reseed_result.reseed.slot_name);
             try appendU64Line(alloc, &out, "reseed.target_timeline_id", reseed_result.reseed.target_timeline_id);
             try appendU64Line(alloc, &out, "reseed.target_epoch", reseed_result.reseed.target_epoch);
@@ -1636,6 +1638,7 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     defer alloc.free(rewind_table);
     try expectContains(rewind_table, "result=rejoin_rewind\n");
     try expectContains(rewind_table, "assessment.action=rewind\n");
+    try expectContains(rewind_table, "rewind.node_id=primary-a\n");
     try expectContains(rewind_table, "rewind.discarded_lsn_count=2\n");
 
     var reseed_plan = try admin_cli.parse(alloc, &.{
@@ -1692,6 +1695,7 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     defer alloc.free(reseed_table);
     try expectContains(reseed_table, "result=rejoin_reseed\n");
     try expectContains(reseed_table, "assessment.action=reseed\n");
+    try expectContains(reseed_table, "reseed.node_id=primary-a\n");
     try expectContains(reseed_table, "reseed.slot_name=primary-a\n");
 }
 

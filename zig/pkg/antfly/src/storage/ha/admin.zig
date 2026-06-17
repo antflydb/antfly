@@ -309,6 +309,7 @@ pub fn markFormerPrimaryForReseed(
     if (assessment.action != .reseed) return error.RejoinReseedNotAllowed;
     try primary.markSlotReseedRequired(assessment.former_node_id);
     return .{
+        .node_id = assessment.former_node_id,
         .slot_name = assessment.former_node_id,
         .target_timeline_id = assessment.target_timeline_id,
         .target_epoch = assessment.target_epoch,

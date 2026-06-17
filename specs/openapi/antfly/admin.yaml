@@ -1175,6 +1175,7 @@ components:
     HARejoinRewindResult:
       type: object
       required:
+        - node_id
         - fork_lsn
         - previous_last_lsn
         - current_last_lsn
@@ -1185,6 +1186,10 @@ components:
         - data_loss_discarded
       additionalProperties: false
       properties:
+        node_id:
+          type: string
+          minLength: 1
+          description: Former primary node id whose local log was rewound.
         fork_lsn:
           type: integer
           format: uint64
@@ -1218,6 +1223,7 @@ components:
     HARejoinReseedResult:
       type: object
       required:
+        - node_id
         - slot_name
         - target_timeline_id
         - target_epoch
@@ -1227,6 +1233,10 @@ components:
         - base_backup_required
       additionalProperties: false
       properties:
+        node_id:
+          type: string
+          minLength: 1
+          description: Former primary node id scheduled for reseed.
         slot_name:
           type: string
           minLength: 1
