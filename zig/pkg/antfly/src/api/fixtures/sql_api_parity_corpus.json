@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 824,
-  "entry_count": 824,
+  "source_entry_count": 828,
+  "entry_count": 828,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -906,6 +906,15 @@
       "sql": "DEALLOCATE usage_plan"
     },
     {
+      "name": "deallocate all prepared statements protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "deallocate_statement"
+      },
+      "plan": "ddl:deallocate_statement:all=true",
+      "sql": "DEALLOCATE ALL"
+    },
+    {
       "name": "declare cursor portal protocol plan",
       "family": "ddl",
       "summary": {
@@ -914,6 +923,16 @@
       },
       "plan": "ddl:declare_cursor:portal=usage_cursor:scroll=default:binary=false:hold=false:subject=read",
       "sql": "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id"
+    },
+    {
+      "name": "declare scroll hold binary cursor portal protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "declare_cursor",
+        "table_name": "usage_scroll_cursor"
+      },
+      "plan": "ddl:declare_cursor:portal=usage_scroll_cursor:scroll=scroll:binary=true:hold=true:subject=read",
+      "sql": "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id"
     },
     {
       "name": "fetch cursor portal protocol plan",
@@ -926,6 +945,17 @@
       "sql": "FETCH NEXT FROM usage_cursor"
     },
     {
+      "name": "fetch cursor portal count in-alias protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "fetch_cursor",
+        "table_name": "usage_cursor",
+        "operations": 10
+      },
+      "plan": "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
+      "sql": "FETCH FORWARD 10 IN usage_cursor"
+    },
+    {
       "name": "close cursor portal protocol plan",
       "family": "ddl",
       "summary": {
@@ -934,6 +964,15 @@
       },
       "plan": "ddl:close_cursor:portal=usage_cursor",
       "sql": "CLOSE usage_cursor"
+    },
+    {
+      "name": "close all cursors protocol plan",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "close_cursor"
+      },
+      "plan": "ddl:close_cursor:all=true",
+      "sql": "CLOSE ALL"
     },
     {
       "name": "explain read plan",

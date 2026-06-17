@@ -4050,10 +4050,11 @@ surface over typed plans rather than storage syntax. `PREPARE`, `EXECUTE`, and
 name, parameter or argument count, and the prepared subject family. They still
 fail closed when applied to storage until Antfly has a native prepared-plan
 cache keyed by typed plan fingerprints, parameter schemas, catalog epochs,
-authorization context, and invalidation rules. `DECLARE ... CURSOR`,
-`FETCH ... FROM cursor`, and `CLOSE cursor` lower to typed cursor-portal intents
-that capture portal name, scroll/hold/binary metadata, fetch direction, and
-close scope. They still fail closed when applied to storage until there is a
+authorization context, and invalidation rules. `DECLARE ... [BINARY]
+[NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH ... FROM|IN cursor`, and
+`CLOSE cursor|ALL` lower to typed cursor-portal intents that capture portal
+name, scroll/hold/binary metadata, fetch direction/count, and close scope.
+They still fail closed when applied to storage until there is a
 typed portal contract with snapshot lifetime, range ownership, ordering,
 backpressure, resume tokens, and transaction cleanup. Plain
 `EXPLAIN <statement>` lowers to a native explain wrapper over the same typed

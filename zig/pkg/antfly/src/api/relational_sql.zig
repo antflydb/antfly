@@ -6705,7 +6705,7 @@ const Parser = struct {
             direction = .relative;
             count = try self.parseCursorFetchCount();
         }
-        try self.expectKeyword("from");
+        if (!self.matchKeyword("from") and !self.matchKeyword("in")) return error.UnsupportedSqlShape;
         const portal_name = try self.parseIdentifierOwned();
         var portal_transferred = false;
         errdefer if (!portal_transferred) self.alloc.free(portal_name);
@@ -49590,6 +49590,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:deallocate_statement:name=usage_plan", deallocate_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, deallocate_statement));
 
+    var deallocate_all_statements = try lowerDdlPlanAlloc(alloc, "DEALLOCATE ALL;");
+    defer deallocate_all_statements.deinit(alloc);
+    const deallocate_all_statements_fingerprint = try ddlFingerprintAlloc(alloc, deallocate_all_statements);
+    defer alloc.free(deallocate_all_statements_fingerprint);
+    try std.testing.expectEqualStrings("ddl:deallocate_statement:all=true", deallocate_all_statements_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, deallocate_all_statements));
+
     var declare_cursor = try lowerDdlPlanAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;");
     defer declare_cursor.deinit(alloc);
     const declare_cursor_plan = switch (declare_cursor) {
@@ -49609,6 +49616,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:declare_cursor:portal=usage_cursor:scroll=default:binary=false:hold=false:subject=read", declare_cursor_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, declare_cursor));
 
+    var declare_scroll_hold_cursor = try lowerDdlPlanAlloc(alloc, "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id;");
+    defer declare_scroll_hold_cursor.deinit(alloc);
+    const declare_scroll_hold_cursor_fingerprint = try ddlFingerprintAlloc(alloc, declare_scroll_hold_cursor);
+    defer alloc.free(declare_scroll_hold_cursor_fingerprint);
+    try std.testing.expectEqualStrings("ddl:declare_cursor:portal=usage_scroll_cursor:scroll=scroll:binary=true:hold=true:subject=read", declare_scroll_hold_cursor_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, declare_scroll_hold_cursor));
+
     var fetch_cursor = try lowerDdlPlanAlloc(alloc, "FETCH NEXT FROM usage_cursor;");
     defer fetch_cursor.deinit(alloc);
     const fetch_cursor_fingerprint = try ddlFingerprintAlloc(alloc, fetch_cursor);
@@ -49616,12 +49630,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:fetch_cursor:portal=usage_cursor:direction=next", fetch_cursor_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, fetch_cursor));
 
+    var fetch_count_cursor = try lowerDdlPlanAlloc(alloc, "FETCH FORWARD 10 IN usage_cursor;");
+    defer fetch_count_cursor.deinit(alloc);
+    const fetch_count_cursor_fingerprint = try ddlFingerprintAlloc(alloc, fetch_count_cursor);
+    defer alloc.free(fetch_count_cursor_fingerprint);
+    try std.testing.expectEqualStrings("ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10", fetch_count_cursor_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, fetch_count_cursor));
+
     var close_cursor = try lowerDdlPlanAlloc(alloc, "CLOSE usage_cursor;");
     defer close_cursor.deinit(alloc);
     const close_cursor_fingerprint = try ddlFingerprintAlloc(alloc, close_cursor);
     defer alloc.free(close_cursor_fingerprint);
     try std.testing.expectEqualStrings("ddl:close_cursor:portal=usage_cursor", close_cursor_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, close_cursor));
+
+    var close_all_cursors = try lowerDdlPlanAlloc(alloc, "CLOSE ALL;");
+    defer close_all_cursors.deinit(alloc);
+    const close_all_cursors_fingerprint = try ddlFingerprintAlloc(alloc, close_all_cursors);
+    defer alloc.free(close_all_cursors_fingerprint);
+    try std.testing.expectEqualStrings("ddl:close_cursor:all=true", close_all_cursors_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, close_all_cursors));
 
     var savepoint_transaction = try lowerDdlPlanAlloc(alloc, "SAVEPOINT before_retry;");
     defer savepoint_transaction.deinit(alloc);
@@ -70548,11 +70576,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "DEALLOCATE usage_plan",
         },
         .{
+            .name = "deallocate all prepared statements protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .deallocate_statement },
+            .plan = "ddl:deallocate_statement:all=true",
+            .sql = "DEALLOCATE ALL",
+        },
+        .{
             .name = "declare cursor portal protocol plan",
             .family = .ddl,
             .summary = .{ .ddl_tag = .declare_cursor, .table_name = "usage_cursor" },
             .plan = "ddl:declare_cursor:portal=usage_cursor:scroll=default:binary=false:hold=false:subject=read",
             .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id",
+        },
+        .{
+            .name = "declare scroll hold binary cursor portal protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .declare_cursor, .table_name = "usage_scroll_cursor" },
+            .plan = "ddl:declare_cursor:portal=usage_scroll_cursor:scroll=scroll:binary=true:hold=true:subject=read",
+            .sql = "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id",
         },
         .{
             .name = "fetch cursor portal protocol plan",
@@ -70562,11 +70604,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "FETCH NEXT FROM usage_cursor",
         },
         .{
+            .name = "fetch cursor portal count in-alias protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .fetch_cursor, .table_name = "usage_cursor", .operations = 10 },
+            .plan = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
+            .sql = "FETCH FORWARD 10 IN usage_cursor",
+        },
+        .{
             .name = "close cursor portal protocol plan",
             .family = .ddl,
             .summary = .{ .ddl_tag = .close_cursor, .table_name = "usage_cursor" },
             .plan = "ddl:close_cursor:portal=usage_cursor",
             .sql = "CLOSE usage_cursor",
+        },
+        .{
+            .name = "close all cursors protocol plan",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .close_cursor },
+            .plan = "ddl:close_cursor:all=true",
+            .sql = "CLOSE ALL",
         },
         .{
             .name = "explain read plan",
