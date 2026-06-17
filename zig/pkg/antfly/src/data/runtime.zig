@@ -1961,6 +1961,7 @@ pub const DataServer = struct {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
         self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
+        _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
         _ = self.write_source.withHAWriteGate(ha_write_gate);
         if (self.data_raft_apply) |apply_sm| {
@@ -2110,6 +2111,12 @@ pub const DataServer = struct {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby) |standby| return .{ .standby = standby };
         if (ctx.primary) |primary| return .{ .primary = primary };
+        return null;
+    }
+
+    fn haReadGate(self: *DataServer) ?antfly.public_api.HAReadGate {
+        const ctx = self.ha_cfg.admin_context orelse return null;
+        if (ctx.standby) |standby| return .{ .standby = standby };
         return null;
     }
 
@@ -13615,6 +13622,13 @@ test "data server propagates standby HA write gate into provisioned write source
         .standby => |handle| try std.testing.expect(handle == &standby),
         .primary => return error.TestExpectedEqual,
     }
+
+    const read_gate = server.read_source.ha_read_gate orelse return error.TestExpectedEqual;
+    try std.testing.expect(read_gate.standby == &standby);
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        server.read_source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index),
+    );
 }
 
 test "data server applies routed HA replication records through standby write gate" {

@@ -3594,6 +3594,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
+            "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3643,6 +3644,8 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
+    api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
