@@ -54,4 +54,3 @@ pub const HAWriteDecision = types.HAWriteDecision;
 pub const HAOwnerJobDecision = types.HAOwnerJobDecision;
 pub const HACommitGate = types.HACommitGate;
 pub const HAReplicationSlot = types.HAReplicationSlot;
-pub const HACommandResult = types.HACommandResult;

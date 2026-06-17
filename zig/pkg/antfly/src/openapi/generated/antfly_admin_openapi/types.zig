@@ -196,9 +196,6 @@ pub const HAReplicationSlot = struct {
     dropped: ?bool = null,
 };
 
-/// JSON rendering of the underlying HA admin command result. This envelope remains intentionally tolerant while the hot-standby API graduates from operator integration to a fully typed response schema.
-pub const HACommandResult = struct {};
-
 pub const CommitCheckRequest = struct {
     target_lsn: i64,
     sync_policy: HASyncPolicy,

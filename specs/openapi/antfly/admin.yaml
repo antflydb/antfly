@@ -1841,10 +1841,3 @@ components:
         dropped:
           type: boolean
           nullable: true
-    HACommandResult:
-      type: object
-      description: |
-        JSON rendering of the underlying HA admin command result. This envelope
-        remains intentionally tolerant while the hot-standby API graduates from
-        operator integration to a fully typed response schema.
-      additionalProperties: true
