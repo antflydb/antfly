@@ -74331,6 +74331,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE usage_records SET status = lower(status) WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) FOR UPDATE RETURNING id",
         },
         .{
+            .name = "claimed computed pattern some update",
+            .family = .update_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .patch_expressions = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "update_source:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
+            .sql = "UPDATE usage_records SET status = lower(status) WHERE lower(status) LIKE SOME(ARRAY['queued%', 'ready%']) FOR UPDATE RETURNING id",
+        },
+        .{
             .name = "claimed boolean is not update",
             .family = .update_source,
             .summary = .{ .table_name = "usage_records", .returning = 1, .row_claim_skip_locked = false },
@@ -76331,6 +76338,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .params = &.{ .{ .string = "bot!_%" }, .{ .string = "!" } },
         },
         .{
+            .name = "joined update source computed pattern some",
+            .family = .update_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .operations = 1, .source_assignments = 1, .returning = 2, .row_claim_skip_locked = true },
+            .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=1:ops=1:returning=2:returning_expr=0:returning_all=0:right_expr_pred=1",
+            .sql = "UPDATE usage_records SET quantity = source.quantity, status = 'synced' FROM source_records AS source WHERE usage_records.id = source.id AND lower(source.name) ILIKE SOME(ARRAY['ada%', 'grace%']) FOR UPDATE SKIP LOCKED RETURNING id, quantity",
+        },
+        .{
             .name = "joined update from implicit claim",
             .family = .update_joined_source,
             .summary = .{ .table_name = "usage_records", .join_on = 1, .source_assignments = 1, .row_claim_skip_locked = false },
@@ -76763,6 +76777,25 @@ test "postgres sql adapter lowers joined mutation source with separate target an
     try std.testing.expectEqualStrings("source_status", computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].field);
     try std.testing.expectEqualStrings("\"ready\\\\_%\"", computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[1].value_json);
     try std.testing.expectEqualStrings("true", computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].rhs[0].value_json);
+
+    var computed_source_pattern_some_filter = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND lower(source.source_status) LIKE SOME(ARRAY['ready%', 'queued%']) FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer computed_source_pattern_some_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_source_pattern_some_filter.mutation.req.join.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("source_status", computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"ready%\"", computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].rhs[0].value_json);
 
     const public_sql = "UPDATE public.usage_records SET quantity = source.source_quantity, status = 'synced' FROM public.source_records AS source WHERE usage_records.source_id = source.source_pk AND source.source_status = 'ready' FOR UPDATE SKIP LOCKED RETURNING id, quantity";
     var public_lowered = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
@@ -78328,6 +78361,24 @@ test "postgres sql adapter lowers claimed update mutation source" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, expression_lowered.mutation.req.increment_expressions[0].expression.kind);
     try std.testing.expectEqual(@as(usize, 1), expression_lowered.mutation.req.returning_expressions.len);
     try std.testing.expectEqualStrings("next_priority", expression_lowered.mutation.req.returning_expressions[0].output);
+
+    var computed_pattern_source = try lowerUpdateMutationSourceAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(status) WHERE lower(status) LIKE SOME(ARRAY['queued%', 'ready%']) FOR UPDATE RETURNING id",
+        schema,
+        &.{},
+        claim,
+    );
+    defer computed_pattern_source.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_pattern_source.mutation.req.source.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_source.mutation.req.source.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, computed_pattern_source.mutation.req.source.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_pattern_source.mutation.req.source.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_pattern_source.mutation.req.source.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_source.mutation.req.source.expression_predicates[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"queued%\"", computed_pattern_source.mutation.req.source.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_source.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", computed_pattern_source.mutation.req.patch_expressions[0].field);
 
     var concat_expression_lowered = try lowerUpdateMutationSourceAlloc(
         alloc,

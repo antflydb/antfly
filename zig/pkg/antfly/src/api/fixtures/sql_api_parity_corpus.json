@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 821,
-  "entry_count": 821,
+  "source_entry_count": 823,
+  "entry_count": 823,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -6851,6 +6851,19 @@
       "sql": "UPDATE usage_records SET status = lower(status) WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) FOR UPDATE RETURNING id"
     },
     {
+      "name": "claimed computed pattern some update",
+      "family": "update_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "patch_expressions": 1,
+        "returning": 1,
+        "row_claim_skip_locked": false
+      },
+      "plan": "update_source:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:claim=locked:rewrite=0:ops=0:patch_expr=1:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
+      "sql": "UPDATE usage_records SET status = lower(status) WHERE lower(status) LIKE SOME(ARRAY['queued%', 'ready%']) FOR UPDATE RETURNING id"
+    },
+    {
       "name": "claimed boolean is not update",
       "family": "update_source",
       "summary": {
@@ -9915,6 +9928,21 @@
       "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=1:ops=1:returning=2:returning_expr=0:returning_all=0:right_text_pattern=1",
       "params": [{"string": "bot!_%"}, {"string": "!"}],
       "sql": "UPDATE usage_records SET quantity = source.quantity, status = 'synced' FROM source_records AS source WHERE usage_records.id = source.id AND source.name NOT ILIKE $1 ESCAPE $2 FOR UPDATE SKIP LOCKED RETURNING id, quantity"
+    },
+    {
+      "name": "joined update source computed pattern some",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "operations": 1,
+        "source_assignments": 1,
+        "returning": 2,
+        "join_on": 1,
+        "row_claim_skip_locked": true
+      },
+      "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=1:ops=1:returning=2:returning_expr=0:returning_all=0:right_expr_pred=1",
+      "sql": "UPDATE usage_records SET quantity = source.quantity, status = 'synced' FROM source_records AS source WHERE usage_records.id = source.id AND lower(source.name) ILIKE SOME(ARRAY['ada%', 'grace%']) FOR UPDATE SKIP LOCKED RETURNING id, quantity"
     },
     {
       "name": "joined update from implicit claim",
