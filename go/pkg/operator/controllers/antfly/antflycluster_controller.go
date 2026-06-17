@@ -3348,7 +3348,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			action.AdminError = fmt.Sprintf("HA action %s is marked AdminAPI but no typed /admin/v1 request could be executed", action.Kind)
 			continue
 		}
-		if action.Executor != "" && action.Executor != string(haActionExecutorCLIJob) {
+		if action.Executor != string(haActionExecutorCLIJob) {
 			continue
 		}
 		if len(action.AdminCommand) == 0 {
