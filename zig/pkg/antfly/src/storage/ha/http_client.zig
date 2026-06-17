@@ -519,14 +519,30 @@ fn appendQuerySyncPolicy(alloc: Allocator, old_uri: []u8, policy: primary_mod.Sy
     var uri = old_uri;
     errdefer alloc.free(uri);
 
-    uri = try appendQueryString(alloc, uri, "sync_mode", @tagName(policy.mode));
+    uri = try appendQueryString(alloc, uri, "sync_mode", durabilityModeQueryName(policy.mode));
     uri = try appendQueryString(alloc, uri, "sync_selection", @tagName(policy.selection));
     uri = try appendQueryU64(alloc, uri, "sync_required", policy.required);
-    uri = try appendQueryString(alloc, uri, "sync_failure", @tagName(policy.failure_policy));
+    uri = try appendQueryString(alloc, uri, "sync_failure", failurePolicyQueryName(policy.failure_policy));
     for (policy.standby_names) |name| {
         uri = try appendQueryString(alloc, uri, "sync_standby", name);
     }
     return uri;
+}
+
+fn durabilityModeQueryName(mode: primary_mod.DurabilityMode) []const u8 {
+    return switch (mode) {
+        .async => "async",
+        .remote_write => "remote-write",
+        .remote_apply => "remote-apply",
+    };
+}
+
+fn failurePolicyQueryName(policy: primary_mod.FailurePolicy) []const u8 {
+    return switch (policy) {
+        .block => "block",
+        .fail_closed => "fail-closed",
+        .degrade_to_async => "degrade-to-async",
+    };
 }
 
 fn i64FromU64(value: u64) !i64 {
@@ -1172,6 +1188,26 @@ test "storage.ha http client maps admin errors" {
     try std.testing.expectError(error.HaEndpointNotReady, client.checkReady("http://ha-admin.test"));
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{"identify"}));
     try std.testing.expectError(error.InvalidHaCommand, client.executeCommand("http://ha-admin.test", &.{"unknown"}));
+}
+
+test "storage.ha http client renders primary status sync query with OpenAPI enum spelling" {
+    const alloc = std.testing.allocator;
+    const standby_names = [_][]const u8{"standby-a"};
+    var uri = try alloc.dupe(u8, "http://ha-admin.test/admin/v1/ha/primary/status");
+    uri = try appendQuerySyncPolicy(alloc, uri, .{
+        .mode = .remote_write,
+        .selection = .first,
+        .required = 1,
+        .standby_names = &standby_names,
+        .failure_policy = .fail_closed,
+    });
+    defer alloc.free(uri);
+
+    try expectContains(uri, "sync_mode=remote-write");
+    try expectContains(uri, "sync_selection=first");
+    try expectContains(uri, "sync_required=1");
+    try expectContains(uri, "sync_failure=fail-closed");
+    try expectContains(uri, "sync_standby=standby-a");
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
