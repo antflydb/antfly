@@ -1139,6 +1139,9 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.FenceStoreUnavailable,
         error.FenceAlreadyHeld,
         error.FenceReceiptMissing,
+        error.FencingRequired,
+        error.PromotionRequiresForce,
+        error.PromotionNotAllowed,
         error.BaseBackupSlotInUse,
         error.BackupSlotNotRetained,
         error.SlotAlreadyExists,
@@ -1189,9 +1192,6 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.InvalidFenceLsn,
         error.FenceRequiresForce,
         error.FenceFieldTooLong,
-        error.FencingRequired,
-        error.PromotionRequiresForce,
-        error.PromotionNotAllowed,
         error.StandbyAheadOfPrimary,
         error.TargetAheadOfPrimary,
         error.InvalidSyncPolicy,
@@ -1282,6 +1282,30 @@ fn testIdentity() standby_mod.Identity {
         .epoch = 1,
     };
 }
+
+fn baseRecord(identity: standby_mod.Identity, lsn: u64, payload: []const u8) replication_record.Record {
+    return .{
+        .kind = .batch_mutation,
+        .payload_codec = .raw,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = lsn,
+        .previous_lsn = lsn - 1,
+        .payload = payload,
+    };
+}
+
+const ApplyCounter = struct {
+    count: usize = 0,
+
+    fn apply(ctx: *anyopaque, _: replication_record.RecordView) !void {
+        const self: *ApplyCounter = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+    }
+};
 
 fn seedFiles() [2]backup_manifest.FileEntry {
     return .{
@@ -1542,6 +1566,16 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(fail_closed_append.body, "SyncPolicyUnsatisfied");
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 
+    var unfenced_promote = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_promotion_current_fence,
+        .content_type = "application/json",
+    });
+    defer unfenced_promote.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), unfenced_promote.status);
+    try expectContains(unfenced_promote.body, "FenceReceiptMissing");
+    try std.testing.expectEqual(@as(u64, 1), standby.identity.timeline_id);
+
     var typed_fence = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_fence,
@@ -1617,6 +1651,44 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_promote.body, "\"promotion\"");
     try expectContains(typed_promote.body, "\"fence_generation\":1");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
+}
+
+test "storage.ha http admin reports unsafe promotion as conflict" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "unsafe-promote-conflict");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    _ = try standby.receive(baseRecord(identity, 1, "one"));
+    var apply_counter = ApplyCounter{};
+    try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&apply_counter, ApplyCounter.apply));
+
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{ .standby = &standby, .fence_store = &fence_store });
+    defer server.deinit();
+
+    var typed_fence = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_fence,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"reason\":\"unsafe-promotion-test\"}",
+    });
+    defer typed_fence.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
+
+    var unsafe_promote = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_promotion_current_fence,
+        .content_type = "application/json",
+    });
+    defer unsafe_promote.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), unsafe_promote.status);
+    try expectContains(unsafe_promote.body, "PromotionNotAllowed");
+    try std.testing.expectEqual(@as(u64, 1), standby.identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
 }
 
 test "storage.ha http admin serves typed base backup seed endpoints" {
