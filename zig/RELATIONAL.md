@@ -5420,9 +5420,9 @@ Aggregate zero-count coverage such as group-only `SELECT DISTINCT` likewise
 requires a well-formed exact `aggs=0` token. Table and source-table coverage
 also uses exact string tokens, so a fingerprint naming `products_extra` cannot
 claim coverage for `products`; cross-table source-schema coverage applies the
-same rule to joined-source, join, lateral, and merge source/right table tokens.
-Pagination coverage requires exact `limit`, `source_limit`, and true absence of
-`offset`/`source_offset` tokens for
+same rule to joined-source, join, lateral, merge, and wrapped read-family
+source/right table tokens. Pagination coverage requires exact `limit`,
+`source_limit`, and true absence of `offset`/`source_offset` tokens for
 unbounded/null-pagination cases. Joined mutation-source semijoin coverage
 requires exact `right_pred` and `on` count tokens instead of combined substring
 matches. Conflict no-op/skip and temporal unique upsert transform coverage

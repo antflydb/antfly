@@ -65503,6 +65503,41 @@ test "app parity cross-table source schema table tokens are exact" {
     try std.testing.expect(coverage.merge_cross_table_source_schema);
 }
 
+test "app parity read cross-table source schema table tokens are exact" {
+    const source_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .read,
+        .source_schema_json = source_schema,
+        .plan = "read:join:join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .read,
+        .source_schema_json = source_schema,
+        .plan = "read:lateral:lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+    });
+
+    try std.testing.expect(!coverage.read_join_cross_table_source_schema_classifier);
+    try std.testing.expect(!coverage.read_lateral_cross_table_source_schema_classifier);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .read,
+        .source_schema_json = source_schema,
+        .plan = "read:join:join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .read,
+        .source_schema_json = source_schema,
+        .plan = "read:lateral:lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+    });
+
+    try std.testing.expect(coverage.read_join_cross_table_source_schema_classifier);
+    try std.testing.expect(coverage.read_lateral_cross_table_source_schema_classifier);
+}
+
 test "app parity conflict write count coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -66794,11 +66829,11 @@ const AppParityCorpusCoverage = struct {
                 self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
                         entry.source_schema_json.len > 0 and
-                        std.mem.indexOf(u8, entry.plan, "right=customer_records") != null);
+                        appParityPlanHasExactStringToken(entry.plan, ":right=", "customer_records"));
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:lateral:") and
                         entry.source_schema_json.len > 0 and
-                        std.mem.indexOf(u8, entry.plan, "right=balance_records") != null);
+                        appParityPlanHasExactStringToken(entry.plan, ":right=", "balance_records"));
                 self.read_cte_query_expression = self.read_cte_query_expression or
                     (is_read_query and has_read_query_expression);
                 self.read_cte_aggregate_expression = self.read_cte_aggregate_expression or
