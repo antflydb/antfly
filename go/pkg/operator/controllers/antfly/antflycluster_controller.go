@@ -11,7 +11,6 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"net/url"
 	"path"
 	"sort"
 	"strconv"
@@ -3639,6 +3638,10 @@ func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatu
 
 func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]byte, error) {
 	if err != nil {
+		var apiErr *adminsdk.HAAPIError
+		if stderrors.As(err, &apiErr) {
+			return nil, fmt.Errorf("HA admin API returned status %d: %s", apiErr.StatusCode, strings.TrimSpace(apiErr.Body))
+		}
 		return nil, err
 	}
 	if value == nil {
@@ -5896,7 +5899,12 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 }
 
 func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Context, baseURL string, ha *antflyv1.HighAvailabilitySpec) (haObservedPrimaryStatus, error) {
-	raw, err := r.getHAAdminJSON(ctx, baseURL, haAdminPrimaryStatusPath, haPrimaryStatusQuery(ha))
+	adminClient, err := r.haAdminSDKClient(baseURL)
+	if err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	response, err := adminClient.PrimaryStatusResponse(ctx, haPrimaryStatusParams(ha))
+	raw, err := haAdminSDKResponseRaw(response, err)
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
@@ -5911,7 +5919,12 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 }
 
 func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, baseURL string, standbyName string, slotName string, upstreamLSN uint64, ha *antflyv1.HighAvailabilitySpec) (antflyv1.HAStandbyStatus, error) {
-	raw, err := r.getHAAdminJSON(ctx, baseURL, haAdminStandbyStatusPath, haStandbyStatusQuery(upstreamLSN))
+	adminClient, err := r.haAdminSDKClient(baseURL)
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	response, err := adminClient.StandbyStatusResponse(ctx, haStandbyStatusParams(upstreamLSN))
+	raw, err := haAdminSDKResponseRaw(response, err)
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
@@ -5925,149 +5938,72 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 	return observed.Status, nil
 }
 
-func (r *AntflyClusterReconciler) getHAAdminJSON(ctx context.Context, baseURL string, apiPath string, query url.Values) ([]byte, error) {
-	endpoint := strings.TrimRight(baseURL, "/") + apiPath
-	if encoded := query.Encode(); encoded != "" {
-		endpoint += "?" + encoded
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return raw, nil
-}
-
-func (r *AntflyClusterReconciler) postHAAdminJSON(ctx context.Context, baseURL string, apiPath string, body any) error {
-	_, err := r.postHAAdminJSONRaw(ctx, baseURL, apiPath, body)
-	return err
-}
-
-func (r *AntflyClusterReconciler) postHAAdminJSONRaw(ctx context.Context, baseURL string, apiPath string, body any) ([]byte, error) {
-	return r.requestHAAdminJSONBodyRaw(ctx, http.MethodPost, baseURL, apiPath, body)
-}
-
-func (r *AntflyClusterReconciler) requestHAAdminJSONBodyRaw(ctx context.Context, method string, baseURL string, apiPath string, body any) ([]byte, error) {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	return r.requestHAAdminJSONRaw(ctx, method, baseURL, apiPath, raw)
-}
-
-func (r *AntflyClusterReconciler) requestHAAdminNoBody(ctx context.Context, method string, baseURL string, apiPath string) error {
-	_, err := r.requestHAAdminJSONRaw(ctx, method, baseURL, apiPath, nil)
-	return err
-}
-
-func (r *AntflyClusterReconciler) requestHAAdminJSONRaw(ctx context.Context, method string, baseURL string, apiPath string, body []byte) ([]byte, error) {
-	endpoint := strings.TrimRight(baseURL, "/") + apiPath
-	var reader io.Reader
-	if body != nil {
-		reader = strings.NewReader(string(body))
-	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := r.httpClient().Do(req) //nolint:gosec // HA admin URL is explicitly configured for the cluster by the operator user.
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HA admin API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return raw, nil
-}
-
-func haPrimaryStatusQuery(ha *antflyv1.HighAvailabilitySpec) url.Values {
-	query := url.Values{}
+func haPrimaryStatusParams(ha *antflyv1.HighAvailabilitySpec) *adminsdk.HAPrimaryStatusParams {
+	params := &adminsdk.HAPrimaryStatusParams{}
 	if ha == nil {
-		return query
+		return params
 	}
 	if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
-		query.Set("max_lag_lsn", strconv.FormatUint(ha.Retention.MaxLagLSN, 10))
+		params.MaxLagLsn = ha.Retention.MaxLagLSN
 	}
 	if ha.SyncPolicy != nil && ha.SyncPolicy.Mode != "" && ha.SyncPolicy.Mode != antflyv1.HADurabilityModeAsync {
-		query.Set("sync_mode", haDurabilityModeCLI(ha.SyncPolicy.Mode))
+		params.SyncMode = haAdminSyncModeParam(ha.SyncPolicy.Mode)
 		if ha.SyncPolicy.Selection != "" {
-			query.Set("sync_selection", haStandbySelectionCLI(ha.SyncPolicy.Selection))
+			params.SyncSelection = haAdminSyncSelectionParam(ha.SyncPolicy.Selection)
 		}
 		if ha.SyncPolicy.Required > 0 {
-			query.Set("sync_required", strconv.FormatInt(int64(ha.SyncPolicy.Required), 10))
+			params.SyncRequired = uint64(ha.SyncPolicy.Required)
 		}
 		for _, name := range ha.SyncPolicy.StandbyNames {
 			if strings.TrimSpace(name) != "" {
-				query.Add("sync_standby", name)
+				params.SyncStandby = append(params.SyncStandby, strings.TrimSpace(name))
 			}
 		}
 		if ha.SyncPolicy.FailurePolicy != "" {
-			query.Set("sync_failure", haFailurePolicyCLI(ha.SyncPolicy.FailurePolicy))
+			params.SyncFailure = haAdminSyncFailureParam(ha.SyncPolicy.FailurePolicy)
 		}
 	}
-	return query
+	return params
 }
 
-func haStandbyStatusQuery(upstreamLSN uint64) url.Values {
-	query := url.Values{}
+func haStandbyStatusParams(upstreamLSN uint64) *adminsdk.HAStandbyStatusParams {
+	params := &adminsdk.HAStandbyStatusParams{}
 	if upstreamLSN > 0 {
-		query.Set("upstream_lsn", strconv.FormatUint(upstreamLSN, 10))
+		params.UpstreamLsn = upstreamLSN
 	}
-	return query
+	return params
 }
 
-func haDurabilityModeCLI(mode antflyv1.HADurabilityMode) string {
+func haAdminSyncModeParam(mode antflyv1.HADurabilityMode) adminsdk.HAPrimaryStatusParamsSyncMode {
 	switch mode {
 	case antflyv1.HADurabilityModeRemoteWrite:
-		return "remote-write"
+		return adminsdk.HAPrimaryStatusSyncModeRemoteWrite
 	case antflyv1.HADurabilityModeRemoteApply:
-		return "remote-apply"
+		return adminsdk.HAPrimaryStatusSyncModeRemoteApply
 	default:
-		return "async"
+		return adminsdk.HAPrimaryStatusSyncModeAsync
 	}
 }
 
-func haStandbySelectionCLI(selection antflyv1.HAStandbySelection) string {
+func haAdminSyncSelectionParam(selection antflyv1.HAStandbySelection) adminsdk.HAPrimaryStatusParamsSyncSelection {
 	switch selection {
 	case antflyv1.HAStandbySelectionFirst:
-		return "first"
+		return adminsdk.HAPrimaryStatusSyncSelectionFirst
 	case antflyv1.HAStandbySelectionAll:
-		return "all"
+		return adminsdk.HAPrimaryStatusSyncSelectionAll
 	default:
-		return "any"
+		return adminsdk.HAPrimaryStatusSyncSelectionAny
 	}
 }
 
-func haFailurePolicyCLI(policy antflyv1.HAFailurePolicy) string {
+func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimaryStatusParamsSyncFail {
 	switch policy {
 	case antflyv1.HAFailurePolicyFailClosed:
-		return "fail-closed"
+		return adminsdk.HAPrimaryStatusSyncFailureFailClosed
 	case antflyv1.HAFailurePolicyDegradeToAsync:
-		return "degrade-to-async"
+		return adminsdk.HAPrimaryStatusSyncFailureDegradeToAsync
 	default:
-		return "block"
+		return adminsdk.HAPrimaryStatusSyncFailureBlock
 	}
 }
 

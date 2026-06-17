@@ -107,6 +107,9 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Fatalf("Authorization = %q, want Bearer test-token", got)
 		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
 		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
 			t.Fatalf("Content-Type = %q, want application/json", got)
 		}

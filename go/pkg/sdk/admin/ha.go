@@ -12,23 +12,26 @@ import (
 const adminV1Path = "/admin/v1"
 
 type (
-	HAActionReceipt                 = oapi.HAActionReceipt
-	HABaseBackupBeginResponse       = oapi.HABaseBackupBeginResponse
-	HABaseBackupFinishResponse      = oapi.HABaseBackupFinishResponse
-	HACurrentFenceResponse          = oapi.HACurrentFenceResponse
-	HAFenceReceipt                  = oapi.HAFenceReceipt
-	HAFenceResponse                 = oapi.HAFenceResponse
-	HAIdentity                      = oapi.HAIdentity
-	HAPrimaryStatusParams           = oapi.GetHAPrimaryStatusParams
-	HAPrimaryStatusResponse         = oapi.HAPrimaryStatusResponse
-	HAPromotionAssessResponse       = oapi.HAPromotionAssessResponse
-	HAPromotionResponse             = oapi.HAPromotionResponse
-	HARejoinAssessResponse          = oapi.HARejoinAssessResponse
-	HAReplicationSlotActionResponse = oapi.HAReplicationSlotActionResponse
-	HAReplicationSlotListResponse   = oapi.HAReplicationSlotListResponse
-	HAStandbyBootstrapResponse      = oapi.HAStandbyBootstrapResponse
-	HAStandbyStatusParams           = oapi.GetHAStandbyStatusParams
-	HAStandbyStatusResponse         = oapi.HAStandbyStatusResponse
+	HAActionReceipt                    = oapi.HAActionReceipt
+	HABaseBackupBeginResponse          = oapi.HABaseBackupBeginResponse
+	HABaseBackupFinishResponse         = oapi.HABaseBackupFinishResponse
+	HACurrentFenceResponse             = oapi.HACurrentFenceResponse
+	HAFenceReceipt                     = oapi.HAFenceReceipt
+	HAFenceResponse                    = oapi.HAFenceResponse
+	HAIdentity                         = oapi.HAIdentity
+	HAPrimaryStatusParams              = oapi.GetHAPrimaryStatusParams
+	HAPrimaryStatusParamsSyncMode      = oapi.GetHAPrimaryStatusParamsSyncMode
+	HAPrimaryStatusParamsSyncSelection = oapi.GetHAPrimaryStatusParamsSyncSelection
+	HAPrimaryStatusParamsSyncFail      = oapi.GetHAPrimaryStatusParamsSyncFailure
+	HAPrimaryStatusResponse            = oapi.HAPrimaryStatusResponse
+	HAPromotionAssessResponse          = oapi.HAPromotionAssessResponse
+	HAPromotionResponse                = oapi.HAPromotionResponse
+	HARejoinAssessResponse             = oapi.HARejoinAssessResponse
+	HAReplicationSlotActionResponse    = oapi.HAReplicationSlotActionResponse
+	HAReplicationSlotListResponse      = oapi.HAReplicationSlotListResponse
+	HAStandbyBootstrapResponse         = oapi.HAStandbyBootstrapResponse
+	HAStandbyStatusParams              = oapi.GetHAStandbyStatusParams
+	HAStandbyStatusResponse            = oapi.HAStandbyStatusResponse
 
 	BaseBackupManifestPathRequest = oapi.BaseBackupManifestPathRequest
 	BaseBackupStartRequest        = oapi.BaseBackupStartRequest
@@ -37,6 +40,20 @@ type (
 	RejoinAssessRequest           = oapi.RejoinAssessRequest
 	ReplicationSlotCreateRequest  = oapi.ReplicationSlotCreateRequest
 	StandbyBootstrapRequest       = oapi.StandbyBootstrapRequest
+)
+
+const (
+	HAPrimaryStatusSyncModeAsync       = oapi.GetHAPrimaryStatusParamsSyncModeAsync
+	HAPrimaryStatusSyncModeRemoteWrite = oapi.GetHAPrimaryStatusParamsSyncModeRemoteWrite
+	HAPrimaryStatusSyncModeRemoteApply = oapi.GetHAPrimaryStatusParamsSyncModeRemoteApply
+
+	HAPrimaryStatusSyncSelectionAny   = oapi.GetHAPrimaryStatusParamsSyncSelectionAny
+	HAPrimaryStatusSyncSelectionFirst = oapi.GetHAPrimaryStatusParamsSyncSelectionFirst
+	HAPrimaryStatusSyncSelectionAll   = oapi.GetHAPrimaryStatusParamsSyncSelectionAll
+
+	HAPrimaryStatusSyncFailureBlock          = oapi.GetHAPrimaryStatusParamsSyncFailureBlock
+	HAPrimaryStatusSyncFailureFailClosed     = oapi.GetHAPrimaryStatusParamsSyncFailureFailClosed
+	HAPrimaryStatusSyncFailureDegradeToAsync = oapi.GetHAPrimaryStatusParamsSyncFailureDegradeToAsync
 )
 
 // HAClient is a typed client for the stable /admin/v1/ha API.
@@ -84,13 +101,13 @@ func NewHAClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*HAClien
 	if err != nil {
 		return nil, err
 	}
-	return &HAClient{client: client}, nil
+	return &HAClient{client: client, editors: []oapi.RequestEditorFn{acceptJSONEditor}}, nil
 }
 
 // WithToken configures bearer-token authentication for HA admin requests.
 func (c *HAClient) WithToken(token string) *HAClient {
 	token = strings.TrimSpace(token)
-	c.editors = nil
+	c.editors = []oapi.RequestEditorFn{acceptJSONEditor}
 	if token != "" {
 		c.editors = append(c.editors, func(_ context.Context, req *http.Request) error {
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -103,6 +120,11 @@ func (c *HAClient) WithToken(token string) *HAClient {
 // Client returns the underlying generated client for low-level operations.
 func (c *HAClient) Client() *oapi.ClientWithResponses {
 	return c.client
+}
+
+func acceptJSONEditor(_ context.Context, req *http.Request) error {
+	req.Header.Set("Accept", "application/json")
+	return nil
 }
 
 func normalizeAdminBaseURL(baseURL string) string {
