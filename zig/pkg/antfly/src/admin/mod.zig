@@ -185,6 +185,39 @@ test "admin facade preserves HA status and gate schema fields" {
     }
 }
 
+test "admin facade preserves HA slot seed and fence schema fields" {
+    inline for (ha_identity_fields) |name| {
+        try expectFacadeStructField(HAIdentity, name);
+    }
+    inline for (ha_replication_slot_fields) |name| {
+        try expectFacadeStructField(HAReplicationSlot, name);
+    }
+    inline for (ha_replication_slot_action_response_fields) |name| {
+        try expectFacadeStructField(HAReplicationSlotActionResponse, name);
+    }
+    inline for (ha_replication_slot_list_response_fields) |name| {
+        try expectFacadeStructField(HAReplicationSlotListResponse, name);
+    }
+    inline for (ha_base_backup_begin_response_fields) |name| {
+        try expectFacadeStructField(HABaseBackupBeginResponse, name);
+    }
+    inline for (ha_base_backup_finish_response_fields) |name| {
+        try expectFacadeStructField(HABaseBackupFinishResponse, name);
+    }
+    inline for (ha_standby_bootstrap_response_fields) |name| {
+        try expectFacadeStructField(HAStandbyBootstrapResponse, name);
+    }
+    inline for (ha_fence_receipt_fields) |name| {
+        try expectFacadeStructField(HAFenceReceipt, name);
+    }
+    inline for (ha_fence_response_fields) |name| {
+        try expectFacadeStructField(HAFenceResponse, name);
+    }
+    inline for (ha_current_fence_response_fields) |name| {
+        try expectFacadeStructField(HACurrentFenceResponse, name);
+    }
+}
+
 const ha_contract_type_names = [_][]const u8{
     "ReplicationSlotCreateRequest",
     "BaseBackupStartRequest",
@@ -456,6 +489,93 @@ const ha_promotion_handoff_fields = [_][]const u8{
     "identity",
     "switch_lsn",
     "next_lsn",
+};
+
+const ha_identity_fields = [_][]const u8{
+    "cluster_id",
+    "shard_id",
+    "table_id",
+    "timeline_id",
+    "epoch",
+};
+
+const ha_replication_slot_fields = [_][]const u8{
+    "slot_name",
+    "timeline_id",
+    "restart_lsn",
+    "received_lsn",
+    "applied_lsn",
+    "safe_read_lsn",
+    "active",
+    "reseed_required",
+    "last_error",
+    "current_lsn",
+    "dropped",
+};
+
+const ha_replication_slot_action_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "slot_action",
+    "slot",
+};
+
+const ha_replication_slot_list_response_fields = [_][]const u8{
+    "schema_version",
+    "slots",
+};
+
+const ha_base_backup_begin_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "slot_name",
+    "manifest_id",
+    "backup_lsn",
+    "start_record_lsn",
+};
+
+const ha_base_backup_finish_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "manifest_id",
+    "backup_lsn",
+    "end_record_lsn",
+};
+
+const ha_standby_bootstrap_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "manifest_id",
+    "backup_lsn",
+    "checkpoint_lsn",
+};
+
+const ha_fence_receipt_fields = [_][]const u8{
+    "identity",
+    "old_primary_id",
+    "promoted_node_id",
+    "parent_timeline_id",
+    "parent_epoch",
+    "new_timeline_id",
+    "new_epoch",
+    "required_lsn",
+    "observed_lsn",
+    "generation",
+    "forced",
+    "token",
+    "reason",
+};
+
+const ha_fence_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "receipt",
+};
+
+const ha_current_fence_response_fields = [_][]const u8{
+    "schema_version",
+    "held",
+    "receipt",
 };
 
 fn expectFacadeTypeAlias(comptime name: []const u8) !void {
