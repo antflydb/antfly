@@ -772,6 +772,43 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	}
 }
 
+func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
+	operations := loadAdminOpenAPIOperations(t)
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{method: "GET", path: haAdminPrimaryStatusPath},
+		{method: "GET", path: haAdminStandbyStatusPath},
+		{method: "GET", path: haAdminReplicationSlotsPath},
+		{method: "POST", path: haAdminReplicationSlotsPath},
+		{method: "DELETE", path: haAdminReplicationSlotPathPrefix + "{slot_name}"},
+		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotPausePathSuffix},
+		{method: "PUT", path: haAdminReplicationSlotPathPrefix + "{slot_name}" + haAdminReplicationSlotResumePathSuffix},
+		{method: "POST", path: haAdminBaseBackupsPath},
+		{method: "POST", path: haAdminBaseBackupsFinishPath},
+		{method: "POST", path: haAdminStandbyBootstrapPath},
+		{method: "POST", path: haAdminFencePath},
+		{method: "GET", path: haAdminFenceCurrentPath},
+		{method: "POST", path: haAdminPromotionAssessPath},
+		{method: "POST", path: haAdminPromotionCurrentFencePath},
+		{method: "POST", path: haAdminPromotionPath},
+		{method: "POST", path: haAdminRejoinAssessPath},
+		{method: "POST", path: haAdminRejoinRewindPath},
+		{method: "POST", path: haAdminRejoinReseedPath},
+	}
+
+	for _, route := range routes {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			path := strings.TrimPrefix(route.path, haAdminBasePath)
+			key := route.method + " " + path
+			if operations[key] == "" {
+				t.Fatalf("operator HA admin route %s is missing from specs/openapi/antfly/admin.yaml", key)
+			}
+		})
+	}
+}
+
 func TestHADirectAdminSupportMatchesAdminOperations(t *testing.T) {
 	directActions := []haPlannedAction{
 		{Kind: haActionCreateSlot, StandbyName: "standby-a", SlotName: "standby-a"},
