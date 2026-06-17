@@ -231,6 +231,8 @@ const FamilyResult = struct {
     active_status_pages: usize,
     active_status_leased_pages: usize,
     active_status_detailed_pages: usize,
+    active_status_cursor_pages: usize,
+    active_status_progress_pages: usize,
     active_status_pages_truncated: bool,
     active_status_progress: f64,
     active_pending_work: usize,
@@ -431,6 +433,8 @@ const ReleaseSummary = struct {
     total_active_status_pages: usize = 0,
     total_active_status_leased_pages: usize = 0,
     total_active_status_detailed_pages: usize = 0,
+    total_active_status_cursor_pages: usize = 0,
+    total_active_status_progress_pages: usize = 0,
     min_active_status_progress: f64 = 0.0,
     max_active_status_progress: f64 = 0.0,
     total_failed_terminal_pending_work: usize = 0,
@@ -644,6 +648,8 @@ const ReleaseSummary = struct {
         self.total_active_status_pages += result.active_status_pages;
         self.total_active_status_leased_pages += result.active_status_leased_pages;
         self.total_active_status_detailed_pages += result.active_status_detailed_pages;
+        self.total_active_status_cursor_pages += result.active_status_cursor_pages;
+        self.total_active_status_progress_pages += result.active_status_progress_pages;
         self.min_active_status_progress = if (first)
             result.active_status_progress
         else
@@ -1135,6 +1141,8 @@ fn runFamily(io: anytype, alloc: std.mem.Allocator, cfg: Config, family: Family)
         .active_status_pages = active_reads.active_status_pages,
         .active_status_leased_pages = active_reads.active_status_leased_pages,
         .active_status_detailed_pages = active_reads.active_status_detailed_pages,
+        .active_status_cursor_pages = active_reads.active_status_cursor_pages,
+        .active_status_progress_pages = active_reads.active_status_progress_pages,
         .active_status_pages_truncated = active_reads.active_status_pages_truncated,
         .active_status_progress = active_reads.active_status_progress,
         .active_pending_work = active_reads.active_pending_work,
@@ -1670,6 +1678,8 @@ fn verifyStatusAndWorkEvidence(cfg: Config, family: Family, result: FamilyResult
         result.active_status_pages == 0 or
         result.active_status_leased_pages != result.active_status_pages or
         result.active_status_detailed_pages != result.active_status_pages or
+        result.active_status_cursor_pages != result.active_status_pages or
+        result.active_status_progress_pages != result.active_status_pages or
         result.active_status_pages > cfg.max_status_pages or
         result.active_status_pages_truncated or
         !std.math.isFinite(result.active_status_progress) or
@@ -2262,6 +2272,8 @@ fn verifyReleaseSummaryBudgets(cfg: Config, summary: ReleaseSummary) !void {
         summary.total_active_status_pages < summary.families_run or
         summary.total_active_status_leased_pages != summary.total_active_status_pages or
         summary.total_active_status_detailed_pages != summary.total_active_status_pages or
+        summary.total_active_status_cursor_pages != summary.total_active_status_pages or
+        summary.total_active_status_progress_pages != summary.total_active_status_pages or
         !std.math.isFinite(summary.min_active_status_progress) or
         !std.math.isFinite(summary.max_active_status_progress) or
         summary.min_active_status_progress < 0.0 or
@@ -2474,6 +2486,8 @@ const ActiveStatusBoundResult = struct {
     build_pages: usize,
     leased_pages: usize,
     detailed_pages: usize,
+    cursor_pages: usize,
+    progress_pages: usize,
     build_pages_truncated: bool,
     progress: f64,
 };
@@ -5118,8 +5132,12 @@ fn verifyActiveStatusBounded(
     }
     var leased_pages: usize = 0;
     var detailed_pages: usize = 0;
+    var cursor_pages: usize = 0;
+    var progress_pages: usize = 0;
     for (status.build_pages) |page| {
         if (page.state == .leased) leased_pages += 1;
+        if (page.cursor.len > 0) cursor_pages += 1;
+        if (page.completed_units > 0 and page.total_units > 0) progress_pages += 1;
         if (page.phase != status.phase or page.iteration != status.build_iteration) {
             return error.GraphMetricReleaseQualificationMissingBuildStatus;
         }
@@ -5145,6 +5163,8 @@ fn verifyActiveStatusBounded(
         .build_pages = status.build_pages.len,
         .leased_pages = leased_pages,
         .detailed_pages = detailed_pages,
+        .cursor_pages = cursor_pages,
+        .progress_pages = progress_pages,
         .build_pages_truncated = status.build_pages_truncated,
         .progress = status.progress,
     };
@@ -5603,6 +5623,8 @@ const ActiveReadResult = struct {
     active_status_pages: usize,
     active_status_leased_pages: usize,
     active_status_detailed_pages: usize,
+    active_status_cursor_pages: usize,
+    active_status_progress_pages: usize,
     active_status_pages_truncated: bool,
     active_status_progress: f64,
     active_pending_work: usize,
@@ -5968,6 +5990,8 @@ fn measureActiveReadContract(
         .active_status_pages = active_status.build_pages,
         .active_status_leased_pages = active_status.leased_pages,
         .active_status_detailed_pages = active_status.detailed_pages,
+        .active_status_cursor_pages = active_status.cursor_pages,
+        .active_status_progress_pages = active_status.progress_pages,
         .active_status_pages_truncated = active_status.build_pages_truncated,
         .active_status_progress = active_status.progress,
         .active_pending_work = active_work.pendingWork(),
@@ -7497,6 +7521,8 @@ fn observedPromotionOperationsFloor(cfg: Config, summary: ReleaseSummary) bool {
         summary.total_active_status_pages != 0 and
         summary.total_active_status_leased_pages == summary.total_active_status_pages and
         summary.total_active_status_detailed_pages == summary.total_active_status_pages and
+        summary.total_active_status_cursor_pages == summary.total_active_status_pages and
+        summary.total_active_status_progress_pages == summary.total_active_status_pages and
         summary.total_active_work_active_builds == summary.families_run and
         summary.total_active_work_active_pages != 0 and
         summary.total_active_work_failed_pages == 0 and
@@ -7836,8 +7862,8 @@ fn emitReleaseSummary(out: anytype, cfg: Config, summary: ReleaseSummary) !void 
         .{ max_allowed_pre_drain_metrics_scanned, summary.total_pre_drain_metrics_scanned, summary.max_observed_pre_drain_metrics_scanned, summary.total_pre_drain_queued_builds, summary.total_pre_drain_paused_metrics, summary.total_fresh_terminal_pending_work, summary.total_fresh_active_builds, summary.total_fresh_active_pages, summary.total_fresh_failed_pages, summary.total_fresh_paused_metrics, summary.total_fresh_truncated_pages, summary.total_fresh_status_pages, summary.total_fresh_status_pages_truncated, summary.total_active_work_active_builds, summary.total_active_work_active_pages, summary.total_active_work_failed_pages, summary.total_active_work_paused_metrics, summary.total_active_work_truncated_pages },
     );
     try out.print(
-        ",\"total_active_page_probe_claimed\":{d},\"total_active_page_probe_reclaimed\":{d},\"total_active_status_pages\":{d},\"total_active_status_leased_pages\":{d},\"total_active_status_detailed_pages\":{d},\"min_active_status_progress\":{d:.12},\"max_active_status_progress\":{d:.12},\"total_failed_terminal_pending_work\":{d},\"total_failed_active_builds\":{d},\"total_failed_active_pages\":{d},\"total_failed_failed_pages\":{d},\"total_failed_paused_metrics\":{d},\"total_failed_truncated_pages\":{d},\"total_failed_status_pages\":{d},\"total_failed_status_pages_truncated\":{d}",
-        .{ summary.total_active_page_probe_claimed, summary.total_active_page_probe_reclaimed, summary.total_active_status_pages, summary.total_active_status_leased_pages, summary.total_active_status_detailed_pages, summary.min_active_status_progress, summary.max_active_status_progress, summary.total_failed_terminal_pending_work, summary.total_failed_active_builds, summary.total_failed_active_pages, summary.total_failed_failed_pages, summary.total_failed_paused_metrics, summary.total_failed_truncated_pages, summary.total_failed_status_pages, summary.total_failed_status_pages_truncated },
+        ",\"total_active_page_probe_claimed\":{d},\"total_active_page_probe_reclaimed\":{d},\"total_active_status_pages\":{d},\"total_active_status_leased_pages\":{d},\"total_active_status_detailed_pages\":{d},\"total_active_status_cursor_pages\":{d},\"total_active_status_progress_pages\":{d},\"min_active_status_progress\":{d:.12},\"max_active_status_progress\":{d:.12},\"total_failed_terminal_pending_work\":{d},\"total_failed_active_builds\":{d},\"total_failed_active_pages\":{d},\"total_failed_failed_pages\":{d},\"total_failed_paused_metrics\":{d},\"total_failed_truncated_pages\":{d},\"total_failed_status_pages\":{d},\"total_failed_status_pages_truncated\":{d}",
+        .{ summary.total_active_page_probe_claimed, summary.total_active_page_probe_reclaimed, summary.total_active_status_pages, summary.total_active_status_leased_pages, summary.total_active_status_detailed_pages, summary.total_active_status_cursor_pages, summary.total_active_status_progress_pages, summary.min_active_status_progress, summary.max_active_status_progress, summary.total_failed_terminal_pending_work, summary.total_failed_active_builds, summary.total_failed_active_pages, summary.total_failed_failed_pages, summary.total_failed_paused_metrics, summary.total_failed_truncated_pages, summary.total_failed_status_pages, summary.total_failed_status_pages_truncated },
     );
     try out.print(
         ",\"expected_primary_pre_publish_not_ready_surfaces\":{d},\"total_primary_pre_publish_not_ready_surfaces\":{d},\"expected_hits_paired_pre_publish_not_ready_surfaces\":{d},\"total_hits_paired_pre_publish_not_ready_surfaces\":{d},\"expected_primary_published_read_surfaces\":{d},\"total_primary_published_read_surfaces\":{d},\"expected_primary_fresh_rejections\":{d},\"total_primary_fresh_rejections\":{d},\"total_active_published_score_count\":{d},\"total_failed_published_score_count\":{d},\"total_profile_entries\":{d},\"expected_hits_paired_published_read_surfaces\":{d},\"total_hits_paired_published_read_surfaces\":{d},\"expected_hits_paired_fresh_rejections\":{d},\"total_hits_paired_fresh_rejections\":{d},\"total_hits_active_paired_published_score_count\":{d},\"total_hits_failed_paired_published_score_count\":{d}",
@@ -8086,7 +8112,7 @@ fn emitFamilyResult(out: anytype, family: Family, result: FamilyResult) !void {
         },
     );
     try out.print(
-        ",\"active_profile_entries\":{d},\"active_page_probe_claimed\":{},\"active_page_probe_reclaimed\":{},\"active_status_pages\":{d},\"active_status_leased_pages\":{d},\"active_status_detailed_pages\":{d},\"active_status_pages_truncated\":{},\"active_status_progress\":{d:.12},\"active_pending_work\":{d},\"active_work_active_builds\":{d},\"active_work_active_pages\":{d},\"active_work_failed_pages\":{d},\"active_work_paused_metrics\":{d},\"active_work_truncated_pages\":{},\"active_published_read_ns\":{d},\"active_published_read_results\":{d},\"active_published_score_count\":{d},\"active_fresh_fail_ns\":{d},\"active_fresh_rejections\":{d},\"active_rerank_published_ns\":{d},\"active_rerank_published_results\":{d},\"active_rerank_fresh_fail_ns\":{d},\"active_rerank_fresh_rejections\":{d},\"active_traversal_published_ns\":{d},\"active_traversal_fresh_fail_ns\":{d},\"active_traversal_published_checks\":{d},\"active_traversal_fresh_rejections\":{d}",
+        ",\"active_profile_entries\":{d},\"active_page_probe_claimed\":{},\"active_page_probe_reclaimed\":{},\"active_status_pages\":{d},\"active_status_leased_pages\":{d},\"active_status_detailed_pages\":{d},\"active_status_cursor_pages\":{d},\"active_status_progress_pages\":{d},\"active_status_pages_truncated\":{},\"active_status_progress\":{d:.12},\"active_pending_work\":{d},\"active_work_active_builds\":{d},\"active_work_active_pages\":{d},\"active_work_failed_pages\":{d},\"active_work_paused_metrics\":{d},\"active_work_truncated_pages\":{},\"active_published_read_ns\":{d},\"active_published_read_results\":{d},\"active_published_score_count\":{d},\"active_fresh_fail_ns\":{d},\"active_fresh_rejections\":{d},\"active_rerank_published_ns\":{d},\"active_rerank_published_results\":{d},\"active_rerank_fresh_fail_ns\":{d},\"active_rerank_fresh_rejections\":{d},\"active_traversal_published_ns\":{d},\"active_traversal_fresh_fail_ns\":{d},\"active_traversal_published_checks\":{d},\"active_traversal_fresh_rejections\":{d}",
         .{
             result.active_profile_entries,
             result.active_page_probe_claimed,
@@ -8094,6 +8120,8 @@ fn emitFamilyResult(out: anytype, family: Family, result: FamilyResult) !void {
             result.active_status_pages,
             result.active_status_leased_pages,
             result.active_status_detailed_pages,
+            result.active_status_cursor_pages,
+            result.active_status_progress_pages,
             result.active_status_pages_truncated,
             result.active_status_progress,
             result.active_pending_work,

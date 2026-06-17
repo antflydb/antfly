@@ -14,33 +14,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const artifact_ref = @import("artifact_ref.zig");
 const base_source = @import("base_source.zig");
 const catalog_types = @import("../catalog/types.zig");
 const search_sources = @import("../search_sources.zig");
 
-pub const ArtifactKind = enum(u8) {
-    text_segment = 1,
-    vector_segment = 2,
-    doc_values = 3,
-    stored_fields = 4,
-    mutation_segment = 5,
-    document_segment = 6,
-    sparse_segment = 7,
-    graph_segment = 8,
-    row_fragment = 9,
-    row_fragment_stats = 10,
-    algebraic_segment = 11,
-    external_base_source = 12,
-};
-
-pub const ArtifactRef = struct {
-    kind: ArtifactKind,
-    name: []const u8 = &.{},
-    artifact_id: []const u8,
-    byte_len: u64,
-    checksum: []const u8,
-};
-
+pub const ArtifactKind = artifact_ref.ArtifactKind;
+pub const ArtifactRef = artifact_ref.ArtifactRef;
 pub const BaseSourceKind = base_source.BaseSourceKind;
 pub const ExternalBaseFormat = base_source.ExternalBaseFormat;
 pub const AntflyFragmentBaseSource = base_source.AntflyFragmentBaseSource;

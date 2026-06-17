@@ -4705,7 +4705,8 @@ than PR unit coverage:
   and status counts, page counts,
   phase advances, publish/failure counts, local/planned publish latency, active page probe
   claim/reclaim flags, active status page count, leased-page count,
-  detailed-page count, truncation flag, progress, cleanup tick count, cleanup elapsed time, DB reopen
+  detailed-page count, cursor-bearing page count, progress-bearing page count,
+  truncation flag, progress, cleanup tick count, cleanup elapsed time, DB reopen
   count, configured worker identity count, split worker identities that made
   tick progress, split worker identities that made page claim/completion
   progress, split worker min/max page-progress counts, configured active
@@ -4891,8 +4892,9 @@ than PR unit coverage:
   operations observed flag is true only when every completed family exposes an
   active page probe, the reclaimed page is fenced from stale completion, the
   reclaimed probe page persists cursor-bearing progress, active status pages
-  carry leased and detailed page counts, terminal fresh/failed work is empty
-  and untruncated, and active progress is finite in `[0, 1]`. Rollout tooling
+  carry leased, detailed, cursor-bearing, and progress-bearing page counts,
+  terminal fresh/failed work is empty and untruncated, and active progress is
+  finite in `[0, 1]`. Rollout tooling
   can therefore tell which local promotion-gate category is absent without
   reverse-engineering every raw knob. When
   `--require-deployment-shaped-release-gate` is set, the harness now requires
@@ -4989,8 +4991,8 @@ than PR unit coverage:
   truncation components, fresh terminal status page and truncation counts, total
   active builds, active pages, active failed-page, paused-metric, and truncation
   components, active status pages, active page-probe claim and reclaim counts,
-  active leased pages, active detailed pages, the observed active-progress
-  range, total failed-terminal pending work plus its active-build/page,
+  active leased pages, active detailed pages, active cursor-bearing pages,
+  active progress-bearing pages, the observed active-progress range, total failed-terminal pending work plus its active-build/page,
   failed-page, paused-metric, and truncation components, and failed terminal
   status page and truncation counts. Those
   totals are verified against the families that actually ran, so release

@@ -1031,9 +1031,10 @@ intent instead of scanning raw SQL. Next extract the shared expression grammar,
 because expressions are reused by SELECT, DML, DDL checks, partial indexes,
 defaults, generated columns, conflict actions, and RETURNING. The binder boundary should
 own catalog source lookup, cross-table source-name pre-scans for read,
-insert-source, and joined-write statements, cross-table source schema
-derivation, identifier normalization, and scope resolution so statement lowerers
-consume typed schemas instead of re-reading metadata snapshots directly. Then
+insert-source, and joined-write statements, non-recursive CTE source-name
+resolution, cross-table source schema derivation, identifier normalization, and
+scope resolution so statement lowerers consume typed schemas instead of
+re-reading metadata snapshots directly. Then
 move statement families one at a time into AST plus binder plus lowerer modules,
 with the existing SQL/API parity tests as the acceptance gate. Only after those
 boundaries are stable should a generated grammar be considered.
@@ -1082,11 +1083,13 @@ remain the implementation units for those families, but application-facing SQL
 planning should use that classifier boundary so callers do not need to know that
 `SELECT ... JOIN ...`, `SELECT ... OVER (...)`, and ordinary base-row reads land
 in different typed request envelopes. The catalog-backed read-plan entrypoint
-resolves cross-table equality join and bounded lateral source schemas from the
-catalog before invoking the same typed lowerers; its SQL pre-scan is limited to
-target/source table identity and the full parser still owns shape validation,
-expression binding, and fail-closed behavior. Unsupported shapes still fail
-closed; SQL text is never carried through storage as the backend
+resolves direct and non-recursive CTE-backed cross-table equality join and
+bounded lateral source schemas from the catalog before invoking the same typed
+lowerers; its SQL pre-scan is limited to target/source table identity and the
+full parser still owns shape validation, expression binding, and fail-closed
+behavior. Recursive CTEs and CTE bodies that mix physical source tables fail
+closed at the binder boundary rather than guessing a schema. Unsupported shapes
+still fail closed; SQL text is never carried through storage as the backend
 representation.
 
 Write-side SQL follows the same boundary. The adapter classifies supported

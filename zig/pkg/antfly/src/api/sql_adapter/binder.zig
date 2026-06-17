@@ -70,6 +70,28 @@ pub const ReadSourceTableNames = struct {
     }
 };
 
+const SelectReadTableNames = struct {
+    left: []const u8,
+    source: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.left));
+        if (self.source) |source| alloc.free(@constCast(source));
+        self.* = undefined;
+    }
+};
+
+const CteSourceBinding = struct {
+    name: []const u8,
+    source: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.name));
+        alloc.free(@constCast(self.source));
+        self.* = undefined;
+    }
+};
+
 pub fn insertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
@@ -158,36 +180,127 @@ pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u
 pub fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?ReadSourceTableNames {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens.items[0].text, "select")) return null;
+    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return null;
+    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "with")) return try readSourceTableNamesFromWithAlloc(alloc, tokens.items);
+    if (!std.ascii.eqlIgnoreCase(tokens.items[0].text, "select")) return null;
+    return try readSourceTableNamesFromSelectAlloc(alloc, tokens.items, 0);
+}
 
-    const from_index = findTopLevelKeyword(tokens.items, "from") orelse return null;
+fn readSourceTableNamesFromSelectAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    select_index: usize,
+) !?ReadSourceTableNames {
+    var tables = (try selectReadTableNamesAlloc(alloc, tokens, select_index)) orelse return null;
+    errdefer tables.deinit(alloc);
+    const source = tables.source orelse {
+        tables.deinit(alloc);
+        return null;
+    };
+    tables.source = null;
+    return .{ .left = tables.left, .source = source };
+}
+
+fn selectReadTableNamesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    select_index: usize,
+) !?SelectReadTableNames {
+    if (select_index >= tokens.len or tokens[select_index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[select_index].text, "select")) return null;
+
+    const from_index = if (findTopLevelKeyword(tokens[select_index..], "from")) |relative|
+        select_index + relative
+    else
+        return null;
     var left_index = from_index + 1;
-    _ = consumeKeyword(tokens.items, &left_index, "only");
-    if (left_index >= tokens.items.len or tokens.items[left_index].kind != .identifier) return error.UnsupportedSqlShape;
-    const left = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[left_index].text);
+    _ = consumeKeyword(tokens, &left_index, "only");
+    if (left_index >= tokens.len or tokens[left_index].kind != .identifier) return error.UnsupportedSqlShape;
+    const left = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[left_index].text);
     var left_transferred = false;
     errdefer if (!left_transferred) alloc.free(left);
 
-    const join_index = if (findTopLevelKeyword(tokens.items[left_index + 1 ..], "join")) |relative|
+    const join_index = if (findTopLevelKeyword(tokens[left_index + 1 ..], "join")) |relative|
         left_index + 1 + relative
     else {
-        alloc.free(left);
-        return null;
+        left_transferred = true;
+        return .{ .left = left };
     };
     var source_index = join_index + 1;
-    if (consumeKeyword(tokens.items, &source_index, "lateral")) {
-        if (source_index >= tokens.items.len or tokens.items[source_index].kind != .lparen) return error.UnsupportedSqlShape;
-        const close_index = findMatchingRParenIndex(tokens.items, source_index) orelse return error.UnsupportedSqlShape;
-        const inner_from = findTopLevelKeyword(tokens.items[source_index + 1 .. close_index], "from") orelse return error.UnsupportedSqlShape;
+    if (consumeKeyword(tokens, &source_index, "lateral")) {
+        if (source_index >= tokens.len or tokens[source_index].kind != .lparen) return error.UnsupportedSqlShape;
+        const close_index = findMatchingRParenIndex(tokens, source_index) orelse return error.UnsupportedSqlShape;
+        const inner_from = findTopLevelKeyword(tokens[source_index + 1 .. close_index], "from") orelse return error.UnsupportedSqlShape;
         source_index = source_index + 1 + inner_from + 1;
     }
-    _ = consumeKeyword(tokens.items, &source_index, "only");
-    if (source_index >= tokens.items.len or tokens.items[source_index].kind != .identifier) return error.UnsupportedSqlShape;
-    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens.items[source_index].text);
+    _ = consumeKeyword(tokens, &source_index, "only");
+    if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
     errdefer alloc.free(source);
 
     left_transferred = true;
     return .{ .left = left, .source = source };
+}
+
+fn readSourceTableNamesFromWithAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !?ReadSourceTableNames {
+    var index: usize = 1;
+    if (consumeKeyword(tokens, &index, "recursive")) return error.UnsupportedSqlShape;
+
+    var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
+    defer {
+        for (cte_bindings.items) |*binding| binding.deinit(alloc);
+        cte_bindings.deinit(alloc);
+    }
+
+    while (true) {
+        if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
+        const cte_name = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) alloc.free(cte_name);
+        if (cteBindingIndex(cte_bindings.items, cte_name) != null) return error.UnsupportedSqlShape;
+        index += 1;
+
+        if (index < tokens.len and tokens[index].kind == .lparen) {
+            index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
+        }
+        if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+        try consumeCteMaterializationHint(tokens, &index);
+        if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
+        if (index + 1 >= close_index) return error.UnsupportedSqlShape;
+
+        var cte_tables = (try selectReadTableNamesAlloc(alloc, tokens[index + 1 .. close_index], 0)) orelse return error.UnsupportedSqlShape;
+        defer cte_tables.deinit(alloc);
+        try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &cte_tables);
+        if (cte_tables.source) |source| {
+            if (!std.mem.eql(u8, cte_tables.left, source)) return error.UnsupportedSqlShape;
+        }
+
+        try cte_bindings.append(alloc, .{
+            .name = cte_name,
+            .source = try alloc.dupe(u8, cte_tables.left),
+        });
+        cte_name_transferred = true;
+
+        index = close_index + 1;
+        if (index < tokens.len and tokens[index].kind == .comma) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    var final_tables = (try selectReadTableNamesAlloc(alloc, tokens, index)) orelse return null;
+    errdefer final_tables.deinit(alloc);
+    try resolveSelectReadTablesAgainstCtes(alloc, cte_bindings.items, &final_tables);
+    const source = final_tables.source orelse {
+        final_tables.deinit(alloc);
+        return null;
+    };
+    final_tables.source = null;
+    return .{ .left = final_tables.left, .source = source };
 }
 
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
@@ -305,6 +418,35 @@ fn insertSourceTableNamesFromWithAlloc(
     return final;
 }
 
+fn resolveSelectReadTablesAgainstCtes(
+    alloc: std.mem.Allocator,
+    bindings: []const CteSourceBinding,
+    tables: *SelectReadTableNames,
+) !void {
+    tables.left = try resolveTableNameAgainstCtesAlloc(alloc, bindings, tables.left);
+    if (tables.source) |source| {
+        tables.source = try resolveTableNameAgainstCtesAlloc(alloc, bindings, source);
+    }
+}
+
+fn resolveTableNameAgainstCtesAlloc(
+    alloc: std.mem.Allocator,
+    bindings: []const CteSourceBinding,
+    owned_name: []const u8,
+) ![]const u8 {
+    const binding_index = cteBindingIndex(bindings, owned_name) orelse return owned_name;
+    const resolved = try alloc.dupe(u8, bindings[binding_index].source);
+    alloc.free(@constCast(owned_name));
+    return resolved;
+}
+
+fn cteBindingIndex(bindings: []const CteSourceBinding, name: []const u8) ?usize {
+    for (bindings, 0..) |binding, index| {
+        if (std.mem.eql(u8, binding.name, name)) return index;
+    }
+    return null;
+}
+
 fn consumeKeyword(tokens: []const Token, index: *usize, keyword: []const u8) bool {
     return parser.matchKeyword(tokens, index, keyword);
 }
@@ -343,6 +485,37 @@ test "sql adapter binder resolves runtime schema from catalog table name" {
     try std.testing.expect(runtime.primary_key != null);
     try std.testing.expectEqual(@as(usize, 2), runtime.relational_columns.len);
     try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaForCatalogTableAlloc(alloc, catalog.iface(), "missing_records"));
+}
+
+test "sql adapter binder resolves read source tables through non recursive ctes" {
+    const alloc = std.testing.allocator;
+
+    var joined = (try readSourceTableNamesAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, tenant, customer_id FROM usage_records), active_customers AS (SELECT id, tenant, name FROM customer_records) SELECT o.id, c.name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.tenant = c.tenant",
+    )).?;
+    defer joined.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", joined.left);
+    try std.testing.expectEqualStrings("customer_records", joined.source);
+
+    var lateral = (try readSourceTableNamesAlloc(
+        alloc,
+        "WITH orgs AS (SELECT id FROM usage_records), balances AS (SELECT organization_id, amount FROM balance_records) SELECT org.id, latest.amount FROM orgs AS org LEFT JOIN LATERAL (SELECT amount FROM balances AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true",
+    )).?;
+    defer lateral.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", lateral.left);
+    try std.testing.expectEqualStrings("balance_records", lateral.source);
+}
+
+test "sql adapter binder rejects ambiguous physical cte read source tables" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        readSourceTableNamesAlloc(
+            alloc,
+            "WITH mixed AS (SELECT o.id FROM orders AS o JOIN customers AS c ON o.customer_id = c.id) SELECT mixed.id, s.id FROM mixed JOIN shipments AS s ON mixed.id = s.order_id",
+        ),
+    );
 }
 
 const TestCatalog = struct {
