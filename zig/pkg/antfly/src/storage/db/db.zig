@@ -3933,12 +3933,13 @@ pub const DB = struct {
             .derived_effect => {
                 _ = try self.applyHADerivedEffectRecord(record);
             },
-            .metadata_mutation,
             .backup_start,
             .backup_end,
             .checkpoint,
             .manifest,
             .truncate,
+            => {},
+            .metadata_mutation,
             .timeline_switch,
             => return error.HAReplicationRecordApplyUnsupported,
             _ => return error.HAReplicationRecordApplyUnsupported,
@@ -36863,6 +36864,11 @@ test "storage.ha db applies batch mutation records through replication session c
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated-session\"}" }},
         .sync_level = .full_index,
     }, .{});
+    _ = try primary.append(.{
+        .kind = .backup_start,
+        .payload_codec = .json,
+        .payload = "{\"manifest_id\":\"base-session\"}",
+    });
     _ = try ha_effects_mod.appendDerivedChangeRecord(alloc, &primary, .{
         .sequence = 1,
         .changed_doc_keys = &.{"doc:a"},
@@ -36883,14 +36889,14 @@ test "storage.ha db applies batch mutation records through replication session c
         &standby_db,
         DB.applyHAReplicationRecordCallback,
     );
-    try std.testing.expectEqual(@as(usize, 2), result.received_count);
-    try std.testing.expectEqual(@as(usize, 2), result.applied_count);
-    try std.testing.expectEqual(@as(u64, 2), result.progress.received_lsn);
-    try std.testing.expectEqual(@as(u64, 2), result.progress.applied_lsn);
+    try std.testing.expectEqual(@as(usize, 3), result.received_count);
+    try std.testing.expectEqual(@as(usize, 3), result.applied_count);
+    try std.testing.expectEqual(@as(u64, 3), result.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.progress.applied_lsn);
 
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 3), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), slot.applied_lsn);
 
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
