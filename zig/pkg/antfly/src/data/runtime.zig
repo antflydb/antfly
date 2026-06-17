@@ -1423,6 +1423,7 @@ pub const DataServerConfig = struct {
 pub const DataServerHAConfig = struct {
     admin_context: ?antfly.ha.admin_exec.Context = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
+    primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
     standby_replication: ?HAStandbyReplicationConfig = null,
 };
 
@@ -1750,6 +1751,13 @@ pub const DataServer = struct {
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
     ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
+    ha_primary_mirror_last_lsn: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_failure_count: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_last_gate_lsn: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_last_gate_action: std.atomic.Value(u8) = .init(255),
+    ha_primary_mirror_sync_reject_count: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
+    ha_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -1963,7 +1971,9 @@ pub const DataServer = struct {
         self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
+        const ha_primary_mirror = self.haPrimaryMirror();
         _ = self.write_source.withHAWriteGate(ha_write_gate);
+        _ = self.write_source.withHAMirror(ha_primary_mirror);
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
@@ -1971,6 +1981,7 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             apply_sm.write_cache.remote_content = api_server_cfg.remote_content;
             _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
+            _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
@@ -2112,6 +2123,29 @@ pub const DataServer = struct {
         if (ctx.standby) |standby| return .{ .standby = standby };
         if (ctx.primary) |primary| return .{ .primary = primary };
         return null;
+    }
+
+    fn haPrimaryMirror(self: *DataServer) ?antfly.db.HAAsyncEffectMirror {
+        if (self.ha_cfg.admin_context) |ctx| {
+            if (ctx.standby != null) return null;
+            if (ctx.primary) |primary| return self.haPrimaryMirrorFor(primary);
+        }
+        if (self.ha_cfg.internal_primary) |primary| return self.haPrimaryMirrorFor(primary);
+        return null;
+    }
+
+    fn haPrimaryMirrorFor(self: *DataServer, primary: *antfly.ha.primary.Primary) antfly.db.HAAsyncEffectMirror {
+        return .{
+            .primary = primary,
+            .last_lsn = &self.ha_primary_mirror_last_lsn,
+            .failure_count = &self.ha_primary_mirror_failure_count,
+            .sync_policy = self.ha_cfg.primary_sync_policy,
+            .last_gate_lsn = &self.ha_primary_mirror_last_gate_lsn,
+            .last_gate_action = &self.ha_primary_mirror_last_gate_action,
+            .sync_reject_count = &self.ha_primary_mirror_sync_reject_count,
+            .sync_wait_count = &self.ha_primary_mirror_sync_wait_count,
+            .sync_degraded_count = &self.ha_primary_mirror_sync_degraded_count,
+        };
     }
 
     fn haReadGate(self: *DataServer) ?antfly.public_api.HAReadGate {
@@ -13544,6 +13578,140 @@ test "data server wires configured HA executors into API server" {
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+}
+
+test "data server mirrors managed primary writes into HA replication log" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-log-{d}", .{nonce});
+    defer alloc.free(primary_log_raw);
+    const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+    defer alloc.free(primary_log);
+    const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-slots-{d}", .{nonce});
+    defer alloc.free(primary_slots_raw);
+    const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+    defer alloc.free(primary_slots);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
+
+    var primary = try antfly.ha.primary.Primary.open(alloc, primary_log.ptr, primary_slots.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .primary = &primary,
+                .primary_node_id = "primary-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const source_mirror = server.write_source.ha_async_mirror orelse return error.TestExpectedEqual;
+    try std.testing.expect(source_mirror.primary == &primary);
+    const cache_mirror = server.provisioned_storage.write_cache.ha_async_mirror orelse return error.TestExpectedEqual;
+    try std.testing.expect(cache_mirror.primary == &primary);
+
+    _ = try server.write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 123,
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(primary.lastLsn(), server.ha_primary_mirror_last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.ha_primary_mirror_failure_count.load(.acquire));
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .batch_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 100), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 77), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 7), entry.record.table_id);
+
+    var decoded = try antfly.ha.effects.decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.writes.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.value.request.writes[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.value.request.writes[0].value);
+    try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
 }
 
 test "data server propagates standby HA write gate into provisioned write sources" {
