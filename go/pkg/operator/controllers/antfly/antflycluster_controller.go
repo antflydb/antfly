@@ -5935,7 +5935,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
-			haActionHasRequiredAdminResult(action) {
+			haAdminActionSucceededWithEvidence(action) {
 			continue
 		}
 		jobName := action.AdminJobName
