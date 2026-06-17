@@ -195,6 +195,48 @@ pub fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usiz
     return null;
 }
 
+pub fn stripBalancedOuterParens(raw_tokens: []const Token) []const Token {
+    var tokens = raw_tokens;
+    while (tokens.len >= 2 and tokens[0].kind == .lparen and tokens[tokens.len - 1].kind == .rparen) {
+        var depth: usize = 0;
+        var closes_at_end = false;
+        for (tokens, 0..) |token, idx| {
+            switch (token.kind) {
+                .lparen => depth += 1,
+                .rparen => {
+                    if (depth == 0) return tokens;
+                    depth -= 1;
+                    if (depth == 0) {
+                        closes_at_end = idx == tokens.len - 1;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+        if (!closes_at_end) return tokens;
+        tokens = tokens[1 .. tokens.len - 1];
+    }
+    return tokens;
+}
+
+pub fn parseWrappedIdentifierOperand(tokens: []const Token, idx: *usize) !Token {
+    var wrapped: usize = 0;
+    while (idx.* < tokens.len and tokens[idx.*].kind == .lparen) {
+        wrapped += 1;
+        idx.* += 1;
+    }
+    if (idx.* >= tokens.len or tokens[idx.*].kind != .identifier) return error.UnsupportedSqlShape;
+    const field_token = tokens[idx.*];
+    idx.* += 1;
+    while (wrapped > 0) {
+        if (idx.* >= tokens.len or tokens[idx.*].kind != .rparen) return error.UnsupportedSqlShape;
+        idx.* += 1;
+        wrapped -= 1;
+    }
+    return field_token;
+}
+
 test "sql adapter parser cursor tracks shared token position" {
     var pos: usize = 0;
     const tokens = [_]Token{
@@ -228,4 +270,33 @@ fn testKeywordIsFrom(text: []const u8) bool {
 
 fn testKeywordIsLower(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "lower");
+}
+
+test "sql adapter parser strips balanced outer parens and parses wrapped identifiers" {
+    const tokens = [_]Token{
+        .{ .kind = .lparen, .text = "(", .source_start = 0, .source_end = 1 },
+        .{ .kind = .lparen, .text = "(", .source_start = 1, .source_end = 2 },
+        .{ .kind = .identifier, .text = "status", .source_start = 2, .source_end = 8 },
+        .{ .kind = .rparen, .text = ")", .source_start = 8, .source_end = 9 },
+        .{ .kind = .rparen, .text = ")", .source_start = 9, .source_end = 10 },
+    };
+    const stripped = stripBalancedOuterParens(tokens[0..]);
+    try std.testing.expectEqual(@as(usize, 1), stripped.len);
+    try std.testing.expectEqualStrings("status", stripped[0].text);
+
+    var idx: usize = 0;
+    const wrapped = try parseWrappedIdentifierOperand(tokens[1..4], &idx);
+    try std.testing.expectEqualStrings("status", wrapped.text);
+    try std.testing.expectEqual(@as(usize, 3), idx);
+
+    const sibling_tokens = [_]Token{
+        .{ .kind = .lparen, .text = "(", .source_start = 0, .source_end = 1 },
+        .{ .kind = .identifier, .text = "a", .source_start = 1, .source_end = 2 },
+        .{ .kind = .rparen, .text = ")", .source_start = 2, .source_end = 3 },
+        .{ .kind = .identifier, .text = "and", .source_start = 4, .source_end = 7 },
+        .{ .kind = .lparen, .text = "(", .source_start = 8, .source_end = 9 },
+        .{ .kind = .identifier, .text = "b", .source_start = 9, .source_end = 10 },
+        .{ .kind = .rparen, .text = ")", .source_start = 10, .source_end = 11 },
+    };
+    try std.testing.expectEqual(@as(usize, sibling_tokens.len), stripBalancedOuterParens(sibling_tokens[0..]).len);
 }

@@ -9910,11 +9910,11 @@ const Parser = struct {
     }
 
     fn parseDdlUniquePredicateAtomAlloc(self: *@This(), raw_tokens: []const Token) !runtime_schema.UniquePredicate {
-        const tokens = stripDdlPredicateOuterParens(raw_tokens);
+        const tokens = sql_adapter.stripBalancedOuterParens(raw_tokens);
         if (tokens.len == 0) return error.UnsupportedSqlShape;
 
         var idx: usize = 0;
-        const field_token = try parseDdlPredicateIdentifierOperand(tokens, &idx);
+        const field_token = try sql_adapter.parseWrappedIdentifierOperand(tokens, &idx);
         const field = try self.alloc.dupe(u8, field_token.text);
         var field_transferred = false;
         errdefer if (!field_transferred) self.alloc.free(field);
@@ -37248,48 +37248,6 @@ const Parser = struct {
         return false;
     }
 };
-
-fn stripDdlPredicateOuterParens(raw_tokens: []const Token) []const Token {
-    var tokens = raw_tokens;
-    while (tokens.len >= 2 and tokens[0].kind == .lparen and tokens[tokens.len - 1].kind == .rparen) {
-        var depth: usize = 0;
-        var closes_at_end = false;
-        for (tokens, 0..) |token, idx| {
-            switch (token.kind) {
-                .lparen => depth += 1,
-                .rparen => {
-                    if (depth == 0) return tokens;
-                    depth -= 1;
-                    if (depth == 0) {
-                        closes_at_end = idx == tokens.len - 1;
-                        break;
-                    }
-                },
-                else => {},
-            }
-        }
-        if (!closes_at_end) return tokens;
-        tokens = tokens[1 .. tokens.len - 1];
-    }
-    return tokens;
-}
-
-fn parseDdlPredicateIdentifierOperand(tokens: []const Token, idx: *usize) !Token {
-    var wrapped: usize = 0;
-    while (idx.* < tokens.len and tokens[idx.*].kind == .lparen) {
-        wrapped += 1;
-        idx.* += 1;
-    }
-    if (idx.* >= tokens.len or tokens[idx.*].kind != .identifier) return error.UnsupportedSqlShape;
-    const field_token = tokens[idx.*];
-    idx.* += 1;
-    while (wrapped > 0) {
-        if (idx.* >= tokens.len or tokens[idx.*].kind != .rparen) return error.UnsupportedSqlShape;
-        idx.* += 1;
-        wrapped -= 1;
-    }
-    return field_token;
-}
 
 fn tokenStartsWhereTailClause(token: []const u8) bool {
     return std.ascii.eqlIgnoreCase(token, "order") or
