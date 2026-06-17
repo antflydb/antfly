@@ -334,16 +334,27 @@ pub const Client = struct {
         defer self.alloc.free(body);
 
         const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_status);
-        errdefer self.alloc.free(uri);
+        var free_uri_on_error = true;
+        errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
+        free_uri_on_error = false;
         defer self.alloc.free(resp.request_uri);
         defer resp.response.deinit(self.alloc);
         try mapStatus(resp.response.status);
+
+        var parsed = try std.json.parseFromSlice(
+            internal_api.HAStandbyStatusUpdateResponse,
+            self.alloc,
+            resp.response.body,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        try verifyStandbyStatusUpdateResponse(parsed.value, slot_name, standby.identity, progress);
     }
 
     fn execute(self: *Client, req: http_common.HttpRequest) !OwnedResponse {
@@ -527,6 +538,25 @@ fn verifyStartReplicationResponse(response: anytype, expected_slot_name: []const
     if (format_version != replication_record.format_version) return error.UnsupportedReplicationFormat;
     const timeline_id = try positiveUint64FromJson(response.timeline_id);
     if (timeline_id != expected.timeline_id) return error.WrongTimeline;
+}
+
+fn verifyStandbyStatusUpdateResponse(
+    response: internal_api.HAStandbyStatusUpdateResponse,
+    expected_slot_name: []const u8,
+    expected_identity: standby_mod.Identity,
+    expected_progress: standby_mod.Progress,
+) !void {
+    if (!std.mem.eql(u8, response.slot_name, expected_slot_name)) return error.ReplicationSlotMismatch;
+    const timeline_id = try positiveUint64FromJson(response.timeline_id);
+    if (timeline_id != expected_identity.timeline_id) return error.WrongTimeline;
+    const received_lsn = try uint64FromJson(response.received_lsn);
+    const applied_lsn = try uint64FromJson(response.applied_lsn);
+    const safe_read_lsn = try uint64FromJson(response.safe_read_lsn);
+    if (received_lsn < expected_progress.received_lsn) return error.ReplicationStatusAckMismatch;
+    if (applied_lsn < expected_progress.applied_lsn) return error.ReplicationStatusAckMismatch;
+    if (safe_read_lsn < expected_progress.safe_read_lsn) return error.ReplicationStatusAckMismatch;
+    if (applied_lsn > received_lsn) return error.ReplicationStatusAckMismatch;
+    if (safe_read_lsn > applied_lsn) return error.ReplicationStatusAckMismatch;
 }
 
 fn uint64FromJson(value: i64) !u64 {
@@ -800,6 +830,98 @@ const WrongIdentityBatchExecutor = struct {
             .end_of_wal = true,
             .encoded_bytes = response_encoded_bytes,
             .records = response_records,
+        });
+    }
+};
+
+const StatusAckMismatchExecutor = struct {
+    const Mismatch = enum { slot, timeline, received_lsn, applied_lsn, safe_read_lsn };
+
+    identity: standby_mod.Identity,
+    mismatch: Mismatch = .slot,
+
+    fn executor(self: *StatusAckMismatchExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *StatusAckMismatchExecutor = @ptrCast(@alignCast(ptr));
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_start)) {
+            return try self.startResponse(alloc);
+        }
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_status)) {
+            return try self.statusResponse(alloc);
+        }
+        return .{
+            .status = 404,
+            .body = try alloc.dupe(u8, "not found"),
+        };
+    }
+
+    fn startResponse(self: *StatusAckMismatchExecutor, alloc: Allocator) !http_common.HttpResponse {
+        const encoded = try replication_record.encodeAlloc(alloc, .{
+            .kind = .batch_mutation,
+            .payload_codec = .raw,
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = self.identity.shard_id,
+            .table_id = self.identity.table_id,
+            .timeline_id = self.identity.timeline_id,
+            .epoch = self.identity.epoch,
+            .lsn = 1,
+            .previous_lsn = 0,
+            .payload = "one",
+        });
+        defer alloc.free(encoded);
+
+        const encoded_frame = try base64TestAlloc(alloc, encoded);
+        defer alloc.free(encoded_frame);
+        const records = [_]struct {
+            lsn: u64,
+            kind: []const u8,
+            payload_codec: []const u8,
+            encoded: []const u8,
+        }{.{
+            .lsn = 1,
+            .kind = "batch-mutation",
+            .payload_codec = "raw",
+            .encoded = encoded_frame,
+        }};
+
+        return try jsonTestResponse(alloc, .{
+            .slot_name = "standby-a",
+            .identity = self.identity,
+            .record_format_version = replication_record.format_version,
+            .timeline_id = self.identity.timeline_id,
+            .from_lsn = 1,
+            .current_lsn = 1,
+            .last_sent_lsn = 1,
+            .next_lsn = 2,
+            .end_of_wal = true,
+            .encoded_bytes = encoded.len,
+            .records = &records,
+        });
+    }
+
+    fn statusResponse(self: *StatusAckMismatchExecutor, alloc: Allocator) !http_common.HttpResponse {
+        const timeline_id: u64 = if (self.mismatch == .timeline) self.identity.timeline_id + 1 else self.identity.timeline_id;
+        const received_lsn: u64 = if (self.mismatch == .received_lsn) 0 else 1;
+        const applied_lsn: u64 = if (self.mismatch == .applied_lsn) 0 else 1;
+        const safe_read_lsn: u64 = if (self.mismatch == .safe_read_lsn) 0 else 1;
+        return try jsonTestResponse(alloc, .{
+            .slot_name = if (self.mismatch == .slot) "standby-other" else "standby-a",
+            .timeline_id = timeline_id,
+            .restart_lsn = 1,
+            .received_lsn = received_lsn,
+            .applied_lsn = applied_lsn,
+            .safe_read_lsn = safe_read_lsn,
+            .active = true,
+            .reseed_required = false,
+            .current_lsn = 1,
         });
     }
 };
@@ -1080,6 +1202,72 @@ test "storage.ha http replication client rejects premature end-of-wal before rec
     try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
     try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
     try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
+}
+
+test "storage.ha http replication client verifies typed standby status acknowledgement" {
+    const cases = [_]struct {
+        name: []const u8,
+        mismatch: StatusAckMismatchExecutor.Mismatch,
+        expected_error: anyerror,
+    }{
+        .{
+            .name = "slot",
+            .mismatch = .slot,
+            .expected_error = error.ReplicationSlotMismatch,
+        },
+        .{
+            .name = "timeline",
+            .mismatch = .timeline,
+            .expected_error = error.WrongTimeline,
+        },
+        .{
+            .name = "received_lsn",
+            .mismatch = .received_lsn,
+            .expected_error = error.ReplicationStatusAckMismatch,
+        },
+        .{
+            .name = "applied_lsn",
+            .mismatch = .applied_lsn,
+            .expected_error = error.ReplicationStatusAckMismatch,
+        },
+        .{
+            .name = "safe_read_lsn",
+            .mismatch = .safe_read_lsn,
+            .expected_error = error.ReplicationStatusAckMismatch,
+        },
+    };
+
+    const alloc = std.testing.allocator;
+    const identity = testIdentity();
+
+    for (cases) |tt| {
+        const paths = try testPaths(alloc, "status-ack-mismatch");
+        defer paths.deinit(alloc);
+
+        var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+        defer standby.close();
+
+        var executor = StatusAckMismatchExecutor{ .identity = identity, .mismatch = tt.mismatch };
+        var client = Client.init(alloc, executor.executor());
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectError(
+            tt.expected_error,
+            client.replicateAvailable(
+                "http://primary.internal.test",
+                "standby-a",
+                &standby,
+                &capture,
+                ApplyCapture.apply,
+                .{ .verify_upstream = false },
+            ),
+        );
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
+        try std.testing.expectEqual(@as(usize, 1), capture.payloads.items.len);
+        try std.testing.expect(tt.name.len > 0);
+    }
 }
 
 test "storage.ha http replication client reports durable receive progress when apply fails" {
