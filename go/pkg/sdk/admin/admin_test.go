@@ -529,6 +529,35 @@ func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
 	}
 }
 
+func TestHAReceiptMatchesExpectedOperationAndTarget(t *testing.T) {
+	t.Parallel()
+
+	expectation := HAReplicationSlotCreateReceiptExpectation()
+	receipt := HAActionReceipt{
+		ActionId:   "replication_slot_create:standby-a",
+		ActionKind: HAActionKindReplicationSlotCreate,
+		Target:     "standby-a",
+		State:      HAActionStateApplied,
+		NodeId:     "primary-a",
+	}
+	if !HAReceiptMatches(receipt, expectation, "standby-a") {
+		t.Fatalf("HAReceiptMatches returned false for exact matching receipt")
+	}
+	receipt.State = HAActionStateAlreadyApplied
+	if !HAReceiptMatches(receipt, expectation, "standby-a") {
+		t.Fatalf("HAReceiptMatches returned false for already-applied idempotent receipt")
+	}
+	receipt.State = HAActionStateApplied
+	receipt.Target = "standby-b"
+	if HAReceiptMatches(receipt, expectation, "standby-a") {
+		t.Fatalf("HAReceiptMatches returned true for mismatched target")
+	}
+	receipt.Target = "standby-a"
+	if HAReceiptMatches(receipt, expectation, "") {
+		t.Fatalf("HAReceiptMatches returned true with empty expected target")
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

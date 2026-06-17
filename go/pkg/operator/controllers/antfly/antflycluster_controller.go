@@ -4848,30 +4848,15 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 }
 
 func haJobResultActionReceiptMatches(actionID, actionKind, actionTarget, actionState, expectedKind, expectedTarget, expectedState string) bool {
-	actionID = strings.TrimSpace(actionID)
-	actionKind = strings.TrimSpace(actionKind)
-	actionTarget = strings.TrimSpace(actionTarget)
-	actionState = strings.TrimSpace(actionState)
-	expectedKind = strings.TrimSpace(expectedKind)
-	expectedTarget = strings.TrimSpace(expectedTarget)
-	expectedState = strings.TrimSpace(expectedState)
-	if actionID == "" || actionKind == "" || actionTarget == "" || actionState == "" ||
-		expectedKind == "" || expectedTarget == "" || expectedState == "" {
-		return false
-	}
-	return actionKind == expectedKind &&
-		actionTarget == expectedTarget &&
-		haJobResultActionStateMatches(actionState, expectedState) &&
-		actionID == expectedKind+":"+expectedTarget
-}
-
-func haJobResultActionStateMatches(actionState, expectedState string) bool {
-	actionState = strings.TrimSpace(actionState)
-	expectedState = strings.TrimSpace(expectedState)
-	if actionState == expectedState {
-		return true
-	}
-	return expectedState == "applied" && actionState == "already_applied"
+	return adminsdk.HAReceiptMatches(adminsdk.HAActionReceipt{
+		ActionId:   actionID,
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(actionKind)),
+		Target:     actionTarget,
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(actionState)),
+	}, adminsdk.HAReceiptExpectation{
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(expectedKind)),
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(expectedState)),
+	}, expectedTarget)
 }
 
 func haPromotionFenceReason(action antflyv1.HAPlannedActionStatus) string {

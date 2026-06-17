@@ -234,6 +234,33 @@ func (e HAReceiptExpectation) Strings() (string, string) {
 	return string(e.ActionKind), string(e.State)
 }
 
+// HAReceiptMatches verifies that a node-local HA admin receipt matches the
+// expected operation and acted-on target.
+func HAReceiptMatches(receipt HAActionReceipt, expectation HAReceiptExpectation, expectedTarget string) bool {
+	actionID := strings.TrimSpace(receipt.ActionId)
+	actionKind := strings.TrimSpace(string(receipt.ActionKind))
+	actionTarget := strings.TrimSpace(receipt.Target)
+	actionState := strings.TrimSpace(string(receipt.State))
+	expectedKind := strings.TrimSpace(string(expectation.ActionKind))
+	expectedTarget = strings.TrimSpace(expectedTarget)
+	expectedState := strings.TrimSpace(string(expectation.State))
+	if actionID == "" ||
+		actionKind == "" ||
+		actionTarget == "" ||
+		actionState == "" ||
+		expectedKind == "" ||
+		expectedTarget == "" ||
+		expectedState == "" {
+		return false
+	}
+	if actionKind != expectedKind || actionTarget != expectedTarget || actionState != expectedState {
+		if !(expectedState == string(HAActionStateApplied) && actionState == string(HAActionStateAlreadyApplied)) {
+			return false
+		}
+	}
+	return actionID == expectedKind+":"+expectedTarget
+}
+
 func HAListReplicationSlotsOperation() HAOperation {
 	return HAOperation{Method: http.MethodGet, Path: HAReplicationSlotsPath}
 }
