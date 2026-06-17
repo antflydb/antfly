@@ -34,6 +34,7 @@ const read_gate = @import("read_gate.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
+const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
 const write_gate = @import("write_gate.zig");
@@ -206,7 +207,12 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer snapshot.deinit(self.alloc);
-        return try self.handleTypedJson(status_mod.primaryStatusDocument(snapshot));
+        const response = admin_api.HAPrimaryStatusResponse{
+            .schema_version = 1,
+            .snapshot = try adminPrimarySnapshot(self.alloc, snapshot),
+        };
+        defer self.alloc.free(response.snapshot.slots);
+        return try self.handleTypedJson(response);
     }
 
     fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -217,9 +223,10 @@ pub const Server = struct {
         else
             null;
 
-        return try self.handleTypedJson(status_mod.standbyStatusDocument(
-            ha_admin.standbyStatus(standby, upstream_lsn),
-        ));
+        return try self.handleTypedJson(admin_api.HAStandbyStatusResponse{
+            .schema_version = 1,
+            .snapshot = try adminStandbySnapshot(ha_admin.standbyStatus(standby, upstream_lsn)),
+        });
     }
 
     fn handleAdminReplicationSlots(self: *Server) !http_common.HttpResponse {
@@ -1013,6 +1020,68 @@ fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPro
         .identity = try adminIdentity(handoff.identity),
         .switch_lsn = try adminI64(handoff.switch_lsn),
         .next_lsn = try adminI64(handoff.next_lsn),
+    };
+}
+
+fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) !admin_api.HAPrimarySnapshot {
+    return .{
+        .role = @tagName(snapshot.role),
+        .identity = try adminIdentity(snapshot.identity),
+        .current_lsn = try adminI64(snapshot.current_lsn),
+        .slots = try adminSlotSnapshots(alloc, snapshot.slots),
+        .retention = try adminRetentionSnapshot(snapshot.retention),
+        .durability = if (snapshot.durability) |decision| try adminDurabilityDecision(decision) else null,
+    };
+}
+
+fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot) !admin_api.HAStandbySnapshot {
+    return .{
+        .role = @tagName(snapshot.role),
+        .identity = try adminIdentity(snapshot.identity),
+        .received_lsn = try adminI64(snapshot.received_lsn),
+        .applied_lsn = try adminI64(snapshot.applied_lsn),
+        .safe_read_lsn = try adminI64(snapshot.safe_read_lsn),
+        .upstream_lsn = if (snapshot.upstream_lsn) |value| try adminI64(value) else null,
+        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| try adminI64(value) else null,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
+        .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
+        .caught_up_to_received = snapshot.caught_up_to_received,
+        .can_serve_safe_reads = snapshot.can_serve_safe_reads,
+    };
+}
+
+fn adminSlotSnapshots(alloc: Allocator, slots: []const status_mod.SlotSnapshot) ![]admin_api.HASlotSnapshot {
+    const admin_slots = try alloc.alloc(admin_api.HASlotSnapshot, slots.len);
+    errdefer alloc.free(admin_slots);
+    for (slots, 0..) |slot, idx| {
+        admin_slots[idx] = .{
+            .name = slot.name,
+            .timeline_id = try adminI64(slot.timeline_id),
+            .active = slot.active,
+            .reseed_required = slot.reseed_required,
+            .restart_lsn = try adminI64(slot.restart_lsn),
+            .received_lsn = try adminI64(slot.received_lsn),
+            .applied_lsn = try adminI64(slot.applied_lsn),
+            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
+            .write_lag_lsn = try adminI64(slot.write_lag_lsn),
+            .apply_lag_lsn = try adminI64(slot.apply_lag_lsn),
+            .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
+            .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
+            .status = @tagName(slot.status),
+            .last_error = slot.last_error,
+        };
+    }
+    return admin_slots;
+}
+
+fn adminRetentionSnapshot(snapshot: slot_store.RetentionSnapshot) !admin_api.HARetentionSnapshot {
+    return .{
+        .primary_lsn = try adminI64(snapshot.primary_lsn),
+        .oldest_restart_lsn = try adminI64(snapshot.oldest_restart_lsn),
+        .retained_lsn_count = try adminI64(snapshot.retained_lsn_count),
+        .active_slots = try adminI64(snapshot.active_slots),
+        .reseed_recommended = try adminI64(snapshot.reseed_recommended),
     };
 }
 
