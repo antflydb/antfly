@@ -5430,11 +5430,13 @@ requires exact `right_pred` and `on` count tokens instead of combined substring
 matches. Join and lateral structured side-access coverage requires well-formed
 nonzero `left_json_contains` or `right_json_exists` count tokens. Insert-source
 assignment-expression coverage likewise requires a well-formed nonzero
-`assignment_expr` token. Merge mutation coverage requires the fingerprint to
-start with the native `merge_mutation:` typed-plan family rather than merely
-containing that text inside another plan. Conflict no-op/skip and temporal
-unique upsert transform coverage requires exact `writes`, `transforms`, and
-`returning_rows` count tokens. DDL
+`assignment_expr` token, and dynamic CTE coverage requires well-formed nonzero
+`cte0_*`/`cte0_expr_*` count tokens rather than raw substring matches. Merge
+mutation coverage requires the fingerprint to start with the native
+`merge_mutation:` typed-plan family rather than merely containing that text
+inside another plan. Conflict no-op/skip and temporal unique upsert transform
+coverage requires exact `writes`, `transforms`, and `returning_rows` count
+tokens. DDL
 family coverage that is already represented by the typed `ddl_tag`, such as
 `table_clone`, is satisfied from that tag rather than a second string search over
 the fingerprint.

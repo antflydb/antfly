@@ -65032,6 +65032,24 @@ fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
     };
 }
 
+fn appParityPlanHasNonZeroUsizeTokenNamePrefix(plan: []const u8, name_prefix: []const u8) bool {
+    var segment_start: usize = 0;
+    var found_non_zero = false;
+    while (segment_start < plan.len) {
+        var segment_end = segment_start;
+        while (segment_end < plan.len and plan[segment_end] != ':') : (segment_end += 1) {}
+        const segment = plan[segment_start..segment_end];
+        if (std.mem.indexOfScalar(u8, segment, '=')) |equals_index| {
+            if (std.mem.startsWith(u8, segment[0..equals_index], name_prefix)) {
+                const value = appParityPlanParseDelimitedUsizeToken(segment, equals_index + 1) orelse return false;
+                found_non_zero = found_non_zero or value > 0;
+            }
+        }
+        segment_start = segment_end + 1;
+    }
+    return found_non_zero;
+}
+
 fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
     return switch (appParityPlanScanUsizeToken(plan, token)) {
         .value => |value| value == expected,
@@ -65608,6 +65626,29 @@ test "app parity insert-source assignment expression coverage tokens are exact" 
     });
 
     try std.testing.expect(coverage.insert_source_expression_assignment);
+}
+
+test "app parity cte coverage tokens are exact" {
+    const malformed = "query:table=usage_records:ctes=1:cte0_expr_pred=2x";
+    try std.testing.expect(!appParityPlanHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_"));
+    try std.testing.expect(!appParityPlanHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_expr_"));
+    try std.testing.expect(!appParityPlanHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=0", "cte0_expr_"));
+    try std.testing.expect(appParityPlanHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=2", "cte0_expr_"));
+
+    var coverage = AppParityCorpusCoverage{};
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .plan = malformed,
+    });
+    try std.testing.expect(!coverage.query_cte_structured_access);
+    try std.testing.expect(!coverage.query_cte_expression_access);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .plan = "query:table=usage_records:ctes=1:cte0_expr_pred=2",
+    });
+    try std.testing.expect(coverage.query_cte_structured_access);
+    try std.testing.expect(coverage.query_cte_expression_access);
 }
 
 test "app parity merge mutation coverage requires typed-plan prefix" {
@@ -66694,9 +66735,10 @@ const AppParityCorpusCoverage = struct {
                 self.cte_query = self.cte_query or uses_cte_stream;
                 self.query_distinct_on = self.query_distinct_on or appParityPlanHasNonZeroToken(entry.plan, ":distinct_on=");
                 self.query_cte_chain = self.query_cte_chain or appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 2);
-                self.query_cte_structured_access = self.query_cte_structured_access or std.mem.indexOf(u8, entry.plan, ":cte0_") != null;
+                self.query_cte_structured_access = self.query_cte_structured_access or
+                    appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_");
                 self.query_cte_expression_access = self.query_cte_expression_access or
-                    (std.mem.indexOf(u8, entry.plan, ":cte0_expr_") != null or
+                    (appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
                         (appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
                             (appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") or
                                 appParityPlanHasNonZeroToken(entry.plan, ":expr_or=") or
@@ -66759,7 +66801,7 @@ const AppParityCorpusCoverage = struct {
                     (appParityPlanHasNonZeroToken(entry.plan, ":group=") and
                         appParityPlanHasExactUsizeToken(entry.plan, ":aggs=", 0));
                 self.aggregate_cte_expression_access = self.aggregate_cte_expression_access or
-                    (std.mem.indexOf(u8, entry.plan, ":cte0_expr_") != null or
+                    (appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
                         (appParityPlanHasNonZeroToken(entry.plan, ":ctes=") and
                             (appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") or
                                 appParityPlanHasNonZeroToken(entry.plan, ":source_expr_or=") or
@@ -66836,7 +66878,7 @@ const AppParityCorpusCoverage = struct {
                     appParityPlanHasNonZeroToken(entry.plan, ":window_filter_expr="));
                 self.window_cte = self.window_cte or uses_cte_stream;
                 self.window_cte_expression_access = self.window_cte_expression_access or
-                    (std.mem.indexOf(u8, entry.plan, ":cte0_expr_") != null or
+                    (appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
                         (appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
                             (appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") or
                                 appParityPlanHasNonZeroToken(entry.plan, ":source_expr_or=") or
@@ -66897,7 +66939,7 @@ const AppParityCorpusCoverage = struct {
                 const is_read_aggregate = std.mem.startsWith(u8, entry.plan, "read:aggregate:");
                 const is_read_window = std.mem.startsWith(u8, entry.plan, "read:window:");
                 const has_cte_expression =
-                    std.mem.indexOf(u8, entry.plan, ":cte0_expr_") != null;
+                    appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
                 const has_read_query_expression =
                     has_cte_expression or
                     appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") or
