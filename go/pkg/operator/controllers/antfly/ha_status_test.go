@@ -3,10 +3,14 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1059,6 +1063,41 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 		if !covered[key] {
 			t.Fatalf("admin OpenAPI HA route %s is not registered in operator HA admin route constants", key)
 		}
+	}
+}
+
+func TestOperatorUsesAdminSDKWrapperOnly(t *testing.T) {
+	_, file, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test file")
+	}
+	operatorRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	forbiddenPrefix := "github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
+	fset := token.NewFileSet()
+
+	if err := filepath.WalkDir(operatorRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, importSpec := range parsed.Imports {
+			importPath, err := strconv.Unquote(importSpec.Path.Value)
+			if err != nil {
+				return err
+			}
+			if importPath == forbiddenPrefix || strings.HasPrefix(importPath, forbiddenPrefix+"/") {
+				t.Errorf("%s imports generated admin OpenAPI internals directly; use go/pkg/sdk/admin wrapper instead", path)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("scan operator imports: %v", err)
 	}
 }
 
