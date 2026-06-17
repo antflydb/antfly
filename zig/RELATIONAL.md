@@ -5414,8 +5414,9 @@ identity allocator `kind`, comment `kind`, transaction `starter`, advisory-lock
 `action`, and relation-population `mode` likewise reads exact string tokens, so
 suffix-like values such as `kind=table_extra` cannot satisfy a `kind=table`
 coverage requirement. DDL boolean/count coverage such as table/function
-`replace`, drop-table `cascade`, truncate `restart_identity`, and temporal FK
-action counts is also parsed as exact tokens rather than substring matches.
+`replace`, drop-table `cascade`, truncate `restart_identity`, temporal period
+counts, and temporal FK action counts is also parsed as exact tokens rather than
+substring matches.
 Aggregate zero-count coverage such as group-only `SELECT DISTINCT` likewise
 requires a well-formed exact `aggs=0` token. Table and source-table coverage
 also uses exact string tokens, so a fingerprint naming `products_extra` cannot

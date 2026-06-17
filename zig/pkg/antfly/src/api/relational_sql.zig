@@ -65299,10 +65299,17 @@ test "app parity count coverage tokens are exact" {
         .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
         .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
     });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .sql = "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
+        .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1x",
+    });
 
     try std.testing.expect(!coverage.aggregate_distinct_group_projection);
     try std.testing.expect(!coverage.ddl_temporal_fk_delete_set_null_action);
     try std.testing.expect(!coverage.ddl_temporal_fk_delete_cascade_action);
+    try std.testing.expect(!coverage.ddl_temporal_table);
 
     try coverage.observe(std.testing.allocator, .{
         .family = .aggregate,
@@ -65320,10 +65327,17 @@ test "app parity count coverage tokens are exact" {
         .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
         .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
     });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .sql = "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
+        .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1",
+    });
 
     try std.testing.expect(coverage.aggregate_distinct_group_projection);
     try std.testing.expect(coverage.ddl_temporal_fk_delete_set_null_action);
     try std.testing.expect(coverage.ddl_temporal_fk_delete_cascade_action);
+    try std.testing.expect(coverage.ddl_temporal_table);
 }
 
 test "app parity table coverage tokens are exact" {
@@ -66931,7 +66945,7 @@ const AppParityCorpusCoverage = struct {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
                 .create_table => {
                     self.ddl_create_table = true;
-                    self.ddl_temporal_table = self.ddl_temporal_table or std.mem.indexOf(u8, entry.plan, ":periods=") != null;
+                    self.ddl_temporal_table = self.ddl_temporal_table or appParityPlanHasNonZeroToken(entry.plan, ":periods=");
                     self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
                         (appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
                             std.mem.indexOf(u8, entry.sql, " ON DELETE SET NULL") != null);
