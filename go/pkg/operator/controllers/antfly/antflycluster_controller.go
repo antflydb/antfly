@@ -4848,14 +4848,10 @@ type haPromotionAPIResultEnvelope struct {
 }
 
 type haPromotionAPIResult struct {
-	SchemaVersion uint32                   `json:"schema_version"`
-	Action        haAdminActionReceiptJSON `json:"action"`
-	Assessment    struct {
-		RequiredLSN uint64 `json:"required_lsn"`
-		ReceivedLSN uint64 `json:"received_lsn"`
-		AppliedLSN  uint64 `json:"applied_lsn"`
-	} `json:"assessment"`
-	Promotion struct {
+	SchemaVersion uint32                    `json:"schema_version"`
+	Action        haAdminActionReceiptJSON  `json:"action"`
+	Assessment    haPromotionAssessmentJSON `json:"assessment"`
+	Promotion     struct {
 		NodeID      string `json:"node_id"`
 		SwitchLSN   uint64 `json:"switch_lsn"`
 		OldIdentity struct {
@@ -4898,6 +4894,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	}
 	if result == nil || result.Promotion.SwitchLSN == 0 ||
 		result.SchemaVersion == 0 ||
+		!haPromotionAssessmentJSONComplete(result.Assessment) ||
 		strings.TrimSpace(result.Promotion.NodeID) == "" ||
 		result.Promotion.OldIdentity.ClusterID == 0 ||
 		result.Promotion.OldIdentity.TimelineID == 0 ||
@@ -4912,11 +4909,12 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if topLevel && !haAdminActionReceiptPresent(result.Action) {
 		return haPromotionJobResult{}, false
 	}
-	observedLSN := result.Assessment.ReceivedLSN
-	if result.Assessment.AppliedLSN > observedLSN {
-		observedLSN = result.Assessment.AppliedLSN
+	observedLSN := haUint64JSONValue(result.Assessment.ReceivedLSN)
+	appliedLSN := haUint64JSONValue(result.Assessment.AppliedLSN)
+	if appliedLSN > observedLSN {
+		observedLSN = appliedLSN
 	}
-	requiredLSN := result.Assessment.RequiredLSN
+	requiredLSN := haUint64JSONValue(result.Assessment.RequiredLSN)
 	if requiredLSN == 0 {
 		requiredLSN = result.Promotion.SwitchLSN
 	}
