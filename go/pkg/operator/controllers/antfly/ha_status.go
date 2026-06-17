@@ -1201,10 +1201,11 @@ func haCurrentPrimaryNodeID(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.
 }
 
 func haPromotedPrimaryNodeID(status *antflyv1.HAStatus) string {
-	if status == nil || status.LastPromotion == nil {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
 		return ""
 	}
-	return strings.TrimSpace(status.LastPromotion.PromotedStandbyID)
+	return strings.TrimSpace(promotion.PromotedStandbyID)
 }
 
 func haAdminOperation(action haPlannedAction) (string, string) {
@@ -1772,21 +1773,17 @@ func haPromotionBoundaryReady(status *antflyv1.HAStatus) bool {
 }
 
 func haPromotionAlreadyRecorded(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) bool {
-	if status == nil || status.LastPromotion == nil {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
 		return false
 	}
 	identity := haReplicationIdentity(ha)
 	if identity == nil {
 		return false
 	}
-	promotion := status.LastPromotion
 	return promotion.OldPrimaryID == identity.CurrentPrimaryID &&
 		promotion.ParentTimelineID == identity.TimelineID &&
-		promotion.ParentEpoch == identity.Epoch &&
-		promotion.PromotedStandbyID != "" &&
-		promotion.NewTimelineID != 0 &&
-		promotion.NewEpoch != 0 &&
-		promotion.SwitchLSN != 0
+		promotion.ParentEpoch == identity.Epoch
 }
 
 func haSyncPolicyDegraded(ha *antflyv1.HighAvailabilitySpec, plan haPlan) bool {
@@ -1944,12 +1941,10 @@ func haEvaluatePrimaryRoute(cluster *antflyv1.AntflyCluster, status *antflyv1.HA
 	if status != nil {
 		currentFenceAuthority = status.PrimaryRoute.FenceAuthority
 		currentFenceGeneration = status.PrimaryRoute.FenceGeneration
-		if status.LastPromotion != nil {
-			evaluation.FenceAuthority = status.LastPromotion.FenceAuthority
-			evaluation.FenceGeneration = status.LastPromotion.FenceGeneration
-			if status.LastPromotion.PromotedStandbyID != "" {
-				evaluation.DesiredTarget = status.LastPromotion.PromotedStandbyID
-			}
+		if promotion := haPromotionReceipt(status); promotion != nil {
+			evaluation.FenceAuthority = promotion.FenceAuthority
+			evaluation.FenceGeneration = promotion.FenceGeneration
+			evaluation.DesiredTarget = promotion.PromotedStandbyID
 		}
 	}
 	if promotionTarget != "" {

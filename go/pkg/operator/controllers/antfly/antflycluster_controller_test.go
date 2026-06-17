@@ -5098,7 +5098,7 @@ func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T)
 		},
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
-				LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-a"},
+				LastPromotion: haCompletePromotionReceipt("primary-a", "standby-a"),
 			},
 		},
 	}
@@ -5108,6 +5108,46 @@ func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T)
 	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(21)))
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeTrue())
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(BeEmpty())
+}
+
+func TestObserveHAPrimaryAdminStatusIgnoresIncompletePromotionForTargeting(t *testing.T) {
+	g := NewWithT(t)
+
+	var observedHost string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
+			observedHost = req.URL.Host
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://old-primary-ha.default.svc:8081"},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-a"},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(observedHost).To(Equal("old-primary-ha.default.svc:8081"))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeTrue())
 }
 
 func TestObserveHAPrimaryAdminStatusDoesNotFallbackWhenPromotedPrimaryURLMissing(t *testing.T) {
@@ -5132,9 +5172,7 @@ func TestObserveHAPrimaryAdminStatusDoesNotFallbackWhenPromotedPrimaryURLMissing
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
 				PrimaryAdminReachable: true,
-				LastPromotion: &antflyv1.HAPromotionStatus{
-					PromotedStandbyID: "standby-a",
-				},
+				LastPromotion:         haCompletePromotionReceipt("primary-a", "standby-a"),
 			},
 		},
 	}
@@ -5315,11 +5353,9 @@ func TestObserveHAStandbyAdminStatusesSkipsPromotedPrimary(t *testing.T) {
 		},
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
-				Mode:       antflyv1.HAModeHotStandby,
-				PrimaryLSN: 21,
-				LastPromotion: &antflyv1.HAPromotionStatus{
-					PromotedStandbyID: "standby-a",
-				},
+				Mode:          antflyv1.HAModeHotStandby,
+				PrimaryLSN:    21,
+				LastPromotion: haCompletePromotionReceipt("primary-a", "standby-a"),
 			},
 		},
 	}
