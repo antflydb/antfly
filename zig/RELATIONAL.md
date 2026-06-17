@@ -5416,7 +5416,9 @@ action counts is also parsed as exact tokens rather than substring matches.
 Aggregate zero-count coverage such as group-only `SELECT DISTINCT` likewise
 requires a well-formed exact `aggs=0` token. Table and source-table coverage
 also uses exact string tokens, so a fingerprint naming `products_extra` cannot
-claim coverage for `products`. DDL family coverage that is already represented
+claim coverage for `products`. Pagination coverage requires exact `limit`,
+`source_limit`, and true absence of `offset`/`source_offset` tokens for
+unbounded/null-pagination cases. DDL family coverage that is already represented
 by the typed `ddl_tag`, such as `table_clone`, is satisfied from that tag rather
 than a second string search over the fingerprint.
 `EXPLAIN` fixture metadata and coverage use the same exact-token rule for

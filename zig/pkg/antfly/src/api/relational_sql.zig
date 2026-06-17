@@ -65104,6 +65104,13 @@ fn appParityPlanHasStringToken(plan: []const u8, token: []const u8) bool {
     };
 }
 
+fn appParityPlanTokenAbsent(plan: []const u8, token: []const u8) bool {
+    return switch (appParityPlanScanStringToken(plan, token)) {
+        .absent => true,
+        .value, .invalid => false,
+    };
+}
+
 fn appParityPlanHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_values: []const []const u8) bool {
     for (expected_values) |expected| {
         if (appParityPlanHasExactStringToken(plan, token, expected)) return true;
@@ -65329,6 +65336,50 @@ test "app parity table coverage tokens are exact" {
 
     try std.testing.expect(coverage.schema_temporal_open_daterange_insert);
     try std.testing.expect(coverage.insert_source_cross_table_source_schema);
+}
+
+test "app parity pagination coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .sql = "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=50:claim=none",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=10:claim=none",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .update_source,
+        .sql = "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-10:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(!coverage.query_set_operation_order_limit);
+    try std.testing.expect(!coverage.set_operation_fetch_tail);
+    try std.testing.expect(!coverage.update_source_nullable_pagination);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .sql = "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .query,
+        .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=1:claim=none",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .update_source,
+        .sql = "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
+        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(coverage.query_set_operation_order_limit);
+    try std.testing.expect(coverage.set_operation_fetch_tail);
+    try std.testing.expect(coverage.update_source_nullable_pagination);
 }
 
 test "app parity explain coverage tokens are exact" {
@@ -65950,8 +66001,8 @@ const AppParityCorpusCoverage = struct {
         self.update_source_nullable_pagination = self.update_source_nullable_pagination or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
             std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
-            std.mem.indexOf(u8, entry.plan, ":source_limit=-1:") != null and
-            std.mem.indexOf(u8, entry.plan, ":source_offset=") == null);
+            appParityPlanHasExactStringToken(entry.plan, ":source_limit=", "-1") and
+            appParityPlanTokenAbsent(entry.plan, ":source_offset="));
         self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.schema_temporal_numrange_insert = self.schema_temporal_numrange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::numrange") != null and
@@ -66047,24 +66098,24 @@ const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":or=") and
             appParityPlanHasNonZeroToken(entry.plan, ":order=") and
-            std.mem.indexOf(u8, entry.plan, ":limit=5") != null);
+            appParityPlanHasExactStringToken(entry.plan, ":limit=", "5"));
         self.read_set_operation_order_limit = self.read_set_operation_order_limit or (entry.family == .read and
             std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null and
             std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":pred=") and
             appParityPlanHasNonZeroToken(entry.plan, ":order=") and
-            std.mem.indexOf(u8, entry.plan, ":limit=5") != null);
+            appParityPlanHasExactStringToken(entry.plan, ":limit=", "5"));
         self.set_operation_fetch_tail = self.set_operation_fetch_tail or
             ((entry.family == .query or entry.family == .read) and
                 std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
                 std.mem.indexOf(u8, entry.sql, " FETCH FIRST ROW ONLY") != null and
-                std.mem.indexOf(u8, entry.plan, ":limit=1") != null);
+                appParityPlanHasExactStringToken(entry.plan, ":limit=", "1"));
         self.set_operation_null_pagination_tail = self.set_operation_null_pagination_tail or
             ((entry.family == .query or entry.family == .read) and
                 std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
                 std.mem.indexOf(u8, entry.sql, " LIMIT NULL OFFSET NULL") != null and
-                std.mem.indexOf(u8, entry.plan, ":limit=none") != null and
-                std.mem.indexOf(u8, entry.plan, ":offset=") == null);
+                appParityPlanHasExactStringToken(entry.plan, ":limit=", "none") and
+                appParityPlanTokenAbsent(entry.plan, ":offset="));
         self.cte_set_operation_tail = self.cte_set_operation_tail or
             ((entry.family == .query or entry.family == .read) and
                 std.mem.indexOf(u8, entry.sql, "WITH scoped AS") != null and
@@ -66131,8 +66182,8 @@ const AppParityCorpusCoverage = struct {
         self.delete_source_nullable_pagination = self.delete_source_nullable_pagination or (entry.family == .delete_source and
             std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
             std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
-            std.mem.indexOf(u8, entry.plan, ":source_limit=-1:") != null and
-            std.mem.indexOf(u8, entry.plan, ":source_offset=") == null);
+            appParityPlanHasExactStringToken(entry.plan, ":source_limit=", "-1") and
+            appParityPlanTokenAbsent(entry.plan, ":source_offset="));
         self.delete_source_boolean_unknown_predicate = self.delete_source_boolean_unknown_predicate or (entry.family == .delete_source and
             appParityPlanHasNonZeroToken(entry.plan, ":source_pred=") and
             (std.mem.indexOf(u8, entry.sql, " IS UNKNOWN") != null or
@@ -67069,8 +67120,8 @@ const AppParityCorpusCoverage = struct {
         self.query_nullable_pagination = self.query_nullable_pagination or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
             std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
-            std.mem.indexOf(u8, entry.plan, "limit=none") != null and
-            std.mem.indexOf(u8, entry.plan, ":offset=") == null);
+            appParityPlanHasExactStringToken(entry.plan, ":limit=", "none") and
+            appParityPlanTokenAbsent(entry.plan, ":offset="));
         self.query_json_build_object_expression = self.query_json_build_object_expression or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, "jsonb_build_object(") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":expr="));
