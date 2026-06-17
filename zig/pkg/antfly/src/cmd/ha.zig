@@ -761,6 +761,22 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
     try expectContains(recorder.last_uri.?, admin_api.routes.ha_replication_slots);
     try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "rejoin",              "assess",
+        "--node-id",           "primary-a",
+        "--cluster-id",        "10",
+        "--shard-id",          "20",
+        "--table-id",          "30",
+        "--timeline-id",       "1",
+        "--epoch",             "2",
+        "--last-lsn",          "12",
+        "--retained-from-lsn", "8",
+    }, recorder.executor());
+
+    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
+    try expectContains(recorder.last_uri.?, admin_api.routes.ha_rejoin_assess);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.last_uri.?, ha.http_admin.Routes.command) == null);
 }
 
 test "ha cmd renders typed JSON responses as dotted table fields" {
