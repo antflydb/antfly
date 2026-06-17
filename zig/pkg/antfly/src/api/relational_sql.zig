@@ -28,6 +28,7 @@ const sql_adapter = @import("sql_adapter/mod.zig");
 const table_catalog = @import("table_catalog.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
+pub const SqlValue = sql_adapter.SqlValue;
 const Token = sql_adapter.Token;
 const TokenKind = sql_adapter.TokenKind;
 const freeTokens = sql_adapter.freeTokens;
@@ -286,33 +287,6 @@ fn rowExpressionBoundaryKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "filter") or
         std.ascii.eqlIgnoreCase(text, "over");
 }
-
-pub const SqlValue = union(enum) {
-    null,
-    bool: bool,
-    integer: i64,
-    float: f64,
-    string: []const u8,
-    json: []const u8,
-
-    fn jsonAlloc(self: SqlValue, alloc: std.mem.Allocator) ![]const u8 {
-        return switch (self) {
-            .null => try alloc.dupe(u8, "null"),
-            .bool => |value| try alloc.dupe(u8, if (value) "true" else "false"),
-            .integer => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
-            .float => |value| try std.fmt.allocPrint(alloc, "{d}", .{value}),
-            .string => |value| try std.json.Stringify.valueAlloc(alloc, value, .{}),
-            .json => |value| try alloc.dupe(u8, value),
-        };
-    }
-
-    fn asU32(self: SqlValue) !u32 {
-        return switch (self) {
-            .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @intCast(value) else error.UnsupportedSqlShape,
-            else => error.UnsupportedSqlShape,
-        };
-    }
-};
 
 const InsertValueRows = []const []const []const u8;
 

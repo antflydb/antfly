@@ -15,7 +15,9 @@
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const token = @import("token.zig");
+pub const value = @import("value.zig");
 
+pub const SqlValue = value.SqlValue;
 pub const Token = token.Token;
 pub const TokenKind = token.TokenKind;
 pub const atEnd = parser.atEnd;
