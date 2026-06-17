@@ -4031,6 +4031,7 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 		ActionKind:   strings.TrimSpace(lines["action.action_kind"]),
 		ActionTarget: strings.TrimSpace(lines["action.target"]),
 		ActionState:  strings.TrimSpace(lines["action.state"]),
+		ActionNodeID: strings.TrimSpace(lines["action.node_id"]),
 		SlotAction:   strings.TrimSpace(lines["slot_action"]),
 		SlotName:     strings.TrimSpace(lines["slot_name"]),
 		ManifestID:   strings.TrimSpace(lines["manifest_id"]),
@@ -5857,6 +5858,9 @@ func haDirectAdminActionNodeMatches(action antflyv1.HAPlannedActionStatus, resul
 func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
 	result := action.AdminResult
 	if result == nil {
+		return false
+	}
+	if !haDirectAdminActionNodeMatches(action, result.ActionNodeID) {
 		return false
 	}
 	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)

@@ -1741,6 +1741,7 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 			ActionKind:   "replication_slot_create",
 			ActionTarget: "standby-a",
 			ActionState:  "applied",
+			ActionNodeID: "primary-a",
 			SlotAction:   "create",
 			SlotName:     "standby-a",
 		},
@@ -1857,6 +1858,8 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	seedFileActions[0].AdminResult.ActionKind = "base_backup_finish"
 	seedFileActions[0].AdminResult.ActionTarget = "base-standby-a-5"
 	seedFileActions[0].AdminResult.ActionState = "applied"
+	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeFalse())
+	seedFileActions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeTrue())
 
 	seedFileActions[1].AdminJobPhase = haAdminJobPhaseSucceeded
@@ -1875,6 +1878,8 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	seedFileActions[1].AdminResult.ActionKind = "standby_bootstrap"
 	seedFileActions[1].AdminResult.ActionTarget = "base-standby-a-5"
 	seedFileActions[1].AdminResult.ActionState = "applied"
+	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeFalse())
+	seedFileActions[1].AdminResult.ActionNodeID = "standby-a"
 	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeTrue())
 
 	promotionActions := []antflyv1.HAPlannedActionStatus{{
@@ -1944,6 +1949,7 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	rejoinActions[0].AdminResult.ActionKind = "rejoin_rewind"
 	rejoinActions[0].AdminResult.ActionTarget = "primary-a"
 	rejoinActions[0].AdminResult.ActionState = "applied"
+	rejoinActions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeTrue())
 
 	reseedActions := []antflyv1.HAPlannedActionStatus{{
@@ -1976,6 +1982,7 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	reseedActions[0].AdminResult.ActionKind = "rejoin_reseed"
 	reseedActions[0].AdminResult.ActionTarget = "primary-a"
 	reseedActions[0].AdminResult.ActionState = "applied"
+	reseedActions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(reseedActions, 1)).To(BeTrue())
 }
 
@@ -2006,6 +2013,8 @@ func TestHACLIActionDependenciesRequireMatchingActionReceipt(t *testing.T) {
 
 	actions[0].AdminResult.ActionID = "replication_slot_create:standby-a"
 	actions[0].AdminResult.ActionTarget = "standby-a"
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+	actions[0].AdminResult.ActionNodeID = "primary-a"
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 }
 
@@ -2309,6 +2318,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 						ActionKind:   "replication_slot_create",
 						ActionTarget: "standby-a",
 						ActionState:  "applied",
+						ActionNodeID: "primary-a",
 						SlotAction:   "create",
 						SlotName:     "standby-a",
 					},
@@ -2830,6 +2840,7 @@ func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 		ActionKind:          "fence_acquire",
 		ActionTarget:        "standby-a",
 		ActionState:         "applied",
+		ActionNodeID:        "standby-a",
 		FenceGeneration:     3,
 		FenceToken:          "lease-token-3",
 		FencePromotedNodeID: "standby-a",
@@ -2876,6 +2887,7 @@ func TestUpdateHALastPromotionHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 						ActionKind:          "fence_acquire",
 						ActionTarget:        "standby-a",
 						ActionState:         "applied",
+						ActionNodeID:        "standby-a",
 						FenceGeneration:     3,
 						FenceToken:          "lease-token-3",
 						FencePromotedNodeID: "standby-a",
@@ -3132,6 +3144,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"action.action_kind=base_backup_finish",
 		"action.target=base-standby-a-5",
 		"action.state=applied",
+		"action.node_id=primary-a",
 		"manifest_id=base-standby-a-5",
 		"backup_lsn=5",
 		"end_record_lsn=8",
@@ -3142,6 +3155,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(finish.ActionKind).To(Equal("base_backup_finish"))
 	g.Expect(finish.ActionTarget).To(Equal("base-standby-a-5"))
 	g.Expect(finish.ActionState).To(Equal("applied"))
+	g.Expect(finish.ActionNodeID).To(Equal("primary-a"))
 	g.Expect(finish.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(finish.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
@@ -3174,6 +3188,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"action.action_kind=promotion",
 		"action.target=standby-a",
 		"action.state=applied",
+		"action.node_id=standby-a",
 		"assessment.required_lsn=12",
 		"assessment.received_lsn=13",
 		"assessment.applied_lsn=12",
@@ -3194,6 +3209,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(promotion.ActionKind).To(Equal("promotion"))
 	g.Expect(promotion.ActionTarget).To(Equal("standby-a"))
 	g.Expect(promotion.ActionState).To(Equal("applied"))
+	g.Expect(promotion.ActionNodeID).To(Equal("standby-a"))
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceToken).To(Equal("promotion-token"))
 	g.Expect(promotion.FencePromotedNodeID).To(Equal("standby-a"))
@@ -3217,6 +3233,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"action.action_kind=rejoin_assess",
 		"action.target=primary-a",
 		"action.state=assessed",
+		"action.node_id=primary-a",
 		"action=rewind",
 		"reason=parent_timeline_retained",
 		"former_node_id=primary-a",
@@ -3233,6 +3250,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(rejoin.ActionKind).To(Equal("rejoin_assess"))
 	g.Expect(rejoin.ActionTarget).To(Equal("primary-a"))
 	g.Expect(rejoin.ActionState).To(Equal("assessed"))
+	g.Expect(rejoin.ActionNodeID).To(Equal("primary-a"))
 	g.Expect(rejoin.RejoinAction).To(Equal("rewind"))
 	g.Expect(rejoin.RejoinReason).To(Equal("parent_timeline_retained"))
 	g.Expect(rejoin.FormerNodeID).To(Equal("primary-a"))
@@ -3691,6 +3709,7 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 		ActionKind:          "fence_acquire",
 		ActionTarget:        "standby-a",
 		ActionState:         "applied",
+		ActionNodeID:        "standby-a",
 		FenceGeneration:     3,
 		FenceToken:          "ha-fence-token",
 		FencePromotedNodeID: "standby-a",
@@ -3704,6 +3723,7 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 		ActionKind:       "rejoin_assess",
 		ActionTarget:     "primary-a",
 		ActionState:      "assessed",
+		ActionNodeID:     "primary-a",
 		RejoinAction:     "reject_unfenced",
 		RejoinReason:     "no_fence",
 		FormerNodeID:     "primary-a",
@@ -3758,6 +3778,7 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 						ActionKind:       "rejoin_assess",
 						ActionTarget:     "primary-a",
 						ActionState:      "assessed",
+						ActionNodeID:     "primary-a",
 						RejoinAction:     "reject_unfenced",
 						RejoinReason:     "no_fence",
 						FormerNodeID:     "primary-a",
