@@ -1172,6 +1172,10 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 		name:   "former primary rewind without node url",
 		action: haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "missing-old-primary"},
 		want:   "",
+	}, {
+		name:   "automatic former primary demote uses explicit route source primary url",
+		action: haPlannedAction{Kind: haActionDemoteFormerPrimary, StandbyName: "missing-old-primary", RouteFrom: "missing-old-primary"},
+		want:   "http://primary-ha.default.svc:8081",
 	}}
 
 	for _, tt := range tests {
@@ -1862,8 +1866,8 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[4].AdminCommand, expectedDemoteCommand) {
 		t.Fatalf("unexpected former-primary demote admin command: %#v", cluster.Status.HAStatus.PlannedActions[4].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[4].AdminURL != "" {
-		t.Fatalf("expected former-primary demote to require a former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[4])
+	if cluster.Status.HAStatus.PlannedActions[4].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("expected former-primary demote to target old primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[4])
 	}
 	if cluster.Status.HAStatus.PlannedActions[4].AdminNodeID != "primary-a" {
 		t.Fatalf("expected former-primary demote to require old primary node receipt, got %#v", cluster.Status.HAStatus.PlannedActions[4])

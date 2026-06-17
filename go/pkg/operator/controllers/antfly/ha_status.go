@@ -1141,12 +1141,25 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 	case haActionAssessPromotion, haActionPromoteStandby:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
-		return haStandbyAdminURL(ha, action.StandbyName)
+		return haFormerPrimaryAdminURL(ha, action)
 	case haActionReseedFormerPrimary:
 		return haCurrentPrimaryAdminURL(ha, status)
 	default:
 		return ""
 	}
+}
+
+func haFormerPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, action haPlannedAction) string {
+	if url := haStandbyAdminURL(ha, action.StandbyName); url != "" {
+		return url
+	}
+	if strings.TrimSpace(action.RouteFrom) == "" || strings.TrimSpace(action.RouteFrom) != strings.TrimSpace(action.StandbyName) {
+		return ""
+	}
+	if ha != nil && ha.Admin != nil {
+		return ha.Admin.PrimaryURL
+	}
+	return ""
 }
 
 func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
