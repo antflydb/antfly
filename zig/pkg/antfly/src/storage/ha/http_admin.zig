@@ -2486,6 +2486,38 @@ test "storage.ha http admin rejects invalid rejoin fence receipt" {
     try expectContains(response.body, "invalid HA rejoin assessment request");
 }
 
+test "storage.ha http admin rejects invalid fence request identity and bounds" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-fence-bounds");
+    defer paths.deinit(alloc);
+
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{ .fence_store = &fence_store });
+    defer server.deinit();
+
+    const invalid_requests = [_][]const u8{
+        "{\"identity\":{\"cluster_id\":0,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1}",
+        "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":0,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1}",
+        "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":0},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1}",
+        "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":0,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1}",
+        "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":0,\"required_lsn\":1,\"observed_lsn\":1}",
+        "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":0,\"observed_lsn\":1}",
+    };
+
+    for (invalid_requests) |body| {
+        var response = try server.handle(.{
+            .method = .POST,
+            .uri = admin_api.routes.ha_fence,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), response.status);
+        try expectContains(response.body, "invalid HA fence request");
+    }
+}
+
 test "storage.ha http admin accepts whole instance identity" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "whole-instance-identity");
