@@ -1311,6 +1311,14 @@ fn generatedRouteSupportsMethod(generated_path: []const u8, method: []const u8) 
     return false;
 }
 
+fn methodFromText(method: []const u8) !http_common.Method {
+    if (std.mem.eql(u8, method, "GET")) return .GET;
+    if (std.mem.eql(u8, method, "POST")) return .POST;
+    if (std.mem.eql(u8, method, "PUT")) return .PUT;
+    if (std.mem.eql(u8, method, "DELETE")) return .DELETE;
+    return error.UnsupportedGeneratedMethod;
+}
+
 fn methodText(method: http_common.Method) []const u8 {
     return switch (method) {
         .GET => "GET",
@@ -2668,6 +2676,31 @@ test "storage.ha http admin returns method errors for generated admin routes" {
         defer response.deinit(alloc);
 
         try std.testing.expectEqual(@as(u16, 405), response.status);
+    }
+}
+
+test "storage.ha http admin handles every generated admin route method" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    for (admin_api.openapi.server.routes) |route| {
+        if (!std.mem.startsWith(u8, route.path, "/ha/")) continue;
+
+        const path = try generatedRoutePathAlloc(alloc, route.path);
+        defer alloc.free(path);
+
+        const method = try methodFromText(route.method);
+        var response = try server.handle(.{ .method = method, .uri = path });
+        defer response.deinit(alloc);
+
+        if (response.status == 404 or response.status == 405) {
+            std.debug.print(
+                "generated admin OpenAPI HA route {s} {s} ({s}) was not dispatched by storage HA admin server\n",
+                .{ route.method, route.path, route.operation_id },
+            );
+            return error.TestExpectedGeneratedRouteDispatched;
+        }
     }
 }
 
