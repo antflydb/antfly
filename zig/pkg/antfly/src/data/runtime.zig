@@ -1947,12 +1947,15 @@ pub const DataServer = struct {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
         self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
+        const ha_write_gate = self.haWriteGate();
+        _ = self.write_source.withHAWriteGate(ha_write_gate);
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
             apply_sm.write_cache.secret_store = api_server_cfg.secret_store;
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             apply_sm.write_cache.remote_content = api_server_cfg.remote_content;
+            _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
             apply_sm.write_source.setLocalChangeHook(self.localChangeHook());
         }
         self.read_source.primary_lookup_db = self.localPrimaryLookupDbSource();
@@ -1996,6 +1999,13 @@ pub const DataServer = struct {
             self.write_source.source(),
         );
         self.http_server.?.antfly_provider = self.read_source.antfly_provider;
+    }
+
+    fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
+        const ctx = self.ha_cfg.admin_context orelse return null;
+        if (ctx.standby) |standby| return .{ .standby = standby };
+        if (ctx.primary) |primary| return .{ .primary = primary };
+        return null;
     }
 
     fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
@@ -13357,6 +13367,108 @@ test "data server wires configured HA executors into API server" {
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+}
+
+test "data server propagates standby HA write gate into provisioned write sources" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = ".",
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const source_gate = server.write_source.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (source_gate) {
+        .standby => |handle| try std.testing.expect(handle == &standby),
+        .primary => return error.TestExpectedEqual,
+    }
+
+    const cache_gate = server.provisioned_storage.write_cache.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (cache_gate) {
+        .standby => |handle| try std.testing.expect(handle == &standby),
+        .primary => return error.TestExpectedEqual,
+    }
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {

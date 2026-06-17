@@ -659,7 +659,10 @@ and either rewind or reseed.
   gate, bootstrap, and promotion operations against the real standby handle.
   Continuous pull/apply should then plug into the DataServer-managed standby DB
   open path so applied LSN only advances after replicated records are applied to
-  storage.
+  storage. Every provisioned writer DB opened by that DataServer path must carry
+  the same HA write gate as the node's admin role, so standby processes reject
+  client/local-owner writes and suppress primary-only background mutation loops
+  while still permitting replicated apply.
 - Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
   `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
   operations following the style of the other SDK APIs.
