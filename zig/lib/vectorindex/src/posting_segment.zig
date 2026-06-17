@@ -2220,6 +2220,13 @@ const PendingDeltaBatch = struct {
         else
             @min(self.min_sequence, record.sequence);
     }
+
+    fn noteAppendedRecords(self: *PendingDeltaBatch, records: []const posting.PostingDeltaRecord, encoded_value_bytes: usize) void {
+        self.encoded_value_bytes = encoded_value_bytes;
+        var min_sequence = if (self.records.items.len == records.len) records[0].sequence else self.min_sequence;
+        for (records) |record| min_sequence = @min(min_sequence, record.sequence);
+        self.min_sequence = min_sequence;
+    }
 };
 
 fn deltaRecordEncodedSizeFromBaseSequence(record: posting.PostingDeltaRecord, base_sequence: u64) !usize {
@@ -2248,6 +2255,35 @@ fn pendingDeltaBatchEncodedSizeWithRecord(batch: PendingDeltaBatch, record: post
         total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(existing, base_sequence));
     }
     total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(record, base_sequence));
+    return total;
+}
+
+fn pendingDeltaBatchEncodedSizeWithRecords(batch: PendingDeltaBatch, records: []const posting.PostingDeltaRecord) !usize {
+    if (records.len == 0) return batch.encoded_value_bytes;
+    if (records.len == 1) return try pendingDeltaBatchEncodedSizeWithRecord(batch, records[0]);
+    if (batch.records.items.len == 0) return try posting.PostingFormat.encodedDeltaTailSize(records);
+
+    var all_new_sequences_after_min = batch.records.items.len >= 2;
+    var base_sequence = batch.min_sequence;
+    for (records) |record| {
+        if (record.sequence < batch.min_sequence) all_new_sequences_after_min = false;
+        base_sequence = @min(base_sequence, record.sequence);
+    }
+    if (all_new_sequences_after_min) {
+        var total = batch.encoded_value_bytes;
+        for (records) |record| {
+            total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(record, batch.min_sequence));
+        }
+        return total;
+    }
+
+    var total = posting.PostingFormat.delta_header_size;
+    for (batch.records.items) |existing| {
+        total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(existing, base_sequence));
+    }
+    for (records) |record| {
+        total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(record, base_sequence));
+    }
     return total;
 }
 
@@ -2642,8 +2678,52 @@ pub const DirectoryBatchWriter = struct {
     }
 
     pub fn appendPostingDeltaRecords(self: *DirectoryBatchWriter, posting_id: PostingId, records: []const posting.PostingDeltaRecord) !void {
-        for (records) |record| {
-            try self.appendDeltaRecord(posting_id, record);
+        if (records.len == 0) return;
+        if (records.len == 1) return try self.appendDeltaRecord(posting_id, records[0]);
+        if (self.options.max_pending_delta_records != 0 and records.len > self.options.max_pending_delta_records) {
+            for (records) |record| try self.appendDeltaRecord(posting_id, record);
+            return;
+        }
+
+        if (self.options.max_pending_delta_records != 0 and self.pending_delta_records + records.len > self.options.max_pending_delta_records) {
+            _ = try self.flush();
+        }
+
+        if (!self.pending_delta_batches.contains(posting_id) and self.options.max_pending_entries != 0 and self.pendingEntries() + 1 > self.options.max_pending_entries) {
+            _ = try self.flush();
+        }
+
+        var existing_batch = self.pending_delta_batches.get(posting_id) orelse PendingDeltaBatch{};
+        var next_encoded_value_bytes = try pendingDeltaBatchEncodedSizeWithRecords(existing_batch, records);
+        if (self.options.max_pending_value_bytes != 0 and self.pendingEntries() != 0) {
+            const existing_encoded_value_bytes = existing_batch.encoded_value_bytes;
+            if (self.pending_value_bytes - existing_encoded_value_bytes + next_encoded_value_bytes > self.options.max_pending_value_bytes) {
+                _ = try self.flush();
+                existing_batch = PendingDeltaBatch{};
+                next_encoded_value_bytes = try pendingDeltaBatchEncodedSizeWithRecords(existing_batch, records);
+            }
+        }
+
+        const gop = try self.pending_delta_batches.getOrPut(self.alloc, posting_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        errdefer if (!gop.found_existing) {
+            gop.value_ptr.deinit(self.alloc);
+            _ = self.pending_delta_batches.remove(posting_id);
+        };
+
+        const previous_encoded_value_bytes = gop.value_ptr.encoded_value_bytes;
+        const pending_value_bytes_without_batch = self.pending_value_bytes - previous_encoded_value_bytes;
+        const next_pending_value_bytes = std.math.add(usize, pending_value_bytes_without_batch, next_encoded_value_bytes) catch return error.PostingSegmentTooLarge;
+        try gop.value_ptr.records.appendSlice(self.alloc, records);
+        gop.value_ptr.noteAppendedRecords(records, next_encoded_value_bytes);
+        self.pending_value_bytes = next_pending_value_bytes;
+        self.pending_delta_records += records.len;
+        if ((self.options.max_pending_delta_records != 0 and self.pending_delta_records >= self.options.max_pending_delta_records) or
+            (self.options.max_pending_value_bytes != 0 and self.pending_value_bytes >= self.options.max_pending_value_bytes))
+        {
+            _ = try self.flush();
         }
     }
 
