@@ -43459,7 +43459,6 @@ fn simpleSetQueriesProvablyDisjoint(
 ) !bool {
     if (lhs.in_predicates.len > 0 or rhs.in_predicates.len > 0) {
         if (!querySupportsSimpleUnionRewrite(lhs) or !querySupportsSimpleUnionRewrite(rhs)) return false;
-        if (lhs.expression_predicates.len > 0 or rhs.expression_predicates.len > 0) return false;
         const lhs_branch_count = simpleAccessSetQueryBranchCount(lhs);
         const rhs_branch_count = simpleAccessSetQueryBranchCount(rhs);
         if (lhs_branch_count == 0 or rhs_branch_count == 0) return false;
@@ -74213,6 +74212,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
         },
         .{
+            .name = "query union all scalar in expression disjoint set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
             .name = "query union scalar in set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
@@ -74561,6 +74567,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "read union all scalar in expression disjoint set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
         },
         .{
             .name = "read union scalar in set operation",
@@ -82879,6 +82892,26 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("\"closed\"", disjoint_or_in_union.query.access_or_predicates[0].predicates[0].value_json.?);
     try std.testing.expectEqualStrings("\"archived\"", disjoint_or_in_union.query.access_or_predicates[1].predicates[0].value_json.?);
     try std.testing.expectEqualStrings("[\"open\",\"pending\"]", disjoint_or_in_union.query.access_or_predicates[2].in_predicates[0].values_json);
+
+    var disjoint_in_expression_union = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_in_expression_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_expression_union.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_expression_union.query.access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_in_expression_union.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_in_expression_union.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_in_expression_union.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_in_expression_union.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_union.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_in_expression_union.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_union.query.expression_or_predicates[1].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_in_expression_union.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_union.query.expression_or_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_in_expression_union.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
 
     var distinct_in_union = try lowerSelectAlloc(
         alloc,
