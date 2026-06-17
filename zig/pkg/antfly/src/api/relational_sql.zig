@@ -74215,6 +74215,55 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'",
         },
         .{
+            .name = "query intersect expression set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 2 },
+            .plan = "query:table=usage_records:ctes=0:pred=2:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT lower(status) AS status_key FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "query union expression predicate set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' UNION SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        },
+        .{
+            .name = "query intersect expression predicate set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 2, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        },
+        .{
+            .name = "query except expression predicate set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_not_predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=1:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'",
+        },
+        .{
+            .name = "query union mixed scalar expression predicate set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 2, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        },
+        .{
+            .name = "query intersect mixed scalar expression predicate set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        },
+        .{
+            .name = "query except mixed scalar expression predicate set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_not_predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'",
+        },
+        .{
             .name = "query union all set operation ordered page",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5, .offset = 2 },
@@ -82891,6 +82940,19 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_intersect.query.expression_or_predicates[0].conditions[1].lhs.kind);
     try std.testing.expectEqualStrings("\"deleted\"", expression_or_intersect.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
     try std.testing.expectEqualStrings("\"archived\"", expression_or_intersect.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+
+    var expression_projection_intersect = try lowerSelectAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT lower(status) AS status_key FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer expression_projection_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), expression_projection_intersect.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_projection_intersect.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_projection_intersect.query.expressions.len);
+    try std.testing.expectEqualStrings("status_key", expression_projection_intersect.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_projection_intersect.query.expressions[0].expression.kind);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
         alloc,

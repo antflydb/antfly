@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 777,
-  "entry_count": 777,
+  "source_entry_count": 784,
+  "entry_count": 784,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -7094,6 +7094,84 @@
       },
       "plan": "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
       "sql": "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'"
+    },
+    {
+      "name": "query intersect expression set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 2
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=2:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT lower(status) AS status_key FROM usage_records WHERE enabled IS TRUE"
+    },
+    {
+      "name": "query union expression predicate set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' UNION SELECT id FROM usage_records WHERE lower(status) = 'closed'"
+    },
+    {
+      "name": "query intersect expression predicate set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 2,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=2:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'"
+    },
+    {
+      "name": "query except expression predicate set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_not_predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=1:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE lower(status) = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'"
+    },
+    {
+      "name": "query union mixed scalar expression predicate set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_or_predicates": 2,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=2:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE lower(status) = 'closed'"
+    },
+    {
+      "name": "query intersect mixed scalar expression predicate set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "expression_predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'closed'"
+    },
+    {
+      "name": "query except mixed scalar expression predicate set operation",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "expression_not_predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=1:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted'"
     },
     {
       "name": "query union all set operation ordered page",

@@ -1281,7 +1281,10 @@ queue-style semantics.
 The parity corpus includes same-table `UNION`, `INTERSECT`, and `EXCEPT`
 predicate-composition read plans, including identical expression-output
 branches, expression-only predicate branches, and mixed scalar/expression
-predicate branches, plus proven-disjoint scalar, scalar OR, scalar `IN`, and expression
+predicate branches. The query-family corpus pins the same expression-output,
+expression-only predicate, and mixed scalar/expression predicate set-operation
+shapes so public query and read plans cannot drift. The corpus also includes
+proven-disjoint scalar, scalar OR, scalar `IN`, and expression
 `UNION ALL` branches over canonical string, boolean, null equality, exact
 complementary inequality/distinctness, exact numeric complementary predicates,
 adjacent numeric field or expression range partitions such as `< bound` versus
