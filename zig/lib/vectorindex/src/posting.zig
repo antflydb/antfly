@@ -290,6 +290,7 @@ pub const PostingFormat = struct {
     pub const base_member_default_block_size: usize = 32;
     pub const base_member_max_block_size: usize = 64;
     pub const delta_header_size: usize = 4 + 1 + 4 + 8;
+    const materialize_latest_map_min_delta_records: usize = 32;
     pub const EncodedBaseResult = struct {
         encoded: []const u8,
         encoded_len: usize = 0,
@@ -1608,11 +1609,42 @@ pub const PostingFormat = struct {
         base_members: []const VectorId,
         records: []const PostingDeltaRecord,
     ) ![]VectorId {
+        if (records.len >= materialize_latest_map_min_delta_records) {
+            return try materializeMembersWithLatestMap(alloc, base_members, records, null);
+        }
+        return try materializeMembersLinear(alloc, base_members, records, null);
+    }
+
+    pub fn materializeMembersAfterGeneration(
+        alloc: std.mem.Allocator,
+        base_members: []const VectorId,
+        records: []const PostingDeltaRecord,
+        base_generation: u64,
+    ) ![]VectorId {
+        if (deltaRecordsAfterGeneration(records, base_generation) >= materialize_latest_map_min_delta_records) {
+            return try materializeMembersWithLatestMap(alloc, base_members, records, base_generation);
+        }
+        return try materializeMembersLinear(alloc, base_members, records, base_generation);
+    }
+
+    fn materializeMembersLinear(
+        alloc: std.mem.Allocator,
+        base_members: []const VectorId,
+        records: []const PostingDeltaRecord,
+        maybe_base_generation: ?u64,
+    ) ![]VectorId {
         var members: std.ArrayList(VectorId) = .empty;
         errdefer members.deinit(alloc);
-        try members.ensureTotalCapacity(alloc, base_members.len + liveDeltaRecordCount(records));
+        const live_count = if (maybe_base_generation) |base_generation|
+            liveDeltaRecordCountAfterGeneration(records, base_generation)
+        else
+            liveDeltaRecordCount(records);
+        try members.ensureTotalCapacity(alloc, base_members.len + live_count);
         try members.appendSlice(alloc, base_members);
         for (records) |record| {
+            if (maybe_base_generation) |base_generation| {
+                if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            }
             switch (record.op) {
                 .insert, .replace => {
                     removeMemberFromList(&members, record.vector_id);
@@ -1624,25 +1656,60 @@ pub const PostingFormat = struct {
         return try members.toOwnedSlice(alloc);
     }
 
-    pub fn materializeMembersAfterGeneration(
+    const LatestDeltaOp = struct {
+        op: PostingDeltaOp,
+        order: usize,
+    };
+
+    fn materializeMembersWithLatestMap(
         alloc: std.mem.Allocator,
         base_members: []const VectorId,
         records: []const PostingDeltaRecord,
-        base_generation: u64,
+        maybe_base_generation: ?u64,
     ) ![]VectorId {
+        var latest = std.AutoHashMapUnmanaged(VectorId, LatestDeltaOp).empty;
+        defer latest.deinit(alloc);
+
+        const delta_count = if (maybe_base_generation) |base_generation|
+            deltaRecordsAfterGeneration(records, base_generation)
+        else
+            records.len;
+        try latest.ensureTotalCapacity(alloc, @intCast(delta_count));
+
+        var order: usize = 0;
+        for (records) |record| {
+            if (maybe_base_generation) |base_generation| {
+                if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            }
+            latest.putAssumeCapacity(record.vector_id, .{
+                .op = record.op,
+                .order = order,
+            });
+            order += 1;
+        }
+
         var members: std.ArrayList(VectorId) = .empty;
         errdefer members.deinit(alloc);
-        try members.ensureTotalCapacity(alloc, base_members.len + liveDeltaRecordCountAfterGeneration(records, base_generation));
-        try members.appendSlice(alloc, base_members);
+        const live_count = if (maybe_base_generation) |base_generation|
+            liveDeltaRecordCountAfterGeneration(records, base_generation)
+        else
+            liveDeltaRecordCount(records);
+        try members.ensureTotalCapacity(alloc, base_members.len + live_count);
+        for (base_members) |member| {
+            if (latest.contains(member)) continue;
+            members.appendAssumeCapacity(member);
+        }
+
+        order = 0;
         for (records) |record| {
-            if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-            switch (record.op) {
-                .insert, .replace => {
-                    removeMemberFromList(&members, record.vector_id);
-                    try members.append(alloc, record.vector_id);
-                },
-                .tombstone => removeMemberFromList(&members, record.vector_id),
+            if (maybe_base_generation) |base_generation| {
+                if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             }
+            const current_order = order;
+            order += 1;
+            const latest_op = latest.get(record.vector_id) orelse continue;
+            if (latest_op.order != current_order or latest_op.op == .tombstone) continue;
+            members.appendAssumeCapacity(record.vector_id);
         }
         return try members.toOwnedSlice(alloc);
     }
@@ -4778,6 +4845,62 @@ test "posting delta tail round trips and overlays base members" {
     try std.testing.expectEqualSlices(VectorId, &[_]VectorId{ 30, 40, 10 }, materialized);
     encoded[4] = 99;
     try std.testing.expectError(error.UnsupportedPostingDeltaVersion, PostingFormat.decodeDeltaTail(alloc, encoded));
+}
+
+test "posting materialization uses latest-op map for large unsorted tails" {
+    const alloc = std.testing.allocator;
+    const base_members = [_]VectorId{ 10, 20, 30, 40 };
+    var records: [32]PostingDeltaRecord = undefined;
+    for (&records, 0..) |*record, i| {
+        record.* = .{
+            .sequence = @intCast(i + 1),
+            .op = .tombstone,
+            .vector_id = @intCast(1000 + i),
+        };
+    }
+    records[0] = .{ .sequence = 1, .op = .insert, .vector_id = 50 };
+    records[3] = .{ .sequence = 4, .op = .replace, .vector_id = 20 };
+    records[8] = .{ .sequence = 9, .op = .insert, .vector_id = 60 };
+    records[12] = .{ .sequence = 13, .op = .tombstone, .vector_id = 50 };
+    records[20] = .{ .sequence = 21, .op = .replace, .vector_id = 20 };
+    records[31] = .{ .sequence = 32, .op = .insert, .vector_id = 70 };
+
+    const materialized = try PostingFormat.materializeMembers(alloc, base_members[0..], records[0..]);
+    defer alloc.free(materialized);
+
+    try std.testing.expectEqualSlices(VectorId, &.{ 10, 30, 40, 60, 20, 70 }, materialized);
+}
+
+test "posting materialization latest-op map honors base generation filter" {
+    const alloc = std.testing.allocator;
+    const base_members = [_]VectorId{ 10, 20, 30 };
+    var records: [34]PostingDeltaRecord = undefined;
+    for (&records, 0..) |*record, i| {
+        record.* = .{
+            .sequence = (@as(u64, 1) << 32) | @as(u64, @intCast(i + 1)),
+            .op = .insert,
+            .vector_id = @intCast(1000 + i),
+        };
+    }
+    records[0] = .{ .sequence = (@as(u64, 1) << 32) | 1, .op = .tombstone, .vector_id = 10 };
+    records[1] = .{ .sequence = (@as(u64, 1) << 32) | 2, .op = .insert, .vector_id = 99 };
+    var i: usize = 2;
+    while (i < records.len) : (i += 1) {
+        records[i] = .{
+            .sequence = (@as(u64, 2) << 32) | @as(u64, @intCast(i + 1)),
+            .op = .tombstone,
+            .vector_id = @intCast(2000 + i),
+        };
+    }
+    records[4] = .{ .sequence = (@as(u64, 2) << 32) | 5, .op = .replace, .vector_id = 20 };
+    records[8] = .{ .sequence = (@as(u64, 2) << 32) | 9, .op = .insert, .vector_id = 40 };
+    records[18] = .{ .sequence = (@as(u64, 2) << 32) | 19, .op = .tombstone, .vector_id = 40 };
+    records[33] = .{ .sequence = (@as(u64, 2) << 32) | 34, .op = .insert, .vector_id = 50 };
+
+    const materialized = try PostingFormat.materializeMembersAfterGeneration(alloc, base_members[0..], records[0..], 1);
+    defer alloc.free(materialized);
+
+    try std.testing.expectEqualSlices(VectorId, &.{ 10, 30, 20, 50 }, materialized);
 }
 
 test "posting delta tail replay skips stale records without growing member scratch" {
