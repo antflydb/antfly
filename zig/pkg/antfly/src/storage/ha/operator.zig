@@ -299,7 +299,7 @@ fn adminUrlForAction(spec: Spec, action: Action) ?[]const u8 {
 
         .demote_former_primary,
         .rewind_former_primary,
-        => standbyAdminUrl(spec, action.standby_name) orelse spec.primary_admin_url,
+        => formerPrimaryAdminUrl(spec, action),
 
         .reseed_former_primary => spec.primary_admin_url,
 
@@ -353,6 +353,15 @@ fn standbyAdminUrl(spec: Spec, standby_name: ?[]const u8) ?[]const u8 {
         if (std.mem.eql(u8, standby.name, name)) return standby.admin_url;
     }
     return null;
+}
+
+fn formerPrimaryAdminUrl(spec: Spec, action: Action) ?[]const u8 {
+    if (standbyAdminUrl(spec, action.standby_name)) |admin_url| return admin_url;
+
+    const route_from = action.route_from orelse return null;
+    const former_node_id = action.standby_name orelse return null;
+    if (!std.mem.eql(u8, route_from, former_node_id)) return null;
+    return spec.primary_admin_url;
 }
 
 pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
@@ -580,6 +589,7 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
                 .depends_on = .promote_standby,
                 .fencing_precondition = fence_precondition,
                 .standby_name = current_primary_id,
+                .route_from = current_primary_id,
                 .target_lsn = observed.primary.current_lsn,
                 .reason = "PromotionPlanned",
             });
@@ -1986,6 +1996,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqualStrings("primary-a", safe.actions[3].route_from.?);
     try std.testing.expectEqualStrings("standby-a", safe.actions[3].route_to.?);
     try std.testing.expectEqualStrings("primary-a", safe.actions[4].standby_name.?);
+    try std.testing.expectEqualStrings("primary-a", safe.actions[4].route_from.?);
     try std.testing.expect((try adminCommandForAction(alloc, safe.actions[3], primary.identity, .{})) == null);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
 }
@@ -2444,6 +2455,25 @@ test "storage.ha operator targets former primary rejoin admin APIs deliberately"
         .reason = "FormerPrimaryRequiresReseed",
     }) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("http://standby-b-ha.default.svc:8081", reseed_url);
+
+    try std.testing.expect(adminUrlForAction(spec, .{
+        .kind = .demote_former_primary,
+        .standby_name = "primary-missing-url",
+        .reason = "FormerPrimaryRejectedUnfenced",
+    }) == null);
+
+    try std.testing.expect(adminUrlForAction(spec, .{
+        .kind = .rewind_former_primary,
+        .standby_name = "primary-missing-url",
+        .reason = "FormerPrimaryCanRewind",
+    }) == null);
+
+    const missing_reseed_url = adminUrlForAction(spec, .{
+        .kind = .reseed_former_primary,
+        .standby_name = "primary-missing-url",
+        .reason = "FormerPrimaryRequiresReseed",
+    }) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("http://standby-b-ha.default.svc:8081", missing_reseed_url);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
