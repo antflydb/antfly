@@ -3574,7 +3574,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectPromotionAssessmentResult(action, raw)
 		}
 		return true, err
 	case string(haActionPromoteStandby):
@@ -4112,6 +4112,19 @@ func requireHADirectFenceAcquireResult(cluster *antflyv1.AntflyCluster, action *
 	}
 	action.AdminResult = nil
 	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
+}
+
+func requireHADirectPromotionAssessmentResult(action *antflyv1.HAPlannedActionStatus, raw []byte) error {
+	if action == nil {
+		return nil
+	}
+	if applyHADirectAdminActionResult(action, raw) &&
+		haDirectAdminActionReceiptMatches(*action) &&
+		haPromotionAssessmentResultMatchesAction(*action, action.AdminResult) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without safe typed promotion assessment", action.Kind)
 }
 
 func haFenceAcquireResultMatchesAction(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
@@ -5975,8 +5988,7 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			result.FenceToken != "" &&
 			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
 	case haActionAssessPromotion:
-		return result.PromotionCanPromote &&
-			(action.TargetLSN == 0 || result.PromotionRequiredLSN == 0 || result.PromotionRequiredLSN == action.TargetLSN)
+		return haPromotionAssessmentResultMatchesAction(action, result)
 	case haActionPromoteStandby:
 		return haPromotionAdminResultHasEvidence(action, result)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
@@ -5984,6 +5996,19 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 	default:
 		return true
 	}
+}
+
+func haPromotionAssessmentResultMatchesAction(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil || !result.PromotionCanPromote || !result.PromotionFenced {
+		return false
+	}
+	if action.TargetLSN > 0 {
+		return result.PromotionRequiredLSN == action.TargetLSN &&
+			result.PromotionReceivedLSN >= action.TargetLSN &&
+			result.PromotionAppliedLSN >= action.TargetLSN
+	}
+	return result.PromotionReceivedLSN >= result.PromotionRequiredLSN &&
+		result.PromotionAppliedLSN >= result.PromotionRequiredLSN
 }
 
 func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
