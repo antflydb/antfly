@@ -3930,7 +3930,9 @@ pub const DB = struct {
                 defer decoded.deinit();
                 try self.batchReplicatedApply(decoded.value.request);
             },
-            .derived_effect => return error.HADerivedEffectApplyUnsupported,
+            .derived_effect => {
+                _ = try self.applyHADerivedEffectRecord(record);
+            },
             .metadata_mutation,
             .backup_start,
             .backup_end,
@@ -3941,6 +3943,11 @@ pub const DB = struct {
             => return error.HAReplicationRecordApplyUnsupported,
             _ => return error.HAReplicationRecordApplyUnsupported,
         }
+    }
+
+    pub fn applyHADerivedEffectRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!u64 {
+        var ctx = self.batchContext();
+        return try appendReplicatedHADerivedEffectContext(&ctx, record);
     }
 
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: ha_replication_record_mod.RecordView) anyerror!void {
@@ -18183,6 +18190,20 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     defer ctx.alloc.free(payload);
     try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
     mirrorHAReplayPayloadBestEffortContext(ctx, payload);
+    ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
+    return sequence;
+}
+
+fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, record: ha_replication_record_mod.RecordView) !u64 {
+    var decoded = try ha_effects_mod.decodeDerivedChangeRecord(ctx.alloc, record);
+    defer decoded.deinit();
+
+    const sequence = ctx.store.reserveNextReplaySequence(1);
+    decoded.record.sequence = sequence;
+    const payload = try change_journal_mod.encodeRecord(ctx.alloc, decoded.record);
+    defer ctx.alloc.free(payload);
+
+    try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
@@ -36842,9 +36863,15 @@ test "storage.ha db applies batch mutation records through replication session c
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated-session\"}" }},
         .sync_level = .full_index,
     }, .{});
+    _ = try ha_effects_mod.appendDerivedChangeRecord(alloc, &primary, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    }, .{});
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
         .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
     });
     defer standby_db.close();
 
@@ -36856,40 +36883,39 @@ test "storage.ha db applies batch mutation records through replication session c
         &standby_db,
         DB.applyHAReplicationRecordCallback,
     );
-    try std.testing.expectEqual(@as(usize, 1), result.received_count);
-    try std.testing.expectEqual(@as(usize, 1), result.applied_count);
-    try std.testing.expectEqual(@as(u64, 1), result.progress.received_lsn);
-    try std.testing.expectEqual(@as(u64, 1), result.progress.applied_lsn);
+    try std.testing.expectEqual(@as(usize, 2), result.received_count);
+    try std.testing.expectEqual(@as(usize, 2), result.applied_count);
+    try std.testing.expectEqual(@as(u64, 2), result.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), result.progress.applied_lsn);
 
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
-    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 2), slot.applied_lsn);
 
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"replicated-session\"}", found.json);
 
-    const derived_payload = try change_journal_mod.encodeRecord(alloc, .{
-        .sequence = 1,
-        .changed_doc_keys = &.{"doc:a"},
-    });
-    defer alloc.free(derived_payload);
-    const derived_record = ha_replication_record_mod.Record{
-        .kind = .derived_effect,
-        .payload_codec = .binary,
-        .cluster_id = identity.cluster_id,
-        .shard_id = identity.shard_id,
-        .table_id = identity.table_id,
-        .timeline_id = identity.timeline_id,
-        .epoch = identity.epoch,
-        .lsn = 2,
-        .previous_lsn = 1,
-        .payload = derived_payload,
-    };
-    try std.testing.expectError(
-        error.HADerivedEffectApplyUnsupported,
-        standby_db.applyHAReplicationRecord(derived_record),
-    );
+    const replay_entries = try replay_stream_mod.iterateFrom(alloc, standby_db.core.store, 1);
+    defer {
+        for (replay_entries) |*entry| entry.deinit(alloc);
+        alloc.free(replay_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), replay_entries.len);
+    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
+    try std.testing.expectEqual(@as(u64, 2), replay_entries[1].sequence);
+
+    var batch_record = try change_journal_mod.decodeRecord(alloc, replay_entries[0].payload);
+    defer batch_record.deinit();
+    try std.testing.expectEqual(@as(u64, 1), batch_record.record.sequence);
+    try std.testing.expectEqualStrings("doc:a", batch_record.record.changed_doc_keys[0]);
+
+    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[1].payload);
+    defer replicated_effect_record.deinit();
+    try std.testing.expectEqual(@as(u64, 2), replicated_effect_record.record.sequence);
+    try std.testing.expectEqualStrings("doc:a", replicated_effect_record.record.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), replicated_effect_record.record.target_hints.len);
+    try std.testing.expectEqual(change_journal_mod.TargetHint.full_text, replicated_effect_record.record.target_hints[0]);
 }
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
