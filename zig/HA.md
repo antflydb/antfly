@@ -438,6 +438,9 @@ should be treated as a new, dedicated admin OpenAPI spec, not an extension point
 inside the existing public DB specs. New HA administration methods must not be
 added first to the existing public DB OpenAPI specs, to
 `specs/openapi/antfly/internal.yaml`, or directly to ad hoc Zig HTTP handlers.
+The committed starting point for this contract is `specs/openapi/antfly/admin.yaml`;
+it is generated as `antfly_admin_openapi` and surfaced through
+`zig/pkg/antfly/src/admin/mod.zig` and `zig/pkg/antfly/src/admin/routes.zig`.
 The implementation path is:
 
 1. define the operation, request schema, response schema, and error response in
