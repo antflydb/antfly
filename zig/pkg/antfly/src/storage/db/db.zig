@@ -207,6 +207,11 @@ pub const OpenOptions = struct {
     /// catch-up/read-replica apply. It is intentionally best-effort until the
     /// DB write path is wired to the synchronous HA commit gate.
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
+    /// Optional async mirror for committed metadata/catalog changes into the HA
+    /// replication stream. The initial metadata mutation payload covers table
+    /// schema changes; additional catalog mutation kinds should be nested under
+    /// the stable HA `metadata_mutation` envelope.
+    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     /// Optional HA write ownership gate. Client/API writes are allowed only
     /// when this DB is attached to the current HA primary. Standby apply paths
     /// must use replicated-apply entry points that explicitly bypass this
@@ -224,6 +229,7 @@ pub const HAAsyncEffectMirror = struct {
 };
 
 pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
+pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
 
 pub const HAWriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
@@ -788,6 +794,7 @@ const EnrichmentAppendContext = struct {
     log_mutex: *std.atomic.Mutex,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
+    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
@@ -810,6 +817,7 @@ const EnrichmentAppendContext = struct {
             .async_context = self.async_context,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
+            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
@@ -850,6 +858,7 @@ const BatchExecutionContext = struct {
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
+    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
 };
 
@@ -2479,6 +2488,7 @@ pub const DB = struct {
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
+    ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
@@ -2540,6 +2550,7 @@ pub const DB = struct {
             .async_context = self.async_context,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
+            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
         };
     }
@@ -2556,6 +2567,11 @@ pub const DB = struct {
     fn mirrorHABatchMutationBestEffort(self: *DB, request: types.BatchRequest) void {
         var ctx = self.batchContext();
         mirrorHABatchMutationBestEffortContext(&ctx, request);
+    }
+
+    fn mirrorHASchemaMetadataBestEffort(self: *DB, table_schema: schema_mod.TableSchema) void {
+        var ctx = self.batchContext();
+        mirrorHASchemaMetadataBestEffortContext(&ctx, table_schema);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -2704,6 +2720,7 @@ pub const DB = struct {
                 .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ha_async_effect_mirror = opts.ha_async_effect_mirror,
                 .ha_async_batch_mirror = opts.ha_async_batch_mirror,
+                .ha_async_metadata_mirror = opts.ha_async_metadata_mirror,
                 .ha_write_gate = opts.ha_write_gate,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
@@ -2885,6 +2902,7 @@ pub const DB = struct {
             .log_mutex = resources.log_mutex,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
+            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -2931,6 +2949,7 @@ pub const DB = struct {
             .log_mutex = resources.log_mutex,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
+            .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
         };
 
@@ -3007,6 +3026,7 @@ pub const DB = struct {
                 .promotion_runtime = self.promotion_runtime,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
                 .ha_async_batch_mirror = self.ha_async_batch_mirror,
+                .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
                 .ha_write_gate = self.ha_write_gate,
             },
             .grace_period_ns = cfg.grace_period_ns,
@@ -3951,6 +3971,11 @@ pub const DB = struct {
         });
     }
 
+    fn setSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, applied_lsn_marker: ?u64) anyerror!void {
+        try self.core.setSchema(table_schema);
+        if (applied_lsn_marker) |lsn| try self.markHAReplicationRecordApplied(lsn);
+    }
+
     pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
         if (try self.haReplicationRecordAlreadyApplied(record)) return;
 
@@ -3959,6 +3984,11 @@ pub const DB = struct {
                 var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
                 defer decoded.deinit();
                 try self.batchReplicatedApplyWithMarker(decoded.value.request, record.lsn);
+            },
+            .metadata_mutation => {
+                const decoded_schema = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
+                defer schema_mod.freeSchema(self.alloc, decoded_schema);
+                try self.setSchemaReplicatedApplyWithMarker(decoded_schema, record.lsn);
             },
             .derived_effect => {
                 _ = try self.applyHADerivedEffectRecord(record);
@@ -3970,7 +4000,6 @@ pub const DB = struct {
             .manifest,
             .truncate,
             => try self.markHAReplicationRecordApplied(record.lsn),
-            .metadata_mutation,
             .timeline_switch,
             => return error.HAReplicationRecordApplyUnsupported,
             _ => return error.HAReplicationRecordApplyUnsupported,
@@ -6191,7 +6220,9 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        try self.enforceHAWriteGate();
         try self.core.setSchema(table_schema);
+        self.mirrorHASchemaMetadataBestEffort(table_schema);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -18312,6 +18343,18 @@ fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, req
     const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
         if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB batch mutation into HA stream: {s}", .{@errorName(err)});
+        return;
+    };
+    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+}
+
+fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) void {
+    const mirror = ctx.ha_async_metadata_mirror orelse return;
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{}) catch |err| {
+        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        std.log.warn("failed to mirror DB schema metadata into HA stream: {s}", .{@errorName(err)});
         return;
     };
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -36891,6 +36934,93 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
+}
+
+test "storage.ha db mirrors and applies schema metadata mutation records" {
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 252,
+        .shard_id = 5,
+        .table_id = 11,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    {
+        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .ha_async_metadata_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.setSchema(.{
+            .version = 12,
+            .default_type = "doc",
+            .ttl_duration_ns = 456,
+            .ttl_field = "expires_at",
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 252), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 5), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    try std.testing.expectError(error.HAReadOnlyStandby, standby_db.setSchema(.{ .version = 99 }));
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+
+    const replicated_schema = (try schema_mod.loadSchema(standby_db.core.store, alloc)).?;
+    defer schema_mod.freeSchema(alloc, replicated_schema);
+    try std.testing.expectEqual(@as(u32, 12), replicated_schema.version);
+    try std.testing.expectEqualStrings("doc", replicated_schema.default_type);
+    try std.testing.expectEqual(@as(u64, 456), replicated_schema.ttl_duration_ns);
+    try std.testing.expectEqualStrings("expires_at", replicated_schema.ttl_field);
+
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
 }
 
 test "storage.ha db applies batch mutation records through replication session callback" {

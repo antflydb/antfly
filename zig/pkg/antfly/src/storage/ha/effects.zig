@@ -24,6 +24,7 @@ const change_journal = @import("../db/derived/change_journal.zig");
 const db_types = @import("../db/types.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
+const schema_mod = @import("../schema.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -39,9 +40,25 @@ pub const AppendBatchMutationOptions = struct {
     commit_timestamp_ns: i64 = 0,
 };
 
+pub const AppendMetadataMutationOptions = struct {
+    shard_id: ?u64 = null,
+    table_id: ?u64 = null,
+    commit_timestamp_ns: i64 = 0,
+};
+
 pub const BatchMutationPayload = struct {
     schema_version: u32 = 1,
     request: db_types.BatchRequest,
+};
+
+pub const MetadataMutationKind = enum {
+    schema,
+};
+
+pub const MetadataMutationPayload = struct {
+    schema_version: u32 = 1,
+    kind: MetadataMutationKind,
+    schema_bytes: []const u8,
 };
 
 pub fn encodeBatchMutationRequestAlloc(
@@ -85,6 +102,62 @@ pub fn decodeBatchMutationRequest(
     errdefer parsed.deinit();
     if (parsed.value.schema_version != 1) return error.UnsupportedBatchMutationPayloadVersion;
     return parsed;
+}
+
+pub fn encodeSchemaMetadataMutationAlloc(
+    alloc: Allocator,
+    schema: schema_mod.TableSchema,
+) ![]u8 {
+    const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
+    defer alloc.free(schema_bytes);
+    return try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
+        .kind = .schema,
+        .schema_bytes = schema_bytes,
+    }, .{});
+}
+
+pub fn appendSchemaMetadataMutation(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    schema: schema_mod.TableSchema,
+    options: AppendMetadataMutationOptions,
+) !u64 {
+    const payload = try encodeSchemaMetadataMutationAlloc(alloc, schema);
+    defer alloc.free(payload);
+
+    return try primary.append(.{
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
+        .shard_id = options.shard_id,
+        .table_id = options.table_id,
+        .commit_timestamp_ns = options.commit_timestamp_ns,
+        .payload = payload,
+    });
+}
+
+pub fn decodeMetadataMutation(
+    alloc: Allocator,
+    record: replication_record.RecordView,
+) !std.json.Parsed(MetadataMutationPayload) {
+    if (record.kind != .metadata_mutation) return error.NotMetadataMutationRecord;
+    if (record.payload_codec != .json) return error.UnsupportedMetadataMutationCodec;
+    var parsed = try std.json.parseFromSlice(MetadataMutationPayload, alloc, record.payload, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    errdefer parsed.deinit();
+    if (parsed.value.schema_version != 1) return error.UnsupportedMetadataMutationPayloadVersion;
+    return parsed;
+}
+
+pub fn decodeSchemaMetadataMutation(
+    alloc: Allocator,
+    record: replication_record.RecordView,
+) !schema_mod.TableSchema {
+    var parsed = try decodeMetadataMutation(alloc, record);
+    defer parsed.deinit();
+    if (parsed.value.kind != .schema) return error.UnsupportedMetadataMutationKind;
+    return try schema_mod.deserializeSchema(alloc, parsed.value.schema_bytes);
 }
 
 pub fn appendDerivedChangeRecord(
@@ -229,6 +302,47 @@ test "storage.ha effects appends db batch mutation payload as HA batch mutation"
     try std.testing.expectEqual(db_types.SyncLevel.write, decoded.value.request.sync_level);
 }
 
+test "storage.ha effects appends schema metadata payload as HA metadata mutation" {
+    const alloc = std.testing.allocator;
+    const log_path = try testPath(alloc, "metadata-log");
+    defer alloc.free(log_path);
+    const slots_path = try testPath(alloc, "metadata-slots");
+    defer alloc.free(slots_path);
+
+    var primary = try primary_mod.Primary.open(alloc, log_path.ptr, slots_path.ptr, .{
+        .cluster_id = 102,
+        .shard_id = 9,
+        .table_id = 13,
+        .timeline_id = 3,
+        .epoch = 4,
+    }, .{});
+    defer primary.close();
+
+    const lsn = try appendSchemaMetadataMutation(alloc, &primary, .{
+        .version = 7,
+        .default_type = "doc",
+        .ttl_duration_ns = 123,
+        .ttl_field = "expires_at",
+    }, .{ .commit_timestamp_ns = 9012 });
+    try std.testing.expectEqual(@as(u64, 1), lsn);
+
+    var entry = (try primary.log.entryAt(alloc, lsn)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(replication_record.RecordKind.metadata_mutation, entry.record.kind);
+    try std.testing.expectEqual(replication_record.PayloadCodec.json, entry.record.payload_codec);
+    try std.testing.expectEqual(@as(u64, 102), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 9), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 13), entry.record.table_id);
+    try std.testing.expectEqual(@as(i64, 9012), entry.record.commit_timestamp_ns);
+
+    const decoded = try decodeSchemaMetadataMutation(alloc, entry.record);
+    defer schema_mod.freeSchema(alloc, decoded);
+    try std.testing.expectEqual(@as(u32, 7), decoded.version);
+    try std.testing.expectEqualStrings("doc", decoded.default_type);
+    try std.testing.expectEqual(@as(u64, 123), decoded.ttl_duration_ns);
+    try std.testing.expectEqualStrings("expires_at", decoded.ttl_field);
+}
+
 test "storage.ha effects rejects non-derived HA records when decoding derived payloads" {
     const record = replication_record.Record{
         .kind = .batch_mutation,
@@ -290,6 +404,53 @@ test "storage.ha effects rejects unsupported batch mutation payloads" {
     try std.testing.expectError(
         error.UnsupportedBatchMutationPayloadVersion,
         decodeBatchMutationRequest(std.testing.allocator, bad_version),
+    );
+}
+
+test "storage.ha effects rejects unsupported metadata mutation payloads" {
+    const batch = replication_record.Record{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "{}",
+    };
+    try std.testing.expectError(
+        error.NotMetadataMutationRecord,
+        decodeMetadataMutation(std.testing.allocator, batch),
+    );
+
+    const binary = replication_record.Record{
+        .kind = .metadata_mutation,
+        .payload_codec = .binary,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "",
+    };
+    try std.testing.expectError(
+        error.UnsupportedMetadataMutationCodec,
+        decodeMetadataMutation(std.testing.allocator, binary),
+    );
+
+    const bad_version = replication_record.Record{
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "{\"schema_version\":2,\"kind\":\"schema\",\"schema_bytes\":\"\"}",
+    };
+    try std.testing.expectError(
+        error.UnsupportedMetadataMutationPayloadVersion,
+        decodeMetadataMutation(std.testing.allocator, bad_version),
     );
 }
 
