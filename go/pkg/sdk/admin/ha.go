@@ -365,6 +365,18 @@ func ValidateHAReplicationSlotActionResponse(response HAReplicationSlotActionRes
 	return nil
 }
 
+func ValidateHAReplicationSlotListResponse(response HAReplicationSlotListResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing replication slot list schema_version")
+	}
+	for _, slot := range response.Slots {
+		if !HAReplicationSlotComplete(slot) {
+			return fmt.Errorf("missing replication slot list slot fields")
+		}
+	}
+	return nil
+}
+
 func ValidateHABaseBackupBeginResponse(response HABaseBackupBeginResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing base backup begin schema_version")
@@ -484,6 +496,22 @@ func ValidateHAFenceResponse(response HAFenceResponse) error {
 	}
 	if !HAFenceReceiptComplete(response.Receipt) {
 		return fmt.Errorf("missing fence response receipt fields")
+	}
+	return nil
+}
+
+func ValidateHACurrentFenceResponse(response HACurrentFenceResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing current fence schema_version")
+	}
+	if response.Held {
+		if !HAFenceReceiptComplete(response.Receipt) {
+			return fmt.Errorf("missing current fence receipt fields")
+		}
+		return nil
+	}
+	if !HAFenceReceiptEmpty(response.Receipt) {
+		return fmt.Errorf("current fence response has receipt while not held")
 	}
 	return nil
 }
@@ -780,6 +808,22 @@ func HAFenceReceiptComplete(receipt HAFenceReceipt) bool {
 		strings.TrimSpace(receipt.Reason) != ""
 }
 
+func HAFenceReceiptEmpty(receipt HAFenceReceipt) bool {
+	return !receipt.Forced &&
+		receipt.Generation == 0 &&
+		receipt.Identity == (HAIdentity{}) &&
+		receipt.NewEpoch == 0 &&
+		receipt.NewTimelineId == 0 &&
+		receipt.ObservedLsn == 0 &&
+		strings.TrimSpace(receipt.OldPrimaryId) == "" &&
+		receipt.ParentEpoch == 0 &&
+		receipt.ParentTimelineId == 0 &&
+		strings.TrimSpace(receipt.PromotedNodeId) == "" &&
+		strings.TrimSpace(receipt.Reason) == "" &&
+		receipt.RequiredLsn == 0 &&
+		strings.TrimSpace(receipt.Token) == ""
+}
+
 func HAIdentityComplete(identity HAIdentity) bool {
 	return identity.ClusterId > 0 &&
 		identity.TimelineId > 0 &&
@@ -950,6 +994,21 @@ func (e *HAAPIError) Error() string {
 	return fmt.Sprintf("%s returned status %d: %s", e.Operation, e.StatusCode, e.Body)
 }
 
+// HAResponseValidationError describes a 2xx HA admin response that decoded but
+// did not satisfy the wrapper's typed response contract.
+type HAResponseValidationError struct {
+	Operation string
+	Err       error
+}
+
+func (e *HAResponseValidationError) Error() string {
+	return fmt.Sprintf("%s response invalid: %v", e.Operation, e.Err)
+}
+
+func (e *HAResponseValidationError) Unwrap() error {
+	return e.Err
+}
+
 // NewHAClient creates a typed HA admin client. The base URL may be either the
 // Antfly server root or an explicit /admin/v1 admin API root.
 func NewHAClient(baseURL string, httpClient *http.Client) (*HAClient, error) {
@@ -1029,7 +1088,7 @@ func requireHAJSON200Validated[T any](operation string, statusCode int, body []b
 	}
 	if validate != nil {
 		if err := validate(*response.Value); err != nil {
-			return nil, fmt.Errorf("%s response invalid: %w", operation, err)
+			return nil, &HAResponseValidationError{Operation: operation, Err: err}
 		}
 	}
 	return response, nil
@@ -1191,7 +1250,7 @@ func (c *HAClient) ListReplicationSlotsResponse(ctx context.Context) (*HARespons
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("list HA replication slots", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("list HA replication slots", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotListResponse)
 }
 
 func (c *HAClient) ListReplicationSlots(ctx context.Context) (*HAReplicationSlotListResponse, error) {
@@ -1203,7 +1262,7 @@ func (c *HAClient) CreateReplicationSlotResponse(ctx context.Context, body Repli
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("create HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("create HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
 }
 
 func (c *HAClient) CreateReplicationSlot(ctx context.Context, body ReplicationSlotCreateRequest) (*HAReplicationSlotActionResponse, error) {
@@ -1215,7 +1274,7 @@ func (c *HAClient) PauseReplicationSlotResponse(ctx context.Context, slotName st
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("pause HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("pause HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
 }
 
 func (c *HAClient) PauseReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
@@ -1227,7 +1286,7 @@ func (c *HAClient) ResumeReplicationSlotResponse(ctx context.Context, slotName s
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("resume HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("resume HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
 }
 
 func (c *HAClient) ResumeReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
@@ -1239,7 +1298,7 @@ func (c *HAClient) DropReplicationSlotResponse(ctx context.Context, slotName str
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("drop HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("drop HA replication slot", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReplicationSlotActionResponse)
 }
 
 func (c *HAClient) DropReplicationSlot(ctx context.Context, slotName string) (*HAReplicationSlotActionResponse, error) {
@@ -1251,7 +1310,7 @@ func (c *HAClient) BeginBaseBackupResponse(ctx context.Context, body BaseBackupS
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("begin HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("begin HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHABaseBackupBeginResponse)
 }
 
 func (c *HAClient) BeginBaseBackup(ctx context.Context, body BaseBackupStartRequest) (*HABaseBackupBeginResponse, error) {
@@ -1263,7 +1322,7 @@ func (c *HAClient) FinishBaseBackupResponse(ctx context.Context, body BaseBackup
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("finish HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("finish HA base backup", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHABaseBackupFinishResponse)
 }
 
 func (c *HAClient) FinishBaseBackup(ctx context.Context, body BaseBackupManifestPathRequest) (*HABaseBackupFinishResponse, error) {
@@ -1275,7 +1334,7 @@ func (c *HAClient) BootstrapStandbyResponse(ctx context.Context, body StandbyBoo
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("bootstrap HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("bootstrap HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyBootstrapResponse)
 }
 
 func (c *HAClient) BootstrapStandby(ctx context.Context, body StandbyBootstrapRequest) (*HAStandbyBootstrapResponse, error) {
@@ -1287,7 +1346,7 @@ func (c *HAClient) AcquireFenceResponse(ctx context.Context, body FenceAcquireRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("acquire HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("acquire HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAFenceResponse)
 }
 
 func (c *HAClient) AcquireFence(ctx context.Context, body FenceAcquireRequest) (*HAFenceResponse, error) {
@@ -1299,7 +1358,7 @@ func (c *HAClient) CurrentFenceResponse(ctx context.Context) (*HAResponse[HACurr
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("get current HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("get current HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHACurrentFenceResponse)
 }
 
 func (c *HAClient) CurrentFence(ctx context.Context) (*HACurrentFenceResponse, error) {
@@ -1311,7 +1370,7 @@ func (c *HAClient) AssessPromotionResponse(ctx context.Context, body PromotionAs
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("assess HA promotion", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("assess HA promotion", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionAssessResponse)
 }
 
 func (c *HAClient) AssessPromotion(ctx context.Context, body PromotionAssessRequest) (*HAPromotionAssessResponse, error) {
@@ -1323,7 +1382,7 @@ func (c *HAClient) PromoteResponse(ctx context.Context, body FenceAcquireRequest
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("promote HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("promote HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionResponse)
 }
 
 func (c *HAClient) Promote(ctx context.Context, body FenceAcquireRequest) (*HAPromotionResponse, error) {
@@ -1335,7 +1394,7 @@ func (c *HAClient) PromoteWithCurrentFenceResponse(ctx context.Context) (*HAResp
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("promote HA standby with current fence", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("promote HA standby with current fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionResponse)
 }
 
 func (c *HAClient) PromoteWithCurrentFence(ctx context.Context) (*HAPromotionResponse, error) {
@@ -1347,7 +1406,7 @@ func (c *HAClient) AssessRejoinResponse(ctx context.Context, body RejoinAssessRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("assess HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("assess HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse)
 }
 
 func (c *HAClient) AssessRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
@@ -1359,7 +1418,7 @@ func (c *HAClient) RewindRejoinResponse(ctx context.Context, body RejoinAssessRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("rewind HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("rewind HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse)
 }
 
 func (c *HAClient) RewindRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
@@ -1371,7 +1430,7 @@ func (c *HAClient) ReseedRejoinResponse(ctx context.Context, body RejoinAssessRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("reseed HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("reseed HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse)
 }
 
 func (c *HAClient) ReseedRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {

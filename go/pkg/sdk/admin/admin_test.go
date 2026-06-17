@@ -351,6 +351,28 @@ func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	}
 }
 
+func TestHAClientCurrentFenceRejectsInvalidTypedResponse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/v1/ha/fence/current" {
+			t.Fatalf("path = %s, want /admin/v1/ha/fence/current", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"schema_version":1,"held":true}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.CurrentFence(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "current fence receipt fields") {
+		t.Fatalf("CurrentFence error = %v, want current fence receipt fields", err)
+	}
+}
+
 func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	t.Parallel()
 
@@ -612,6 +634,17 @@ func TestHAReceiptMatchesNode(t *testing.T) {
 func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 	t.Parallel()
 
+	slot := HAReplicationSlot{
+		SlotName:       "standby-a",
+		TimelineId:     1,
+		RestartLsn:     7,
+		ReceivedLsn:    7,
+		AppliedLsn:     7,
+		SafeReadLsn:    7,
+		CurrentLsn:     7,
+		Active:         true,
+		ReseedRequired: false,
+	}
 	response := HAReplicationSlotActionResponse{
 		SchemaVersion: 1,
 		Action: HAActionReceipt{
@@ -622,20 +655,24 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 			NodeId:     "primary-a",
 		},
 		SlotAction: HAReplicationSlotActionCreate,
-		Slot: HAReplicationSlot{
-			SlotName:       "standby-a",
-			TimelineId:     1,
-			RestartLsn:     7,
-			ReceivedLsn:    7,
-			AppliedLsn:     7,
-			SafeReadLsn:    7,
-			CurrentLsn:     7,
-			Active:         true,
-			ReseedRequired: false,
-		},
+		Slot:       slot,
 	}
 	if err := ValidateHAReplicationSlotActionResponse(response); err != nil {
 		t.Fatalf("ValidateHAReplicationSlotActionResponse returned error: %v", err)
+	}
+	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
+		SchemaVersion: 1,
+		Slots:         []HAReplicationSlot{slot},
+	}); err != nil {
+		t.Fatalf("ValidateHAReplicationSlotListResponse returned error: %v", err)
+	}
+	badListSlot := slot
+	badListSlot.SlotName = ""
+	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
+		SchemaVersion: 1,
+		Slots:         []HAReplicationSlot{badListSlot},
+	}); err == nil || !strings.Contains(err.Error(), "slot fields") {
+		t.Fatalf("invalid slot list error = %v, want slot fields error", err)
 	}
 
 	response.Action.NodeId = ""
@@ -727,6 +764,27 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 func TestValidateHAFenceResponse(t *testing.T) {
 	t.Parallel()
 
+	receipt := HAFenceReceipt{
+		Identity: HAIdentity{
+			ClusterId:  1,
+			ShardId:    2,
+			TableId:    3,
+			TimelineId: 4,
+			Epoch:      5,
+		},
+		OldPrimaryId:     "primary-a",
+		PromotedNodeId:   "standby-a",
+		ParentTimelineId: 4,
+		ParentEpoch:      5,
+		NewTimelineId:    6,
+		NewEpoch:         7,
+		RequiredLsn:      8,
+		ObservedLsn:      8,
+		Generation:       9,
+		Forced:           false,
+		Token:            "fence-token",
+		Reason:           "manual",
+	}
 	response := HAFenceResponse{
 		SchemaVersion: 1,
 		Action: HAActionReceipt{
@@ -736,30 +794,36 @@ func TestValidateHAFenceResponse(t *testing.T) {
 			State:      HAActionStateApplied,
 			NodeId:     "standby-a",
 		},
-		Receipt: HAFenceReceipt{
-			Identity: HAIdentity{
-				ClusterId:  1,
-				ShardId:    2,
-				TableId:    3,
-				TimelineId: 4,
-				Epoch:      5,
-			},
-			OldPrimaryId:     "primary-a",
-			PromotedNodeId:   "standby-a",
-			ParentTimelineId: 4,
-			ParentEpoch:      5,
-			NewTimelineId:    6,
-			NewEpoch:         7,
-			RequiredLsn:      8,
-			ObservedLsn:      8,
-			Generation:       9,
-			Forced:           false,
-			Token:            "fence-token",
-			Reason:           "manual",
-		},
+		Receipt: receipt,
 	}
 	if err := ValidateHAFenceResponse(response); err != nil {
 		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
+	}
+	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+		SchemaVersion: 1,
+		Held:          false,
+	}); err != nil {
+		t.Fatalf("ValidateHACurrentFenceResponse empty returned error: %v", err)
+	}
+	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+		SchemaVersion: 1,
+		Held:          true,
+		Receipt:       receipt,
+	}); err != nil {
+		t.Fatalf("ValidateHACurrentFenceResponse held returned error: %v", err)
+	}
+	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+		SchemaVersion: 1,
+		Held:          true,
+	}); err == nil || !strings.Contains(err.Error(), "receipt fields") {
+		t.Fatalf("missing current fence receipt error = %v, want receipt fields error", err)
+	}
+	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+		SchemaVersion: 1,
+		Held:          false,
+		Receipt:       receipt,
+	}); err == nil || !strings.Contains(err.Error(), "not held") {
+		t.Fatalf("unexpected current fence receipt error = %v, want not held error", err)
 	}
 	response.Receipt.Token = ""
 	if err := ValidateHAFenceResponse(response); err == nil || !strings.Contains(err.Error(), "receipt fields") {

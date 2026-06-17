@@ -3837,6 +3837,10 @@ func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]b
 		if stderrors.As(err, &apiErr) {
 			return nil, fmt.Errorf("HA admin API returned status %d: %s", apiErr.StatusCode, strings.TrimSpace(apiErr.Body))
 		}
+		var validationErr *adminsdk.HAResponseValidationError
+		if stderrors.As(err, &validationErr) {
+			return nil, fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+		}
 		return nil, err
 	}
 	if value == nil {
