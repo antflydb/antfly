@@ -5201,6 +5201,19 @@ fn claimActiveStatusProbePage(db: *db_mod.DB, family: Family) !ActivePageProbeRe
     {
         return error.GraphMetricReleaseQualificationMissingBuildStatus;
     }
+    if (reclaimed.total_units == 0) return error.GraphMetricReleaseQualificationMissingBuildStatus;
+    _ = try graph_entry.index.updateGraphMetricBuildPageProgressForAttempt(
+        family.primaryMetric(),
+        status.build_job_id,
+        status.phase,
+        status.build_iteration,
+        reclaimed.page_id,
+        active_probe_worker_id,
+        reclaimed.attempt,
+        "release-qualification-active-probe",
+        1,
+        reclaimed.total_units,
+    );
     return .{
         .claimed = true,
         .reclaimed = true,
@@ -5214,7 +5227,10 @@ fn verifyActiveProbePageStatus(status: graph_mod.GraphIndex.GraphMetricStatus) !
         if (page.state != .leased or
             page.attempt == 0 or
             page.lease_expires_at_ms == 0 or
+            page.cursor.len == 0 or
+            page.completed_units == 0 or
             page.total_units == 0 or
+            page.completed_units > page.total_units or
             page.last_error.len != 0)
         {
             return error.GraphMetricReleaseQualificationMissingBuildStatus;

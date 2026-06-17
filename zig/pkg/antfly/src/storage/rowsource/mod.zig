@@ -13,6 +13,7 @@
 // limitations.
 
 pub const types = @import("types.zig");
+pub const external = @import("external.zig");
 
 pub const SourceKind = types.SourceKind;
 pub const NextBatchFn = types.NextBatchFn;
@@ -27,12 +28,20 @@ pub const ColumnValues = types.ColumnValues;
 pub const NullBitmap = types.NullBitmap;
 pub const ColumnVector = types.ColumnVector;
 pub const ColumnBatch = types.ColumnBatch;
+pub const ExternalFormat = external.Format;
+pub const ExternalBinding = external.Binding;
+pub const ExternalFileRef = external.FileRef;
+pub const ExternalBatchSource = external.BatchSource;
+pub const makeExternalRowRef = external.makeRowRef;
+pub const validateExternalBatch = external.validateExternalBatch;
 
 test "rowsource module compiles" {
     _ = types;
+    _ = external;
     _ = Source;
     _ = SnapshotRef;
     _ = RowRef;
     _ = ColumnVector;
     _ = ColumnBatch;
+    _ = ExternalBatchSource;
 }

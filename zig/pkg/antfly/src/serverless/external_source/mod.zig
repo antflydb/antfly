@@ -14,25 +14,20 @@
 
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
-pub const source_binding = @import("source_binding.zig");
 
-pub const Entry = types.Entry;
-pub const SidecarKind = source_binding.SidecarKind;
-pub const SidecarSourceBinding = source_binding.Binding;
-pub const SidecarSourceRowRefKind = source_binding.RowRefKind;
-pub const freeEntries = types.freeEntries;
-pub const encodeAlloc = codec.encodeAlloc;
-pub const decodeAlloc = codec.decodeAlloc;
-pub const sameSidecarSourceSnapshot = source_binding.sameSourceSnapshot;
+pub const Format = types.Format;
+pub const RowGroup = types.RowGroup;
+pub const FileEntry = types.FileEntry;
+pub const Inventory = types.Inventory;
+pub const freeInventory = types.freeInventory;
+pub const encodeInventoryAlloc = codec.encodeAlloc;
+pub const decodeInventoryAlloc = codec.decodeAlloc;
 
-test "serverless segment module compiles" {
+test "serverless external source module compiles" {
     _ = types;
     _ = codec;
-    _ = source_binding;
-    _ = Entry;
-    _ = SidecarSourceBinding;
-    _ = freeEntries;
-    _ = encodeAlloc;
-    _ = decodeAlloc;
-    _ = sameSidecarSourceSnapshot;
+    _ = Format;
+    _ = Inventory;
+    _ = encodeInventoryAlloc;
+    _ = decodeInventoryAlloc;
 }
