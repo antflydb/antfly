@@ -3421,6 +3421,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		body := haReplicationSlotCreateRequest{SlotName: slotName}
 		if action.TargetLSN > 0 {
 			body.InitialLSN = action.TargetLSN
@@ -3439,6 +3442,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
@@ -3453,6 +3459,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
@@ -3466,6 +3475,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
 		if !ok {
 			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
 		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil {
@@ -3485,6 +3497,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		body := haBaseBackupStartRequest{
 			SlotName:   slotName,
 			ManifestID: manifestID,
@@ -3502,6 +3517,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		body := haBaseBackupManifestPathRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
 		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
@@ -3515,6 +3533,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
 		if !ok {
 			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
 		}
 		body := haStandbyBootstrapRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
 		if strings.TrimSpace(action.SeedContentRoot) != "" {
@@ -3534,6 +3555,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
 			err = requireHADirectFenceAcquireResult(cluster, action, raw)
@@ -3543,6 +3567,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
 		if !ok {
 			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
 		}
 		raw, err := r.requestHAAdminJSONRaw(ctx, method, action.AdminURL, apiPath, nil)
 		if err == nil && !r.applyHADirectPromotionResult(cluster, action, raw) {
@@ -3558,6 +3585,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if !ok {
 			return false, nil
 		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
 		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil && !r.applyHADirectRejoinAssessResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed rejoin assessment", action.Kind)
@@ -3566,6 +3596,13 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	default:
 		return false, nil
 	}
+}
+
+func haValidateDirectAdminNodeTarget(action antflyv1.HAPlannedActionStatus) error {
+	if strings.TrimSpace(action.AdminNodeID) == "" {
+		return fmt.Errorf("HA action %s requires adminNodeID before typed /admin/v1 execution", action.Kind)
+	}
+	return nil
 }
 
 func haPlannedActionDirectAdminOperation(action antflyv1.HAPlannedActionStatus) (string, string, bool) {

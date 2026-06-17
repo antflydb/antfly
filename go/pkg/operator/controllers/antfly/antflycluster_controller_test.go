@@ -400,6 +400,60 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
+func TestReconcileHAAdminJobsRejectsDirectAPIMissingAdminNodeID(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:        string(haActionCreateSlot),
+					StandbyName: "standby-a",
+					TargetLSN:   5,
+					AdminURL:    "http://primary-ha.default.svc:8081",
+					AdminMethod: "POST",
+					AdminPath:   "/admin/v1/ha/replication-slots",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("direct HA admin action without AdminNodeID must not issue HTTP request: %s %s", req.Method, req.URL.Path)
+			return nil, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("adminNodeID"))
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(BeEmpty())
+}
+
 func TestReconcileHAAdminJobsDoesNotFallbackFromAdminAPIToCLIJob(t *testing.T) {
 	g := NewWithT(t)
 
