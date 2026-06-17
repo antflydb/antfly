@@ -1297,6 +1297,8 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FenceOldPrimaryID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FencePromotedNodeID).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FenceReason).To(Equal("LeaseAcquired"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.PromotionForce).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.PromotionDataLossPossible).To(BeFalse())
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -3411,6 +3413,9 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(adminResult.FencePromotedNodeID).To(Equal("standby-a"))
 	g.Expect(adminResult.FenceRequiredLSN).To(Equal(uint64(12)))
 	g.Expect(adminResult.FenceObservedLSN).To(Equal(uint64(13)))
+	g.Expect(adminResult.FenceForced).To(BeTrue())
+	g.Expect(adminResult.PromotionForce).To(BeTrue())
+	g.Expect(adminResult.PromotionDataLossPossible).To(BeTrue())
 
 	identity := &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
@@ -3430,6 +3435,12 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(adminResult.FenceOldPrimaryID).To(Equal("primary-a"))
 	g.Expect(adminResult.FencePromotedNodeID).To(Equal("standby-a"))
 	g.Expect(adminResult.FenceReason).To(Equal("LeaseAcquired"))
+	g.Expect(haActionHasRequiredAdminResult(antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionPromoteStandby),
+		StandbyName: "standby-a",
+		TargetLSN:   12,
+		AdminResult: adminResult,
+	})).To(BeFalse())
 
 	promotion := &antflyv1.HAPromotionStatus{
 		OldPrimaryID:      "primary-a",
@@ -3709,6 +3720,8 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(promotion.FenceNewTimelineID).To(Equal(uint64(5)))
 	g.Expect(promotion.FenceRequiredLSN).To(Equal(uint64(12)))
 	g.Expect(promotion.FenceObservedLSN).To(Equal(uint64(13)))
+	g.Expect(promotion.PromotionForce).To(BeFalse())
+	g.Expect(promotion.PromotionDataLossPossible).To(BeFalse())
 
 	promotion, ok = parseHAAdminActionResultTable(strings.Join([]string{
 		"result=promote_current_fence",

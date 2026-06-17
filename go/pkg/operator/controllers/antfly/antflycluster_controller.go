@@ -4460,25 +4460,27 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 
 func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
-		SchemaVersion:         result.SchemaVersion,
-		ActionID:              strings.TrimSpace(result.ActionID),
-		ActionKind:            strings.TrimSpace(result.ActionKind),
-		ActionTarget:          strings.TrimSpace(result.ActionTarget),
-		ActionState:           strings.TrimSpace(result.ActionState),
-		ActionNodeID:          strings.TrimSpace(result.ActionNodeID),
-		FenceGeneration:       result.FenceGeneration,
-		FenceToken:            result.FenceToken,
-		FenceClusterID:        result.NewClusterID,
-		FenceShardID:          result.NewShardID,
-		FenceTableID:          result.NewTableID,
-		FencePromotedNodeID:   strings.TrimSpace(result.PromotedNodeID),
-		FenceParentTimelineID: result.ParentTimelineID,
-		FenceParentEpoch:      result.ParentEpoch,
-		FenceNewTimelineID:    result.NewTimelineID,
-		FenceNewEpoch:         result.NewEpoch,
-		FenceRequiredLSN:      result.RequiredLSN,
-		FenceObservedLSN:      result.ObservedLSN,
-		FenceForced:           result.Forced,
+		SchemaVersion:             result.SchemaVersion,
+		ActionID:                  strings.TrimSpace(result.ActionID),
+		ActionKind:                strings.TrimSpace(result.ActionKind),
+		ActionTarget:              strings.TrimSpace(result.ActionTarget),
+		ActionState:               strings.TrimSpace(result.ActionState),
+		ActionNodeID:              strings.TrimSpace(result.ActionNodeID),
+		FenceGeneration:           result.FenceGeneration,
+		FenceToken:                result.FenceToken,
+		FenceClusterID:            result.NewClusterID,
+		FenceShardID:              result.NewShardID,
+		FenceTableID:              result.NewTableID,
+		FencePromotedNodeID:       strings.TrimSpace(result.PromotedNodeID),
+		FenceParentTimelineID:     result.ParentTimelineID,
+		FenceParentEpoch:          result.ParentEpoch,
+		FenceNewTimelineID:        result.NewTimelineID,
+		FenceNewEpoch:             result.NewEpoch,
+		FenceRequiredLSN:          result.RequiredLSN,
+		FenceObservedLSN:          result.ObservedLSN,
+		FenceForced:               result.Forced,
+		PromotionForce:            result.Forced,
+		PromotionDataLossPossible: result.DataLossPossible,
 	}
 }
 
@@ -6642,7 +6644,10 @@ func haPromotionAdminResultHasEvidence(action antflyv1.HAPlannedActionStatus, re
 		result.FenceNewTimelineID == 0 ||
 		result.FenceNewEpoch == 0 ||
 		result.FenceRequiredLSN == 0 ||
-		result.FenceObservedLSN < result.FenceRequiredLSN {
+		result.FenceObservedLSN < result.FenceRequiredLSN ||
+		result.FenceForced ||
+		result.PromotionForce ||
+		result.PromotionDataLossPossible {
 		return false
 	}
 	if action.TargetLSN != 0 && result.FenceRequiredLSN != action.TargetLSN {
