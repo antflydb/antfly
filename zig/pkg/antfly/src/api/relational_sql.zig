@@ -63241,8 +63241,26 @@ fn appParitySetupSqlIsValid(alloc: std.mem.Allocator, setup_sql: []const []const
     return true;
 }
 
-fn validateAppParityFixtureMetadata(
+fn appParityFixtureAppliedPlanMatchesDerived(
+    alloc: std.mem.Allocator,
+    base_schema_json: []const u8,
     entry: AppParityCorpusEntry,
+) !bool {
+    if (entry.applied_plan.len == 0) return true;
+    const derived = appParityAppliedDdlPlanAlloc(alloc, base_schema_json, entry) catch |err| switch (err) {
+        error.InvalidSqlCatalog,
+        error.UnsupportedSqlShape,
+        error.InvalidSchemaUpdateRequest,
+        => return false,
+        else => return err,
+    };
+    defer alloc.free(derived);
+    return std.mem.eql(u8, entry.applied_plan, derived);
+}
+
+fn validateAppParityFixtureMetadataWithBaseSchema(
+    entry: AppParityCorpusEntry,
+    base_schema_json: []const u8,
     seen_names: *std.StringHashMapUnmanaged(void),
     alloc: std.mem.Allocator,
 ) !void {
@@ -63462,6 +63480,9 @@ fn validateAppParityFixtureMetadata(
     if (entry.applied_plan.len > 0 and !appParityAppliedPlanIsStructured(entry.applied_plan)) {
         return error.TestUnexpectedResult;
     }
+    if (entry.applied_plan.len > 0 and !(try appParityFixtureAppliedPlanMatchesDerived(alloc, base_schema_json, entry))) {
+        return error.TestUnexpectedResult;
+    }
     if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
         return error.TestUnexpectedResult;
     }
@@ -63539,6 +63560,14 @@ fn validateAppParityFixtureMetadata(
     }
     if (seen_names.contains(entry.name)) return error.TestUnexpectedResult;
     try seen_names.put(alloc, entry.name, {});
+}
+
+fn validateAppParityFixtureMetadata(
+    entry: AppParityCorpusEntry,
+    seen_names: *std.StringHashMapUnmanaged(void),
+    alloc: std.mem.Allocator,
+) !void {
+    return validateAppParityFixtureMetadataWithBaseSchema(entry, "", seen_names, alloc);
 }
 
 test "app parity fixture metadata requires typed summary anchors" {
@@ -64569,6 +64598,16 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale applied plan",
+        .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
+        .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
+        .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "non-ddl applied plan",
         .sql = "SELECT id FROM usage_records",
         .family = .query,
@@ -64916,6 +64955,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records" },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
         .applied_plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
     }, &seen, alloc);
 
@@ -73917,7 +73957,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
         const entry = try parseAppParityFixtureEntryAlloc(alloc, entry_value);
         defer freeAppParityFixtureEntry(alloc, entry);
         errdefer std.debug.print("fixture parity corpus entry failed: {s}\n", .{entry.name});
-        try validateAppParityFixtureMetadata(entry, &seen_names, alloc);
+        try validateAppParityFixtureMetadataWithBaseSchema(entry, schema_json, &seen_names, alloc);
         try coverage.observe(alloc, entry);
         try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
