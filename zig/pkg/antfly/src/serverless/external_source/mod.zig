@@ -14,6 +14,7 @@
 
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
+pub const rowsource_bridge = @import("rowsource_bridge.zig");
 
 pub const Format = types.Format;
 pub const RowGroup = types.RowGroup;
@@ -22,12 +23,19 @@ pub const Inventory = types.Inventory;
 pub const freeInventory = types.freeInventory;
 pub const encodeInventoryAlloc = codec.encodeAlloc;
 pub const decodeInventoryAlloc = codec.decodeAlloc;
+pub const bindingFromInventory = rowsource_bridge.bindingFromInventory;
+pub const rowRefForInventoryRow = rowsource_bridge.rowRefForInventoryRow;
+pub const validateBatchAgainstInventory = rowsource_bridge.validateBatchAgainstInventory;
 
 test "serverless external source module compiles" {
     _ = types;
     _ = codec;
+    _ = rowsource_bridge;
     _ = Format;
     _ = Inventory;
     _ = encodeInventoryAlloc;
     _ = decodeInventoryAlloc;
+    _ = bindingFromInventory;
+    _ = rowRefForInventoryRow;
+    _ = validateBatchAgainstInventory;
 }
