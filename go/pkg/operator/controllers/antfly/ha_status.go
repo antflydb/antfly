@@ -1505,6 +1505,9 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return ""
 	}
+	if !haAutomaticFailoverFencingAuthoritySupported(ha) {
+		return ""
+	}
 	if !plan.FencingReady {
 		return ""
 	}
@@ -1623,6 +1626,9 @@ func haFencingReady(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus
 	if authority == "" || authority == antflyv1.HAFencingAuthorityNone {
 		return false
 	}
+	if !haAutomaticFailoverFencingAuthoritySupported(ha) {
+		return false
+	}
 	if status == nil {
 		return false
 	}
@@ -1678,6 +1684,9 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return antflyv1.ReasonHAFencingAuthorityMissing
 	}
+	if !haAutomaticFailoverFencingAuthoritySupported(ha) {
+		return antflyv1.ReasonHAFencingAuthorityUnsupported
+	}
 	if !plan.FencingReady {
 		return antflyv1.ReasonHAFencingNotReady
 	}
@@ -1701,6 +1710,12 @@ func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) s
 
 func haAutomaticFailoverExecutionEnabled(ha *antflyv1.HighAvailabilitySpec) bool {
 	return ha != nil && ha.Admin != nil && ha.Admin.ExecutePlannedActions
+}
+
+func haAutomaticFailoverFencingAuthoritySupported(ha *antflyv1.HighAvailabilitySpec) bool {
+	return ha != nil &&
+		ha.AutomaticFailover != nil &&
+		ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityKubernetesLease
 }
 
 func haPrimaryAdminUnavailable(status *antflyv1.HAStatus) bool {

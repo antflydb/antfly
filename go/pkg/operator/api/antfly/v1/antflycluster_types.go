@@ -260,6 +260,9 @@ const (
 	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
 	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"
 
+	// ReasonHAFencingAuthorityUnsupported indicates automatic failover is configured with a fencing authority this operator cannot manage.
+	ReasonHAFencingAuthorityUnsupported = "HAFencingAuthorityUnsupported"
+
 	// ReasonHAFencingNotReady indicates automatic failover lacks an observed ready fence.
 	ReasonHAFencingNotReady = "HAFencingNotReady"
 

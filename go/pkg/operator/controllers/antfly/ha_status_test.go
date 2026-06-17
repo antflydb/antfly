@@ -1411,6 +1411,47 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWhenAdminExecutionDisabled(t *tes
 	}
 }
 
+func TestUpdateHAStatusBlocksAutomaticPromotionWithUnsupportedFencingAuthority(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
+		PrimaryURL:            "http://primary-ha.default.svc:8081",
+		ExecutePlannedActions: true,
+	}
+	cluster.Spec.HighAvailability.Standbys[0].AdminURL = "http://standby-a-ha.default.svc:8081"
+	cluster.Spec.HighAvailability.Standbys[0].RouteSelector = haTestRouteSelector("standby-a")
+	cluster.Spec.HighAvailability.AutomaticFailover = &antflyv1.HAAutomaticFailoverPolicy{
+		Enabled:          true,
+		FencingAuthority: antflyv1.HAFencingAuthorityExternal,
+	}
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
+		Authority:  antflyv1.HAFencingAuthorityExternal,
+		Ready:      true,
+		Holder:     "standby-a",
+		Generation: 1,
+		Reason:     "ExternalFenceReady",
+	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to be blocked for unsupported fencing authority")
+	}
+	failover := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
+	if failover == nil || failover.Status != metav1.ConditionFalse ||
+		failover.Reason != antflyv1.ReasonHAFencingAuthorityUnsupported {
+		t.Fatalf("expected unsupported-fencing-authority condition, got %#v", failover)
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+			t.Fatalf("expected no automatic promotion actions with unsupported fencing authority, got %#v", cluster.Status.HAStatus.PlannedActions)
+		}
+	}
+}
+
 func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
