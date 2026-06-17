@@ -76,7 +76,9 @@ type (
 	HAReadDecisionAction               = oapi.HAReadDecisionAction
 	HAReadDecisionConsistency          = oapi.HAReadDecisionConsistency
 	HARejoinAssessResponse             = oapi.HARejoinAssessResponse
+	HAReplicationSlot                  = oapi.HAReplicationSlot
 	HAReplicationSlotActionResponse    = oapi.HAReplicationSlotActionResponse
+	HAReplicationSlotAction            = oapi.HAReplicationSlotActionResponseSlotAction
 	HAReplicationSlotListResponse      = oapi.HAReplicationSlotListResponse
 	HARetentionSnapshot                = oapi.HARetentionSnapshot
 	HASlotSnapshot                     = oapi.HASlotSnapshot
@@ -179,6 +181,11 @@ const (
 	HASyncPolicyFailureFailClosed     = oapi.HASyncPolicyFailurePolicyFailClosed
 	HASyncPolicyFailureDegradeToAsync = oapi.HASyncPolicyFailurePolicyDegradeToAsync
 
+	HAReplicationSlotActionCreate = oapi.HAReplicationSlotActionResponseSlotActionCreate
+	HAReplicationSlotActionDrop   = oapi.HAReplicationSlotActionResponseSlotActionDrop
+	HAReplicationSlotActionPause  = oapi.HAReplicationSlotActionResponseSlotActionPause
+	HAReplicationSlotActionResume = oapi.HAReplicationSlotActionResponseSlotActionResume
+
 	CommitAppendKindBatchMutation    = oapi.CommitAppendRequestKindBatchMutation
 	CommitAppendKindMetadataMutation = oapi.CommitAppendRequestKindMetadataMutation
 	CommitAppendKindDerivedEffect    = oapi.CommitAppendRequestKindDerivedEffect
@@ -279,6 +286,37 @@ func HAReceiptNodeMatches(receipt HAActionReceipt, expectedNodeID string, requir
 func HAReceiptMatchesNode(receipt HAActionReceipt, expectation HAReceiptExpectation, expectedTarget string, expectedNodeID string, requireExpectedNode bool) bool {
 	return HAReceiptMatches(receipt, expectation, expectedTarget) &&
 		HAReceiptNodeMatches(receipt, expectedNodeID, requireExpectedNode)
+}
+
+func ValidateHAReplicationSlotActionResponse(response HAReplicationSlotActionResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing replication slot action schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing replication slot action receipt")
+	}
+	switch response.SlotAction {
+	case HAReplicationSlotActionCreate, HAReplicationSlotActionDrop, HAReplicationSlotActionPause, HAReplicationSlotActionResume:
+	default:
+		return fmt.Errorf("invalid replication slot action %q", response.SlotAction)
+	}
+	if !HAReplicationSlotComplete(response.Slot) {
+		return fmt.Errorf("missing replication slot action slot fields")
+	}
+	return nil
+}
+
+func HAActionReceiptPresent(receipt HAActionReceipt) bool {
+	return strings.TrimSpace(receipt.ActionId) != "" &&
+		strings.TrimSpace(string(receipt.ActionKind)) != "" &&
+		strings.TrimSpace(receipt.Target) != "" &&
+		strings.TrimSpace(string(receipt.State)) != "" &&
+		strings.TrimSpace(receipt.NodeId) != ""
+}
+
+func HAReplicationSlotComplete(slot HAReplicationSlot) bool {
+	return strings.TrimSpace(slot.SlotName) != "" &&
+		slot.TimelineId > 0
 }
 
 func HAListReplicationSlotsOperation() HAOperation {

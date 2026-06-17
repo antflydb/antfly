@@ -3579,6 +3579,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		result, err := adminClient.CreateReplicationSlotResponse(ctx, body)
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
+			err = haValidateReplicationSlotActionSDKResponse(result)
+		}
+		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
@@ -3595,6 +3598,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		result, err := adminClient.PauseReplicationSlotResponse(ctx, slotName)
 		raw, err := haAdminSDKResponseRaw(result, err)
+		if err == nil {
+			err = haValidateReplicationSlotActionSDKResponse(result)
+		}
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3613,6 +3619,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		result, err := adminClient.ResumeReplicationSlotResponse(ctx, slotName)
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
+			err = haValidateReplicationSlotActionSDKResponse(result)
+		}
+		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
@@ -3629,6 +3638,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		result, err := adminClient.DropReplicationSlotResponse(ctx, slotName)
 		raw, err := haAdminSDKResponseRaw(result, err)
+		if err == nil {
+			err = haValidateReplicationSlotActionSDKResponse(result)
+		}
 		if err == nil {
 			err = requireHADirectAdminActionResult(action, raw)
 		}
@@ -3810,6 +3822,16 @@ func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]b
 		return nil, fmt.Errorf("HA admin SDK response is nil")
 	}
 	return value.Body, nil
+}
+
+func haValidateReplicationSlotActionSDKResponse(value *adminsdk.HAResponse[adminsdk.HAReplicationSlotActionResponse]) error {
+	if value == nil || value.Value == nil {
+		return fmt.Errorf("HA admin replication slot action response is nil")
+	}
+	if err := adminsdk.ValidateHAReplicationSlotActionResponse(*value.Value); err != nil {
+		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+	}
+	return nil
 }
 
 func haValidateDirectAdminNodeTarget(action antflyv1.HAPlannedActionStatus) error {

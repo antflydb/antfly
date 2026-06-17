@@ -587,6 +587,53 @@ func TestHAReceiptMatchesNode(t *testing.T) {
 	}
 }
 
+func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
+	t.Parallel()
+
+	response := HAReplicationSlotActionResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "replication_slot_create:standby-a",
+			ActionKind: HAActionKindReplicationSlotCreate,
+			Target:     "standby-a",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		SlotAction: HAReplicationSlotActionCreate,
+		Slot: HAReplicationSlot{
+			SlotName:       "standby-a",
+			TimelineId:     1,
+			RestartLsn:     7,
+			ReceivedLsn:    7,
+			AppliedLsn:     7,
+			SafeReadLsn:    7,
+			CurrentLsn:     7,
+			Active:         true,
+			ReseedRequired: false,
+		},
+	}
+	if err := ValidateHAReplicationSlotActionResponse(response); err != nil {
+		t.Fatalf("ValidateHAReplicationSlotActionResponse returned error: %v", err)
+	}
+
+	response.Action.NodeId = ""
+	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("missing node id error = %v, want receipt error", err)
+	}
+	response.Action.NodeId = "primary-a"
+
+	response.SlotAction = HAReplicationSlotAction("invalid")
+	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "invalid replication slot action") {
+		t.Fatalf("invalid slot action error = %v, want invalid action error", err)
+	}
+	response.SlotAction = HAReplicationSlotActionCreate
+
+	response.Slot.TimelineId = 0
+	if err := ValidateHAReplicationSlotActionResponse(response); err == nil || !strings.Contains(err.Error(), "slot fields") {
+		t.Fatalf("missing slot fields error = %v, want slot fields error", err)
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 
