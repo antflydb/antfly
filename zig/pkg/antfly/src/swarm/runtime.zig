@@ -62,6 +62,9 @@ const CliConfig = struct {
     ha_primary_log: ?[]const u8 = null,
     ha_primary_slots: ?[]const u8 = null,
     ha_primary_node_id: ?[]const u8 = null,
+    ha_standby_log: ?[]const u8 = null,
+    ha_standby_progress: ?[]const u8 = null,
+    ha_standby_node_id: ?[]const u8 = null,
     ha_cluster_id: ?u64 = null,
     ha_shard_id: ?u64 = null,
     ha_table_id: ?u64 = null,
@@ -719,8 +722,11 @@ pub fn runFromIterator(
     );
     defer local_metadata.deinit();
 
+    try validateHARole(cli);
     var ha_primary = try openHAPrimaryFromCli(alloc, setup_io.io(), cli);
     defer if (ha_primary) |*primary| primary.close();
+    var ha_standby = try openHAStandbyFromCli(alloc, setup_io.io(), cli);
+    defer if (ha_standby) |*standby| standby.close();
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -746,11 +752,14 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
-        .ha = if (ha_primary) |*primary| .{
+        .ha = if (ha_primary != null or ha_standby != null) .{
             .admin_context = .{
-                .primary = primary,
-                .primary_node_id = cli.ha_primary_node_id.?,
+                .primary = if (ha_primary) |*primary| primary else null,
+                .primary_node_id = cli.ha_primary_node_id,
+                .standby = if (ha_standby) |*standby| standby else null,
+                .standby_node_id = cli.ha_standby_node_id,
             },
+            .internal_primary = if (ha_primary) |*primary| primary else null,
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
@@ -1788,6 +1797,18 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.ha_primary_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-standby-log")) {
+            cfg.ha_standby_log = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-standby-progress")) {
+            cfg.ha_standby_progress = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-standby-node-id")) {
+            cfg.ha_standby_node_id = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -1961,12 +1982,28 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
 fn haPrimaryRequested(cli: CliConfig) bool {
     return cli.ha_primary_log != null or
         cli.ha_primary_slots != null or
-        cli.ha_primary_node_id != null or
-        cli.ha_cluster_id != null or
+        cli.ha_primary_node_id != null;
+}
+
+fn haStandbyRequested(cli: CliConfig) bool {
+    return cli.ha_standby_log != null or
+        cli.ha_standby_progress != null or
+        cli.ha_standby_node_id != null;
+}
+
+fn haIdentityRequested(cli: CliConfig) bool {
+    return cli.ha_cluster_id != null or
         cli.ha_shard_id != null or
         cli.ha_table_id != null or
         cli.ha_timeline_id != null or
         cli.ha_epoch != null;
+}
+
+fn validateHARole(cli: CliConfig) !void {
+    const primary_requested = haPrimaryRequested(cli);
+    const standby_requested = haStandbyRequested(cli);
+    if (primary_requested and standby_requested) return error.HAMultipleRolesConfigured;
+    if (haIdentityRequested(cli) and !primary_requested and !standby_requested) return error.HARoleMissing;
 }
 
 fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
@@ -1994,6 +2031,33 @@ fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     defer alloc.free(slots_z);
 
     return try antfly.ha.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
+}
+
+fn haStandbyIdentity(cli: CliConfig) !antfly.ha.standby.Identity {
+    return .{
+        .cluster_id = cli.ha_cluster_id orelse return error.HAClusterIdMissing,
+        .shard_id = cli.ha_shard_id orelse 0,
+        .table_id = cli.ha_table_id orelse 0,
+        .timeline_id = cli.ha_timeline_id orelse return error.HATimelineIdMissing,
+        .epoch = cli.ha_epoch orelse return error.HAEpochMissing,
+    };
+}
+
+fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.standby.Standby {
+    if (!haStandbyRequested(cli)) return null;
+    const log_path = cli.ha_standby_log orelse return error.HAStandbyLogMissing;
+    const progress_path = cli.ha_standby_progress orelse return error.HAStandbyProgressMissing;
+    if (cli.ha_standby_node_id == null) return error.HAStandbyNodeIdMissing;
+
+    try ensureParent(io, log_path);
+    try ensureParent(io, progress_path);
+
+    const log_z = try alloc.dupeZ(u8, log_path);
+    defer alloc.free(log_z);
+    const progress_z = try alloc.dupeZ(u8, progress_path);
+    defer alloc.free(progress_z);
+
+    return try antfly.ha.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
 }
 
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
@@ -2072,6 +2136,9 @@ fn printUsage() void {
         \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
         \\  --ha-primary-slots <path>             HA primary replication slot store path
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
+        \\  --ha-standby-log <path>               Enable HA standby admin API with this received replication log path
+        \\  --ha-standby-progress <path>          HA standby durable receive/apply progress WAL path
+        \\  --ha-standby-node-id <id>             HA standby node id for typed admin receipts
         \\  --ha-cluster-id <id>                  HA replicated cluster id
         \\  --ha-shard-id <id>                    HA replicated shard id (default: 0)
         \\  --ha-table-id <id>                    HA replicated table id (default: 0)
@@ -2346,6 +2413,40 @@ test "parse cli accepts HA primary runtime flags" {
     try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
 }
 
+test "parse cli accepts HA standby runtime flags" {
+    var argv = [_][*:0]const u8{
+        "--ha-standby-log",
+        "/tmp/ha-standby.log",
+        "--ha-standby-progress",
+        "/tmp/ha-standby-progress.wal",
+        "--ha-standby-node-id",
+        "standby-a",
+        "--ha-cluster-id",
+        "100",
+        "--ha-shard-id",
+        "10",
+        "--ha-table-id",
+        "20",
+        "--ha-timeline-id",
+        "3",
+        "--ha-epoch",
+        "4",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try validateHARole(cfg);
+    try std.testing.expect(!haPrimaryRequested(cfg));
+    try std.testing.expect(haStandbyRequested(cfg));
+    try std.testing.expectEqualStrings("/tmp/ha-standby.log", cfg.ha_standby_log.?);
+    try std.testing.expectEqualStrings("/tmp/ha-standby-progress.wal", cfg.ha_standby_progress.?);
+    try std.testing.expectEqualStrings("standby-a", cfg.ha_standby_node_id.?);
+    try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
+    try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
+    try std.testing.expectEqual(@as(u64, 3), cfg.ha_timeline_id.?);
+    try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
+}
+
 test "swarm HA primary identity defaults shard and table to whole instance" {
     const identity = try haPrimaryIdentity(.{
         .ha_cluster_id = 100,
@@ -2357,6 +2458,31 @@ test "swarm HA primary identity defaults shard and table to whole instance" {
     try std.testing.expectEqual(@as(u64, 0), identity.table_id);
     try std.testing.expectEqual(@as(u64, 3), identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 4), identity.epoch);
+}
+
+test "swarm HA standby identity defaults shard and table to whole instance" {
+    const identity = try haStandbyIdentity(.{
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    });
+    try std.testing.expectEqual(@as(u64, 100), identity.cluster_id);
+    try std.testing.expectEqual(@as(u64, 0), identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), identity.table_id);
+    try std.testing.expectEqual(@as(u64, 3), identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 4), identity.epoch);
+}
+
+test "swarm HA runtime rejects ambiguous role flags" {
+    try std.testing.expectError(error.HAMultipleRolesConfigured, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_standby_log = "/tmp/standby.log",
+    }));
+    try std.testing.expectError(error.HARoleMissing, validateHARole(.{
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
 }
 
 test "swarm runtime defaults public listener to antfarm port" {

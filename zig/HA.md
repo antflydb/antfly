@@ -653,6 +653,13 @@ and either rewind or reseed.
   runtime path should attach the same `/admin/v1/ha` executor and
   `/internal/v1/ha/replication` executor used by tests and the CLI, rather than
   requiring a bespoke harness to expose primary-side HA operations.
+- Wire the supported Zig `antfly swarm` runtime so a standby can also be started
+  with a durable received-WAL log, progress WAL, node id, and identity flags.
+  The standby runtime path should expose `/admin/v1/ha` status, read/write
+  gate, bootstrap, and promotion operations against the real standby handle.
+  Continuous pull/apply should then plug into the DataServer-managed standby DB
+  open path so applied LSN only advances after replicated records are applied to
+  storage.
 - Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
   `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
   operations following the style of the other SDK APIs.
