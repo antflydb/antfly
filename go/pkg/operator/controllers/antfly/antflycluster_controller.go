@@ -3931,6 +3931,19 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 	result.StartRecordLSN, _ = parseHAResultUint(lines, "start_record_lsn")
 	result.EndRecordLSN, _ = parseHAResultUint(lines, "end_record_lsn")
 	result.CheckpointLSN, _ = parseHAResultUint(lines, "checkpoint_lsn")
+	result.FenceClusterID, _ = parseHAResultUint(lines, "identity.cluster_id")
+	result.FenceShardID, _ = parseHAResultUint(lines, "identity.shard_id")
+	result.FenceTableID, _ = parseHAResultUint(lines, "identity.table_id")
+	result.FenceOldPrimaryID = strings.TrimSpace(lines["old_primary_id"])
+	result.FencePromotedNodeID = strings.TrimSpace(lines["promoted_node_id"])
+	result.FenceParentTimelineID, _ = parseHAResultUint(lines, "parent_timeline_id")
+	result.FenceParentEpoch, _ = parseHAResultUint(lines, "parent_epoch")
+	result.FenceNewTimelineID, _ = parseHAResultUint(lines, "new_timeline_id")
+	result.FenceNewEpoch, _ = parseHAResultUint(lines, "new_epoch")
+	result.FenceRequiredLSN, _ = parseHAResultUint(lines, "required_lsn")
+	result.FenceObservedLSN, _ = parseHAResultUint(lines, "observed_lsn")
+	result.FenceForced, _ = parseHAResultBool(lines, "forced")
+	result.FenceReason = strings.TrimSpace(lines["reason"])
 	result.FenceGeneration, _ = parseHAResultUint(lines, "generation")
 	if result.FenceGeneration == 0 {
 		result.FenceGeneration, _ = parseHAResultUint(lines, "fence_generation")
@@ -3957,6 +3970,7 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 		result.CheckpointLSN == 0 &&
 		result.FenceGeneration == 0 &&
 		result.FenceToken == "" &&
+		result.FencePromotedNodeID == "" &&
 		result.RejoinAction == "" {
 		return nil, false
 	}
@@ -4002,8 +4016,16 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 
 func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration: result.FenceGeneration,
-		FenceToken:      result.FenceToken,
+		FenceGeneration:       result.FenceGeneration,
+		FenceToken:            result.FenceToken,
+		FencePromotedNodeID:   strings.TrimSpace(result.PromotedNodeID),
+		FenceParentTimelineID: result.ParentTimelineID,
+		FenceParentEpoch:      result.ParentEpoch,
+		FenceNewTimelineID:    result.NewTimelineID,
+		FenceNewEpoch:         result.NewEpoch,
+		FenceRequiredLSN:      result.RequiredLSN,
+		FenceObservedLSN:      result.ObservedLSN,
+		FenceForced:           result.Forced,
 	}
 }
 
@@ -4030,6 +4052,9 @@ func haDirectPromotionResultMatchesAction(result haPromotionJobResult, identity 
 		return false
 	}
 	if action.TargetLSN > 0 && (result.SwitchLSN != action.TargetLSN || result.RequiredLSN != action.TargetLSN) {
+		return false
+	}
+	if strings.TrimSpace(action.StandbyName) != "" && result.PromotedNodeID != strings.TrimSpace(action.StandbyName) {
 		return false
 	}
 	if result.ObservedLSN < result.RequiredLSN {
@@ -4293,6 +4318,7 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 }
 
 type haPromotionJobResult struct {
+	PromotedNodeID   string
 	SwitchLSN        uint64
 	ParentClusterID  uint64
 	ParentShardID    uint64
@@ -4321,6 +4347,10 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 
 	var result haPromotionJobResult
 	var ok bool
+	result.PromotedNodeID = strings.TrimSpace(lines["promotion.node_id"])
+	if result.PromotedNodeID == "" {
+		return haPromotionJobResult{}, false
+	}
 	if result.SwitchLSN, ok = parseHAResultUint(lines, "promotion.switch_lsn"); !ok {
 		return haPromotionJobResult{}, false
 	}
@@ -4376,6 +4406,7 @@ type haPromotionAPIResult struct {
 		AppliedLSN  uint64 `json:"applied_lsn"`
 	} `json:"assessment"`
 	Promotion struct {
+		NodeID      string `json:"node_id"`
 		SwitchLSN   uint64 `json:"switch_lsn"`
 		OldIdentity struct {
 			ClusterID  uint64 `json:"cluster_id"`
@@ -4412,6 +4443,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		result = envelope.Result.Promote
 	}
 	if result == nil || result.Promotion.SwitchLSN == 0 ||
+		strings.TrimSpace(result.Promotion.NodeID) == "" ||
 		result.Promotion.OldIdentity.ClusterID == 0 ||
 		result.Promotion.OldIdentity.TimelineID == 0 ||
 		result.Promotion.OldIdentity.Epoch == 0 ||
@@ -4434,6 +4466,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		observedLSN = requiredLSN
 	}
 	return haPromotionJobResult{
+		PromotedNodeID:   strings.TrimSpace(result.Promotion.NodeID),
 		SwitchLSN:        result.Promotion.SwitchLSN,
 		ParentClusterID:  result.Promotion.OldIdentity.ClusterID,
 		ParentShardID:    result.Promotion.OldIdentity.ShardID,
@@ -5479,11 +5512,13 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 	case haActionAcquireFence:
 		return result.FenceGeneration > 0 &&
 			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
-			result.FenceToken != ""
+			result.FenceToken != "" &&
+			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
 	case haActionPromoteStandby:
 		return result.FenceGeneration > 0 &&
 			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
-			result.FenceToken != ""
+			result.FenceToken != "" &&
+			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return haRejoinResultMatchesRequiredAdminResult(action, result)
 	default:

@@ -74,11 +74,13 @@ pub const FenceReceiptResult = struct {
 pub const FencedPromotionResult = struct {
     assessment: status.PromotionAssessment,
     promotion: standby_mod.PromotionResult,
+    promoted_node_id: []const u8,
     fence_generation: u64,
     fence_token: []const u8,
     forced: bool,
 
     pub fn deinit(self: *FencedPromotionResult, alloc: Allocator) void {
+        alloc.free(self.promoted_node_id);
         alloc.free(self.fence_token);
         self.* = undefined;
     }
@@ -250,6 +252,8 @@ fn promoteWithReceipt(
     const assessment = status.assessPromotionWithFence(standby, receipt);
     if (!assessment.can_promote) return error.PromotionNotAllowed;
 
+    const promoted_node_id = try alloc.dupe(u8, receipt.promoted_node_id);
+    errdefer alloc.free(promoted_node_id);
     const token = try alloc.dupe(u8, receipt.token);
     errdefer alloc.free(token);
     const promotion = try standby.promote(receipt.promotionRequest());
@@ -257,6 +261,7 @@ fn promoteWithReceipt(
     return .{
         .assessment = assessment,
         .promotion = promotion,
+        .promoted_node_id = promoted_node_id,
         .fence_generation = receipt.generation,
         .fence_token = token,
         .forced = receipt.forced,

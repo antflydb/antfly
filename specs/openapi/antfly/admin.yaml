@@ -1309,9 +1309,13 @@ components:
           type: boolean
     HAPromotionResult:
       type: object
-      required: [switch_lsn, old_identity, new_identity, forced, data_loss_possible]
+      required: [node_id, switch_lsn, old_identity, new_identity, forced, data_loss_possible]
       additionalProperties: false
       properties:
+        node_id:
+          type: string
+          minLength: 1
+          description: Standby node id that executed the promotion.
         switch_lsn:
           type: integer
           format: uint64

@@ -270,6 +270,8 @@ pub const HAFenceReceipt = struct {
 };
 
 pub const HAPromotionResult = struct {
+    /// Standby node id that executed the promotion.
+    node_id: []const u8,
     switch_lsn: i64,
     old_identity: HAIdentity,
     new_identity: HAIdentity,

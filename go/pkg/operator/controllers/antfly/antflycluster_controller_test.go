@@ -697,7 +697,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -921,10 +921,12 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 		Epoch:      6,
 	}
 	action := antflyv1.HAPlannedActionStatus{
+		StandbyName:     "standby-a",
 		TargetLSN:       12,
 		FenceGeneration: 3,
 	}
 	result := haPromotionJobResult{
+		PromotedNodeID:   "standby-a",
 		SwitchLSN:        12,
 		RequiredLSN:      12,
 		ObservedLSN:      13,
@@ -958,6 +960,10 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 	unappliedBoundary := result
 	unappliedBoundary.ObservedLSN = 10
 	g.Expect(haDirectPromotionResultMatchesAction(unappliedBoundary, identity, &action)).To(BeFalse())
+
+	wrongNode := result
+	wrongNode.PromotedNodeID = "standby-b"
+	g.Expect(haDirectPromotionResultMatchesAction(wrongNode, identity, &action)).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
@@ -1569,8 +1575,9 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeFalse())
 
 	promotionActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration: 3,
-		FenceToken:      "ha-fence-token",
+		FenceGeneration:     3,
+		FenceToken:          "ha-fence-token",
+		FencePromotedNodeID: "standby-a",
 	}
 	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeTrue())
 
@@ -1812,8 +1819,9 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration: 7,
-		FenceToken:      "ha-fence-token",
+		FenceGeneration:     7,
+		FenceToken:          "ha-fence-token",
+		FencePromotedNodeID: "standby-a",
 	}
 	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
@@ -1874,8 +1882,9 @@ func TestReconcileHAPrimaryRouteRequiresStandbyRouteSelector(t *testing.T) {
 					AdminJobName:  "promote-job",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration: 7,
-						FenceToken:      "ha-fence-token",
+						FenceGeneration:     7,
+						FenceToken:          "ha-fence-token",
+						FencePromotedNodeID: "standby-a",
 					},
 				}, {
 					Kind:            string(haActionUpdatePrimaryRoute),
@@ -2010,8 +2019,9 @@ func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t 
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration: 7,
-						FenceToken:      "ha-fence-token",
+						FenceGeneration:     7,
+						FenceToken:          "ha-fence-token",
+						FencePromotedNodeID: "standby-a",
 					},
 				}, {
 					Kind:            string(haActionUpdatePrimaryRoute),
@@ -2159,9 +2169,9 @@ func TestUpdateHAAdminJobExecutionConditionReportsMissingPromotionReceipt(t *tes
 	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	g.Expect(degraded).NotTo(BeNil())
 	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
-	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAPromotionReceiptMissing))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminResultMissing))
 	g.Expect(degraded.Message).To(ContainSubstring("promote-job"))
-	g.Expect(degraded.Message).To(ContainSubstring("former-primary rejoin remains blocked"))
+	g.Expect(degraded.Message).To(ContainSubstring("dependent HA actions remain blocked"))
 }
 
 func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
@@ -2212,8 +2222,9 @@ func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration: 3,
-		FenceToken:      "lease-token-3",
+		FenceGeneration:     3,
+		FenceToken:          "lease-token-3",
+		FencePromotedNodeID: "standby-a",
 	}
 	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion).NotTo(BeNil())
@@ -2279,6 +2290,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 		"assessment.required_lsn=12",
 		"assessment.received_lsn=13",
 		"assessment.applied_lsn=11",
+		"promotion.node_id=standby-a",
 		"promotion.switch_lsn=12",
 		"promotion.old_identity.timeline_id=4",
 		"promotion.old_identity.epoch=6",
@@ -2292,6 +2304,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	}, "\n"))
 
 	g.Expect(ok).To(BeTrue())
+	g.Expect(result.PromotedNodeID).To(Equal("standby-a"))
 	g.Expect(result.SwitchLSN).To(Equal(uint64(12)))
 	g.Expect(result.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(result.ParentEpoch).To(Equal(uint64(6)))
@@ -2318,8 +2331,9 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(openAPIResult.PromotedNodeID).To(Equal("standby-a"))
 	g.Expect(openAPIResult.SwitchLSN).To(Equal(uint64(12)))
 	g.Expect(openAPIResult.ParentClusterID).To(Equal(uint64(100)))
 	g.Expect(openAPIResult.ParentShardID).To(Equal(uint64(10)))
@@ -2332,11 +2346,12 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(openAPIResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIResult.FenceToken).To(Equal("ha-fence-token"))
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15},"promotion":{"switch_lsn":14,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
+	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15},"promotion":{"node_id":"standby-a","switch_lsn":14,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(legacyResult.PromotedNodeID).To(Equal("standby-a"))
 	g.Expect(legacyResult.SwitchLSN).To(Equal(uint64(14)))
 	g.Expect(legacyResult.ParentClusterID).To(Equal(uint64(100)))
 	g.Expect(legacyResult.ParentShardID).To(Equal(uint64(0)))

@@ -1002,6 +1002,7 @@ fn appendPromotionResultLines(
     promotion_result: admin.FencedPromotionResult,
 ) !void {
     try appendPromotionAssessmentLines(alloc, out, "assessment", promotion_result.assessment);
+    try appendLine(alloc, out, "promotion.node_id", promotion_result.promoted_node_id);
     try appendU64Line(alloc, out, "promotion.switch_lsn", promotion_result.promotion.switch_lsn);
     try appendIdentityLines(alloc, out, "promotion.old_identity", promotion_result.promotion.old_identity);
     try appendIdentityLines(alloc, out, "promotion.new_identity", promotion_result.promotion.new_identity);
@@ -2003,6 +2004,7 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     const promoted_table = try renderTableAlloc(alloc, promoted);
     defer alloc.free(promoted_table);
     try expectContains(promoted_table, "result=promote_current_fence\n");
+    try expectContains(promoted_table, "promotion.node_id=standby-a\n");
     try expectContains(promoted_table, "promotion.new_identity.timeline_id=2\n");
 
     var rejoin_plan = try admin_cli.parse(alloc, &.{

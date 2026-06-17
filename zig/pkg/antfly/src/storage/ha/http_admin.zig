@@ -794,10 +794,19 @@ const PromotionAssessDocument = struct {
 const PromotionDocument = struct {
     schema_version: u32 = 1,
     assessment: status_mod.PromotionAssessment,
-    promotion: standby_mod.PromotionResult,
+    promotion: PromotionResultDocument,
     fence_generation: u64,
     fence_token: []const u8,
     forced: bool,
+};
+
+const PromotionResultDocument = struct {
+    node_id: []const u8,
+    switch_lsn: u64,
+    old_identity: standby_mod.Identity,
+    new_identity: standby_mod.Identity,
+    forced: bool,
+    data_loss_possible: bool,
 };
 
 const RejoinAssessDocument = struct {
@@ -820,7 +829,14 @@ const RejoinReseedDocument = struct {
 fn promotionDocument(result: ha_admin.FencedPromotionResult) PromotionDocument {
     return .{
         .assessment = result.assessment,
-        .promotion = result.promotion,
+        .promotion = .{
+            .node_id = result.promoted_node_id,
+            .switch_lsn = result.promotion.switch_lsn,
+            .old_identity = result.promotion.old_identity,
+            .new_identity = result.promotion.new_identity,
+            .forced = result.promotion.forced,
+            .data_loss_possible = result.promotion.data_loss_possible,
+        },
         .fence_generation = result.fence_generation,
         .fence_token = result.fence_token,
         .forced = result.forced,
@@ -1869,6 +1885,7 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
     try std.testing.expectEqualStrings("application/json", typed_promote.content_type.?);
     try expectContains(typed_promote.body, "\"promotion\"");
+    try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"fence_generation\":1");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
 }
@@ -1949,6 +1966,7 @@ test "storage.ha http admin accepts whole instance identity" {
     defer typed_promote.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
+    try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"forced\":true");
     try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
 }
