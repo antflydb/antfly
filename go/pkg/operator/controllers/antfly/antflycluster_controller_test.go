@@ -1557,6 +1557,10 @@ func TestReconcileHAAdminJobsMarksExecutableActionMissingAdminURL(t *testing.T) 
 				}, {
 					Kind:    string(haActionUpdatePrimaryRoute),
 					RouteTo: "standby-a",
+				}, {
+					Kind:        string(haActionPromoteStandby),
+					Executor:    string(haActionExecutorAdminAPI),
+					StandbyName: "standby-a",
 				}},
 			},
 		},
@@ -1570,6 +1574,8 @@ func TestReconcileHAAdminJobsMarksExecutableActionMissingAdminURL(t *testing.T) 
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseMissingAdminURL))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseMissingAdminURL))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobName).To(BeEmpty())
 
 	reconciler.updateHAAdminJobExecutionCondition(cluster)
 	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)

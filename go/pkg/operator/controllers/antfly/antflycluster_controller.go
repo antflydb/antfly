@@ -3389,6 +3389,10 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 const haAdminDirectAPIName = "direct-admin-api"
 
 func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) bool {
+	if action.Executor == string(haActionExecutorAdminAPI) &&
+		haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+		return true
+	}
 	return len(action.AdminCommand) > 0 ||
 		strings.TrimSpace(action.AdminMethod) != "" ||
 		strings.TrimSpace(action.AdminPath) != ""
