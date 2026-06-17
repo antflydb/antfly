@@ -363,10 +363,13 @@ pub const Client = struct {
     ) !ParsedOutput(admin_api.HAPromotionResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_promotion_current_fence);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.HAPromotionResponse, .{
+        var result = try self.executeJson(admin_api.HAPromotionResponse, .{
             .method = .POST,
             .uri = uri,
         });
+        errdefer result.deinit(self.alloc);
+        try validatePromotionResponse(result.parsed.value, null);
+        return result;
     }
 
     pub fn promote(
@@ -374,12 +377,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.FenceAcquireRequest,
     ) !ParsedOutput(admin_api.HAPromotionResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAPromotionResponse,
             base_uri,
             admin_api.routes.ha_promotion,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validatePromotionResponse(result.parsed.value, request);
+        return result;
     }
 
     pub fn assessRejoin(
@@ -608,6 +614,56 @@ fn isQueryValueUnreserved(byte: u8) bool {
 fn i64FromU64(value: u64) !i64 {
     if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidHaCommand;
     return @intCast(value);
+}
+
+fn validatePromotionResponse(
+    response: admin_api.HAPromotionResponse,
+    request: ?admin_api.FenceAcquireRequest,
+) !void {
+    if (response.schema_version <= 0) return error.AdminPromotionResponseMismatch;
+    if (!std.mem.eql(u8, response.action.action_kind, "promotion")) return error.AdminPromotionResponseMismatch;
+    if (!std.mem.eql(u8, response.action.state, "applied")) return error.AdminPromotionResponseMismatch;
+    if (!std.mem.eql(u8, response.action.target, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
+    if (!std.mem.eql(u8, response.action.node_id, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
+
+    const promotion = response.promotion;
+    const assessment = response.assessment;
+    if (assessment.required_lsn <= 0 or assessment.received_lsn < 0 or assessment.applied_lsn < 0) return error.AdminPromotionResponseMismatch;
+    if (promotion.switch_lsn <= 0 or promotion.switch_lsn != assessment.received_lsn + 1) return error.AdminPromotionResponseMismatch;
+    if (assessment.has_required_lsn != (assessment.received_lsn >= assessment.required_lsn)) return error.AdminPromotionResponseMismatch;
+    if (assessment.caught_up_to_received != (assessment.applied_lsn >= assessment.received_lsn)) return error.AdminPromotionResponseMismatch;
+    const data_loss_possible = !assessment.has_required_lsn or !assessment.caught_up_to_received or assessment.applied_lsn < assessment.required_lsn;
+    if (assessment.data_loss_possible != data_loss_possible) return error.AdminPromotionResponseMismatch;
+    if (assessment.safe != (assessment.fencing_confirmed and !assessment.data_loss_possible)) return error.AdminPromotionResponseMismatch;
+    if (assessment.requires_fencing != (!assessment.fencing_confirmed and !assessment.force)) return error.AdminPromotionResponseMismatch;
+    if (assessment.requires_force != (assessment.data_loss_possible and !assessment.force)) return error.AdminPromotionResponseMismatch;
+    if (assessment.can_promote != (!assessment.requires_fencing and (!assessment.requires_force or assessment.force))) return error.AdminPromotionResponseMismatch;
+    if (!response.assessment.fencing_confirmed) return error.AdminPromotionResponseMismatch;
+    if (!response.assessment.can_promote) return error.AdminPromotionResponseMismatch;
+    if (response.forced != promotion.forced) return error.AdminPromotionResponseMismatch;
+    if (response.assessment.force != response.forced) return error.AdminPromotionResponseMismatch;
+    if (promotion.data_loss_possible != response.assessment.data_loss_possible) return error.AdminPromotionResponseMismatch;
+    if (promotion.old_identity.cluster_id != promotion.new_identity.cluster_id) return error.AdminPromotionResponseMismatch;
+    if (promotion.old_identity.shard_id != promotion.new_identity.shard_id) return error.AdminPromotionResponseMismatch;
+    if (promotion.old_identity.table_id != promotion.new_identity.table_id) return error.AdminPromotionResponseMismatch;
+    if (promotion.new_identity.timeline_id <= promotion.old_identity.timeline_id) return error.AdminPromotionResponseMismatch;
+    if (promotion.new_identity.epoch <= promotion.old_identity.epoch) return error.AdminPromotionResponseMismatch;
+    if (response.fence_generation <= 0 or response.fence_token.len == 0) return error.AdminPromotionResponseMismatch;
+
+    if (request) |expected| {
+        if (!std.mem.eql(u8, promotion.node_id, expected.promoted_node_id)) return error.AdminPromotionResponseMismatch;
+        if (!std.mem.eql(u8, response.action.target, expected.promoted_node_id)) return error.AdminPromotionResponseMismatch;
+        if (promotion.old_identity.cluster_id != expected.identity.cluster_id) return error.AdminPromotionResponseMismatch;
+        if (promotion.old_identity.shard_id != expected.identity.shard_id) return error.AdminPromotionResponseMismatch;
+        if (promotion.old_identity.table_id != expected.identity.table_id) return error.AdminPromotionResponseMismatch;
+        if (promotion.old_identity.timeline_id != expected.identity.timeline_id) return error.AdminPromotionResponseMismatch;
+        if (promotion.old_identity.epoch != expected.identity.epoch) return error.AdminPromotionResponseMismatch;
+        if (promotion.new_identity.timeline_id != expected.new_timeline_id) return error.AdminPromotionResponseMismatch;
+        if (promotion.new_identity.epoch != expected.new_epoch) return error.AdminPromotionResponseMismatch;
+        if (response.assessment.required_lsn != expected.required_lsn) return error.AdminPromotionResponseMismatch;
+        if (response.assessment.received_lsn < expected.observed_lsn) return error.AdminPromotionResponseMismatch;
+        if (response.forced != (expected.force orelse false)) return error.AdminPromotionResponseMismatch;
+    }
 }
 
 const RejoinResponseKind = enum {
@@ -1442,6 +1498,27 @@ test "storage.ha http client rejects mismatched rejoin admin responses" {
         .last_lsn = 2,
         .retained_from_lsn = 0,
         .receipt = testFenceReceipt(),
+    }));
+}
+
+test "storage.ha http client rejects mismatched promotion admin responses" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{
+        .body =
+        \\{"schema_version":1,"action":{"action_id":"promotion:standby-b","action_kind":"promotion","target":"standby-b","state":"applied","node_id":"standby-b"},"assessment":{"required_lsn":1,"received_lsn":1,"applied_lsn":1,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-b","switch_lsn":2,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"forced":false,"data_loss_possible":false},"fence_generation":1,"fence_token":"token","forced":false}
+        ,
+    };
+    var client = Client.init(alloc, executor.executor());
+
+    try std.testing.expectError(error.AdminPromotionResponseMismatch, client.promote("http://ha-admin.test", .{
+        .identity = testAdminIdentity(),
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "http-client-test",
     }));
 }
 
