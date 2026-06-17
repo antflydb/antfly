@@ -1743,6 +1743,162 @@ func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T
 	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
 }
 
+func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     antflyv1.HAPlannedActionStatus
+		wantKind   string
+		wantTarget string
+		wantState  string
+	}{{
+		name: "create slot",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:     string(haActionCreateSlot),
+			SlotName: "standby-a",
+		},
+		wantKind:   "replication_slot_create",
+		wantTarget: "standby-a",
+		wantState:  "applied",
+	}, {
+		name: "resume slot",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:     string(haActionResumeSlot),
+			SlotName: "standby-a",
+		},
+		wantKind:   "replication_slot_resume",
+		wantTarget: "standby-a",
+		wantState:  "applied",
+	}, {
+		name: "pause slot",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:     string(haActionPauseSlot),
+			SlotName: "standby-a",
+		},
+		wantKind:   "replication_slot_pause",
+		wantTarget: "standby-a",
+		wantState:  "applied",
+	}, {
+		name: "drop slot",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:     string(haActionDropSlot),
+			SlotName: "standby-a",
+		},
+		wantKind:   "replication_slot_drop",
+		wantTarget: "standby-a",
+		wantState:  "applied",
+	}, {
+		name: "seed standby",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:      string(haActionSeedStandby),
+			SlotName:  "standby-a",
+			TargetLSN: 5,
+		},
+		wantKind:   "base_backup_begin",
+		wantTarget: "base-standby-a-5",
+		wantState:  "applied",
+	}, {
+		name: "mark reseed",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:      string(haActionMarkReseed),
+			SlotName:  "standby-a",
+			TargetLSN: 5,
+		},
+		wantKind:   "base_backup_begin",
+		wantTarget: "base-standby-a-5",
+		wantState:  "applied",
+	}, {
+		name: "finish standby seed",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:             string(haActionFinishStandbySeed),
+			SeedManifestPath: "/backups/base-standby-a-5.afha",
+		},
+		wantKind:   "base_backup_finish",
+		wantTarget: "base-standby-a-5",
+		wantState:  "applied",
+	}, {
+		name: "bootstrap standby seed",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:             string(haActionBootstrapStandbySeed),
+			SeedManifestPath: "/backups/base-standby-a-5.afha",
+		},
+		wantKind:   "standby_bootstrap",
+		wantTarget: "base-standby-a-5",
+		wantState:  "applied",
+	}, {
+		name: "acquire fence",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:        string(haActionAcquireFence),
+			StandbyName: "standby-a",
+		},
+		wantKind:   "fence_acquire",
+		wantTarget: "standby-a",
+		wantState:  "applied",
+	}, {
+		name: "promote standby",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:        string(haActionPromoteStandby),
+			StandbyName: "standby-a",
+		},
+		wantKind:   "promotion",
+		wantTarget: "standby-a",
+		wantState:  "applied",
+	}, {
+		name: "demote former primary",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:        string(haActionDemoteFormerPrimary),
+			StandbyName: "primary-a",
+		},
+		wantKind:   "rejoin_assess",
+		wantTarget: "primary-a",
+		wantState:  "assessed",
+	}, {
+		name: "rewind former primary",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:        string(haActionRewindFormerPrimary),
+			StandbyName: "primary-a",
+		},
+		wantKind:   "rejoin_rewind",
+		wantTarget: "primary-a",
+		wantState:  "applied",
+	}, {
+		name: "reseed former primary",
+		action: antflyv1.HAPlannedActionStatus{
+			Kind:        string(haActionReseedFormerPrimary),
+			StandbyName: "primary-a",
+		},
+		wantKind:   "rejoin_reseed",
+		wantTarget: "primary-a",
+		wantState:  "applied",
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			kind := haActionKind(tt.action.Kind)
+			g.Expect(haPlannedActionSupportsDirectAdminAPI(kind)).To(BeTrue())
+			g.Expect(haActionRequiresAdminResult(kind)).To(BeTrue())
+
+			gotKind, gotTarget, gotState := haDirectAdminActionReceiptExpectation(tt.action)
+			g.Expect(gotKind).To(Equal(tt.wantKind))
+			g.Expect(gotTarget).To(Equal(tt.wantTarget))
+			g.Expect(gotState).To(Equal(tt.wantState))
+
+			tt.action.AdminResult = &antflyv1.HAAdminActionResultStatus{
+				SchemaVersion: 1,
+				ActionID:      tt.wantKind + ":" + tt.wantTarget,
+				ActionKind:    tt.wantKind,
+				ActionTarget:  tt.wantTarget,
+				ActionState:   tt.wantState,
+			}
+			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
+
+			tt.action.AdminResult.ActionTarget = tt.wantTarget + "-other"
+			tt.action.AdminResult.ActionID = tt.wantKind + ":" + tt.action.AdminResult.ActionTarget
+			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeFalse())
+		})
+	}
+}
+
 func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
 	g := NewWithT(t)
 

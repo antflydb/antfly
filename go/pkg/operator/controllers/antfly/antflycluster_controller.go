@@ -3559,23 +3559,38 @@ func haPlannedActionDirectAdminOperation(action antflyv1.HAPlannedActionStatus) 
 }
 
 func haPlannedActionSupportsDirectAdminAPI(kind haActionKind) bool {
+	_, _, ok := haDirectAdminActionReceiptSpec(kind)
+	return ok
+}
+
+func haDirectAdminActionReceiptSpec(kind haActionKind) (string, string, bool) {
 	switch kind {
-	case haActionCreateSlot,
-		haActionPauseSlot,
-		haActionResumeSlot,
-		haActionDropSlot,
-		haActionSeedStandby,
-		haActionMarkReseed,
-		haActionFinishStandbySeed,
-		haActionBootstrapStandbySeed,
-		haActionAcquireFence,
-		haActionPromoteStandby,
-		haActionDemoteFormerPrimary,
-		haActionRewindFormerPrimary,
-		haActionReseedFormerPrimary:
-		return true
+	case haActionCreateSlot:
+		return "replication_slot_create", "applied", true
+	case haActionResumeSlot:
+		return "replication_slot_resume", "applied", true
+	case haActionPauseSlot:
+		return "replication_slot_pause", "applied", true
+	case haActionDropSlot:
+		return "replication_slot_drop", "applied", true
+	case haActionSeedStandby, haActionMarkReseed:
+		return "base_backup_begin", "applied", true
+	case haActionFinishStandbySeed:
+		return "base_backup_finish", "applied", true
+	case haActionBootstrapStandbySeed:
+		return "standby_bootstrap", "applied", true
+	case haActionAcquireFence:
+		return "fence_acquire", "applied", true
+	case haActionPromoteStandby:
+		return "promotion", "applied", true
+	case haActionDemoteFormerPrimary:
+		return "rejoin_assess", "assessed", true
+	case haActionRewindFormerPrimary:
+		return "rejoin_rewind", "applied", true
+	case haActionReseedFormerPrimary:
+		return "rejoin_reseed", "applied", true
 	default:
-		return false
+		return "", "", false
 	}
 }
 
@@ -5669,24 +5684,8 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 }
 
 func haActionRequiresAdminResult(kind haActionKind) bool {
-	switch kind {
-	case haActionCreateSlot,
-		haActionResumeSlot,
-		haActionPauseSlot,
-		haActionDropSlot,
-		haActionSeedStandby,
-		haActionFinishStandbySeed,
-		haActionBootstrapStandbySeed,
-		haActionMarkReseed,
-		haActionAcquireFence,
-		haActionPromoteStandby,
-		haActionDemoteFormerPrimary,
-		haActionRewindFormerPrimary,
-		haActionReseedFormerPrimary:
-		return true
-	default:
-		return false
-	}
+	_, _, ok := haDirectAdminActionReceiptSpec(kind)
+	return ok
 }
 
 func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool {
@@ -5750,35 +5749,27 @@ func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bo
 }
 
 func haDirectAdminActionReceiptExpectation(action antflyv1.HAPlannedActionStatus) (string, string, string) {
+	expectedKind, expectedState, ok := haDirectAdminActionReceiptSpec(haActionKind(action.Kind))
+	if !ok {
+		return "", "", ""
+	}
+	return expectedKind, haDirectAdminActionReceiptTarget(action), expectedState
+}
+
+func haDirectAdminActionReceiptTarget(action antflyv1.HAPlannedActionStatus) string {
 	expectedSlotName := haActionSlotName(action)
 	expectedManifestID := haExpectedSeedBeginManifestID(action, expectedSlotName)
 	switch haActionKind(action.Kind) {
-	case haActionCreateSlot:
-		return "replication_slot_create", expectedSlotName, "applied"
-	case haActionResumeSlot:
-		return "replication_slot_resume", expectedSlotName, "applied"
-	case haActionPauseSlot:
-		return "replication_slot_pause", expectedSlotName, "applied"
-	case haActionDropSlot:
-		return "replication_slot_drop", expectedSlotName, "applied"
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot:
+		return expectedSlotName
 	case haActionSeedStandby, haActionMarkReseed:
-		return "base_backup_begin", expectedManifestID, "applied"
-	case haActionFinishStandbySeed:
-		return "base_backup_finish", expectedManifestID, "applied"
-	case haActionBootstrapStandbySeed:
-		return "standby_bootstrap", expectedManifestID, "applied"
-	case haActionAcquireFence:
-		return "fence_acquire", strings.TrimSpace(action.StandbyName), "applied"
-	case haActionPromoteStandby:
-		return "promotion", strings.TrimSpace(action.StandbyName), "applied"
-	case haActionDemoteFormerPrimary:
-		return "rejoin_assess", strings.TrimSpace(action.StandbyName), "assessed"
-	case haActionRewindFormerPrimary:
-		return "rejoin_rewind", strings.TrimSpace(action.StandbyName), "applied"
-	case haActionReseedFormerPrimary:
-		return "rejoin_reseed", strings.TrimSpace(action.StandbyName), "applied"
+		return expectedManifestID
+	case haActionFinishStandbySeed, haActionBootstrapStandbySeed:
+		return expectedManifestID
+	case haActionAcquireFence, haActionPromoteStandby, haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		return strings.TrimSpace(action.StandbyName)
 	default:
-		return "", "", ""
+		return ""
 	}
 }
 
