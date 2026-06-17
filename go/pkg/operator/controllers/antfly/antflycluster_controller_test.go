@@ -2132,6 +2132,16 @@ func TestHAFormerPrimaryActionRequiresPromotionReceiptEvidence(t *testing.T) {
 	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
 	actions[0] = action
 	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, actions, 1)).To(BeFalse())
+
+	action.AdminResult.ForkLSN = 12
+	status.LastPromotion.Forced = true
+	actions[0] = action
+	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, actions, 1)).To(BeFalse())
+
+	status.LastPromotion.Forced = false
+	status.LastPromotion.DataLossPossible = true
+	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {

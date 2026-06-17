@@ -6841,6 +6841,10 @@ func haRejoinResultMatchesPromotion(status *antflyv1.HAStatus, action antflyv1.H
 	if promotion.RequiredLSN != 0 && result.ForkLSN != promotion.RequiredLSN {
 		return false
 	}
+	if haActionKind(action.Kind) == haActionRewindFormerPrimary &&
+		(promotion.Forced || promotion.DataLossPossible) {
+		return false
+	}
 	if action.FenceAuthority != "" && promotion.FenceAuthority != action.FenceAuthority {
 		return false
 	}
