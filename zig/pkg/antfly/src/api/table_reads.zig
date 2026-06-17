@@ -23252,6 +23252,13 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
     };
 
     const ExecutorState = struct {
+        const Scenario = enum {
+            generation_mismatch,
+            metadata_mismatch,
+            edge_filter_mismatch,
+        };
+
+        scenario: Scenario = .generation_mismatch,
         query_calls: usize = 0,
 
         fn iface(self: *@This()) http_common.RequestExecutor {
@@ -23265,13 +23272,17 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
             if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7321/tables/docs/query")) {
                 return .{
                     .status = 200,
-                    .body = try remoteHitsPairBody(alloc_inner, "q", 11, 11),
+                    .body = try remoteHitsPairBody(alloc_inner, "q", 11, 11, 1, "cites"),
                 };
             }
             if (std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7322/tables/docs/query")) {
+                const authority_generation: u64 = 11;
+                const hub_generation: u64 = if (self.scenario == .generation_mismatch) 12 else 11;
+                const metadata_version: u32 = if (self.scenario == .metadata_mismatch) 2 else 1;
+                const edge_type: []const u8 = if (self.scenario == .edge_filter_mismatch) "mentions" else "cites";
                 return .{
                     .status = 200,
-                    .body = try remoteHitsPairBody(alloc_inner, "r", 11, 12),
+                    .body = try remoteHitsPairBody(alloc_inner, "r", authority_generation, hub_generation, metadata_version, edge_type),
                 };
             }
             return error.UnexpectedHttpRequest;
@@ -23282,11 +23293,26 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
             prefix: []const u8,
             authority_generation: u64,
             hub_generation: u64,
+            metadata_version: u32,
+            edge_type: []const u8,
         ) ![]u8 {
             return try std.fmt.allocPrint(
                 alloc_inner,
-                "{{\"responses\":[{{\"hits\":{{\"total\":0,\"hits\":[]}},\"graph_metric_results\":{{\"authority\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_authority\",\"scores\":[{{\"node\":\"doc:{s}:authority\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}},\"hub\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_hub\",\"scores\":[{{\"node\":\"doc:{s}:hub\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}}}},\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
-                .{ prefix, authority_generation, authority_generation, authority_generation, prefix, hub_generation, hub_generation, hub_generation },
+                "{{\"responses\":[{{\"hits\":{{\"total\":0,\"hits\":[]}},\"graph_metric_results\":{{\"authority\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_authority\",\"scores\":[{{\"node\":\"doc:{s}:authority\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"metadata_version\":{d},\"edge_filter\":{{\"mode\":\"types\",\"types\":[\"{s}\"]}},\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}},\"hub\":{{\"index_name\":\"graph_idx\",\"metric\":\"hits_hub\",\"scores\":[{{\"node\":\"doc:{s}:hub\",\"score\":1.0}}],\"status\":{{\"state\":\"fresh\",\"phase\":\"complete\",\"maintenance_paused\":false,\"build_queued\":false,\"published_generation\":{d},\"edge_generation\":{d},\"target_edge_generation\":{d},\"queued_generation\":0,\"building_generation\":0,\"metadata_version\":{d},\"edge_filter\":{{\"mode\":\"types\",\"types\":[\"{s}\"]}},\"progress\":1.0,\"converged\":true,\"iterations_completed\":1,\"delta\":0.0,\"computed_at_ms\":1780000000000}}}}}},\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{
+                    prefix,
+                    authority_generation,
+                    authority_generation,
+                    authority_generation,
+                    metadata_version,
+                    edge_type,
+                    prefix,
+                    hub_generation,
+                    hub_generation,
+                    hub_generation,
+                    metadata_version,
+                    edge_type,
+                },
             );
         }
     };
@@ -23301,6 +23327,60 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
     );
     _ = hosted.withIo(&io_impl);
 
+    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+        },
+        .limit = 0,
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), executor_state.query_calls);
+
+    executor_state.scenario = .metadata_mismatch;
+    executor_state.query_calls = 0;
+    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 8,
+                    .freshness = .published,
+                },
+            },
+        },
+        .limit = 0,
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), executor_state.query_calls);
+
+    executor_state.scenario = .edge_filter_mismatch;
+    executor_state.query_calls = 0;
     try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().query(alloc, "docs", .{
         .graph_metric_queries = &.{
             .{
