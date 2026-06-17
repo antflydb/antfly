@@ -65592,6 +65592,24 @@ test "app parity structured side-access coverage tokens are exact" {
     try std.testing.expect(coverage.lateral_structured_side_access);
 }
 
+test "app parity insert-source assignment expression coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert_source,
+        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=0:returning_expr=0:returning_all=0:assignment_expr=1x",
+    });
+
+    try std.testing.expect(!coverage.insert_source_expression_assignment);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert_source,
+        .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=0:returning_expr=0:returning_all=0:assignment_expr=1",
+    });
+
+    try std.testing.expect(coverage.insert_source_expression_assignment);
+}
+
 test "app parity conflict write count coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -67635,7 +67653,7 @@ const AppParityCorpusCoverage = struct {
                 appParityPlanHasExactStringToken(entry.plan, ":source_table=", "archived_records"));
         self.insert_source_expression_assignment = self.insert_source_expression_assignment or
             (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.plan, ":assignment_expr=") != null);
+                appParityPlanHasNonZeroToken(entry.plan, ":assignment_expr="));
         self.insert_source_regexp_expression_assignment = self.insert_source_regexp_expression_assignment or
             (entry.family == .insert_source and
                 std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null and
