@@ -1240,12 +1240,34 @@ pub const PostingFormat = struct {
         const encoded_len = try encodedDeltaTailSize(records);
         const out = try alloc.alloc(u8, encoded_len);
         errdefer alloc.free(out);
-        return try encodeDeltaTailInto(out, records);
+        return try encodeDeltaTailKnownSizeAndBaseSequenceInto(out, records, encoded_len, baseSequenceForDeltaTail(records));
     }
 
     pub fn encodeDeltaTailInto(out: []u8, records: []const PostingDeltaRecord) ![]u8 {
         if (records.len > std.math.maxInt(u32)) return error.TooLarge;
         const encoded_len = try encodedDeltaTailSize(records);
+        return try encodeDeltaTailKnownSizeAndBaseSequenceInto(out, records, encoded_len, baseSequenceForDeltaTail(records));
+    }
+
+    pub fn encodeDeltaTailKnownSizeAndBaseSequence(
+        alloc: std.mem.Allocator,
+        records: []const PostingDeltaRecord,
+        encoded_len: usize,
+        base_sequence: u64,
+    ) ![]u8 {
+        if (records.len > std.math.maxInt(u32)) return error.TooLarge;
+        const out = try alloc.alloc(u8, encoded_len);
+        errdefer alloc.free(out);
+        return try encodeDeltaTailKnownSizeAndBaseSequenceInto(out, records, encoded_len, base_sequence);
+    }
+
+    pub fn encodeDeltaTailKnownSizeAndBaseSequenceInto(
+        out: []u8,
+        records: []const PostingDeltaRecord,
+        encoded_len: usize,
+        base_sequence: u64,
+    ) ![]u8 {
+        if (records.len > std.math.maxInt(u32)) return error.TooLarge;
         if (out.len < encoded_len) return error.BufferTooSmall;
         @memcpy(out[0..4], &delta_magic);
         if (records.len == 1) {
@@ -1260,11 +1282,10 @@ pub const PostingFormat = struct {
         out[4] = version;
         std.mem.writeInt(u32, out[5..9], @intCast(records.len), .little);
 
-        const base_sequence = baseSequenceForDeltaTail(records);
         std.mem.writeInt(u64, out[9..17], base_sequence, .little);
         var pos: usize = delta_header_size;
         for (records) |record| {
-            writeVarint(out, &pos, record.sequence - base_sequence);
+            writeVarint(out, &pos, std.math.sub(u64, record.sequence, base_sequence) catch return error.Corrupted);
             out[pos] = @intFromEnum(record.op);
             pos += 1;
             writeVarint(out, &pos, record.vector_id);

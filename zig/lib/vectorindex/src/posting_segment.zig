@@ -3078,10 +3078,13 @@ pub const DirectoryBatchWriter = struct {
         var iter = self.pending_delta_batches.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.records.items.len == 0) continue;
-            var min_sequence = entry.value_ptr.records.items[0].sequence;
-            for (entry.value_ptr.records.items[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
-            const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, entry.value_ptr.records.items);
-            try self.writer.appendOwnedDelta(entry.key_ptr.*, min_sequence, encoded);
+            const encoded = try posting.PostingFormat.encodeDeltaTailKnownSizeAndBaseSequence(
+                self.alloc,
+                entry.value_ptr.records.items,
+                entry.value_ptr.encoded_value_bytes,
+                entry.value_ptr.min_sequence,
+            );
+            try self.writer.appendOwnedDelta(entry.key_ptr.*, entry.value_ptr.min_sequence, encoded);
         }
         self.clearPendingDeltaBatches();
     }
