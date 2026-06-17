@@ -51,6 +51,9 @@ type (
 	HACommitGateAction                 = oapi.HACommitGateAction
 	HACurrentFenceResponse             = oapi.HACurrentFenceResponse
 	HADurabilityDecision               = oapi.HADurabilityDecision
+	HADurabilityDecisionMode           = oapi.HADurabilityDecisionMode
+	HADurabilityDecisionSelection      = oapi.HADurabilityDecisionSelection
+	HADurabilityDecisionStatus         = oapi.HADurabilityDecisionStatus
 	HAFenceReceipt                     = oapi.HAFenceReceipt
 	HAFenceResponse                    = oapi.HAFenceResponse
 	HAIdentity                         = oapi.HAIdentity
@@ -59,6 +62,8 @@ type (
 	HAOwnerJobDecisionAction           = oapi.HAOwnerJobDecisionAction
 	HAOwnerJobDecisionKind             = oapi.HAOwnerJobDecisionKind
 	HAOwnerJobDecisionRole             = oapi.HAOwnerJobDecisionRole
+	HAPrimarySnapshot                  = oapi.HAPrimarySnapshot
+	HAPrimarySnapshotRole              = oapi.HAPrimarySnapshotRole
 	HAPrimaryStatusParams              = oapi.GetHAPrimaryStatusParams
 	HAPrimaryStatusParamsSyncMode      = oapi.GetHAPrimaryStatusParamsSyncMode
 	HAPrimaryStatusParamsSyncSelection = oapi.GetHAPrimaryStatusParamsSyncSelection
@@ -73,6 +78,11 @@ type (
 	HARejoinAssessResponse             = oapi.HARejoinAssessResponse
 	HAReplicationSlotActionResponse    = oapi.HAReplicationSlotActionResponse
 	HAReplicationSlotListResponse      = oapi.HAReplicationSlotListResponse
+	HARetentionSnapshot                = oapi.HARetentionSnapshot
+	HASlotSnapshot                     = oapi.HASlotSnapshot
+	HASlotSnapshotStatus               = oapi.HASlotSnapshotStatus
+	HAStandbySnapshot                  = oapi.HAStandbySnapshot
+	HAStandbySnapshotRole              = oapi.HAStandbySnapshotRole
 	HAStandbyBootstrapResponse         = oapi.HAStandbyBootstrapResponse
 	HAStandbyStatusParams              = oapi.GetHAStandbyStatusParams
 	HAStandbyStatusResponse            = oapi.HAStandbyStatusResponse
@@ -123,6 +133,27 @@ const (
 	HAActionStateAlreadyApplied = oapi.HAActionReceiptStateAlreadyApplied
 	HAActionStateApplied        = oapi.HAActionReceiptStateApplied
 	HAActionStateAssessed       = oapi.HAActionReceiptStateAssessed
+
+	HAPrimarySnapshotRolePrimary = oapi.HAPrimarySnapshotRolePrimary
+
+	HAStandbySnapshotRoleStandby = oapi.HAStandbySnapshotRoleStandby
+
+	HASlotSnapshotStatusHealthy        = oapi.HASlotSnapshotStatusHealthy
+	HASlotSnapshotStatusLagging        = oapi.HASlotSnapshotStatusLagging
+	HASlotSnapshotStatusReseedRequired = oapi.HASlotSnapshotStatusReseedRequired
+
+	HADurabilityStatusSatisfied       = oapi.HADurabilityDecisionStatusSatisfied
+	HADurabilityStatusWouldBlock      = oapi.HADurabilityDecisionStatusWouldBlock
+	HADurabilityStatusFailClosed      = oapi.HADurabilityDecisionStatusFailClosed
+	HADurabilityStatusDegradedToAsync = oapi.HADurabilityDecisionStatusDegradedToAsync
+
+	HADurabilityModeAsync       = oapi.HADurabilityDecisionModeAsync
+	HADurabilityModeRemoteWrite = oapi.HADurabilityDecisionModeRemoteWrite
+	HADurabilityModeRemoteApply = oapi.HADurabilityDecisionModeRemoteApply
+
+	HADurabilitySelectionAny   = oapi.HADurabilityDecisionSelectionAny
+	HADurabilitySelectionFirst = oapi.HADurabilityDecisionSelectionFirst
+	HADurabilitySelectionAll   = oapi.HADurabilityDecisionSelectionAll
 
 	HAPrimaryStatusSyncModeAsync       = oapi.GetHAPrimaryStatusParamsSyncModeAsync
 	HAPrimaryStatusSyncModeRemoteWrite = oapi.GetHAPrimaryStatusParamsSyncModeRemoteWrite
