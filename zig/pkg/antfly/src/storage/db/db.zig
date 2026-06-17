@@ -203,7 +203,8 @@ pub const OpenOptions = struct {
     /// Optional HA write ownership gate. Client/API writes are allowed only
     /// when this DB is attached to the current HA primary. Standby apply paths
     /// must use replicated-apply entry points that explicitly bypass this
-    /// client-write guard.
+    /// client-write guard. A standby gate also suppresses mutating background
+    /// runtimes at open, even if the generic runtime defaults are enabled.
     ha_write_gate: ?HAWriteGate = null,
 };
 
@@ -219,6 +220,14 @@ pub const HAWriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
     standby: *ha_standby_mod.Standby,
 };
+
+fn haWriteGateIsStandby(gate: ?HAWriteGate) bool {
+    const configured = gate orelse return false;
+    return switch (configured) {
+        .primary => false,
+        .standby => true,
+    };
+}
 
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
@@ -2626,6 +2635,8 @@ pub const DB = struct {
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                 .lmdb, .mem => {},
             }
+            const ha_standby_role = haWriteGateIsStandby(opts.ha_write_gate);
+            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
 
             var db = DB{
                 .alloc = alloc,
@@ -2640,7 +2651,7 @@ pub const DB = struct {
                 .backend_owner_id = backend_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .executor = executor,
-                .start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers,
+                .start_index_workers = start_index_workers,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
@@ -2670,7 +2681,7 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
-            const optional_runtimes_enabled = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes;
+            const optional_runtimes_enabled = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
             if (optional_runtimes_enabled) {
                 const init_optional_started_ns = monotonicTimeNs();
                 try db.initOptionalRuntimes(opts);
@@ -36672,6 +36683,51 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     var found = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
+}
+
+test "storage.ha db standby role suppresses mutating background runtimes" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
+        .cluster_id = 301,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = true,
+        .start_optional_runtimes = true,
+        .enrichment = .{ .enable_without_producers = true },
+        .ttl_cleanup = .{ .enabled = true },
+        .transaction_recovery = .{ .enabled = true },
+        .text_merge = .{ .enabled = true },
+        .sparse_compaction = .{ .enabled = true },
+    });
+    defer db.close();
+
+    try std.testing.expect(!db.start_index_workers);
+    try std.testing.expect(!db.executor.hasWorkers());
+    try std.testing.expect(db.enrichment_runtime == null);
+    try std.testing.expect(db.resolution_runtime == null);
+    try std.testing.expect(db.promotion_runtime == null);
+    try std.testing.expect(db.ttl_runtime == null);
+    try std.testing.expect(db.transaction_runtime == null);
+    try std.testing.expect(db.text_merge_runtime == null);
+    try std.testing.expect(db.sparse_compaction_runtime == null);
 }
 
 test "db reopen replays pending derived embeddings with durable lsm primary backend" {
