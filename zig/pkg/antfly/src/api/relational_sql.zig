@@ -62475,19 +62475,12 @@ fn appParityFixtureAllowsAggregateSummary(entry: AppParityCorpusEntry) bool {
     };
 }
 
-fn appParityPlanHasUsizeToken(plan: []const u8, token: []const u8) bool {
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const pos = index + token.len;
-        if (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') return true;
-        start = index + token.len;
-    }
-    return false;
-}
-
 fn appParityFixtureOptionalZeroSummaryMatchesPlan(plan: []const u8, token: []const u8, expected: usize) bool {
-    if (appParityPlanHasExactUsizeToken(plan, token, expected)) return true;
-    return expected == 0 and !appParityPlanHasUsizeToken(plan, token);
+    return switch (appParityPlanScanUsizeToken(plan, token)) {
+        .value => |value| value == expected,
+        .absent => expected == 0,
+        .invalid => false,
+    };
 }
 
 fn appParityFixtureOptionalBool01SummaryMatchesPlan(plan: []const u8, token: []const u8, expected: bool) bool {
@@ -64276,6 +64269,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .aggregate,
         .summary = .{ .table_name = "usage_records", .group_by = 1, .aggregations = 1, .filter_groups = 2, .having_expressions = 0, .having_any = 0, .having_not = 0 },
         .plan = "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:filter_groups=1:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=-1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed aggregate optional zero summary",
+        .sql = "SELECT status, count(*) AS count FROM usage_records GROUP BY status",
+        .family = .aggregate,
+        .summary = .{ .table_name = "usage_records", .group_by = 1, .aggregations = 1, .filter_groups = 0 },
+        .plan = "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=0:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:filter_groups=none:having=0:having_expr=0:having_any=0:having_not=0:order=0:limit=-1",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
