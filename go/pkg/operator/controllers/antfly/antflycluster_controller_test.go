@@ -1994,8 +1994,18 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 
 	status := &antflyv1.HAStatus{
 		LastPromotion: &antflyv1.HAPromotionStatus{
-			NewTimelineID: 5,
-			NewEpoch:      7,
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			SwitchLSN:         12,
+			RequiredLSN:       12,
+			ObservedLSN:       13,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   3,
+			FenceToken:        "ha-fence-token",
 		},
 	}
 	action := antflyv1.HAPlannedActionStatus{
@@ -2004,6 +2014,8 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		TargetLSN:       12,
 		ObservedLSN:     13,
 		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 3,
 		AdminNodeID:     "primary-a",
 	}
 	result := haRejoinJobResult{
@@ -2028,6 +2040,10 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	result.RewindNextLSN = 13
 	result.RewindDiscardedLSNCount = 1
 	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
+
+	status.LastPromotion.FenceAuthority = ""
+	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeFalse())
+	status.LastPromotion.FenceAuthority = antflyv1.HAFencingAuthorityKubernetesLease
 
 	reseedResult := haRejoinJobResult{
 		ActionID:         "rejoin_reseed:primary-a",

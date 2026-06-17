@@ -1229,6 +1229,7 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 		NewEpoch:          7,
 		RequiredLSN:       12,
 		ObservedLSN:       13,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceGeneration:   3,
 		FenceToken:        "ha-fence-token",
 		FenceReason:       "LeaseAcquired",
@@ -1300,6 +1301,18 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 	receiptIdentity := receipt["identity"].(map[string]any)
 	if receiptIdentity["timeline_id"] != float64(5) || receiptIdentity["epoch"] != float64(7) {
 		t.Fatalf("expected rejoin receipt identity to use promoted timeline, got %#v", receiptIdentity)
+	}
+
+	cluster.Status.HAStatus.LastPromotion.FenceAuthority = ""
+	_, ok = haRejoinAssessBody(cluster, antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionRewindFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+	})
+	if ok {
+		t.Fatal("expected rejoin request body to require a concrete fence authority")
 	}
 }
 

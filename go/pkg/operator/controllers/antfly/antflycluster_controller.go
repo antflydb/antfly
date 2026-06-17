@@ -3829,23 +3829,19 @@ func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 	}
 	if receipt, ok := haRejoinFenceReceipt(cluster.Status.HAStatus, identity); ok {
 		body.Receipt = &receipt
+	} else if haActionKind(action.Kind) == haActionRewindFormerPrimary ||
+		haActionKind(action.Kind) == haActionReseedFormerPrimary {
+		return haRejoinAssessRequest{}, false
 	}
 	return body, true
 }
 
 func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) (haFenceReceiptRequest, bool) {
-	if status == nil || status.LastPromotion == nil {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
 		return haFenceReceiptRequest{}, false
 	}
-	promotion := status.LastPromotion
 	if identity == nil {
-		return haFenceReceiptRequest{}, false
-	}
-	if promotion.OldPrimaryID == "" || promotion.PromotedStandbyID == "" ||
-		promotion.ParentTimelineID == 0 || promotion.ParentEpoch == 0 ||
-		promotion.NewTimelineID == 0 || promotion.NewEpoch == 0 ||
-		haPromotionRequiredLSN(promotion) == 0 || haPromotionObservedLSN(promotion) == 0 ||
-		promotion.FenceGeneration == 0 || strings.TrimSpace(promotion.FenceToken) == "" {
 		return haFenceReceiptRequest{}, false
 	}
 	if promotion.OldPrimaryID != identity.CurrentPrimaryID ||
@@ -4682,7 +4678,7 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 			return false
 		}
 	}
-	return true
+	return haRejoinResultMatchesPromotion(status, action, haRejoinAdminActionResult(result))
 }
 
 func haJobResultActionReceiptMatches(actionID, actionKind, actionTarget, actionState, expectedKind, expectedTarget, expectedState string) bool {
