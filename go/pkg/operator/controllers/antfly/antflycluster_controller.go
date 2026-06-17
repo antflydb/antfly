@@ -4878,18 +4878,19 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 	if result == nil {
 		return false
 	}
+	expectedSlotName := haActionSlotName(action)
 	switch haActionKind(action.Kind) {
 	case haActionCreateSlot:
-		return result.SlotAction == "create" && result.SlotName != ""
+		return result.SlotAction == "create" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
 	case haActionResumeSlot:
-		return result.SlotAction == "resume" && result.SlotName != ""
+		return result.SlotAction == "resume" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
 	case haActionPauseSlot:
-		return result.SlotAction == "pause" && result.SlotName != ""
+		return result.SlotAction == "pause" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
 	case haActionDropSlot:
-		return result.SlotAction == "drop" && result.SlotName != ""
+		return result.SlotAction == "drop" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
 	case haActionSeedStandby, haActionMarkReseed:
-		return result.SlotName != "" &&
-			result.ManifestID != "" &&
+		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
+			haResultManifestMatches(result.ManifestID, haExpectedSeedBeginManifestID(action, expectedSlotName)) &&
 			result.BackupLSN > 0 &&
 			result.StartRecordLSN > 0
 	case haActionFinishStandbySeed:
@@ -4901,10 +4902,42 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			result.BackupLSN > 0 &&
 			result.CheckpointLSN > 0
 	case haActionAcquireFence:
-		return result.FenceGeneration > 0 && result.FenceToken != ""
+		return result.FenceGeneration > 0 &&
+			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
+			result.FenceToken != ""
 	default:
 		return true
 	}
+}
+
+func haResultSlotNameMatches(resultSlotName string, expectedSlotName string) bool {
+	resultSlotName = strings.TrimSpace(resultSlotName)
+	if resultSlotName == "" {
+		return false
+	}
+	expectedSlotName = strings.TrimSpace(expectedSlotName)
+	return expectedSlotName == "" || resultSlotName == expectedSlotName
+}
+
+func haResultManifestMatches(resultManifestID string, expectedManifestID string) bool {
+	resultManifestID = strings.TrimSpace(resultManifestID)
+	if resultManifestID == "" {
+		return false
+	}
+	expectedManifestID = strings.TrimSpace(expectedManifestID)
+	return expectedManifestID == "" || resultManifestID == expectedManifestID
+}
+
+func haExpectedSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName string) string {
+	for i := 0; i+1 < len(action.AdminCommand); i++ {
+		if action.AdminCommand[i] == "--manifest-id" {
+			return strings.TrimSpace(action.AdminCommand[i+1])
+		}
+	}
+	if strings.TrimSpace(slotName) == "" || action.TargetLSN == 0 {
+		return ""
+	}
+	return fmt.Sprintf("base-%s-%d", strings.TrimSpace(slotName), action.TargetLSN)
 }
 
 func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
