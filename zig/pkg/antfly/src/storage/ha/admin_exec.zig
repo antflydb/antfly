@@ -197,17 +197,20 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .slot => |slot_result| try appendSlotResultLines(alloc, &out, slot_result),
         .slot_list => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
         .seed_begin => |response| {
+            try appendActionReceiptLines(alloc, &out, "base_backup_begin", response.manifest_id, "applied");
             try appendLine(alloc, &out, "slot_name", response.slot_name);
             try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "start_record_lsn", response.start_record_lsn);
         },
         .seed_finish => |response| {
+            try appendActionReceiptLines(alloc, &out, "base_backup_finish", response.manifest_id, "applied");
             try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "end_record_lsn", response.end_record_lsn);
         },
         .seed_bootstrap => |response| {
+            try appendActionReceiptLines(alloc, &out, "standby_bootstrap", response.manifest_id, "applied");
             try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "checkpoint_lsn", response.checkpoint_lsn);
@@ -269,6 +272,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .write_check => |decision| try appendWriteGateLines(alloc, &out, decision),
         .owner_job_check => |decision| try appendOwnerJobGateLines(alloc, &out, decision),
         .fence_acquire => |fence_result| {
+            try appendActionReceiptLines(alloc, &out, "fence_acquire", fence_result.receipt.promoted_node_id, "applied");
             try appendFenceReceiptLines(alloc, &out, fence_result.receipt);
         },
         .fence_current => |maybe_fence_result| {
@@ -283,15 +287,19 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendPromotionAssessmentLines(alloc, &out, "assessment", assessment);
         },
         .promote_current_fence => |promotion_result| {
+            try appendActionReceiptLines(alloc, &out, "promotion", promotion_result.promoted_node_id, "applied");
             try appendPromotionResultLines(alloc, &out, promotion_result);
         },
         .promote => |promotion_result| {
+            try appendActionReceiptLines(alloc, &out, "promotion", promotion_result.promoted_node_id, "applied");
             try appendPromotionResultLines(alloc, &out, promotion_result);
         },
         .rejoin_assess => |assessment| {
+            try appendActionReceiptLines(alloc, &out, "rejoin_assess", assessment.former_node_id, "assessed");
             try appendRejoinAssessmentLines(alloc, &out, "", assessment);
         },
         .rejoin_rewind => |rewind_result| {
+            try appendActionReceiptLines(alloc, &out, "rejoin_rewind", rewind_result.assessment.former_node_id, "applied");
             try appendRejoinAssessmentLines(alloc, &out, "assessment", rewind_result.assessment);
             try appendLine(alloc, &out, "rewind.node_id", rewind_result.rewind.node_id);
             try appendU64Line(alloc, &out, "rewind.fork_lsn", rewind_result.rewind.fork_lsn);
@@ -304,6 +312,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendBoolLine(alloc, &out, "rewind.data_loss_discarded", rewind_result.rewind.data_loss_discarded);
         },
         .rejoin_reseed => |reseed_result| {
+            try appendActionReceiptLines(alloc, &out, "rejoin_reseed", reseed_result.assessment.former_node_id, "applied");
             try appendRejoinAssessmentLines(alloc, &out, "assessment", reseed_result.assessment);
             try appendLine(alloc, &out, "reseed.node_id", reseed_result.reseed.node_id);
             try appendLine(alloc, &out, "reseed.slot_name", reseed_result.reseed.slot_name);
@@ -709,22 +718,41 @@ fn resultName(result: Result) []const u8 {
 fn appendSlotResultLines(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), result: admin.SlotResult) !void {
     switch (result) {
         .create => |slot| {
+            try appendActionReceiptLines(alloc, out, "replication_slot_create", slot.slot_name, "applied");
             try appendLine(alloc, out, "slot_action", "create");
             try appendCreateSlotResponseLines(alloc, out, slot);
         },
         .pause => |slot| {
+            try appendActionReceiptLines(alloc, out, "replication_slot_pause", slot.slot_name, "applied");
             try appendLine(alloc, out, "slot_action", "pause");
             try appendSlotLifecycleResponseLines(alloc, out, slot);
         },
         .@"resume" => |slot| {
+            try appendActionReceiptLines(alloc, out, "replication_slot_resume", slot.slot_name, "applied");
             try appendLine(alloc, out, "slot_action", "resume");
             try appendSlotLifecycleResponseLines(alloc, out, slot);
         },
         .drop => |slot| {
+            try appendActionReceiptLines(alloc, out, "replication_slot_drop", slot.slot_name, "applied");
             try appendLine(alloc, out, "slot_action", "drop");
             try appendSlotLifecycleResponseLines(alloc, out, slot);
         },
     }
+}
+
+fn appendActionReceiptLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    action_kind: []const u8,
+    target: []const u8,
+    state: []const u8,
+) !void {
+    const action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ action_kind, target });
+    defer alloc.free(action_id);
+    try appendLine(alloc, out, "action.action_id", action_id);
+    try appendLine(alloc, out, "action.action_kind", action_kind);
+    try appendLine(alloc, out, "action.target", target);
+    try appendLine(alloc, out, "action.state", state);
 }
 
 fn appendCreateSlotResponseLines(
@@ -1333,6 +1361,10 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try std.testing.expectEqual(@as(u64, 1), created.slot.create.restart_lsn);
     const created_table = try renderTableAlloc(alloc, created);
     defer alloc.free(created_table);
+    try expectContains(created_table, "action.action_id=replication_slot_create:standby-a\n");
+    try expectContains(created_table, "action.action_kind=replication_slot_create\n");
+    try expectContains(created_table, "action.target=standby-a\n");
+    try expectContains(created_table, "action.state=applied\n");
     try expectContains(created_table, "last_error=-\n");
 
     var ack_plan = try admin_cli.parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "1", "--received-lsn", "2", "--applied-lsn", "1", "--safe-read-lsn", "1" });
@@ -1357,6 +1389,7 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer paused.deinit(alloc);
     const paused_table = try renderTableAlloc(alloc, paused);
     defer alloc.free(paused_table);
+    try expectContains(paused_table, "action.action_id=replication_slot_pause:standby-a\n");
     try expectContains(paused_table, "slot_action=pause\n");
     try expectContains(paused_table, "last_error=IntentionalApplyFailure\n");
 
@@ -1366,6 +1399,7 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     defer resumed.deinit(alloc);
     const resumed_table = try renderTableAlloc(alloc, resumed);
     defer alloc.free(resumed_table);
+    try expectContains(resumed_table, "action.action_id=replication_slot_resume:standby-a\n");
     try expectContains(resumed_table, "slot_action=resume\n");
     try expectContains(resumed_table, "last_error=IntentionalApplyFailure\n");
 
@@ -1638,6 +1672,10 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     const rewind_table = try renderTableAlloc(alloc, rewind_result);
     defer alloc.free(rewind_table);
     try expectContains(rewind_table, "result=rejoin_rewind\n");
+    try expectContains(rewind_table, "action.action_id=rejoin_rewind:primary-a\n");
+    try expectContains(rewind_table, "action.action_kind=rejoin_rewind\n");
+    try expectContains(rewind_table, "action.target=primary-a\n");
+    try expectContains(rewind_table, "action.state=applied\n");
     try expectContains(rewind_table, "assessment.action=rewind\n");
     try expectContains(rewind_table, "rewind.node_id=primary-a\n");
     try expectContains(rewind_table, "rewind.discarded_lsn_count=2\n");
@@ -1695,6 +1733,7 @@ test "storage.ha admin exec executes former primary rejoin rewind and reseed com
     const reseed_table = try renderTableAlloc(alloc, reseed_result);
     defer alloc.free(reseed_table);
     try expectContains(reseed_table, "result=rejoin_reseed\n");
+    try expectContains(reseed_table, "action.action_id=rejoin_reseed:primary-a\n");
     try expectContains(reseed_table, "assessment.action=reseed\n");
     try expectContains(reseed_table, "reseed.node_id=primary-a\n");
     try expectContains(reseed_table, "reseed.slot_name=primary-a\n");
@@ -1718,6 +1757,10 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     try std.testing.expectEqual(@as(u64, 1), begun.seed_begin.backup_lsn);
     const begin_table = try renderTableAlloc(alloc, begun);
     defer alloc.free(begin_table);
+    try expectContains(begin_table, "action.action_id=base_backup_begin:base-0001\n");
+    try expectContains(begin_table, "action.action_kind=base_backup_begin\n");
+    try expectContains(begin_table, "action.target=base-0001\n");
+    try expectContains(begin_table, "action.state=applied\n");
     try expectContains(begin_table, "slot_name=standby-a\n");
     try expectContains(begin_table, "manifest_id=base-0001\n");
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
@@ -1749,6 +1792,10 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     try std.testing.expectEqualStrings("base-0001", finished.seed_finish.manifest_id);
     try std.testing.expectEqual(@as(u64, 1), finished.seed_finish.backup_lsn);
     try std.testing.expectEqual(@as(u64, 3), finished.seed_finish.end_record_lsn);
+    const finish_table = try renderTableAlloc(alloc, finished);
+    defer alloc.free(finish_table);
+    try expectContains(finish_table, "action.action_id=base_backup_finish:base-0001\n");
+    try expectContains(finish_table, "end_record_lsn=3\n");
 
     var bootstrap_plan = try admin_cli.parse(alloc, &.{ "seed", "bootstrap", "--manifest", manifest_path, "--content-root", paths.backup_root });
     defer bootstrap_plan.deinit(alloc);
@@ -1762,6 +1809,7 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     const table_body = try renderTableAlloc(alloc, bootstrapped);
     defer alloc.free(table_body);
     try expectContains(table_body, "result=seed_bootstrap\n");
+    try expectContains(table_body, "action.action_id=standby_bootstrap:base-0001\n");
     try expectContains(table_body, "manifest_id=base-0001\n");
     try expectContains(table_body, "checkpoint_lsn=2\n");
 }
@@ -1959,6 +2007,10 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     const fence_table = try renderTableAlloc(alloc, fenced);
     defer alloc.free(fence_table);
     try expectContains(fence_table, "result=fence_acquire\n");
+    try expectContains(fence_table, "action.action_id=fence_acquire:standby-a\n");
+    try expectContains(fence_table, "action.action_kind=fence_acquire\n");
+    try expectContains(fence_table, "action.target=standby-a\n");
+    try expectContains(fence_table, "action.state=applied\n");
     try expectContains(fence_table, "promoted_node_id=standby-a\n");
     try expectContains(fence_table, "generation=1\n");
 
@@ -2004,6 +2056,10 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     const promoted_table = try renderTableAlloc(alloc, promoted);
     defer alloc.free(promoted_table);
     try expectContains(promoted_table, "result=promote_current_fence\n");
+    try expectContains(promoted_table, "action.action_id=promotion:standby-a\n");
+    try expectContains(promoted_table, "action.action_kind=promotion\n");
+    try expectContains(promoted_table, "action.target=standby-a\n");
+    try expectContains(promoted_table, "action.state=applied\n");
     try expectContains(promoted_table, "promotion.node_id=standby-a\n");
     try expectContains(promoted_table, "promotion.new_identity.timeline_id=2\n");
 
@@ -2022,6 +2078,12 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var rejoin_result = try execute(alloc, .{}, rejoin_plan);
     defer rejoin_result.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.reject_unfenced, rejoin_result.rejoin_assess.action);
+    const rejoin_table = try renderTableAlloc(alloc, rejoin_result);
+    defer alloc.free(rejoin_table);
+    try expectContains(rejoin_table, "action.action_id=rejoin_assess:primary-a\n");
+    try expectContains(rejoin_table, "action.action_kind=rejoin_assess\n");
+    try expectContains(rejoin_table, "action.target=primary-a\n");
+    try expectContains(rejoin_table, "action.state=assessed\n");
 
     const read_json = try renderJsonAlloc(alloc, read);
     defer alloc.free(read_json);
