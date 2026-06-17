@@ -63747,6 +63747,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed query select summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1x:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid query select summary",
         .sql = "SELECT id FROM usage_records",
@@ -64826,15 +64834,37 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc);
 }
 
+fn appParityPlanParseDelimitedUsizeToken(plan: []const u8, value_start: usize) ?usize {
+    var pos = value_start;
+    if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') return null;
+    var value: usize = 0;
+    while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
+        value = value * 10 + @as(usize, plan[pos] - '0');
+    }
+    if (pos != plan.len and plan[pos] != ':') return null;
+    return value;
+}
+
+fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse {
+            start = index + token.len;
+            continue;
+        };
+        return parsed;
+    }
+    return null;
+}
+
 fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
     var start: usize = 0;
     while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        var value: usize = 0;
-        var pos = index + token.len;
-        while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
-            value = value * 10 + @as(usize, plan[pos] - '0');
-        }
-        if (value > 0) return true;
+        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse {
+            start = index + token.len;
+            continue;
+        };
+        if (parsed > 0) return true;
         start = index + token.len;
     }
     return false;
@@ -64843,36 +64873,14 @@ fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
 fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
     var start: usize = 0;
     while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        var pos = index + token.len;
-        if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') {
+        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse {
             start = index + token.len;
             continue;
-        }
-        var value: usize = 0;
-        while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
-            value = value * 10 + @as(usize, plan[pos] - '0');
-        }
-        if (value == expected) return true;
+        };
+        if (parsed == expected) return true;
         start = index + token.len;
     }
     return false;
-}
-
-fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        var pos = index + token.len;
-        if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') {
-            start = index + token.len;
-            continue;
-        }
-        var value: usize = 0;
-        while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
-            value = value * 10 + @as(usize, plan[pos] - '0');
-        }
-        return value;
-    }
-    return null;
 }
 
 fn appParityPlanUsizeOptionalTokenValue(plan: []const u8, token: []const u8) usize {

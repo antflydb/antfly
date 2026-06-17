@@ -5241,6 +5241,10 @@ must match `corr` and `right_offset`; `windows` is valid only on window plans an
 must match `windows`. This keeps the golden corpus tied to the REST/SDK-visible
 typed stage that actually owns each field.
 
+Numeric summary tokens are delimiter-strict. A token value must end at the
+fingerprint boundary or before the next `:` separator; malformed hand-edits such
+as `select=1x` do not satisfy a `select = 1` summary.
+
 Row-stream predicate summaries are fingerprint-anchored for non-DDL typed read
 and source streams. Row-query plans, generic read-row plans, and `EXPLAIN`
 wrappers around them must match the exact `pred` token. Aggregate, window,
