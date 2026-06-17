@@ -1843,6 +1843,25 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStandbyAdminURL(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b"},
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected partial HA admin endpoint configuration to be valid without automatic failover, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	cluster := baseSwarmCluster()
 	backoffLimit := int32(-1)
@@ -1869,11 +1888,46 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "admin.primaryURL") ||
 		!strings.Contains(err.Error(), "standbys[0].adminURL") ||
-		!strings.Contains(err.Error(), "standbys[1].adminURL is required") ||
 		!strings.Contains(err.Error(), "admin.jobBackoffLimit") ||
 		!strings.Contains(err.Error(), "admin.jobTimeoutSeconds") ||
 		!strings.Contains(err.Error(), "admin.jobTTLSecondsAfterFinished") {
-		t.Fatalf("expected invalid and missing HA admin URL errors, got: %v", err)
+		t.Fatalf("expected invalid HA admin endpoint errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutDesiredStandbyAdminURL(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", RouteSelector: map[string]string{
+				"app.kubernetes.io/component": "standby-a",
+			}},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without standby admin URL to be rejected")
+	}
+	if !strings.Contains(err.Error(), "standbys[0].adminURL is required when automaticFailover is enabled") {
+		t.Fatalf("expected automatic failover standby admin URL validation error, got: %v", err)
 	}
 }
 

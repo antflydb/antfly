@@ -1196,11 +1196,6 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			if strings.TrimSpace(admin.PrimaryURL) == "" {
 				errors = append(errors, "spec.highAvailability.admin.primaryURL is required when executePlannedActions is true")
 			}
-			for i, standby := range ha.Standbys {
-				if strings.TrimSpace(standby.AdminURL) == "" {
-					errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL is required when executePlannedActions is true", i))
-				}
-			}
 		}
 	}
 
@@ -1270,6 +1265,11 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		if ha.Admin == nil || !ha.Admin.ExecutePlannedActions {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.admin.executePlannedActions=true")
+		}
+		for i, standby := range ha.Standbys {
+			if standbyDesiredBySpec(standby) && strings.TrimSpace(standby.AdminURL) == "" {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL is required when automaticFailover is enabled", i))
+			}
 		}
 		if ha.Identity == nil {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.identity")
