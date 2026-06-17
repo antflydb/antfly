@@ -560,6 +560,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				TargetLSN:       status.PrimaryLSN,
 				ObservedLSN:     status.PrimaryLSN,
 				RetainedFromLSN: status.Retention.OldestRestartLSN,
+				RouteFrom:       haAutomaticFailoverFormerPrimaryID(ha),
 				FenceAuthority:  fence.Authority,
 				FenceHolder:     fence.Holder,
 				FenceGeneration: fence.Generation,
