@@ -237,6 +237,31 @@ pub fn parseWrappedIdentifierOperand(tokens: []const Token, idx: *usize) !Token 
     return field_token;
 }
 
+pub fn hasTopLevelOrBeforeTail(
+    tokens: []const Token,
+    start: usize,
+    comptime tail_clause_keyword: fn ([]const u8) bool,
+) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => if (depth > 0) {
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) return false,
+            .identifier => if (depth == 0) {
+                if (std.ascii.eqlIgnoreCase(token.text, "or")) return true;
+                if (tail_clause_keyword(token.text)) return false;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 test "sql adapter parser cursor tracks shared token position" {
     var pos: usize = 0;
     const tokens = [_]Token{
@@ -299,4 +324,32 @@ test "sql adapter parser strips balanced outer parens and parses wrapped identif
         .{ .kind = .rparen, .text = ")", .source_start = 10, .source_end = 11 },
     };
     try std.testing.expectEqual(@as(usize, sibling_tokens.len), stripBalancedOuterParens(sibling_tokens[0..]).len);
+}
+
+test "sql adapter parser detects top-level OR before tail clauses" {
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .eq, .text = "=" },
+        .{ .kind = .string, .text = "'active'" },
+        .{ .kind = .identifier, .text = "or" },
+        .{ .kind = .identifier, .text = "status" },
+        .{ .kind = .eq, .text = "=" },
+        .{ .kind = .string, .text = "'pending'" },
+        .{ .kind = .identifier, .text = "order" },
+    };
+    try std.testing.expect(hasTopLevelOrBeforeTail(tokens[0..], 0, testWhereTailKeyword));
+
+    const nested_tokens = [_]Token{
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "a" },
+        .{ .kind = .identifier, .text = "or" },
+        .{ .kind = .identifier, .text = "b" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .identifier, .text = "order" },
+    };
+    try std.testing.expect(!hasTopLevelOrBeforeTail(nested_tokens[0..], 0, testWhereTailKeyword));
+}
+
+fn testWhereTailKeyword(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "order");
 }

@@ -19434,7 +19434,7 @@ const Parser = struct {
                 .identifier => {
                     if (depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "and") or
                         std.ascii.eqlIgnoreCase(token.text, "or") or
-                        tokenStartsWhereTailClause(token.text)))
+                        sql_adapter.sqlWhereTailClauseKeyword(token.text)))
                     {
                         break;
                     }
@@ -22456,7 +22456,7 @@ const Parser = struct {
                 },
                 .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return false,
                 .identifier => {
-                    if (depth == 0 and tokenStartsWhereTailClause(token.text)) break;
+                    if (depth == 0 and sql_adapter.sqlWhereTailClauseKeyword(token.text)) break;
                     if (sqlKeywordStartsScalarPredicate(token.text)) return false;
                     if (std.ascii.eqlIgnoreCase(token.text, "and") or
                         std.ascii.eqlIgnoreCase(token.text, "or") or
@@ -25420,7 +25420,7 @@ const Parser = struct {
                 },
                 .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return false,
                 .identifier => {
-                    if (depth == 0 and tokenStartsWhereTailClause(token.text)) break;
+                    if (depth == 0 and sql_adapter.sqlWhereTailClauseKeyword(token.text)) break;
                     if (sqlKeywordStartsScalarPredicate(token.text)) return false;
                     if (std.ascii.eqlIgnoreCase(token.text, "and") or
                         std.ascii.eqlIgnoreCase(token.text, "or") or
@@ -25654,7 +25654,7 @@ const Parser = struct {
                 },
                 .semicolon => if (depth == 0) return false,
                 .identifier => if (depth == 0) {
-                    if (tokenStartsWhereTailClause(token.text)) return false;
+                    if (sql_adapter.sqlWhereTailClauseKeyword(token.text)) return false;
                     if (std.ascii.eqlIgnoreCase(token.text, "and") or std.ascii.eqlIgnoreCase(token.text, "or")) {
                         expect_predicate_start = true;
                         continue;
@@ -25694,7 +25694,7 @@ const Parser = struct {
                 },
                 .semicolon => if (depth == 0) return false,
                 .identifier => {
-                    if (depth == 0 and tokenStartsWhereTailClause(token.text)) return false;
+                    if (depth == 0 and sql_adapter.sqlWhereTailClauseKeyword(token.text)) return false;
                     if (try self.arrayOverlapPredicateCanStartAt(i)) return true;
                 },
                 else => {},
@@ -25736,7 +25736,7 @@ const Parser = struct {
                 .semicolon => if (depth == 0) return false,
                 .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question => return true,
                 .identifier => {
-                    if (depth == 0 and tokenStartsWhereTailClause(token.text)) return false;
+                    if (depth == 0 and sql_adapter.sqlWhereTailClauseKeyword(token.text)) return false;
                     if (std.ascii.eqlIgnoreCase(token.text, "like") or
                         std.ascii.eqlIgnoreCase(token.text, "ilike"))
                     {
@@ -26603,7 +26603,7 @@ const Parser = struct {
             .semicolon, .rparen => enabled,
             .identifier => if (std.ascii.eqlIgnoreCase(next.text, "and") or
                 std.ascii.eqlIgnoreCase(next.text, "or") or
-                tokenStartsWhereTailClause(next.text))
+                sql_adapter.sqlWhereTailClauseKeyword(next.text))
                 enabled
             else
                 null,
@@ -37228,42 +37228,9 @@ const Parser = struct {
     }
 
     fn whereHasTopLevelOr(self: *@This()) bool {
-        var depth: usize = 0;
-        var i = self.pos;
-        while (i < self.tokens.len) : (i += 1) {
-            const token = self.tokens[i];
-            switch (token.kind) {
-                .lparen => depth += 1,
-                .rparen => if (depth > 0) {
-                    depth -= 1;
-                },
-                .semicolon => if (depth == 0) return false,
-                .identifier => if (depth == 0) {
-                    if (std.ascii.eqlIgnoreCase(token.text, "or")) return true;
-                    if (tokenStartsWhereTailClause(token.text)) return false;
-                },
-                else => {},
-            }
-        }
-        return false;
+        return sql_adapter.hasTopLevelOrBeforeTail(self.tokens, self.pos, sql_adapter.sqlWhereTailClauseKeyword);
     }
 };
-
-fn tokenStartsWhereTailClause(token: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(token, "order") or
-        std.ascii.eqlIgnoreCase(token, "limit") or
-        std.ascii.eqlIgnoreCase(token, "offset") or
-        std.ascii.eqlIgnoreCase(token, "for") or
-        std.ascii.eqlIgnoreCase(token, "group") or
-        std.ascii.eqlIgnoreCase(token, "having") or
-        std.ascii.eqlIgnoreCase(token, "returning") or
-        std.ascii.eqlIgnoreCase(token, "join") or
-        std.ascii.eqlIgnoreCase(token, "left") or
-        std.ascii.eqlIgnoreCase(token, "inner") or
-        std.ascii.eqlIgnoreCase(token, "with") or
-        std.ascii.eqlIgnoreCase(token, "over") or
-        std.ascii.eqlIgnoreCase(token, "lateral");
-}
 
 fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     return try sql_adapter.normalizeSqlObjectIdentifierAlloc(alloc, identifier);

@@ -240,3 +240,19 @@ pub fn rowExpressionBoundaryKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "filter") or
         std.ascii.eqlIgnoreCase(text, "over");
 }
+
+pub fn sqlWhereTailClauseKeyword(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "order") or
+        std.ascii.eqlIgnoreCase(text, "limit") or
+        std.ascii.eqlIgnoreCase(text, "offset") or
+        std.ascii.eqlIgnoreCase(text, "for") or
+        std.ascii.eqlIgnoreCase(text, "group") or
+        std.ascii.eqlIgnoreCase(text, "having") or
+        std.ascii.eqlIgnoreCase(text, "returning") or
+        std.ascii.eqlIgnoreCase(text, "join") or
+        std.ascii.eqlIgnoreCase(text, "left") or
+        std.ascii.eqlIgnoreCase(text, "inner") or
+        std.ascii.eqlIgnoreCase(text, "with") or
+        std.ascii.eqlIgnoreCase(text, "over") or
+        std.ascii.eqlIgnoreCase(text, "lateral");
+}
