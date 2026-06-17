@@ -619,6 +619,9 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceToken).To(Equal("ha-fence-token"))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -742,19 +745,19 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 		FenceGeneration:  3,
 	}
 
-	g.Expect(haDirectPromotionResultMatchesAction(result, identity, action)).To(BeTrue())
+	g.Expect(haDirectPromotionResultMatchesAction(result, identity, &action)).To(BeTrue())
 
 	mismatchedLSN := result
 	mismatchedLSN.SwitchLSN = 11
-	g.Expect(haDirectPromotionResultMatchesAction(mismatchedLSN, identity, action)).To(BeFalse())
+	g.Expect(haDirectPromotionResultMatchesAction(mismatchedLSN, identity, &action)).To(BeFalse())
 
 	mismatchedTimeline := result
 	mismatchedTimeline.NewTimelineID = 6
-	g.Expect(haDirectPromotionResultMatchesAction(mismatchedTimeline, identity, action)).To(BeFalse())
+	g.Expect(haDirectPromotionResultMatchesAction(mismatchedTimeline, identity, &action)).To(BeFalse())
 
 	unappliedBoundary := result
 	unappliedBoundary.ObservedLSN = 10
-	g.Expect(haDirectPromotionResultMatchesAction(unappliedBoundary, identity, action)).To(BeFalse())
+	g.Expect(haDirectPromotionResultMatchesAction(unappliedBoundary, identity, &action)).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
@@ -1210,6 +1213,31 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 		SlotName:   "standby-a",
 	}
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
+
+	promotionActions := []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionPromoteStandby),
+		StandbyName:     "standby-a",
+		FenceGeneration: 3,
+		AdminCommand:    []string{"promote", "--current-fence"},
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+	}, {
+		Kind:      string(haActionUpdatePrimaryRoute),
+		DependsOn: string(haActionPromoteStandby),
+		RouteTo:   "standby-a",
+	}}
+	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeFalse())
+
+	promotionActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration: 2,
+		FenceToken:      "old-token",
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeFalse())
+
+	promotionActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration: 3,
+		FenceToken:      "ha-fence-token",
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeTrue())
 }
 
 func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
@@ -1370,6 +1398,15 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
 	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration: 7,
+		FenceToken:      "ha-fence-token",
+	}
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))
@@ -1481,6 +1518,10 @@ func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t 
 					StandbyName:   "standby-a",
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						FenceGeneration: 7,
+						FenceToken:      "ha-fence-token",
+					},
 				}, {
 					Kind:            string(haActionUpdatePrimaryRoute),
 					DependsOn:       string(haActionPromoteStandby),
@@ -1541,6 +1582,10 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminJobName:    "promote-job",
 					AdminJobPhase:   haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						FenceGeneration: 3,
+						FenceToken:      "ha-fence-token",
+					},
 				}},
 			},
 		},
@@ -1607,6 +1652,10 @@ func TestUpdateHAAdminJobExecutionConditionReportsMissingPromotionReceipt(t *tes
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminJobName:    "promote-job",
 					AdminJobPhase:   haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						FenceGeneration: 3,
+						FenceToken:      "ha-fence-token",
+					},
 				}},
 			},
 		},
@@ -1871,6 +1920,16 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(ok).To(BeTrue())
 	g.Expect(fence.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(fence.FenceToken).To(Equal("ha-fence-token"))
+
+	promotion, ok := parseHAAdminActionResultTable(strings.Join([]string{
+		"result=promote_current_fence",
+		"fence_generation=4",
+		"fence_token=promotion-token",
+		"",
+	}, "\n"))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(promotion.FenceGeneration).To(Equal(uint64(4)))
+	g.Expect(promotion.FenceToken).To(Equal("promotion-token"))
 }
 
 func TestParseHARejoinJobResult(t *testing.T) {
@@ -1972,6 +2031,10 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration: 3,
+		FenceToken:      "ha-fence-token",
+	}
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
@@ -2001,6 +2064,10 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					Kind:          string(haActionPromoteStandby),
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						FenceGeneration: 3,
+						FenceToken:      "ha-fence-token",
+					},
 				}, {
 					Kind:          string(haActionDemoteFormerPrimary),
 					DependsOn:     string(haActionPromoteStandby),

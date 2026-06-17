@@ -3390,7 +3390,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		return true, err
 	case string(haActionPromoteStandby):
 		raw, err := r.requestHAAdminJSONRaw(ctx, http.MethodPost, action.AdminURL, "/admin/v1/ha/promotion/current-fence", nil)
-		if err == nil && !r.applyHADirectPromotionResult(cluster, *action, raw) {
+		if err == nil && !r.applyHADirectPromotionResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed promotion receipt", action.Kind)
 		}
 		return true, err
@@ -3715,11 +3715,17 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 		ManifestID: strings.TrimSpace(lines["manifest_id"]),
 		FenceToken: strings.TrimSpace(lines["token"]),
 	}
+	if result.FenceToken == "" {
+		result.FenceToken = strings.TrimSpace(lines["fence_token"])
+	}
 	result.BackupLSN, _ = parseHAResultUint(lines, "backup_lsn")
 	result.StartRecordLSN, _ = parseHAResultUint(lines, "start_record_lsn")
 	result.EndRecordLSN, _ = parseHAResultUint(lines, "end_record_lsn")
 	result.CheckpointLSN, _ = parseHAResultUint(lines, "checkpoint_lsn")
 	result.FenceGeneration, _ = parseHAResultUint(lines, "generation")
+	if result.FenceGeneration == 0 {
+		result.FenceGeneration, _ = parseHAResultUint(lines, "fence_generation")
+	}
 	if result.SlotName == "" {
 		result.SlotName = strings.TrimSpace(lines["name"])
 	}
@@ -3740,8 +3746,8 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 	return result, true
 }
 
-func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, raw []byte) bool {
-	if cluster == nil || cluster.Status.HAStatus == nil {
+func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, raw []byte) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
 		return false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
@@ -3755,14 +3761,15 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 	if !haDirectPromotionResultMatchesAction(result, identity, action) {
 		return false
 	}
+	action.AdminResult = haPromotionAdminActionResult(result)
 	if cluster.Status.HAStatus.LastPromotion == nil ||
-		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, *action) {
 		now := metav1.Now()
 		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
 			OldPrimaryID:      identity.CurrentPrimaryID,
 			PromotedStandbyID: action.StandbyName,
 			FenceAuthority:    action.FenceAuthority,
-			FenceReason:       haPromotionFenceReason(action),
+			FenceReason:       haPromotionFenceReason(*action),
 			CompletionTime:    &now,
 		}
 	}
@@ -3771,13 +3778,20 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 		cluster.Status.HAStatus.LastPromotion.FenceAuthority = action.FenceAuthority
 	}
 	if cluster.Status.HAStatus.LastPromotion.FenceReason == "" {
-		cluster.Status.HAStatus.LastPromotion.FenceReason = haPromotionFenceReason(action)
+		cluster.Status.HAStatus.LastPromotion.FenceReason = haPromotionFenceReason(*action)
 	}
 	return true
 }
 
-func haDirectPromotionResultMatchesAction(result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
-	if identity == nil {
+func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
+	return &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration: result.FenceGeneration,
+		FenceToken:      result.FenceToken,
+	}
+}
+
+func haDirectPromotionResultMatchesAction(result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action *antflyv1.HAPlannedActionStatus) bool {
+	if identity == nil || action == nil {
 		return false
 	}
 	if result.ParentTimelineID != identity.TimelineID || result.ParentEpoch != identity.Epoch {
@@ -4921,7 +4935,8 @@ func haActionRequiresAdminResult(kind haActionKind) bool {
 		haActionFinishStandbySeed,
 		haActionBootstrapStandbySeed,
 		haActionMarkReseed,
-		haActionAcquireFence:
+		haActionAcquireFence,
+		haActionPromoteStandby:
 		return true
 	default:
 		return false
@@ -4957,6 +4972,10 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			result.BackupLSN > 0 &&
 			result.CheckpointLSN > 0
 	case haActionAcquireFence:
+		return result.FenceGeneration > 0 &&
+			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
+			result.FenceToken != ""
+	case haActionPromoteStandby:
 		return result.FenceGeneration > 0 &&
 			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
 			result.FenceToken != ""
