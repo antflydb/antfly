@@ -24,6 +24,7 @@ pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
 pub const internal = @import("internal.zig");
+pub const auth = @import("auth.zig");
 
 pub const OutputFormat = enum { json, table_fmt };
 
@@ -85,4 +86,5 @@ test "cli mod compiles" {
     _ = backup;
     _ = agents;
     _ = internal;
+    _ = auth;
 }

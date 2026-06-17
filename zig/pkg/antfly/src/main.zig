@@ -154,6 +154,7 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
     if (std.mem.eql(u8, subcommand, "agents")) return cmd.cli.agents.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "backup")) return cmd.cli.backup.runBackup(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "restore")) return cmd.cli.backup.runRestore(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "auth")) return cmd.cli.auth.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "internal")) return cmd.cli.internal.run(allocator, io, &client, args);
 }
 
@@ -179,6 +180,7 @@ fn printUsage(argv0: []const u8) void {
         \\  agents         Run AI agents (retrieval, query-builder)
         \\  backup         Backup tables
         \\  restore        Restore tables from backup
+        \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI
         \\
