@@ -44,6 +44,8 @@ const algebraic_mod = @import("algebraic/mod.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
+const ha_effects_mod = @import("../ha/effects.zig");
+const ha_primary_mod = @import("../ha/primary.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_worker = @import("derived/derived_worker.zig");
@@ -191,9 +193,21 @@ pub const OpenOptions = struct {
     /// `name_embedding` model and the extraction artifact carries no vector.
     /// Caller-owned; must outlive the DB. Null disables backfill.
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
+    /// Optional async mirror for committed derived/change-journal effects into
+    /// the HA replication stream. This is not a synchronous commit gate; callers
+    /// that need remote-write or remote-apply durability must use the HA commit
+    /// gate around the primary replication stream.
+    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
+
+pub const HAAsyncEffectMirror = struct {
+    primary: *ha_primary_mod.Primary,
+    last_lsn: ?*std.atomic.Value(u64) = null,
+    failure_count: ?*std.atomic.Value(u64) = null,
+};
+
 pub const ReplayProgress = struct {
     sequence: u64 = 0,
     target_sequence: u64 = 0,
@@ -742,6 +756,7 @@ const EnrichmentAppendContext = struct {
     executor: *derived_executor_mod.Executor,
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
+    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -761,6 +776,7 @@ const EnrichmentAppendContext = struct {
             .executor = self.executor,
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
+            .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -798,6 +814,7 @@ const BatchExecutionContext = struct {
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
+    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
 };
 
 const ReplayApplyContext = struct {
@@ -2401,6 +2418,7 @@ pub const DB = struct {
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
     promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
+    ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2459,7 +2477,13 @@ pub const DB = struct {
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
+            .ha_async_effect_mirror = self.ha_async_effect_mirror,
         };
+    }
+
+    fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
+        var ctx = self.batchContext();
+        mirrorHAReplayPayloadBestEffortContext(&ctx, payload);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -2604,6 +2628,7 @@ pub const DB = struct {
                 .entity_sink = opts.entity_sink,
                 .promotion_owner = opts.promotion_owner,
                 .entity_sink_missing_policy = opts.entity_sink_missing_policy,
+                .ha_async_effect_mirror = opts.ha_async_effect_mirror,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -2782,6 +2807,7 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
+            .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
         };
@@ -2825,6 +2851,7 @@ pub const DB = struct {
             .executor = self.executor,
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
+            .ha_async_effect_mirror = self.ha_async_effect_mirror,
         };
 
         const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
@@ -2898,6 +2925,7 @@ pub const DB = struct {
                 .enrichment_runtime = self.enrichment_runtime,
                 .resolution_runtime = self.resolution_runtime,
                 .promotion_runtime = self.promotion_runtime,
+                .ha_async_effect_mirror = self.ha_async_effect_mirror,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -3949,6 +3977,7 @@ pub const DB = struct {
                 .payload = replay_payload,
             },
         );
+        self.mirrorHAReplayPayloadBestEffort(replay_payload);
         if (shouldAppendSplitDelta(self)) {
             try self.core.appendSplitDelta(currentTimeNs(), store_writes.items, delete_keys.items);
         }
@@ -4523,6 +4552,7 @@ pub const DB = struct {
             },
             store_batch_options,
         );
+        self.mirrorHAReplayPayloadBestEffort(replay_payload);
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
         }
@@ -5320,6 +5350,7 @@ pub const DB = struct {
             .sequence = sequence,
             .payload = replay_payload,
         });
+        self.mirrorHAReplayPayloadBestEffort(replay_payload);
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
@@ -6693,6 +6724,7 @@ pub const DB = struct {
             .sequence = sequence,
             .payload = replay_payload,
         });
+        self.mirrorHAReplayPayloadBestEffort(replay_payload);
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         return sequence;
     }
@@ -6835,6 +6867,7 @@ pub const DB = struct {
             .sequence = sequence,
             .payload = replay_payload,
         });
+        self.mirrorHAReplayPayloadBestEffort(replay_payload);
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
@@ -17990,6 +18023,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         .sequence = sequence,
         .payload = replay_payload,
     });
+    mirrorHAReplayPayloadBestEffortContext(ctx, replay_payload);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
@@ -18051,6 +18085,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
     try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
+    mirrorHAReplayPayloadBestEffortContext(ctx, payload);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
@@ -18059,6 +18094,18 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
     var record = try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
     defer change_journal_mod.deinitRecord(ctx.alloc, &record);
     return try change_journal_mod.encodeRecord(ctx.alloc, record);
+}
+
+fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
+    const mirror = ctx.ha_async_effect_mirror orelse return;
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
+        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        std.log.warn("failed to mirror DB derived effect into HA stream: {s}", .{@errorName(err)});
+        return;
+    };
+    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
@@ -22544,6 +22591,7 @@ fn markSplitOffDocumentArtifactChildRangesLocked(
         .sequence = sequence,
         .payload = replay_payload,
     });
+    self.mirrorHAReplayPayloadBestEffort(replay_payload);
     if (shouldAppendSplitDelta(self)) {
         try self.core.appendSplitDelta(currentTimeNs(), writes.items, &.{});
     }
@@ -36476,6 +36524,66 @@ test "db reopen replays pending derived embeddings from durable log" {
 
     const applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
     try std.testing.expectEqual(appended_sequence, applied);
+}
+
+test "storage.ha db mirrors appended derived replay records into HA stream" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 200,
+        .shard_id = 3,
+        .table_id = 9,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .ha_async_effect_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+        });
+        defer db.close();
+
+        const changed_artifact_keys = [_][]const u8{artifact_key};
+        const sequence = try appendDerivedBatchRecord(&db, .{
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        });
+        try std.testing.expectEqual(@as(u64, 1), sequence);
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .derived_effect), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 200), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 3), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 9), entry.record.table_id);
+
+    var decoded = try ha_effects_mod.decodeDerivedChangeRecord(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 1), decoded.record.sequence);
+    try std.testing.expectEqualStrings(artifact_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
 }
 
 test "db reopen replays pending derived embeddings with durable lsm primary backend" {
