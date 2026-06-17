@@ -3633,7 +3633,10 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler maps HA read gate errors",
             "public table query view handler maps doc identity unavailable errors",
+            "public table query view handler maps HA read gate errors",
+            "public document artifact manifest handlers map HA read gate errors",
             "public document artifact manifest handler returns summary and raw state",
             "public document artifact reprocess handler returns accepted",
         },
@@ -3673,6 +3676,8 @@ pub fn build(b: *std.Build) void {
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
+    api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
