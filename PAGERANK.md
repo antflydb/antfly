@@ -4437,7 +4437,10 @@ Recommended follow-up release cuts from the current checkpoint:
    runtime summaries bounded, no-error, and useful. The process harness now
    proves reclaimed pages are completed by the replacement worker under a newer
    attempt before the stale owner is rejected, so stale workers cannot silently
-   complete reclaimed direct-process pages.
+   complete reclaimed direct-process pages. The process-harness summary now
+   makes those direct abandoned-attempt checks auditable with separate
+   required/observed reclaimed-attempt-completion and stale-attempt-rejection
+   counters in addition to the generic direct page-reclaim phase count.
 2. **PageRank production gate**: finish the iterative single-vector promotion
    matrix under remote owners. DB-level production-budget local/planned parity
    now covers a 130-source one-page-budget planned drain against the local
@@ -5130,7 +5133,9 @@ than PR unit coverage:
   together. The process-owner summary emits a top-level
   `remote_owner_release_gate` plus service, direct, and failure/reclaim
   component booleans, with required/observed service cleanup-takeover counts
-  for killed degree, PageRank, eigenvector, and paired-HITS cleanup owners; the
+  for killed degree, PageRank, eigenvector, and paired-HITS cleanup owners and
+  required/observed direct reclaimed-attempt-completion plus stale-attempt-rejection
+  counts for abandoned direct page attempts; the
   release-qualification summary emits configured and observed deployment-shaped
   local-gate booleans.
   Together those two final JSON
@@ -5328,6 +5333,10 @@ than PR unit coverage:
   scan, contribution, reduce, publish, and cleanup boundaries. Reopen between
   ticks proves durable restart after each scheduler tick, but it is not a
   substitute for killing active owners while they hold leases or page attempts.
+  The direct process gate now explicitly counts abandoned page attempts whose
+  stale completion is rejected after a replacement worker completes a newer
+  attempt; the remaining gap is exercising that shape through deployment-sized
+  service owner churn.
   The synthetic fan-in probe proves the release harness sees normal merge
   compatibility behavior, and the focused hosted fan-in gate now covers a
   nonuniform eight-shard degree/PageRank/eigenvector direct merge with four

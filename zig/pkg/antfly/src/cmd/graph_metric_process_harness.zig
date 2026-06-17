@@ -112,6 +112,8 @@ const ProcessHarnessReleaseSummary = struct {
     direct_publish_failure_families: usize = 0,
     direct_active_public_read_families: usize = 0,
     direct_page_reclaim_phase_proofs: usize = 0,
+    direct_reclaimed_attempt_completion_phase_proofs: usize = 0,
+    direct_stale_attempt_rejection_phase_proofs: usize = 0,
     fixed_iteration_families: usize = 0,
     exhausted_attempt_families: usize = 0,
     same_worker_fencing_proofs: usize = 0,
@@ -131,10 +133,18 @@ const required_process_harness_release_summary = ProcessHarnessReleaseSummary{
     .direct_publish_failure_families = 3,
     .direct_active_public_read_families = 3,
     .direct_page_reclaim_phase_proofs = 20,
+    .direct_reclaimed_attempt_completion_phase_proofs = 20,
+    .direct_stale_attempt_rejection_phase_proofs = 20,
     .fixed_iteration_families = 2,
     .exhausted_attempt_families = 3,
     .same_worker_fencing_proofs = 2,
 };
+
+fn recordDirectPageReclaimProof(summary: *ProcessHarnessReleaseSummary) void {
+    summary.direct_page_reclaim_phase_proofs += 1;
+    summary.direct_reclaimed_attempt_completion_phase_proofs += 1;
+    summary.direct_stale_attempt_rejection_phase_proofs += 1;
+}
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -611,7 +621,7 @@ pub fn main(init: std.process.Init) !void {
 
     const worker_page_target_generation = try seedDegreeDb(alloc, worker_page_db_path);
     try verifyWorkerPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, worker_page_db_path, worker_page_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const worker_runtime_target_generation = try seedDegreeDbWithSources(alloc, worker_runtime_db_path, 130);
     try verifyWorkerRuntimeSameWorkerLeaseFencing(alloc, init.io, antfly_exe, worker_runtime_db_path, worker_runtime_target_generation);
@@ -623,23 +633,23 @@ pub fn main(init: std.process.Init) !void {
 
     const pagerank_scan_target_generation = try seedPageRankDb(alloc, pagerank_scan_db_path);
     try verifyPageRankScanPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_scan_db_path, pagerank_scan_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_initialize_target_generation = try seedPageRankDb(alloc, pagerank_initialize_db_path);
     try verifyPageRankInitializePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_initialize_db_path, pagerank_initialize_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_contribution_target_generation = try seedPageRankDb(alloc, pagerank_contribution_db_path);
     try verifyPageRankContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_contribution_db_path, pagerank_contribution_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_reduce_target_generation = try seedPageRankDb(alloc, pagerank_reduce_db_path);
     try verifyPageRankReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_reduce_db_path, pagerank_reduce_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_convergence_target_generation = try seedPageRankDb(alloc, pagerank_convergence_db_path);
     try verifyPageRankConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_convergence_db_path, pagerank_convergence_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_publish_cleanup_target_generation = try seedPageRankDb(alloc, pagerank_publish_cleanup_db_path);
     try verifyPageRankPublishAndCleanupRestart(alloc, init.io, antfly_exe, pagerank_publish_cleanup_db_path, pagerank_publish_cleanup_target_generation);
@@ -647,7 +657,7 @@ pub fn main(init: std.process.Init) !void {
 
     const pagerank_cleanup_reclaim_target_generation = try seedPageRankDb(alloc, pagerank_cleanup_reclaim_db_path);
     try verifyPageRankCleanupPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_cleanup_reclaim_db_path, pagerank_cleanup_reclaim_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_publish_failure_initial_generation = try seedPageRankDb(alloc, pagerank_publish_failure_db_path);
     try verifyPageRankPublishVerifierFailureProcess(alloc, init.io, antfly_exe, pagerank_publish_failure_db_path, pagerank_publish_failure_initial_generation);
@@ -679,15 +689,15 @@ pub fn main(init: std.process.Init) !void {
 
     const pagerank_later_contribution_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_later_contribution_db_path, 2);
     try verifyPageRankLaterContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_later_contribution_db_path, pagerank_later_contribution_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_later_reduce_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_later_reduce_db_path, 2);
     try verifyPageRankLaterReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_later_reduce_db_path, pagerank_later_reduce_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_later_convergence_target_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_later_convergence_db_path, 2);
     try verifyPageRankLaterConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, pagerank_later_convergence_db_path, pagerank_later_convergence_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const pagerank_exhausted_attempt_initial_generation = try seedPageRankDbWithMaxIterations(alloc, pagerank_exhausted_attempt_db_path, 2);
     try verifyPageRankExhaustedAttemptProcess(alloc, init.io, harness_exe, antfly_exe, pagerank_exhausted_attempt_db_path, pagerank_exhausted_attempt_initial_generation);
@@ -738,23 +748,23 @@ pub fn main(init: std.process.Init) !void {
 
     const eigenvector_scan_target_generation = try seedEigenvectorDb(alloc, eigenvector_scan_db_path);
     try verifyEigenvectorScanPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_scan_db_path, eigenvector_scan_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const eigenvector_initialize_target_generation = try seedEigenvectorDb(alloc, eigenvector_initialize_db_path);
     try verifyEigenvectorInitializePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_initialize_db_path, eigenvector_initialize_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const eigenvector_contribution_target_generation = try seedEigenvectorDb(alloc, eigenvector_contribution_db_path);
     try verifyEigenvectorContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_contribution_db_path, eigenvector_contribution_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const eigenvector_reduce_target_generation = try seedEigenvectorDb(alloc, eigenvector_reduce_db_path);
     try verifyEigenvectorReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_reduce_db_path, eigenvector_reduce_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const eigenvector_convergence_target_generation = try seedEigenvectorDb(alloc, eigenvector_convergence_db_path);
     try verifyEigenvectorConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, eigenvector_convergence_db_path, eigenvector_convergence_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const eigenvector_exhausted_attempt_initial_generation = try seedEigenvectorDbWithMaxIterations(alloc, eigenvector_exhausted_attempt_db_path, 2);
     try verifyEigenvectorExhaustedAttemptProcess(alloc, init.io, harness_exe, antfly_exe, eigenvector_exhausted_attempt_db_path, eigenvector_exhausted_attempt_initial_generation);
@@ -798,23 +808,23 @@ pub fn main(init: std.process.Init) !void {
 
     const hits_authority_contribution_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_authority_contribution_db_path);
     try verifyHitsAuthorityContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_authority_contribution_db_path, hits_authority_contribution_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const hits_authority_reduce_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_authority_reduce_db_path);
     try verifyHitsAuthorityReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_authority_reduce_db_path, hits_authority_reduce_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const hits_convergence_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_convergence_db_path);
     try verifyHitsConvergencePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_convergence_db_path, hits_convergence_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const hits_hub_contribution_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_hub_contribution_db_path);
     try verifyHitsHubContributionPageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_hub_contribution_db_path, hits_hub_contribution_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     const hits_hub_reduce_target_generation = try seedHitsDbWithActiveBuild(alloc, hits_hub_reduce_db_path);
     try verifyHitsHubReducePageLeaseReclaim(alloc, init.io, harness_exe, antfly_exe, hits_hub_reduce_db_path, hits_hub_reduce_target_generation);
-    release_summary.direct_page_reclaim_phase_proofs += 1;
+    recordDirectPageReclaimProof(&release_summary);
 
     try verifyProcessHarnessReleaseSummary(release_summary);
     try emitProcessHarnessReleaseSummary(init.io, release_summary);
@@ -854,6 +864,8 @@ fn hasDirectRemoteOwnerReleaseGate(summary: ProcessHarnessReleaseSummary, requir
 
 fn hasFailureReclaimReleaseGate(summary: ProcessHarnessReleaseSummary, required: ProcessHarnessReleaseSummary) bool {
     return summary.direct_page_reclaim_phase_proofs == required.direct_page_reclaim_phase_proofs and
+        summary.direct_reclaimed_attempt_completion_phase_proofs == required.direct_reclaimed_attempt_completion_phase_proofs and
+        summary.direct_stale_attempt_rejection_phase_proofs == required.direct_stale_attempt_rejection_phase_proofs and
         summary.exhausted_attempt_families == required.exhausted_attempt_families and
         summary.same_worker_fencing_proofs == required.same_worker_fencing_proofs;
 }
@@ -898,7 +910,7 @@ fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSu
         },
     );
     try out.print(
-        ",\"required_direct_publish_cleanup_families\":{d},\"direct_publish_cleanup_families\":{d},\"required_direct_publish_failure_families\":{d},\"direct_publish_failure_families\":{d},\"required_direct_active_public_read_families\":{d},\"direct_active_public_read_families\":{d},\"required_direct_page_reclaim_phase_proofs\":{d},\"direct_page_reclaim_phase_proofs\":{d},\"required_fixed_iteration_families\":{d},\"fixed_iteration_families\":{d},\"required_exhausted_attempt_families\":{d},\"exhausted_attempt_families\":{d},\"required_same_worker_fencing_proofs\":{d},\"same_worker_fencing_proofs\":{d}}}\n",
+        ",\"required_direct_publish_cleanup_families\":{d},\"direct_publish_cleanup_families\":{d},\"required_direct_publish_failure_families\":{d},\"direct_publish_failure_families\":{d},\"required_direct_active_public_read_families\":{d},\"direct_active_public_read_families\":{d},\"required_direct_page_reclaim_phase_proofs\":{d},\"direct_page_reclaim_phase_proofs\":{d},\"required_direct_reclaimed_attempt_completion_phase_proofs\":{d},\"direct_reclaimed_attempt_completion_phase_proofs\":{d},\"required_direct_stale_attempt_rejection_phase_proofs\":{d},\"direct_stale_attempt_rejection_phase_proofs\":{d},\"required_fixed_iteration_families\":{d},\"fixed_iteration_families\":{d},\"required_exhausted_attempt_families\":{d},\"exhausted_attempt_families\":{d},\"required_same_worker_fencing_proofs\":{d},\"same_worker_fencing_proofs\":{d}}}\n",
         .{
             required.direct_publish_cleanup_families,
             summary.direct_publish_cleanup_families,
@@ -908,6 +920,10 @@ fn emitProcessHarnessReleaseSummary(io: std.Io, summary: ProcessHarnessReleaseSu
             summary.direct_active_public_read_families,
             required.direct_page_reclaim_phase_proofs,
             summary.direct_page_reclaim_phase_proofs,
+            required.direct_reclaimed_attempt_completion_phase_proofs,
+            summary.direct_reclaimed_attempt_completion_phase_proofs,
+            required.direct_stale_attempt_rejection_phase_proofs,
+            summary.direct_stale_attempt_rejection_phase_proofs,
             required.fixed_iteration_families,
             summary.fixed_iteration_families,
             required.exhausted_attempt_families,
