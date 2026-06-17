@@ -2206,10 +2206,19 @@ const PendingEntry = struct {
 const PendingDeltaBatch = struct {
     records: std.ArrayListUnmanaged(posting.PostingDeltaRecord) = .empty,
     encoded_value_bytes: usize = 0,
+    min_sequence: u64 = 0,
 
     fn deinit(self: *PendingDeltaBatch, alloc: Allocator) void {
         self.records.deinit(alloc);
         self.* = .{};
+    }
+
+    fn noteAppendedRecord(self: *PendingDeltaBatch, record: posting.PostingDeltaRecord, encoded_value_bytes: usize) void {
+        self.encoded_value_bytes = encoded_value_bytes;
+        self.min_sequence = if (self.records.items.len == 1)
+            record.sequence
+        else
+            @min(self.min_sequence, record.sequence);
     }
 };
 
@@ -2225,9 +2234,15 @@ fn pendingDeltaBatchEncodedSizeWithRecord(batch: PendingDeltaBatch, record: post
         return try posting.PostingFormat.encodedDeltaTailSize(&.{record});
     }
 
-    var base_sequence = record.sequence;
-    for (batch.records.items) |existing| base_sequence = @min(base_sequence, existing.sequence);
+    if (batch.records.items.len >= 2 and record.sequence >= batch.min_sequence) {
+        return try std.math.add(
+            usize,
+            batch.encoded_value_bytes,
+            try deltaRecordEncodedSizeFromBaseSequence(record, batch.min_sequence),
+        );
+    }
 
+    const base_sequence = @min(record.sequence, batch.min_sequence);
     var total = posting.PostingFormat.delta_header_size;
     for (batch.records.items) |existing| {
         total = try std.math.add(usize, total, try deltaRecordEncodedSizeFromBaseSequence(existing, base_sequence));
@@ -2671,7 +2686,7 @@ pub const DirectoryBatchWriter = struct {
         const pending_value_bytes_without_batch = self.pending_value_bytes - previous_encoded_value_bytes;
         const next_pending_value_bytes = std.math.add(usize, pending_value_bytes_without_batch, next_encoded_value_bytes) catch return error.PostingSegmentTooLarge;
         try gop.value_ptr.records.append(self.alloc, record);
-        gop.value_ptr.encoded_value_bytes = next_encoded_value_bytes;
+        gop.value_ptr.noteAppendedRecord(record, next_encoded_value_bytes);
         self.pending_value_bytes = next_pending_value_bytes;
         self.pending_delta_records += 1;
         if ((self.options.max_pending_delta_records != 0 and self.pending_delta_records >= self.options.max_pending_delta_records) or
@@ -5972,6 +5987,29 @@ test "posting segment directory store round trips segment files" {
 
 test "posting segment directory commit appends manifest segments" {
     try testDirectoryCommitAppendsManifestSegments();
+}
+
+test "posting segment pending delta batch size uses cached min sequence" {
+    const alloc = std.testing.allocator;
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 10) << 32) | 2, .op = .insert, .vector_id = 100 },
+        .{ .sequence = (@as(u64, 8) << 32) | 1, .op = .tombstone, .vector_id = 50 },
+        .{ .sequence = (@as(u64, 12) << 32) | 3, .op = .insert, .vector_id = 150 },
+    };
+
+    var batch = PendingDeltaBatch{};
+    defer batch.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < records.len) : (i += 1) {
+        const expected = try posting.PostingFormat.encodedDeltaTailSize(records[0 .. i + 1]);
+        const actual = try pendingDeltaBatchEncodedSizeWithRecord(batch, records[i]);
+        try std.testing.expectEqual(expected, actual);
+        try batch.records.append(alloc, records[i]);
+        batch.noteAppendedRecord(records[i], actual);
+    }
+
+    try std.testing.expectEqual(records[1].sequence, batch.min_sequence);
 }
 
 test "posting segment directory batch writer flushes bounded segments" {
