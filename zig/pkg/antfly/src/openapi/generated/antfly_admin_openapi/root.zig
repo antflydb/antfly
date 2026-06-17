@@ -37,6 +37,7 @@ pub const HACurrentFenceResponse = types.HACurrentFenceResponse;
 pub const HAPromotionAssessResponse = types.HAPromotionAssessResponse;
 pub const HAPromotionResponse = types.HAPromotionResponse;
 pub const HARejoinAssessResponse = types.HARejoinAssessResponse;
+pub const HARejoinRewindResult = types.HARejoinRewindResult;
 pub const HAPromotionAssessment = types.HAPromotionAssessment;
 pub const HAPromotionResult = types.HAPromotionResult;
 pub const HARejoinAssessment = types.HARejoinAssessment;

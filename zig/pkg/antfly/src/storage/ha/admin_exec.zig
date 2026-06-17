@@ -34,6 +34,7 @@ const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
+const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
@@ -49,6 +50,7 @@ pub const Context = struct {
     primary: ?*primary_mod.Primary = null,
     standby: ?*standby_mod.Standby = null,
     fence_store: ?*fencing.Store = null,
+    former_primary_log: ?*replication_log.ReplicationLog = null,
 };
 
 pub const SeedFinishResult = struct {

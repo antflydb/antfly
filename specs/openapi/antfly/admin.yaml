@@ -1166,6 +1166,52 @@ components:
           minimum: 1
         assessment:
           $ref: "#/components/schemas/HARejoinAssessment"
+        rewind:
+          $ref: "#/components/schemas/HARejoinRewindResult"
+          description: Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
+    HARejoinRewindResult:
+      type: object
+      required:
+        - fork_lsn
+        - previous_last_lsn
+        - current_last_lsn
+        - next_lsn
+        - discarded_lsn_count
+        - target_timeline_id
+        - target_epoch
+        - data_loss_discarded
+      additionalProperties: false
+      properties:
+        fork_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        previous_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        current_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        discarded_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        target_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        target_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        data_loss_discarded:
+          type: boolean
     HAPromotionAssessment:
       type: object
       required:

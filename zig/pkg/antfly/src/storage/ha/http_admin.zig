@@ -31,6 +31,7 @@ const fencing = @import("fencing.zig");
 const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
+const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const rejoin = @import("rejoin.zig");
 const standby_mod = @import("standby.zig");
@@ -619,6 +620,18 @@ pub const Server = struct {
                 };
                 return try textResponse(self.alloc, 409, message);
             }
+
+            if (expected == .rewind) {
+                if (self.ctx.former_primary_log) |log| {
+                    const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                    return try self.handleTypedJson(RejoinRewindDocument{
+                        .assessment = assessment,
+                        .rewind = rewind,
+                    });
+                }
+            }
         }
 
         return try self.handleTypedJson(RejoinAssessDocument{ .assessment = assessment });
@@ -779,6 +792,12 @@ const PromotionDocument = struct {
 const RejoinAssessDocument = struct {
     schema_version: u32 = 1,
     assessment: rejoin.Assessment,
+};
+
+const RejoinRewindDocument = struct {
+    schema_version: u32 = 1,
+    assessment: rejoin.Assessment,
+    rewind: rejoin.RewindResult,
 };
 
 fn promotionDocument(result: ha_admin.FencedPromotionResult) PromotionDocument {
@@ -1230,6 +1249,9 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.SlotInactive,
         error.SlotRequiresReseed,
         error.WalNoLongerRetained,
+        error.RejoinAssessmentStale,
+        error.RejoinRewindNotAllowed,
+        error.FormerPrimaryBeforeFork,
         error.MissingReceivedRecord,
         error.RecordAlreadyReceived,
         error.StandbyAlreadyBootstrapped,
@@ -1404,6 +1426,48 @@ fn writeTestFile(path: []const u8, bytes: []const u8) !void {
         .sub_path = path,
         .data = bytes,
     });
+}
+
+test "storage.ha http admin executes typed former primary log rewind when configured" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-rewind");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var former_log = try replication_log.ReplicationLog.open(paths.primary_log.ptr, .{});
+    defer former_log.close();
+    _ = try former_log.append(alloc, baseRecord(identity, 1, "one"));
+    _ = try former_log.append(alloc, baseRecord(identity, 2, "two"));
+    _ = try former_log.append(alloc, baseRecord(identity, 3, "diverged"));
+
+    var server = Server.init(alloc, .{ .former_primary_log = &former_log });
+    defer server.deinit();
+
+    const body =
+        "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}";
+    var rewind = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_rewind,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer rewind.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), rewind.status);
+    try std.testing.expectEqualStrings("application/json", rewind.content_type.?);
+    try expectContains(rewind.body, "\"assessment\"");
+    try expectContains(rewind.body, "\"rewind\"");
+    try expectContains(rewind.body, "\"discarded_lsn_count\":1");
+    try std.testing.expectEqual(@as(u64, 2), former_log.lastLsn());
+
+    var stale = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_rewind,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer stale.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), stale.status);
+    try expectContains(stale.body, "RejoinAssessmentStale");
 }
 
 test "storage.ha http admin serves health and command endpoint" {

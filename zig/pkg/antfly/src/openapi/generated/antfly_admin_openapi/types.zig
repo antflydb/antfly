@@ -94,6 +94,17 @@ pub const HAStandbyBootstrapResponse = struct {
     checkpoint_lsn: i64,
 };
 
+pub const HARejoinRewindResult = struct {
+    fork_lsn: i64,
+    previous_last_lsn: i64,
+    current_last_lsn: i64,
+    next_lsn: i64,
+    discarded_lsn_count: i64,
+    target_timeline_id: i64,
+    target_epoch: i64,
+    data_loss_discarded: bool,
+};
+
 pub const HAPromotionAssessment = struct {
     required_lsn: i64,
     received_lsn: i64,
@@ -281,6 +292,8 @@ pub const HAPromotionAssessResponse = struct {
 pub const HARejoinAssessResponse = struct {
     schema_version: i64,
     assessment: HARejoinAssessment,
+    /// Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
+    rewind: ?HARejoinRewindResult = null,
 };
 
 pub const HAPrimarySnapshot = struct {
