@@ -910,7 +910,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
 }
 
-func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
+func TestHAPromotionResultMatchesPlannedBoundary(t *testing.T) {
 	g := NewWithT(t)
 
 	identity := &antflyv1.HAReplicationIdentitySpec{
@@ -943,27 +943,27 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 		FenceGeneration:  3,
 	}
 
-	g.Expect(haDirectPromotionResultMatchesAction(result, identity, &action)).To(BeTrue())
+	g.Expect(haPromotionResultMatchesAction(result, identity, &action)).To(BeTrue())
 
 	mismatchedLSN := result
 	mismatchedLSN.SwitchLSN = 11
-	g.Expect(haDirectPromotionResultMatchesAction(mismatchedLSN, identity, &action)).To(BeFalse())
+	g.Expect(haPromotionResultMatchesAction(mismatchedLSN, identity, &action)).To(BeFalse())
 
 	mismatchedTimeline := result
 	mismatchedTimeline.NewTimelineID = 6
-	g.Expect(haDirectPromotionResultMatchesAction(mismatchedTimeline, identity, &action)).To(BeFalse())
+	g.Expect(haPromotionResultMatchesAction(mismatchedTimeline, identity, &action)).To(BeFalse())
 
 	mismatchedScope := result
 	mismatchedScope.NewTableID = 21
-	g.Expect(haDirectPromotionResultMatchesAction(mismatchedScope, identity, &action)).To(BeFalse())
+	g.Expect(haPromotionResultMatchesAction(mismatchedScope, identity, &action)).To(BeFalse())
 
 	unappliedBoundary := result
 	unappliedBoundary.ObservedLSN = 10
-	g.Expect(haDirectPromotionResultMatchesAction(unappliedBoundary, identity, &action)).To(BeFalse())
+	g.Expect(haPromotionResultMatchesAction(unappliedBoundary, identity, &action)).To(BeFalse())
 
 	wrongNode := result
 	wrongNode.PromotedNodeID = "standby-b"
-	g.Expect(haDirectPromotionResultMatchesAction(wrongNode, identity, &action)).To(BeFalse())
+	g.Expect(haPromotionResultMatchesAction(wrongNode, identity, &action)).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
@@ -2292,8 +2292,14 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 		"assessment.applied_lsn=11",
 		"promotion.node_id=standby-a",
 		"promotion.switch_lsn=12",
+		"promotion.old_identity.cluster_id=100",
+		"promotion.old_identity.shard_id=10",
+		"promotion.old_identity.table_id=20",
 		"promotion.old_identity.timeline_id=4",
 		"promotion.old_identity.epoch=6",
+		"promotion.new_identity.cluster_id=100",
+		"promotion.new_identity.shard_id=10",
+		"promotion.new_identity.table_id=20",
 		"promotion.new_identity.timeline_id=5",
 		"promotion.new_identity.epoch=7",
 		"promotion.forced=true",
@@ -2317,15 +2323,42 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(result.Forced).To(BeTrue())
 	g.Expect(result.DataLossPossible).To(BeTrue())
 
+	adminResult := haPromotionAdminActionResult(result)
+	g.Expect(adminResult.FenceClusterID).To(Equal(uint64(100)))
+	g.Expect(adminResult.FenceShardID).To(Equal(uint64(10)))
+	g.Expect(adminResult.FenceTableID).To(Equal(uint64(20)))
+	g.Expect(adminResult.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(adminResult.FenceRequiredLSN).To(Equal(uint64(12)))
+	g.Expect(adminResult.FenceObservedLSN).To(Equal(uint64(13)))
+
+	identity := &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceGeneration: 3,
+	}
 	promotion := &antflyv1.HAPromotionStatus{
 		OldPrimaryID:      "primary-a",
 		PromotedStandbyID: "standby-a",
 	}
-	applyHAPromotionJobResult(promotion, result)
+	g.Expect(applyHAPromotionJobResultIfMatches(promotion, result, identity, action)).To(BeTrue())
 	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.NewEpoch).To(Equal(uint64(7)))
 	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(promotion.DataLossPossible).To(BeTrue())
+
+	wrongNode := result
+	wrongNode.PromotedNodeID = "standby-b"
+	promotion.FenceToken = "unchanged-token"
+	g.Expect(applyHAPromotionJobResultIfMatches(promotion, wrongNode, identity, action)).To(BeFalse())
+	g.Expect(promotion.FenceToken).To(Equal("unchanged-token"))
 }
 
 func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {

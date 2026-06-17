@@ -3996,7 +3996,7 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 	if !ok {
 		return false
 	}
-	if !haDirectPromotionResultMatchesAction(result, identity, action) {
+	if !haPromotionResultMatchesAction(result, identity, action) {
 		return false
 	}
 	action.AdminResult = haPromotionAdminActionResult(result)
@@ -4025,6 +4025,9 @@ func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdmin
 	return &antflyv1.HAAdminActionResultStatus{
 		FenceGeneration:       result.FenceGeneration,
 		FenceToken:            result.FenceToken,
+		FenceClusterID:        result.NewClusterID,
+		FenceShardID:          result.NewShardID,
+		FenceTableID:          result.NewTableID,
 		FencePromotedNodeID:   strings.TrimSpace(result.PromotedNodeID),
 		FenceParentTimelineID: result.ParentTimelineID,
 		FenceParentEpoch:      result.ParentEpoch,
@@ -4036,7 +4039,7 @@ func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdmin
 	}
 }
 
-func haDirectPromotionResultMatchesAction(result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action *antflyv1.HAPlannedActionStatus) bool {
+func haPromotionResultMatchesAction(result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action *antflyv1.HAPlannedActionStatus) bool {
 	if identity == nil || action == nil {
 		return false
 	}
@@ -4196,7 +4199,8 @@ func (r *AntflyClusterReconciler) updateHAPromotionStatusFromAdminJobLogs(ctx co
 	if !ok {
 		return
 	}
-	applyHAPromotionJobResult(promotion, result)
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	_ = applyHAPromotionJobResultIfMatches(promotion, result, identity, action)
 }
 
 func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) {
@@ -4361,12 +4365,18 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 	if result.SwitchLSN, ok = parseHAResultUint(lines, "promotion.switch_lsn"); !ok {
 		return haPromotionJobResult{}, false
 	}
+	result.ParentClusterID, _ = parseHAResultUint(lines, "promotion.old_identity.cluster_id")
+	result.ParentShardID, _ = parseHAResultUint(lines, "promotion.old_identity.shard_id")
+	result.ParentTableID, _ = parseHAResultUint(lines, "promotion.old_identity.table_id")
 	if result.ParentTimelineID, ok = parseHAResultUint(lines, "promotion.old_identity.timeline_id"); !ok {
 		return haPromotionJobResult{}, false
 	}
 	if result.ParentEpoch, ok = parseHAResultUint(lines, "promotion.old_identity.epoch"); !ok {
 		return haPromotionJobResult{}, false
 	}
+	result.NewClusterID, _ = parseHAResultUint(lines, "promotion.new_identity.cluster_id")
+	result.NewShardID, _ = parseHAResultUint(lines, "promotion.new_identity.shard_id")
+	result.NewTableID, _ = parseHAResultUint(lines, "promotion.new_identity.table_id")
 	if result.NewTimelineID, ok = parseHAResultUint(lines, "promotion.new_identity.timeline_id"); !ok {
 		return haPromotionJobResult{}, false
 	}
@@ -4885,6 +4895,14 @@ func applyHAPromotionJobResult(promotion *antflyv1.HAPromotionStatus, result haP
 	promotion.FenceToken = result.FenceToken
 	promotion.Forced = result.Forced
 	promotion.DataLossPossible = result.DataLossPossible
+}
+
+func applyHAPromotionJobResultIfMatches(promotion *antflyv1.HAPromotionStatus, result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
+	if promotion == nil || !haPromotionResultMatchesAction(result, identity, &action) {
+		return false
+	}
+	applyHAPromotionJobResult(promotion, result)
+	return true
 }
 
 func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
