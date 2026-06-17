@@ -3918,6 +3918,30 @@ type haPromotionAssessmentJSON struct {
 	CanPromote         *bool   `json:"can_promote"`
 }
 
+type haFenceReceiptIdentityJSON struct {
+	ClusterID  *uint64 `json:"cluster_id"`
+	ShardID    *uint64 `json:"shard_id"`
+	TableID    *uint64 `json:"table_id"`
+	TimelineID *uint64 `json:"timeline_id"`
+	Epoch      *uint64 `json:"epoch"`
+}
+
+type haFenceReceiptJSON struct {
+	Identity         haFenceReceiptIdentityJSON `json:"identity"`
+	OldPrimaryID     string                     `json:"old_primary_id"`
+	PromotedNodeID   string                     `json:"promoted_node_id"`
+	ParentTimelineID *uint64                    `json:"parent_timeline_id"`
+	ParentEpoch      *uint64                    `json:"parent_epoch"`
+	NewTimelineID    *uint64                    `json:"new_timeline_id"`
+	NewEpoch         *uint64                    `json:"new_epoch"`
+	RequiredLSN      *uint64                    `json:"required_lsn"`
+	ObservedLSN      *uint64                    `json:"observed_lsn"`
+	Generation       *uint64                    `json:"generation"`
+	Forced           *bool                      `json:"forced"`
+	Token            string                     `json:"token"`
+	Reason           *string                    `json:"reason"`
+}
+
 type haDirectAdminActionResultJSON struct {
 	SchemaVersion  uint32                    `json:"schema_version"`
 	Action         haAdminActionReceiptJSON  `json:"action"`
@@ -3930,27 +3954,7 @@ type haDirectAdminActionResultJSON struct {
 	EndRecordLSN   uint64                    `json:"end_record_lsn"`
 	CheckpointLSN  uint64                    `json:"checkpoint_lsn"`
 	Assessment     haPromotionAssessmentJSON `json:"assessment"`
-	Receipt        struct {
-		Identity struct {
-			ClusterID  uint64 `json:"cluster_id"`
-			ShardID    uint64 `json:"shard_id"`
-			TableID    uint64 `json:"table_id"`
-			TimelineID uint64 `json:"timeline_id"`
-			Epoch      uint64 `json:"epoch"`
-		} `json:"identity"`
-		OldPrimaryID     string `json:"old_primary_id"`
-		PromotedNodeID   string `json:"promoted_node_id"`
-		ParentTimelineID uint64 `json:"parent_timeline_id"`
-		ParentEpoch      uint64 `json:"parent_epoch"`
-		NewTimelineID    uint64 `json:"new_timeline_id"`
-		NewEpoch         uint64 `json:"new_epoch"`
-		RequiredLSN      uint64 `json:"required_lsn"`
-		ObservedLSN      uint64 `json:"observed_lsn"`
-		Generation       uint64 `json:"generation"`
-		Forced           bool   `json:"forced"`
-		Token            string `json:"token"`
-		Reason           string `json:"reason"`
-	} `json:"receipt"`
+	Receipt        haFenceReceiptJSON        `json:"receipt"`
 }
 
 type haReplicationSlotJSON struct {
@@ -4067,21 +4071,21 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		PromotionAppliedLSN:   haUint64JSONValue(result.Assessment.AppliedLSN),
 		PromotionCanPromote:   haBoolJSONValue(result.Assessment.CanPromote),
 		PromotionFenced:       haBoolJSONValue(result.Assessment.FencingConfirmed),
-		FenceGeneration:       result.Receipt.Generation,
+		FenceGeneration:       haUint64JSONValue(result.Receipt.Generation),
 		FenceToken:            strings.TrimSpace(result.Receipt.Token),
-		FenceClusterID:        result.Receipt.Identity.ClusterID,
-		FenceShardID:          result.Receipt.Identity.ShardID,
-		FenceTableID:          result.Receipt.Identity.TableID,
+		FenceClusterID:        haUint64JSONValue(result.Receipt.Identity.ClusterID),
+		FenceShardID:          haUint64JSONValue(result.Receipt.Identity.ShardID),
+		FenceTableID:          haUint64JSONValue(result.Receipt.Identity.TableID),
 		FenceOldPrimaryID:     strings.TrimSpace(result.Receipt.OldPrimaryID),
 		FencePromotedNodeID:   strings.TrimSpace(result.Receipt.PromotedNodeID),
-		FenceParentTimelineID: result.Receipt.ParentTimelineID,
-		FenceParentEpoch:      result.Receipt.ParentEpoch,
-		FenceNewTimelineID:    result.Receipt.NewTimelineID,
-		FenceNewEpoch:         result.Receipt.NewEpoch,
-		FenceRequiredLSN:      result.Receipt.RequiredLSN,
-		FenceObservedLSN:      result.Receipt.ObservedLSN,
-		FenceForced:           result.Receipt.Forced,
-		FenceReason:           strings.TrimSpace(result.Receipt.Reason),
+		FenceParentTimelineID: haUint64JSONValue(result.Receipt.ParentTimelineID),
+		FenceParentEpoch:      haUint64JSONValue(result.Receipt.ParentEpoch),
+		FenceNewTimelineID:    haUint64JSONValue(result.Receipt.NewTimelineID),
+		FenceNewEpoch:         haUint64JSONValue(result.Receipt.NewEpoch),
+		FenceRequiredLSN:      haUint64JSONValue(result.Receipt.RequiredLSN),
+		FenceObservedLSN:      haUint64JSONValue(result.Receipt.ObservedLSN),
+		FenceForced:           haBoolJSONValue(result.Receipt.Forced),
+		FenceReason:           haStringJSONValue(result.Receipt.Reason),
 	}
 	if status.SlotName == "" {
 		status.SlotName = strings.TrimSpace(result.Slot.SlotName)
@@ -4133,6 +4137,35 @@ func haReplicationSlotJSONComplete(slot haReplicationSlotJSON) bool {
 		slot.CurrentLSN != nil
 }
 
+func haFenceReceiptJSONComplete(receipt haFenceReceiptJSON) bool {
+	return receipt.Identity.ClusterID != nil &&
+		haUint64JSONValue(receipt.Identity.ClusterID) > 0 &&
+		receipt.Identity.ShardID != nil &&
+		receipt.Identity.TableID != nil &&
+		receipt.Identity.TimelineID != nil &&
+		haUint64JSONValue(receipt.Identity.TimelineID) > 0 &&
+		receipt.Identity.Epoch != nil &&
+		haUint64JSONValue(receipt.Identity.Epoch) > 0 &&
+		strings.TrimSpace(receipt.OldPrimaryID) != "" &&
+		strings.TrimSpace(receipt.PromotedNodeID) != "" &&
+		receipt.ParentTimelineID != nil &&
+		haUint64JSONValue(receipt.ParentTimelineID) > 0 &&
+		receipt.ParentEpoch != nil &&
+		haUint64JSONValue(receipt.ParentEpoch) > 0 &&
+		receipt.NewTimelineID != nil &&
+		haUint64JSONValue(receipt.NewTimelineID) > 0 &&
+		receipt.NewEpoch != nil &&
+		haUint64JSONValue(receipt.NewEpoch) > 0 &&
+		receipt.RequiredLSN != nil &&
+		haUint64JSONValue(receipt.RequiredLSN) > 0 &&
+		receipt.ObservedLSN != nil &&
+		receipt.Generation != nil &&
+		haUint64JSONValue(receipt.Generation) > 0 &&
+		receipt.Forced != nil &&
+		strings.TrimSpace(receipt.Token) != "" &&
+		receipt.Reason != nil
+}
+
 func haDirectAdminActionPayloadComplete(result haDirectAdminActionResultJSON) bool {
 	switch strings.TrimSpace(result.Action.ActionKind) {
 	case "base_backup_begin":
@@ -4148,6 +4181,8 @@ func haDirectAdminActionPayloadComplete(result haDirectAdminActionResultJSON) bo
 		return strings.TrimSpace(result.ManifestID) != "" &&
 			result.BackupLSN > 0 &&
 			result.CheckpointLSN > 0
+	case "fence_acquire":
+		return haFenceReceiptJSONComplete(result.Receipt)
 	default:
 		return true
 	}
@@ -4164,6 +4199,13 @@ func haBoolJSONValue(value *bool) bool {
 	return value != nil && *value
 }
 
+func haStringJSONValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
 func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionResultJSON) bool {
 	return strings.TrimSpace(result.SlotAction) != "" ||
 		strings.TrimSpace(result.Slot.SlotName) != "" ||
@@ -4178,20 +4220,23 @@ func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionRes
 		strings.TrimSpace(result.Action.Target) != "" ||
 		strings.TrimSpace(result.Action.State) != "" ||
 		strings.TrimSpace(result.Action.NodeID) != "" ||
-		result.Receipt.Generation != 0 ||
+		result.Receipt.Generation != nil ||
 		strings.TrimSpace(result.Receipt.Token) != "" ||
-		result.Receipt.Identity.ClusterID != 0 ||
-		result.Receipt.Identity.ShardID != 0 ||
-		result.Receipt.Identity.TableID != 0 ||
+		result.Receipt.Identity.ClusterID != nil ||
+		result.Receipt.Identity.ShardID != nil ||
+		result.Receipt.Identity.TableID != nil ||
+		result.Receipt.Identity.TimelineID != nil ||
+		result.Receipt.Identity.Epoch != nil ||
 		strings.TrimSpace(result.Receipt.OldPrimaryID) != "" ||
 		strings.TrimSpace(result.Receipt.PromotedNodeID) != "" ||
-		result.Receipt.ParentTimelineID != 0 ||
-		result.Receipt.ParentEpoch != 0 ||
-		result.Receipt.NewTimelineID != 0 ||
-		result.Receipt.NewEpoch != 0 ||
-		result.Receipt.RequiredLSN != 0 ||
-		result.Receipt.ObservedLSN != 0 ||
-		strings.TrimSpace(result.Receipt.Reason) != ""
+		result.Receipt.ParentTimelineID != nil ||
+		result.Receipt.ParentEpoch != nil ||
+		result.Receipt.NewTimelineID != nil ||
+		result.Receipt.NewEpoch != nil ||
+		result.Receipt.RequiredLSN != nil ||
+		result.Receipt.ObservedLSN != nil ||
+		result.Receipt.Forced != nil ||
+		result.Receipt.Reason != nil
 }
 
 func requireHADirectFenceAcquireResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, raw []byte) error {

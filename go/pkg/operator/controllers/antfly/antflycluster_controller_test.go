@@ -74,6 +74,32 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 	return string(body)
 }
 
+func haFenceResponseJSONWithoutReceiptPath(path ...string) string {
+	var body map[string]any
+	if err := json.Unmarshal([]byte(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token")), &body); err != nil {
+		panic(err)
+	}
+	var current map[string]any
+	receipt, ok := body["receipt"].(map[string]any)
+	if !ok {
+		panic("fence response missing receipt")
+	}
+	current = receipt
+	for _, segment := range path[:len(path)-1] {
+		next, ok := current[segment].(map[string]any)
+		if !ok {
+			panic("fence response missing nested receipt path")
+		}
+		current = next
+	}
+	delete(current, path[len(path)-1])
+	mutated, err := json.Marshal(body)
+	if err != nil {
+		panic(err)
+	}
+	return string(mutated)
+}
+
 func haReplicationSlotActionResponseJSON(actionKind, slotAction, slotName, nodeID string) string {
 	body, err := json.Marshal(map[string]any{
 		"schema_version": 1,
@@ -3430,6 +3456,18 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(openAPIFence.FenceObservedLSN).To(Equal(uint64(12)))
 	g.Expect(openAPIFence.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIFence.FenceToken).To(Equal("ha-fence-token"))
+
+	_, ok = parseHADirectAdminActionResult([]byte(haFenceResponseJSONWithoutReceiptPath("forced")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHADirectAdminActionResult([]byte(haFenceResponseJSONWithoutReceiptPath("reason")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHADirectAdminActionResult([]byte(haFenceResponseJSONWithoutReceiptPath("generation")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHADirectAdminActionResult([]byte(haFenceResponseJSONWithoutReceiptPath("identity", "epoch")))
+	g.Expect(ok).To(BeFalse())
 }
 
 func TestParseHAAdminActionResultTable(t *testing.T) {
