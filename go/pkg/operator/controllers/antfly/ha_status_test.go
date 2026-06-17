@@ -1011,6 +1011,11 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 	}{
 		{method: "GET", path: haAdminPrimaryStatusPath},
 		{method: "GET", path: haAdminStandbyStatusPath},
+		{method: "POST", path: haAdminCommitCheckPath},
+		{method: "POST", path: haAdminCommitAppendPath},
+		{method: "POST", path: haAdminReadCheckPath},
+		{method: "POST", path: haAdminWriteCheckPath},
+		{method: "POST", path: haAdminOwnerJobCheckPath},
 		{method: "GET", path: haAdminReplicationSlotsPath},
 		{method: "POST", path: haAdminReplicationSlotsPath},
 		{method: "DELETE", path: haAdminReplicationSlotPathPrefix + "{slot_name}"},
@@ -1037,6 +1042,19 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 				t.Fatalf("operator HA admin route %s is missing from specs/openapi/antfly/admin.yaml", key)
 			}
 		})
+	}
+
+	covered := map[string]bool{}
+	for _, route := range routes {
+		covered[route.method+" "+strings.TrimPrefix(route.path, haAdminBasePath)] = true
+	}
+	for key := range operations {
+		if !strings.Contains(key, " /ha/") {
+			continue
+		}
+		if !covered[key] {
+			t.Fatalf("admin OpenAPI HA route %s is not registered in operator HA admin route constants", key)
+		}
 	}
 }
 
