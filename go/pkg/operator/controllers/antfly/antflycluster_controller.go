@@ -4948,28 +4948,16 @@ type haPromotionAPIResult struct {
 	Action        haAdminActionReceiptJSON  `json:"action"`
 	Assessment    haPromotionAssessmentJSON `json:"assessment"`
 	Promotion     struct {
-		NodeID      string `json:"node_id"`
-		SwitchLSN   uint64 `json:"switch_lsn"`
-		OldIdentity struct {
-			ClusterID  uint64 `json:"cluster_id"`
-			ShardID    uint64 `json:"shard_id"`
-			TableID    uint64 `json:"table_id"`
-			TimelineID uint64 `json:"timeline_id"`
-			Epoch      uint64 `json:"epoch"`
-		} `json:"old_identity"`
-		NewIdentity struct {
-			ClusterID  uint64 `json:"cluster_id"`
-			ShardID    uint64 `json:"shard_id"`
-			TableID    uint64 `json:"table_id"`
-			TimelineID uint64 `json:"timeline_id"`
-			Epoch      uint64 `json:"epoch"`
-		} `json:"new_identity"`
-		Forced           bool `json:"forced"`
-		DataLossPossible bool `json:"data_loss_possible"`
+		NodeID           string              `json:"node_id"`
+		SwitchLSN        *uint64             `json:"switch_lsn"`
+		OldIdentity      haAdminIdentityJSON `json:"old_identity"`
+		NewIdentity      haAdminIdentityJSON `json:"new_identity"`
+		Forced           *bool               `json:"forced"`
+		DataLossPossible *bool               `json:"data_loss_possible"`
 	} `json:"promotion"`
 	FenceGeneration uint64 `json:"fence_generation"`
 	FenceToken      string `json:"fence_token"`
-	Forced          bool   `json:"forced"`
+	Forced          *bool  `json:"forced"`
 }
 
 func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
@@ -4977,9 +4965,9 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return haPromotionJobResult{}, false
 	}
-	topLevel := envelope.Promotion.SwitchLSN != 0
+	topLevel := envelope.Promotion.SwitchLSN != nil
 	result := &envelope.haPromotionAPIResult
-	if result.Promotion.SwitchLSN == 0 {
+	if result.Promotion.SwitchLSN == nil {
 		result = envelope.Result.PromoteCurrentFence
 	}
 	if result == nil {
@@ -4988,16 +4976,10 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if result != nil && result.SchemaVersion == 0 {
 		result.SchemaVersion = envelope.SchemaVersion
 	}
-	if result == nil || result.Promotion.SwitchLSN == 0 ||
+	if result == nil ||
 		result.SchemaVersion == 0 ||
 		!haPromotionAssessmentJSONComplete(result.Assessment) ||
-		strings.TrimSpace(result.Promotion.NodeID) == "" ||
-		result.Promotion.OldIdentity.ClusterID == 0 ||
-		result.Promotion.OldIdentity.TimelineID == 0 ||
-		result.Promotion.OldIdentity.Epoch == 0 ||
-		result.Promotion.NewIdentity.ClusterID == 0 ||
-		result.Promotion.NewIdentity.TimelineID == 0 ||
-		result.Promotion.NewIdentity.Epoch == 0 ||
+		!haPromotionResultJSONComplete(result) ||
 		result.FenceGeneration == 0 ||
 		strings.TrimSpace(result.FenceToken) == "" {
 		return haPromotionJobResult{}, false
@@ -5012,7 +4994,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	}
 	requiredLSN := haUint64JSONValue(result.Assessment.RequiredLSN)
 	if requiredLSN == 0 {
-		requiredLSN = result.Promotion.SwitchLSN
+		requiredLSN = haUint64JSONValue(result.Promotion.SwitchLSN)
 	}
 	if observedLSN == 0 {
 		observedLSN = requiredLSN
@@ -5025,24 +5007,36 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		ActionState:      strings.TrimSpace(result.Action.State),
 		ActionNodeID:     strings.TrimSpace(result.Action.NodeID),
 		PromotedNodeID:   strings.TrimSpace(result.Promotion.NodeID),
-		SwitchLSN:        result.Promotion.SwitchLSN,
-		ParentClusterID:  result.Promotion.OldIdentity.ClusterID,
-		ParentShardID:    result.Promotion.OldIdentity.ShardID,
-		ParentTableID:    result.Promotion.OldIdentity.TableID,
-		ParentTimelineID: result.Promotion.OldIdentity.TimelineID,
-		ParentEpoch:      result.Promotion.OldIdentity.Epoch,
-		NewClusterID:     result.Promotion.NewIdentity.ClusterID,
-		NewShardID:       result.Promotion.NewIdentity.ShardID,
-		NewTableID:       result.Promotion.NewIdentity.TableID,
-		NewTimelineID:    result.Promotion.NewIdentity.TimelineID,
-		NewEpoch:         result.Promotion.NewIdentity.Epoch,
+		SwitchLSN:        haUint64JSONValue(result.Promotion.SwitchLSN),
+		ParentClusterID:  haUint64JSONValue(result.Promotion.OldIdentity.ClusterID),
+		ParentShardID:    haUint64JSONValue(result.Promotion.OldIdentity.ShardID),
+		ParentTableID:    haUint64JSONValue(result.Promotion.OldIdentity.TableID),
+		ParentTimelineID: haUint64JSONValue(result.Promotion.OldIdentity.TimelineID),
+		ParentEpoch:      haUint64JSONValue(result.Promotion.OldIdentity.Epoch),
+		NewClusterID:     haUint64JSONValue(result.Promotion.NewIdentity.ClusterID),
+		NewShardID:       haUint64JSONValue(result.Promotion.NewIdentity.ShardID),
+		NewTableID:       haUint64JSONValue(result.Promotion.NewIdentity.TableID),
+		NewTimelineID:    haUint64JSONValue(result.Promotion.NewIdentity.TimelineID),
+		NewEpoch:         haUint64JSONValue(result.Promotion.NewIdentity.Epoch),
 		RequiredLSN:      requiredLSN,
 		ObservedLSN:      observedLSN,
 		FenceGeneration:  result.FenceGeneration,
 		FenceToken:       strings.TrimSpace(result.FenceToken),
-		Forced:           result.Forced || result.Promotion.Forced,
-		DataLossPossible: result.Promotion.DataLossPossible,
+		Forced:           haBoolJSONValue(result.Forced) || haBoolJSONValue(result.Promotion.Forced),
+		DataLossPossible: haBoolJSONValue(result.Promotion.DataLossPossible),
 	}, true
+}
+
+func haPromotionResultJSONComplete(result *haPromotionAPIResult) bool {
+	return result != nil &&
+		strings.TrimSpace(result.Promotion.NodeID) != "" &&
+		result.Promotion.SwitchLSN != nil &&
+		haUint64JSONValue(result.Promotion.SwitchLSN) > 0 &&
+		haAdminIdentityJSONComplete(result.Promotion.OldIdentity) &&
+		haAdminIdentityJSONComplete(result.Promotion.NewIdentity) &&
+		result.Promotion.Forced != nil &&
+		result.Promotion.DataLossPossible != nil &&
+		result.Forced != nil
 }
 
 func haAdminActionReceiptPresent(action haAdminActionReceiptJSON) bool {

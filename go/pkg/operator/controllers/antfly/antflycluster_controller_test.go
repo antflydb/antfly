@@ -100,6 +100,81 @@ func haFenceResponseJSONWithoutReceiptPath(path ...string) string {
 	return string(mutated)
 }
 
+func haPromotionResponseJSON() string {
+	body, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"action": map[string]any{
+			"action_id":   "promotion:standby-a",
+			"action_kind": "promotion",
+			"target":      "standby-a",
+			"state":       "applied",
+			"node_id":     "standby-a",
+		},
+		"assessment": map[string]any{
+			"required_lsn":          12,
+			"received_lsn":          13,
+			"applied_lsn":           11,
+			"has_required_lsn":      true,
+			"caught_up_to_received": false,
+			"fencing_confirmed":     true,
+			"force":                 false,
+			"data_loss_possible":    false,
+			"safe":                  true,
+			"requires_fencing":      false,
+			"requires_force":        false,
+			"can_promote":           true,
+		},
+		"promotion": map[string]any{
+			"node_id":    "standby-a",
+			"switch_lsn": 12,
+			"old_identity": map[string]any{
+				"cluster_id":  100,
+				"shard_id":    10,
+				"table_id":    20,
+				"timeline_id": 4,
+				"epoch":       6,
+			},
+			"new_identity": map[string]any{
+				"cluster_id":  100,
+				"shard_id":    10,
+				"table_id":    20,
+				"timeline_id": 5,
+				"epoch":       7,
+			},
+			"forced":             false,
+			"data_loss_possible": false,
+		},
+		"fence_generation": 3,
+		"fence_token":      "ha-fence-token",
+		"forced":           false,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
+func haPromotionResponseJSONWithoutPath(path ...string) string {
+	var body map[string]any
+	if err := json.Unmarshal([]byte(haPromotionResponseJSON()), &body); err != nil {
+		panic(err)
+	}
+	current := body
+	for _, segment := range path[:len(path)-1] {
+		next, ok := current[segment].(map[string]any)
+		if !ok {
+			panic("promotion response missing nested path")
+		}
+		current = next
+	}
+	delete(current, path[len(path)-1])
+	mutated, err := json.Marshal(body)
+	if err != nil {
+		panic(err)
+	}
+	return string(mutated)
+}
+
 func haReplicationSlotActionResponseJSON(actionKind, slotAction, slotName, nodeID string) string {
 	body, err := json.Marshal(map[string]any{
 		"schema_version": 1,
@@ -3309,7 +3384,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	openAPIResult, ok := parseHAPromotionAPIResult([]byte(haPromotionResponseJSON()))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(openAPIResult.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(openAPIResult.ActionID).To(Equal("promotion:standby-a"))
@@ -3334,6 +3409,21 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(openAPIStatus.ActionKind).To(Equal("promotion"))
 	g.Expect(openAPIStatus.ActionTarget).To(Equal("standby-a"))
 	g.Expect(openAPIStatus.ActionState).To(Equal("applied"))
+
+	_, ok = parseHAPromotionAPIResult([]byte(haPromotionResponseJSONWithoutPath("forced")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHAPromotionAPIResult([]byte(haPromotionResponseJSONWithoutPath("promotion", "forced")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHAPromotionAPIResult([]byte(haPromotionResponseJSONWithoutPath("promotion", "data_loss_possible")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHAPromotionAPIResult([]byte(haPromotionResponseJSONWithoutPath("promotion", "old_identity", "shard_id")))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHAPromotionAPIResult([]byte(haPromotionResponseJSONWithoutPath("promotion", "new_identity", "table_id")))
+	g.Expect(ok).To(BeFalse())
 
 	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
