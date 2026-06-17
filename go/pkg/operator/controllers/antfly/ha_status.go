@@ -646,7 +646,20 @@ func haSamePlannedActionOperation(a antflyv1.HAPlannedActionStatus, b antflyv1.H
 		a.SeedManifestPath == b.SeedManifestPath &&
 		a.SeedContentRoot == b.SeedContentRoot &&
 		a.Reason == b.Reason &&
-		slices.Equal(a.AdminCommand, b.AdminCommand)
+		haSameAdminCommandHint(a, b)
+}
+
+func haSameAdminCommandHint(a antflyv1.HAPlannedActionStatus, b antflyv1.HAPlannedActionStatus) bool {
+	if haPlannedActionUsesTypedAdminAPI(a) && haPlannedActionUsesTypedAdminAPI(b) {
+		return true
+	}
+	return slices.Equal(a.AdminCommand, b.AdminCommand)
+}
+
+func haPlannedActionUsesTypedAdminAPI(action antflyv1.HAPlannedActionStatus) bool {
+	return haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) &&
+		strings.TrimSpace(action.AdminMethod) != "" &&
+		strings.TrimSpace(action.AdminPath) != ""
 }
 
 func parseHAOperatorPlanTable(body string) (haOperatorPlanTable, error) {

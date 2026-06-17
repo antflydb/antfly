@@ -179,6 +179,76 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 	}
 }
 
+func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+	}
+	actions := []haPlannedAction{{
+		Kind:        haActionCreateSlot,
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		TargetLSN:   5,
+		Reason:      "SlotMissing",
+	}}
+
+	initial := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{})
+	if len(initial) != 1 {
+		t.Fatalf("expected one planned action, got %#v", initial)
+	}
+	previous := initial[0]
+	previous.AdminCommand = []string{"legacy-slot-create"}
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1,
+		SlotAction:    "create",
+		SlotName:      "standby-a",
+	}
+
+	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
+	preserved := haPlannedActionStatuses(actions, ha, status)
+	if preserved[0].AdminJobName != haAdminDirectAPIName ||
+		preserved[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+		preserved[0].AdminResult == nil ||
+		preserved[0].AdminResult.SlotAction != "create" {
+		t.Fatalf("expected typed admin execution state to survive CLI hint drift, got %#v", preserved[0])
+	}
+}
+
+func TestHAPlannedActionStatusesRequireAdminCommandMatchForFileBackedActions(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+	}
+	actions := []haPlannedAction{{
+		Kind:             haActionFinishStandbySeed,
+		DependsOn:        haActionSeedStandby,
+		StandbyName:      "standby-a",
+		SeedManifestPath: "/backup/base-standby-a-5.afha",
+		Reason:           "SeedManifestReady",
+	}}
+
+	initial := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{})
+	if len(initial) != 1 {
+		t.Fatalf("expected one planned action, got %#v", initial)
+	}
+	previous := initial[0]
+	previous.AdminCommand = []string{"legacy-seed-finish"}
+	previous.AdminJobName = "seed-finish-job"
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1,
+		ManifestID:    "base-standby-a-5",
+	}
+
+	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
+	notPreserved := haPlannedActionStatuses(actions, ha, status)
+	if notPreserved[0].AdminJobName != "" ||
+		notPreserved[0].AdminJobPhase != "" ||
+		notPreserved[0].AdminResult != nil {
+		t.Fatalf("expected file-backed action with changed command to drop execution state, got %#v", notPreserved[0])
+	}
+}
+
 func TestParseHAOperatorPlanTableActions(t *testing.T) {
 	plan, err := parseHAOperatorPlanTable(strings.Join([]string{
 		"result=operator_plan",
