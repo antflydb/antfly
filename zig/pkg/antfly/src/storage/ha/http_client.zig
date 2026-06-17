@@ -772,7 +772,7 @@ fn validateStandbyBootstrapResponse(response: admin_api.HAStandbyBootstrapRespon
 
 fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
     try validateIdentity(receipt.identity, error.AdminFenceResponseMismatch);
-    if (receipt.old_primary_id.len == 0 or receipt.promoted_node_id.len == 0 or receipt.token.len == 0 or receipt.reason.len == 0) {
+    if (receipt.old_primary_id.len == 0 or receipt.promoted_node_id.len == 0 or receipt.token.len == 0) {
         return error.AdminFenceResponseMismatch;
     }
     if (receipt.parent_timeline_id <= 0 or receipt.parent_epoch <= 0 or receipt.new_timeline_id <= 0 or receipt.new_epoch <= 0) {
@@ -1908,6 +1908,31 @@ test "storage.ha http client rejects mismatched promotion admin responses" {
         .force = false,
         .reason = "http-client-test",
     }));
+}
+
+test "storage.ha http client accepts empty fence receipt reason" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{
+        .body =
+        \\{"schema_version":1,"action":{"action_id":"fence_acquire:standby-a","action_kind":"fence_acquire","target":"standby-a","state":"applied","node_id":"standby-a"},"receipt":{"identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":2,"epoch":2},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":1,"parent_epoch":1,"new_timeline_id":2,"new_epoch":2,"required_lsn":1,"observed_lsn":1,"generation":1,"forced":false,"token":"token","reason":""}}
+        ,
+    };
+    var client = Client.init(alloc, executor.executor());
+
+    var response = try client.acquireFence("http://ha-admin.test", .{
+        .identity = testAdminIdentity(),
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .force = false,
+        .reason = "",
+    });
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqualStrings("", response.parsed.value.receipt.reason);
 }
 
 test "storage.ha http client rejects invalid typed admin responses" {
