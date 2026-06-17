@@ -670,6 +670,51 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	}
 }
 
+func TestHADirectAdminSupportMatchesAdminOperations(t *testing.T) {
+	directActions := []haPlannedAction{
+		{Kind: haActionCreateSlot, StandbyName: "standby-a", SlotName: "standby-a"},
+		{Kind: haActionResumeSlot, StandbyName: "standby-a", SlotName: "standby-a"},
+		{Kind: haActionPauseSlot, StandbyName: "standby-a", SlotName: "standby-a"},
+		{Kind: haActionDropSlot, StandbyName: "standby-a", SlotName: "standby-a"},
+		{Kind: haActionSeedStandby, StandbyName: "standby-a", SlotName: "standby-a"},
+		{Kind: haActionMarkReseed, StandbyName: "standby-a", SlotName: "standby-a"},
+		{Kind: haActionFinishStandbySeed, StandbyName: "standby-a", SeedManifestPath: "/backups/base-standby-a-5.afha"},
+		{Kind: haActionBootstrapStandbySeed, StandbyName: "standby-a", SeedManifestPath: "/backups/base-standby-a-5.afha"},
+		{Kind: haActionAcquireFence, StandbyName: "standby-a"},
+		{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
+		{Kind: haActionDemoteFormerPrimary, StandbyName: "primary-a"},
+		{Kind: haActionRewindFormerPrimary, StandbyName: "primary-a"},
+		{Kind: haActionReseedFormerPrimary, StandbyName: "primary-a"},
+	}
+
+	for _, action := range directActions {
+		t.Run(string(action.Kind), func(t *testing.T) {
+			method, path := haAdminOperation(action)
+			if method == "" || path == "" {
+				t.Fatalf("direct admin action %s has no typed admin operation", action.Kind)
+			}
+			if !haPlannedActionSupportsDirectAdminAPI(action.Kind) {
+				t.Fatalf("direct admin action %s has a typed admin operation but is not directly executable", action.Kind)
+			}
+			if !haActionRequiresAdminResult(action.Kind) {
+				t.Fatalf("direct admin action %s is directly executable without typed result evidence", action.Kind)
+			}
+		})
+	}
+
+	unsupported := haPlannedAction{Kind: haActionUpdatePrimaryRoute, StandbyName: "standby-a"}
+	method, path := haAdminOperation(unsupported)
+	if method != "" || path != "" {
+		t.Fatalf("controller-only action %s unexpectedly has typed admin operation %s %s", unsupported.Kind, method, path)
+	}
+	if haPlannedActionSupportsDirectAdminAPI(unsupported.Kind) {
+		t.Fatalf("controller-only action %s unexpectedly supports direct admin API", unsupported.Kind)
+	}
+	if haActionRequiresAdminResult(unsupported.Kind) {
+		t.Fatalf("controller-only action %s unexpectedly requires admin result evidence", unsupported.Kind)
+	}
+}
+
 func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
