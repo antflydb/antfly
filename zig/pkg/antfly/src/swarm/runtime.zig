@@ -65,6 +65,8 @@ const CliConfig = struct {
     ha_standby_log: ?[]const u8 = null,
     ha_standby_progress: ?[]const u8 = null,
     ha_standby_node_id: ?[]const u8 = null,
+    ha_standby_upstream_url: ?[]const u8 = null,
+    ha_standby_slot: ?[]const u8 = null,
     ha_cluster_id: ?u64 = null,
     ha_shard_id: ?u64 = null,
     ha_table_id: ?u64 = null,
@@ -760,6 +762,7 @@ pub fn runFromIterator(
                 .standby_node_id = cli.ha_standby_node_id,
             },
             .internal_primary = if (ha_primary) |*primary| primary else null,
+            .standby_replication = try haStandbyReplicationConfigFromCli(cli),
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
@@ -1809,6 +1812,14 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.ha_standby_node_id = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-standby-upstream-url")) {
+            cfg.ha_standby_upstream_url = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-standby-slot")) {
+            cfg.ha_standby_slot = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -1988,7 +1999,9 @@ fn haPrimaryRequested(cli: CliConfig) bool {
 fn haStandbyRequested(cli: CliConfig) bool {
     return cli.ha_standby_log != null or
         cli.ha_standby_progress != null or
-        cli.ha_standby_node_id != null;
+        cli.ha_standby_node_id != null or
+        cli.ha_standby_upstream_url != null or
+        cli.ha_standby_slot != null;
 }
 
 fn haIdentityRequested(cli: CliConfig) bool {
@@ -2004,6 +2017,14 @@ fn validateHARole(cli: CliConfig) !void {
     const standby_requested = haStandbyRequested(cli);
     if (primary_requested and standby_requested) return error.HAMultipleRolesConfigured;
     if (haIdentityRequested(cli) and !primary_requested and !standby_requested) return error.HARoleMissing;
+}
+
+fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
+    if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
+    return .{
+        .upstream_base_uri = cli.ha_standby_upstream_url orelse return error.HAStandbyUpstreamUrlMissing,
+        .slot_name = cli.ha_standby_slot orelse return error.HAStandbySlotMissing,
+    };
 }
 
 fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
@@ -2139,6 +2160,8 @@ fn printUsage() void {
         \\  --ha-standby-log <path>               Enable HA standby admin API with this received replication log path
         \\  --ha-standby-progress <path>          HA standby durable receive/apply progress WAL path
         \\  --ha-standby-node-id <id>             HA standby node id for typed admin receipts
+        \\  --ha-standby-upstream-url <url>       Upstream primary URL for continuous standby pull/apply
+        \\  --ha-standby-slot <name>              Upstream replication slot name for continuous standby pull/apply
         \\  --ha-cluster-id <id>                  HA replicated cluster id
         \\  --ha-shard-id <id>                    HA replicated shard id (default: 0)
         \\  --ha-table-id <id>                    HA replicated table id (default: 0)
@@ -2421,6 +2444,10 @@ test "parse cli accepts HA standby runtime flags" {
         "/tmp/ha-standby-progress.wal",
         "--ha-standby-node-id",
         "standby-a",
+        "--ha-standby-upstream-url",
+        "http://primary.antfly.svc:8080",
+        "--ha-standby-slot",
+        "standby-a",
         "--ha-cluster-id",
         "100",
         "--ha-shard-id",
@@ -2440,11 +2467,26 @@ test "parse cli accepts HA standby runtime flags" {
     try std.testing.expectEqualStrings("/tmp/ha-standby.log", cfg.ha_standby_log.?);
     try std.testing.expectEqualStrings("/tmp/ha-standby-progress.wal", cfg.ha_standby_progress.?);
     try std.testing.expectEqualStrings("standby-a", cfg.ha_standby_node_id.?);
+    try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", cfg.ha_standby_upstream_url.?);
+    try std.testing.expectEqualStrings("standby-a", cfg.ha_standby_slot.?);
     try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
     try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
     try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
     try std.testing.expectEqual(@as(u64, 3), cfg.ha_timeline_id.?);
     try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
+
+    const replication_cfg = (try haStandbyReplicationConfigFromCli(cfg)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", replication_cfg.upstream_base_uri);
+    try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
+}
+
+test "swarm HA standby replication flags require upstream and slot" {
+    try std.testing.expectError(error.HAStandbySlotMissing, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
+    }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlMissing, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_slot = "standby-a",
+    }));
 }
 
 test "swarm HA primary identity defaults shard and table to whole instance" {

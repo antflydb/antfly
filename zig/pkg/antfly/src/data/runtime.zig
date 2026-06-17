@@ -1423,6 +1423,15 @@ pub const DataServerConfig = struct {
 pub const DataServerHAConfig = struct {
     admin_context: ?antfly.ha.admin_exec.Context = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
+    standby_replication: ?HAStandbyReplicationConfig = null,
+};
+
+pub const HAStandbyReplicationConfig = struct {
+    upstream_base_uri: []const u8,
+    slot_name: []const u8,
+    options: HAStandbyReplicationOptions = .{},
+    catch_up_until_end_of_wal: bool = false,
+    executor: ?antfly.common.http.RequestExecutor = null,
 };
 
 pub const HAStandbyReplicationOptions = antfly.ha.http_replication_client.ReplicateOptions;
@@ -1740,6 +1749,7 @@ pub const DataServer = struct {
     ha_cfg: DataServerHAConfig = .{},
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
+    ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -2060,6 +2070,37 @@ pub const DataServer = struct {
         );
     }
 
+    fn runHAStandbyReplicationRound(self: *DataServer) !void {
+        const cfg = self.ha_cfg.standby_replication orelse return;
+        const executor = try self.haStandbyReplicationExecutor(cfg);
+        if (cfg.catch_up_until_end_of_wal) {
+            _ = try self.replicateHAStandbyUntilCaughtUp(
+                executor,
+                cfg.upstream_base_uri,
+                cfg.slot_name,
+                cfg.options,
+            );
+        } else {
+            _ = try self.replicateHAStandbyAvailable(
+                executor,
+                cfg.upstream_base_uri,
+                cfg.slot_name,
+                cfg.options,
+            );
+        }
+    }
+
+    fn haStandbyReplicationExecutor(
+        self: *DataServer,
+        cfg: HAStandbyReplicationConfig,
+    ) !antfly.common.http.RequestExecutor {
+        if (cfg.executor) |executor| return executor;
+        if (self.ha_standby_replication_http_executor == null) {
+            self.ha_standby_replication_http_executor = antfly.common.http.StdHttpExecutor.init(self.alloc, .{});
+        }
+        return self.ha_standby_replication_http_executor.?.executor();
+    }
+
     fn haStandbyHandle(self: *DataServer) !*antfly.ha.standby.Standby {
         const ctx = self.ha_cfg.admin_context orelse return error.HAStandbyNotConfigured;
         return ctx.standby orelse error.HAStandbyNotConfigured;
@@ -2151,6 +2192,17 @@ pub const DataServer = struct {
     }
 
     pub fn runRound(self: *DataServer) !void {
+        self.runHAStandbyReplicationRound() catch |err| switch (err) {
+            error.HttpConnectionClosing,
+            error.ConnectionResetByPeer,
+            error.ConnectionRefused,
+            error.BrokenPipe,
+            error.EndOfStream,
+            error.UnexpectedHttpStatus,
+            error.NotListening,
+            => std.log.warn("HA standby replication round skipped err={}", .{err}),
+            else => return err,
+        };
         if (self.data_raft) |raft| {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
@@ -2268,6 +2320,7 @@ pub const DataServer = struct {
         if (self.listener) |*listener| listener.deinit();
         if (self.http_server) |*http_server| http_server.deinit();
         if (self.ha_admin_server) |*server| server.deinit();
+        if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
         if (self.data_raft) |raft| {
             raft.stop();
             raft.deinit();
@@ -2301,6 +2354,7 @@ pub const DataServer = struct {
         self.listener = null;
         self.http_server = null;
         self.ha_admin_server = null;
+        self.ha_standby_replication_http_executor = null;
         self.ha_internal_server = null;
         self.data_raft = null;
         self.data_raft_factory = null;
@@ -13819,22 +13873,22 @@ test "data server pulls and applies HA standby replication through internal HTTP
                 .standby = &standby,
                 .standby_node_id = "standby-a",
             },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .options = .{ .max_records = 1 },
+                .catch_up_until_end_of_wal = true,
+                .executor = primary_internal.executor(),
+            },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
 
-    const result = try server.replicateHAStandbyUntilCaughtUp(
-        primary_internal.executor(),
-        "http://primary.internal.test",
-        "standby-a",
-        .{ .max_records = 1 },
-    );
+    try server.runHAStandbyReplicationRound();
 
-    try std.testing.expectEqual(@as(usize, 1), result.iterations);
-    try std.testing.expectEqual(@as(usize, 1), result.received_count);
-    try std.testing.expectEqual(@as(usize, 1), result.applied_count);
-    try std.testing.expectEqual(@as(u64, 1), result.progress.received_lsn);
-    try std.testing.expectEqual(@as(u64, 1), result.progress.applied_lsn);
+    const progress = standby.currentProgress();
+    try std.testing.expectEqual(@as(u64, 1), progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
 
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
