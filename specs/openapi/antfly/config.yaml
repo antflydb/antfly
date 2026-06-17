@@ -34,6 +34,14 @@ components:
           $ref: "#/components/schemas/TLSInfo"
         remote_content:
           $ref: "../shared/scraping.yaml#/components/schemas/RemoteContentConfig"
+        connections:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ConnectionConfig"
+          description: |
+            Public connection resources keyed by stable connection ID. These
+            are the external systems Antfly can use for inference, external IO,
+            CDC, backups, indexing, agents, and related workflows.
         speech_to_text:
           type: object
           additionalProperties:
@@ -370,6 +378,218 @@ components:
           $ref: "../shared/generating.yaml#/components/schemas/ChainCondition"
           description: "When to try the next generator in chain"
 
+    ConnectionKind:
+      type: string
+      enum:
+        - inference
+        - web_search
+        - external_io
+        - cdc
+      description: Broad physical category for a configured connection.
+    ExternalIoProtocol:
+      type: string
+      enum:
+        - s3
+        - gcs
+        - filesystem
+        - http
+      description: External IO transport protocol.
+    ConnectionConfig:
+      type: object
+      required:
+        - kind
+        - capabilities
+      properties:
+        display_name:
+          type: string
+          description: Optional display name for UIs.
+        provider:
+          type: string
+          description: Provider token for connection kinds that have a provider-level service identity, such as web_search.
+        kind:
+          $ref: "#/components/schemas/ConnectionKind"
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Namespaced actions and workflow uses this connection supports.
+        inference:
+          $ref: "#/components/schemas/InferenceConnectionConfig"
+        web_search:
+          $ref: "#/components/schemas/WebSearchConnectionConfig"
+        external_io:
+          $ref: "#/components/schemas/ExternalIoConnectionConfig"
+        cdc:
+          $ref: "#/components/schemas/CdcConnectionConfig"
+    InferenceConnectionConfig:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          description: Inference provider type, such as openai, anthropic, antfly, ollama, or mock.
+        url:
+          type: string
+          description: Provider endpoint URL when applicable.
+        api_key:
+          type: string
+          description: Provider API key or secret reference. Never returned by inventory APIs.
+        region:
+          type: string
+          description: Cloud region when applicable.
+        project_id:
+          type: string
+          description: Google Cloud project when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        location:
+          type: string
+          description: Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        credentials_path:
+          type: string
+          description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        names:
+          type: array
+          items:
+            type: string
+          description: Optional aliases for this provider instance.
+        configured_model_types:
+          type: array
+          items:
+            type: string
+            enum:
+              - embedder
+              - generator
+              - reranker
+              - chunker
+          description: Model types this connection is configured to serve.
+    WebSearchConnectionConfig:
+      type: object
+      properties:
+        service:
+          type: string
+          description: Provider-specific service flavor, such as agent_search for provider vertex.
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: Maximum ranked results to return.
+        timeout_ms:
+          type: integer
+          description: Provider request timeout in milliseconds.
+        safe_search:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          description: Request provider safe-search filtering.
+        language:
+          type: string
+          description: Preferred result language, such as en.
+        region:
+          type: string
+          description: Preferred result region, such as us.
+        include_content:
+          type: boolean
+          description: Ask the provider to return extracted page content when supported.
+        include_highlights:
+          type: boolean
+          description: Ask the provider to return highlighted passages when supported.
+        api_key:
+          type: string
+          description: Provider API key or secret reference. Never returned by inventory APIs.
+        endpoint:
+          type: string
+          description: Provider endpoint override when applicable.
+        project_id:
+          type: string
+          description: Google Cloud project for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        location:
+          type: string
+          description: Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        data_store:
+          type: string
+          description: Agent Search data store ID for provider vertex.
+        serving_config:
+          type: string
+          description: Agent Search serving config ID for provider vertex.
+        credentials_path:
+          type: string
+          description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        include_domains:
+          type: array
+          items:
+            type: string
+          description: Only include results from these domains when provider supports it.
+        exclude_domains:
+          type: array
+          items:
+            type: string
+          description: Exclude results from these domains when provider supports it.
+    ExternalIoConnectionConfig:
+      type: object
+      required:
+        - protocol
+      properties:
+        protocol:
+          $ref: "#/components/schemas/ExternalIoProtocol"
+        endpoint:
+          type: string
+          description: Custom endpoint URL when configured.
+        buckets:
+          type: array
+          items:
+            type: string
+          description: Buckets this connection is configured for.
+        prefix:
+          type: string
+          description: Key prefix when configured.
+        hosts:
+          type: array
+          items:
+            type: string
+          description: Hosts or base URLs this connection applies to.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: HTTP headers or secret references. Never returned by inventory APIs.
+        access_key_id:
+          type: string
+          description: Object-store access key or secret reference. Never returned by inventory APIs.
+        secret_access_key:
+          type: string
+          description: Object-store secret key or secret reference. Never returned by inventory APIs.
+        session_token:
+          type: string
+          description: Object-store session token or secret reference. Never returned by inventory APIs.
+        use_ssl:
+          type: boolean
+          description: Whether S3-compatible endpoints should use TLS.
+    CdcConnectionConfig:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          description: CDC provider type. Initially postgres.
+        dsn:
+          type: string
+          description: Source DSN or secret reference. Never returned by inventory APIs.
+        table_name:
+          type: string
+          description: Antfly table receiving changes from this CDC source.
+        source_ordinal:
+          type: integer
+          format: uint32
+          description: Zero-based ordinal of the source within the table's CDC runtime.
+        external_table:
+          type: string
+          description: Source-side table or stream name.
+        slot_name:
+          type: string
+          description: Provider replication cursor or slot name when applicable.
+        publication_name:
+          type: string
+          description: Provider publication or stream grouping name when applicable.
     MetadataInfo:
       type: object
       properties:

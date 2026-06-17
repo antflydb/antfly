@@ -19,6 +19,7 @@ pub const Routes = struct {
     pub const readyz = "/readyz";
     pub const status = "/status";
     pub const cluster = "/cluster";
+    pub const connections = "/connections";
     pub const secrets = "/secrets";
     pub const secrets_prefix = "/secrets/";
     pub const auth_v1 = "/auth/v1";
@@ -32,7 +33,21 @@ pub const Routes = struct {
     pub const agents_retrieval = "/agents/retrieval";
     pub const mcp_v1 = "/mcp/v1";
     pub const mcp_v1_prefix = "/mcp/v1/";
+    pub const mcp_v1_extensions = "/mcp/v1/extensions";
+    pub const mcp_v1_extensions_prefix = "/mcp/v1/extensions/";
     pub const a2a = "/a2a";
+    pub const extensions_v1 = "/extensions/v1";
+    pub const extensions_v1_packages = "/extensions/v1/packages";
+    pub const extensions_v1_packages_prefix = "/extensions/v1/packages/";
+    pub const extensions_v1_installed = "/extensions/v1/installed";
+    pub const extensions_v1_installed_prefix = "/extensions/v1/installed/";
+    pub const extension_versions_marker = "/versions/";
+    pub const extension_update_suffix = "/update";
+    pub const extension_drop_suffix = "/drop";
+    pub const extension_enable_suffix = "/enable";
+    pub const extension_disable_suffix = "/disable";
+    pub const extension_objects_suffix = "/objects";
+    pub const extension_config_suffix = "/config";
     pub const agent_card_legacy = "/.well-known/agent.json";
     pub const agent_card = "/.well-known/agent-card.json";
     pub const backup = "/backup";
@@ -106,13 +121,17 @@ pub const Routes = struct {
     pub const documents_marker = "/documents/";
     pub const artifacts_marker = "/artifacts/";
     pub const artifacts_suffix = "/artifacts";
-    pub const reprocess_suffix = ":reprocess";
+    pub const reprocess_suffix = "/reprocess";
     pub const placement_update_suffix = ":placement";
     pub const child_range_batch_suffix = ":child-range-batch";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
     pub const graph_metrics_marker = "/graph-metrics/";
+    pub const reprocess_jobs_suffix = "/reprocess-jobs";
+    pub const reprocess_jobs_marker = "/reprocess-jobs/";
+    pub const advance_suffix = "/advance";
+    pub const cancel_suffix = "/cancel";
 
     pub const TableLookup = struct {
         table_name: []const u8,
@@ -183,6 +202,33 @@ pub const Routes = struct {
         action: []const u8,
     };
 
+    pub const TableArtifact = struct {
+        table_name: []const u8,
+        artifact_name: []const u8,
+    };
+
+    pub const TableDocumentArtifact = struct {
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+    };
+
+    pub const TableDocumentArtifacts = struct {
+        table_name: []const u8,
+        key: []const u8,
+    };
+
+    pub const TableArtifactReprocessJobs = struct {
+        table_name: []const u8,
+        artifact_name: []const u8,
+    };
+
+    pub const TableArtifactReprocessJob = struct {
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    };
+
     pub const SecretPath = struct {
         key: []const u8,
     };
@@ -228,6 +274,23 @@ pub const Routes = struct {
     pub const SubjectRowFilter = struct {
         subject: []const u8,
         table: []const u8,
+    };
+
+    pub const ExtensionPackage = struct {
+        name: []const u8,
+    };
+
+    pub const ExtensionPackageVersion = struct {
+        name: []const u8,
+        version: []const u8,
+    };
+
+    pub const InstalledExtension = struct {
+        name: []const u8,
+    };
+
+    pub const McpExtension = struct {
+        name: []const u8,
     };
 
     pub const GroupLookup = struct {
@@ -621,6 +684,126 @@ pub const Routes = struct {
         };
     }
 
+    pub fn matchTableDocumentArtifact(path: []const u8) ?TableDocumentArtifact {
+        return matchTableDocumentArtifactWithReprocess(path, false);
+    }
+
+    pub fn matchTableDocumentArtifactReprocess(path: []const u8) ?TableDocumentArtifact {
+        return matchTableDocumentArtifactWithReprocess(path, true);
+    }
+
+    pub fn matchTableArtifactReprocess(path: []const u8) ?TableArtifact {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
+        const effective_path = path[0 .. path.len - reprocess_suffix.len];
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    pub fn matchTableArtifactReprocessJobs(path: []const u8) ?TableArtifactReprocessJobs {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, reprocess_jobs_suffix)) return null;
+        const effective_path = path[0 .. path.len - reprocess_jobs_suffix.len];
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_name = rest[artifacts_index + artifacts_marker.len ..];
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+        };
+    }
+
+    pub fn matchTableArtifactReprocessJob(path: []const u8) ?TableArtifactReprocessJob {
+        return matchTableArtifactReprocessJobWithSuffix(path, "");
+    }
+
+    pub fn matchTableArtifactReprocessJobAdvance(path: []const u8) ?TableArtifactReprocessJob {
+        return matchTableArtifactReprocessJobWithSuffix(path, advance_suffix);
+    }
+
+    pub fn matchTableArtifactReprocessJobCancel(path: []const u8) ?TableArtifactReprocessJob {
+        return matchTableArtifactReprocessJobWithSuffix(path, cancel_suffix);
+    }
+
+    fn matchTableArtifactReprocessJobWithSuffix(path: []const u8, suffix: []const u8) ?TableArtifactReprocessJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (suffix.len > 0 and !std.mem.endsWith(u8, path, suffix)) return null;
+        const effective_path = if (suffix.len > 0) path[0 .. path.len - suffix.len] else path;
+        const rest = effective_path[tables_prefix.len..];
+        const artifacts_index = std.mem.indexOf(u8, rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const table_name = rest[0..artifacts_index];
+        const artifact_rest = rest[artifacts_index + artifacts_marker.len ..];
+        const jobs_index = std.mem.indexOf(u8, artifact_rest, reprocess_jobs_marker) orelse return null;
+        const artifact_name = artifact_rest[0..jobs_index];
+        const job_id = artifact_rest[jobs_index + reprocess_jobs_marker.len ..];
+        if (artifact_name.len == 0 or job_id.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        if (std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        if (suffix.len == 0 and (std.mem.endsWith(u8, job_id, advance_suffix) or std.mem.endsWith(u8, job_id, cancel_suffix))) return null;
+        if (std.mem.indexOf(u8, rest, documents_marker) != null) return null;
+        return .{
+            .table_name = table_name,
+            .artifact_name = artifact_name,
+            .job_id = job_id,
+        };
+    }
+
+    pub fn matchTableDocumentArtifacts(path: []const u8) ?TableDocumentArtifacts {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, artifacts_suffix)) return null;
+        const rest = path[tables_prefix.len .. path.len - artifacts_suffix.len];
+        const documents_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = rest[0..documents_index];
+        const key = rest[documents_index + documents_marker.len ..];
+        if (key.len == 0) return null;
+        return .{
+            .table_name = table_name,
+            .key = key,
+        };
+    }
+
+    fn matchTableDocumentArtifactWithReprocess(path: []const u8, reprocess: bool) ?TableDocumentArtifact {
+        const effective_path = if (reprocess) blk: {
+            if (!std.mem.endsWith(u8, path, reprocess_suffix)) return null;
+            break :blk path[0 .. path.len - reprocess_suffix.len];
+        } else blk: {
+            if (std.mem.endsWith(u8, path, reprocess_suffix)) return null;
+            break :blk path;
+        };
+        if (!std.mem.startsWith(u8, effective_path, tables_prefix)) return null;
+        const rest = effective_path[tables_prefix.len..];
+        const documents_index = std.mem.indexOf(u8, rest, documents_marker) orelse return null;
+        if (documents_index == 0) return null;
+        const table_name = rest[0..documents_index];
+        const document_rest = rest[documents_index + documents_marker.len ..];
+        const artifacts_index = std.mem.indexOf(u8, document_rest, artifacts_marker) orelse return null;
+        if (artifacts_index == 0) return null;
+        const key = document_rest[0..artifacts_index];
+        const artifact_name = document_rest[artifacts_index + artifacts_marker.len ..];
+        if (std.mem.endsWith(u8, artifact_name, placement_update_suffix)) return null;
+        if (artifact_name.len == 0 or std.mem.indexOfScalar(u8, artifact_name, '/') != null) return null;
+        return .{
+            .table_name = table_name,
+            .key = key,
+            .artifact_name = artifact_name,
+        };
+    }
+
     pub fn matchSecretPath(path: []const u8) ?SecretPath {
         if (!std.mem.startsWith(u8, path, secrets_prefix)) return null;
         const key = path[secrets_prefix.len..];
@@ -723,6 +906,63 @@ pub const Routes = struct {
             .subject = subject,
             .table = table,
         };
+    }
+
+    pub fn matchExtensionPackage(path: []const u8) ?ExtensionPackage {
+        if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
+        const name = path[extensions_v1_packages_prefix.len..];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
+    pub fn matchExtensionPackageVersion(path: []const u8) ?ExtensionPackageVersion {
+        if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
+        const rest = path[extensions_v1_packages_prefix.len..];
+        const marker_index = std.mem.indexOf(u8, rest, extension_versions_marker) orelse return null;
+        if (marker_index == 0) return null;
+        const name = rest[0..marker_index];
+        const version = rest[marker_index + extension_versions_marker.len ..];
+        if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        if (version.len == 0 or std.mem.indexOfScalar(u8, version, '/') != null) return null;
+        return .{ .name = name, .version = version };
+    }
+
+    pub fn matchInstalledExtension(path: []const u8) ?InstalledExtension {
+        if (!std.mem.startsWith(u8, path, extensions_v1_installed_prefix)) return null;
+        const name = path[extensions_v1_installed_prefix.len..];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
+    pub fn matchInstalledExtensionUpdate(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_update_suffix);
+    }
+
+    pub fn matchInstalledExtensionDrop(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_drop_suffix);
+    }
+
+    pub fn matchInstalledExtensionEnable(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_enable_suffix);
+    }
+
+    pub fn matchInstalledExtensionDisable(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_disable_suffix);
+    }
+
+    pub fn matchInstalledExtensionObjects(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_objects_suffix);
+    }
+
+    pub fn matchInstalledExtensionConfig(path: []const u8) ?InstalledExtension {
+        return matchInstalledExtensionPath(path, extension_config_suffix);
+    }
+
+    pub fn matchMcpExtension(path: []const u8) ?McpExtension {
+        if (!std.mem.startsWith(u8, path, mcp_v1_extensions_prefix)) return null;
+        const name = path[mcp_v1_extensions_prefix.len..];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
     }
 
     pub fn matchGroupLookup(path: []const u8) ?GroupLookup {
@@ -1244,6 +1484,16 @@ pub const Routes = struct {
         return .{ .txn_id = txn_id };
     }
 
+    fn matchInstalledExtensionPath(path: []const u8, suffix: []const u8) ?InstalledExtension {
+        if (!std.mem.startsWith(u8, path, extensions_v1_installed_prefix)) return null;
+        const rest = path[extensions_v1_installed_prefix.len..];
+        if (rest.len <= suffix.len) return null;
+        if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        const name = rest[0 .. rest.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
     const GroupPrefix = struct {
         group_id: u64,
         rest: []const u8,
@@ -1302,6 +1552,32 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("pagerank", graph_metric.metric_name);
     try std.testing.expectEqualStrings("refresh", graph_metric.action);
     try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:refresh") == null);
+    const artifact = Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+    try std.testing.expectEqualStrings("docs", artifact.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", artifact.key);
+    try std.testing.expectEqualStrings("document_units_v1", artifact.artifact_name);
+    const artifacts = Routes.matchTableDocumentArtifacts("/tables/docs/documents/doc%2Fa/artifacts").?;
+    try std.testing.expectEqualStrings("docs", artifacts.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", artifacts.key);
+    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts") == null);
+    const reprocess = Routes.matchTableDocumentArtifactReprocess("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess").?;
+    try std.testing.expectEqualStrings("docs", reprocess.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", reprocess.key);
+    try std.testing.expectEqualStrings("document_units_v1", reprocess.artifact_name);
+    const table_reprocess = Routes.matchTableArtifactReprocess("/tables/docs/artifacts/document_units_v1/reprocess").?;
+    try std.testing.expectEqualStrings("docs", table_reprocess.table_name);
+    try std.testing.expectEqualStrings("document_units_v1", table_reprocess.artifact_name);
+    const table_reprocess_jobs = Routes.matchTableArtifactReprocessJobs("/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
+    try std.testing.expectEqualStrings("docs", table_reprocess_jobs.table_name);
+    try std.testing.expectEqualStrings("document_units_v1", table_reprocess_jobs.artifact_name);
+    const table_reprocess_job = Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
+    try std.testing.expectEqualStrings("42", table_reprocess_job.job_id);
+    const table_reprocess_job_advance = Routes.matchTableArtifactReprocessJobAdvance("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance").?;
+    try std.testing.expectEqualStrings("42", table_reprocess_job_advance.job_id);
+    const table_reprocess_job_cancel = Routes.matchTableArtifactReprocessJobCancel("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/cancel").?;
+    try std.testing.expectEqualStrings("42", table_reprocess_job_cancel.job_id);
+    try std.testing.expect(Routes.matchTableArtifactReprocessJob("/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance") == null);
+    try std.testing.expect(Routes.matchTableDocumentArtifact("/tables/docs/documents/doc:a/artifacts/document_units_v1/reprocess") == null);
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
     try std.testing.expectEqualStrings("docs", algebraic_partials.table_name);
@@ -1331,6 +1607,31 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("group:eng", subject_row_filter.subject);
     try std.testing.expectEqualStrings("docs", subject_row_filter.table);
     const group_lookup = Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a").?;
+    try std.testing.expectEqualStrings("/extensions/v1/packages", Routes.extensions_v1_packages);
+    const extension_package = Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf").?;
+    try std.testing.expectEqualStrings("memoryaf", extension_package.name);
+    try std.testing.expect(Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf/versions/1.0.0") == null);
+    const extension_package_version = Routes.matchExtensionPackageVersion("/extensions/v1/packages/memoryaf/versions/1.0.0").?;
+    try std.testing.expectEqualStrings("memoryaf", extension_package_version.name);
+    try std.testing.expectEqualStrings("1.0.0", extension_package_version.version);
+    const installed_extension = Routes.matchInstalledExtension("/extensions/v1/installed/memoryaf").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension.name);
+    const installed_extension_update = Routes.matchInstalledExtensionUpdate("/extensions/v1/installed/memoryaf/update").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_update.name);
+    const installed_extension_drop = Routes.matchInstalledExtensionDrop("/extensions/v1/installed/memoryaf/drop").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_drop.name);
+    const installed_extension_enable = Routes.matchInstalledExtensionEnable("/extensions/v1/installed/memoryaf/enable").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_enable.name);
+    const installed_extension_disable = Routes.matchInstalledExtensionDisable("/extensions/v1/installed/memoryaf/disable").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_disable.name);
+    const installed_extension_objects = Routes.matchInstalledExtensionObjects("/extensions/v1/installed/memoryaf/objects").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_objects.name);
+    const installed_extension_config = Routes.matchInstalledExtensionConfig("/extensions/v1/installed/memoryaf/config").?;
+    try std.testing.expectEqualStrings("memoryaf", installed_extension_config.name);
+    try std.testing.expect(Routes.matchInstalledExtension("/extensions/v1/installed/memoryaf/update") == null);
+    const mcp_extension = Routes.matchMcpExtension("/mcp/v1/extensions/memoryaf").?;
+    try std.testing.expectEqualStrings("memoryaf", mcp_extension.name);
+    try std.testing.expect(Routes.matchMcpExtension("/mcp/v1/extensions/memoryaf/tools") == null);
     try std.testing.expectEqual(@as(u64, 7), group_lookup.group_id);
     try std.testing.expectEqualStrings("docs", group_lookup.table_name);
     const group_query = Routes.matchGroupQuery("/internal/v1/groups/7/tables/docs/query").?;
@@ -1360,6 +1661,31 @@ test "public api routes compile" {
     const group_fk_action_schedule_progress = Routes.matchGroupForeignKeyActionScheduleProgress("/internal/v1/groups/7/tables/docs/foreign-key-action-schedule-progress").?;
     try std.testing.expectEqual(@as(u64, 7), group_fk_action_schedule_progress.group_id);
     try std.testing.expectEqualStrings("docs", group_fk_action_schedule_progress.table_name);
+    const group_artifact = Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+    try std.testing.expectEqual(@as(u64, 7), group_artifact.group_id);
+    try std.testing.expectEqualStrings("docs", group_artifact.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", group_artifact.key);
+    try std.testing.expectEqualStrings("document_units_v1", group_artifact.artifact_name);
+    const group_artifacts = Routes.matchGroupDocumentArtifacts("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts").?;
+    try std.testing.expectEqual(@as(u64, 7), group_artifacts.group_id);
+    try std.testing.expectEqualStrings("docs", group_artifacts.table_name);
+    try std.testing.expectEqualStrings("doc%2Fa", group_artifacts.key);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts") == null);
+    const group_reprocess = Routes.matchGroupDocumentArtifactReprocess("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess").?;
+    try std.testing.expectEqual(@as(u64, 7), group_reprocess.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_reprocess.artifact_name);
+    const group_placement_update = Routes.matchGroupDocumentArtifactPlacementUpdate("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement").?;
+    try std.testing.expectEqual(@as(u64, 7), group_placement_update.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_placement_update.artifact_name);
+    const group_child_range_batch = Routes.matchGroupDocumentArtifactChildRangeBatch("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch").?;
+    try std.testing.expectEqual(@as(u64, 7), group_child_range_batch.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_child_range_batch.artifact_name);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:placement") == null);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc%2Fa/artifacts/document_units_v1:child-range-batch") == null);
+    const group_table_reprocess = Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/docs/artifacts/document_units_v1/reprocess").?;
+    try std.testing.expectEqual(@as(u64, 7), group_table_reprocess.group_id);
+    try std.testing.expectEqualStrings("document_units_v1", group_table_reprocess.artifact_name);
+    try std.testing.expect(Routes.matchGroupDocumentArtifact("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1/reprocess") == null);
     const group_graph_expand = Routes.matchGroupGraphExpand("/internal/v1/groups/7/tables/docs/graph-expand").?;
     try std.testing.expectEqual(@as(u64, 7), group_graph_expand.group_id);
     const group_graph_hydrate = Routes.matchGroupGraphHydrate("/internal/v1/groups/7/tables/docs/graph-hydrate").?;

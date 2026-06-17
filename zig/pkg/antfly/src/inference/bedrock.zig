@@ -254,6 +254,32 @@ pub const Provider = struct {
     }
 };
 
+/// Fetch the Bedrock control-plane foundation-models listing for a region.
+/// Returns the raw JSON response body; the caller owns it.
+pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Client, region: []const u8, endpoint_override: ?[]const u8, timeout_ms: u64) ![]u8 {
+    var creds = try resolveCredentialsUncached(alloc, http, region);
+    defer creds.deinit(alloc);
+
+    const default_endpoint = try std.fmt.allocPrint(alloc, "https://bedrock.{s}.amazonaws.com", .{region});
+    defer alloc.free(default_endpoint);
+    const endpoint = try endpointBaseAlloc(alloc, endpoint_override orelse default_endpoint);
+    defer alloc.free(endpoint);
+    const host = try endpointHostAlloc(alloc, endpoint);
+    defer alloc.free(host);
+    const path = "/foundation-models";
+    const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ endpoint, path });
+    defer alloc.free(url);
+
+    const signed = try signRequestHeadersAlloc(alloc, creds, region, "GET", host, path, "");
+    defer freeHeaderPairs(alloc, signed);
+
+    var resp = try http.request(.GET, url, .{ .headers = signed, .timeout_ms = timeout_ms });
+    defer resp.deinit();
+    if (!resp.ok()) return mapStatus(resp.status.code);
+    const body = resp.body orelse return error.EmptyResponse;
+    return try alloc.dupe(u8, body);
+}
+
 fn isCohereV4(model: []const u8) bool {
     return std.mem.startsWith(u8, model, "cohere.embed-v4");
 }
@@ -788,6 +814,10 @@ fn daysFromCivil(year_in: i64, month_in: u8, day_in: u8) i64 {
 }
 
 fn signHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, host: []const u8, path: []const u8, body: []const u8) ![]HeaderPair {
+    return try signRequestHeadersAlloc(alloc, creds, region, "POST", host, path, body);
+}
+
+fn signRequestHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, method: []const u8, host: []const u8, path: []const u8, body: []const u8) ![]HeaderPair {
     const timestamp = currentUnixSeconds();
     const amz_date = try formatAmzDateAlloc(alloc, timestamp);
     errdefer alloc.free(amz_date);
@@ -799,21 +829,21 @@ fn signHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []cons
     var headers = std.ArrayListUnmanaged(HeaderPair).empty;
     errdefer freeHeaderPairs(alloc, headers.items);
     try headers.append(alloc, .{ try alloc.dupe(u8, "accept"), try alloc.dupe(u8, "application/json") });
-    try headers.append(alloc, .{ try alloc.dupe(u8, "content-type"), try alloc.dupe(u8, "application/json") });
+    if (body.len > 0) try headers.append(alloc, .{ try alloc.dupe(u8, "content-type"), try alloc.dupe(u8, "application/json") });
     try headers.append(alloc, .{ try alloc.dupe(u8, "host"), try alloc.dupe(u8, host) });
     try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-content-sha256"), try alloc.dupe(u8, payload_hash) });
     try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-date"), amz_date });
     if (creds.session_token) |token| try headers.append(alloc, .{ try alloc.dupe(u8, "x-amz-security-token"), try alloc.dupe(u8, token) });
-    const auth = try authorizationValueAlloc(alloc, creds, region, path, headers.items, payload_hash, amz_date, scope_date);
+    const auth = try authorizationValueAlloc(alloc, creds, region, method, path, headers.items, payload_hash, amz_date, scope_date);
     errdefer alloc.free(auth);
     try headers.append(alloc, .{ try alloc.dupe(u8, "authorization"), auth });
     return try headers.toOwnedSlice(alloc);
 }
 
-fn authorizationValueAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, path: []const u8, headers: []const HeaderPair, payload_hash: []const u8, amz_date: []const u8, scope_date: []const u8) ![]u8 {
+fn authorizationValueAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, method: []const u8, path: []const u8, headers: []const HeaderPair, payload_hash: []const u8, amz_date: []const u8, scope_date: []const u8) ![]u8 {
     var canonical_headers = try canonicalHeadersAlloc(alloc, headers);
     defer canonical_headers.deinit(alloc);
-    const canonical_request = try std.fmt.allocPrint(alloc, "POST\n{s}\n\n{s}\n{s}\n{s}", .{ path, canonical_headers.header_block, canonical_headers.signed_headers, payload_hash });
+    const canonical_request = try std.fmt.allocPrint(alloc, "{s}\n{s}\n\n{s}\n{s}\n{s}", .{ method, path, canonical_headers.header_block, canonical_headers.signed_headers, payload_hash });
     defer alloc.free(canonical_request);
     const canonical_hash = try sha256HexAlloc(alloc, canonical_request);
     defer alloc.free(canonical_hash);
@@ -1126,9 +1156,40 @@ pub fn testBedrockSignerUsesBedrockServiceScope() !void {
         .{ "x-amz-date", "20260102T030405Z" },
         .{ "x-amz-content-sha256", "hash" },
     };
-    const auth = try authorizationValueAlloc(alloc, creds, "us-east-1", "/model/amazon.titan-embed-image-v1/invoke", &headers, "hash", "20260102T030405Z", "20260102");
+    const auth = try authorizationValueAlloc(alloc, creds, "us-east-1", "POST", "/model/amazon.titan-embed-image-v1/invoke", &headers, "hash", "20260102T030405Z", "20260102");
     defer alloc.free(auth);
     try std.testing.expect(std.mem.indexOf(u8, auth, "/bedrock/aws4_request") != null);
+}
+
+pub fn testBedrockSignerSignsGetRequests() !void {
+    const alloc = std.testing.allocator;
+    const creds = Credentials{ .access_key_id = "AKIA", .secret_access_key = "secret" };
+    const headers = [_]HeaderPair{
+        .{ "host", "bedrock.us-east-1.amazonaws.com" },
+        .{ "x-amz-date", "20260102T030405Z" },
+        .{ "x-amz-content-sha256", "hash" },
+    };
+    const get_auth = try authorizationValueAlloc(alloc, creds, "us-east-1", "GET", "/foundation-models", &headers, "hash", "20260102T030405Z", "20260102");
+    defer alloc.free(get_auth);
+    try std.testing.expect(std.mem.indexOf(u8, get_auth, "/bedrock/aws4_request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_auth, "SignedHeaders=host;x-amz-content-sha256;x-amz-date") != null);
+
+    // The method participates in the canonical request, so GET and POST
+    // signatures over otherwise identical inputs must differ.
+    const post_auth = try authorizationValueAlloc(alloc, creds, "us-east-1", "POST", "/foundation-models", &headers, "hash", "20260102T030405Z", "20260102");
+    defer alloc.free(post_auth);
+    try std.testing.expect(!std.mem.eql(u8, get_auth, post_auth));
+
+    // GET requests sign an empty payload and omit content-type.
+    const signed = try signRequestHeadersAlloc(alloc, creds, "us-east-1", "GET", "bedrock.us-east-1.amazonaws.com", "/foundation-models", "");
+    defer freeHeaderPairs(alloc, signed);
+    for (signed) |pair| {
+        try std.testing.expect(!std.mem.eql(u8, pair[0], "content-type"));
+        if (std.mem.eql(u8, pair[0], "x-amz-content-sha256")) {
+            // SHA-256 of the empty string.
+            try std.testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", pair[1]);
+        }
+    }
 }
 
 pub fn testEndpointHostIncludesExplicitPort() !void {
@@ -1184,6 +1245,10 @@ test "bedrock invoke path escapes model id" {
 
 test "bedrock signer uses bedrock service scope" {
     try testBedrockSignerUsesBedrockServiceScope();
+}
+
+test "bedrock signer signs get requests" {
+    try testBedrockSignerSignsGetRequests();
 }
 
 test "endpoint host includes explicit port" {

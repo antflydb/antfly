@@ -12,31 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const build_options = @import("build_options");
 const std = @import("std");
-const decoder_bitnet_runtime = if (build_options.enable_mlx) @import("backends/decoder_bitnet_runtime.zig") else struct {};
-const decoder_gated_runtime = if (build_options.enable_mlx) @import("backends/decoder_gated_runtime.zig") else struct {};
-const decoder_rms_runtime = if (build_options.enable_mlx) @import("backends/decoder_rms_runtime.zig") else struct {};
 const ops = @import("ops/ops.zig");
-const mlx_compute = if (build_options.enable_mlx) @import("ops/mlx_compute.zig") else struct {};
-const mlx_quant = if (build_options.enable_mlx) @import("backends/mlx_quant.zig") else struct {};
 const gpt_arch = @import("architectures/gpt.zig");
 
-pub fn fallbackMlxTimingSnapshot() ops.BackendDebugTimingSnapshot {
-    if (!build_options.enable_mlx) return .{};
-    return .{
-        .native_quant_null = false,
-        .provider = mlx_quant.getTimingStats(),
-        .quant = mlx_compute.getQuantExecutionTimingStats(),
-    };
+pub fn fallbackGpuTimingSnapshot() ops.BackendDebugTimingSnapshot {
+    return .{};
 }
 
-pub fn resetLiveMlxTimingStats(cb: *const ops.ComputeBackend) void {
-    if (!build_options.enable_mlx) return;
+pub fn resetLiveGpuTimingStats(cb: *const ops.ComputeBackend) void {
     cb.resetDebugTimingStats();
-    decoder_rms_runtime.resetTimingStats();
-    decoder_gated_runtime.resetTimingStats();
-    decoder_bitnet_runtime.resetTimingStats();
 }
 
 pub fn printBackendTimingDetails(
@@ -47,7 +32,6 @@ pub fn printBackendTimingDetails(
 ) void {
     const prefix = switch (backend_kind) {
         .metal => "metal",
-        .mlx => "mlx",
         else => "backend",
     };
     const provider_stats = backend_stats.provider;

@@ -72,7 +72,7 @@ pub const KvStorage = struct {
         setTargetMaxBlocks: *const fn (*anyopaque, ?usize) void,
 
         /// Escape hatch for consumers that still require the concrete host pool
-        /// (MLX paged cache rebuild, tests that poke at refcounts). Device
+        /// (paged cache rebuild, tests that poke at refcounts). Device
         /// impls return null — callers then pick an alternate code path.
         hostPool: *const fn (*anyopaque) ?*pool_mod.KvPool,
     };

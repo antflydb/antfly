@@ -25,6 +25,7 @@
 //! server-specific metrics sources (raft metrics, serverless metrics, etc).
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Io = std.Io;
 const http_common = @import("http/http_common.zig");
 const std_http_listener = @import("http/std_http_listener.zig");
@@ -407,7 +408,7 @@ fn buildMetricsBody(alloc: std.mem.Allocator, metrics: ?MetricsWriter) ![]u8 {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 // ---------------------------------------------------------------------------

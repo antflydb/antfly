@@ -7,6 +7,7 @@ export interface TableContextType {
   selectedTable: string;
   setSelectedTable: (name: string) => void;
   embeddingIndexes: string[];
+  graphIndexes: string[];
   /** All searchable indexes (embedding + full-text) for chat */
   chatIndexes: string[];
   isLoadingIndexes: boolean;

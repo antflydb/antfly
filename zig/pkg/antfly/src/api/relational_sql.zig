@@ -73959,6 +73959,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR NO KEY UPDATE NOWAIT RETURNING id",
         },
         .{
+            .name = "unsupported claimed update share row lock mode",
+            .family = .unsupported_update_source,
+            .plan = "unsupported:update_source:requires=row_lock_mode_plan",
+            .classification_reason = "row_lock_mode_plan",
+            .sql = "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id",
+        },
+        .{
             .name = "unsupported claimed update non-target row lock",
             .family = .unsupported_update_source,
             .plan = "unsupported:update_source:requires=row_lock_mode_plan",

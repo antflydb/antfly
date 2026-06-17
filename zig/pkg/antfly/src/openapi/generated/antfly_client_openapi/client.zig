@@ -31,6 +31,15 @@ pub fn ApiResponse(comptime T: type) type {
     };
 }
 
+pub const ListConnectionsParams = struct {
+    /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
+    types: ?[]const u8 = null,
+    /// Comma-separated list of expansions. Supported value: "models" — live-query each inference provider's model listing API.
+    include: ?[]const u8 = null,
+    /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
+    refresh: ?[]const u8 = null,
+};
+
 pub const CleanupTransactionSessionsParams = struct {
     cutoff_ns: ?[]const u8 = null,
 };
@@ -121,6 +130,41 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.ClusterTopology).fromResponse(self.allocator, &resp);
+    }
+
+    /// List configured external connections
+    /// GET /db/v1/connections
+    pub fn listConnections(self: *@This(), params: ListConnectionsParams) !ApiResponse(types.ConnectionsResponse) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections", .{self.base_url});
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.types) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "types=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.include) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "include=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (params.refresh) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "refresh=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ConnectionsResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List secrets status
@@ -685,9 +729,9 @@ pub const Client = struct {
     }
 
     /// Reprocess a derived document artifact across a table range
-    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}:reprocess
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, artifact_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess", .{ self.base_url, table_name, artifact_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -716,18 +760,18 @@ pub const Client = struct {
     }
 
     /// Advance a derived document artifact reprocess job
-    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:advance
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance
     pub fn advanceDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}:advance", .{ self.base_url, table_name, artifact_name, job_id });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/advance", .{ self.base_url, table_name, artifact_name, job_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
     }
 
     /// Cancel a derived document artifact reprocess job
-    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}:cancel
+    /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel
     pub fn cancelDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}:cancel", .{ self.base_url, table_name, artifact_name, job_id });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/cancel", .{ self.base_url, table_name, artifact_name, job_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
@@ -757,9 +801,9 @@ pub const Client = struct {
     }
 
     /// Reprocess a derived document artifact
-    /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}:reprocess
+    /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}:reprocess", .{ self.base_url, table_name, key, artifact_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}/reprocess", .{ self.base_url, table_name, key, artifact_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
@@ -1209,6 +1253,122 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferencePredictResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List available packages.
+    /// GET /extensions/v1/packages
+    pub fn listExtensionPackages(self: *@This()) !ApiResponse([]const types.PackageManifest) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.PackageManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get available package metadata.
+    /// GET /extensions/v1/packages/{name}
+    pub fn getExtensionPackage(self: *@This(), name: []const u8) !ApiResponse(types.PackageManifest) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PackageManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get a specific immutable package version.
+    /// GET /extensions/v1/packages/{name}/versions/{version}
+    pub fn getExtensionPackageVersion(self: *@This(), name: []const u8, version: []const u8) !ApiResponse(types.PackageManifest) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}/versions/{s}", .{ self.base_url, name, version });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.PackageManifest).fromResponse(self.allocator, &resp);
+    }
+
+    /// List installed extensions.
+    /// GET /extensions/v1/installed
+    pub fn listInstalledExtensions(self: *@This()) !ApiResponse([]const types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.InstalledExtension).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get an installed extension.
+    /// GET /extensions/v1/installed/{name}
+    pub fn getInstalledExtension(self: *@This(), name: []const u8) !ApiResponse(types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
+    }
+
+    /// Install a package as an extension.
+    /// POST /extensions/v1/installed/{name}
+    pub fn installExtension(self: *@This(), name: []const u8, body: types.InstallExtensionRequest) !ApiResponse(types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
+    }
+
+    /// Update an installed extension.
+    /// POST /extensions/v1/installed/{name}/update
+    pub fn updateInstalledExtension(self: *@This(), name: []const u8, body: types.UpdateExtensionRequest) !ApiResponse(types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/update", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop an installed extension.
+    /// POST /extensions/v1/installed/{name}/drop
+    pub fn dropInstalledExtension(self: *@This(), name: []const u8, body: types.DropExtensionRequest) !ApiResponse(types.DropExtensionResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/drop", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DropExtensionResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// List objects owned by an installed extension.
+    /// GET /extensions/v1/installed/{name}/objects
+    pub fn listInstalledExtensionObjects(self: *@This(), name: []const u8) !ApiResponse([]const types.ExtensionMember) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/objects", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.ExtensionMember).fromResponse(self.allocator, &resp);
+    }
+
+    /// Enable a disabled installed extension.
+    /// POST /extensions/v1/installed/{name}/enable
+    pub fn enableInstalledExtension(self: *@This(), name: []const u8) !ApiResponse(types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/enable", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
+    }
+
+    /// Disable an installed extension without dropping owned state.
+    /// POST /extensions/v1/installed/{name}/disable
+    pub fn disableInstalledExtension(self: *@This(), name: []const u8) !ApiResponse(types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/disable", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
+    }
+
+    /// Replace installed extension configuration.
+    /// PUT /extensions/v1/installed/{name}/config
+    pub fn configureInstalledExtension(self: *@This(), name: []const u8, body: types.ConfigureExtensionRequest) !ApiResponse(types.InstalledExtension) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/config", .{ self.base_url, name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
     }
 
     fn authHeaders(self: *const @This()) ?[]const [2][]const u8 {

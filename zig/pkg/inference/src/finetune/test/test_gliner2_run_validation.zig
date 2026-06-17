@@ -379,9 +379,6 @@ test "GLiNER2 autodiff run validator rejects non-resident Metal optimizer metric
     try std.testing.expectError(error.OptimizerBackendMismatch, validation.validateRun(allocator, out_dir, .{
         .require_optimizer_backend = "metal",
     }));
-    try std.testing.expectError(error.OptimizerBackendMismatch, validation.validateRun(allocator, out_dir, .{
-        .require_optimizer_backend = "mlx",
-    }));
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = metrics_path, .data = "{\"event\":\"step\",\"loss\":1.0,\"supervised_token_count\":4,\"entity_token_count\":1,\"ignored_token_count\":0,\"target_build_ms\":1.0,\"train_step_ms\":9.0,\"step_wall_ms\":10.0,\"graph_build_ms\":1.0,\"runtime_input_ms\":1.0,\"autodiff_ms\":2.0,\"execute_ms\":3.0,\"extract_ms\":1.0,\"optimizer_update_ms\":1.0,\"device_optimizer_ms\":0.5,\"optimizer_backend\":\"metal\",\"device_resident_transfer_count\":1,\"device_trainable_bytes\":128,\"trainer_total_ms\":8.0,\"peak_resident_bytes\":1024,\"supervised_tokens_per_second\":400.0}\n{\"event\":\"epoch\",\"avg_loss\":1.0}\n" });
 

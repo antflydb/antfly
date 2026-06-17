@@ -25,6 +25,7 @@ pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
+pub const list_models = @import("list_models.zig");
 
 pub const Embedder = types.Embedder;
 pub const Generator = types.Generator;
@@ -44,6 +45,7 @@ test "inference module compiles" {
     _ = openai;
     _ = vertex;
     _ = managed_embedder;
+    _ = list_models;
 }
 
 test "bedrock provider request helpers" {
@@ -58,6 +60,7 @@ test "bedrock provider request helpers" {
     try bedrock.testRequestShapeBatchesByProviderRequest();
     try bedrock.testBedrockInvokePathEscapesModelId();
     try bedrock.testBedrockSignerUsesBedrockServiceScope();
+    try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
 }
 
@@ -67,4 +70,8 @@ test "managed embedder resolves file-backed api key rotation at request time" {
 
 test "managed embedder dimension probe validation modes" {
     try managed_embedder.testDimensionProbeValidationModes();
+}
+
+test "managed embedder artifact backed embedding translation" {
+    try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }

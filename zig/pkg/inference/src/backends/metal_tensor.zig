@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// MetalTensor — MLX-free tensor wrapper for the Metal runtime's public surface.
+// MetalTensor — JIT-free tensor wrapper for the Metal runtime's public surface.
 //
 // Carries host-backed storage (`data`/`len` pointing into c_allocator memory,
 // the original representation) and — optionally — an attached device-backed

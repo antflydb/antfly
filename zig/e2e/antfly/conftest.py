@@ -254,7 +254,7 @@ def raise_request_error_with_logs(
     ) from err
 
 
-def _read_log_tail(path: Path, *, limit: int = 20000) -> str:
+def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     if not path.exists():
         return ""
     data = path.read_text(errors="replace")

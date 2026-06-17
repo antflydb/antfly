@@ -53,7 +53,11 @@ fi
 
 export ANTFLY_BIN="${ANTFLY_BIN:-./zig-out/bin/antfly}"
 export ANTFLY_LSM_OPEN_DEBUG="${ANTFLY_LSM_OPEN_DEBUG:-1}"
-export ANTFLY_FS_PATH_DEBUG="${ANTFLY_FS_PATH_DEBUG:-1}"
+# ANTFLY_FS_PATH_DEBUG is intentionally not defaulted on: it logs one line per
+# path component on every filesystem op (~8k lines/s per node), slowing the
+# servers and flooding the per-node log tails captured on failure until they
+# carry no diagnostic signal. Export it explicitly when chasing an
+# fs-path-specific bug.
 
 if [[ "$#" -gt 0 ]]; then
   antfly_args=("$@")

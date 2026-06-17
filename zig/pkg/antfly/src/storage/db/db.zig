@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -3634,6 +3635,189 @@ pub const DB = struct {
             steps += 1;
         }
         return steps;
+    }
+
+    pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        var steps: usize = 0;
+        while (steps < max_steps) : (steps += 1) {
+            var progressed = false;
+            if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) progressed = true;
+            if (try self.core.index_manager.runLsmObsoleteReclaimDue()) progressed = true;
+
+            if (!progressed) {
+                const wake_due = if (self.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
+                if (!wake_due) break;
+                if (!try self.runLsmMaintenanceStep()) break;
+            }
+        }
+        return steps;
+    }
+
+    test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        var key_buf: [16]u8 = undefined;
+        for (0..4) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
+                .sync_level = .write,
+            });
+            switch (db.core.primary_store_owner) {
+                .lsm => |*owner| try owner.handle.backend.sync(true),
+                else => return error.SkipZigTest,
+            }
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
+            else => return error.SkipZigTest,
+        }
+
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
+            else => return error.SkipZigTest,
+        }
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try expectObsoletePathsReclaimable(dense_backend, 1);
+        try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
+    }
+
+    /// A queued obsolete path only counts as reclaimable once no reader pins
+    /// the backend; transient background readers (index loads, status probes)
+    /// mask it as pinned_by_readers for a moment. Poll instead of asserting a
+    /// single snapshot so loaded CI machines don't flake.
+    fn expectObsoletePathsReclaimable(backend: *lsm_backend_mod.Backend, expected: u64) !void {
+        var attempts: usize = 0;
+        while (backend.snapshotMaintenanceStats().obsolete_paths_reclaimable != expected) : (attempts += 1) {
+            if (attempts >= 2000) {
+                return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+
+    test "db primary lsm maintenance step does not reclaim index obsolete paths" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .primary_backend = .{ .lsm = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            } },
+            .index_backends = .{
+                .dense_lsm_options = .{
+                    .flush_threshold = 1,
+                    .defer_flush_on_commit = true,
+                    .l0_soft_limit_runs = 100,
+                    .obsolete_retention_ns = 0,
+                },
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+        });
+
+        const primary_backend = switch (db.core.primary_store_owner) {
+            .lsm => |*owner| owner.handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
+        const primary_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, primary_root, 888_888);
+        defer alloc.free(primary_obsolete_path);
+
+        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+        const dense_backend = switch (dense_entry.index.env_owner) {
+            .lsm => |*handle| handle.backend,
+            else => return error.SkipZigTest,
+        };
+        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+        const dense_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+        defer alloc.free(dense_obsolete_path);
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, primary_obsolete_path, "primary obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, primary_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, primary_backend, locked);
+            try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, primary_obsolete_path));
+            primary_backend.manifest_dirty = false;
+        }
+
+        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, dense_obsolete_path, "dense obsolete");
+        {
+            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
+            dense_backend.manifest_dirty = false;
+        }
+
+        try expectObsoletePathsReclaimable(primary_backend, 1);
+        try expectObsoletePathsReclaimable(dense_backend, 1);
+
+        _ = try db.runPrimaryLsmMaintenanceStep();
+
+        try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
+        try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
+        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+        const dense_bytes = try dense_backend.storage.?.readFileAlloc(alloc, dense_obsolete_path, 1024);
+        alloc.free(dense_bytes);
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
@@ -34998,13 +35182,8 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 .compact_text_segment_threshold = null,
                 .defer_text_compaction = true,
             };
-            const delete_keys = if (batch.deleted_keys.len == 0)
-                batch.overwritten_doc_keys
-            else if (batch.overwritten_doc_keys.len == 0)
-                batch.deleted_keys
-            else
-                try collectCombinedDeleteKeys(ctx.alloc, batch.deleted_keys, batch.overwritten_doc_keys);
-            defer if (batch.deleted_keys.len > 0 and batch.overwritten_doc_keys.len > 0) ctx.alloc.free(delete_keys);
+            const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
+            defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
 
             const missing_required = try applyTextDocumentsForIndex(
                 ctx.alloc,
@@ -35796,11 +35975,30 @@ fn collectDocumentWritesProfiled(
     };
 }
 
-fn collectCombinedDeleteKeys(alloc: Allocator, deleted_keys: []const []const u8, overwritten_doc_keys: []const []const u8) ![]const []const u8 {
-    const combined = try alloc.alloc([]const u8, deleted_keys.len + overwritten_doc_keys.len);
-    @memcpy(combined[0..deleted_keys.len], deleted_keys);
-    @memcpy(combined[deleted_keys.len..], overwritten_doc_keys);
-    return combined;
+fn appendUniqueBorrowedKey(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+) !void {
+    if (key.len == 0) return;
+    for (out.items) |existing| {
+        if (std.mem.eql(u8, existing, key)) return;
+    }
+    try out.append(alloc, key);
+}
+
+fn collectTextReplayDeleteKeys(alloc: Allocator, batch: derived_types.DerivedBatch) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+
+    for (batch.deleted_keys) |key| try appendUniqueBorrowedKey(alloc, &keys, key);
+    for (batch.overwritten_doc_keys) |key| try appendUniqueBorrowedKey(alloc, &keys, key);
+    for (batch.documents) |doc| {
+        if (doc.action != .upsert) continue;
+        try appendUniqueBorrowedKey(alloc, &keys, doc.key);
+    }
+
+    return try keys.toOwnedSlice(alloc);
 }
 
 fn denseEmbeddingDocKeySet(
@@ -45361,7 +45559,7 @@ const FakePromotionSink = struct {
     fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const t = try self.alloc.dupe(u8, table);
         errdefer self.alloc.free(t);
@@ -45373,7 +45571,7 @@ const FakePromotionSink = struct {
     }
 
     fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         for (self.upserts.items) |u| {
             if (std.mem.eql(u8, u.key, key)) return u.doc;
@@ -46734,8 +46932,9 @@ test "db async asset producer mention edges come from resolution artifacts" {
             .key = "doc:a",
             .value = "{\"body\":\"Ada mention\"}",
         }},
-        .sync_level = .write,
+        .sync_level = .enrichments,
     });
+    try db.runUntilIdle();
     try db.runUntilIdle();
 
     try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
@@ -62825,13 +63024,16 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
     const entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, @intCast(total_docs)), entry.index.stats().active_count);
 
-    const first_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", 1)) orelse return error.TestUnexpectedResult;
+    const first_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:00000000")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(denseTestVectorId("doc:00000000"), first_vector_id);
+    const first_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", first_vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(first_doc);
     try std.testing.expectEqualStrings("doc:00000000", first_doc);
 
-    const last_vector_id: u64 = @intCast(total_docs);
     const expected_last_doc = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{total_docs - 1});
     defer alloc.free(expected_last_doc);
+    const last_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", expected_last_doc)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(denseTestVectorId(expected_last_doc), last_vector_id);
     const last_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", last_vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(last_doc);
     try std.testing.expectEqualStrings(expected_last_doc, last_doc);
@@ -63599,6 +63801,31 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
     try std.testing.expectEqual(@as(usize, 0), writes.missing_required);
     try std.testing.expectEqualStrings("doc:z", writes.items[0].key);
     try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", writes.items[0].value);
+}
+
+test "text replay delete keys include upserted derived document keys" {
+    const alloc = std.testing.allocator;
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"new\"}" },
+        .{ .key = "ignored", .action = .delete },
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"newer\"}" },
+    };
+    const deleted = [_][]const u8{"deleted:1"};
+    const overwritten = [_][]const u8{ "chunk:1", "overwritten:1" };
+    const batch = derived_types.DerivedBatch{
+        .documents = &docs,
+        .deleted_keys = &deleted,
+        .overwritten_doc_keys = &overwritten,
+    };
+
+    const keys = try collectTextReplayDeleteKeys(alloc, batch);
+    defer alloc.free(keys);
+
+    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqualStrings("deleted:1", keys[0]);
+    try std.testing.expectEqualStrings("chunk:1", keys[1]);
+    try std.testing.expectEqualStrings("overwritten:1", keys[2]);
 }
 
 test "db replay respects per-index applied watermarks" {
@@ -70678,6 +70905,7 @@ test "db search filters expired documents when ttl schema is configured" {
         .kind = .full_text,
         .config_json = "{}",
     });
+    try db.runUntilIdle();
 
     var text = try db.search(alloc, .{
         .index_name = "ft_v1",
@@ -70734,6 +70962,7 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
         .kind = .full_text,
         .config_json = "{}",
     });
+    try db.runUntilIdle();
 
     var text = try db.search(alloc, .{
         .index_name = "ft_v1",

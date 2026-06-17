@@ -129,6 +129,10 @@ pub fn runFromArgs(
         try inference.compare_generate.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "finetune")) {
         try inference.finetune_cli.main(init, command_args);
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        try inference.cuda_info.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "bench-cuda")) {
+        try inference.cuda_microbench.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "smoke")) {
         try inference.native_smoke.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "list")) {
@@ -137,6 +141,8 @@ pub fn runFromArgs(
         try pullModel(allocator, init.io, usage_name, command_args);
     } else if (std.mem.eql(u8, command, "convert")) {
         try inference.tabular.cli.convertMain(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "version")) {
+        printVersion();
     } else {
         print("unknown command: {s}\n", .{command});
         printUsage(usage_name);
@@ -187,12 +193,12 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     }
 
     print("antfly inference v{s}\n", .{build_options.inference_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
-        build_options.enable_mlx,
+        build_options.enable_cuda,
     });
     print("ai models: {s}\n", .{models_dir});
     print("ml models: {s}\n", .{ml_dir});
@@ -312,12 +318,11 @@ fn isPredictorPull(args: []const []const u8) bool {
 
 pub fn printVersion() void {
     print("antfly inference v{s}\n", .{build_options.inference_version});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} mlx={} cuda={}\n", .{
+    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
         build_options.enable_onnx,
         build_options.enable_metal,
-        build_options.enable_mlx,
         build_options.enable_cuda,
     });
 }
@@ -342,9 +347,12 @@ fn printUsage(usage_name: []const u8) void {
         \\  compare   Compare inference backends or implementations
         \\  finetune  Run fine-tuning recipes, datasets, adapters, train/eval, and workflows
         \\  smoke     Run a native GGUF/SafeTensors smoke test
+        \\  cuda-info Inspect CUDA Driver API availability and optionally run a kernel smoke
+        \\  bench-cuda Benchmark CUDA Q4_K CLIP/CLAP kernel shapes and optional ClipCLAP text embed
         \\  list      List available models
         \\  pull      Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
         \\  convert   Convert a native ML model (XGBoost/LightGBM/ONNX) to the antfly tabular IR
+        \\  version   Print version information
         \\
         \\Run options:
         \\  --host <addr>     Listen address (default: 127.0.0.1)

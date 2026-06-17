@@ -30,6 +30,7 @@ import (
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/schema"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/websearch"
 	"github.com/antflydb/antfly/go/pkg/antfly/lib/workerpool"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/common"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/usermgr"
 	"github.com/antflydb/antfly/go/pkg/generating"
@@ -1200,13 +1201,10 @@ func (t *TableApi) RunAgenticRetrieval(
 	}
 
 	// Initialize websearch provider if configured
-	if toolsConfig.WebsearchConfig != nil {
-		provider, err := websearch.NewSearchProvider(*toolsConfig.WebsearchConfig)
-		if err != nil {
-			t.logger.Warn("Failed to create websearch provider", zap.Error(err))
-		} else {
-			executor.websearchProvider = provider
-		}
+	if provider, err := t.resolveWebSearchProvider(toolsConfig); err != nil {
+		t.logger.Warn("Failed to create websearch provider", zap.Error(err))
+	} else if provider != nil {
+		executor.websearchProvider = provider
 	}
 
 	// Initialize URL fetcher if configured
@@ -1237,6 +1235,63 @@ func (t *TableApi) RunAgenticRetrieval(
 	finalizeRetrievalAgentSession(req, result)
 
 	return result
+}
+
+func (t *TableApi) resolveWebSearchProvider(toolsConfig ai.ChatToolsConfig) (websearch.SearchProvider, error) {
+	if toolsConfig.WebsearchConnection != nil && *toolsConfig.WebsearchConnection != "" {
+		if t.config == nil {
+			return nil, fmt.Errorf("websearch_connection %q requested but server config is unavailable", *toolsConfig.WebsearchConnection)
+		}
+		connection, ok := t.config.Connections[*toolsConfig.WebsearchConnection]
+		if !ok {
+			return nil, fmt.Errorf("websearch_connection %q is not configured", *toolsConfig.WebsearchConnection)
+		}
+		config, err := webSearchConfigFromConnection(*toolsConfig.WebsearchConnection, connection)
+		if err != nil {
+			return nil, err
+		}
+		return websearch.NewSearchProvider(config)
+	}
+
+	if toolsConfig.WebsearchConfig != nil {
+		return websearch.NewSearchProvider(*toolsConfig.WebsearchConfig)
+	}
+
+	return nil, nil
+}
+
+func webSearchConfigFromConnection(name string, connection common.ConnectionConfig) (websearch.WebSearchConfig, error) {
+	if connection.Kind != common.ConnectionKindWebSearch {
+		return websearch.WebSearchConfig{}, fmt.Errorf("connection %q has kind %q, expected web_search", name, connection.Kind)
+	}
+
+	provider := strings.TrimSpace(connection.Provider)
+	if provider == "" {
+		return websearch.WebSearchConfig{}, fmt.Errorf("web_search connection %q is missing provider", name)
+	}
+
+	webSearch := connection.WebSearch
+	config := websearch.WebSearchConfig{
+		Provider:          websearch.WebSearchProvider(provider),
+		ApiKey:            webSearch.ApiKey,
+		CredentialsPath:   webSearch.CredentialsPath,
+		DataStore:         webSearch.DataStore,
+		Endpoint:          webSearch.Endpoint,
+		MaxResults:        webSearch.MaxResults,
+		TimeoutMs:         webSearch.TimeoutMs,
+		Language:          webSearch.Language,
+		Location:          webSearch.Location,
+		ProjectId:         webSearch.ProjectId,
+		Region:            webSearch.Region,
+		ServingConfig:     webSearch.ServingConfig,
+		IncludeContent:    webSearch.IncludeContent,
+		IncludeHighlights: webSearch.IncludeHighlights,
+	}
+	if webSearch.SafeSearch != nil {
+		config.SafeSearch = webSearch.SafeSearch
+	}
+
+	return config, nil
 }
 
 // runAgenticWithTools runs the agentic loop using native tool calling

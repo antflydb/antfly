@@ -88,10 +88,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
         if (err instanceof Error && err.message.includes("401")) {
           throw new Error("Invalid credentials");
         }
-        throw new Error("Failed to fetch user info");
+        throw new Error(`Failed to fetch user info from ${apiUrl}`);
       }
     },
-    [createClient]
+    [apiUrl, createClient]
   );
 
   // Refresh user info

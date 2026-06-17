@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -28,7 +29,7 @@ const AtomicMutex = struct {
     inner: std.atomic.Mutex = .unlocked,
 
     fn lock(self: *AtomicMutex) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&self.inner);
     }
 
     fn unlock(self: *AtomicMutex) void {

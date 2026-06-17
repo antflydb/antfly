@@ -54,6 +54,7 @@ pub const http_internal_group_write_routes = @import("http_internal_group_write_
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const connections = @import("connections.zig");
 
 pub const ClusterHealth = cluster.ClusterHealth;
 pub const ClusterStatus = cluster.ClusterStatus;
@@ -197,6 +198,7 @@ test "api module compiles" {
     _ = http_server;
     _ = http_client;
     _ = httpx_handler;
+    _ = connections;
     _ = ClusterHealth;
     _ = ClusterStatus;
     _ = clusterStatusFromMetadata;

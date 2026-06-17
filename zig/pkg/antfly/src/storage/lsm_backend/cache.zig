@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
@@ -919,7 +920,7 @@ fn copyKey(allocator: Allocator, key: Cache.Key) !Cache.Key {
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
     if (builtin.os.tag == .freestanding) return false;
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
     return true;
 }
 

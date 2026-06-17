@@ -54,7 +54,6 @@ pub fn find(kind: contracts.BackendKind) ?compiled_backend.Definition {
 
 test "compiled backend registry ignores non-compiled host backends" {
     try std.testing.expect(find(.native) == null);
-    try std.testing.expect(find(.mlx) == null);
 }
 
 test "compiled backend registry returns enabled compiled backends" {

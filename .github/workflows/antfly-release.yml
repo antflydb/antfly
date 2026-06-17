@@ -192,7 +192,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           registry-url: https://registry.npmjs.org/
 
       - name: Build wheels and populate npm packages
@@ -261,7 +261,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22.x
+          node-version: 24.x
           registry-url: https://registry.npmjs.org/
 
       - name: Upgrade npm for OIDC support

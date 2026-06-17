@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 748,
-  "entry_count": 748,
+  "source_entry_count": 749,
+  "entry_count": 749,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -7507,17 +7507,25 @@
       "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR UPDATE NOWAIT"
     },
     {
-      "name": "unsupported read share row lock mode",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=row_lock_mode_plan",
-      "classification_reason": "row_lock_mode_plan",
+      "name": "read share row lock query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=share",
       "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR SHARE"
     },
     {
-      "name": "unsupported read key share row lock mode",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=row_lock_mode_plan",
-      "classification_reason": "row_lock_mode_plan",
+      "name": "read key share row lock query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 1
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=key_share",
       "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR KEY SHARE"
     },
     {
@@ -8167,6 +8175,13 @@
       },
       "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=no_key_update_nowait:rewrite=0:ops=1:patch_expr=0:increment_expr=0:json_set_expr=0:returning=1:returning_expr=0:returning_all=0",
       "sql": "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR NO KEY UPDATE NOWAIT RETURNING id"
+    },
+    {
+      "name": "unsupported claimed update share row lock mode",
+      "family": "unsupported_update_source",
+      "plan": "unsupported:update_source:requires=row_lock_mode_plan",
+      "classification_reason": "row_lock_mode_plan",
+      "sql": "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id"
     },
     {
       "name": "unsupported claimed update non-target row lock",

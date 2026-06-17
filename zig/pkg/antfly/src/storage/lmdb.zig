@@ -34,6 +34,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const platform = @import("antfly_platform");
 const zig_lmdb = @import("lmdb_engine");
 const lmdb_sim_test = @import("lmdb_sim_test.zig");
@@ -56,7 +57,7 @@ fn heapAllocator() std.mem.Allocator {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    platform_sync.lockYielding(mutex);
 }
 
 fn backoffWriterLockRetry() void {

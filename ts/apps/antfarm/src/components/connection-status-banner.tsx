@@ -2,30 +2,19 @@ import { Button } from "@antfly/design-system";
 import { AlertTriangle, RefreshCw, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { isProductEnabled } from "@/config/products";
+import { useApiConfig } from "@/hooks/use-api-config";
 import { useConnectionStatus } from "@/hooks/use-connection-status";
-
-interface ServerInfo {
-  name: string;
-  port: number;
-  hint: string;
-}
-
-const SERVER_INFO: Record<string, ServerInfo> = {
-  antfly: {
-    name: "Antfly",
-    port: 8080,
-    hint: "Make sure the Antfly server is running on localhost:8080",
-  },
-  inference: {
-    name: "Antfly inference",
-    port: 11433,
-    hint: "Make sure the Antfly inference runtime is running (check Settings for URL)",
-  },
-};
 
 export function ConnectionStatusBanner() {
   const { antfly, inference, retry } = useConnectionStatus();
+  const { apiUrl, inferenceApiUrl } = useApiConfig();
   const [dismissed, setDismissed] = useState(false);
+  const devProxyTarget = import.meta.env.VITE_ANTFARM_API_PROXY_TARGET as string | undefined;
+
+  const antflyTarget =
+    apiUrl.startsWith("/") && devProxyTarget ? `${devProxyTarget}${apiUrl}` : apiUrl;
+  const inferenceTarget =
+    inferenceApiUrl || (devProxyTarget ? `${devProxyTarget}/ai/v1` : "/ai/v1");
 
   // Reset dismissed state when both servers reconnect
   useEffect(() => {
@@ -57,23 +46,35 @@ export function ConnectionStatusBanner() {
     return null;
   }
 
+  const bothDisconnected =
+    disconnectedServers.includes("antfly") && disconnectedServers.includes("inference");
+  const title = bothDisconnected
+    ? "Antfly is not running"
+    : disconnectedServers.includes("antfly")
+      ? "Antfly data is not connected"
+      : "Antfly inference is not connected";
+  const description = bothDisconnected ? (
+    <>
+      Run <code>./antfly swarm</code>, or use Settings to connect to another API.
+    </>
+  ) : disconnectedServers.includes("antfly") ? (
+    <>
+      Checking <code>{antflyTarget}</code>. Run <code>./antfly swarm</code> or update Settings.
+    </>
+  ) : (
+    <>
+      Checking <code>{inferenceTarget}</code>. Run <code>./antfly swarm</code> or update Settings.
+    </>
+  );
+
   return (
     <div className="af-connection-banner px-4 py-3">
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-start gap-3">
           <AlertTriangle className="af-connection-banner-icon h-5 w-5 mt-0.5 flex-shrink-0" />
-          <div className="space-y-1">
-            {disconnectedServers.map((server) => {
-              const info = SERVER_INFO[server];
-              return (
-                <div key={server}>
-                  <p className="af-connection-banner-title">
-                    Unable to connect to {info.name} server
-                  </p>
-                  <p className="af-connection-banner-description">{info.hint}</p>
-                </div>
-              );
-            })}
+          <div>
+            <p className="af-connection-banner-title">{title}</p>
+            <p className="af-connection-banner-description">{description}</p>
           </div>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">

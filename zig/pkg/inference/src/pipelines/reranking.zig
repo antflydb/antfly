@@ -68,14 +68,14 @@ pub const RerankingPipeline = struct {
         };
     }
 
-    pub fn usesDistributedMlx(self: *const RerankingPipeline) bool {
+    pub fn usesDistributedGpuHosted(self: *const RerankingPipeline) bool {
         return self.config.distributed.enabled and
             self.config.distributed.world_size > 1 and
             self.session.backend().usesGpuHostedSession();
     }
 
-    pub fn usesTensorParallelMlx(self: *const RerankingPipeline) bool {
-        return self.usesDistributedMlx() and self.config.distributed.mode == .tensor_parallel;
+    pub fn usesTensorParallelGpuHosted(self: *const RerankingPipeline) bool {
+        return self.usesDistributedGpuHosted() and self.config.distributed.mode == .tensor_parallel;
     }
 
     /// Score query-document pairs using the configured reranker mode.

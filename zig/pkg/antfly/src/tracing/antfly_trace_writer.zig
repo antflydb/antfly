@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 
 /// Event emitted by instrumented Antfly transaction code for TLA+ trace validation.
 pub const AntflyTracingEvent = struct {
@@ -58,7 +59,7 @@ pub const AntflyNdjsonTraceWriter = struct {
 
     fn traceEvent(ptr: *anyopaque, event: *const AntflyTracingEvent) void {
         const self: *AntflyNdjsonTraceWriter = @ptrCast(@alignCast(ptr));
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         self.writeEvent(event) catch {};
         self.writer.flush() catch {};

@@ -4,23 +4,25 @@
 const std = @import("std");
 const antfly_s3_openapi = @import("antfly_s3_openapi");
 
-/// The web search provider to use. - **google**: Google Custom Search API (requires CSE setup) - **bing**: Microsoft Bing Web Search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **duckduckgo**: DuckDuckGo Instant Answer API (limited, no API key)
+/// The web search provider to use. - **exa**: Exa neural/semantic web search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **you**: You.com Search API for agent and research workflows - **linkup**: Linkup Search API for web search and content retrieval - **vertex**: Google Cloud Agent Search / Vertex AI Search
 pub const WebSearchProvider = enum {
-    google,
-    bing,
+    exa,
     serper,
     tavily,
     brave,
-    duckduckgo,
+    you,
+    linkup,
+    vertex,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .google => "google",
-            .bing => "bing",
+            .exa => "exa",
             .serper => "serper",
             .tavily => "tavily",
             .brave => "brave",
-            .duckduckgo => "duckduckgo",
+            .you => "you",
+            .linkup => "linkup",
+            .vertex => "vertex",
         };
         try jw.write(s);
     }
@@ -31,12 +33,13 @@ pub const WebSearchProvider = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "google", .google },
-            .{ "bing", .bing },
+            .{ "exa", .exa },
             .{ "serper", .serper },
             .{ "tavily", .tavily },
             .{ "brave", .brave },
-            .{ "duckduckgo", .duckduckgo },
+            .{ "you", .you },
+            .{ "linkup", .linkup },
+            .{ "vertex", .vertex },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -90,9 +93,23 @@ pub const FetchResult = struct {
     fetch_time_ms: ?i64 = null,
 };
 
-/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID - BING_SEARCH_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY
+/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
 pub const WebSearchConfig = struct {
     provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -103,6 +120,10 @@ pub const WebSearchConfig = struct {
     language: ?[]const u8 = null,
     /// Preferred region for results (e.g., 'us', 'uk', 'de')
     region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
 };
 
 /// Response from a web search query
@@ -119,53 +140,68 @@ pub const WebSearchResponse = struct {
     search_time_ms: ?i64 = null,
 };
 
-/// Configuration for Google Custom Search API. Requires a Custom Search Engine (CSE) to be configured in Google Cloud Console. **Setup:** 1. Create a project at https://console.cloud.google.com 2. Enable Custom Search API 3. Create a Custom Search Engine at https://cse.google.com 4. Get API key and CSE ID **Docs:** https://developers.google.com/custom-search/v1/overview
-pub const GoogleSearchConfig = struct {
+/// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
+pub const ExaSearchConfig = struct {
     provider: WebSearchProvider,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Google API key (or set GOOGLE_CSE_API_KEY env var)
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
     api_key: ?[]const u8 = null,
-    /// Custom Search Engine ID (or set GOOGLE_CSE_ID env var)
-    cse_id: ?[]const u8 = null,
-    /// Type of search to perform
-    search_type: ?[]const u8 = null,
-    /// Restrict results by date (e.g., 'd7' for last 7 days, 'm1' for last month)
-    date_restrict: ?[]const u8 = null,
-};
-
-/// Configuration for Microsoft Bing Web Search API. **Setup:** 1. Create Azure account at https://portal.azure.com 2. Create a Bing Search resource 3. Get API key from resource keys **Docs:** https://docs.microsoft.com/en-us/bing/search-apis/bing-web-search/overview
-pub const BingSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Bing Search API key (or set BING_SEARCH_API_KEY env var)
-    api_key: ?[]const u8 = null,
-    /// Bing API endpoint URL
+    /// Provider endpoint override when applicable
     endpoint: ?[]const u8 = null,
-    /// Filter results by freshness
-    freshness: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Search mode to request from Exa
+    search_type: ?[]const u8 = null,
+    /// Provider-specific result count override
+    num_results: ?i64 = null,
+    /// ISO date/time lower bound for published date filtering
+    start_published_date: ?[]const u8 = null,
+    /// ISO date/time upper bound for published date filtering
+    end_published_date: ?[]const u8 = null,
+    /// Only include results from these domains
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains
+    exclude_domains: ?[]const []const u8 = null,
 };
 
 /// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
 pub const SerperSearchConfig = struct {
     provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -176,8 +212,10 @@ pub const SerperSearchConfig = struct {
     language: ?[]const u8 = null,
     /// Preferred region for results (e.g., 'us', 'uk', 'de')
     region: ?[]const u8 = null,
-    /// Serper API key (or set SERPER_API_KEY env var)
-    api_key: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
     /// Type of search to perform
     search_type: ?[]const u8 = null,
     /// Time period filter: d=day, w=week, m=month, y=year
@@ -187,6 +225,20 @@ pub const SerperSearchConfig = struct {
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
 pub const TavilySearchConfig = struct {
     provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -197,8 +249,10 @@ pub const TavilySearchConfig = struct {
     language: ?[]const u8 = null,
     /// Preferred region for results (e.g., 'us', 'uk', 'de')
     region: ?[]const u8 = null,
-    /// Tavily API key (or set TAVILY_API_KEY env var)
-    api_key: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
     /// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
     search_depth: ?[]const u8 = null,
     /// Include AI-generated answer summary
@@ -214,6 +268,20 @@ pub const TavilySearchConfig = struct {
 /// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
 pub const BraveSearchConfig = struct {
     provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -224,8 +292,10 @@ pub const BraveSearchConfig = struct {
     language: ?[]const u8 = null,
     /// Preferred region for results (e.g., 'us', 'uk', 'de')
     region: ?[]const u8 = null,
-    /// Brave Search API key (or set BRAVE_API_KEY env var)
-    api_key: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
     /// Freshness filter: pd=day, pw=week, pm=month, py=year
     freshness: ?[]const u8 = null,
     /// Include text decorations (bold, italic markers)
@@ -234,9 +304,23 @@ pub const BraveSearchConfig = struct {
     spellcheck: ?bool = null,
 };
 
-/// Configuration for DuckDuckGo Instant Answer API. DuckDuckGo provides limited free search without requiring an API key. Best for simple queries; may not return results for all searches. **Note:** This uses the Instant Answer API which has limitations. For production use, consider other providers. **Docs:** https://duckduckgo.com/api
-pub const DuckDuckGoSearchConfig = struct {
+/// Configuration for You.com Search API. You.com is useful for agentic search and research-oriented result retrieval. **Setup:** 1. Sign up for You.com API access 2. Get API key from dashboard **Docs:** https://api.you.com
+pub const YouSearchConfig = struct {
     provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
     /// Maximum number of search results to return
     max_results: ?i64 = null,
     /// Request timeout in milliseconds
@@ -247,8 +331,80 @@ pub const DuckDuckGoSearchConfig = struct {
     language: ?[]const u8 = null,
     /// Preferred region for results (e.g., 'us', 'uk', 'de')
     region: ?[]const u8 = null,
-    /// Skip HTTP redirect for bang queries
-    no_redirect: ?bool = null,
-    /// Remove HTML from results
-    no_html: ?bool = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+};
+
+/// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
+pub const LinkupSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Search depth to request from Linkup
+    depth: ?[]const u8 = null,
+    /// Linkup response shape to request
+    output_type: ?[]const u8 = null,
+};
+
+/// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+pub const VertexSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Google Cloud search service flavor
+    service: ?[]const u8 = null,
 };

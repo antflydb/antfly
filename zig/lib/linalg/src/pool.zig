@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const linux = std.os.linux;
 
 pub const have_futex = builtin.os.tag == .linux;
 
@@ -89,12 +90,20 @@ var pool_storage: Pool = .{};
 
 inline fn futexWait(ptr: *const std.atomic.Value(u32), expected: u32) void {
     if (!have_futex) return;
-    _ = std.os.linux.futex_3arg(@ptrCast(ptr), .{ .cmd = .WAIT, .private = true }, expected);
+    const rc = linux.futex_4arg(&ptr.raw, .{ .cmd = .WAIT, .private = true }, expected, null);
+    switch (linux.errno(rc)) {
+        .SUCCESS, .AGAIN, .INTR => {},
+        else => |err| std.debug.panic("linalg futex WAIT failed: {}", .{err}),
+    }
 }
 
 inline fn futexWake(ptr: *const std.atomic.Value(u32), max: u32) void {
     if (!have_futex) return;
-    _ = std.os.linux.futex_3arg(@ptrCast(ptr), .{ .cmd = .WAKE, .private = true }, max);
+    const rc = linux.futex_3arg(&ptr.raw, .{ .cmd = .WAKE, .private = true }, max);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| std.debug.panic("linalg futex WAKE failed: {}", .{err}),
+    }
 }
 
 fn workerLoop(w: *Worker) void {
@@ -125,6 +134,18 @@ pub inline fn cachedCpuCount() usize {
     const detected = std.Thread.getCpuCount() catch 1;
     Once.value.store(@max(detected, 1), .release);
     return @max(detected, 1);
+}
+
+fn sleepNs(ns: u64) void {
+    var req = std.posix.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
 }
 
 /// Lazy-init the global pool.  Returns the actual number of background
@@ -239,6 +260,37 @@ const TestCtx = struct {
         _ = self.counter.fetchAdd(self.contribution, .acq_rel);
     }
 };
+
+test "futexWait parks until futexWake" {
+    if (!have_futex) return error.SkipZigTest;
+
+    const Waiter = struct {
+        fn run(
+            state: *std.atomic.Value(u32),
+            entered: *std.atomic.Value(u32),
+            returned: *std.atomic.Value(u32),
+        ) void {
+            entered.store(1, .release);
+            while (state.load(.acquire) == 0) futexWait(state, 0);
+            returned.store(1, .release);
+        }
+    };
+
+    var state: std.atomic.Value(u32) = .{ .raw = 0 };
+    var entered: std.atomic.Value(u32) = .{ .raw = 0 };
+    var returned: std.atomic.Value(u32) = .{ .raw = 0 };
+
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &state, &entered, &returned });
+    while (entered.load(.acquire) == 0) std.Thread.yield() catch {};
+
+    sleepNs(10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), returned.load(.acquire));
+
+    state.store(1, .release);
+    futexWake(&state, 1);
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 1), returned.load(.acquire));
+}
 
 test "dispatchJobs runs every submitted job exactly once" {
     var counter: std.atomic.Value(u32) = .{ .raw = 0 };

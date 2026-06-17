@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
@@ -517,7 +518,7 @@ test "query runtime warming keeps artifact available through cache" {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    platform_sync.lockYielding(mutex);
 }
 
 fn applyModeCount(metrics: *QueryExecutionMetrics, mode: request_mod.QueryMode) void {

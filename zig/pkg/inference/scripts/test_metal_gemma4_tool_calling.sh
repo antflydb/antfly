@@ -36,7 +36,7 @@ OUT_DIR="${OUT_DIR:-/tmp/antfly-inference-metal-gemma4-tool-calling-test}"
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
   echo "antfly inference binary not executable: $ANTFLY_BIN" >&2
-  echo "build it first, for example: cd pkg/inference && zig build -Dmetal=true -Dmlx=false -Donnx=false -Dpjrt=false" >&2
+  echo "build it first, for example: cd pkg/inference && zig build -Dmetal=true -Donnx=false -Dpjrt=false" >&2
   exit 2
 fi
 
