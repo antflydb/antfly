@@ -803,6 +803,7 @@ test "storage.ha http client round trips admin commands" {
         "plan",
         "--standby",
         "standby-a",
+        "--standby-route-selector",
         "--sync-mode",
         "remote-apply",
         "--sync-standby",

@@ -1368,18 +1368,18 @@ test "storage.ha admin exec renders operator plan command" {
     try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 1);
 
     var plan = try admin_cli.parse(alloc, &.{
-        "operator",          "plan",
-        "--standby",         "standby-a",
-        "--sync-mode",       "remote-apply",
-        "--sync-standby",    "standby-a",
-        "--auto-failover",   "--fencing-authority",
-        "kubernetes-lease",  "--current-primary-id",
-        "primary-a",         "--primary-admin-unavailable",
-        "--fence-authority", "kubernetes-lease",
-        "--fence-ready",     "--fence-holder",
-        "standby-a",         "--fence-generation",
-        "9",                 "--fence-reason",
-        "LeaseAcquired",
+        "operator",                    "plan",
+        "--standby",                   "standby-a",
+        "--standby-route-selector",    "--sync-mode",
+        "remote-apply",                "--sync-standby",
+        "standby-a",                   "--auto-failover",
+        "--fencing-authority",         "kubernetes-lease",
+        "--current-primary-id",        "primary-a",
+        "--primary-admin-unavailable", "--fence-authority",
+        "kubernetes-lease",            "--fence-ready",
+        "--fence-holder",              "standby-a",
+        "--fence-generation",          "9",
+        "--fence-reason",              "LeaseAcquired",
     });
     defer plan.deinit(alloc);
 

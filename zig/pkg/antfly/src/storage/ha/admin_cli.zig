@@ -773,6 +773,10 @@ fn parseOperator(
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
             standbys.items[standbys.items.len - 1].admin_url = try cursor.value("--standby-admin-url");
+        } else if (std.mem.eql(u8, arg, "--standby-route-selector")) {
+            _ = cursor.next();
+            if (standbys.items.len == 0) return error.StandbyNameMissing;
+            standbys.items[standbys.items.len - 1].route_selector_configured = true;
         } else if (std.mem.eql(u8, arg, "--standby-initial-lsn")) {
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
@@ -1494,46 +1498,47 @@ test "storage.ha admin cli parses primary status with sync policy" {
 test "storage.ha admin cli parses operator plan command" {
     const alloc = std.testing.allocator;
     var plan = try parse(alloc, &.{
-        "operator",                     "plan",
-        "--primary-admin-url",          "http://primary-ha.default.svc:8081",
-        "--standby",                    "standby-a",
-        "--standby-admin-url",          "http://standby-a-ha.default.svc:8081",
-        "--standby-initial-lsn",        "3",
-        "--standby-seed-manifest",      "/backup/base-standby-a-3.afha",
-        "--standby-seed-content-root",  "/backup/base-standby-a-3",
-        "--standby-disabled",           "standby-b",
-        "--standby-admin-url",          "http://standby-b-ha.default.svc:8081",
-        "--standby-drop-slot",          "--max-lag-lsn",
-        "50",                           "--sync-mode",
-        "remote-apply",                 "--sync-standby",
-        "standby-a",                    "--auto-failover",
-        "--fencing-authority",          "kubernetes-lease",
-        "--auto-max-lag-lsn",           "2",
-        "--current-primary-id",         "primary-a",
-        "--primary-admin-unavailable",  "--fence-authority",
-        "kubernetes_lease",             "--fence-ready",
-        "--fence-holder",               "standby-a",
-        "--fence-generation",           "7",
-        "--fence-reason",               "LeaseAcquired",
-        "--former-primary-id",          "primary-a",
-        "--former-cluster-id",          "100",
-        "--former-shard-id",            "0",
-        "--former-table-id",            "0",
-        "--former-timeline-id",         "1",
-        "--former-epoch",               "1",
-        "--former-last-lsn",            "12",
-        "--retained-from-lsn",          "8",
-        "--receipt-old-primary-id",     "primary-a",
-        "--receipt-promoted-node-id",   "standby-a",
-        "--receipt-parent-timeline-id", "1",
-        "--receipt-parent-epoch",       "1",
-        "--receipt-new-timeline-id",    "2",
-        "--receipt-new-epoch",          "2",
-        "--receipt-required-lsn",       "10",
-        "--receipt-observed-lsn",       "10",
-        "--receipt-generation",         "3",
-        "--receipt-token",              "token",
-        "--receipt-reason",             "operator-approved",
+        "operator",                             "plan",
+        "--primary-admin-url",                  "http://primary-ha.default.svc:8081",
+        "--standby",                            "standby-a",
+        "--standby-admin-url",                  "http://standby-a-ha.default.svc:8081",
+        "--standby-route-selector",             "--standby-initial-lsn",
+        "3",                                    "--standby-seed-manifest",
+        "/backup/base-standby-a-3.afha",        "--standby-seed-content-root",
+        "/backup/base-standby-a-3",             "--standby-disabled",
+        "standby-b",                            "--standby-admin-url",
+        "http://standby-b-ha.default.svc:8081", "--standby-drop-slot",
+        "--max-lag-lsn",                        "50",
+        "--sync-mode",                          "remote-apply",
+        "--sync-standby",                       "standby-a",
+        "--auto-failover",                      "--fencing-authority",
+        "kubernetes-lease",                     "--auto-max-lag-lsn",
+        "2",                                    "--current-primary-id",
+        "primary-a",                            "--primary-admin-unavailable",
+        "--fence-authority",                    "kubernetes_lease",
+        "--fence-ready",                        "--fence-holder",
+        "standby-a",                            "--fence-generation",
+        "7",                                    "--fence-reason",
+        "LeaseAcquired",                        "--former-primary-id",
+        "primary-a",                            "--former-cluster-id",
+        "100",                                  "--former-shard-id",
+        "0",                                    "--former-table-id",
+        "0",                                    "--former-timeline-id",
+        "1",                                    "--former-epoch",
+        "1",                                    "--former-last-lsn",
+        "12",                                   "--retained-from-lsn",
+        "8",                                    "--receipt-old-primary-id",
+        "primary-a",                            "--receipt-promoted-node-id",
+        "standby-a",                            "--receipt-parent-timeline-id",
+        "1",                                    "--receipt-parent-epoch",
+        "1",                                    "--receipt-new-timeline-id",
+        "2",                                    "--receipt-new-epoch",
+        "2",                                    "--receipt-required-lsn",
+        "10",                                   "--receipt-observed-lsn",
+        "10",                                   "--receipt-generation",
+        "3",                                    "--receipt-token",
+        "token",                                "--receipt-reason",
+        "operator-approved",
     });
     defer plan.deinit(alloc);
 
@@ -1543,6 +1548,7 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqual(@as(usize, 2), command.spec.standbys.len);
     try std.testing.expectEqualStrings("standby-a", command.spec.standbys[0].name);
     try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", command.spec.standbys[0].admin_url.?);
+    try std.testing.expect(command.spec.standbys[0].route_selector_configured);
     try std.testing.expectEqual(@as(?u64, 3), command.spec.standbys[0].initial_lsn);
     try std.testing.expectEqualStrings("/backup/base-standby-a-3.afha", command.spec.standbys[0].seed_manifest_path.?);
     try std.testing.expectEqualStrings("/backup/base-standby-a-3", command.spec.standbys[0].seed_content_root.?);

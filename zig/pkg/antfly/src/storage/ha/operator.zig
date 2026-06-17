@@ -62,6 +62,7 @@ pub const StandbySpec = struct {
     name: []const u8,
     desired: bool = true,
     drop_slot_on_removal: bool = false,
+    route_selector_configured: bool = false,
     admin_url: ?[]const u8 = null,
     initial_lsn: ?u64 = null,
     seed_manifest_path: ?[]const u8 = null,
@@ -879,6 +880,7 @@ fn automaticPromotionStandby(spec: Spec, observed: Observed) ?[]const u8 {
     if (isDegraded(primary.durability)) return null;
     const fence_holder = fencing_observed.holder orelse return null;
     _ = fencing_observed.generation orelse return null;
+    if (!standbyRouteSelectorConfigured(spec, fence_holder)) return null;
 
     const max_lag = spec.auto_failover.maximum_lag_lsn;
     for (spec.standbys) |standby| {
@@ -1029,6 +1031,7 @@ fn automaticFailoverReason(spec: Spec, observed: Observed, allowed: bool) []cons
     const fence_holder = fencing_observed.holder orelse return "FencingHolderMissing";
     _ = fencing_observed.generation orelse return "FencingGenerationMissing";
     if (!desiredStandbyNamed(spec, fence_holder)) return "FencingHolderNotDesired";
+    if (!standbyRouteSelectorConfigured(spec, fence_holder)) return "PrimaryRouteSelectorMissing";
     if (automaticFailoverSlotReason(spec, primary, fence_holder)) |reason| return reason;
     return "NoEligibleStandby";
 }
@@ -1056,6 +1059,13 @@ fn exceedsLagPolicy(progress_lsn: u64, target_lsn: u64, max_lag_lsn: u64) bool {
 fn desiredStandbyNamed(spec: Spec, name: []const u8) bool {
     for (spec.standbys) |standby| {
         if (standby.desired and std.mem.eql(u8, standby.name, name)) return true;
+    }
+    return false;
+}
+
+fn standbyRouteSelectorConfigured(spec: Spec, name: []const u8) bool {
+    for (spec.standbys) |standby| {
+        if (standby.desired and std.mem.eql(u8, standby.name, name)) return standby.route_selector_configured;
     }
     return false;
 }
@@ -1294,7 +1304,7 @@ test "storage.ha operator reports retention pressure degraded sync and reseed" {
         },
     };
     const standbys = [_]StandbySpec{
-        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081" },
+        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081", .route_selector_configured = true },
     };
 
     var plan = try reconcile(alloc, .{
@@ -1462,6 +1472,9 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         },
     };
     const standbys = [_]StandbySpec{
+        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081", .route_selector_configured = true },
+    };
+    const standbys_without_route = [_]StandbySpec{
         .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081" },
     };
 
@@ -1667,6 +1680,36 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         "PromotionAlreadyRecorded",
         (condition(already_recorded, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
     );
+
+    var route_missing = try reconcile(alloc, .{
+        .mode = .hot_standby,
+        .standbys = &standbys_without_route,
+        .auto_failover = .{
+            .enabled = true,
+            .fencing_authority = .kubernetes_lease,
+            .maximum_lag_lsn = 0,
+        },
+    }, .{
+        .primary = primary,
+        .primary_admin_unavailable = true,
+        .fencing = .{
+            .authority = .kubernetes_lease,
+            .ready = true,
+            .holder = "standby-a",
+            .generation = 6,
+            .reason = "LeaseAcquired",
+        },
+    });
+    defer route_missing.deinit(alloc);
+    try std.testing.expect(!route_missing.automatic_promotion_allowed);
+    try std.testing.expectEqualStrings(
+        "PrimaryRouteSelectorMissing",
+        (condition(route_missing, .automatic_failover_ready) orelse return error.TestExpectedEqual).reason,
+    );
+    for (route_missing.actions) |action| {
+        try std.testing.expect(action.kind != .acquire_fence);
+        try std.testing.expect(action.kind != .promote_standby);
+    }
 
     var inactive_slots = slots;
     inactive_slots[0].active = false;
@@ -1950,7 +1993,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
         },
     };
     const standbys = [_]StandbySpec{
-        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081" },
+        .{ .name = "standby-a", .admin_url = "http://standby-a-ha.default.svc:8081", .route_selector_configured = true },
     };
 
     var plan = try reconcile(alloc, .{
