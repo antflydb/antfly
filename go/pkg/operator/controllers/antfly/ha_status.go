@@ -424,21 +424,25 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.DesiredStandbyCount++
 		if !ok {
 			plan.UnhealthyStandbyCount++
+			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
 			plan.Actions = append(plan.Actions, haPlannedAction{
 				Kind:        haActionCreateSlot,
 				StandbyName: standby.Name,
 				SlotName:    slotName,
-				TargetLSN:   initialStandbyLSN(standby, status.PrimaryLSN),
+				TargetLSN:   seedTargetLSN,
 				Reason:      "SlotMissing",
-			}, haPlannedAction{
-				Kind:        haActionSeedStandby,
-				DependsOn:   haActionCreateSlot,
-				StandbyName: standby.Name,
-				SlotName:    slotName,
-				TargetLSN:   initialStandbyLSN(standby, status.PrimaryLSN),
-				Reason:      "StandbyNeedsBaseBackup",
 			})
-			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, initialStandbyLSN(standby, status.PrimaryLSN), "StandbyNeedsBaseBackup", haActionSeedStandby)...)
+			if seedTargetLSN > 0 {
+				plan.Actions = append(plan.Actions, haPlannedAction{
+					Kind:        haActionSeedStandby,
+					DependsOn:   haActionCreateSlot,
+					StandbyName: standby.Name,
+					SlotName:    slotName,
+					TargetLSN:   seedTargetLSN,
+					Reason:      "StandbyNeedsBaseBackup",
+				})
+				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "StandbyNeedsBaseBackup", haActionSeedStandby)...)
+			}
 			continue
 		}
 		if !observed.Active && !observed.ReseedRequired {
@@ -459,14 +463,16 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		}
 		if observed.ReseedRequired || observed.Status == "reseed_required" {
 			plan.ReseedRequiredCount++
-			plan.Actions = append(plan.Actions, haPlannedAction{
-				Kind:        haActionMarkReseed,
-				StandbyName: standby.Name,
-				SlotName:    slotName,
-				TargetLSN:   status.PrimaryLSN,
-				Reason:      "SlotRequiresReseed",
-			})
-			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "SlotRequiresReseed", haActionMarkReseed)...)
+			if status.PrimaryLSN > 0 {
+				plan.Actions = append(plan.Actions, haPlannedAction{
+					Kind:        haActionMarkReseed,
+					StandbyName: standby.Name,
+					SlotName:    slotName,
+					TargetLSN:   status.PrimaryLSN,
+					Reason:      "SlotRequiresReseed",
+				})
+				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "SlotRequiresReseed", haActionMarkReseed)...)
+			}
 			continue
 		}
 		if observed.Active && observed.ApplyLagLSN == 0 {
@@ -548,16 +554,18 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		if action.Kind == haActionReseedFormerPrimary {
 			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
 				slotName := standbySlotName(standby)
-				seed := haPlannedAction{
-					Kind:        haActionSeedStandby,
-					DependsOn:   haActionReseedFormerPrimary,
-					StandbyName: standby.Name,
-					SlotName:    slotName,
-					TargetLSN:   status.PrimaryLSN,
-					Reason:      "FormerPrimaryRequiresReseed",
+				if status.PrimaryLSN > 0 {
+					seed := haPlannedAction{
+						Kind:        haActionSeedStandby,
+						DependsOn:   haActionReseedFormerPrimary,
+						StandbyName: standby.Name,
+						SlotName:    slotName,
+						TargetLSN:   status.PrimaryLSN,
+						Reason:      "FormerPrimaryRequiresReseed",
+					}
+					plan.Actions = append(plan.Actions, seed)
+					plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "FormerPrimaryRequiresReseed", haActionSeedStandby)...)
 				}
-				plan.Actions = append(plan.Actions, seed)
-				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "FormerPrimaryRequiresReseed", haActionSeedStandby)...)
 			}
 		}
 	}
@@ -914,7 +922,11 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 		if slotName == "" {
 			return nil
 		}
-		return []string{"slot", "create", "--slot", slotName, "--initial-lsn", strconv.FormatUint(action.TargetLSN, 10)}
+		command := []string{"slot", "create", "--slot", slotName}
+		if action.TargetLSN > 0 {
+			command = append(command, "--initial-lsn", strconv.FormatUint(action.TargetLSN, 10))
+		}
+		return command
 	case haActionResumeSlot:
 		return haSlotLifecycleCommand("resume", action)
 	case haActionPauseSlot:

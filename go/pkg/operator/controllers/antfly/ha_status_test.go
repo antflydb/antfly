@@ -130,6 +130,57 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	}
 }
 
+func TestPlanHAWaitsForPrimaryLSNBeforeBaseBackup(t *testing.T) {
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 0}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+
+	plan := planHA(cluster)
+
+	if len(plan.Actions) != 1 {
+		t.Fatalf("expected only create-slot while primary LSN is unknown, got %#v", plan.Actions)
+	}
+	if plan.Actions[0].Kind != haActionCreateSlot || plan.Actions[0].TargetLSN != 0 {
+		t.Fatalf("unexpected create-slot action: %#v", plan.Actions[0])
+	}
+
+	reconciler := &AntflyClusterReconciler{}
+	reconciler.updateHAStatusAndConditions(cluster)
+	if len(cluster.Status.HAStatus.PlannedActions) != 1 {
+		t.Fatalf("expected one planned action while primary LSN is unknown, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	action := cluster.Status.HAStatus.PlannedActions[0]
+	if action.Kind != string(haActionCreateSlot) ||
+		action.AdminMethod != "POST" ||
+		action.AdminPath != "/admin/v1/ha/replication-slots" ||
+		!reflect.DeepEqual(action.AdminCommand, []string{"slot", "create", "--slot", "standby-a"}) {
+		t.Fatalf("unexpected create-slot status while primary LSN is unknown: %#v", action)
+	}
+}
+
+func TestPlanHAWaitsForPrimaryLSNBeforeReseedBaseBackup(t *testing.T) {
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 0,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:           "standby-a",
+			SlotName:       "standby-a",
+			ReseedRequired: true,
+			Status:         "reseed_required",
+		}},
+	}
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+
+	plan := planHA(cluster)
+
+	if plan.ReseedRequiredCount != 1 {
+		t.Fatalf("expected reseed-required status to remain visible, got %d", plan.ReseedRequiredCount)
+	}
+	if len(plan.Actions) != 0 {
+		t.Fatalf("expected no reseed actions while primary LSN is unknown, got %#v", plan.Actions)
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
@@ -812,6 +863,23 @@ func TestHAFormerPrimaryAdminCommandUsesExecutableRejoinSubcommands(t *testing.T
 }
 
 func TestHASeedAdminCommandRequiresTargetLSN(t *testing.T) {
+	create := haAdminCommand(haPlannedAction{
+		Kind:     haActionCreateSlot,
+		SlotName: "standby-a",
+	}, nil, nil)
+	if !reflect.DeepEqual(create, []string{"slot", "create", "--slot", "standby-a"}) {
+		t.Fatalf("unexpected create command without target LSN: %#v", create)
+	}
+
+	create = haAdminCommand(haPlannedAction{
+		Kind:      haActionCreateSlot,
+		SlotName:  "standby-a",
+		TargetLSN: 5,
+	}, nil, nil)
+	if !reflect.DeepEqual(create, []string{"slot", "create", "--slot", "standby-a", "--initial-lsn", "5"}) {
+		t.Fatalf("unexpected create command with target LSN: %#v", create)
+	}
+
 	command := haAdminCommand(haPlannedAction{
 		Kind:     haActionSeedStandby,
 		SlotName: "standby-a",
