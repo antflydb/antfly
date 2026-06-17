@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 818,
-  "entry_count": 818,
+  "source_entry_count": 821,
+  "entry_count": 821,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4237,6 +4237,20 @@
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE 'ad!_%' ESCAPE '!' ORDER BY 1 ASC LIMIT 5"
     },
     {
+      "name": "equality join computed pattern some side predicate",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 1,
+        "join_select": 2
+      },
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE SOME(ARRAY['ad%', 'grace%']) ORDER BY 1 ASC LIMIT 5"
+    },
+    {
       "name": "equality join expression null-safe distinct side predicates",
       "family": "join",
       "summary": {
@@ -4543,6 +4557,20 @@
       },
       "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5",
       "sql": "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND lower(bal.kind) LIKE 'bal!_%' ESCAPE '!' ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5"
+    },
+    {
+      "name": "bounded lateral computed pattern some side predicate",
+      "family": "lateral",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "join_select": 2,
+        "lateral_correlations": 1
+      },
+      "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND lower(bal.kind) LIKE SOME(ARRAY['bal%', 'ledger%']) ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5"
     },
     {
       "name": "bounded lateral expression null-safe distinct side predicates",
@@ -5394,6 +5422,18 @@
       },
       "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0",
       "sql": "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['ready%', 'queued%']) RETURNING id, status"
+    },
+    {
+      "name": "same-table insert select computed pattern some source plan",
+      "family": "insert_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "operations": 3,
+        "returning": 2
+      },
+      "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0",
+      "sql": "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE SOME(ARRAY['ready%', 'queued%']) RETURNING id, status"
     },
     {
       "name": "same-table insert select regexp expression assignment",

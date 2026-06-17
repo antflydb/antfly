@@ -57614,6 +57614,30 @@ test "postgres sql adapter lowers insert values returning into row batch" {
         else => return error.TestUnexpectedResult,
     }
 
+    var insert_source_computed_pattern_some_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE SOME(ARRAY['ready%', 'queued%']) RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_computed_pattern_some_plan.deinit(alloc);
+    switch (insert_source_computed_pattern_some_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.expression_predicates.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, insert_source.insert_source.req.source.expression_predicates[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.source.expression_predicates[0].lhs.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].operands[0].kind);
+            try std.testing.expectEqualStrings("\"ready%\"", insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var insert_source_expression_or_plan = try lowerWritePlanAlloc(
         alloc,
         "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3 RETURNING id, status",
@@ -72520,6 +72544,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE 'ad!_%' ESCAPE '!' ORDER BY 1 ASC LIMIT 5",
         },
         .{
+            .name = "equality join computed pattern some side predicate",
+            .family = .join,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
+            .plan = "join:type=left:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE SOME(ARRAY['ad%', 'grace%']) ORDER BY 1 ASC LIMIT 5",
+        },
+        .{
             .name = "equality join expression null-safe distinct side predicates",
             .family = .join,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 2, .join_on = 1, .join_select = 2, .order_by = 1, .limit = 5 },
@@ -72679,6 +72710,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .lateral_correlations = 1, .join_select = 2, .order_by = 1, .limit = 5 },
             .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5",
             .sql = "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND lower(bal.kind) LIKE 'bal!_%' ESCAPE '!' ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
+        },
+        .{
+            .name = "bounded lateral computed pattern some side predicate",
+            .family = .lateral,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .lateral_correlations = 1, .join_select = 2, .order_by = 1, .limit = 5 },
+            .plan = "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=1:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5",
+            .sql = "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND lower(bal.kind) LIKE SOME(ARRAY['bal%', 'ledger%']) ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
         },
         .{
             .name = "bounded lateral expression null-safe distinct side predicates",
@@ -73295,6 +73333,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .operations = 3, .returning = 2 },
             .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0",
             .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['ready%', 'queued%']) RETURNING id, status",
+        },
+        .{
+            .name = "same-table insert select computed pattern some source plan",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .operations = 3, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0",
+            .sql = "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE SOME(ARRAY['ready%', 'queued%']) RETURNING id, status",
         },
         .{
             .name = "same-table insert select regexp expression assignment",
@@ -84120,6 +84165,31 @@ test "postgres sql adapter typed read plans execute through relational storage" 
     defer computed_pattern_any_plan.deinit(alloc);
 
     switch (computed_pattern_any_plan) {
+        .query => |lowered| {
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, lowered.plan.query.expression_predicates[0].lhs.kind);
+            var result = try db.queryRelationalRows(alloc, schema, lowered.plan.query);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(@as(u32, 3), result.total);
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"p1\",\"status\":\"op_en\"}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"p2\",\"status\":\"open\"}", result.rows[1]);
+            try std.testing.expectEqualStrings("{\"id\":\"p3\",\"status\":\"OP_en\"}", result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var computed_pattern_some_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE kind = 'pattern' AND lower(status) LIKE SOME(ARRAY['op_en', 'open']) ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_some_plan.deinit(alloc);
+
+    switch (computed_pattern_some_plan) {
         .query => |lowered| {
             try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
             try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);

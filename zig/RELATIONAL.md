@@ -1023,7 +1023,7 @@ Ordered SELECT outputs lower to typed target assignments in projection order;
 computed outputs such as `lower(status)` or `amount + 1` stay in the shared
 row-expression AST with source-row field bindings before the inserted image is
 planned. Source filters use the same typed row-query predicate surface as reads,
-including computed text pattern sets such as `lower(status) LIKE ANY(ARRAY[...])`
+including computed text pattern sets such as `lower(status) LIKE ANY/SOME(ARRAY[...])`
 and expression-backed `OR`/`NOT` groups such as
 `array_length(tags, 1) NOT BETWEEN ...`, so insert-copy operations do not carry
 backend SQL predicates into storage. The native insert-source validator and
