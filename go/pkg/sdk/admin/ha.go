@@ -41,6 +41,8 @@ const adminV1Path = AdminV1Path
 
 type (
 	HAActionReceipt                    = oapi.HAActionReceipt
+	HAActionReceiptActionKind          = oapi.HAActionReceiptActionKind
+	HAActionReceiptState               = oapi.HAActionReceiptState
 	HABaseBackupBeginResponse          = oapi.HABaseBackupBeginResponse
 	HABaseBackupFinishResponse         = oapi.HABaseBackupFinishResponse
 	HACommitAppendResponse             = oapi.HACommitAppendResponse
@@ -104,6 +106,24 @@ type (
 )
 
 const (
+	HAActionKindBaseBackupBegin       = oapi.HAActionReceiptActionKindBaseBackupBegin
+	HAActionKindBaseBackupFinish      = oapi.HAActionReceiptActionKindBaseBackupFinish
+	HAActionKindFenceAcquire          = oapi.HAActionReceiptActionKindFenceAcquire
+	HAActionKindPromotion             = oapi.HAActionReceiptActionKindPromotion
+	HAActionKindPromotionAssess       = oapi.HAActionReceiptActionKindPromotionAssess
+	HAActionKindRejoinAssess          = oapi.HAActionReceiptActionKindRejoinAssess
+	HAActionKindRejoinReseed          = oapi.HAActionReceiptActionKindRejoinReseed
+	HAActionKindRejoinRewind          = oapi.HAActionReceiptActionKindRejoinRewind
+	HAActionKindReplicationSlotCreate = oapi.HAActionReceiptActionKindReplicationSlotCreate
+	HAActionKindReplicationSlotDrop   = oapi.HAActionReceiptActionKindReplicationSlotDrop
+	HAActionKindReplicationSlotPause  = oapi.HAActionReceiptActionKindReplicationSlotPause
+	HAActionKindReplicationSlotResume = oapi.HAActionReceiptActionKindReplicationSlotResume
+	HAActionKindStandbyBootstrap      = oapi.HAActionReceiptActionKindStandbyBootstrap
+
+	HAActionStateAlreadyApplied = oapi.HAActionReceiptStateAlreadyApplied
+	HAActionStateApplied        = oapi.HAActionReceiptStateApplied
+	HAActionStateAssessed       = oapi.HAActionReceiptStateAssessed
+
 	HAPrimaryStatusSyncModeAsync       = oapi.GetHAPrimaryStatusParamsSyncModeAsync
 	HAPrimaryStatusSyncModeRemoteWrite = oapi.GetHAPrimaryStatusParamsSyncModeRemoteWrite
 	HAPrimaryStatusSyncModeRemoteApply = oapi.GetHAPrimaryStatusParamsSyncModeRemoteApply
@@ -170,6 +190,17 @@ type HAClient struct {
 type HAOperation struct {
 	Method string
 	Path   string
+}
+
+// HAReceiptExpectation identifies the generated action receipt kind/state a
+// successful idempotent admin operation should return.
+type HAReceiptExpectation struct {
+	ActionKind HAActionReceiptActionKind
+	State      HAActionReceiptState
+}
+
+func (e HAReceiptExpectation) Strings() (string, string) {
+	return string(e.ActionKind), string(e.State)
 }
 
 func HAListReplicationSlotsOperation() HAOperation {
@@ -246,6 +277,58 @@ func HAReplicationSlotPath(slotName string) (string, bool) {
 		return "", false
 	}
 	return HAReplicationSlotPathPrefix + url.PathEscape(slotName), true
+}
+
+func HAReplicationSlotCreateReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindReplicationSlotCreate, State: HAActionStateApplied}
+}
+
+func HAReplicationSlotResumeReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindReplicationSlotResume, State: HAActionStateApplied}
+}
+
+func HAReplicationSlotPauseReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindReplicationSlotPause, State: HAActionStateApplied}
+}
+
+func HAReplicationSlotDropReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindReplicationSlotDrop, State: HAActionStateApplied}
+}
+
+func HABaseBackupBeginReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindBaseBackupBegin, State: HAActionStateApplied}
+}
+
+func HABaseBackupFinishReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindBaseBackupFinish, State: HAActionStateApplied}
+}
+
+func HAStandbyBootstrapReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindStandbyBootstrap, State: HAActionStateApplied}
+}
+
+func HAFenceAcquireReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindFenceAcquire, State: HAActionStateApplied}
+}
+
+func HAPromotionAssessReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindPromotionAssess, State: HAActionStateAssessed}
+}
+
+func HAPromotionReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindPromotion, State: HAActionStateApplied}
+}
+
+func HARejoinAssessReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindRejoinAssess, State: HAActionStateAssessed}
+}
+
+func HARejoinRewindReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindRejoinRewind, State: HAActionStateApplied}
+}
+
+func HARejoinReseedReceiptExpectation() HAReceiptExpectation {
+	return HAReceiptExpectation{ActionKind: HAActionKindRejoinReseed, State: HAActionStateApplied}
 }
 
 // HAResponse keeps the typed response and the original response body together.

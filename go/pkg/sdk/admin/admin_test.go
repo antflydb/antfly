@@ -430,6 +430,105 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	}
 }
 
+func TestHAReceiptExpectationsUseAdminAPIEnums(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		got       HAReceiptExpectation
+		wantKind  string
+		wantState string
+	}{
+		{
+			name:      "create replication slot",
+			got:       HAReplicationSlotCreateReceiptExpectation(),
+			wantKind:  "replication_slot_create",
+			wantState: "applied",
+		},
+		{
+			name:      "resume replication slot",
+			got:       HAReplicationSlotResumeReceiptExpectation(),
+			wantKind:  "replication_slot_resume",
+			wantState: "applied",
+		},
+		{
+			name:      "pause replication slot",
+			got:       HAReplicationSlotPauseReceiptExpectation(),
+			wantKind:  "replication_slot_pause",
+			wantState: "applied",
+		},
+		{
+			name:      "drop replication slot",
+			got:       HAReplicationSlotDropReceiptExpectation(),
+			wantKind:  "replication_slot_drop",
+			wantState: "applied",
+		},
+		{
+			name:      "begin base backup",
+			got:       HABaseBackupBeginReceiptExpectation(),
+			wantKind:  "base_backup_begin",
+			wantState: "applied",
+		},
+		{
+			name:      "finish base backup",
+			got:       HABaseBackupFinishReceiptExpectation(),
+			wantKind:  "base_backup_finish",
+			wantState: "applied",
+		},
+		{
+			name:      "bootstrap standby",
+			got:       HAStandbyBootstrapReceiptExpectation(),
+			wantKind:  "standby_bootstrap",
+			wantState: "applied",
+		},
+		{
+			name:      "acquire fence",
+			got:       HAFenceAcquireReceiptExpectation(),
+			wantKind:  "fence_acquire",
+			wantState: "applied",
+		},
+		{
+			name:      "assess promotion",
+			got:       HAPromotionAssessReceiptExpectation(),
+			wantKind:  "promotion_assess",
+			wantState: "assessed",
+		},
+		{
+			name:      "promote",
+			got:       HAPromotionReceiptExpectation(),
+			wantKind:  "promotion",
+			wantState: "applied",
+		},
+		{
+			name:      "assess rejoin",
+			got:       HARejoinAssessReceiptExpectation(),
+			wantKind:  "rejoin_assess",
+			wantState: "assessed",
+		},
+		{
+			name:      "rewind rejoin",
+			got:       HARejoinRewindReceiptExpectation(),
+			wantKind:  "rejoin_rewind",
+			wantState: "applied",
+		},
+		{
+			name:      "reseed rejoin",
+			got:       HARejoinReseedReceiptExpectation(),
+			wantKind:  "rejoin_reseed",
+			wantState: "applied",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gotKind, gotState := tt.got.Strings()
+			if gotKind != tt.wantKind || gotState != tt.wantState {
+				t.Fatalf("receipt expectation = (%q, %q), want (%q, %q)", gotKind, gotState, tt.wantKind, tt.wantState)
+			}
+		})
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

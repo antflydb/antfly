@@ -3905,36 +3905,43 @@ func haPlannedActionSupportsDirectAdminAPI(kind haActionKind) bool {
 }
 
 func haDirectAdminActionReceiptSpec(kind haActionKind) (string, string, bool) {
+	expectation := adminsdk.HAReceiptExpectation{}
+	ok := true
 	switch kind {
 	case haActionCreateSlot:
-		return "replication_slot_create", "applied", true
+		expectation = adminsdk.HAReplicationSlotCreateReceiptExpectation()
 	case haActionResumeSlot:
-		return "replication_slot_resume", "applied", true
+		expectation = adminsdk.HAReplicationSlotResumeReceiptExpectation()
 	case haActionPauseSlot:
-		return "replication_slot_pause", "applied", true
+		expectation = adminsdk.HAReplicationSlotPauseReceiptExpectation()
 	case haActionDropSlot:
-		return "replication_slot_drop", "applied", true
+		expectation = adminsdk.HAReplicationSlotDropReceiptExpectation()
 	case haActionSeedStandby, haActionMarkReseed:
-		return "base_backup_begin", "applied", true
+		expectation = adminsdk.HABaseBackupBeginReceiptExpectation()
 	case haActionFinishStandbySeed:
-		return "base_backup_finish", "applied", true
+		expectation = adminsdk.HABaseBackupFinishReceiptExpectation()
 	case haActionBootstrapStandbySeed:
-		return "standby_bootstrap", "applied", true
+		expectation = adminsdk.HAStandbyBootstrapReceiptExpectation()
 	case haActionAcquireFence:
-		return "fence_acquire", "applied", true
+		expectation = adminsdk.HAFenceAcquireReceiptExpectation()
 	case haActionAssessPromotion:
-		return "promotion_assess", "assessed", true
+		expectation = adminsdk.HAPromotionAssessReceiptExpectation()
 	case haActionPromoteStandby:
-		return "promotion", "applied", true
+		expectation = adminsdk.HAPromotionReceiptExpectation()
 	case haActionDemoteFormerPrimary:
-		return "rejoin_assess", "assessed", true
+		expectation = adminsdk.HARejoinAssessReceiptExpectation()
 	case haActionRewindFormerPrimary:
-		return "rejoin_rewind", "applied", true
+		expectation = adminsdk.HARejoinRewindReceiptExpectation()
 	case haActionReseedFormerPrimary:
-		return "rejoin_reseed", "applied", true
+		expectation = adminsdk.HARejoinReseedReceiptExpectation()
 	default:
+		ok = false
+	}
+	if !ok {
 		return "", "", false
 	}
+	expectedKind, expectedState := expectation.Strings()
+	return expectedKind, expectedState, true
 }
 
 func haValidatePlannedActionAdminOperation(action antflyv1.HAPlannedActionStatus) error {
