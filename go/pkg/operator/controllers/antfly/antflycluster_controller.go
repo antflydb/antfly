@@ -3706,7 +3706,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		result, err := adminClient.AcquireFenceResponse(ctx, haFenceAcquireAdminSDKRequest(body))
+		result, err := adminClient.AcquireFenceResponse(ctx, body)
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectFenceAcquireResult(cluster, action, raw)
@@ -3720,7 +3720,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		result, err := adminClient.AssessPromotionResponse(ctx, haPromotionAssessAdminSDKRequest(body))
+		result, err := adminClient.AssessPromotionResponse(ctx, body)
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil {
 			err = requireHADirectPromotionAssessmentResult(action, raw)
@@ -3753,11 +3753,11 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		var result *adminsdk.HAResponse[adminsdk.HARejoinAssessResponse]
 		switch haActionKind(action.Kind) {
 		case haActionRewindFormerPrimary:
-			result, err = adminClient.RewindRejoinResponse(ctx, haRejoinAssessAdminSDKRequest(body))
+			result, err = adminClient.RewindRejoinResponse(ctx, body)
 		case haActionReseedFormerPrimary:
-			result, err = adminClient.ReseedRejoinResponse(ctx, haRejoinAssessAdminSDKRequest(body))
+			result, err = adminClient.ReseedRejoinResponse(ctx, body)
 		default:
-			result, err = adminClient.AssessRejoinResponse(ctx, haRejoinAssessAdminSDKRequest(body))
+			result, err = adminClient.AssessRejoinResponse(ctx, body)
 		}
 		raw, err := haAdminSDKResponseRaw(result, err)
 		if err == nil && !r.applyHADirectRejoinAssessResult(cluster, action, raw) {
@@ -3810,71 +3810,6 @@ func haAdminSDKResponseRaw[T any](value *adminsdk.HAResponse[T], err error) ([]b
 		return nil, fmt.Errorf("HA admin SDK response is nil")
 	}
 	return value.Body, nil
-}
-
-func haAdminSDKIdentity(identity haAdminIdentityRequest) adminsdk.HAIdentity {
-	return adminsdk.HAIdentity{
-		ClusterId:  identity.ClusterID,
-		ShardId:    identity.ShardID,
-		TableId:    identity.TableID,
-		TimelineId: identity.TimelineID,
-		Epoch:      identity.Epoch,
-	}
-}
-
-func haFenceAcquireAdminSDKRequest(body haFenceAcquireRequest) adminsdk.FenceAcquireRequest {
-	return adminsdk.FenceAcquireRequest{
-		Identity:       haAdminSDKIdentity(body.Identity),
-		OldPrimaryId:   body.OldPrimaryID,
-		PromotedNodeId: body.PromotedNodeID,
-		NewTimelineId:  body.NewTimelineID,
-		NewEpoch:       body.NewEpoch,
-		RequiredLsn:    body.RequiredLSN,
-		ObservedLsn:    body.ObservedLSN,
-		Force:          body.Force,
-		Reason:         body.Reason,
-	}
-}
-
-func haPromotionAssessAdminSDKRequest(body haPromotionAssessRequest) adminsdk.PromotionAssessRequest {
-	return adminsdk.PromotionAssessRequest{
-		RequiredLsn:      body.RequiredLSN,
-		FencingConfirmed: body.FencingConfirmed,
-		Force:            body.Force,
-		UseCurrentFence:  body.UseCurrentFence,
-	}
-}
-
-func haFenceReceiptAdminSDKRequest(receipt *haFenceReceiptRequest) adminsdk.HAFenceReceipt {
-	if receipt == nil {
-		return adminsdk.HAFenceReceipt{}
-	}
-	return adminsdk.HAFenceReceipt{
-		Identity:         haAdminSDKIdentity(receipt.Identity),
-		OldPrimaryId:     receipt.OldPrimaryID,
-		PromotedNodeId:   receipt.PromotedNodeID,
-		ParentTimelineId: receipt.ParentTimelineID,
-		ParentEpoch:      receipt.ParentEpoch,
-		NewTimelineId:    receipt.NewTimelineID,
-		NewEpoch:         receipt.NewEpoch,
-		RequiredLsn:      receipt.RequiredLSN,
-		ObservedLsn:      receipt.ObservedLSN,
-		Generation:       receipt.Generation,
-		Forced:           receipt.Forced,
-		Token:            receipt.Token,
-		Reason:           receipt.Reason,
-	}
-}
-
-func haRejoinAssessAdminSDKRequest(body haRejoinAssessRequest) adminsdk.RejoinAssessRequest {
-	return adminsdk.RejoinAssessRequest{
-		NodeId:                          body.NodeID,
-		Identity:                        haAdminSDKIdentity(body.Identity),
-		LastLsn:                         body.LastLSN,
-		RetainedFromLsn:                 body.RetainedFromLSN,
-		AllowRewindAfterForcedPromotion: body.AllowRewindAfterForcedPromotion,
-		Receipt:                         haFenceReceiptAdminSDKRequest(body.Receipt),
-	}
 }
 
 func haValidateDirectAdminNodeTarget(action antflyv1.HAPlannedActionStatus) error {
@@ -3962,178 +3897,107 @@ func haValidatePlannedActionAdminOperation(action antflyv1.HAPlannedActionStatus
 	return nil
 }
 
-type haReplicationSlotCreateRequest struct {
-	SlotName   string `json:"slot_name"`
-	InitialLSN uint64 `json:"initial_lsn,omitempty"`
-}
-
-type haBaseBackupStartRequest struct {
-	SlotName   string `json:"slot_name"`
-	ManifestID string `json:"manifest_id"`
-}
-
-type haBaseBackupManifestPathRequest struct {
-	ManifestPath string `json:"manifest_path"`
-}
-
-type haStandbyBootstrapRequest struct {
-	ManifestPath string `json:"manifest_path"`
-	ContentRoot  string `json:"content_root,omitempty"`
-}
-
-type haAdminIdentityRequest struct {
-	ClusterID  uint64 `json:"cluster_id"`
-	ShardID    uint64 `json:"shard_id"`
-	TableID    uint64 `json:"table_id"`
-	TimelineID uint64 `json:"timeline_id"`
-	Epoch      uint64 `json:"epoch"`
-}
-
-type haFenceAcquireRequest struct {
-	Identity       haAdminIdentityRequest `json:"identity"`
-	OldPrimaryID   string                 `json:"old_primary_id"`
-	PromotedNodeID string                 `json:"promoted_node_id"`
-	NewTimelineID  uint64                 `json:"new_timeline_id"`
-	NewEpoch       uint64                 `json:"new_epoch"`
-	RequiredLSN    uint64                 `json:"required_lsn"`
-	ObservedLSN    uint64                 `json:"observed_lsn"`
-	Force          bool                   `json:"force,omitempty"`
-	Reason         string                 `json:"reason,omitempty"`
-}
-
-type haPromotionAssessRequest struct {
-	RequiredLSN      uint64 `json:"required_lsn,omitempty"`
-	FencingConfirmed bool   `json:"fencing_confirmed"`
-	Force            bool   `json:"force"`
-	UseCurrentFence  bool   `json:"use_current_fence"`
-}
-
-type haFenceReceiptRequest struct {
-	Identity         haAdminIdentityRequest `json:"identity"`
-	OldPrimaryID     string                 `json:"old_primary_id"`
-	PromotedNodeID   string                 `json:"promoted_node_id"`
-	ParentTimelineID uint64                 `json:"parent_timeline_id"`
-	ParentEpoch      uint64                 `json:"parent_epoch"`
-	NewTimelineID    uint64                 `json:"new_timeline_id"`
-	NewEpoch         uint64                 `json:"new_epoch"`
-	RequiredLSN      uint64                 `json:"required_lsn"`
-	ObservedLSN      uint64                 `json:"observed_lsn"`
-	Generation       uint64                 `json:"generation"`
-	Forced           bool                   `json:"forced"`
-	Token            string                 `json:"token"`
-	Reason           string                 `json:"reason"`
-}
-
-type haRejoinAssessRequest struct {
-	NodeID                          string                 `json:"node_id"`
-	Identity                        haAdminIdentityRequest `json:"identity"`
-	LastLSN                         uint64                 `json:"last_lsn"`
-	RetainedFromLSN                 uint64                 `json:"retained_from_lsn"`
-	AllowRewindAfterForcedPromotion bool                   `json:"allow_rewind_after_forced_promotion"`
-	Receipt                         *haFenceReceiptRequest `json:"receipt,omitempty"`
-}
-
-func haAdminIdentityRequestFromSpec(identity *antflyv1.HAReplicationIdentitySpec) haAdminIdentityRequest {
+func haAdminIdentityRequestFromSpec(identity *antflyv1.HAReplicationIdentitySpec) adminsdk.HAIdentity {
 	if identity == nil {
-		return haAdminIdentityRequest{}
+		return adminsdk.HAIdentity{}
 	}
-	return haAdminIdentityRequest{
-		ClusterID:  identity.ClusterID,
-		ShardID:    identity.ShardID,
-		TableID:    identity.TableID,
-		TimelineID: identity.TimelineID,
+	return adminsdk.HAIdentity{
+		ClusterId:  identity.ClusterID,
+		ShardId:    identity.ShardID,
+		TableId:    identity.TableID,
+		TimelineId: identity.TimelineID,
 		Epoch:      identity.Epoch,
 	}
 }
 
-func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (haFenceAcquireRequest, bool) {
+func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (adminsdk.FenceAcquireRequest, bool) {
 	if cluster == nil {
-		return haFenceAcquireRequest{}, false
+		return adminsdk.FenceAcquireRequest{}, false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	if identity == nil || identity.CurrentPrimaryID == "" || strings.TrimSpace(action.StandbyName) == "" {
-		return haFenceAcquireRequest{}, false
+		return adminsdk.FenceAcquireRequest{}, false
 	}
 	reason := action.FenceReason
 	if strings.TrimSpace(reason) == "" {
 		reason = action.Reason
 	}
-	return haFenceAcquireRequest{
+	return adminsdk.FenceAcquireRequest{
 		Identity:       haAdminIdentityRequestFromSpec(identity),
-		OldPrimaryID:   identity.CurrentPrimaryID,
-		PromotedNodeID: strings.TrimSpace(action.StandbyName),
-		NewTimelineID:  identity.TimelineID + 1,
+		OldPrimaryId:   identity.CurrentPrimaryID,
+		PromotedNodeId: strings.TrimSpace(action.StandbyName),
+		NewTimelineId:  identity.TimelineID + 1,
 		NewEpoch:       identity.Epoch + 1,
-		RequiredLSN:    action.TargetLSN,
-		ObservedLSN:    action.TargetLSN,
+		RequiredLsn:    action.TargetLSN,
+		ObservedLsn:    action.TargetLSN,
 		Reason:         reason,
 	}, true
 }
 
-func haPromotionAssessBody(action antflyv1.HAPlannedActionStatus) haPromotionAssessRequest {
-	return haPromotionAssessRequest{
-		RequiredLSN:      action.TargetLSN,
+func haPromotionAssessBody(action antflyv1.HAPlannedActionStatus) adminsdk.PromotionAssessRequest {
+	return adminsdk.PromotionAssessRequest{
+		RequiredLsn:      action.TargetLSN,
 		FencingConfirmed: false,
 		Force:            false,
 		UseCurrentFence:  true,
 	}
 }
 
-func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (haRejoinAssessRequest, bool) {
+func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (adminsdk.RejoinAssessRequest, bool) {
 	if cluster == nil {
-		return haRejoinAssessRequest{}, false
+		return adminsdk.RejoinAssessRequest{}, false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	nodeID := strings.TrimSpace(action.StandbyName)
 	if identity == nil || nodeID == "" {
-		return haRejoinAssessRequest{}, false
+		return adminsdk.RejoinAssessRequest{}, false
 	}
 	lastLSN := action.ObservedLSN
 	if lastLSN == 0 {
 		lastLSN = action.TargetLSN
 	}
-	body := haRejoinAssessRequest{
-		NodeID:                          nodeID,
+	body := adminsdk.RejoinAssessRequest{
+		NodeId:                          nodeID,
 		Identity:                        haAdminIdentityRequestFromSpec(identity),
-		LastLSN:                         lastLSN,
-		RetainedFromLSN:                 action.RetainedFromLSN,
+		LastLsn:                         lastLSN,
+		RetainedFromLsn:                 action.RetainedFromLSN,
 		AllowRewindAfterForcedPromotion: false,
 	}
 	if receipt, ok := haRejoinFenceReceipt(cluster.Status.HAStatus, identity); ok {
-		body.Receipt = &receipt
+		body.Receipt = receipt
 	} else if haActionKind(action.Kind) == haActionRewindFormerPrimary ||
 		haActionKind(action.Kind) == haActionReseedFormerPrimary {
-		return haRejoinAssessRequest{}, false
+		return adminsdk.RejoinAssessRequest{}, false
 	}
 	return body, true
 }
 
-func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) (haFenceReceiptRequest, bool) {
+func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) (adminsdk.HAFenceReceipt, bool) {
 	promotion := haPromotionReceipt(status)
 	if promotion == nil {
-		return haFenceReceiptRequest{}, false
+		return adminsdk.HAFenceReceipt{}, false
 	}
 	if identity == nil {
-		return haFenceReceiptRequest{}, false
+		return adminsdk.HAFenceReceipt{}, false
 	}
 	if promotion.OldPrimaryID != identity.CurrentPrimaryID ||
 		promotion.ParentTimelineID != identity.TimelineID ||
 		promotion.ParentEpoch != identity.Epoch {
-		return haFenceReceiptRequest{}, false
+		return adminsdk.HAFenceReceipt{}, false
 	}
 	receiptIdentity := haAdminIdentityRequestFromSpec(identity)
-	receiptIdentity.TimelineID = promotion.NewTimelineID
+	receiptIdentity.TimelineId = promotion.NewTimelineID
 	receiptIdentity.Epoch = promotion.NewEpoch
-	return haFenceReceiptRequest{
+	return adminsdk.HAFenceReceipt{
 		Identity:         receiptIdentity,
-		OldPrimaryID:     promotion.OldPrimaryID,
-		PromotedNodeID:   promotion.PromotedStandbyID,
-		ParentTimelineID: promotion.ParentTimelineID,
+		OldPrimaryId:     promotion.OldPrimaryID,
+		PromotedNodeId:   promotion.PromotedStandbyID,
+		ParentTimelineId: promotion.ParentTimelineID,
 		ParentEpoch:      promotion.ParentEpoch,
-		NewTimelineID:    promotion.NewTimelineID,
+		NewTimelineId:    promotion.NewTimelineID,
 		NewEpoch:         promotion.NewEpoch,
-		RequiredLSN:      haPromotionRequiredLSN(promotion),
-		ObservedLSN:      haPromotionObservedLSN(promotion),
+		RequiredLsn:      haPromotionRequiredLSN(promotion),
+		ObservedLsn:      haPromotionObservedLSN(promotion),
 		Generation:       promotion.FenceGeneration,
 		Forced:           promotion.Forced,
 		Token:            strings.TrimSpace(promotion.FenceToken),
