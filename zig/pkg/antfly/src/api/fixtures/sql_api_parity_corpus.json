@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 823,
-  "entry_count": 823,
+  "source_entry_count": 824,
+  "entry_count": 824,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -9687,6 +9687,18 @@
       },
       "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=1:returning_all=0:right_expr_pred=1",
       "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^stale', true) FOR UPDATE RETURNING id, regexp_substr(source.status, '[a-z]+') AS source_token"
+    },
+    {
+      "name": "joined delete source computed pattern some",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "returning": 1,
+        "join_on": 1
+      },
+      "plan": "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:right_expr_pred=1",
+      "sql": "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND lower(source.status) LIKE SOME(ARRAY['stale%', 'expired%']) FOR UPDATE RETURNING id"
     },
     {
       "name": "joined delete source array returning expression",

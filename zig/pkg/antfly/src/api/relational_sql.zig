@@ -76212,6 +76212,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND regexp_like(source.status, '^stale', true) FOR UPDATE RETURNING id, regexp_substr(source.status, '[a-z]+') AS source_token",
         },
         .{
+            .name = "joined delete source computed pattern some",
+            .family = .delete_joined_source,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
+            .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:right_expr_pred=1",
+            .sql = "DELETE FROM usage_records USING source_records AS source WHERE usage_records.id = source.id AND lower(source.status) LIKE SOME(ARRAY['stale%', 'expired%']) FOR UPDATE RETURNING id",
+        },
+        .{
             .name = "joined delete source array returning expression",
             .family = .delete_joined_source,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .join_on = 1, .returning = 1 },
@@ -76976,6 +76983,25 @@ test "postgres sql adapter lowers joined mutation source with separate target an
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, delete_source_returning_expression.mutation.req.returning_expressions[0].expression.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, delete_source_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field_source);
     try std.testing.expectEqualStrings("source_status", delete_source_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field);
+
+    var delete_source_pattern_some_filter = try lowerDeleteJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk AND lower(source.source_status) LIKE SOME(ARRAY['stale%', 'expired%']) FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer delete_source_pattern_some_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), delete_source_pattern_some_filter.mutation.req.join.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("source_status", delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"stale%\"", delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].rhs[0].value_json);
 
     var implicit_claim = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
         alloc,
