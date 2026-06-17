@@ -189,7 +189,12 @@ func (s *GoogleDriveSource) Traverse(ctx context.Context) (<-chan ContentItem, <
 // downloadSlot holds the result channel for a single concurrent download,
 // allowing ordered emission after concurrent downloads complete.
 type downloadSlot struct {
-	ch chan ContentItem
+	ch chan downloadResult
+}
+
+type downloadResult struct {
+	item ContentItem
+	err  error
 }
 
 // traverseFolder recursively lists files in a folder and sends them to the items channel.
@@ -293,19 +298,19 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 		slots := make([]downloadSlot, len(files))
 		var wg sync.WaitGroup
 		for i, fe := range files {
-			slots[i] = downloadSlot{ch: make(chan ContentItem, 1)}
+			slots[i] = downloadSlot{ch: make(chan downloadResult, 1)}
 
 			wg.Add(1)
 			s.semaphore <- struct{}{}
-			go func(f *drive.File, relPath string, slot chan<- ContentItem) {
+			go func(f *drive.File, relPath string, slot chan<- downloadResult) {
 				defer wg.Done()
 				defer func() { <-s.semaphore }()
 				defer close(slot)
 
 				content, contentType, err := s.downloadFile(ctx, f)
 				if err != nil {
-					log.Printf("Warning: Failed to download %s: %v", relPath, err)
-					return // slot closed empty — skipped in emission
+					slot <- downloadResult{err: fmt.Errorf("failed to download %s: %w", relPath, err)}
+					return
 				}
 
 				driveURL := f.WebViewLink
@@ -314,21 +319,23 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 				}
 
 				select {
-				case slot <- ContentItem{
-					Path:        relPath,
-					SourceURL:   driveURL,
-					Content:     content,
-					ContentType: contentType,
-					Metadata: map[string]any{
-						"source_type":   "google_drive",
-						"drive_file_id": f.Id,
-						"etag":          f.Md5Checksum,
-						"file_size":     f.Size,
-						"mime_type":     f.MimeType,
-						"mod_time":      f.ModifiedTime,
-						"modified_time": f.ModifiedTime,
-						"md5_checksum":  f.Md5Checksum,
-						"size":          f.Size,
+				case slot <- downloadResult{
+					item: ContentItem{
+						Path:        relPath,
+						SourceURL:   driveURL,
+						Content:     content,
+						ContentType: contentType,
+						Metadata: map[string]any{
+							"source_type":   "google_drive",
+							"drive_file_id": f.Id,
+							"etag":          f.Md5Checksum,
+							"file_size":     f.Size,
+							"mime_type":     f.MimeType,
+							"mod_time":      f.ModifiedTime,
+							"modified_time": f.ModifiedTime,
+							"md5_checksum":  f.Md5Checksum,
+							"size":          f.Size,
+						},
 					},
 				}:
 				case <-ctx.Done():
@@ -339,9 +346,13 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 		// Emit items in name-sorted order by reading slots sequentially.
 		// Each slot blocks until that file's download completes.
 		for _, slot := range slots {
-			if item, ok := <-slot.ch; ok {
+			if result, ok := <-slot.ch; ok {
+				if result.err != nil {
+					wg.Wait()
+					return result.err
+				}
 				select {
-				case items <- item:
+				case items <- result.item:
 				case <-ctx.Done():
 					wg.Wait()
 					return ctx.Err()
@@ -349,8 +360,7 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 			}
 		}
 
-		// Wait for any remaining goroutines (e.g., failed downloads
-		// whose slots were already closed empty).
+		// Wait for any remaining goroutines.
 		wg.Wait()
 
 		pageToken = fileList.NextPageToken
