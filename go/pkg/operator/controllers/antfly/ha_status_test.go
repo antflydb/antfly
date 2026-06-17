@@ -825,6 +825,11 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 		status: &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-a"}},
 		want:   "http://standby-a-ha.default.svc:8081",
 	}, {
+		name:   "post-promotion primary scoped action missing promoted node url fails closed",
+		action: haPlannedAction{Kind: haActionSeedStandby, StandbyName: "old-primary"},
+		status: &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-missing"}},
+		want:   "",
+	}, {
 		name:   "former primary rewind without node url",
 		action: haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "missing-old-primary"},
 		want:   "",
@@ -1717,10 +1722,15 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 
 func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.T) {
 	cluster := haCluster()
+	disabled := false
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
 		Name:     "old-primary",
 		AdminURL: "http://old-primary-ha.default.svc:8081",
+	}, {
+		Name:     "standby-a",
+		Desired:  &disabled,
+		AdminURL: "http://standby-a-ha.default.svc:8081",
 	}}
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
@@ -1822,7 +1832,7 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 
 	if len(cluster.Status.HAStatus.PlannedActions) != 2 ||
 		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) ||
-		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" {
+		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://standby-a-ha.default.svc:8081" {
 		t.Fatalf("expected forced promotion to require former-primary reseed, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	forcedCommand := strings.Join(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, " ")

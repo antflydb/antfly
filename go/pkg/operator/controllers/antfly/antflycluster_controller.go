@@ -5231,6 +5231,10 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	}
 	adminURL := haCurrentPrimaryAdminURL(ha, cluster.Status.HAStatus)
 	if strings.TrimSpace(adminURL) == "" {
+		if promoted := haPromotedPrimaryNodeID(cluster.Status.HAStatus); promoted != "" {
+			cluster.Status.HAStatus.PrimaryAdminReachable = false
+			cluster.Status.HAStatus.PrimaryAdminLastError = fmt.Sprintf("promoted primary %s admin URL is not configured", promoted)
+		}
 		return nil
 	}
 	status, err := r.observeHAPrimaryStatusTyped(ctx, adminURL, ha)

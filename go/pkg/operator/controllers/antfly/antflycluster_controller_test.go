@@ -3886,6 +3886,40 @@ func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T)
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(BeEmpty())
 }
 
+func TestObserveHAPrimaryAdminStatusDoesNotFallbackWhenPromotedPrimaryURLMissing(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			t.Fatalf("promoted primary with no node-local admin URL must not fall back to stale primary URL: %s", req.URL.String())
+			return nil, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://old-primary-ha.default.svc:8081"},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name: "standby-a",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PrimaryAdminReachable: true,
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					PromotedStandbyID: "standby-a",
+				},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("promoted primary standby-a admin URL is not configured"))
+}
+
 func TestObserveHAPrimaryAdminStatusDoesNotFallbackToCommandEndpoint(t *testing.T) {
 	g := NewWithT(t)
 

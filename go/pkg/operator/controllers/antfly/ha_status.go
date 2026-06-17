@@ -1121,10 +1121,11 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 }
 
 func haCurrentPrimaryAdminURL(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
-	if promoted := haCurrentPrimaryNodeID(ha, status); promoted != "" {
+	if promoted := haPromotedPrimaryNodeID(status); promoted != "" {
 		if url := haStandbyAdminURL(ha, promoted); url != "" {
 			return url
 		}
+		return ""
 	}
 	if ha != nil && ha.Admin != nil {
 		return ha.Admin.PrimaryURL
@@ -1148,15 +1149,20 @@ func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, st
 }
 
 func haCurrentPrimaryNodeID(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) string {
-	if status != nil && status.LastPromotion != nil {
-		if promoted := strings.TrimSpace(status.LastPromotion.PromotedStandbyID); promoted != "" {
-			return promoted
-		}
+	if promoted := haPromotedPrimaryNodeID(status); promoted != "" {
+		return promoted
 	}
 	if identity := haReplicationIdentity(ha); identity != nil {
 		return strings.TrimSpace(identity.CurrentPrimaryID)
 	}
 	return ""
+}
+
+func haPromotedPrimaryNodeID(status *antflyv1.HAStatus) string {
+	if status == nil || status.LastPromotion == nil {
+		return ""
+	}
+	return strings.TrimSpace(status.LastPromotion.PromotedStandbyID)
 }
 
 func haAdminOperation(action haPlannedAction) (string, string) {
