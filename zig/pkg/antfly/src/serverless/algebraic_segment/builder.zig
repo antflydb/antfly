@@ -30,6 +30,20 @@ pub const BuildOptions = struct {
     op: algebraic_segment.AggregateOp,
 };
 
+pub const ExpressionSpec = struct {
+    name: []const u8,
+    value_column: []const u8 = &.{},
+    op: algebraic_segment.AggregateOp,
+};
+
+pub const ExpressionBuildOptions = struct {
+    source_kind: algebraic_segment.SourceKind,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+    source_id: []const u8 = &.{},
+    expressions: []const ExpressionSpec,
+};
+
 pub fn buildGroupByAggregateAlloc(
     alloc: Allocator,
     batch: rowsource.ColumnBatch,
@@ -120,6 +134,68 @@ pub fn encodeGroupByAggregateAlloc(
     return codec.encodeAlloc(alloc, segment);
 }
 
+pub fn buildExpressionFoldsAlloc(
+    alloc: Allocator,
+    batch: rowsource.ColumnBatch,
+    options: ExpressionBuildOptions,
+) !algebraic_segment.ExpressionMaterialization {
+    if (options.snapshot_id.len == 0) return error.InvalidAlgebraicSegmentBuildOptions;
+    if (options.schema_fingerprint.len == 0) return error.InvalidAlgebraicSegmentBuildOptions;
+    if (options.expressions.len == 0) return error.InvalidAlgebraicSegmentBuildOptions;
+    try batch.validate();
+
+    const expressions = try alloc.alloc(algebraic_segment.ExpressionFold, options.expressions.len);
+    errdefer alloc.free(expressions);
+    var initialized_expressions: usize = 0;
+    errdefer {
+        for (expressions[0..initialized_expressions]) |*expression| expression.deinit(alloc);
+    }
+
+    for (options.expressions, expressions) |spec, *out| {
+        if (spec.name.len == 0) return error.InvalidAlgebraicSegmentBuildOptions;
+        if (spec.op != .count and spec.value_column.len == 0) return error.InvalidAlgebraicSegmentBuildOptions;
+        const value_column = if (spec.op == .count) null else batch.findColumn(spec.value_column) orelse return error.RowSourceColumnNotFound;
+        if (value_column) |column| {
+            if (column.kind() != .i64) return error.UnsupportedAlgebraicValueColumnKind;
+        }
+        const name = try alloc.dupe(u8, spec.name);
+        errdefer alloc.free(name);
+        var value_column_name: []u8 = &.{};
+        if (spec.value_column.len != 0) value_column_name = try alloc.dupe(u8, spec.value_column);
+        errdefer if (value_column_name.len != 0) alloc.free(value_column_name);
+        out.* = .{
+            .name = name,
+            .value_column = value_column_name,
+            .op = spec.op,
+            .value = try expressionValue(spec.op, value_column, batch.rowCount()),
+        };
+        initialized_expressions += 1;
+    }
+
+    var materialization = algebraic_segment.ExpressionMaterialization{
+        .source = .{
+            .kind = options.source_kind,
+            .snapshot_id = try alloc.dupe(u8, options.snapshot_id),
+            .schema_fingerprint = try alloc.dupe(u8, options.schema_fingerprint),
+            .source_id = if (options.source_id.len == 0) &.{} else try alloc.dupe(u8, options.source_id),
+        },
+        .expressions = expressions,
+    };
+    errdefer materialization.deinit(alloc);
+    try materialization.validate();
+    return materialization;
+}
+
+pub fn encodeExpressionFoldsAlloc(
+    alloc: Allocator,
+    batch: rowsource.ColumnBatch,
+    options: ExpressionBuildOptions,
+) ![]u8 {
+    var materialization = try buildExpressionFoldsAlloc(alloc, batch, options);
+    defer materialization.deinit(alloc);
+    return codec.encodeExpressionAlloc(alloc, materialization);
+}
+
 fn rowAggregateValue(
     op: algebraic_segment.AggregateOp,
     value_column: ?rowsource.ColumnVector,
@@ -130,6 +206,52 @@ fn rowAggregateValue(
         .sum_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .sum_i64 = value_column.?.values.i64[row_idx] },
         .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
         .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
+    };
+}
+
+fn expressionValue(
+    op: algebraic_segment.AggregateOp,
+    value_column: ?rowsource.ColumnVector,
+    row_count: usize,
+) !algebraic_segment.AggregateValue {
+    return switch (op) {
+        .count => .{ .count = @intCast(row_count) },
+        .sum_i64 => blk: {
+            var total: i64 = 0;
+            for (0..row_count) |row_idx| {
+                if (value_column.?.nulls.isNull(row_idx)) continue;
+                total += value_column.?.values.i64[row_idx];
+            }
+            break :blk .{ .sum_i64 = total };
+        },
+        .min_i64 => blk: {
+            var found = false;
+            var best: i64 = 0;
+            for (0..row_count) |row_idx| {
+                if (value_column.?.nulls.isNull(row_idx)) continue;
+                const value = value_column.?.values.i64[row_idx];
+                if (!found or value < best) {
+                    best = value;
+                    found = true;
+                }
+            }
+            if (!found) return error.EmptyAlgebraicExpressionFold;
+            break :blk .{ .min_i64 = best };
+        },
+        .max_i64 => blk: {
+            var found = false;
+            var best: i64 = 0;
+            for (0..row_count) |row_idx| {
+                if (value_column.?.nulls.isNull(row_idx)) continue;
+                const value = value_column.?.values.i64[row_idx];
+                if (!found or value > best) {
+                    best = value;
+                    found = true;
+                }
+            }
+            if (!found) return error.EmptyAlgebraicExpressionFold;
+            break :blk .{ .max_i64 = best };
+        },
     };
 }
 
@@ -220,4 +342,51 @@ test "algebraic builder skips null value rows for i64 folds" {
     try std.testing.expectEqual(@as(usize, 1), segment.aggregate.groups.len);
     try std.testing.expectEqualStrings("t1", segment.aggregate.groups[0].key);
     try std.testing.expectEqual(@as(i64, 9), segment.aggregate.groups[0].value.min_i64);
+}
+
+test "algebraic builder computes expression folds" {
+    const alloc = std.testing.allocator;
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-1", .file_id = "file-a", .row_group_ordinal = 0, .row_ordinal = 0 } },
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-1", .file_id = "file-a", .row_group_ordinal = 0, .row_ordinal = 1 } },
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-1", .file_id = "file-a", .row_group_ordinal = 0, .row_ordinal = 2 } },
+    };
+    const amounts = [_]i64{ 7, 11, 13 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "events", .snapshot_id = "iceberg-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+    const expressions = [_]ExpressionSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+        .{ .name = "amount_max", .value_column = "amount", .op = .max_i64 },
+    };
+
+    var materialization = try buildExpressionFoldsAlloc(alloc, batch, .{
+        .source_kind = .external_iceberg,
+        .snapshot_id = "iceberg-1",
+        .schema_fingerprint = "schema-v1",
+        .source_id = "events",
+        .expressions = &expressions,
+    });
+    defer materialization.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), materialization.expressions.len);
+    try std.testing.expectEqual(@as(u64, 3), materialization.expressions[0].value.count);
+    try std.testing.expectEqual(@as(i64, 31), materialization.expressions[1].value.sum_i64);
+    try std.testing.expectEqual(@as(i64, 13), materialization.expressions[2].value.max_i64);
+
+    const encoded = try encodeExpressionFoldsAlloc(alloc, batch, .{
+        .source_kind = .external_iceberg,
+        .snapshot_id = "iceberg-1",
+        .schema_fingerprint = "schema-v1",
+        .source_id = "events",
+        .expressions = &expressions,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > 0);
 }

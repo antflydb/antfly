@@ -5996,6 +5996,16 @@ from the relational row keyspace. Algebraic fact projection and materialization
 therefore rebuild from committed typed rows, not from stale generic document KV
 values or derived text segment columns.
 
+Lake algebraic materializations have two durable artifact shapes: grouped folds
+for keyed rollups and expression folds for source-wide typed expressions such as
+row counts, sums, minima, and maxima. Both are built from `RowSource`
+column batches, encoded as algebraic artifacts, published through the artifact
+store, and referenced from manifest metadata as disposable derived state. A SQL
+aggregate, migration backfill, or embedded-JSON algebraic projection therefore
+targets the same native build/publish path that REST/SDK callers use; PostgreSQL
+syntax can choose a materialization but cannot introduce a separate SQL-only
+aggregate store.
+
 Relational table creation and same-catalog relational schema updates both run
 the same schema-aware index preparation: if no algebraic index exists,
 `algebraic_index_v0` is added with `derive_from_schema: true` and stored as a

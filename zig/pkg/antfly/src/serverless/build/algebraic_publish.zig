@@ -32,6 +32,15 @@ pub const PublishOptions = struct {
     artifact_name: []const u8 = &.{},
 };
 
+pub const ExpressionPublishOptions = struct {
+    source_kind: algebraic_segment.SourceKind,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+    source_id: []const u8 = &.{},
+    expressions: []const algebraic_segment.ExpressionSpec,
+    artifact_name: []const u8 = &.{},
+};
+
 pub const PublishResult = struct {
     plan: algebraic_manifest.Plan,
 
@@ -59,6 +68,41 @@ pub fn publishGroupByAggregateAlloc(
     defer segment.deinit(alloc);
 
     const encoded = try algebraic_segment.encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+
+    var metadata = try artifacts.put(encoded);
+    defer metadata.deinit(alloc);
+
+    const published = [_]algebraic_manifest.PublishedArtifact{
+        .{
+            .artifact_id = metadata.artifact_id,
+            .byte_len = metadata.byte_len,
+            .checksum = metadata.checksum,
+            .name = options.artifact_name,
+        },
+    };
+
+    return .{
+        .plan = try algebraic_manifest.planAlloc(alloc, &published),
+    };
+}
+
+pub fn publishExpressionFoldsAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    batch: rowsource.ColumnBatch,
+    options: ExpressionPublishOptions,
+) !PublishResult {
+    var materialization = try algebraic_segment.buildExpressionFoldsAlloc(alloc, batch, .{
+        .source_kind = options.source_kind,
+        .snapshot_id = options.snapshot_id,
+        .schema_fingerprint = options.schema_fingerprint,
+        .source_id = options.source_id,
+        .expressions = options.expressions,
+    });
+    defer materialization.deinit(alloc);
+
+    const encoded = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
     defer alloc.free(encoded);
 
     var metadata = try artifacts.put(encoded);
@@ -218,4 +262,97 @@ test "algebraic publisher writes fold artifact and returns manifest plan" {
     const encoded = try artifacts.getAlloc("mem:folds");
     defer alloc.free(encoded);
     try std.testing.expect(encoded.len > 0);
+}
+
+test "algebraic publisher writes serverless expression fold artifact and returns manifest plan" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .serverless = .{ .fragment_id = "frag-1", .row_ordinal = 0 } },
+        .{ .serverless = .{ .fragment_id = "frag-1", .row_ordinal = 1 } },
+        .{ .serverless = .{ .fragment_id = "frag-1", .row_ordinal = 2 } },
+    };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "manifest-7" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+    const expressions = [_]algebraic_segment.ExpressionSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+    };
+
+    var result = try publishExpressionFoldsAlloc(alloc, &artifacts, batch, .{
+        .source_kind = .serverless_fragment,
+        .snapshot_id = "manifest-7",
+        .schema_fingerprint = "schema-v1",
+        .source_id = "orders",
+        .expressions = &expressions,
+        .artifact_name = "orders.expression_folds",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.plan.artifacts.len);
+    try std.testing.expectEqualStrings("mem:folds", result.plan.artifacts[0].artifact_id);
+    try std.testing.expectEqualStrings("orders.expression_folds", result.plan.artifacts[0].name);
+
+    const encoded = try artifacts.getAlloc("mem:folds");
+    defer alloc.free(encoded);
+
+    var reader = try algebraic_segment.ExpressionReader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reader.expressionCount());
+    try std.testing.expectEqual(@as(u64, 3), reader.find("row_count").?.count);
+    try std.testing.expectEqual(@as(i64, 60), reader.find("amount_sum").?.sum_i64);
+}
+
+test "algebraic publisher writes expression fold artifact and returns manifest plan" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-1", .file_id = "file-a", .row_group_ordinal = 0, .row_ordinal = 0 } },
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-1", .file_id = "file-a", .row_group_ordinal = 0, .row_ordinal = 1 } },
+    };
+    const amounts = [_]i64{ 10, 20 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batch = rowsource.ColumnBatch{
+        .snapshot = .{ .table_id = "events", .snapshot_id = "iceberg-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    };
+    const expressions = [_]algebraic_segment.ExpressionSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+    };
+
+    var result = try publishExpressionFoldsAlloc(alloc, &artifacts, batch, .{
+        .source_kind = .external_iceberg,
+        .snapshot_id = "iceberg-1",
+        .schema_fingerprint = "schema-v1",
+        .source_id = "events",
+        .expressions = &expressions,
+        .artifact_name = "events.expression_folds",
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.plan.artifacts.len);
+    try std.testing.expectEqualStrings("events.expression_folds", result.plan.artifacts[0].name);
+    const encoded = try artifacts.getAlloc("mem:folds");
+    defer alloc.free(encoded);
+    var reader = try algebraic_segment.ExpressionReader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reader.find("row_count").?.count);
+    try std.testing.expectEqual(@as(i64, 30), reader.find("amount_sum").?.sum_i64);
 }

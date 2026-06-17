@@ -23,14 +23,24 @@ pub const AggregateValue = types.AggregateValue;
 pub const SourceRef = types.SourceRef;
 pub const GroupFold = types.GroupFold;
 pub const GroupByAggregate = types.GroupByAggregate;
+pub const ExpressionFold = types.ExpressionFold;
+pub const ExpressionMaterialization = types.ExpressionMaterialization;
 pub const Segment = types.Segment;
 pub const BuildOptions = builder.BuildOptions;
+pub const ExpressionSpec = builder.ExpressionSpec;
+pub const ExpressionBuildOptions = builder.ExpressionBuildOptions;
 pub const Reader = reader.Reader;
+pub const ExpressionReader = reader.ExpressionReader;
 pub const freeSegment = types.freeSegment;
+pub const freeExpressionMaterialization = types.freeExpressionMaterialization;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const decodeAlloc = codec.decodeAlloc;
+pub const encodeExpressionAlloc = codec.encodeExpressionAlloc;
+pub const decodeExpressionAlloc = codec.decodeExpressionAlloc;
 pub const buildGroupByAggregateAlloc = builder.buildGroupByAggregateAlloc;
 pub const encodeGroupByAggregateAlloc = builder.encodeGroupByAggregateAlloc;
+pub const buildExpressionFoldsAlloc = builder.buildExpressionFoldsAlloc;
+pub const encodeExpressionFoldsAlloc = builder.encodeExpressionFoldsAlloc;
 
 test "serverless algebraic segment module compiles" {
     _ = types;
@@ -38,10 +48,18 @@ test "serverless algebraic segment module compiles" {
     _ = builder;
     _ = reader;
     _ = Segment;
+    _ = ExpressionMaterialization;
     _ = BuildOptions;
+    _ = ExpressionSpec;
+    _ = ExpressionBuildOptions;
     _ = Reader;
+    _ = ExpressionReader;
     _ = encodeAlloc;
     _ = decodeAlloc;
+    _ = encodeExpressionAlloc;
+    _ = decodeExpressionAlloc;
     _ = buildGroupByAggregateAlloc;
     _ = encodeGroupByAggregateAlloc;
+    _ = buildExpressionFoldsAlloc;
+    _ = encodeExpressionFoldsAlloc;
 }

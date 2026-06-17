@@ -47,6 +47,34 @@ pub const Reader = struct {
     }
 };
 
+pub const ExpressionReader = struct {
+    alloc: Allocator,
+    materialization: algebraic_segment.ExpressionMaterialization,
+
+    pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !ExpressionReader {
+        return .{
+            .alloc = alloc,
+            .materialization = try codec.decodeExpressionAlloc(alloc, bytes),
+        };
+    }
+
+    pub fn deinit(self: *ExpressionReader) void {
+        self.materialization.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn expressionCount(self: ExpressionReader) usize {
+        return self.materialization.expressions.len;
+    }
+
+    pub fn find(self: ExpressionReader, name: []const u8) ?algebraic_segment.AggregateValue {
+        for (self.materialization.expressions) |expression| {
+            if (std.mem.eql(u8, expression.name, name)) return expression.value;
+        }
+        return null;
+    }
+};
+
 test "algebraic reader finds decoded group folds" {
     const alloc = std.testing.allocator;
     var segment = algebraic_segment.Segment{
@@ -74,5 +102,35 @@ test "algebraic reader finds decoded group folds" {
 
     try std.testing.expectEqual(@as(usize, 1), reader.groupCount());
     try std.testing.expectEqual(@as(i64, 42), reader.find("t1").?.sum_i64);
+    try std.testing.expect(reader.find("missing") == null);
+}
+
+test "algebraic expression reader finds decoded expression folds" {
+    const alloc = std.testing.allocator;
+    var materialization = algebraic_segment.ExpressionMaterialization{
+        .source = .{
+            .kind = .serverless_fragment,
+            .snapshot_id = try alloc.dupe(u8, "manifest-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "orders"),
+        },
+        .expressions = try alloc.alloc(algebraic_segment.ExpressionFold, 1),
+    };
+    defer materialization.deinit(alloc);
+    materialization.expressions[0] = .{
+        .name = try alloc.dupe(u8, "amount_sum"),
+        .value_column = try alloc.dupe(u8, "amount"),
+        .op = .sum_i64,
+        .value = .{ .sum_i64 = 42 },
+    };
+
+    const encoded = try codec.encodeExpressionAlloc(alloc, materialization);
+    defer alloc.free(encoded);
+
+    var reader = try ExpressionReader.decodeAlloc(alloc, encoded);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), reader.expressionCount());
+    try std.testing.expectEqual(@as(i64, 42), reader.find("amount_sum").?.sum_i64);
     try std.testing.expect(reader.find("missing") == null);
 }
