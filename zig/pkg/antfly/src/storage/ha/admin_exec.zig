@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const admin_api = @import("../../admin/mod.zig");
 const admin = @import("admin.zig");
 const admin_cli = @import("admin_cli.zig");
 const backup_manifest = @import("backup_manifest.zig");
@@ -140,20 +141,6 @@ pub const ResultDocument = struct {
     result: Result,
 };
 
-const ActionReceiptDocument = struct {
-    action_id: []const u8,
-    action_kind: []const u8,
-    target: []const u8,
-    state: []const u8,
-    node_id: []const u8,
-};
-
-const PromotionAssessDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    assessment: status.PromotionAssessment,
-};
-
 pub const RenderedOutput = struct {
     content_type: []const u8,
     body: []u8,
@@ -193,7 +180,8 @@ fn renderPromotionAssessJsonAlloc(
 ) ![]u8 {
     const action_id = try std.fmt.allocPrint(alloc, "promotion_assess:{s}", .{node_id});
     defer alloc.free(action_id);
-    return try std.json.Stringify.valueAlloc(alloc, PromotionAssessDocument{
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAPromotionAssessResponse{
+        .schema_version = 1,
         .action = .{
             .action_id = action_id,
             .action_kind = "promotion_assess",
@@ -201,8 +189,30 @@ fn renderPromotionAssessJsonAlloc(
             .state = "assessed",
             .node_id = node_id,
         },
-        .assessment = assessment,
+        .assessment = try adminPromotionAssessment(assessment),
     }, .{});
+}
+
+fn adminPromotionAssessment(assessment: status.PromotionAssessment) !admin_api.HAPromotionAssessment {
+    return .{
+        .required_lsn = try adminI64(assessment.required_lsn),
+        .received_lsn = try adminI64(assessment.received_lsn),
+        .applied_lsn = try adminI64(assessment.applied_lsn),
+        .has_required_lsn = assessment.has_required_lsn,
+        .caught_up_to_received = assessment.caught_up_to_received,
+        .fencing_confirmed = assessment.fencing_confirmed,
+        .force = assessment.force,
+        .data_loss_possible = assessment.data_loss_possible,
+        .safe = assessment.safe,
+        .requires_fencing = assessment.requires_fencing,
+        .requires_force = assessment.requires_force,
+        .can_promote = assessment.can_promote,
+    };
+}
+
+fn adminI64(value: u64) !i64 {
+    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.AdminOpenAPIIntegerOverflow;
+    return @intCast(value);
 }
 
 pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
