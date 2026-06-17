@@ -2001,6 +2001,23 @@ pub const DataServer = struct {
         self.http_server.?.antfly_provider = self.read_source.antfly_provider;
     }
 
+    pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.ha.replication_record.RecordView) !void {
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        const route = try resolveHAReplicationRecordRoute(&snapshot, record);
+        try self.write_source.applyHAReplicationRecordGroupLocal(
+            self.alloc,
+            route.group_id,
+            route.table_name,
+            record,
+        );
+    }
+
+    pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.ha.replication_record.RecordView) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ctx));
+        try self.applyHAReplicationRecord(record);
+    }
+
     fn haWriteGate(self: *DataServer) ?antfly.db.HAWriteGate {
         const ctx = self.ha_cfg.admin_context orelse return null;
         if (ctx.standby) |standby| return .{ .standby = standby };
@@ -6732,6 +6749,34 @@ fn findTableById(
         if (table.table_id == table_id) return table;
     }
     return null;
+}
+
+const HAReplicationRecordRoute = struct {
+    group_id: u64,
+    table_name: []const u8,
+};
+
+fn resolveHAReplicationRecordRoute(
+    snapshot: *const antfly.metadata_api.AdminSnapshot,
+    record: antfly.ha.replication_record.RecordView,
+) !HAReplicationRecordRoute {
+    if (record.table_id == 0) return error.HAReplicationRecordMissingTableId;
+    if (record.shard_id == 0) return error.HAReplicationRecordMissingShardId;
+    const table = findTableById(snapshot.tables, record.table_id) orelse return error.HAReplicationRecordUnknownTable;
+
+    if (findRangeByGroupId(snapshot.ranges, record.shard_id)) |range| {
+        if (range.table_id == record.table_id) {
+            return .{ .group_id = range.group_id, .table_name = table.name };
+        }
+    }
+
+    for (snapshot.ranges) |range| {
+        if (range.table_id != record.table_id) continue;
+        if (antfly.metadata.table_manager.rangeDocIdentityShardId(range) != record.shard_id) continue;
+        return .{ .group_id = range.group_id, .table_name = table.name };
+    }
+
+    return error.HAReplicationRecordUnknownShard;
 }
 
 fn collectLocalGroupStatuses(
@@ -13469,6 +13514,141 @@ test "data server propagates standby HA write gate into provisioned write source
         .standby => |handle| try std.testing.expect(handle == &standby),
         .primary => return error.TestExpectedEqual,
     }
+}
+
+test "data server applies routed HA replication records through standby write gate" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+    server.initApiServer();
+
+    const payload = try antfly.ha.effects.encodeBatchMutationRequestAlloc(alloc, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .write,
+    });
+    defer alloc.free(payload);
+
+    try server.applyHAReplicationRecord(.{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = payload,
+    });
+
+    var lookup = (try server.read_source.source().lookupGroupLocal(
+        alloc,
+        77,
+        "docs",
+        "doc:a",
+        .{},
+        .stale,
+    )) orelse return error.TestExpectedEqual;
+    defer lookup.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.json, "\"title\":\"alpha\"") != null);
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {

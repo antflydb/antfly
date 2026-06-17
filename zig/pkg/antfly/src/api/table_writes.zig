@@ -5641,6 +5641,13 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_change_hook) |hook| hook.on_change(hook.ptr, table_name, kind);
     }
 
+    fn changeKindForHARecord(record: db_mod.HAReplicationRecordView) LocalChangeKind {
+        return switch (record.kind) {
+            .metadata_mutation => .structural,
+            else => .data,
+        };
+    }
+
     fn publishRestoreRepairComplete(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.invalidateWriteCacheForTable(table_name);
@@ -6722,6 +6729,49 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
             self.notifyLocalChange(table_name, .data);
+        }
+    }
+
+    pub fn applyHAReplicationRecordGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: db_mod.HAReplicationRecordView,
+    ) !void {
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(
+                alloc,
+                cache,
+                path,
+                group_id,
+                table_name,
+                .default_async,
+                null,
+                null,
+            );
+            defer cached.deinit(alloc);
+            try cached.db.applyHAReplicationRecord(record);
+            lockAtomic(&self.local_db_mutex);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            self.notifyLocalChange(table_name, changeKindForHARecord(record));
+        } else {
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            try db.applyHAReplicationRecord(record);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            lockAtomic(&self.local_db_mutex);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, changeKindForHARecord(record));
         }
     }
 

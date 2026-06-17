@@ -83,6 +83,7 @@ pub const DocumentArtifactChildRangeDispatcher = @import("db.zig").DocumentArtif
 pub const OpenOptions = @import("db.zig").OpenOptions;
 pub const OpenMode = @import("db.zig").OpenMode;
 pub const HAWriteGate = @import("db.zig").HAWriteGate;
+pub const HAReplicationRecordView = @import("../ha/replication_record.zig").RecordView;
 pub const ReplayProgress = @import("db.zig").ReplayProgress;
 pub const QueryVisibilityHook = @import("db.zig").QueryVisibilityHook;
 pub const QueryVisibilityChange = @import("db.zig").QueryVisibilityChange;
