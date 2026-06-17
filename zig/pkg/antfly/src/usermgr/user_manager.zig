@@ -26,6 +26,7 @@ pub const default_rbac_model_text =
     \\p = sub, typ, obj, act
     \\p2 = sub, obj, filter
     \\p3 = sub, setting, value
+    \\p4 = table
     \\[role_definition]
     \\g = _, _
     \\[matchers]
@@ -132,6 +133,24 @@ pub const RowFilterEntry = struct {
     pub fn deinit(self: *RowFilterEntry, alloc: Allocator) void {
         alloc.free(self.table);
         alloc.free(self.filter);
+        self.* = undefined;
+    }
+};
+
+pub const RoleSetting = struct {
+    name: []u8,
+    value: []u8,
+
+    pub fn initOwned(alloc: Allocator, name: []const u8, value: []const u8) !RoleSetting {
+        return .{
+            .name = try alloc.dupe(u8, name),
+            .value = try alloc.dupe(u8, value),
+        };
+    }
+
+    pub fn deinit(self: *RoleSetting, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.value);
         self.* = undefined;
     }
 };
@@ -263,6 +282,7 @@ pub const ValidatedApiKey = struct {
     row_filter: []RowFilterEntry,
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
+    role_settings: []RoleSetting = &.{},
 
     pub fn deinit(self: *ValidatedApiKey, alloc: Allocator) void {
         alloc.free(self.username);
@@ -272,6 +292,8 @@ pub const ValidatedApiKey = struct {
         alloc.free(self.row_filter);
         if (self.metadata_json.len > 0) alloc.free(self.metadata_json);
         freeOwnedStrings(alloc, self.roles);
+        for (self.role_settings) |*setting| setting.deinit(alloc);
+        if (self.role_settings.len > 0) alloc.free(self.role_settings);
         self.* = undefined;
     }
 };
@@ -808,6 +830,93 @@ pub const UserManager = struct {
         if (!removed) return error.RoleSettingNotFound;
     }
 
+    pub fn listRoleSettingsForSubject(self: *const UserManager, subject: []const u8) ![]RoleSetting {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{subject});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn getEffectiveRoleSettings(self: *const UserManager, username: []const u8) ![]RoleSetting {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        const roles = try self.getRolesForUser(username);
+        defer freeOwnedStrings(self.alloc, roles);
+
+        var merged = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = merged.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            merged.deinit(self.alloc);
+        }
+
+        for (roles) |role| try self.mergeRoleSettingsForSubject(&merged, role);
+        try self.mergeRoleSettingsForSubject(&merged, username);
+
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var it = merged.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn mergeRoleSettingsForSubject(
+        self: *const UserManager,
+        merged: *std.StringArrayHashMapUnmanaged([]u8),
+        subject: []const u8,
+    ) !void {
+        const settings = try self.listRoleSettingsForSubject(subject);
+        defer {
+            for (settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(settings);
+        }
+        for (settings) |setting| {
+            if (merged.fetchOrderedRemove(setting.name)) |removed| {
+                self.alloc.free(removed.key);
+                self.alloc.free(removed.value);
+            }
+            try merged.put(
+                self.alloc,
+                try self.alloc.dupe(u8, setting.name),
+                try self.alloc.dupe(u8, setting.value),
+            );
+        }
+    }
+
+    pub fn enableSqlRowSecurity(self: *UserManager, table: []const u8) !void {
+        if (table.len == 0) return error.InvalidRowFilter;
+        _ = try self.enforcer.addNamedPolicy("p4", &.{table});
+    }
+
+    pub fn disableSqlRowSecurity(self: *UserManager, table: []const u8) !void {
+        if (table.len == 0) return error.InvalidRowFilter;
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p4", 0, &.{table});
+        if (!removed) return error.RowSecurityNotEnabled;
+    }
+
+    pub fn sqlRowSecurityEnabled(self: *const UserManager, table: []const u8) !bool {
+        if (table.len == 0) return false;
+        return try self.hasFilteredPolicy("p4", 0, table);
+    }
+
     pub fn createSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8) !void {
         const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
         defer self.alloc.free(subject);
@@ -842,6 +951,7 @@ pub const UserManager = struct {
         for (rules) |rule| {
             if (rule.fields.len < 3) continue;
             if (!isSqlRowSecurityPolicySubject(rule.fields[0])) continue;
+            if (!(try self.sqlRowSecurityEnabled(rule.fields[1]))) continue;
             const entry = RowFilterEntry{
                 .table = @constCast(rule.fields[1]),
                 .filter = @constCast(rule.fields[2]),
@@ -1169,6 +1279,7 @@ pub const UserManager = struct {
             .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
             .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
             .roles = try self.getRolesForUser(record.key.username),
+            .role_settings = try self.getEffectiveRoleSettings(record.key.username),
         };
     }
 

@@ -4469,14 +4469,17 @@ predicates such as
 `tenant_id = current_setting('app.tenant_id')` as native policy metadata rather
 than raw SQL. Public API execution maps each supported policy to a hidden native
 row-filter policy subject, converts `current_setting('app.<key>')` to
-`{"$auth":"metadata.<key>"}`, and merges those filters into every user's
+`{"$auth":"metadata.<key>"}`, and merges enabled-table filters into every user's
 effective row filters before row-query, aggregate, join, lateral, window, and
-document query execution. `DROP POLICY` removes the hidden policy subject for
-that table, while `DROP POLICY IF EXISTS` is an idempotent no-op. Unsupported
-policy expressions, policy replacement, per-role `TO ...` policy targeting, and
-`DISABLE ROW LEVEL SECURITY` still fail closed until they have durable native
-policy state, request-context bindings, and planner/executor validation. Storage
-must not silently accept or ignore unsupported SQL RLS declarations.
+document query execution. Creating a policy stores policy metadata but does not
+make the filter active until `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` marks
+that table as RLS-enabled in the native auth policy store. `DROP POLICY` removes
+the hidden policy subject for that table, while `DROP POLICY IF EXISTS` is an
+idempotent no-op. Unsupported policy expressions, policy replacement, per-role
+`TO ...` policy targeting, and `DISABLE ROW LEVEL SECURITY` still fail closed
+until they have durable native policy state, request-context bindings, and
+planner/executor validation. Storage must not silently accept or ignore
+unsupported SQL RLS declarations.
 
 PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 `REVOKE`, and role lifecycle statements lower to typed authorization-catalog
@@ -4490,15 +4493,19 @@ assignments, and table
 `GRANT`/`REVOKE` statements map PostgreSQL privileges onto Antfly
 `read`/`write`/`admin` table permissions, with `ALL [PRIVILEGES]` expanded to
 all three native permission bits. `GRANT`/`REVOKE ... ON ALL TABLES IN SCHEMA
-public` maps to the native wildcard table resource `*`; non-public schema-wide
-targets fail closed until schema namespaces have first-class authorization
-semantics. A grant target that is already an Antfly user is applied directly to
-that user; otherwise SQL principals must resolve to a SQL-created `role:<name>`
-subject instead of being created implicitly by `GRANT`. `ALTER ROLE ... SET ...`
-persists the setting through the native auth policy store as role-owned metadata
-and removes that metadata when the role is dropped. Unsupported role-setting
-forms such as reset, database-scoped settings, and multi-token expressions still
-fail closed until they have explicit native semantics.
+public` is catalog-aware: API execution enumerates the current public table
+names from the admin snapshot and applies the corresponding per-table native
+permissions, so future tables are not accidentally granted without an explicit
+catalog event. Non-public schema-wide targets fail closed until schema
+namespaces have first-class authorization semantics. A grant target that is
+already an Antfly user is applied directly to that user; otherwise SQL
+principals must resolve to a SQL-created `role:<name>` subject instead of being
+created implicitly by `GRANT`. `ALTER ROLE ... SET ...` persists the setting
+through the native auth policy store as role-owned metadata, removes that
+metadata when the role is dropped, and authentication exposes merged effective
+role settings after role inheritance plus direct user settings. Unsupported
+role-setting forms such as reset, database-scoped settings, and multi-token
+expressions still fail closed until they have explicit native semantics.
 
 `COPY FROM` and `COPY TO` lower to typed bulk import/export intent that captures
 table identity, column count, stream endpoint, direction, and format, then fails
@@ -4983,9 +4990,11 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `updateOnService`, and `dropOnService`, not a second extension
    implementation: the parser owns syntax and typed intent, while the adapter
    resolves SQL names to package manifests, enforces strict `IF EXISTS` /
-   `IF NOT EXISTS` semantics, rejects transactional use until metadata DDL has a
-   unified boundary, and emits extension metadata transition commands instead
-   of mutating relational schema JSON. PL/pgSQL
+   `IF NOT EXISTS` semantics, resolves PostgreSQL-facing names through manifest
+   `sql_names` aliases such as `"uuid-ossp"` -> `uuid_ossp` before installing a
+   package, rejects ambiguous SQL-name aliases, rejects transactional use until
+   metadata DDL has a unified boundary, and emits extension metadata transition
+   commands instead of mutating relational schema JSON. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

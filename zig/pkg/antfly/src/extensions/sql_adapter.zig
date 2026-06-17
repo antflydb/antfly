@@ -48,19 +48,17 @@ fn executeCreate(
     alloc: std.mem.Allocator,
     plan: relational_sql.CreateExtensionPlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    {
-        var snapshot = try service.adminSnapshot();
-        defer service.freeAdminSnapshot(&snapshot);
-        if (findInstalledExtension(&snapshot, plan.extension_name)) |installed| {
-            if (!plan.if_not_exists) return error.ExtensionAlreadyInstalled;
-            if (plan.version) |version| {
-                if (!std.mem.eql(u8, installed.package_version, version)) return error.ExtensionVersionMismatch;
-            }
-            return try noopRecordAlloc(alloc);
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    if (findInstalledExtension(&snapshot, plan.extension_name)) |installed| {
+        if (!plan.if_not_exists) return error.ExtensionAlreadyInstalled;
+        if (plan.version) |version| {
+            if (!std.mem.eql(u8, installed.package_version, version)) return error.ExtensionVersionMismatch;
         }
+        return try noopRecordAlloc(alloc);
     }
 
-    const package_name = packageNameForSqlExtension(plan.extension_name);
+    const package_name = try packageNameForSqlExtension(&snapshot, plan.extension_name, plan.version);
     var installed = try extension_domain.lifecycle.installPackageOnService(service, alloc, plan.extension_name, package_name, .{
         .version = plan.version orelse "",
         .scope = .{ .kind = .cluster },
@@ -101,9 +99,49 @@ fn executeDrop(
     return try changedRecordAlloc(alloc);
 }
 
-fn packageNameForSqlExtension(extension_name: []const u8) []const u8 {
-    if (std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp")) return "uuid_ossp";
+fn packageNameForSqlExtension(
+    snapshot: *const metadata_api.AdminSnapshot,
+    extension_name: []const u8,
+    version: ?[]const u8,
+) ![]const u8 {
+    if (try findPackageForSqlName(snapshot.extension_packages, extension_name, version)) |package| return package.name;
+
+    if (std.ascii.eqlIgnoreCase(extension_name, "uuid-ossp")) {
+        if (try findPackageForSqlName(snapshot.extension_packages, "uuid_ossp", version)) |package| return package.name;
+    }
+
     return extension_name;
+}
+
+fn findPackageForSqlName(
+    packages: []const extension_domain.PackageManifest,
+    sql_name: []const u8,
+    version: ?[]const u8,
+) !?*const extension_domain.PackageManifest {
+    var found: ?*const extension_domain.PackageManifest = null;
+    for (packages) |*package| {
+        if (version) |target_version| {
+            if (!std.mem.eql(u8, package.version, target_version)) continue;
+        }
+        if (!packageMatchesSqlName(package.*, sql_name)) continue;
+        if (found) |existing| {
+            if (!std.mem.eql(u8, existing.name, package.name)) return error.AmbiguousExtensionSqlName;
+            if (version == null and extension_domain.packageVersionLess(existing.version, package.version)) {
+                found = package;
+            }
+            continue;
+        }
+        found = package;
+    }
+    return found;
+}
+
+fn packageMatchesSqlName(package: extension_domain.PackageManifest, sql_name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(package.name, sql_name)) return true;
+    for (package.sql_names) |alias| {
+        if (std.ascii.eqlIgnoreCase(alias, sql_name)) return true;
+    }
+    return false;
 }
 
 fn findInstalledExtension(snapshot: *const metadata_api.AdminSnapshot, name: []const u8) ?*const extension_domain.InstalledExtension {
@@ -146,6 +184,7 @@ const TestService = struct {
     proposed: usize = 0,
     installed_upserts: usize = 0,
     installed_removes: usize = 0,
+    saw_uuid_ossp_package: bool = false,
 
     pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
         return .{
@@ -169,6 +208,9 @@ const TestService = struct {
         const Delta = @TypeOf(delta);
         if (@hasField(Delta, "upsert_installed_extensions")) {
             self.installed_upserts += delta.upsert_installed_extensions.len;
+            inline for (delta.upsert_installed_extensions) |installed| {
+                if (std.mem.eql(u8, installed.package_name, "uuid_ossp")) self.saw_uuid_ossp_package = true;
+            }
         }
         if (@hasField(Delta, "remove_installed_extensions")) {
             self.installed_removes += delta.remove_installed_extensions.len;
@@ -195,6 +237,14 @@ const test_postgis_35_package = extension_domain.PackageManifest{
     }},
 };
 
+const test_uuid_ossp_package = extension_domain.PackageManifest{
+    .name = "uuid_ossp",
+    .version = "1.0.0",
+    .digest = "sha256:uuid",
+    .sql_names = &.{"uuid-ossp"},
+    .install = .{ .scopes_supported = &.{.cluster} },
+};
+
 const test_postgis_installed = extension_domain.InstalledExtension{
     .name = "postgis",
     .package_name = "postgis",
@@ -213,6 +263,16 @@ test "sql extension adapter installs create extension through lifecycle" {
     try std.testing.expect(!applied.noop);
     try std.testing.expectEqual(@as(usize, 1), service.proposed);
     try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
+}
+
+test "sql extension adapter resolves package from manifest sql name" {
+    const alloc = std.testing.allocator;
+    var service = TestService{ .packages = &.{test_uuid_ossp_package} };
+    var applied = (try executeRelationalSqlDdlOnService(&service, alloc, "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';")).?;
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(!applied.noop);
+    try std.testing.expect(service.saw_uuid_ossp_package);
 }
 
 test "sql extension adapter treats matching create if not exists as no-op" {

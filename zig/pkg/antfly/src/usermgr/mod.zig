@@ -27,6 +27,7 @@ pub const initDefaultEnforcer = user_manager.initDefaultEnforcer;
 pub const Permission = user_manager.Permission;
 pub const PermissionType = user_manager.PermissionType;
 pub const ResourceType = user_manager.ResourceType;
+pub const RoleSetting = user_manager.RoleSetting;
 pub const RowFilterEntry = user_manager.RowFilterEntry;
 pub const User = user_manager.User;
 pub const ValidatedApiKey = user_manager.ValidatedApiKey;

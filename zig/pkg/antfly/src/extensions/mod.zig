@@ -259,6 +259,7 @@ pub const PackageManifest = struct {
     kind: PackageKind = .extension,
     description: []const u8 = "",
     digest: []const u8 = "",
+    sql_names: []const []const u8 = &.{},
     antfly_min_version: []const u8 = "",
     antfly_max_version: []const u8 = "",
     trusted: bool = false,
@@ -274,6 +275,7 @@ pub const PackageManifest = struct {
         try requirePackageName(self.name);
         try requireName("package.version", self.version);
         try requireName("package.digest", self.digest);
+        for (self.sql_names) |sql_name| try requireObjectName(sql_name);
         if (self.kind != .extension) return error.UnsupportedPackageKind;
         for (self.capabilities_requested) |capability| try capability.validate();
         for (self.dependencies) |dependency| try dependency.validate();
@@ -1245,6 +1247,25 @@ fn cloneStrings(comptime T: type, alloc: std.mem.Allocator, values: []const T) !
     return out;
 }
 
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
 fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !PackageManifest {
     const manifest_api_version = try alloc.dupe(u8, package.manifest_api_version);
     errdefer alloc.free(manifest_api_version);
@@ -1256,6 +1277,8 @@ fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !Pac
     errdefer alloc.free(description);
     const digest = try alloc.dupe(u8, package.digest);
     errdefer alloc.free(digest);
+    const sql_names = try cloneStringSlice(alloc, package.sql_names);
+    errdefer freeStringSlice(alloc, sql_names);
     const antfly_min_version = try alloc.dupe(u8, package.antfly_min_version);
     errdefer alloc.free(antfly_min_version);
     const antfly_max_version = try alloc.dupe(u8, package.antfly_max_version);
@@ -1277,6 +1300,7 @@ fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !Pac
         .kind = package.kind,
         .description = description,
         .digest = digest,
+        .sql_names = sql_names,
         .antfly_min_version = antfly_min_version,
         .antfly_max_version = antfly_max_version,
         .trusted = package.trusted,
@@ -1295,6 +1319,7 @@ fn freePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) void 
     alloc.free(package.version);
     alloc.free(package.description);
     alloc.free(package.digest);
+    freeStringSlice(alloc, package.sql_names);
     alloc.free(package.antfly_min_version);
     alloc.free(package.antfly_max_version);
     freeCapabilities(alloc, package.capabilities_requested);

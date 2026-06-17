@@ -24,6 +24,7 @@ const public_table_http = @import("public_table_http.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const relational_rows_api = @import("relational_rows.zig");
+const relational_sql = @import("relational_sql.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
 const table_contract = @import("table_contract.zig");
@@ -395,6 +396,7 @@ pub const AuthenticatedIdentity = struct {
     row_filter: []usermgr.RowFilterEntry = &.{},
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
+    role_settings: []usermgr.RoleSetting = &.{},
 
     pub fn deinit(self: *AuthenticatedIdentity, alloc: std.mem.Allocator) void {
         alloc.free(self.username);
@@ -405,6 +407,8 @@ pub const AuthenticatedIdentity = struct {
         if (self.metadata_json.len > 0) alloc.free(self.metadata_json);
         for (self.roles) |role| alloc.free(role);
         if (self.roles.len > 0) alloc.free(self.roles);
+        for (self.role_settings) |*setting| setting.deinit(alloc);
+        if (self.role_settings.len > 0) alloc.free(self.role_settings);
         self.* = undefined;
     }
 };
@@ -1784,11 +1788,58 @@ pub const ApiHttpServer = struct {
 
     pub fn applyRelationalSqlDdl(self: *ApiHttpServer, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
         if (self.cfg.user_manager) |manager| {
-            if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManager(manager, self.alloc, sql)) |applied| {
+            var catalog = try self.sqlAuthCatalogForDdl(sql);
+            defer catalog.deinit(self.alloc);
+            if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManagerWithCatalog(manager, self.alloc, sql, catalog.value)) |applied| {
                 return applied;
             }
         }
         return try self.source.applyRelationalSqlDdl(self.alloc, sql);
+    }
+
+    const OwnedSqlAuthCatalog = struct {
+        value: auth_sql_adapter.SqlAuthCatalog = .{},
+        public_table_names: []const []const u8 = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.public_table_names) |name| alloc.free(@constCast(name));
+            if (self.public_table_names.len > 0) alloc.free(self.public_table_names);
+            self.* = undefined;
+        }
+    };
+
+    fn sqlAuthCatalogForDdl(self: *ApiHttpServer, sql: []const u8) !OwnedSqlAuthCatalog {
+        var plan = relational_sql.lowerDdlPlanAlloc(self.alloc, sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{},
+            else => return err,
+        };
+        defer plan.deinit(self.alloc);
+        const needs_public_tables = switch (plan) {
+            .authorization_catalog => |authorization_plan| switch (authorization_plan) {
+                .grant_privilege => |grant| std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema"),
+                .revoke_privilege => |revoke| std.ascii.eqlIgnoreCase(revoke.object_kind, "all_tables_in_schema"),
+                else => false,
+            },
+            else => false,
+        };
+        if (!needs_public_tables) return .{};
+
+        var snapshot = (try self.source.adminSnapshot()) orelse return error.UnsupportedOperation;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const names = try self.alloc.alloc([]const u8, snapshot.tables.len);
+        var filled: usize = 0;
+        errdefer {
+            for (names[0..filled]) |name| self.alloc.free(@constCast(name));
+            self.alloc.free(names);
+        }
+        for (snapshot.tables) |table| {
+            names[filled] = try self.alloc.dupe(u8, table.name);
+            filled += 1;
+        }
+        return .{
+            .value = .{ .public_table_names = names[0..filled] },
+            .public_table_names = names,
+        };
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
@@ -1824,6 +1875,7 @@ pub const ApiHttpServer = struct {
                 .row_filter = try manager.getRowFilters(user.username),
                 .metadata_json = try self.alloc.dupe(u8, user.metadata_json),
                 .roles = try manager.getRolesForUser(user.username),
+                .role_settings = try manager.getEffectiveRoleSettings(user.username),
             };
         }
 
@@ -1841,6 +1893,7 @@ pub const ApiHttpServer = struct {
                 .row_filter = validated.row_filter,
                 .metadata_json = validated.metadata_json,
                 .roles = validated.roles,
+                .role_settings = validated.role_settings,
             };
         }
 
@@ -12324,11 +12377,18 @@ test "api http server serves user management routes when auth is enabled" {
 test "api http server applies authorization SQL DDL through user manager" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 1, .name = "usage_records" },
+            .{ .table_id = 2, .name = "docs" },
+        },
+
+        fn iface(self: *@This()) StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl = applyRelationalSqlDdl,
                 },
             };
@@ -12341,6 +12401,21 @@ test "api http server applies authorization SQL DDL through user manager" {
                 .projected_stores = 1,
             };
         }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         fn applyRelationalSqlDdl(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
             return error.TestUnexpectedResult;
@@ -12365,11 +12440,15 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer created.deinit(alloc);
     var granted = try server.applyRelationalSqlDdl("GRANT SELECT ON TABLE usage_records TO app_writer;");
     defer granted.deinit(alloc);
+    var schema_granted = try server.applyRelationalSqlDdl("GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;");
+    defer schema_granted.deinit(alloc);
     var row_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));");
     defer row_policy.deinit(alloc);
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try auth.manager.enforce("alice", .table, "usage_records", .read));
+    try std.testing.expect(try auth.manager.enforce("alice", .table, "docs", .read));
+    try std.testing.expect(!(try auth.manager.enforce("alice", .table, "future_table", .read)));
     const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
     defer alloc.free(stored_policy);
     try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"metadata.tenant_id\"") != null);
@@ -12377,6 +12456,8 @@ test "api http server applies authorization SQL DDL through user manager" {
     try std.testing.expectError(error.RoleInUse, server.applyRelationalSqlDdl("DROP ROLE app_writer;"));
     var revoked = try server.applyRelationalSqlDdl("REVOKE SELECT ON TABLE usage_records FROM app_writer;");
     defer revoked.deinit(alloc);
+    var schema_revoked = try server.applyRelationalSqlDdl("REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer;");
+    defer schema_revoked.deinit(alloc);
     try auth.manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);
