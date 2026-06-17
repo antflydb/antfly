@@ -82,6 +82,16 @@ pub const RewindResult = struct {
     data_loss_discarded: bool,
 };
 
+pub const ReseedResult = struct {
+    slot_name: []const u8,
+    target_timeline_id: u64,
+    target_epoch: u64,
+    fork_lsn: u64,
+    former_last_lsn: u64,
+    reseed_required: bool,
+    base_backup_required: bool,
+};
+
 pub fn assessFormerPrimary(
     former: FormerPrimaryState,
     receipt: ?fencing.Receipt,

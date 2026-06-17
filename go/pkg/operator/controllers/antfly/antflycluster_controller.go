@@ -4104,6 +4104,13 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary && !result.RewindExecuted {
 		return false
 	}
+	if haActionKind(action.Kind) == haActionReseedFormerPrimary &&
+		(!result.ReseedExecuted ||
+			!result.ReseedRequired ||
+			!result.ReseedBaseBackupRequired ||
+			strings.TrimSpace(result.ReseedSlotName) != strings.TrimSpace(result.FormerNodeID)) {
+		return false
+	}
 	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
 		return false
 	}
@@ -4438,20 +4445,24 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 }
 
 type haRejoinJobResult struct {
-	Action                  string
-	Reason                  string
-	FormerNodeID            string
-	TargetTimelineID        uint64
-	TargetEpoch             uint64
-	ForkLSN                 uint64
-	FormerLastLSN           uint64
-	RetainedFromLSN         uint64
-	DataLossDiscarded       bool
-	RewindExecuted          bool
-	RewindPreviousLastLSN   uint64
-	RewindCurrentLastLSN    uint64
-	RewindNextLSN           uint64
-	RewindDiscardedLSNCount uint64
+	Action                   string
+	Reason                   string
+	FormerNodeID             string
+	TargetTimelineID         uint64
+	TargetEpoch              uint64
+	ForkLSN                  uint64
+	FormerLastLSN            uint64
+	RetainedFromLSN          uint64
+	DataLossDiscarded        bool
+	RewindExecuted           bool
+	RewindPreviousLastLSN    uint64
+	RewindCurrentLastLSN     uint64
+	RewindNextLSN            uint64
+	RewindDiscardedLSNCount  uint64
+	ReseedExecuted           bool
+	ReseedSlotName           string
+	ReseedRequired           bool
+	ReseedBaseBackupRequired bool
 }
 
 func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
@@ -4490,6 +4501,7 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 type haRejoinAPIResultEnvelope struct {
 	Assessment haRejoinAPIResult  `json:"assessment"`
 	Rewind     *haRejoinAPIRewind `json:"rewind,omitempty"`
+	Reseed     *haRejoinAPIReseed `json:"reseed,omitempty"`
 }
 
 type haRejoinAPIResult struct {
@@ -4513,6 +4525,16 @@ type haRejoinAPIRewind struct {
 	TargetTimelineID  uint64 `json:"target_timeline_id"`
 	TargetEpoch       uint64 `json:"target_epoch"`
 	DataLossDiscarded bool   `json:"data_loss_discarded"`
+}
+
+type haRejoinAPIReseed struct {
+	SlotName           string `json:"slot_name"`
+	TargetTimelineID   uint64 `json:"target_timeline_id"`
+	TargetEpoch        uint64 `json:"target_epoch"`
+	ForkLSN            uint64 `json:"fork_lsn"`
+	FormerLastLSN      uint64 `json:"former_last_lsn"`
+	ReseedRequired     bool   `json:"reseed_required"`
+	BaseBackupRequired bool   `json:"base_backup_required"`
 }
 
 func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
@@ -4558,6 +4580,23 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		result.RewindDiscardedLSNCount = rewind.DiscardedLSNCount
 		result.DataLossDiscarded = result.DataLossDiscarded || rewind.DataLossDiscarded
 	}
+	if reseed := envelope.Reseed; reseed != nil {
+		if strings.TrimSpace(assessment.Action) != "reseed" ||
+			strings.TrimSpace(reseed.SlotName) == "" ||
+			strings.TrimSpace(reseed.SlotName) != strings.TrimSpace(assessment.FormerNodeID) ||
+			reseed.TargetTimelineID != assessment.TargetTimelineID ||
+			reseed.TargetEpoch != assessment.TargetEpoch ||
+			reseed.ForkLSN != assessment.ForkLSN ||
+			reseed.FormerLastLSN != assessment.FormerLastLSN ||
+			!reseed.ReseedRequired ||
+			!reseed.BaseBackupRequired {
+			return haRejoinJobResult{}, false
+		}
+		result.ReseedExecuted = true
+		result.ReseedSlotName = strings.TrimSpace(reseed.SlotName)
+		result.ReseedRequired = reseed.ReseedRequired
+		result.ReseedBaseBackupRequired = reseed.BaseBackupRequired
+	}
 	return result, true
 }
 
@@ -4585,6 +4624,10 @@ func applyHARejoinAdminActionResult(status *antflyv1.HAAdminActionResultStatus, 
 	status.RewindCurrentLastLSN = result.RewindCurrentLastLSN
 	status.RewindNextLSN = result.RewindNextLSN
 	status.RewindDiscardedLSNCount = result.RewindDiscardedLSNCount
+	status.ReseedExecuted = result.ReseedExecuted
+	status.ReseedSlotName = result.ReseedSlotName
+	status.ReseedRequired = result.ReseedRequired
+	status.ReseedBaseBackupRequired = result.ReseedBaseBackupRequired
 }
 
 func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus) (haRejoinJobResult, bool) {
@@ -4596,20 +4639,24 @@ func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus
 		return haRejoinJobResult{}, false
 	}
 	return haRejoinJobResult{
-		Action:                  strings.TrimSpace(result.RejoinAction),
-		Reason:                  strings.TrimSpace(result.RejoinReason),
-		FormerNodeID:            strings.TrimSpace(result.FormerNodeID),
-		TargetTimelineID:        result.TargetTimelineID,
-		TargetEpoch:             result.TargetEpoch,
-		ForkLSN:                 result.ForkLSN,
-		FormerLastLSN:           result.FormerLastLSN,
-		RetainedFromLSN:         result.RetainedFromLSN,
-		DataLossDiscarded:       result.DataLossDiscarded,
-		RewindExecuted:          result.RewindExecuted,
-		RewindPreviousLastLSN:   result.RewindPreviousLastLSN,
-		RewindCurrentLastLSN:    result.RewindCurrentLastLSN,
-		RewindNextLSN:           result.RewindNextLSN,
-		RewindDiscardedLSNCount: result.RewindDiscardedLSNCount,
+		Action:                   strings.TrimSpace(result.RejoinAction),
+		Reason:                   strings.TrimSpace(result.RejoinReason),
+		FormerNodeID:             strings.TrimSpace(result.FormerNodeID),
+		TargetTimelineID:         result.TargetTimelineID,
+		TargetEpoch:              result.TargetEpoch,
+		ForkLSN:                  result.ForkLSN,
+		FormerLastLSN:            result.FormerLastLSN,
+		RetainedFromLSN:          result.RetainedFromLSN,
+		DataLossDiscarded:        result.DataLossDiscarded,
+		RewindExecuted:           result.RewindExecuted,
+		RewindPreviousLastLSN:    result.RewindPreviousLastLSN,
+		RewindCurrentLastLSN:     result.RewindCurrentLastLSN,
+		RewindNextLSN:            result.RewindNextLSN,
+		RewindDiscardedLSNCount:  result.RewindDiscardedLSNCount,
+		ReseedExecuted:           result.ReseedExecuted,
+		ReseedSlotName:           strings.TrimSpace(result.ReseedSlotName),
+		ReseedRequired:           result.ReseedRequired,
+		ReseedBaseBackupRequired: result.ReseedBaseBackupRequired,
 	}, true
 }
 
@@ -5365,6 +5412,12 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 		}
 	case haActionReseedFormerPrimary:
 		if result.RejoinAction != "reseed" {
+			return false
+		}
+		if !result.ReseedExecuted ||
+			!result.ReseedRequired ||
+			!result.ReseedBaseBackupRequired ||
+			strings.TrimSpace(result.ReseedSlotName) != strings.TrimSpace(result.FormerNodeID) {
 			return false
 		}
 	default:

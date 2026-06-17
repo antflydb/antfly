@@ -8888,6 +8888,22 @@ spec:
                               description: RejoinReason is the former-primary rejoin
                                 reason returned by a rejoin assessment.
                               type: string
+                            reseedBaseBackupRequired:
+                              description: ReseedBaseBackupRequired reports that a
+                                new base backup must be taken before bootstrap.
+                              type: boolean
+                            reseedExecuted:
+                              description: ReseedExecuted reports that `/admin/v1/ha/rejoin/reseed`
+                                marked the former-primary slot for reseed.
+                              type: boolean
+                            reseedRequired:
+                              description: ReseedRequired reports that the former-primary
+                                slot is now reseed-required.
+                              type: boolean
+                            reseedSlotName:
+                              description: ReseedSlotName is the replication slot
+                                marked for former-primary reseed.
+                              type: string
                             retainedFromLSN:
                               description: RetainedFromLSN is the earliest retained
                                 WAL LSN used by a rejoin assessment.

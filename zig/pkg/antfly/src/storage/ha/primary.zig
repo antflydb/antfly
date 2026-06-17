@@ -258,6 +258,10 @@ pub const Primary = struct {
         try self.slots.resumeSlot(name);
     }
 
+    pub fn markSlotReseedRequired(self: *Primary, name: []const u8) !void {
+        try self.slots.markReseedRequired(name);
+    }
+
     pub fn slot(self: *const Primary, name: []const u8) ?slot_store.SlotState {
         return self.slots.get(name);
     }

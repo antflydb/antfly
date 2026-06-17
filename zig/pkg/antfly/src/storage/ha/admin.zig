@@ -302,6 +302,23 @@ pub fn rewindFormerPrimaryReplicationLog(
     return try rejoin.rewindReplicationLog(alloc, log, assessment);
 }
 
+pub fn markFormerPrimaryForReseed(
+    primary: *primary_mod.Primary,
+    assessment: rejoin.Assessment,
+) !rejoin.ReseedResult {
+    if (assessment.action != .reseed) return error.RejoinReseedNotAllowed;
+    try primary.markSlotReseedRequired(assessment.former_node_id);
+    return .{
+        .slot_name = assessment.former_node_id,
+        .target_timeline_id = assessment.target_timeline_id,
+        .target_epoch = assessment.target_epoch,
+        .fork_lsn = assessment.fork_lsn,
+        .former_last_lsn = assessment.former_last_lsn,
+        .reseed_required = true,
+        .base_backup_required = true,
+    };
+}
+
 fn cloneReceiptAlloc(alloc: Allocator, receipt: fencing.Receipt) !fencing.Receipt {
     var cloned = fencing.Receipt{
         .identity = receipt.identity,

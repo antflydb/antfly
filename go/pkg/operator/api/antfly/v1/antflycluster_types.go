@@ -1720,6 +1720,22 @@ type HAAdminActionResultStatus struct {
 	// RewindDiscardedLSNCount is the count of divergent former-primary LSNs discarded by rewind.
 	// +optional
 	RewindDiscardedLSNCount uint64 `json:"rewindDiscardedLSNCount,omitempty"`
+
+	// ReseedExecuted reports that `/admin/v1/ha/rejoin/reseed` marked the former-primary slot for reseed.
+	// +optional
+	ReseedExecuted bool `json:"reseedExecuted,omitempty"`
+
+	// ReseedSlotName is the replication slot marked for former-primary reseed.
+	// +optional
+	ReseedSlotName string `json:"reseedSlotName,omitempty"`
+
+	// ReseedRequired reports that the former-primary slot is now reseed-required.
+	// +optional
+	ReseedRequired bool `json:"reseedRequired,omitempty"`
+
+	// ReseedBaseBackupRequired reports that a new base backup must be taken before bootstrap.
+	// +optional
+	ReseedBaseBackupRequired bool `json:"reseedBaseBackupRequired,omitempty"`
 }
 
 // HAPrimaryRouteStatus reports the operator-facing primary endpoint target.

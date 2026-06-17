@@ -1221,8 +1221,11 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		former.Reason != "FormerPrimaryRequiresReseed" {
 		t.Fatalf("unexpected reseed disposition: %#v", former)
 	}
-	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
-		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) {
+	if len(cluster.Status.HAStatus.PlannedActions) != 2 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionSeedStandby) ||
+		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionReseedFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[1].StandbyName != "old-primary" {
 		t.Fatalf("expected reseed planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 

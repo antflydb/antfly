@@ -632,6 +632,17 @@ pub const Server = struct {
                     });
                 }
             }
+            if (expected == .reseed) {
+                if (self.ctx.primary) |primary| {
+                    const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
+                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                    };
+                    return try self.handleTypedJson(RejoinReseedDocument{
+                        .assessment = assessment,
+                        .reseed = reseed,
+                    });
+                }
+            }
         }
 
         return try self.handleTypedJson(RejoinAssessDocument{ .assessment = assessment });
@@ -798,6 +809,12 @@ const RejoinRewindDocument = struct {
     schema_version: u32 = 1,
     assessment: rejoin.Assessment,
     rewind: rejoin.RewindResult,
+};
+
+const RejoinReseedDocument = struct {
+    schema_version: u32 = 1,
+    assessment: rejoin.Assessment,
+    reseed: rejoin.ReseedResult,
 };
 
 fn promotionDocument(result: ha_admin.FencedPromotionResult) PromotionDocument {
@@ -1251,6 +1268,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.WalNoLongerRetained,
         error.RejoinAssessmentStale,
         error.RejoinRewindNotAllowed,
+        error.RejoinReseedNotAllowed,
         error.FormerPrimaryBeforeFork,
         error.MissingReceivedRecord,
         error.RecordAlreadyReceived,
@@ -1468,6 +1486,38 @@ test "storage.ha http admin executes typed former primary log rewind when config
     defer stale.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), stale.status);
     try expectContains(stale.body, "RejoinAssessmentStale");
+}
+
+test "storage.ha http admin marks former primary slot for typed reseed" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-reseed");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    try primary.createSlot("primary-a", 0);
+
+    var server = Server.init(alloc, .{ .primary = &primary });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_reseed,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type.?);
+    try expectContains(response.body, "\"assessment\"");
+    try expectContains(response.body, "\"action\":\"reseed\"");
+    try expectContains(response.body, "\"reseed\"");
+    try expectContains(response.body, "\"slot_name\":\"primary-a\"");
+    try expectContains(response.body, "\"base_backup_required\":true");
+
+    const slot = primary.slot("primary-a") orelse return error.TestExpectedEqual;
+    try std.testing.expect(slot.reseed_required);
 }
 
 test "storage.ha http admin serves health and command endpoint" {

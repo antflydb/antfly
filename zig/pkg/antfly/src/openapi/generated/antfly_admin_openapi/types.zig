@@ -105,6 +105,16 @@ pub const HARejoinRewindResult = struct {
     data_loss_discarded: bool,
 };
 
+pub const HARejoinReseedResult = struct {
+    slot_name: []const u8,
+    target_timeline_id: i64,
+    target_epoch: i64,
+    fork_lsn: i64,
+    former_last_lsn: i64,
+    reseed_required: bool,
+    base_backup_required: bool,
+};
+
 pub const HAPromotionAssessment = struct {
     required_lsn: i64,
     received_lsn: i64,
@@ -294,6 +304,8 @@ pub const HARejoinAssessResponse = struct {
     assessment: HARejoinAssessment,
     /// Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
     rewind: ?HARejoinRewindResult = null,
+    /// Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
+    reseed: ?HARejoinReseedResult = null,
 };
 
 pub const HAPrimarySnapshot = struct {

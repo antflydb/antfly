@@ -526,6 +526,21 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
 	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
 		plan.Actions = append(plan.Actions, action)
+		if action.Kind == haActionReseedFormerPrimary {
+			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
+				slotName := standbySlotName(standby)
+				seed := haPlannedAction{
+					Kind:        haActionSeedStandby,
+					DependsOn:   haActionReseedFormerPrimary,
+					StandbyName: standby.Name,
+					SlotName:    slotName,
+					TargetLSN:   status.PrimaryLSN,
+					Reason:      "FormerPrimaryRequiresReseed",
+				}
+				plan.Actions = append(plan.Actions, seed)
+				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, status.PrimaryLSN, "FormerPrimaryRequiresReseed", haActionSeedStandby)...)
+			}
+		}
 	}
 
 	return plan
@@ -1108,6 +1123,18 @@ func haStandbyAdminURL(ha *antflyv1.HighAvailabilitySpec, standbyName string) st
 		}
 	}
 	return ""
+}
+
+func haStandbySpecByName(ha *antflyv1.HighAvailabilitySpec, standbyName string) (antflyv1.HAStandbySpec, bool) {
+	if ha == nil || standbyName == "" {
+		return antflyv1.HAStandbySpec{}, false
+	}
+	for _, standby := range ha.Standbys {
+		if standby.Name == standbyName {
+			return standby, true
+		}
+	}
+	return antflyv1.HAStandbySpec{}, false
 }
 
 func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplicationIdentitySpec {

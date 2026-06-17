@@ -1203,6 +1203,23 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	result.RewindDiscardedLSNCount = 1
 	g.Expect(haDirectRejoinResultMatchesAction(result, status, action)).To(BeTrue())
 
+	reseedResult := haRejoinJobResult{
+		Action:           "reseed",
+		FormerNodeID:     "primary-a",
+		TargetTimelineID: 5,
+		TargetEpoch:      7,
+		ForkLSN:          12,
+		FormerLastLSN:    13,
+		RetainedFromLSN:  8,
+	}
+	action.Kind = string(haActionReseedFormerPrimary)
+	g.Expect(haDirectRejoinResultMatchesAction(reseedResult, status, action)).To(BeFalse())
+	reseedResult.ReseedExecuted = true
+	reseedResult.ReseedSlotName = "primary-a"
+	reseedResult.ReseedRequired = true
+	reseedResult.ReseedBaseBackupRequired = true
+	g.Expect(haDirectRejoinResultMatchesAction(reseedResult, status, action)).To(BeTrue())
+
 	wrongTimeline := result
 	wrongTimeline.TargetTimelineID = 6
 	g.Expect(haDirectRejoinResultMatchesAction(wrongTimeline, status, action)).To(BeFalse())
@@ -1545,6 +1562,34 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	rejoinActions[0].AdminResult.RewindNextLSN = 13
 	rejoinActions[0].AdminResult.RewindDiscardedLSNCount = 1
 	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeTrue())
+
+	reseedActions := []antflyv1.HAPlannedActionStatus{{
+		Kind:            string(haActionReseedFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+		AdminCommand:    []string{"rejoin", "assess"},
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			RejoinAction:     "reseed",
+			FormerNodeID:     "primary-a",
+			TargetTimelineID: 5,
+			TargetEpoch:      7,
+			ForkLSN:          12,
+			FormerLastLSN:    13,
+			RetainedFromLSN:  8,
+		},
+	}, {
+		Kind:      string(haActionSeedStandby),
+		DependsOn: string(haActionReseedFormerPrimary),
+	}}
+	g.Expect(haPlannedActionDependenciesSucceeded(reseedActions, 1)).To(BeFalse())
+	reseedActions[0].AdminResult.ReseedExecuted = true
+	reseedActions[0].AdminResult.ReseedSlotName = "primary-a"
+	reseedActions[0].AdminResult.ReseedRequired = true
+	reseedActions[0].AdminResult.ReseedBaseBackupRequired = true
+	g.Expect(haPlannedActionDependenciesSucceeded(reseedActions, 1)).To(BeTrue())
 }
 
 func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
@@ -2471,6 +2516,32 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g.Expect(ok).To(BeFalse())
 
 	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"rewind":{"fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	g.Expect(ok).To(BeFalse())
+}
+
+func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
+	g := NewWithT(t)
+
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(result.Action).To(Equal("reseed"))
+	g.Expect(result.ReseedExecuted).To(BeTrue())
+	g.Expect(result.ReseedSlotName).To(Equal("primary-a"))
+	g.Expect(result.ReseedRequired).To(BeTrue())
+	g.Expect(result.ReseedBaseBackupRequired).To(BeTrue())
+
+	status := haRejoinAdminActionResult(result)
+	g.Expect(status.ReseedExecuted).To(BeTrue())
+	g.Expect(status.ReseedSlotName).To(Equal("primary-a"))
+	g.Expect(status.ReseedRequired).To(BeTrue())
+	g.Expect(status.ReseedBaseBackupRequired).To(BeTrue())
+
+	roundTripped, ok := haRejoinJobResultFromAdminResult(status)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(roundTripped.ReseedExecuted).To(BeTrue())
+	g.Expect(roundTripped.ReseedSlotName).To(Equal("primary-a"))
+
+	_, ok = parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14},"reseed":{"slot_name":"other","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
 	g.Expect(ok).To(BeFalse())
 }
 

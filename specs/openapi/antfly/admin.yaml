@@ -1169,6 +1169,9 @@ components:
         rewind:
           $ref: "#/components/schemas/HARejoinRewindResult"
           description: Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
+        reseed:
+          $ref: "#/components/schemas/HARejoinReseedResult"
+          description: Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
     HARejoinRewindResult:
       type: object
       required:
@@ -1211,6 +1214,41 @@ components:
           format: uint64
           minimum: 1
         data_loss_discarded:
+          type: boolean
+    HARejoinReseedResult:
+      type: object
+      required:
+        - slot_name
+        - target_timeline_id
+        - target_epoch
+        - fork_lsn
+        - former_last_lsn
+        - reseed_required
+        - base_backup_required
+      additionalProperties: false
+      properties:
+        slot_name:
+          type: string
+          minLength: 1
+        target_timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        target_epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+        fork_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        former_last_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        reseed_required:
+          type: boolean
+        base_backup_required:
           type: boolean
     HAPromotionAssessment:
       type: object
