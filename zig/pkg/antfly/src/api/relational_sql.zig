@@ -332,13 +332,6 @@ const SelectSetOperation = enum {
     except,
 };
 
-const SimpleSetPredicateMode = enum {
-    none,
-    scalar,
-    expression,
-    mixed,
-};
-
 pub const LoweredSelect = struct {
     table_name: []const u8,
     ctes: []const db_mod.types.RelationalRowsCte = &.{},
@@ -10697,8 +10690,8 @@ const Parser = struct {
                 if (!querySupportsSimpleUnionRewrite(rhs)) return error.UnsupportedSqlShape;
             },
             .intersect, .except => {
-                _ = querySimpleSetPredicateMode(lhs) orelse return error.UnsupportedSqlShape;
-                _ = querySimpleSetPredicateMode(rhs) orelse return error.UnsupportedSqlShape;
+                if (!querySupportsSimpleIntersectExceptRewrite(lhs)) return error.UnsupportedSqlShape;
+                if (!querySupportsSimpleIntersectExceptRewrite(rhs)) return error.UnsupportedSqlShape;
             },
         }
     }
@@ -10863,6 +10856,12 @@ const Parser = struct {
             if (lhs.query.predicates.len > 0) self.alloc.free(lhs.query.predicates);
             lhs.query.predicates = predicates;
         }
+        if (rhs.in_predicates.len > 0) {
+            const in_predicates = try cloneInPredicatesConcatAlloc(self.alloc, lhs.query.in_predicates, rhs.in_predicates);
+            freeInPredicates(self.alloc, lhs.query.in_predicates);
+            if (lhs.query.in_predicates.len > 0) self.alloc.free(lhs.query.in_predicates);
+            lhs.query.in_predicates = in_predicates;
+        }
         if (rhs.expression_predicates.len > 0) {
             const expression_predicates = try cloneExpressionConditionsConcatAlloc(self.alloc, lhs.query.expression_predicates, rhs.expression_predicates);
             freeExpressionConditions(self.alloc, lhs.query.expression_predicates);
@@ -10876,7 +10875,7 @@ const Parser = struct {
         lhs: *LoweredSelect,
         rhs: db_mod.types.RelationalRowsQueryRequest,
     ) !void {
-        if (rhs.predicates.len == 0 and rhs.expression_predicates.len == 0) return error.UnsupportedSqlShape;
+        if (rhs.predicates.len == 0 and rhs.in_predicates.len == 0 and rhs.expression_predicates.len == 0) return error.UnsupportedSqlShape;
         if (rhs.expression_predicates.len > 0) {
             const groups = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, 1);
             var initialized: usize = 0;
@@ -10889,6 +10888,34 @@ const Parser = struct {
             freeExpressionPredicateGroups(self.alloc, lhs.query.expression_not_predicates);
             if (lhs.query.expression_not_predicates.len > 0) self.alloc.free(lhs.query.expression_not_predicates);
             lhs.query.expression_not_predicates = groups;
+            return;
+        }
+        if (rhs.in_predicates.len > 0) {
+            const groups = try self.alloc.alloc(db_mod.types.RelationalRowsAccessPredicateGroup, 1);
+            var initialized: usize = 0;
+            errdefer {
+                for (groups[0..initialized]) |group| freeAccessPredicateGroup(self.alloc, group);
+                self.alloc.free(groups);
+            }
+            const predicates = try cloneQueryRelationalChecksAlloc(self.alloc, rhs.predicates);
+            var predicates_transferred = false;
+            errdefer if (!predicates_transferred) {
+                freeRelationalChecks(self.alloc, predicates);
+                if (predicates.len > 0) self.alloc.free(predicates);
+            };
+            const in_predicates = try cloneInPredicatesAlloc(self.alloc, rhs.in_predicates);
+            var in_transferred = false;
+            errdefer if (!in_transferred) {
+                freeInPredicates(self.alloc, in_predicates);
+                if (in_predicates.len > 0) self.alloc.free(in_predicates);
+            };
+            groups[0] = .{ .predicates = predicates, .in_predicates = in_predicates };
+            predicates_transferred = true;
+            in_transferred = true;
+            initialized += 1;
+            freeAccessPredicateGroups(self.alloc, lhs.query.access_not_predicates);
+            if (lhs.query.access_not_predicates.len > 0) self.alloc.free(lhs.query.access_not_predicates);
+            lhs.query.access_not_predicates = groups;
             return;
         }
         const groups = try self.alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, 1);
@@ -43141,19 +43168,48 @@ fn cloneInPredicatesAlloc(
         alloc.free(out);
     }
     for (values, 0..) |value, i| {
-        const field = try alloc.dupe(u8, value.field);
-        var field_transferred = false;
-        errdefer if (!field_transferred) alloc.free(field);
-        const values_json = try alloc.dupe(u8, value.values_json);
-        var values_transferred = false;
-        errdefer if (!values_transferred) alloc.free(values_json);
-        out[i] = .{
-            .field = field,
-            .values_json = values_json,
-            .negated = value.negated,
-        };
-        field_transferred = true;
-        values_transferred = true;
+        out[i] = try cloneInPredicateAlloc(alloc, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneInPredicateAlloc(
+    alloc: std.mem.Allocator,
+    value: db_mod.types.RelationalRowsInPredicate,
+) !db_mod.types.RelationalRowsInPredicate {
+    const field = try alloc.dupe(u8, value.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const values_json = try alloc.dupe(u8, value.values_json);
+    var values_transferred = false;
+    errdefer if (!values_transferred) alloc.free(values_json);
+    field_transferred = true;
+    values_transferred = true;
+    return .{
+        .field = field,
+        .values_json = values_json,
+        .negated = value.negated,
+    };
+}
+
+fn cloneInPredicatesConcatAlloc(
+    alloc: std.mem.Allocator,
+    lhs: []const db_mod.types.RelationalRowsInPredicate,
+    rhs: []const db_mod.types.RelationalRowsInPredicate,
+) ![]const db_mod.types.RelationalRowsInPredicate {
+    const out = try alloc.alloc(db_mod.types.RelationalRowsInPredicate, lhs.len + rhs.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeInPredicates(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (lhs) |value| {
+        out[initialized] = try cloneInPredicateAlloc(alloc, value);
+        initialized += 1;
+    }
+    for (rhs) |value| {
+        out[initialized] = try cloneInPredicateAlloc(alloc, value);
         initialized += 1;
     }
     return out;
@@ -43203,6 +43259,13 @@ fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryReques
         return false;
     }
     if (query.expression_or_predicates.len > 0) return false;
+    return true;
+}
+
+fn querySupportsSimpleIntersectExceptRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
+    if (!queryHasOnlySimpleIntersectExceptPredicateSurface(query)) return false;
+    if (query.or_predicates.len != 0 or query.expression_or_predicates.len != 0) return false;
+    if (query.in_predicates.len != 0 and query.expression_predicates.len != 0) return false;
     return true;
 }
 
@@ -43663,20 +43726,10 @@ fn jsonNumberLiteralValue(value: ?[]const u8) ?f64 {
     return parsed;
 }
 
-fn querySimpleSetPredicateMode(query: db_mod.types.RelationalRowsQueryRequest) ?SimpleSetPredicateMode {
-    if (!queryHasOnlySimpleSetPredicateSurface(query)) return null;
-    if (query.or_predicates.len != 0 or query.expression_or_predicates.len != 0) return null;
-    if (query.predicates.len != 0 and query.expression_predicates.len != 0) return .mixed;
-    if (query.expression_predicates.len != 0) return .expression;
-    if (query.predicates.len != 0) return .scalar;
-    return .none;
-}
-
-fn queryHasOnlySimpleSetPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
+fn queryHasOnlySimpleUnionPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
     if (query.array_any.len != 0 or
         query.array_contains.len != 0 or
         query.array_eq.len != 0 or
-        query.in_predicates.len != 0 or
         query.json_contains.len != 0 or
         query.json_path_eq.len != 0 or
         query.json_path_exists.len != 0 or
@@ -43703,7 +43756,7 @@ fn queryHasOnlySimpleSetPredicateSurface(query: db_mod.types.RelationalRowsQuery
     return true;
 }
 
-fn queryHasOnlySimpleUnionPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
+fn queryHasOnlySimpleIntersectExceptPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
     if (query.array_any.len != 0 or
         query.array_contains.len != 0 or
         query.array_eq.len != 0 or
@@ -73755,6 +73808,27 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
         },
         .{
+            .name = "query union scalar in set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "query intersect scalar in set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "query except scalar in set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .access_not_predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_not=1",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived')",
+        },
+        .{
             .name = "query union all set operation ordered page",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5, .offset = 2 },
@@ -73984,6 +74058,27 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "read union scalar in set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "read intersect scalar in set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "read except scalar in set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .access_not_predicates = 1, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_not=1",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived')",
         },
         .{
             .name = "read union all boolean disjoint set operation",
@@ -82233,6 +82328,30 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("\"archived\"", disjoint_or_in_union.query.access_or_predicates[1].predicates[0].value_json.?);
     try std.testing.expectEqualStrings("[\"open\",\"pending\"]", disjoint_or_in_union.query.access_or_predicates[2].in_predicates[0].values_json);
 
+    var distinct_in_union = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer distinct_in_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), distinct_in_union.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), distinct_in_union.query.access_or_predicates.len);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", distinct_in_union.query.access_or_predicates[0].in_predicates[0].values_json);
+    try std.testing.expectEqualStrings("\"closed\"", distinct_in_union.query.access_or_predicates[1].predicates[0].value_json.?);
+
+    var in_intersect = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_intersect.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_intersect.query.predicates.len);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", in_intersect.query.in_predicates[0].values_json);
+    try std.testing.expectEqualStrings("enabled", in_intersect.query.predicates[0].field);
+
     var except = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records EXCEPT SELECT id FROM usage_records WHERE status = 'deleted'",
@@ -82263,6 +82382,19 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_except.query.expression_not_predicates[0].conditions[1].lhs.kind);
     try std.testing.expectEqualStrings("\"archived\"", mixed_except.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
 
+    var in_except = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived')",
+        schema,
+        &.{},
+    );
+    defer in_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_except.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_except.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_except.query.access_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_except.query.access_not_predicates[0].in_predicates.len);
+    try std.testing.expectEqualStrings("[\"deleted\",\"archived\"]", in_except.query.access_not_predicates[0].in_predicates[0].values_json);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE",
@@ -82278,6 +82410,12 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'pending'",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted') AND lower(status) = 'archived'",
         schema,
         &.{},
     ));
