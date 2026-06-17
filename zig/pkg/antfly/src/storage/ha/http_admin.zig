@@ -1881,6 +1881,20 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(fail_closed_append.body, "SyncPolicyUnsatisfied");
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
 
+    var typed_commit_append = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_commit_append,
+        .content_type = "application/json",
+        .body = "{\"payload\":\"two\",\"sync_policy\":{\"mode\":\"async\"}}",
+    });
+    defer typed_commit_append.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_commit_append.status);
+    try expectContains(typed_commit_append.body, "\"lsn\":2");
+    var appended_entry = (try primary.log.entryAt(alloc, 2)) orelse return error.TestExpectedEqual;
+    defer appended_entry.deinit(alloc);
+    try std.testing.expectEqual(identity.shard_id, appended_entry.record.shard_id);
+    try std.testing.expectEqual(identity.table_id, appended_entry.record.table_id);
+
     var unfenced_promote = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_promotion_current_fence,
