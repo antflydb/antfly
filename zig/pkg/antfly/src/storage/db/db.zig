@@ -244,6 +244,64 @@ pub const HASyncWaitFn = *const fn (
     policy: ha_primary_mod.SyncPolicy,
 ) anyerror!void;
 
+pub const HASessionSyncWait = struct {
+    alloc: Allocator,
+    slot_name: []const u8,
+    standby: *ha_standby_mod.Standby,
+    apply_ctx: *anyopaque,
+    apply_fn: ha_standby_mod.ApplyFn,
+    max_rounds: usize = 8,
+
+    pub fn wait(ctx: *anyopaque, primary: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (policy.mode == .async) return;
+        if (!haSyncPolicyIncludesStandby(policy, self.slot_name)) return error.HASyncCommitWaitStandbyNotInPolicy;
+        if (self.max_rounds == 0) return error.HASyncCommitWaitLimitExceeded;
+
+        var progress = self.standby.currentProgress();
+        var round: usize = 0;
+        while (round < self.max_rounds) : (round += 1) {
+            const result = ha_session_mod.replicateAvailable(
+                self.alloc,
+                primary,
+                self.slot_name,
+                self.standby,
+                self.apply_ctx,
+                self.apply_fn,
+            ) catch |err| {
+                if (policy.mode == .remote_write) {
+                    const gate = ha_commit_gate_mod.evaluate(primary, target_lsn, policy) catch return err;
+                    if (gate.shouldAcknowledge()) return;
+                }
+                return err;
+            };
+
+            const gate = try ha_commit_gate_mod.evaluate(primary, target_lsn, policy);
+            if (gate.shouldAcknowledge()) return;
+            if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
+            if (result.received_count == 0 and result.applied_count == 0) break;
+
+            const next_progress = self.standby.currentProgress();
+            if (next_progress.received_lsn == progress.received_lsn and
+                next_progress.applied_lsn == progress.applied_lsn and
+                next_progress.safe_read_lsn == progress.safe_read_lsn)
+            {
+                break;
+            }
+            progress = next_progress;
+        }
+
+        return error.HASyncCommitWouldBlock;
+    }
+};
+
+fn haSyncPolicyIncludesStandby(policy: ha_primary_mod.SyncPolicy, slot_name: []const u8) bool {
+    for (policy.standby_names) |name| {
+        if (std.mem.eql(u8, name, slot_name)) return true;
+    }
+    return false;
+}
+
 pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
 pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
 
@@ -37238,6 +37296,195 @@ test "storage.ha db block sync policy waits for standby acknowledgement" {
     var found = (try db.lookup(alloc, "doc:block", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
+}
+
+test "storage.ha db session sync wait satisfies remote apply through standby DB apply" {
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 257,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    var wait_state = HASessionSyncWait{
+        .alloc = alloc,
+        .slot_name = "standby-a",
+        .standby = &standby,
+        .apply_ctx = &standby_db,
+        .apply_fn = DB.applyHAReplicationRecordCallback,
+    };
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = HASessionSyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer primary_db.close();
+
+    try primary_db.batch(.{
+        .writes = &.{.{ .key = "doc:remote-apply", .value = "{\"title\":\"remote-apply\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+
+    var found = (try standby_db.lookup(alloc, "doc:remote-apply", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
+}
+
+test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 258,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    const ApplyFailure = struct {
+        calls: u64 = 0,
+
+        fn apply(ctx: *anyopaque, _: ha_replication_record_mod.RecordView) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.IntentionalApplyFailure;
+        }
+    };
+
+    var apply_failure = ApplyFailure{};
+    var wait_state = HASessionSyncWait{
+        .alloc = alloc,
+        .slot_name = "standby-a",
+        .standby = &standby,
+        .apply_ctx = &apply_failure,
+        .apply_fn = ApplyFailure.apply,
+    };
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = HASessionSyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer primary_db.close();
+
+    try primary_db.batch(.{
+        .writes = &.{.{ .key = "doc:remote-write", .value = "{\"title\":\"remote-write\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), apply_failure.calls);
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
+
+    var found = (try primary_db.lookup(alloc, "doc:remote-write", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"remote-write\"}", found.json);
 }
 
 test "storage.ha db block sync policy surfaces wait provider errors" {
