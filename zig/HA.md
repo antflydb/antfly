@@ -614,6 +614,10 @@ and either rewind or reseed.
   only source locations for HA admin HTTP contract definitions. Public DB specs
   and `/internal/v1` specs may reference HA concepts only as clients of the
   contract, not as owners of HA operator actions.
+- Reject implementations that add HA operator actions first to
+  `specs/openapi/antfly/internal.yaml`, public OpenAPI specs, or ad hoc Zig HTTP
+  handlers; the new admin spec and `zig/pkg/antfly/src/admin/` package must land
+  before the route is consumed by the CLI or operator.
 - Implement node-local admin behavior in the HA runtime by importing
   `zig/pkg/antfly/src/admin/` types and routes, not by hard-coding new
   `/admin/v1/ha` paths or request/response schemas in storage modules.
@@ -651,6 +655,9 @@ be validated against that operator package.
 - Treat `specs/openapi/antfly/admin.yaml` plus `zig/pkg/antfly/src/admin/` as
   the operator-facing contract source for admin HTTP method/path, request, and
   response fields.
+- Generate or hand-maintain any Go operator admin client/types from that admin
+  OpenAPI contract, not from `specs/openapi/antfly/internal.yaml` and not from
+  CLI output parsing.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.
