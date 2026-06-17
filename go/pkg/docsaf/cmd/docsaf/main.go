@@ -35,31 +35,62 @@ func (s *StringSliceFlag) Set(value string) error {
 }
 
 type sourceFlags struct {
-	dirPath         *string
-	baseURL         *string
-	inlineContent   *bool
-	maxInlineBytes  *int64
-	idPrefix        *string
-	includePatterns StringSliceFlag
-	excludePatterns StringSliceFlag
+	sourceType        *string
+	dirPath           *string
+	baseURL           *string
+	inlineContent     *bool
+	maxInlineBytes    *int64
+	idPrefix          *string
+	driveFolder       *string
+	driveCredentials  *string
+	driveAccessToken  *string
+	driveTokenFile    *string
+	driveConcurrency  *int
+	driveSharedDrives *bool
+	includePatterns   StringSliceFlag
+	excludePatterns   StringSliceFlag
 }
 
 func registerSourceFlags(fs *flag.FlagSet) sourceFlags {
 	flags := sourceFlags{
-		dirPath:        fs.String("dir", "", "Path to directory containing source documents (required)"),
-		baseURL:        fs.String("base-url", "", "Fetchable URL prefix for source documents"),
-		inlineContent:  fs.Bool("inline-content", false, "Encode source bytes as data: URLs for local smoke tests"),
-		maxInlineBytes: fs.Int64("max-inline-bytes", defaultDocsafMaxInlineContentBytes, "Maximum source bytes allowed with --inline-content"),
-		idPrefix:       fs.String("id-prefix", "", "Optional prefix for source document IDs"),
+		sourceType:        fs.String("source", "filesystem", "Source type: filesystem or google-drive"),
+		dirPath:           fs.String("dir", "", "Path to directory containing source documents (required for filesystem source)"),
+		baseURL:           fs.String("base-url", "", "Fetchable URL prefix for source documents"),
+		inlineContent:     fs.Bool("inline-content", false, "Encode source bytes as data: URLs for local smoke tests and private sources"),
+		maxInlineBytes:    fs.Int64("max-inline-bytes", defaultDocsafMaxInlineContentBytes, "Maximum source bytes allowed with --inline-content"),
+		idPrefix:          fs.String("id-prefix", "", "Optional prefix for source document IDs"),
+		driveFolder:       fs.String("drive-folder", "", "Google Drive folder ID or folder URL (required for google-drive source)"),
+		driveCredentials:  fs.String("drive-credentials", "", "Google service account JSON or path for Drive readonly access"),
+		driveAccessToken:  fs.String("drive-access-token", "", "Google Drive OAuth access token; falls back to GOOGLE_DRIVE_ACCESS_TOKEN"),
+		driveTokenFile:    fs.String("drive-token-file", defaultGoogleDriveTokenFile(), "OAuth token cache from `docsaf auth google-drive`"),
+		driveConcurrency:  fs.Int("drive-concurrency", 5, "Parallel Google Drive downloads"),
+		driveSharedDrives: fs.Bool("drive-include-shared-drives", true, "Include files from Google shared drives"),
 	}
 	fs.Var(&flags.includePatterns, "include", "Include pattern (can be repeated, supports ** wildcards)")
 	fs.Var(&flags.excludePatterns, "exclude", "Exclude pattern (can be repeated, supports ** wildcards)")
 	return flags
 }
 
-func (f sourceFlags) validate() error {
+func (f sourceFlags) validate(ctx context.Context) error {
+	switch f.normalizedSourceType() {
+	case "filesystem":
+		return f.validateFilesystem()
+	case "google-drive":
+		if strings.TrimSpace(*f.driveFolder) == "" {
+			return fmt.Errorf("--drive-folder is required for --source google-drive")
+		}
+		if f.googleDriveAuthConfigured(ctx) {
+			return nil
+		}
+		return fmt.Errorf("google-drive source requires --drive-credentials, --drive-access-token, GOOGLE_DRIVE_ACCESS_TOKEN, or a token file from `docsaf auth google-drive`")
+	default:
+		return fmt.Errorf("unknown --source %q; expected filesystem or google-drive", *f.sourceType)
+	}
+}
+
+func (f sourceFlags) validateFilesystem() error {
 	if *f.dirPath == "" {
-		return fmt.Errorf("--dir flag is required")
+		return fmt.Errorf("--dir flag is required for --source filesystem")
 	}
 	if *f.baseURL == "" && !*f.inlineContent {
 		return fmt.Errorf("set --base-url for fetchable source URLs or --inline-content for local smoke tests")
@@ -74,13 +105,60 @@ func (f sourceFlags) validate() error {
 	return nil
 }
 
-func (f sourceFlags) source() *docsaf.FilesystemSource {
-	return docsaf.NewFilesystemSource(docsaf.FilesystemSourceConfig{
-		BaseDir:         *f.dirPath,
-		BaseURL:         *f.baseURL,
-		IncludePatterns: f.includePatterns,
-		ExcludePatterns: f.excludePatterns,
-	})
+func (f sourceFlags) normalizedSourceType() string {
+	sourceType := strings.TrimSpace(*f.sourceType)
+	if sourceType == "" {
+		return "filesystem"
+	}
+	return sourceType
+}
+
+func (f sourceFlags) googleDriveAuthConfigured(ctx context.Context) bool {
+	if strings.TrimSpace(*f.driveCredentials) != "" || strings.TrimSpace(*f.driveAccessToken) != "" || strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_ACCESS_TOKEN")) != "" {
+		return true
+	}
+	if strings.TrimSpace(*f.driveTokenFile) == "" {
+		return false
+	}
+	_, err := loadGoogleDriveTokenSource(ctx, *f.driveTokenFile)
+	return err == nil
+}
+
+func (f sourceFlags) source(ctx context.Context) (docsaf.ContentSource, error) {
+	switch f.normalizedSourceType() {
+	case "filesystem":
+		return docsaf.NewFilesystemSource(docsaf.FilesystemSourceConfig{
+			BaseDir:         *f.dirPath,
+			BaseURL:         *f.baseURL,
+			IncludePatterns: f.includePatterns,
+			ExcludePatterns: f.excludePatterns,
+		}), nil
+	case "google-drive":
+		config := docsaf.GoogleDriveSourceConfig{
+			FolderID:            *f.driveFolder,
+			BaseURL:             *f.baseURL,
+			IncludePatterns:     f.includePatterns,
+			ExcludePatterns:     f.excludePatterns,
+			Concurrency:         *f.driveConcurrency,
+			IncludeSharedDrives: f.driveSharedDrives,
+		}
+		if token := strings.TrimSpace(*f.driveAccessToken); token != "" {
+			config.AccessToken = token
+		} else if credentials := strings.TrimSpace(*f.driveCredentials); credentials != "" {
+			config.CredentialsJSON = credentials
+		} else if token := strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_ACCESS_TOKEN")); token != "" {
+			config.AccessToken = token
+		} else {
+			tokenSource, err := loadGoogleDriveTokenSource(ctx, *f.driveTokenFile)
+			if err != nil {
+				return nil, err
+			}
+			config.TokenSource = tokenSource
+		}
+		return docsaf.NewGoogleDriveSource(ctx, config)
+	default:
+		return nil, fmt.Errorf("unknown --source %q; expected filesystem or google-drive", *f.sourceType)
+	}
 }
 
 func (f sourceFlags) options() docsaf.SourceDocumentOptions {
@@ -93,7 +171,22 @@ func (f sourceFlags) options() docsaf.SourceDocumentOptions {
 }
 
 func (f sourceFlags) print() {
-	fmt.Printf("Directory: %s\n", *f.dirPath)
+	sourceType := f.normalizedSourceType()
+	fmt.Printf("Source: %s\n", sourceType)
+	switch sourceType {
+	case "filesystem":
+		fmt.Printf("Directory: %s\n", *f.dirPath)
+	case "google-drive":
+		fmt.Printf("Drive folder: %s\n", *f.driveFolder)
+		fmt.Printf("Drive token file: %s\n", *f.driveTokenFile)
+		fmt.Printf("Drive service account configured: %v\n", strings.TrimSpace(*f.driveCredentials) != "")
+		fmt.Printf("Drive access token configured: %v\n", strings.TrimSpace(*f.driveAccessToken) != "" || strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_ACCESS_TOKEN")) != "")
+		fmt.Printf("Drive include shared drives: %v\n", *f.driveSharedDrives)
+		fmt.Printf("Drive concurrency: %d\n", *f.driveConcurrency)
+		if !*f.inlineContent && *f.baseURL == "" {
+			fmt.Printf("Drive URL mode: using Drive web links; private files usually require --inline-content or Antfly-readable URLs\n")
+		}
+	}
 	if *f.baseURL != "" {
 		fmt.Printf("Base URL: %s\n", *f.baseURL)
 	}
@@ -121,7 +214,8 @@ func prepareCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
-	if err := sourceFlags.validate(); err != nil {
+	ctx := context.Background()
+	if err := sourceFlags.validate(ctx); err != nil {
 		return err
 	}
 
@@ -129,7 +223,11 @@ func prepareCmd(args []string) error {
 	sourceFlags.print()
 	fmt.Printf("Output: %s\n\n", *outputFile)
 
-	docs, err := docsaf.BuildSourceDocuments(context.Background(), sourceFlags.source(), sourceFlags.options())
+	source, err := sourceFlags.source(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create source: %w", err)
+	}
+	docs, err := docsaf.BuildSourceDocuments(ctx, source, sourceFlags.options())
 	if err != nil {
 		return fmt.Errorf("failed to build source documents: %w", err)
 	}
@@ -248,12 +346,12 @@ func syncCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
-	if err := sourceFlags.validate(); err != nil {
+	ctx := context.Background()
+	if err := sourceFlags.validate(ctx); err != nil {
 		return err
 	}
 	token := resolveAuthToken(*authToken)
 
-	ctx := context.Background()
 	client, err := newDocsafClient(*antflyURL, token)
 	if err != nil {
 		return fmt.Errorf("failed to create Antfly client: %w", err)
@@ -278,7 +376,11 @@ func syncCmd(args []string) error {
 		}
 	}
 
-	docs, err := docsaf.BuildSourceDocuments(ctx, sourceFlags.source(), sourceFlags.options())
+	source, err := sourceFlags.source(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create source: %w", err)
+	}
+	docs, err := docsaf.BuildSourceDocuments(ctx, source, sourceFlags.options())
 	if err != nil {
 		return fmt.Errorf("failed to build source documents: %w", err)
 	}
@@ -540,11 +642,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  docsaf prepare [flags]  - Traverse files and create source-row JSON\n")
 		fmt.Fprintf(os.Stderr, "  docsaf load [flags]     - Load source-row JSON into Antfly\n")
 		fmt.Fprintf(os.Stderr, "  docsaf sync [flags]     - Traverse files and load source rows directly\n")
+		fmt.Fprintf(os.Stderr, "  docsaf auth google-drive [flags] - Authorize Drive access for prepare/sync\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  docsaf prepare --dir ./docs --base-url s3://docs-bucket --output docs.json\n")
 		fmt.Fprintf(os.Stderr, "  docsaf load --input docs.json --table docs --create-table\n")
 		fmt.Fprintf(os.Stderr, "  docsaf sync --dir ./docs --base-url s3://docs-bucket --table docs --create-table\n")
 		fmt.Fprintf(os.Stderr, "  docsaf sync --dir ./docs --inline-content --table docs --create-table\n")
+		fmt.Fprintf(os.Stderr, "  docsaf auth google-drive --client-secret ./client_secret.json\n")
+		fmt.Fprintf(os.Stderr, "  docsaf sync --source google-drive --drive-folder <folder-url> --inline-content --table docs\n")
 		os.Exit(1)
 	}
 
@@ -556,9 +661,11 @@ func main() {
 		err = loadCmd(os.Args[2:])
 	case "sync":
 		err = syncCmd(os.Args[2:])
+	case "auth":
+		err = authCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintf(os.Stderr, "Valid commands: prepare, load, sync\n")
+		fmt.Fprintf(os.Stderr, "Valid commands: prepare, load, sync, auth\n")
 		os.Exit(1)
 	}
 

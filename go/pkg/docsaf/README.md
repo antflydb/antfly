@@ -4,7 +4,7 @@ A generic content traversal and processing library for building documentation fr
 
 ## Features
 
-- **Multiple Content Sources**: Traverse local directories, crawl websites, clone Git repositories, or fetch from S3-compatible storage
+- **Multiple Content Sources**: Traverse local directories, crawl websites, clone Git repositories, fetch from S3-compatible storage, or sync Google Drive folders
 - **Pluggable Processors**: Markdown, HTML, PDF, OpenAPI, and custom processors
 - **Web Crawling**: Full-featured web crawler with sitemap support via go-colly
 - **Git Integration**: Clone and traverse Git repositories with branch/tag support
@@ -315,6 +315,44 @@ source, err := docsaf.NewS3Source(docsaf.S3SourceConfig{
     Concurrency: 10,
 })
 ```
+
+### GoogleDriveSource
+
+Traverses a Google Drive folder recursively, downloads regular files, and
+exports supported Google Workspace documents before yielding content items.
+Google Docs are exported as HTML and Google Slides are exported as PDF.
+
+```go
+includeSharedDrives := true
+source, err := docsaf.NewGoogleDriveSource(ctx, docsaf.GoogleDriveSourceConfig{
+    // Required: folder ID or folder URL
+    FolderID: "https://drive.google.com/drive/folders/...",
+
+    // Auth option 1: service account JSON or path
+    CredentialsJSON: "./service-account.json",
+
+    // Auth option 2: pre-obtained OAuth access token
+    // AccessToken: os.Getenv("GOOGLE_DRIVE_ACCESS_TOKEN"),
+
+    // Optional: include shared/team drives, defaults to true
+    IncludeSharedDrives: &includeSharedDrives,
+
+    // Optional: glob filters
+    IncludePatterns: []string{"**/*.pdf", "**/*.docx"},
+    ExcludePatterns: []string{"**/drafts/**"},
+})
+```
+
+The `docsaf` command line tool can create a refresh-token cache for personal
+Drive accounts:
+
+```bash
+docsaf auth google-drive --client-secret ./client_secret.json
+docsaf sync --source google-drive --drive-folder <folder-url> --inline-content --table docs
+```
+
+For private Drive folders, `--inline-content` is usually required unless Antfly
+can fetch the emitted Drive links directly.
 
 #### Using with MinIO
 

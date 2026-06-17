@@ -46,12 +46,16 @@ var folderIDRegexp = regexp.MustCompile(`/folders/([a-zA-Z0-9_-]+)`)
 
 // GoogleDriveSourceConfig holds configuration for a GoogleDriveSource.
 type GoogleDriveSourceConfig struct {
+	// TokenSource is an OAuth2 token source, usually backed by a refresh token.
+	// If set, it takes precedence over AccessToken and CredentialsJSON.
+	TokenSource oauth2.TokenSource
+
 	// CredentialsJSON is a service account key JSON string or file path.
-	// Either CredentialsJSON or AccessToken must be provided.
+	// TokenSource, CredentialsJSON, or AccessToken must be provided.
 	CredentialsJSON string
 
 	// AccessToken is a pre-obtained OAuth2 access token.
-	// Either CredentialsJSON or AccessToken must be provided.
+	// TokenSource, CredentialsJSON, or AccessToken must be provided.
 	AccessToken string
 
 	// FolderID is the Google Drive folder ID or full folder URL (required).
@@ -91,8 +95,8 @@ type GoogleDriveSource struct {
 
 // NewGoogleDriveSource creates a new Google Drive content source.
 func NewGoogleDriveSource(ctx context.Context, config GoogleDriveSourceConfig) (*GoogleDriveSource, error) {
-	if config.CredentialsJSON == "" && config.AccessToken == "" {
-		return nil, fmt.Errorf("either CredentialsJSON or AccessToken is required")
+	if config.TokenSource == nil && config.CredentialsJSON == "" && config.AccessToken == "" {
+		return nil, fmt.Errorf("TokenSource, CredentialsJSON, or AccessToken is required")
 	}
 	if config.FolderID == "" {
 		return nil, fmt.Errorf("FolderID is required")
@@ -108,7 +112,9 @@ func NewGoogleDriveSource(ctx context.Context, config GoogleDriveSourceConfig) (
 
 	// Build Drive service
 	var opts []option.ClientOption
-	if config.AccessToken != "" {
+	if config.TokenSource != nil {
+		opts = append(opts, option.WithTokenSource(config.TokenSource))
+	} else if config.AccessToken != "" {
 		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.AccessToken})
 		opts = append(opts, option.WithTokenSource(ts))
 	} else {
