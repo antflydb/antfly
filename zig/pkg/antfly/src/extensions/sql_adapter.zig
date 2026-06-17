@@ -149,7 +149,7 @@ const TestService = struct {
 
     pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
         return .{
-            .status = .{ .metadata_group_id = 1 },
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
             .tables = &.{},
             .ranges = &.{},
             .stores = &.{},
@@ -166,8 +166,13 @@ const TestService = struct {
     pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
         self.proposed += 1;
         const delta = command.apply_extension_lifecycle;
-        self.installed_upserts += delta.upsert_installed_extensions.len;
-        self.installed_removes += delta.remove_installed_extensions.len;
+        const Delta = @TypeOf(delta);
+        if (@hasField(Delta, "upsert_installed_extensions")) {
+            self.installed_upserts += delta.upsert_installed_extensions.len;
+        }
+        if (@hasField(Delta, "remove_installed_extensions")) {
+            self.installed_removes += delta.remove_installed_extensions.len;
+        }
     }
 };
 
@@ -176,6 +181,18 @@ const test_postgis_package = extension_domain.PackageManifest{
     .version = "3.4.0",
     .digest = "sha256:postgis-3.4.0",
     .install = .{ .scopes_supported = &.{.cluster} },
+};
+
+const test_postgis_35_package = extension_domain.PackageManifest{
+    .name = "postgis",
+    .version = "3.5.0",
+    .digest = "sha256:postgis-3.5.0",
+    .install = .{ .scopes_supported = &.{.cluster} },
+    .updates = &.{.{
+        .from_version = "3.4.0",
+        .to_version = "3.5.0",
+        .path = "updates/3.4.0--3.5.0.json",
+    }},
 };
 
 const test_postgis_installed = extension_domain.InstalledExtension{
@@ -210,6 +227,21 @@ test "sql extension adapter treats matching create if not exists as no-op" {
     try std.testing.expect(applied.noop);
     try std.testing.expectEqual(@as(usize, 0), service.proposed);
     try std.testing.expectError(error.ExtensionVersionMismatch, executeRelationalSqlDdlOnService(&service, alloc, "CREATE EXTENSION IF NOT EXISTS postgis VERSION '3.5.0';"));
+}
+
+test "sql extension adapter updates extension through lifecycle" {
+    const alloc = std.testing.allocator;
+    var service = TestService{
+        .packages = &.{ test_postgis_package, test_postgis_35_package },
+        .installed = &.{test_postgis_installed},
+    };
+    var applied = (try executeRelationalSqlDdlOnService(&service, alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';")).?;
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(!applied.noop);
+    try std.testing.expectEqual(@as(usize, 1), service.proposed);
+    try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
+    try std.testing.expectEqual(@as(usize, 0), service.installed_removes);
 }
 
 test "sql extension adapter drops extension through lifecycle and no-ops missing if exists" {
