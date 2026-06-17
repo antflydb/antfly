@@ -111,6 +111,9 @@ test "admin facade preserves HA failover receipt schema fields" {
     inline for (ha_promotion_assessment_fields) |name| {
         try expectFacadeStructField(HAPromotionAssessment, name);
     }
+    inline for (ha_promotion_assess_response_fields) |name| {
+        try expectFacadeStructField(HAPromotionAssessResponse, name);
+    }
     inline for (ha_promotion_response_fields) |name| {
         try expectFacadeStructField(HAPromotionResponse, name);
     }
@@ -211,6 +214,12 @@ const ha_promotion_response_fields = [_][]const u8{
     "fence_generation",
     "fence_token",
     "forced",
+};
+
+const ha_promotion_assess_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "assessment",
 };
 
 const ha_promotion_result_fields = [_][]const u8{

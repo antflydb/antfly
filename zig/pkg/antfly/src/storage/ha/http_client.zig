@@ -1226,6 +1226,10 @@ test "storage.ha http client round trips typed safety operations" {
         .use_current_fence = true,
     });
     defer assessment.deinit(alloc);
+    try std.testing.expectEqualStrings("promotion_assess", assessment.parsed.value.action.action_kind);
+    try std.testing.expectEqualStrings("promotion_assess:standby-a", assessment.parsed.value.action.action_id);
+    try std.testing.expectEqualStrings("assessed", assessment.parsed.value.action.state);
+    try std.testing.expectEqualStrings("standby-a", assessment.parsed.value.action.node_id);
     try std.testing.expect(assessment.parsed.value.assessment.can_promote);
     try std.testing.expect(assessment.parsed.value.assessment.fencing_confirmed);
 

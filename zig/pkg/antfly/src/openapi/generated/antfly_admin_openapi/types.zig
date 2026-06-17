@@ -315,6 +315,7 @@ pub const HAStandbyBootstrapResponse = struct {
 
 pub const HAPromotionAssessResponse = struct {
     schema_version: i64,
+    action: HAActionReceipt,
     assessment: HAPromotionAssessment,
 };
 

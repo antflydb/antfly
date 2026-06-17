@@ -564,6 +564,7 @@ pub const Server = struct {
             command.check.force = parsed.value.force orelse false;
             command.use_current_fence = parsed.value.use_current_fence orelse false;
         }
+        const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
 
         var plan = admin_cli.Plan{
             .output = .json,
@@ -575,9 +576,14 @@ pub const Server = struct {
         };
         defer result.deinit(self.alloc);
         return switch (result) {
-            .promote_assess => |assessment| try self.handleTypedJson(PromotionAssessDocument{
-                .assessment = assessment,
-            }),
+            .promote_assess => |assessment| blk: {
+                var receipt = try actionReceiptAlloc(self.alloc, "promotion_assess", node_id, "assessed", node_id);
+                defer receipt.deinit(self.alloc);
+                break :blk try self.handleTypedJson(PromotionAssessDocument{
+                    .action = receipt,
+                    .assessment = assessment,
+                });
+            },
             else => unreachable,
         };
     }
@@ -877,6 +883,7 @@ const CurrentFenceDocument = struct {
 
 const PromotionAssessDocument = struct {
     schema_version: u32 = 1,
+    action: ActionReceiptDocument,
     assessment: status_mod.PromotionAssessment,
 };
 
@@ -2141,6 +2148,10 @@ test "storage.ha http admin serves health and command endpoint" {
     try std.testing.expectEqual(@as(u16, 200), typed_promote_assess.status);
     try std.testing.expectEqualStrings("application/json", typed_promote_assess.content_type.?);
     try expectContains(typed_promote_assess.body, "\"schema_version\":1");
+    try expectContains(typed_promote_assess.body, "\"action_kind\":\"promotion_assess\"");
+    try expectContains(typed_promote_assess.body, "\"action_id\":\"promotion_assess:standby-a\"");
+    try expectContains(typed_promote_assess.body, "\"state\":\"assessed\"");
+    try expectContains(typed_promote_assess.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote_assess.body, "\"assessment\"");
     try expectContains(typed_promote_assess.body, "\"can_promote\":true");
 

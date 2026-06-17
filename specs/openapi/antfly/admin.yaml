@@ -1021,6 +1021,7 @@ components:
             - base_backup_finish
             - standby_bootstrap
             - fence_acquire
+            - promotion_assess
             - promotion
             - rejoin_assess
             - rejoin_rewind
@@ -1171,13 +1172,15 @@ components:
           $ref: "#/components/schemas/HAFenceReceipt"
     HAPromotionAssessResponse:
       type: object
-      required: [schema_version, assessment]
+      required: [schema_version, action, assessment]
       additionalProperties: false
       properties:
         schema_version:
           type: integer
           format: uint32
           minimum: 1
+        action:
+          $ref: "#/components/schemas/HAActionReceipt"
         assessment:
           $ref: "#/components/schemas/HAPromotionAssessment"
     HAPromotionResponse:
