@@ -65468,10 +65468,86 @@ const AppParitySqlParameterScan = union(enum) {
     invalid,
 };
 
-fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) AppParitySqlParameterScan {
-    if (dollar + 1 >= sql.len) return .absent;
-    if (sql[dollar] != '$') return .absent;
-    if (sql[dollar + 1] < '0' or sql[dollar + 1] > '9') return .absent;
+fn appParitySqlHasParameterIndex(sql: []const u8, expected: usize) bool {
+    var index: usize = 0;
+    while (appParitySqlNextParameter(sql, &index)) |scan| {
+        switch (scan) {
+            .value => |param_index| if (param_index == expected) return true,
+            .absent, .invalid => {},
+        }
+    }
+    return false;
+}
+
+fn appParitySqlParameterCoverageMatches(sql: []const u8, param_count: usize) bool {
+    var index: usize = 0;
+    var saw_parameter = false;
+    var max_index: usize = 0;
+    while (appParitySqlNextParameter(sql, &index)) |scan| {
+        switch (scan) {
+            .value => |param_index| {
+                if (param_index == 0 or param_index > param_count) return false;
+                saw_parameter = true;
+                max_index = @max(max_index, param_index);
+            },
+            .invalid => return false,
+            .absent => {},
+        }
+    }
+    if (param_count == 0) return !saw_parameter;
+    if (!saw_parameter or max_index != param_count) return false;
+
+    for (1..param_count + 1) |param_index| {
+        if (!appParitySqlHasParameterIndex(sql, param_index)) return false;
+    }
+    return true;
+}
+
+fn appParitySqlNextParameter(sql: []const u8, index: *usize) ?AppParitySqlParameterScan {
+    while (index.* < sql.len) {
+        switch (sql[index.*]) {
+            '\'' => {
+                index.* = appParitySqlSingleQuotedEnd(sql, index.*);
+                continue;
+            },
+            '"' => {
+                index.* = appParitySqlDoubleQuotedEnd(sql, index.*);
+                continue;
+            },
+            '-' => {
+                if (index.* + 1 < sql.len and sql[index.* + 1] == '-') {
+                    index.* = appParitySqlLineCommentEnd(sql, index.*);
+                    continue;
+                }
+            },
+            '/' => {
+                if (index.* + 1 < sql.len and sql[index.* + 1] == '*') {
+                    index.* = appParitySqlBlockCommentEnd(sql, index.*);
+                    continue;
+                }
+            },
+            '$' => {
+                const dollar = index.*;
+                if (appParitySqlParameterIndexAt(sql, dollar)) |scan| {
+                    index.* = appParitySqlParameterTokenEnd(sql, dollar);
+                    return scan;
+                }
+                if (appParitySqlDollarQuotedEnd(sql, dollar)) |end| {
+                    index.* = end;
+                    continue;
+                }
+            },
+            else => {},
+        }
+        index.* += 1;
+    }
+    return null;
+}
+
+fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?AppParitySqlParameterScan {
+    if (dollar + 1 >= sql.len) return null;
+    if (sql[dollar] != '$') return null;
+    if (sql[dollar + 1] < '0' or sql[dollar + 1] > '9') return null;
 
     var index = dollar + 1;
     var value: usize = 0;
@@ -65482,41 +65558,81 @@ fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) AppParitySqlPara
     return .{ .value = value };
 }
 
-fn appParitySqlHasParameterIndex(sql: []const u8, expected: usize) bool {
-    var index: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
-        switch (appParitySqlParameterIndexAt(sql, dollar)) {
-            .value => |param_index| if (param_index == expected) return true,
-            .absent, .invalid => {},
-        }
-        index = dollar + 1;
-    }
-    return false;
+fn appParitySqlParameterTokenEnd(sql: []const u8, dollar: usize) usize {
+    var index = dollar + 1;
+    while (index < sql.len and sql[index] >= '0' and sql[index] <= '9') : (index += 1) {}
+    return index;
 }
 
-fn appParitySqlParameterCoverageMatches(sql: []const u8, param_count: usize) bool {
-    var index: usize = 0;
-    var saw_parameter = false;
-    var max_index: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
-        switch (appParitySqlParameterIndexAt(sql, dollar)) {
-            .value => |param_index| {
-                if (param_index == 0 or param_index > param_count) return false;
-                saw_parameter = true;
-                max_index = @max(max_index, param_index);
-            },
-            .invalid => return false,
-            .absent => {},
+fn appParitySqlSingleQuotedEnd(sql: []const u8, quote: usize) usize {
+    var index = quote + 1;
+    while (index < sql.len) : (index += 1) {
+        if (sql[index] != '\'') continue;
+        if (index + 1 < sql.len and sql[index + 1] == '\'') {
+            index += 1;
+            continue;
         }
-        index = dollar + 1;
+        return index + 1;
     }
-    if (param_count == 0) return !saw_parameter;
-    if (!saw_parameter or max_index != param_count) return false;
+    return sql.len;
+}
 
-    for (1..param_count + 1) |param_index| {
-        if (!appParitySqlHasParameterIndex(sql, param_index)) return false;
+fn appParitySqlDoubleQuotedEnd(sql: []const u8, quote: usize) usize {
+    var index = quote + 1;
+    while (index < sql.len) : (index += 1) {
+        if (sql[index] != '"') continue;
+        if (index + 1 < sql.len and sql[index + 1] == '"') {
+            index += 1;
+            continue;
+        }
+        return index + 1;
     }
-    return true;
+    return sql.len;
+}
+
+fn appParitySqlLineCommentEnd(sql: []const u8, dash: usize) usize {
+    var index = dash + 2;
+    while (index < sql.len and sql[index] != '\n' and sql[index] != '\r') : (index += 1) {}
+    return index;
+}
+
+fn appParitySqlBlockCommentEnd(sql: []const u8, slash: usize) usize {
+    var index = slash + 2;
+    while (index + 1 < sql.len) : (index += 1) {
+        if (sql[index] == '*' and sql[index + 1] == '/') return index + 2;
+    }
+    return sql.len;
+}
+
+fn appParitySqlDollarQuotedEnd(sql: []const u8, dollar: usize) ?usize {
+    if (dollar + 1 >= sql.len) return null;
+    if (sql[dollar + 1] >= '0' and sql[dollar + 1] <= '9') return null;
+
+    var delimiter_end = dollar + 1;
+    if (sql[delimiter_end] == '$') {
+        delimiter_end += 1;
+    } else {
+        if (!appParitySqlDollarQuoteTagStart(sql[delimiter_end])) return null;
+        delimiter_end += 1;
+        while (delimiter_end < sql.len and appParitySqlDollarQuoteTagContinue(sql[delimiter_end])) : (delimiter_end += 1) {}
+        if (delimiter_end >= sql.len or sql[delimiter_end] != '$') return null;
+        delimiter_end += 1;
+    }
+
+    const delimiter = sql[dollar..delimiter_end];
+    const body_start = delimiter_end;
+    if (std.mem.indexOfPos(u8, sql, body_start, delimiter)) |close| {
+        return close + delimiter.len;
+    }
+    return sql.len;
+}
+
+fn appParitySqlDollarQuoteTagStart(ch: u8) bool {
+    return std.ascii.isAlphabetic(ch) or ch == '_';
+}
+
+fn appParitySqlDollarQuoteTagContinue(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_';
 }
 
 fn appParityFixtureSqlParameterCoverageMatches(entry: AppParityCorpusEntry) bool {
@@ -67279,6 +67395,31 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "query:table=usage_records",
         .params = &.{.{ .string = "u1" }},
     }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "literal placeholder text ignored",
+        .sql = "SELECT '$1' AS literal, id FROM usage_records -- $2\nWHERE id = $1 /* $3 */",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{.{ .string = "u1" }},
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "dollar quoted placeholder text ignored",
+        .sql = "SELECT $$ $1 $$ AS literal, $tag$ $2abc $tag$ AS tagged, id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+    }, &seen, alloc);
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "malformed placeholder suffix ignored in comment",
+        .sql = "SELECT id FROM usage_records /* $1abc */ -- $2abc",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "prepare statement placeholder mismatch",
