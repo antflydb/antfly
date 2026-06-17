@@ -90,6 +90,7 @@ func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
 		ha.Mode != antflyv1.HAModeDisabled &&
 		ha.AutomaticFailover != nil &&
 		ha.AutomaticFailover.Enabled &&
+		haAutomaticFailoverExecutionEnabled(ha) &&
 		ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityKubernetesLease
 }
 
@@ -195,6 +196,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	ha := cluster.Spec.HighAvailability
 	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
 		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
+		!haAutomaticFailoverExecutionEnabled(ha) ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
 		return nil
 	}

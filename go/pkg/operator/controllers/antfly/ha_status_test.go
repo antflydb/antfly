@@ -2161,6 +2161,28 @@ func TestReconcileHAFencingLeaseSkipsWhilePrimaryAdminReachable(t *testing.T) {
 	}
 }
 
+func TestReconcileHAFencingLeaseSkipsWhenAdminExecutionDisabled(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no fencing lease when admin execution is disabled, got lease=%#v err=%v", lease, err)
+	}
+	if haKubernetesLeaseRenewalEnabled(cluster) {
+		t.Fatal("expected HA lease renewal to be disabled when admin execution is disabled")
+	}
+}
+
 func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
