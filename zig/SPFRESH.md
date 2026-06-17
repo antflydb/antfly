@@ -128,7 +128,9 @@ Current status:
   then regrows them through the existing `ensure*Capacity` paths. Query-side
   posting delta-tail prefetch cache entries now grow their parallel record
   arrays geometrically instead of reallocating all three arrays for each
-  appended cached record.
+  appended cached record. Query and fold overlay-append scratch uses the same
+  geometric growth shape for appended-id/live arrays, reducing allocator churn
+  on hash-backed overlay replay.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
   repeated linear membership checks to a temporary removal set for larger
   postings/delete lists, preserving member order while avoiding quadratic CPU

@@ -1934,8 +1934,13 @@ pub const PostingStore = struct {
         }
 
         pub fn ensureAppendCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
-            if (self.appended_ids.len < needed) self.appended_ids = try alloc.realloc(self.appended_ids, needed);
-            if (self.appended_live.len < needed) self.appended_live = try alloc.realloc(self.appended_live, needed);
+            if (self.appended_ids.len < needed or self.appended_live.len < needed) {
+                const current_capacity = @min(self.appended_ids.len, self.appended_live.len);
+                const doubled = current_capacity *| 2;
+                const capacity = @max(needed, @max(doubled, @as(usize, 8)));
+                self.appended_ids = try alloc.realloc(self.appended_ids, capacity);
+                self.appended_live = try alloc.realloc(self.appended_live, capacity);
+            }
         }
 
         pub fn ensurePostingOverlayAppendCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
@@ -4543,6 +4548,20 @@ test "posting fold scratch trims retained buffers to budget" {
     try std.testing.expectEqual(@as(usize, 0), scratch.delta_record_count);
     try std.testing.expectEqual(@as(usize, 0), scratch.compact_delta_count);
     try std.testing.expectEqual(@as(usize, 0), scratch.appended_count);
+}
+
+test "posting fold scratch grows overlay append buffers geometrically" {
+    const alloc = std.testing.allocator;
+    var scratch = PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureAppendCapacity(alloc, 1);
+    try std.testing.expectEqual(@as(usize, 8), scratch.appended_ids.len);
+    try std.testing.expectEqual(scratch.appended_ids.len, scratch.appended_live.len);
+
+    try scratch.ensureAppendCapacity(alloc, 9);
+    try std.testing.expectEqual(@as(usize, 16), scratch.appended_ids.len);
+    try std.testing.expectEqual(scratch.appended_ids.len, scratch.appended_live.len);
 }
 
 test "posting base format round trips members" {

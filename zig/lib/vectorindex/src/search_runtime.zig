@@ -346,12 +346,13 @@ pub const SearchScratch = struct {
     }
 
     pub fn ensurePostingOverlayAppendCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.posting_overlay_appended_ids.len < needed) {
-            self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, needed);
+        if (self.posting_overlay_appended_ids.len < needed or self.posting_overlay_appended_live.len < needed) {
+            const current_capacity = @min(self.posting_overlay_appended_ids.len, self.posting_overlay_appended_live.len);
+            const doubled = current_capacity *| 2;
+            const capacity = @max(needed, @max(doubled, @as(usize, 8)));
+            self.posting_overlay_appended_ids = try alloc.realloc(self.posting_overlay_appended_ids, capacity);
             self.noteScratchAllocation(byteLen(self.posting_overlay_appended_ids));
-        }
-        if (self.posting_overlay_appended_live.len < needed) {
-            self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, needed);
+            self.posting_overlay_appended_live = try alloc.realloc(self.posting_overlay_appended_live, capacity);
             self.noteScratchAllocation(byteLen(self.posting_overlay_appended_live));
         }
     }
@@ -936,6 +937,20 @@ test "SearchScratch posting delta tail cache grows geometrically" {
     try std.testing.expectEqual(entry.sequences.len, entry.ops.len);
     try std.testing.expectEqual(@as(u64, 1), view.sequences[0]);
     try std.testing.expectEqual(@as(u64, 9), view.sequences[8]);
+}
+
+test "SearchScratch grows posting overlay append buffers geometrically" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    try scratch.ensurePostingOverlayAppendCapacity(alloc, 1);
+    try std.testing.expectEqual(@as(usize, 8), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqual(scratch.posting_overlay_appended_ids.len, scratch.posting_overlay_appended_live.len);
+
+    try scratch.ensurePostingOverlayAppendCapacity(alloc, 9);
+    try std.testing.expectEqual(@as(usize, 16), scratch.posting_overlay_appended_ids.len);
+    try std.testing.expectEqual(scratch.posting_overlay_appended_ids.len, scratch.posting_overlay_appended_live.len);
 }
 
 test "SearchScratch bounds posting member cache and reports evictions" {
