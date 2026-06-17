@@ -2051,6 +2051,31 @@ func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T)
 	}
 }
 
+func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDesired(t *testing.T) {
+	disabled := false
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+			{Name: "standby-b", Desired: &disabled},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{"standby-b"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected sync policy naming an undesired standby to be rejected")
+	}
+	if !strings.Contains(err.Error(), "syncPolicy.standbyNames[0] \"standby-b\" must reference a desired standby") {
+		t.Fatalf("expected undesired sync standby validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsDuplicateSlotIdentities(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

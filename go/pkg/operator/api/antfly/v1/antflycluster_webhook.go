@@ -1130,6 +1130,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	var errors []string
 	names := map[string]struct{}{}
+	desiredNames := map[string]struct{}{}
 	slotNames := map[string]int{}
 	desiredStandbys := 0
 	desiredStandbyWithRouteSelector := false
@@ -1172,6 +1173,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		if standbyDesiredBySpec(standby) {
 			desiredStandbys++
+			desiredNames[name] = struct{}{}
 			if len(standby.RouteSelector) > 0 {
 				desiredStandbyWithRouteSelector = true
 			}
@@ -1244,6 +1246,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			seenSyncNames[name] = i
 			if _, ok := names[name]; !ok {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
+			} else if _, desired := desiredNames[name]; !desired {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q must reference a desired standby", i, name))
 			}
 		}
 	}
