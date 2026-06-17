@@ -210,6 +210,68 @@ func TestHAClientPrimaryStatusParsedResponseValidatesRawBody(t *testing.T) {
 	}
 }
 
+func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedPrimaryStatusJSON(), `"retained_lsn_count":5`, `"retained_lsn_count":4`, 1))
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.PrimaryStatusResponse(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("PrimaryStatusResponse returned nil error, want validation error")
+	}
+	if !strings.Contains(err.Error(), "get HA primary status response invalid") {
+		t.Fatalf("error = %q, want typed response validation error", err.Error())
+	}
+	if !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("error = %q, want retention invariant", err.Error())
+	}
+}
+
+func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAStandbyStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedStandbyStatusJSON(), `"caught_up_to_received":false`, `"caught_up_to_received":true`, 1))
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.StandbyStatusResponse(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("StandbyStatusResponse returned nil error, want validation error")
+	}
+	if !strings.Contains(err.Error(), "get HA standby status response invalid") {
+		t.Fatalf("error = %q, want typed response validation error", err.Error())
+	}
+	if !strings.Contains(err.Error(), "caught_up_to_received") {
+		t.Fatalf("error = %q, want caught_up_to_received invariant", err.Error())
+	}
+}
+
 func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) {
 	t.Parallel()
 
@@ -230,6 +292,83 @@ func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) 
 	if !strings.Contains(err.Error(), "standby status fields") {
 		t.Fatalf("error = %q, want standby status fields", err.Error())
 	}
+}
+
+func haGeneratedPrimaryStatusJSON() string {
+	return `{
+		"schema_version":1,
+		"snapshot":{
+			"role":"primary",
+			"identity":{
+				"cluster_id":11,
+				"shard_id":22,
+				"table_id":33,
+				"timeline_id":44,
+				"epoch":55
+			},
+			"current_lsn":12,
+			"retention":{
+				"primary_lsn":12,
+				"oldest_restart_lsn":7,
+				"retained_lsn_count":5,
+				"active_slots":1,
+				"reseed_recommended":0
+			},
+			"durability":{
+				"status":"satisfied",
+				"mode":"remote_write",
+				"selection":"any",
+				"target_lsn":12,
+				"progress_lsn":12,
+				"missing_lsn_count":0,
+				"satisfied_count":1,
+				"required_count":1,
+				"candidate_count":1
+			},
+			"slots":[{
+				"name":"standby-a",
+				"timeline_id":44,
+				"active":true,
+				"reseed_required":false,
+				"restart_lsn":7,
+				"received_lsn":12,
+				"applied_lsn":12,
+				"safe_read_lsn":12,
+				"write_lag_lsn":0,
+				"apply_lag_lsn":0,
+				"safe_read_lag_lsn":0,
+				"retention_lag_lsn":5,
+				"status":"healthy",
+				"last_error":""
+			}]
+		}
+	}`
+}
+
+func haGeneratedStandbyStatusJSON() string {
+	return `{
+		"schema_version":1,
+		"snapshot":{
+			"role":"standby",
+			"identity":{
+				"cluster_id":11,
+				"shard_id":22,
+				"table_id":33,
+				"timeline_id":44,
+				"epoch":55
+			},
+			"received_lsn":12,
+			"applied_lsn":11,
+			"safe_read_lsn":11,
+			"upstream_lsn":12,
+			"write_lag_lsn":0,
+			"receive_lag_lsn":0,
+			"apply_lag_lsn":1,
+			"unapplied_lsn_count":1,
+			"caught_up_to_received":false,
+			"can_serve_safe_reads":true
+		}
+	}`
 }
 
 func haLegacyPrimaryStatusJSON() string {

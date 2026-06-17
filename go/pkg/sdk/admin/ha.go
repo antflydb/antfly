@@ -437,6 +437,73 @@ func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) err
 	return nil
 }
 
+func ValidateHAPrimaryStatusResponse(response HAPrimaryStatusResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing primary status schema_version")
+	}
+	snapshot := response.Snapshot
+	if snapshot.Role != HAPrimarySnapshotRolePrimary {
+		return fmt.Errorf("invalid primary status role %q", snapshot.Role)
+	}
+	if !HAIdentityComplete(snapshot.Identity) {
+		return fmt.Errorf("missing primary status identity fields")
+	}
+	if err := validateHAPrimaryRetentionSnapshot(snapshot.Retention, snapshot.CurrentLsn, len(snapshot.Slots)); err != nil {
+		return err
+	}
+	for _, slot := range snapshot.Slots {
+		if err := validateHASlotSnapshot(slot, snapshot.CurrentLsn); err != nil {
+			return err
+		}
+	}
+	if !HADurabilityDecisionEmpty(snapshot.Durability) {
+		if err := validateHADurabilityDecision(snapshot.Durability); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ValidateHAStandbyStatusResponse(response HAStandbyStatusResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing standby status schema_version")
+	}
+	snapshot := response.Snapshot
+	if snapshot.Role != HAStandbySnapshotRoleStandby {
+		return fmt.Errorf("invalid standby status role %q", snapshot.Role)
+	}
+	if !HAIdentityComplete(snapshot.Identity) {
+		return fmt.Errorf("missing standby status identity fields")
+	}
+	if snapshot.AppliedLsn > snapshot.ReceivedLsn {
+		return fmt.Errorf("standby status inconsistent: applied_lsn=%d exceeds received_lsn=%d", snapshot.AppliedLsn, snapshot.ReceivedLsn)
+	}
+	if snapshot.SafeReadLsn > snapshot.AppliedLsn {
+		return fmt.Errorf("standby status inconsistent: safe_read_lsn=%d exceeds applied_lsn=%d", snapshot.SafeReadLsn, snapshot.AppliedLsn)
+	}
+	if snapshot.UnappliedLsnCount != snapshot.ReceivedLsn-snapshot.AppliedLsn {
+		return fmt.Errorf("standby status inconsistent: unapplied_lsn_count=%d expected=%d", snapshot.UnappliedLsnCount, snapshot.ReceivedLsn-snapshot.AppliedLsn)
+	}
+	if snapshot.CaughtUpToReceived != (snapshot.AppliedLsn >= snapshot.ReceivedLsn) {
+		return fmt.Errorf("standby status inconsistent: caught_up_to_received=%t with applied_lsn=%d received_lsn=%d", snapshot.CaughtUpToReceived, snapshot.AppliedLsn, snapshot.ReceivedLsn)
+	}
+	if snapshot.CanServeSafeReads != (snapshot.SafeReadLsn <= snapshot.AppliedLsn) {
+		return fmt.Errorf("standby status inconsistent: can_serve_safe_reads=%t with safe_read_lsn=%d applied_lsn=%d", snapshot.CanServeSafeReads, snapshot.SafeReadLsn, snapshot.AppliedLsn)
+	}
+	if snapshot.UpstreamLsn > 0 || snapshot.WriteLagLsn > 0 || snapshot.ReceiveLagLsn > 0 || snapshot.ApplyLagLsn > 0 {
+		if snapshot.WriteLagLsn != haSaturatingSub(snapshot.UpstreamLsn, snapshot.ReceivedLsn) {
+			return fmt.Errorf("standby status inconsistent: write_lag_lsn=%d expected=%d", snapshot.WriteLagLsn, haSaturatingSub(snapshot.UpstreamLsn, snapshot.ReceivedLsn))
+		}
+		if snapshot.ReceiveLagLsn != haSaturatingSub(snapshot.UpstreamLsn, snapshot.ReceivedLsn) {
+			return fmt.Errorf("standby status inconsistent: receive_lag_lsn=%d expected=%d", snapshot.ReceiveLagLsn, haSaturatingSub(snapshot.UpstreamLsn, snapshot.ReceivedLsn))
+		}
+		if snapshot.ApplyLagLsn != haSaturatingSub(snapshot.UpstreamLsn, snapshot.AppliedLsn) {
+			return fmt.Errorf("standby status inconsistent: apply_lag_lsn=%d expected=%d", snapshot.ApplyLagLsn, haSaturatingSub(snapshot.UpstreamLsn, snapshot.AppliedLsn))
+		}
+	}
+	return nil
+}
+
 func ValidateHACommitCheckResponse(response HACommitCheckResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing commit check schema_version")
@@ -633,6 +700,94 @@ func HACommitGateComplete(gate HACommitGate) bool {
 		HADurabilityDecisionComplete(gate.Durability)
 }
 
+func validateHAPrimaryRetentionSnapshot(retention HARetentionSnapshot, currentLSN uint64, slotCount int) error {
+	if retention.PrimaryLsn != currentLSN {
+		return fmt.Errorf("primary retention snapshot inconsistent: primary_lsn=%d current_lsn=%d", retention.PrimaryLsn, currentLSN)
+	}
+	if retention.OldestRestartLsn > retention.PrimaryLsn {
+		return fmt.Errorf("primary retention snapshot inconsistent: oldest_restart_lsn=%d exceeds primary_lsn=%d", retention.OldestRestartLsn, retention.PrimaryLsn)
+	}
+	if retention.RetainedLsnCount != retention.PrimaryLsn-retention.OldestRestartLsn {
+		return fmt.Errorf("primary retention snapshot inconsistent: retained_lsn_count=%d expected=%d", retention.RetainedLsnCount, retention.PrimaryLsn-retention.OldestRestartLsn)
+	}
+	if retention.ActiveSlots > uint64(slotCount) {
+		return fmt.Errorf("primary retention snapshot inconsistent: active_slots=%d exceeds slot count=%d", retention.ActiveSlots, slotCount)
+	}
+	if retention.ReseedRecommended > uint64(slotCount) {
+		return fmt.Errorf("primary retention snapshot inconsistent: reseed_recommended=%d exceeds slot count=%d", retention.ReseedRecommended, slotCount)
+	}
+	return nil
+}
+
+func validateHASlotSnapshot(slot HASlotSnapshot, currentLSN uint64) error {
+	name := strings.TrimSpace(slot.Name)
+	if name == "" {
+		return fmt.Errorf("missing slot snapshot name")
+	}
+	if slot.TimelineId == 0 {
+		return fmt.Errorf("slot %s snapshot missing timeline_id", name)
+	}
+	if !HASlotSnapshotStatusValid(slot.Status) {
+		return fmt.Errorf("slot %s snapshot invalid status %q", name, slot.Status)
+	}
+	if slot.RestartLsn > currentLSN {
+		return fmt.Errorf("slot %s snapshot inconsistent: restart_lsn=%d exceeds current_lsn=%d", name, slot.RestartLsn, currentLSN)
+	}
+	if slot.ReceivedLsn > currentLSN {
+		return fmt.Errorf("slot %s snapshot inconsistent: received_lsn=%d exceeds current_lsn=%d", name, slot.ReceivedLsn, currentLSN)
+	}
+	if slot.AppliedLsn > slot.ReceivedLsn {
+		return fmt.Errorf("slot %s snapshot inconsistent: applied_lsn=%d exceeds received_lsn=%d", name, slot.AppliedLsn, slot.ReceivedLsn)
+	}
+	if slot.SafeReadLsn > slot.AppliedLsn {
+		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lsn=%d exceeds applied_lsn=%d", name, slot.SafeReadLsn, slot.AppliedLsn)
+	}
+	if slot.WriteLagLsn != haSaturatingSub(currentLSN, slot.ReceivedLsn) {
+		return fmt.Errorf("slot %s snapshot inconsistent: write_lag_lsn=%d expected=%d", name, slot.WriteLagLsn, haSaturatingSub(currentLSN, slot.ReceivedLsn))
+	}
+	if slot.ApplyLagLsn != haSaturatingSub(currentLSN, slot.AppliedLsn) {
+		return fmt.Errorf("slot %s snapshot inconsistent: apply_lag_lsn=%d expected=%d", name, slot.ApplyLagLsn, haSaturatingSub(currentLSN, slot.AppliedLsn))
+	}
+	if slot.SafeReadLagLsn != haSaturatingSub(currentLSN, slot.SafeReadLsn) {
+		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lag_lsn=%d expected=%d", name, slot.SafeReadLagLsn, haSaturatingSub(currentLSN, slot.SafeReadLsn))
+	}
+	if slot.RetentionLagLsn != haSaturatingSub(currentLSN, slot.RestartLsn) {
+		return fmt.Errorf("slot %s snapshot inconsistent: retention_lag_lsn=%d expected=%d", name, slot.RetentionLagLsn, haSaturatingSub(currentLSN, slot.RestartLsn))
+	}
+	return nil
+}
+
+func HASlotSnapshotStatusValid(status HASlotSnapshotStatus) bool {
+	switch status {
+	case HASlotSnapshotStatusHealthy, HASlotSnapshotStatusLagging, HASlotSnapshotStatusReseedRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateHADurabilityDecision(decision HADurabilityDecision) error {
+	if !HADurabilityDecisionComplete(decision) {
+		return fmt.Errorf("missing durability decision fields")
+	}
+	if decision.ProgressLsn > decision.TargetLsn {
+		return fmt.Errorf("durability decision inconsistent: progress_lsn=%d exceeds target_lsn=%d", decision.ProgressLsn, decision.TargetLsn)
+	}
+	if decision.MissingLsnCount != decision.TargetLsn-decision.ProgressLsn {
+		return fmt.Errorf("durability decision inconsistent: missing_lsn_count=%d expected=%d", decision.MissingLsnCount, decision.TargetLsn-decision.ProgressLsn)
+	}
+	if decision.RequiredCount > decision.CandidateCount {
+		return fmt.Errorf("durability decision inconsistent: required_count=%d exceeds candidate_count=%d", decision.RequiredCount, decision.CandidateCount)
+	}
+	if decision.SatisfiedCount > decision.CandidateCount {
+		return fmt.Errorf("durability decision inconsistent: satisfied_count=%d exceeds candidate_count=%d", decision.SatisfiedCount, decision.CandidateCount)
+	}
+	if decision.Status == HADurabilityStatusSatisfied && decision.SatisfiedCount < decision.RequiredCount {
+		return fmt.Errorf("durability decision inconsistent: satisfied_count=%d below required_count=%d", decision.SatisfiedCount, decision.RequiredCount)
+	}
+	return nil
+}
+
 func HACommitGateActionValid(action HACommitGateAction) bool {
 	switch action {
 	case HACommitGateActionAcknowledge,
@@ -649,6 +804,10 @@ func HADurabilityDecisionComplete(decision HADurabilityDecision) bool {
 	return HADurabilityDecisionStatusValid(decision.Status) &&
 		HADurabilityDecisionModeValid(decision.Mode) &&
 		HADurabilityDecisionSelectionValid(decision.Selection)
+}
+
+func HADurabilityDecisionEmpty(decision HADurabilityDecision) bool {
+	return decision == (HADurabilityDecision{})
 }
 
 func HADurabilityDecisionStatusValid(status HADurabilityDecisionStatus) bool {
@@ -1120,7 +1279,7 @@ func (c *HAClient) PrimaryStatusResponse(ctx context.Context, params *HAPrimaryS
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("get HA primary status", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("get HA primary status", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPrimaryStatusResponse)
 }
 
 func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusParams) (*HAPrimaryStatusResponse, error) {
@@ -1155,7 +1314,7 @@ func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyS
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("get HA standby status", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("get HA standby status", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyStatusResponse)
 }
 
 func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
