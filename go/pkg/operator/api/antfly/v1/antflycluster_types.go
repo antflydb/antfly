@@ -1610,6 +1610,58 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	FenceToken string `json:"fenceToken,omitempty"`
 
+	// FenceClusterID is the cluster identity carried by a promotion fence receipt.
+	// +optional
+	FenceClusterID uint64 `json:"fenceClusterID,omitempty"`
+
+	// FenceShardID is the shard identity carried by a promotion fence receipt.
+	// +optional
+	FenceShardID uint64 `json:"fenceShardID,omitempty"`
+
+	// FenceTableID is the table identity carried by a promotion fence receipt.
+	// +optional
+	FenceTableID uint64 `json:"fenceTableID,omitempty"`
+
+	// FenceOldPrimaryID is the fenced primary node id carried by a promotion fence receipt.
+	// +optional
+	FenceOldPrimaryID string `json:"fenceOldPrimaryID,omitempty"`
+
+	// FencePromotedNodeID is the promoted standby node id carried by a promotion fence receipt.
+	// +optional
+	FencePromotedNodeID string `json:"fencePromotedNodeID,omitempty"`
+
+	// FenceParentTimelineID is the parent timeline carried by a promotion fence receipt.
+	// +optional
+	FenceParentTimelineID uint64 `json:"fenceParentTimelineID,omitempty"`
+
+	// FenceParentEpoch is the parent epoch carried by a promotion fence receipt.
+	// +optional
+	FenceParentEpoch uint64 `json:"fenceParentEpoch,omitempty"`
+
+	// FenceNewTimelineID is the promoted timeline carried by a promotion fence receipt.
+	// +optional
+	FenceNewTimelineID uint64 `json:"fenceNewTimelineID,omitempty"`
+
+	// FenceNewEpoch is the promoted epoch carried by a promotion fence receipt.
+	// +optional
+	FenceNewEpoch uint64 `json:"fenceNewEpoch,omitempty"`
+
+	// FenceRequiredLSN is the minimum promotion LSN carried by a promotion fence receipt.
+	// +optional
+	FenceRequiredLSN uint64 `json:"fenceRequiredLSN,omitempty"`
+
+	// FenceObservedLSN is the observed standby LSN carried by a promotion fence receipt.
+	// +optional
+	FenceObservedLSN uint64 `json:"fenceObservedLSN,omitempty"`
+
+	// FenceForced reports whether the promotion fence was acquired with force.
+	// +optional
+	FenceForced bool `json:"fenceForced,omitempty"`
+
+	// FenceReason is the reason carried by a promotion fence receipt.
+	// +optional
+	FenceReason string `json:"fenceReason,omitempty"`
+
 	// RejoinAction is the former-primary rejoin action returned by a rejoin assessment.
 	// +optional
 	RejoinAction string `json:"rejoinAction,omitempty"`

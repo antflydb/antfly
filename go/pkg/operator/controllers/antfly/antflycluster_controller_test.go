@@ -36,6 +36,37 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64, token string) string {
+	body, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"receipt": map[string]any{
+			"identity": map[string]any{
+				"cluster_id":  100,
+				"shard_id":    10,
+				"table_id":    20,
+				"timeline_id": 5,
+				"epoch":       7,
+			},
+			"old_primary_id":     oldPrimaryID,
+			"promoted_node_id":   promotedNodeID,
+			"parent_timeline_id": 4,
+			"parent_epoch":       6,
+			"new_timeline_id":    5,
+			"new_epoch":          7,
+			"required_lsn":       12,
+			"observed_lsn":       12,
+			"generation":         generation,
+			"forced":             false,
+			"token":              token,
+			"reason":             "AutomaticFailoverReady",
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
 func mergeStringMaps(base map[string]string, overlay map[string]string) map[string]string {
 	merged := maps.Clone(base)
 	maps.Copy(merged, overlay)
@@ -591,7 +622,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"receipt":{"generation":3,"token":"ha-fence-token"}}`)),
+					Body:       io.NopCloser(strings.NewReader(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token"))),
 				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -617,6 +648,9 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceClusterID).To(Equal(uint64(100)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.FenceNewTimelineID).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
@@ -637,6 +671,91 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
+}
+
+func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					ShardID:          10,
+					TableID:          20,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					Reason:          "AutomaticFailoverReady",
+					AdminCommand:    []string{"fence", "acquire"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+				}, {
+					Kind:            string(haActionPromoteStandby),
+					DependsOn:       string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+	var observed []string
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			observed = append(observed, req.Method+" "+req.URL.Path)
+			switch req.URL.Path {
+			case "/admin/v1/ha/fence":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(haFenceResponseJSON("primary-a", "standby-b", 3, "ha-fence-token"))),
+				}, nil
+			default:
+				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
+				return nil, nil
+			}
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/fence"}))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseWaitingDependency))
+	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
 }
 
 func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) {
@@ -701,7 +820,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"receipt":{"generation":3,"token":"ha-fence-token"}}`)),
+					Body:       io.NopCloser(strings.NewReader(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token"))),
 				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				return &http.Response{
@@ -1954,6 +2073,21 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(fence.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(fence.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(fence.FenceToken).To(Equal("legacy-token"))
+
+	openAPIFence, ok := parseHADirectAdminActionResult([]byte(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token")))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(openAPIFence.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(openAPIFence.FenceClusterID).To(Equal(uint64(100)))
+	g.Expect(openAPIFence.FenceShardID).To(Equal(uint64(10)))
+	g.Expect(openAPIFence.FenceTableID).To(Equal(uint64(20)))
+	g.Expect(openAPIFence.FenceOldPrimaryID).To(Equal("primary-a"))
+	g.Expect(openAPIFence.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(openAPIFence.FenceParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(openAPIFence.FenceNewTimelineID).To(Equal(uint64(5)))
+	g.Expect(openAPIFence.FenceRequiredLSN).To(Equal(uint64(12)))
+	g.Expect(openAPIFence.FenceObservedLSN).To(Equal(uint64(12)))
+	g.Expect(openAPIFence.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(openAPIFence.FenceToken).To(Equal("ha-fence-token"))
 }
 
 func TestParseHAAdminActionResultTable(t *testing.T) {

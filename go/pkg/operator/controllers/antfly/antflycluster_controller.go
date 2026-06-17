@@ -3465,7 +3465,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
 		if err == nil {
-			err = requireHADirectAdminActionResult(action, raw)
+			err = requireHADirectFenceAcquireResult(cluster, action, raw)
 		}
 		return true, err
 	case string(haActionPromoteStandby):
@@ -3684,8 +3684,25 @@ type haDirectAdminActionResultJSON struct {
 	EndRecordLSN   uint64 `json:"end_record_lsn"`
 	CheckpointLSN  uint64 `json:"checkpoint_lsn"`
 	Receipt        struct {
-		Generation uint64 `json:"generation"`
-		Token      string `json:"token"`
+		Identity struct {
+			ClusterID  uint64 `json:"cluster_id"`
+			ShardID    uint64 `json:"shard_id"`
+			TableID    uint64 `json:"table_id"`
+			TimelineID uint64 `json:"timeline_id"`
+			Epoch      uint64 `json:"epoch"`
+		} `json:"identity"`
+		OldPrimaryID     string `json:"old_primary_id"`
+		PromotedNodeID   string `json:"promoted_node_id"`
+		ParentTimelineID uint64 `json:"parent_timeline_id"`
+		ParentEpoch      uint64 `json:"parent_epoch"`
+		NewTimelineID    uint64 `json:"new_timeline_id"`
+		NewEpoch         uint64 `json:"new_epoch"`
+		RequiredLSN      uint64 `json:"required_lsn"`
+		ObservedLSN      uint64 `json:"observed_lsn"`
+		Generation       uint64 `json:"generation"`
+		Forced           bool   `json:"forced"`
+		Token            string `json:"token"`
+		Reason           string `json:"reason"`
 	} `json:"receipt"`
 }
 
@@ -3746,16 +3763,29 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		}
 	}
 	status := &antflyv1.HAAdminActionResultStatus{
-		SchemaVersion:   result.SchemaVersion,
-		SlotAction:      strings.TrimSpace(result.SlotAction),
-		SlotName:        strings.TrimSpace(result.SlotName),
-		ManifestID:      strings.TrimSpace(result.ManifestID),
-		BackupLSN:       result.BackupLSN,
-		StartRecordLSN:  result.StartRecordLSN,
-		EndRecordLSN:    result.EndRecordLSN,
-		CheckpointLSN:   result.CheckpointLSN,
-		FenceGeneration: result.Receipt.Generation,
-		FenceToken:      strings.TrimSpace(result.Receipt.Token),
+		SchemaVersion:         result.SchemaVersion,
+		SlotAction:            strings.TrimSpace(result.SlotAction),
+		SlotName:              strings.TrimSpace(result.SlotName),
+		ManifestID:            strings.TrimSpace(result.ManifestID),
+		BackupLSN:             result.BackupLSN,
+		StartRecordLSN:        result.StartRecordLSN,
+		EndRecordLSN:          result.EndRecordLSN,
+		CheckpointLSN:         result.CheckpointLSN,
+		FenceGeneration:       result.Receipt.Generation,
+		FenceToken:            strings.TrimSpace(result.Receipt.Token),
+		FenceClusterID:        result.Receipt.Identity.ClusterID,
+		FenceShardID:          result.Receipt.Identity.ShardID,
+		FenceTableID:          result.Receipt.Identity.TableID,
+		FenceOldPrimaryID:     strings.TrimSpace(result.Receipt.OldPrimaryID),
+		FencePromotedNodeID:   strings.TrimSpace(result.Receipt.PromotedNodeID),
+		FenceParentTimelineID: result.Receipt.ParentTimelineID,
+		FenceParentEpoch:      result.Receipt.ParentEpoch,
+		FenceNewTimelineID:    result.Receipt.NewTimelineID,
+		FenceNewEpoch:         result.Receipt.NewEpoch,
+		FenceRequiredLSN:      result.Receipt.RequiredLSN,
+		FenceObservedLSN:      result.Receipt.ObservedLSN,
+		FenceForced:           result.Receipt.Forced,
+		FenceReason:           strings.TrimSpace(result.Receipt.Reason),
 	}
 	if status.SlotName == "" {
 		status.SlotName = strings.TrimSpace(result.Slot.SlotName)
@@ -3784,7 +3814,68 @@ func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionRes
 		result.EndRecordLSN != 0 ||
 		result.CheckpointLSN != 0 ||
 		result.Receipt.Generation != 0 ||
-		strings.TrimSpace(result.Receipt.Token) != ""
+		strings.TrimSpace(result.Receipt.Token) != "" ||
+		result.Receipt.Identity.ClusterID != 0 ||
+		result.Receipt.Identity.ShardID != 0 ||
+		result.Receipt.Identity.TableID != 0 ||
+		strings.TrimSpace(result.Receipt.OldPrimaryID) != "" ||
+		strings.TrimSpace(result.Receipt.PromotedNodeID) != "" ||
+		result.Receipt.ParentTimelineID != 0 ||
+		result.Receipt.ParentEpoch != 0 ||
+		result.Receipt.NewTimelineID != 0 ||
+		result.Receipt.NewEpoch != 0 ||
+		result.Receipt.RequiredLSN != 0 ||
+		result.Receipt.ObservedLSN != 0 ||
+		strings.TrimSpace(result.Receipt.Reason) != ""
+}
+
+func requireHADirectFenceAcquireResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, raw []byte) error {
+	if action == nil {
+		return nil
+	}
+	if applyHADirectAdminActionResult(action, raw) &&
+		haActionHasRequiredAdminResult(*action) &&
+		haFenceAcquireResultMatchesAction(cluster, action, action.AdminResult) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
+}
+
+func haFenceAcquireResultMatchesAction(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if cluster == nil || action == nil || result == nil {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
+		return false
+	}
+	if result.FenceClusterID == 0 ||
+		result.FenceClusterID != identity.ClusterID ||
+		result.FenceShardID != identity.ShardID ||
+		result.FenceTableID != identity.TableID {
+		return false
+	}
+	if result.FenceOldPrimaryID != identity.CurrentPrimaryID ||
+		result.FencePromotedNodeID != strings.TrimSpace(action.StandbyName) {
+		return false
+	}
+	if result.FenceParentTimelineID != identity.TimelineID ||
+		result.FenceParentEpoch != identity.Epoch ||
+		result.FenceNewTimelineID != identity.TimelineID+1 ||
+		result.FenceNewEpoch != identity.Epoch+1 {
+		return false
+	}
+	if action.TargetLSN > 0 && result.FenceRequiredLSN != action.TargetLSN {
+		return false
+	}
+	if !result.FenceForced && result.FenceObservedLSN < result.FenceRequiredLSN {
+		return false
+	}
+	if action.FenceGeneration > 0 && result.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	return true
 }
 
 func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) {

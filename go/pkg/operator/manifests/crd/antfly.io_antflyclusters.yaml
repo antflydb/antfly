@@ -8789,9 +8789,70 @@ spec:
                                 record LSN returned by seed finish.
                               format: int64
                               type: integer
+                            fenceClusterID:
+                              description: FenceClusterID is the cluster identity
+                                carried by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceForced:
+                              description: FenceForced reports whether the promotion
+                                fence was acquired with force.
+                              type: boolean
                             fenceGeneration:
                               description: FenceGeneration is the promotion fence
                                 generation returned by fence operations.
+                              format: int64
+                              type: integer
+                            fenceNewEpoch:
+                              description: FenceNewEpoch is the promoted epoch carried
+                                by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceNewTimelineID:
+                              description: FenceNewTimelineID is the promoted timeline
+                                carried by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceObservedLSN:
+                              description: FenceObservedLSN is the observed standby
+                                LSN carried by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceOldPrimaryID:
+                              description: FenceOldPrimaryID is the fenced primary
+                                node id carried by a promotion fence receipt.
+                              type: string
+                            fenceParentEpoch:
+                              description: FenceParentEpoch is the parent epoch carried
+                                by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceParentTimelineID:
+                              description: FenceParentTimelineID is the parent timeline
+                                carried by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fencePromotedNodeID:
+                              description: FencePromotedNodeID is the promoted standby
+                                node id carried by a promotion fence receipt.
+                              type: string
+                            fenceReason:
+                              description: FenceReason is the reason carried by a
+                                promotion fence receipt.
+                              type: string
+                            fenceRequiredLSN:
+                              description: FenceRequiredLSN is the minimum promotion
+                                LSN carried by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceShardID:
+                              description: FenceShardID is the shard identity carried
+                                by a promotion fence receipt.
+                              format: int64
+                              type: integer
+                            fenceTableID:
+                              description: FenceTableID is the table identity carried
+                                by a promotion fence receipt.
                               format: int64
                               type: integer
                             fenceToken:
