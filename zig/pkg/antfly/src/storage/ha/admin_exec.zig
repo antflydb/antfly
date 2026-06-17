@@ -140,6 +140,20 @@ pub const ResultDocument = struct {
     result: Result,
 };
 
+const ActionReceiptDocument = struct {
+    action_id: []const u8,
+    action_kind: []const u8,
+    target: []const u8,
+    state: []const u8,
+    node_id: []const u8,
+};
+
+const PromotionAssessDocument = struct {
+    schema_version: u32 = 1,
+    action: ActionReceiptDocument,
+    assessment: status.PromotionAssessment,
+};
+
 pub const RenderedOutput = struct {
     content_type: []const u8,
     body: []u8,
@@ -156,6 +170,39 @@ pub fn resultDocument(result: Result) ResultDocument {
 
 pub fn renderJsonAlloc(alloc: Allocator, result: Result) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, resultDocument(result), .{});
+}
+
+fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Result) ![]u8 {
+    return switch (result) {
+        .promote_assess => |assessment| {
+            if (standbyActionNodeID(maybe_ctx)) |node_id| {
+                if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) {
+                    return try renderPromotionAssessJsonAlloc(alloc, node_id, assessment);
+                }
+            }
+            return try renderJsonAlloc(alloc, result);
+        },
+        else => try renderJsonAlloc(alloc, result),
+    };
+}
+
+fn renderPromotionAssessJsonAlloc(
+    alloc: Allocator,
+    node_id: []const u8,
+    assessment: status.PromotionAssessment,
+) ![]u8 {
+    const action_id = try std.fmt.allocPrint(alloc, "promotion_assess:{s}", .{node_id});
+    defer alloc.free(action_id);
+    return try std.json.Stringify.valueAlloc(alloc, PromotionAssessDocument{
+        .action = .{
+            .action_id = action_id,
+            .action_kind = "promotion_assess",
+            .target = node_id,
+            .state = "assessed",
+            .node_id = node_id,
+        },
+        .assessment = assessment,
+    }, .{});
 }
 
 pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
@@ -381,7 +428,11 @@ pub fn executeAndRenderAlloc(alloc: Allocator, ctx: Context, plan: admin_cli.Pla
     var result = try execute(alloc, ctx, plan);
     defer result.deinit(alloc);
     return switch (plan.output) {
-        .json, .prometheus => try renderOutputAlloc(alloc, result, plan.output),
+        .json => .{
+            .content_type = "application/json",
+            .body = try renderJsonWithContextAlloc(alloc, ctx, result),
+        },
+        .prometheus => try renderOutputAlloc(alloc, result, plan.output),
         .table => .{
             .content_type = "text/plain; charset=utf-8",
             .body = try renderTableForContextAlloc(alloc, ctx, result),
@@ -2092,6 +2143,20 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     try expectContains(direct_assess_context_table, "action.target=standby-a\n");
     try expectContains(direct_assess_context_table, "action.state=assessed\n");
     try expectContains(direct_assess_context_table, "action.node_id=standby-a\n");
+
+    var direct_assess_json_plan = try admin_cli.parse(alloc, &.{ "--json", "promote", "assess", "--required-lsn", "1", "--fencing-confirmed" });
+    defer direct_assess_json_plan.deinit(alloc);
+    var direct_assess_json = try executeAndRenderAlloc(alloc, .{ .standby = &standby, .standby_node_id = "standby-a" }, direct_assess_json_plan);
+    defer direct_assess_json.deinit(alloc);
+    try std.testing.expectEqualStrings("application/json", direct_assess_json.content_type);
+    try expectContains(direct_assess_json.body, "\"schema_version\":1");
+    try expectContains(direct_assess_json.body, "\"action\":{\"action_id\":\"promotion_assess:standby-a\"");
+    try expectContains(direct_assess_json.body, "\"action_kind\":\"promotion_assess\"");
+    try expectContains(direct_assess_json.body, "\"target\":\"standby-a\"");
+    try expectContains(direct_assess_json.body, "\"state\":\"assessed\"");
+    try expectContains(direct_assess_json.body, "\"node_id\":\"standby-a\"");
+    try expectContains(direct_assess_json.body, "\"assessment\":");
+    try expectContains(direct_assess_json.body, "\"can_promote\":true");
 
     var fenced_assess_plan = try admin_cli.parse(alloc, &.{ "--prometheus", "promote", "assess", "--current-fence" });
     defer fenced_assess_plan.deinit(alloc);
