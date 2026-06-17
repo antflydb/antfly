@@ -1044,6 +1044,7 @@ const BatchExecutionOptions = struct {
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
+    suppress_derived_replay_append: bool = false,
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -3946,6 +3947,7 @@ pub const DB = struct {
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = true,
             .ha_applied_lsn_marker = applied_lsn_marker,
+            .suppress_derived_replay_append = true,
         });
     }
 
@@ -4693,14 +4695,18 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
             }
         }
+        const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
+            null
+        else
+            .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            };
         try self.core.store.putBatchWithReplayWithOptions(
             self.backend_runtime.io(),
             store_writes.items,
             delete_keys.items,
-            .{
-                .sequence = sequence,
-                .payload = replay_payload,
-            },
+            replay_append,
             store_batch_options,
         );
         if (!opts.bypass_ha_write_gate) {
@@ -4721,21 +4727,25 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
         }
 
-        const append_replay_journal_start_ns = monotonicTimeNs();
-        self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
-        if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
+        if (!opts.suppress_derived_replay_append) {
+            const append_replay_journal_start_ns = monotonicTimeNs();
+            self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
+        }
         self.core.unlockApply();
         apply_mutex_held = false;
         if (opts.document_child_range_dispatcher) |dispatcher| {
             _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
         }
-        var pressure_ctx = self.batchContext();
-        const backlog_pressure_start_ns = monotonicTimeNs();
-        try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
-        try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
-        if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
+        if (!opts.suppress_derived_replay_append) {
+            var pressure_ctx = self.batchContext();
+            const backlog_pressure_start_ns = monotonicTimeNs();
+            try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
+            try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
+            if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
+        }
         const wait_sync_start_ns = monotonicTimeNs();
-        if (self.executor.hasWorkers()) {
+        if (!opts.suppress_derived_replay_append and self.executor.hasWorkers()) {
             const notify_executor_start_ns = monotonicTimeNs();
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
@@ -4764,12 +4774,14 @@ pub const DB = struct {
             try self.drainScheduledTextMerges();
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
-        if (self.enrichment_runtime) |runtime| {
-            const notify_enrichment_start_ns = monotonicTimeNs();
-            runtime.notifySequence(sequence);
-            if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
+        if (!opts.suppress_derived_replay_append) {
+            if (self.enrichment_runtime) |runtime| {
+                const notify_enrichment_start_ns = monotonicTimeNs();
+                runtime.notifySequence(sequence);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
+            }
+            self.notifyResolverReplayRuntimes(sequence);
         }
-        self.notifyResolverReplayRuntimes(sequence);
     }
 
     /// Inject (or clear) the cross-shard entity-resolution candidate source on
@@ -36961,16 +36973,10 @@ test "storage.ha db applies batch mutation records through replication session c
         for (replay_entries) |*entry| entry.deinit(alloc);
         alloc.free(replay_entries);
     }
-    try std.testing.expectEqual(@as(usize, 2), replay_entries.len);
-    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
-    try std.testing.expectEqual(@as(u64, 2), replay_entries[1].sequence);
+    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
+    try std.testing.expectEqual(@as(u64, 2), replay_entries[0].sequence);
 
-    var batch_record = try change_journal_mod.decodeRecord(alloc, replay_entries[0].payload);
-    defer batch_record.deinit();
-    try std.testing.expectEqual(@as(u64, 1), batch_record.record.sequence);
-    try std.testing.expectEqualStrings("doc:a", batch_record.record.changed_doc_keys[0]);
-
-    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[1].payload);
+    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[0].payload);
     defer replicated_effect_record.deinit();
     try std.testing.expectEqual(@as(u64, 2), replicated_effect_record.record.sequence);
     try std.testing.expectEqualStrings("doc:a", replicated_effect_record.record.changed_doc_keys[0]);
@@ -36990,7 +36996,7 @@ test "storage.ha db applies batch mutation records through replication session c
         for (replay_after_duplicates) |*entry| entry.deinit(alloc);
         alloc.free(replay_after_duplicates);
     }
-    try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
+    try std.testing.expectEqual(@as(usize, 1), replay_after_duplicates.len);
 }
 
 test "storage.ha db persists applied replication marker across reopen" {
@@ -37036,12 +37042,10 @@ test "storage.ha db persists applied replication marker across reopen" {
     try reopened.applyHAReplicationRecord(entry.record);
     try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
 
-    const replay_entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
-    defer {
-        for (replay_entries) |*replay_entry| replay_entry.deinit(alloc);
-        alloc.free(replay_entries);
-    }
-    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
+    try std.testing.expectError(
+        error.ReplayIndexUnavailable,
+        replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1),
+    );
 }
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
