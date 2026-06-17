@@ -3824,6 +3824,9 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 			result.SchemaVersion = direct.SchemaVersion
 		}
 	}
+	if result.SchemaVersion == 0 {
+		return nil, false
+	}
 	status := &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion:         result.SchemaVersion,
 		ActionID:              strings.TrimSpace(result.Action.ActionID),

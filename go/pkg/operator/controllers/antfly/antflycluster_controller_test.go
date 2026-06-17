@@ -2441,6 +2441,9 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(seed.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(seed.StartRecordLSN).To(Equal(uint64(5)))
 
+	_, ok = parseHADirectAdminActionResult([]byte(`{"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
+	g.Expect(ok).To(BeFalse())
+
 	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(finish.ManifestID).To(Equal("base-standby-a-5"))
