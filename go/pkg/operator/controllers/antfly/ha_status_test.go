@@ -149,6 +149,7 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 	previous := initial[0]
 	previous.AdminJobName = haAdminDirectAPIName
 	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminError = "previous direct-admin-api diagnostic"
 	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion: 1,
 		SlotAction:    "create",
@@ -159,6 +160,7 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 	preserved := haPlannedActionStatuses(actions, ha, status)
 	if preserved[0].AdminJobName != haAdminDirectAPIName ||
 		preserved[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+		preserved[0].AdminError != "previous direct-admin-api diagnostic" ||
 		preserved[0].AdminResult == nil ||
 		preserved[0].AdminResult.SlotAction != "create" {
 		t.Fatalf("expected execution state to survive identical replan, got %#v", preserved[0])
@@ -174,6 +176,7 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 	notPreserved := haPlannedActionStatuses(changed, ha, status)
 	if notPreserved[0].AdminJobName != "" ||
 		notPreserved[0].AdminJobPhase != "" ||
+		notPreserved[0].AdminError != "" ||
 		notPreserved[0].AdminResult != nil {
 		t.Fatalf("expected changed action to drop stale execution state, got %#v", notPreserved[0])
 	}

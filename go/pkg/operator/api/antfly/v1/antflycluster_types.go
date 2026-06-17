@@ -1571,6 +1571,10 @@ type HAPlannedActionStatus struct {
 	// +optional
 	AdminJobPhase string `json:"adminJobPhase,omitempty"`
 
+	// AdminError records the latest direct /admin/v1 HA execution or result-validation error for this action.
+	// +optional
+	AdminError string `json:"adminError,omitempty"`
+
 	Reason string `json:"reason,omitempty"`
 }
 

@@ -3335,8 +3335,10 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			action.AdminJobName = haAdminDirectAPIName
 			if err != nil {
 				action.AdminJobPhase = haAdminJobPhaseFailed
+				action.AdminError = err.Error()
 			} else {
 				action.AdminJobPhase = haAdminJobPhaseSucceeded
+				action.AdminError = ""
 			}
 			continue
 		}
@@ -5783,12 +5785,16 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		if jobName == "" {
 			jobName = "unknown"
 		}
+		message := fmt.Sprintf("HA admin action %s failed in Job %s", action.Kind, jobName)
+		if strings.TrimSpace(action.AdminError) != "" {
+			message = fmt.Sprintf("%s: %s", message, strings.TrimSpace(action.AdminError))
+		}
 		setHACondition(
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
 			"HAAdminJobFailed",
-			fmt.Sprintf("HA admin action %s failed in Job %s", action.Kind, jobName),
+			message,
 		)
 		return
 	}

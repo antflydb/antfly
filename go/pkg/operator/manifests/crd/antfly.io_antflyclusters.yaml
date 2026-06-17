@@ -8751,6 +8751,10 @@ spec:
                           items:
                             type: string
                           type: array
+                        adminError:
+                          description: AdminError records the latest direct /admin/v1
+                            HA execution or result-validation error for this action.
+                          type: string
                         adminJobName:
                           description: AdminJobName records direct-admin-api for typed
                             execution or the Kubernetes Job created for CLI-backed

@@ -427,6 +427,8 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("status 409"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("slot conflict"))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -438,6 +440,7 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
 	g.Expect(degraded.Reason).To(Equal("HAAdminJobFailed"))
 	g.Expect(degraded.Message).To(ContainSubstring(haAdminDirectAPIName))
+	g.Expect(degraded.Message).To(ContainSubstring("status 409"))
 }
 
 func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
@@ -488,6 +491,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("typed result evidence"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
 
 	var jobs batchv1.JobList
@@ -543,6 +547,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMismatchedResultEvidence(t *testing
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("typed result evidence"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
 }
 
