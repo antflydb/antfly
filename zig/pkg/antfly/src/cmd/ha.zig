@@ -219,7 +219,7 @@ fn executeTypedRemote(
     remote_url: []const u8,
     plan: ha.admin_cli.Plan,
 ) !bool {
-    if (plan.output == .prometheus) return false;
+    if (plan.output == .prometheus and !typedRemotePrometheusAllowed(plan.command)) return false;
 
     switch (plan.command) {
         .slot => |command| switch (command.action) {
@@ -295,20 +295,20 @@ fn executeTypedRemote(
             },
         },
         .primary_status => |command| {
-            if (command.view != .status) return false;
+            if (command.view != .status and plan.output != .prometheus) return false;
             var out = try client.getPrimaryStatus(remote_url, .{
                 .max_lag_lsn = if (command.retention_policy.max_lag_lsn == 0) null else command.retention_policy.max_lag_lsn,
                 .sync_policy = command.sync_policy,
             });
             defer out.deinit(alloc);
-            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            try writePrimaryStatusRemote(alloc, io, plan.output, out.body, out.parsed.value.snapshot);
             return true;
         },
         .standby_status => |command| {
-            if (command.view != .status) return false;
+            if (command.view != .status and plan.output != .prometheus) return false;
             var out = try client.getStandbyStatus(remote_url, command.upstream_lsn);
             defer out.deinit(alloc);
-            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            try writeStandbyStatusRemote(alloc, io, plan.output, out.body, out.parsed.value.snapshot);
             return true;
         },
         .commit_check => |command| {
@@ -384,7 +384,7 @@ fn executeTypedRemote(
                 .use_current_fence = command.use_current_fence,
             });
             defer out.deinit(alloc);
-            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            try writePromotionAssessRemote(alloc, io, plan.output, out.body, out.parsed.value.assessment);
             return true;
         },
         .promote_current_fence => {
@@ -426,6 +426,16 @@ fn executeTypedRemote(
     }
 }
 
+fn typedRemotePrometheusAllowed(command: ha.admin_cli.Command) bool {
+    return switch (command) {
+        .primary_status,
+        .standby_status,
+        .promote_assess,
+        => true,
+        else => false,
+    };
+}
+
 fn remoteCommandEndpointAllowed(command: ha.admin_cli.Command, output: ha.admin_cli.OutputFormat) bool {
     if (output == .prometheus) return false;
     return switch (command) {
@@ -458,6 +468,208 @@ fn writeTypedRemoteBody(
         },
         .prometheus => unreachable,
     }
+}
+
+fn writePrimaryStatusRemote(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    output: ha.admin_cli.OutputFormat,
+    body: []const u8,
+    snapshot: admin_api.HAPrimarySnapshot,
+) !void {
+    switch (output) {
+        .json, .table => try writeTypedRemoteBody(alloc, io, output, body),
+        .prometheus => {
+            var metrics = try primaryMetricsFromAdminSnapshot(alloc, snapshot);
+            defer metrics.deinit(alloc);
+            const rendered = try ha.metrics.renderPrimaryPrometheusAlloc(alloc, metrics);
+            defer alloc.free(rendered);
+            writeRemoteBody(io, rendered);
+        },
+    }
+}
+
+fn writeStandbyStatusRemote(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    output: ha.admin_cli.OutputFormat,
+    body: []const u8,
+    snapshot: admin_api.HAStandbySnapshot,
+) !void {
+    switch (output) {
+        .json, .table => try writeTypedRemoteBody(alloc, io, output, body),
+        .prometheus => {
+            const metrics = try standbyMetricsFromAdminSnapshot(snapshot);
+            const rendered = try ha.metrics.renderStandbyPrometheusAlloc(alloc, metrics);
+            defer alloc.free(rendered);
+            writeRemoteBody(io, rendered);
+        },
+    }
+}
+
+fn writePromotionAssessRemote(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    output: ha.admin_cli.OutputFormat,
+    body: []const u8,
+    assessment: admin_api.HAPromotionAssessment,
+) !void {
+    switch (output) {
+        .json, .table => try writeTypedRemoteBody(alloc, io, output, body),
+        .prometheus => {
+            const metrics = try promotionMetricsFromAdminAssessment(assessment);
+            const rendered = try ha.metrics.renderPromotionPrometheusAlloc(alloc, metrics);
+            defer alloc.free(rendered);
+            writeRemoteBody(io, rendered);
+        },
+    }
+}
+
+fn primaryMetricsFromAdminSnapshot(alloc: std.mem.Allocator, snapshot: admin_api.HAPrimarySnapshot) !ha.metrics.PrimaryMetrics {
+    const slots = try alloc.alloc(ha.metrics.SlotMetrics, snapshot.slots.len);
+    errdefer alloc.free(slots);
+
+    var filled: usize = 0;
+    errdefer for (slots[0..filled]) |slot| alloc.free(slot.name);
+
+    var active_slots: u64 = 0;
+    var reseed_required_slots: u64 = 0;
+    var max_write_lag_lsn: u64 = 0;
+    var max_apply_lag_lsn: u64 = 0;
+    var max_safe_read_lag_lsn: u64 = 0;
+    var max_retention_lag_lsn: u64 = 0;
+
+    for (snapshot.slots, 0..) |slot, idx| {
+        const received_lsn = try u64FromI64(slot.received_lsn);
+        const applied_lsn = try u64FromI64(slot.applied_lsn);
+        const safe_read_lsn = try u64FromI64(slot.safe_read_lsn);
+        const restart_lsn = try u64FromI64(slot.restart_lsn);
+        const write_lag_lsn = try u64FromI64(slot.write_lag_lsn);
+        const apply_lag_lsn = try u64FromI64(slot.apply_lag_lsn);
+        const safe_read_lag_lsn = try u64FromI64(slot.safe_read_lag_lsn);
+        const retention_lag_lsn = try u64FromI64(slot.retention_lag_lsn);
+        const status_code = @intFromEnum(try slotStatusCodeFromAdmin(slot.status));
+
+        if (slot.active) active_slots += 1;
+        if (slot.reseed_required) reseed_required_slots += 1;
+        max_write_lag_lsn = @max(max_write_lag_lsn, write_lag_lsn);
+        max_apply_lag_lsn = @max(max_apply_lag_lsn, apply_lag_lsn);
+        max_safe_read_lag_lsn = @max(max_safe_read_lag_lsn, safe_read_lag_lsn);
+        max_retention_lag_lsn = @max(max_retention_lag_lsn, retention_lag_lsn);
+
+        slots[idx] = .{
+            .name = try alloc.dupe(u8, slot.name),
+            .active = boolGauge(slot.active),
+            .reseed_required = boolGauge(slot.reseed_required),
+            .received_lsn = received_lsn,
+            .applied_lsn = applied_lsn,
+            .safe_read_lsn = safe_read_lsn,
+            .restart_lsn = restart_lsn,
+            .write_lag_lsn = write_lag_lsn,
+            .apply_lag_lsn = apply_lag_lsn,
+            .safe_read_lag_lsn = safe_read_lag_lsn,
+            .retention_lag_lsn = retention_lag_lsn,
+            .status_code = status_code,
+            .last_error = boolGauge(slot.last_error != null),
+        };
+        filled += 1;
+    }
+
+    const durability = snapshot.durability;
+    const durability_status_code = if (durability) |decision|
+        @intFromEnum(try durabilityStatusCodeFromAdmin(decision.status))
+    else
+        @intFromEnum(ha.metrics.DurabilityStatusCode.not_configured);
+    const durability_satisfied = if (durability) |decision|
+        boolGauge(std.mem.eql(u8, decision.status, "satisfied"))
+    else
+        0;
+    const durability_degraded = if (durability) |decision|
+        boolGauge(!std.mem.eql(u8, decision.status, "satisfied"))
+    else
+        0;
+
+    return .{
+        .current_lsn = try u64FromI64(snapshot.current_lsn),
+        .slot_count = @intCast(snapshot.slots.len),
+        .active_slots = active_slots,
+        .reseed_required_slots = reseed_required_slots,
+        .max_write_lag_lsn = max_write_lag_lsn,
+        .max_apply_lag_lsn = max_apply_lag_lsn,
+        .max_safe_read_lag_lsn = max_safe_read_lag_lsn,
+        .max_retention_lag_lsn = max_retention_lag_lsn,
+        .retention_oldest_restart_lsn = try u64FromI64(snapshot.retention.oldest_restart_lsn),
+        .retention_retained_lsn_count = try u64FromI64(snapshot.retention.retained_lsn_count),
+        .retention_active_slots = try u64FromI64(snapshot.retention.active_slots),
+        .retention_reseed_recommended = try u64FromI64(snapshot.retention.reseed_recommended),
+        .durability_configured = boolGauge(durability != null),
+        .durability_satisfied = durability_satisfied,
+        .durability_degraded = durability_degraded,
+        .durability_status_code = durability_status_code,
+        .durability_target_lsn = if (durability) |decision| try u64FromI64(decision.target_lsn) else 0,
+        .durability_progress_lsn = if (durability) |decision| try u64FromI64(decision.progress_lsn) else 0,
+        .durability_missing_lsn_count = if (durability) |decision| try u64FromI64(decision.missing_lsn_count) else 0,
+        .durability_required_count = if (durability) |decision| try u64FromI64(decision.required_count) else 0,
+        .durability_satisfied_count = if (durability) |decision| try u64FromI64(decision.satisfied_count) else 0,
+        .durability_candidate_count = if (durability) |decision| try u64FromI64(decision.candidate_count) else 0,
+        .slots = slots,
+    };
+}
+
+fn standbyMetricsFromAdminSnapshot(snapshot: admin_api.HAStandbySnapshot) !ha.metrics.StandbyMetrics {
+    return .{
+        .received_lsn = try u64FromI64(snapshot.received_lsn),
+        .applied_lsn = try u64FromI64(snapshot.applied_lsn),
+        .safe_read_lsn = try u64FromI64(snapshot.safe_read_lsn),
+        .upstream_configured = boolGauge(snapshot.upstream_lsn != null),
+        .write_lag_lsn = if (snapshot.write_lag_lsn) |raw| try u64FromI64(raw) else 0,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |raw| try u64FromI64(raw) else 0,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |raw| try u64FromI64(raw) else 0,
+        .unapplied_lsn_count = try u64FromI64(snapshot.unapplied_lsn_count),
+        .caught_up_to_received = boolGauge(snapshot.caught_up_to_received),
+        .can_serve_safe_reads = boolGauge(snapshot.can_serve_safe_reads),
+    };
+}
+
+fn promotionMetricsFromAdminAssessment(assessment: admin_api.HAPromotionAssessment) !ha.metrics.PromotionMetrics {
+    return .{
+        .required_lsn = try u64FromI64(assessment.required_lsn),
+        .received_lsn = try u64FromI64(assessment.received_lsn),
+        .applied_lsn = try u64FromI64(assessment.applied_lsn),
+        .has_required_lsn = boolGauge(assessment.has_required_lsn),
+        .caught_up_to_received = boolGauge(assessment.caught_up_to_received),
+        .fencing_confirmed = boolGauge(assessment.fencing_confirmed),
+        .force = boolGauge(assessment.force),
+        .data_loss_possible = boolGauge(assessment.data_loss_possible),
+        .safe = boolGauge(assessment.safe),
+        .requires_fencing = boolGauge(assessment.requires_fencing),
+        .requires_force = boolGauge(assessment.requires_force),
+        .can_promote = boolGauge(assessment.can_promote),
+    };
+}
+
+fn slotStatusCodeFromAdmin(raw: []const u8) !ha.metrics.SlotStatusCode {
+    if (std.mem.eql(u8, raw, "healthy")) return .healthy;
+    if (std.mem.eql(u8, raw, "lagging")) return .lagging;
+    if (std.mem.eql(u8, raw, "reseed_required")) return .reseed_required;
+    return error.InvalidHaCommand;
+}
+
+fn durabilityStatusCodeFromAdmin(raw: []const u8) !ha.metrics.DurabilityStatusCode {
+    if (std.mem.eql(u8, raw, "satisfied")) return .satisfied;
+    if (std.mem.eql(u8, raw, "would_block")) return .would_block;
+    if (std.mem.eql(u8, raw, "fail_closed")) return .fail_closed;
+    if (std.mem.eql(u8, raw, "degraded_to_async")) return .degraded_to_async;
+    return error.InvalidHaCommand;
+}
+
+fn boolGauge(value: bool) u64 {
+    return if (value) 1 else 0;
+}
+
+fn u64FromI64(raw: i64) !u64 {
+    if (raw < 0) return error.InvalidHaCommand;
+    return @intCast(raw);
 }
 
 fn renderJsonTableAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -783,7 +995,7 @@ test "ha cmd parses remote admin URL before command" {
     try std.testing.expectEqualStrings("primary", parsed.command_args[2]);
 }
 
-test "ha cmd remote JSON commands prefer typed admin routes" {
+test "ha cmd remote commands prefer typed admin routes" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "remote-typed");
     defer paths.deinit(alloc);
@@ -848,8 +1060,30 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "--prometheus",
+        "status",
+        "primary",
+        "--view",
+        "metrics",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "status",
         "standby",
+        "--upstream-lsn",
+        "4",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_standby_status);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "--prometheus",
+        "status",
+        "standby",
+        "--view",
+        "metrics",
         "--upstream-lsn",
         "4",
     }, recorder.executor());
@@ -956,6 +1190,17 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_assess);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "--prometheus",
+        "promote",
+        "assess",
+        "--required-lsn",
+        "0",
+        "--fencing-confirmed",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_assess);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "rejoin",              "assess",
         "--node-id",           "primary-a",
         "--cluster-id",        "10",
@@ -1040,10 +1285,9 @@ test "ha cmd remote rejects legacy command fallback for production admin operati
 
     try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
-        "status",
-        "primary",
-        "--view",
-        "metrics",
+        "slot",
+        "create",
+        "standby-a",
     }, executor.executor()));
     try std.testing.expect(!executor.called);
 }
