@@ -12365,9 +12365,14 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer created.deinit(alloc);
     var granted = try server.applyRelationalSqlDdl("GRANT SELECT ON TABLE usage_records TO app_writer;");
     defer granted.deinit(alloc);
+    var row_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));");
+    defer row_policy.deinit(alloc);
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try auth.manager.enforce("alice", .table, "usage_records", .read));
+    const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
+    defer alloc.free(stored_policy);
+    try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"metadata.tenant_id\"") != null);
 
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);

@@ -4444,15 +4444,20 @@ catalog metadata and must not become hidden physical routing state.
 
 PostgreSQL row-level-security DDL is not adapter-only syntax. `ALTER TABLE ...
 ENABLE ROW LEVEL SECURITY`, `CREATE POLICY ... USING (...)`, and `DROP POLICY`
-lower to typed fail-closed row-security catalog plans. The current typed subset
-preserves table identity, policy identity, enable/disable intent, and
-request-setting equality predicates such as
+lower to typed row-security catalog plans. The current runtime subset preserves
+table identity, policy identity, enable intent, and request-setting equality
+predicates such as
 `tenant_id = current_setting('app.tenant_id')` as native policy metadata rather
-than raw SQL. Schema application remains fail-closed until Antfly has durable
-row-policy catalog storage, request-context bindings, planner/executor
-authorization checks, repair/schema-promotion behavior, and typed policy
-expression validation. Storage must not silently accept or ignore SQL RLS
-declarations.
+than raw SQL. Public API execution maps each supported policy to a hidden native
+row-filter policy subject, converts `current_setting('app.<key>')` to
+`{"$auth":"metadata.<key>"}`, and merges those filters into every user's
+effective row filters before row-query, aggregate, join, lateral, window, and
+document query execution. `DROP POLICY` removes the hidden policy subject for
+that table, while `DROP POLICY IF EXISTS` is an idempotent no-op. Unsupported
+policy expressions, policy replacement, per-role `TO ...` policy targeting, and
+`DISABLE ROW LEVEL SECURITY` still fail closed until they have durable native
+policy state, request-context bindings, and planner/executor validation. Storage
+must not silently accept or ignore unsupported SQL RLS declarations.
 
 PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 `REVOKE`, and role lifecycle statements lower to typed authorization-catalog
