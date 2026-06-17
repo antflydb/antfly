@@ -125,7 +125,7 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 			"schema_version":1,
 			"slot_action":"create",
 			"action":{
-				"action_id":"replication-slot-create:standby-a",
+				"action_id":"replication_slot_create:standby-a",
 				"action_kind":"replication_slot_create",
 				"target":"standby-a",
 				"state":"applied",
@@ -660,6 +660,17 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 	if err := ValidateHAReplicationSlotActionResponse(response); err != nil {
 		t.Fatalf("ValidateHAReplicationSlotActionResponse returned error: %v", err)
 	}
+	wrongSlotTarget := response
+	wrongSlotTarget.Action.Target = "standby-b"
+	if err := ValidateHAReplicationSlotActionResponse(wrongSlotTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong slot target error = %v, want receipt mismatch", err)
+	}
+	wrongSlotKind := response
+	wrongSlotKind.Action.ActionKind = HAActionKindReplicationSlotPause
+	wrongSlotKind.Action.ActionId = "replication_slot_pause:standby-a"
+	if err := ValidateHAReplicationSlotActionResponse(wrongSlotKind); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong slot action kind error = %v, want receipt mismatch", err)
+	}
 	if err := ValidateHAReplicationSlotListResponse(HAReplicationSlotListResponse{
 		SchemaVersion: 1,
 		Slots:         []HAReplicationSlot{slot},
@@ -713,6 +724,11 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 	if err := ValidateHABaseBackupBeginResponse(begin); err != nil {
 		t.Fatalf("ValidateHABaseBackupBeginResponse returned error: %v", err)
 	}
+	wrongBeginTarget := begin
+	wrongBeginTarget.Action.Target = "manifest-b"
+	if err := ValidateHABaseBackupBeginResponse(wrongBeginTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong begin target error = %v, want receipt mismatch", err)
+	}
 	begin.StartRecordLsn = 0
 	if err := ValidateHABaseBackupBeginResponse(begin); err == nil || !strings.Contains(err.Error(), "start_record_lsn") {
 		t.Fatalf("missing start_record_lsn error = %v, want start_record_lsn error", err)
@@ -734,6 +750,12 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 	if err := ValidateHABaseBackupFinishResponse(finish); err != nil {
 		t.Fatalf("ValidateHABaseBackupFinishResponse returned error: %v", err)
 	}
+	wrongFinishKind := finish
+	wrongFinishKind.Action.ActionKind = HAActionKindBaseBackupBegin
+	wrongFinishKind.Action.ActionId = "base_backup_begin:manifest-a"
+	if err := ValidateHABaseBackupFinishResponse(wrongFinishKind); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong finish kind error = %v, want receipt mismatch", err)
+	}
 	finish.EndRecordLsn = 0
 	if err := ValidateHABaseBackupFinishResponse(finish); err == nil || !strings.Contains(err.Error(), "end_record_lsn") {
 		t.Fatalf("missing end_record_lsn error = %v, want end_record_lsn error", err)
@@ -754,6 +776,11 @@ func TestValidateHASeedActionResponses(t *testing.T) {
 	}
 	if err := ValidateHAStandbyBootstrapResponse(bootstrap); err != nil {
 		t.Fatalf("ValidateHAStandbyBootstrapResponse returned error: %v", err)
+	}
+	wrongBootstrapTarget := bootstrap
+	wrongBootstrapTarget.Action.Target = "manifest-b"
+	if err := ValidateHAStandbyBootstrapResponse(wrongBootstrapTarget); err == nil || !strings.Contains(err.Error(), "receipt") {
+		t.Fatalf("wrong bootstrap target error = %v, want receipt mismatch", err)
 	}
 	bootstrap.CheckpointLsn = 0
 	if err := ValidateHAStandbyBootstrapResponse(bootstrap); err == nil || !strings.Contains(err.Error(), "checkpoint_lsn") {

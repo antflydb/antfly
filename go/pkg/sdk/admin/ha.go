@@ -363,6 +363,9 @@ func ValidateHAReplicationSlotActionResponse(response HAReplicationSlotActionRes
 	if !HAReplicationSlotComplete(response.Slot) {
 		return fmt.Errorf("missing replication slot action slot fields")
 	}
+	if err := validateHAReplicationSlotActionCorrelation(response); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -397,6 +400,9 @@ func ValidateHABaseBackupBeginResponse(response HABaseBackupBeginResponse) error
 	if response.StartRecordLsn == 0 {
 		return fmt.Errorf("missing base backup begin start_record_lsn")
 	}
+	if err := validateHAActionReceiptTarget(response.Action, HABaseBackupBeginReceiptExpectation(), response.ManifestId, "base backup begin"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -416,6 +422,9 @@ func ValidateHABaseBackupFinishResponse(response HABaseBackupFinishResponse) err
 	if response.EndRecordLsn == 0 {
 		return fmt.Errorf("missing base backup finish end_record_lsn")
 	}
+	if err := validateHAActionReceiptTarget(response.Action, HABaseBackupFinishReceiptExpectation(), response.ManifestId, "base backup finish"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -434,6 +443,33 @@ func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) err
 	}
 	if response.CheckpointLsn == 0 {
 		return fmt.Errorf("missing standby bootstrap checkpoint_lsn")
+	}
+	if err := validateHAActionReceiptTarget(response.Action, HAStandbyBootstrapReceiptExpectation(), response.ManifestId, "standby bootstrap"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateHAReplicationSlotActionCorrelation(response HAReplicationSlotActionResponse) error {
+	expectation := HAReceiptExpectation{}
+	switch response.SlotAction {
+	case HAReplicationSlotActionCreate:
+		expectation = HAReplicationSlotCreateReceiptExpectation()
+	case HAReplicationSlotActionDrop:
+		expectation = HAReplicationSlotDropReceiptExpectation()
+	case HAReplicationSlotActionPause:
+		expectation = HAReplicationSlotPauseReceiptExpectation()
+	case HAReplicationSlotActionResume:
+		expectation = HAReplicationSlotResumeReceiptExpectation()
+	default:
+		return fmt.Errorf("invalid replication slot action %q", response.SlotAction)
+	}
+	return validateHAActionReceiptTarget(response.Action, expectation, response.Slot.SlotName, "replication slot action")
+}
+
+func validateHAActionReceiptTarget(receipt HAActionReceipt, expectation HAReceiptExpectation, expectedTarget string, label string) error {
+	if !HAReceiptMatches(receipt, expectation, expectedTarget) {
+		return fmt.Errorf("%s receipt does not match action target", label)
 	}
 	return nil
 }
