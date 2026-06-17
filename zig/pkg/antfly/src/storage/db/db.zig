@@ -45,6 +45,7 @@ const artifact_ids = @import("artifact_ids.zig");
 const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
+const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const ha_session_mod = @import("../ha/session.zig");
@@ -197,17 +198,17 @@ pub const OpenOptions = struct {
     /// `name_embedding` model and the extraction artifact carries no vector.
     /// Caller-owned; must outlive the DB. Null disables backfill.
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
-    /// Optional async mirror for committed derived/change-journal effects into
-    /// the HA replication stream. This is not a synchronous commit gate; callers
-    /// that need remote-write or remote-apply durability must use the HA commit
-    /// gate around the primary replication stream.
+    /// Optional mirror for committed derived/change-journal effects into the HA
+    /// replication stream. The default policy is async/best-effort; configuring
+    /// a non-async sync_policy makes normal DB writes evaluate the HA commit
+    /// gate for the appended replication record.
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
-    /// Optional async mirror for committed user batch mutations into the HA
+    /// Optional mirror for committed user batch mutations into the HA
     /// replication stream. This emits versioned `batch_mutation` envelopes for
-    /// catch-up/read-replica apply. It is intentionally best-effort until the
-    /// DB write path is wired to the synchronous HA commit gate.
+    /// catch-up/read-replica apply and can be paired with sync_policy for
+    /// remote-write/remote-apply gate decisions.
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
-    /// Optional async mirror for committed metadata/catalog changes into the HA
+    /// Optional mirror for committed metadata/catalog changes into the HA
     /// replication stream. The initial metadata mutation payload covers table
     /// schema changes; additional catalog mutation kinds should be nested under
     /// the stable HA `metadata_mutation` envelope.
@@ -226,6 +227,12 @@ pub const HAAsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
+    sync_policy: ha_primary_mod.SyncPolicy = .{},
+    last_gate_lsn: ?*std.atomic.Value(u64) = null,
+    last_gate_action: ?*std.atomic.Value(u8) = null,
+    sync_reject_count: ?*std.atomic.Value(u64) = null,
+    sync_wait_count: ?*std.atomic.Value(u64) = null,
+    sync_degraded_count: ?*std.atomic.Value(u64) = null,
 };
 
 pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
@@ -2574,6 +2581,32 @@ pub const DB = struct {
         mirrorHASchemaMetadataBestEffortContext(&ctx, table_schema);
     }
 
+    fn preflightHABatchSyncCommit(self: *DB) !void {
+        var ctx = self.batchContext();
+        try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_batch_mirror);
+        try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_effect_mirror);
+    }
+
+    fn preflightHAMetadataSyncCommit(self: *DB) !void {
+        var ctx = self.batchContext();
+        try preflightHAMirrorSyncCommitContext(&ctx, ctx.ha_async_metadata_mirror);
+    }
+
+    fn mirrorHABatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
+        var ctx = self.batchContext();
+        try mirrorHABatchMutationCommitContext(&ctx, request);
+    }
+
+    fn mirrorHAReplayPayloadCommit(self: *DB, payload: []const u8) !void {
+        var ctx = self.batchContext();
+        try mirrorHAReplayPayloadCommitContext(&ctx, payload);
+    }
+
+    fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        var ctx = self.batchContext();
+        try mirrorHASchemaMetadataCommitContext(&ctx, table_schema);
+    }
+
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
         for (self.core.index_manager.algebraic_indexes.items) |*entry| {
             entry.index.loadPersistedObservations(self.core.store) catch {};
@@ -4185,6 +4218,7 @@ pub const DB = struct {
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
+        if (!opts.bypass_ha_write_gate) try self.preflightHABatchSyncCommit();
         const total_start_ns = monotonicTimeNs();
         defer {
             if (profile) |active_profile| {
@@ -4739,8 +4773,8 @@ pub const DB = struct {
             store_batch_options,
         );
         if (!opts.bypass_ha_write_gate) {
-            self.mirrorHABatchMutationBestEffort(effective_req);
-            self.mirrorHAReplayPayloadBestEffort(replay_payload);
+            try self.mirrorHABatchMutationCommit(effective_req);
+            try self.mirrorHAReplayPayloadCommit(replay_payload);
         }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
@@ -6221,8 +6255,9 @@ pub const DB = struct {
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         try self.enforceHAWriteGate();
+        try self.preflightHAMetadataSyncCommit();
         try self.core.setSchema(table_schema);
-        self.mirrorHASchemaMetadataBestEffort(table_schema);
+        try self.mirrorHASchemaMetadataCommit(table_schema);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -18336,6 +18371,19 @@ fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, pay
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
+fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
+    const mirror = ctx.ha_async_effect_mirror orelse return;
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
+        noteHAMirrorFailure(mirror, "derived effect", err);
+        if (haMirrorSyncEnabled(mirror)) return err;
+        return;
+    };
+    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    try evaluateHAMirrorCommitGate(mirror, lsn);
+}
+
 fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) void {
     const mirror = ctx.ha_async_batch_mirror orelse return;
     lockAtomic(ctx.log_mutex);
@@ -18348,6 +18396,19 @@ fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, req
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
+fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !void {
+    const mirror = ctx.ha_async_batch_mirror orelse return;
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
+        noteHAMirrorFailure(mirror, "batch mutation", err);
+        if (haMirrorSyncEnabled(mirror)) return err;
+        return;
+    };
+    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    try evaluateHAMirrorCommitGate(mirror, lsn);
+}
+
 fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) void {
     const mirror = ctx.ha_async_metadata_mirror orelse return;
     lockAtomic(ctx.log_mutex);
@@ -18358,6 +18419,87 @@ fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, ta
         return;
     };
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+}
+
+fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) !void {
+    const mirror = ctx.ha_async_metadata_mirror orelse return;
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{}) catch |err| {
+        noteHAMirrorFailure(mirror, "metadata mutation", err);
+        if (haMirrorSyncEnabled(mirror)) return err;
+        return;
+    };
+    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+    try evaluateHAMirrorCommitGate(mirror, lsn);
+}
+
+fn preflightHAMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?HAAsyncEffectMirror) !void {
+    const configured = mirror orelse return;
+    if (configured.sync_policy.mode == .async) return;
+    if (configured.sync_policy.failure_policy != .fail_closed) return;
+
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+
+    const target_lsn = configured.primary.nextLsn();
+    const decision = try configured.primary.evaluateAppendDurability(target_lsn, configured.sync_policy);
+    const gate = haCommitGateResultFromDecision(target_lsn, decision);
+    if (gate.action == .reject) {
+        recordHAMirrorGate(configured, gate);
+        return error.SyncPolicyUnsatisfied;
+    }
+}
+
+fn evaluateHAMirrorCommitGate(mirror: HAAsyncEffectMirror, lsn: u64) !void {
+    if (mirror.sync_policy.mode == .async) return;
+    const gate = try ha_commit_gate_mod.evaluate(mirror.primary, lsn, mirror.sync_policy);
+    recordHAMirrorGate(mirror, gate);
+    switch (gate.action) {
+        .acknowledge => return,
+        .acknowledge_degraded => return,
+        .reject => return error.SyncPolicyUnsatisfied,
+        .wait_for_standby => return error.HASyncCommitWouldBlock,
+    }
+}
+
+fn haMirrorSyncEnabled(mirror: HAAsyncEffectMirror) bool {
+    return mirror.sync_policy.mode != .async;
+}
+
+fn recordHAMirrorGate(mirror: HAAsyncEffectMirror, gate: ha_commit_gate_mod.GateResult) void {
+    if (mirror.last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
+    if (mirror.last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
+    switch (gate.action) {
+        .acknowledge => {},
+        .acknowledge_degraded => {
+            if (mirror.sync_degraded_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        },
+        .reject => {
+            if (mirror.sync_reject_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        },
+        .wait_for_standby => {
+            if (mirror.sync_wait_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        },
+    }
+}
+
+fn haCommitGateResultFromDecision(target_lsn: u64, decision: ha_primary_mod.DurabilityDecision) ha_commit_gate_mod.GateResult {
+    return .{
+        .target_lsn = target_lsn,
+        .action = switch (decision.status) {
+            .satisfied => .acknowledge,
+            .would_block => .wait_for_standby,
+            .fail_closed => .reject,
+            .degraded_to_async => .acknowledge_degraded,
+        },
+        .decision = decision,
+    };
+}
+
+fn noteHAMirrorFailure(mirror: HAAsyncEffectMirror, comptime label: []const u8, err: anyerror) void {
+    if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+    std.log.warn("failed to mirror DB " ++ label ++ " into HA stream: {s}", .{@errorName(err)});
 }
 
 fn applyDerivedBacklogPressureContext(ctx: *const BatchExecutionContext, sequence: u64, sync_level: types.SyncLevel, sync_targets: ManagedSyncTargets) !void {
@@ -36934,6 +37076,119 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
+}
+
+test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 253,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var degraded = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .ha_async_batch_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .sync_policy = .{
+                    .mode = .remote_write,
+                    .standby_names = &standby_names,
+                    .failure_policy = .degrade_to_async,
+                },
+                .last_gate_lsn = &gate_lsn,
+                .last_gate_action = &gate_action,
+                .sync_degraded_count = &degraded,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:sync", .value = "{\"title\":\"sync\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
+}
+
+test "storage.ha db fail-closed sync policy rejects before local batch commit" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 254,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var rejected = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .fail_closed,
+            },
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_reject_count = &rejected,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, db.batch(.{
+        .writes = &.{.{ .key = "doc:rejected", .value = "{\"title\":\"rejected\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
+    try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
 }
 
 test "storage.ha db mirrors and applies schema metadata mutation records" {
