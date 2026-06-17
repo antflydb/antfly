@@ -2316,7 +2316,7 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
         if (foreign_key.period) |period| try validateRelationalPeriodReference(schema, period);
         if ((foreign_key.period == null) != (foreign_key.references.period == null)) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.references.period) |period| {
-            if (!foreignKeyActionIsRestrictive(foreign_key.on_update)) return error.InvalidSchemaUpdateRequest;
+            if (!foreignKeyActionSupportsTemporalUpdate(foreign_key.on_update)) return error.InvalidSchemaUpdateRequest;
             const same_table_parent = std.mem.eql(u8, foreign_key.references.table, schema.default_type);
             if (same_table_parent) try validateRelationalPeriodReference(schema, period);
         }
@@ -2357,6 +2357,10 @@ fn validateRelationalForeignKeys(schema: TableSchema) !void {
 
 fn foreignKeyActionIsRestrictive(action: ForeignKeyAction) bool {
     return action == .restrict or action == .no_action;
+}
+
+fn foreignKeyActionSupportsTemporalUpdate(action: ForeignKeyAction) bool {
+    return foreignKeyActionIsRestrictive(action) or action == .set_null;
 }
 
 fn foreignKeyReferencesPrimaryKey(foreign_key: ForeignKey) bool {
@@ -6121,10 +6125,16 @@ test "relational schema parses application-time temporal constraints" {
     defer parsed_delete_set_null.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_delete_set_null.foreign_keys[0].on_delete);
 
+    var parsed_update_set_null = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"adjustment_id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["adjustment_id","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["adjustment_id"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"set_null"}]}
+    );
+    defer parsed_update_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_update_set_null.foreign_keys[0].on_update);
+
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,
         parseSchema(std.testing.allocator,
-            \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"set_null"}]}
+            \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"cascade"}]}
         ),
     );
 

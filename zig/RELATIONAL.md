@@ -1191,17 +1191,23 @@ finite/infinite sentinels inside temporal unique-owner keys.
 Storage enforces period validity, no-overlap primary/unique keys, temporal FK
 coverage, and `FOR PORTION OF` splitting/trimming through the ordinary
 row-claim, 2PC, unique-owner, FK-proof, replay, and returning paths. Temporal
-FKs support restrictive actions plus bounded delete-side `ON DELETE SET NULL`
-and `ON DELETE CASCADE` actions through the same remaining-coverage proof used
-by storage. That is deliberately broader than the PostgreSQL 19 launch shape,
-which keeps temporal foreign keys to non-mutating referential actions; the
-extra Antfly delete actions are admitted only because they are expressed as
-bounded owner-routed row mutations with a post-delete coverage proof. Mutating
-temporal update actions remain rejected at the SQL/API boundary because
-changing a parent interval/key requires update-side period action semantics
-that are broader than a scalar child-row rewrite. The parity corpus explicitly
-pins supported temporal `SET NULL` and `CASCADE` delete-action DDL and
-fail-closed coverage for update-side mutating temporal FK actions. Typed
+FKs support restrictive actions, bounded delete-side `ON DELETE SET NULL` and
+`ON DELETE CASCADE` actions, and bounded temporal `ON UPDATE SET NULL` actions
+through the same remaining-coverage proof used by storage. That is deliberately
+broader than the PostgreSQL 19 launch shape, which keeps temporal foreign keys
+to non-mutating referential actions; the extra Antfly actions are admitted only
+because they are expressed as bounded owner-routed row mutations with a
+post-action coverage proof. For temporal `ON UPDATE SET NULL`, updating a
+parent key or interval first rewrites the temporal unique-owner rows, then scans
+the reverse-reference rows for that parent identity: children that remain fully
+covered by the replacement parent intervals keep their FK columns, and children
+whose application period is no longer covered have only the FK columns nulled.
+Temporal `ON UPDATE CASCADE` remains rejected at the SQL/API boundary because
+period-preserving child rewrites are not enough when parent interval movement
+would require child interval splitting, trimming, or multi-parent coverage
+selection. The parity corpus explicitly pins supported temporal `SET NULL` and
+`CASCADE` delete-action DDL, supported temporal `SET NULL` update-action DDL,
+and fail-closed coverage for update-side temporal cascade actions. Typed
 `FOR PORTION OF` requests carry the period name plus storage-typed `from` and
 `to` JSON values: numeric periods use numbers, datetime periods use encoded
 UTC nanoseconds, and SQL date/timestamp literals, including `DATE '...'`,

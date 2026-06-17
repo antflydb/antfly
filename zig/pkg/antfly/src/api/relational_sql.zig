@@ -9978,7 +9978,7 @@ const Parser = struct {
 
         const options = try self.parseDdlForeignKeyOptions();
         if ((child.period == null) != (parent.period == null)) return error.UnsupportedSqlShape;
-        if (child.period != null and !foreignKeyActionIsRestrictive(options.on_update)) return error.UnsupportedSqlShape;
+        if (child.period != null and !foreignKeyActionSupportsTemporalUpdate(options.on_update)) return error.UnsupportedSqlShape;
 
         const name = if (constraint_name) |existing|
             try self.alloc.dupe(u8, existing)
@@ -41743,7 +41743,7 @@ fn validateForeignKeyForColumns(columns: []const runtime_schema.RelationalColumn
     if (foreign_key.child_columns.len == 0 or foreign_key.child_columns.len != foreign_key.parent_columns.len) return error.InvalidSqlCatalog;
     if ((foreign_key.child_period == null) != (foreign_key.parent_period == null)) return error.InvalidSqlCatalog;
     if (foreign_key.child_period) |period| {
-        if (!foreignKeyActionIsRestrictive(foreign_key.on_update)) return error.InvalidSqlCatalog;
+        if (!foreignKeyActionSupportsTemporalUpdate(foreign_key.on_update)) return error.InvalidSqlCatalog;
         _ = relationalPeriodForDdl(periods, period) orelse return error.InvalidSqlCatalog;
     }
     for (foreign_key.child_columns) |column| {
@@ -41754,6 +41754,10 @@ fn validateForeignKeyForColumns(columns: []const runtime_schema.RelationalColumn
 
 fn foreignKeyActionIsRestrictive(action: runtime_schema.ForeignKeyAction) bool {
     return action == .restrict or action == .no_action;
+}
+
+fn foreignKeyActionSupportsTemporalUpdate(action: runtime_schema.ForeignKeyAction) bool {
+    return foreignKeyActionIsRestrictive(action) or action == .set_null;
 }
 
 fn validateCheckForColumns(columns: []const runtime_schema.RelationalColumn, check: runtime_schema.RelationalCheck) !void {
@@ -44249,7 +44253,7 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
     var temporal_action_child_parsed_schema = try schema_api.parseValidatedTableSchema(alloc, temporal_action_child_schema_json);
     defer temporal_action_child_parsed_schema.deinit(alloc);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var temporal_update_set_null_lowered = try lowerDdlPlanAlloc(
         alloc,
         \\CREATE TABLE price_adjustments_update (
         \\  tenant_id text,
@@ -44263,6 +44267,33 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
         \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
         \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
         \\    ON UPDATE SET NULL
+        \\);
+        ,
+    );
+    defer temporal_update_set_null_lowered.deinit(alloc);
+    const temporal_update_set_null_create = switch (temporal_update_set_null_lowered) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), temporal_update_set_null_create.foreign_keys.len);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, temporal_update_set_null_create.foreign_keys[0].on_update);
+    try std.testing.expectEqualStrings("valid_time", temporal_update_set_null_create.foreign_keys[0].child_period.?);
+    try std.testing.expectEqualStrings("valid_time", temporal_update_set_null_create.foreign_keys[0].parent_period.?);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE price_adjustments_update_cascade (
+        \\  tenant_id text,
+        \\  sku text,
+        \\  adjustment_id text NOT NULL,
+        \\  valid_from timestamptz NOT NULL,
+        \\  valid_to timestamptz NOT NULL,
+        \\  PERIOD FOR valid_time (valid_from, valid_to),
+        \\  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),
+        \\  CONSTRAINT price_adjustments_price_fkey
+        \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
+        \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
+        \\    ON UPDATE CASCADE
         \\);
         ,
     ));
@@ -44760,7 +44791,7 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
     try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, child_cascade_create.foreign_keys[0].on_delete);
     try std.testing.expectEqual(runtime_schema.ForeignKeyAction.restrict, child_cascade_create.foreign_keys[0].on_update);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var child_update_set_null = try lowerDdlPlanAlloc(
         alloc,
         \\CREATE TABLE price_adjustments_set_null (
         \\  tenant_id text,
@@ -44776,7 +44807,14 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
         \\    ON UPDATE SET NULL
         \\);
         ,
-    ));
+    );
+    defer child_update_set_null.deinit(alloc);
+    const child_update_set_null_create = switch (child_update_set_null) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), child_update_set_null_create.foreign_keys.len);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, child_update_set_null_create.foreign_keys[0].on_update);
 }
 
 test "postgres sql adapter query check clone strips catalog names and preserves expression" {
@@ -68707,10 +68745,11 @@ test "postgres sql adapter classifies application parity corpus" {
             ,
         },
         .{
-            .name = "unsupported temporal foreign key set-null update action",
-            .family = .unsupported_ddl,
-            .plan = "unsupported:ddl:requires=temporal_fk_action",
-            .classification_reason = "temporal_fk_action",
+            .name = "schema temporal foreign key set-null update action",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_table, .table_name = "price_adjustments_set_null", .select = 5, .temporal_periods = 1, .temporal_primary_key = true, .temporal_unique = 0, .temporal_foreign_keys = 1 },
+            .plan = "ddl:create_table:table=price_adjustments_set_null:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
+            .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql =
             \\CREATE TABLE price_adjustments_set_null (
             \\  tenant_id text,
@@ -68724,6 +68763,27 @@ test "postgres sql adapter classifies application parity corpus" {
             \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
             \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
             \\    ON UPDATE SET NULL
+            \\);
+            ,
+        },
+        .{
+            .name = "unsupported temporal foreign key cascade update action",
+            .family = .unsupported_ddl,
+            .plan = "unsupported:ddl:requires=temporal_fk_action",
+            .classification_reason = "temporal_fk_action",
+            .sql =
+            \\CREATE TABLE price_adjustments_update_cascade (
+            \\  tenant_id text,
+            \\  sku text,
+            \\  adjustment_id text NOT NULL,
+            \\  valid_from timestamptz NOT NULL,
+            \\  valid_to timestamptz NOT NULL,
+            \\  PERIOD FOR valid_time (valid_from, valid_to),
+            \\  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),
+            \\  CONSTRAINT price_adjustments_price_fkey
+            \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
+            \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
+            \\    ON UPDATE CASCADE
             \\);
             ,
         },

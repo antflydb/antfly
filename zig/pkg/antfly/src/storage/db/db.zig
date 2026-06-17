@@ -74193,6 +74193,46 @@ test "db relational temporal foreign key delete actions respect remaining parent
     defer alloc.free(uncovered_child);
     try std.testing.expect(std.mem.indexOf(u8, uncovered_child, "\"parent_sku\"") == null);
 
+    var set_null_update_path_buf: [256]u8 = undefined;
+    const set_null_update_path = tempPath(&set_null_update_path_buf);
+    defer cleanupTempDir(set_null_update_path);
+
+    var set_null_update_db = try DB.open(alloc, std.mem.span(set_null_update_path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer set_null_update_db.close();
+
+    const set_null_update_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"on_update":"set_null","validation_state":"enforced"}]}
+    ;
+    var set_null_update_parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, set_null_update_schema_json);
+    defer set_null_update_parsed_schema.deinit(alloc);
+    const set_null_update_runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, set_null_update_parsed_schema);
+    defer schema_mod.freeSchema(alloc, set_null_update_runtime_schema);
+    try set_null_update_db.setSchema(set_null_update_runtime_schema);
+
+    try set_null_update_db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":6,\"valid_to\":8,\"price\":99}" },
+        },
+    });
+
+    try set_null_update_db.batch(.{
+        .writes = &.{.{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":4,\"price\":10}" }},
+    });
+    const update_covered_child = (try set_null_update_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(update_covered_child);
+    try std.testing.expect(std.mem.indexOf(u8, update_covered_child, "\"parent_sku\":\"parent\"") != null);
+
+    try set_null_update_db.batch(.{
+        .writes = &.{.{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":7,\"price\":12}" }},
+    });
+    const update_uncovered_child = (try set_null_update_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(update_uncovered_child);
+    try std.testing.expect(std.mem.indexOf(u8, update_uncovered_child, "\"parent_sku\"") == null);
+
     var cascade_path_buf: [256]u8 = undefined;
     const cascade_path = tempPath(&cascade_path_buf);
     defer cleanupTempDir(cascade_path);
