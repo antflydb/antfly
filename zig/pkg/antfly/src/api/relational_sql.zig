@@ -58561,6 +58561,7 @@ const AppParityCorpusPlanFamily = enum {
     unsupported_delete,
     unsupported_update_joined_source,
     unsupported_delete_joined_source,
+    unsupported_merge_mutation,
 };
 
 const AppParityDdlTag = enum {
@@ -62370,6 +62371,7 @@ fn appParityUnsupportedFingerprintFamily(family: AppParityCorpusPlanFamily) ?[]c
         .unsupported_delete => "delete",
         .unsupported_update_joined_source => "update_joined_source",
         .unsupported_delete_joined_source => "delete_joined_source",
+        .unsupported_merge_mutation => "merge_mutation",
         else => null,
     };
 }
@@ -62396,6 +62398,7 @@ fn expectAppParityUnsupportedPlanEntry(
         .unsupported_delete => try expectFailClosedUnsupported(lowerDeleteAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
         .unsupported_update_joined_source => try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
         .unsupported_delete_joined_source => try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
+        .unsupported_merge_mutation => try expectFailClosedUnsupported(lowerMergeMutationPlanAlloc(alloc, entry.sql, effective_schema, effective_schema, entry.params)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -62532,6 +62535,7 @@ fn expectAppParityCorpusEntry(
         .unsupported_delete,
         .unsupported_update_joined_source,
         .unsupported_delete_joined_source,
+        .unsupported_merge_mutation,
         => return error.TestUnexpectedResult,
     }
 }
@@ -63271,6 +63275,7 @@ fn appParityPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const u
         .unsupported_delete,
         .unsupported_update_joined_source,
         .unsupported_delete_joined_source,
+        .unsupported_merge_mutation,
         => unreachable,
     };
     return std.mem.startsWith(u8, plan, prefix);
@@ -67330,6 +67335,7 @@ const AppParityCorpusCoverage = struct {
     unsupported_delete: bool = false,
     unsupported_update_joined_source: bool = false,
     unsupported_delete_joined_source: bool = false,
+    unsupported_merge_mutation: bool = false,
     unsupported_query_recursive_cte_stream_plan: bool = false,
     unsupported_query_set_operation_plan: bool = false,
     query_calendar_interval_expression: bool = false,
@@ -67356,6 +67362,7 @@ const AppParityCorpusCoverage = struct {
     unsupported_update_joined_source_row_lock_target: bool = false,
     unsupported_update_joined_source_cte_mutation: bool = false,
     unsupported_delete_joined_source_cte_mutation: bool = false,
+    unsupported_merge_mutation_cte: bool = false,
     update_identity_rewrite: bool = false,
     unsupported_update_non_unique_point_selector: bool = false,
     unsupported_delete_non_unique_point_selector: bool = false,
@@ -68341,6 +68348,7 @@ const AppParityCorpusCoverage = struct {
             .unsupported_delete => self.unsupported_delete = true,
             .unsupported_update_joined_source => self.unsupported_update_joined_source = true,
             .unsupported_delete_joined_source => self.unsupported_delete_joined_source = true,
+            .unsupported_merge_mutation => self.unsupported_merge_mutation = true,
             .read => {
                 const is_read_query = std.mem.startsWith(u8, entry.plan, "read:query:");
                 const is_read_aggregate = std.mem.startsWith(u8, entry.plan, "read:aggregate:");
@@ -68454,6 +68462,11 @@ const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
                     std.mem.startsWith(u8, entry.sql, "WITH ") and
                     std.mem.indexOf(u8, entry.sql, " DELETE ") != null);
+        } else if (entry.family == .unsupported_merge_mutation) {
+            self.unsupported_merge_mutation_cte = self.unsupported_merge_mutation_cte or
+                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
+                    std.mem.startsWith(u8, entry.sql, "WITH ") and
+                    std.mem.indexOf(u8, entry.sql, " MERGE ") != null);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -69244,6 +69257,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_delete);
         try std.testing.expect(self.unsupported_update_joined_source);
         try std.testing.expect(self.unsupported_delete_joined_source);
+        try std.testing.expect(self.unsupported_merge_mutation);
         try std.testing.expect(self.ddl_view_create);
         try std.testing.expect(self.ddl_view_rename);
         try std.testing.expect(self.ddl_view_drop);
@@ -69363,6 +69377,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_update_joined_source_row_lock_target);
         try std.testing.expect(self.unsupported_update_joined_source_cte_mutation);
         try std.testing.expect(self.unsupported_delete_joined_source_cte_mutation);
+        try std.testing.expect(self.unsupported_merge_mutation_cte);
         try std.testing.expect(self.update_identity_rewrite);
         try std.testing.expect(self.unsupported_update_non_unique_point_selector);
         try std.testing.expect(self.unsupported_delete_non_unique_point_selector);
@@ -76521,6 +76536,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "unsupported:delete_joined_source:requires=cte_mutation_source_plan",
             .classification_reason = "cte_mutation_source_plan",
             .sql = "WITH stale_sources AS (SELECT id FROM archived_records WHERE status = 'stale') DELETE FROM usage_records WHERE id IN (SELECT id FROM stale_sources) RETURNING id",
+        },
+        .{
+            .name = "unsupported cte-backed merge mutation",
+            .family = .unsupported_merge_mutation,
+            .plan = "unsupported:merge_mutation:requires=cte_mutation_source_plan",
+            .classification_reason = "cte_mutation_source_plan",
+            .sql = "WITH ready_sources AS (SELECT id, status FROM archived_records WHERE status = 'ready') MERGE INTO usage_records AS target USING ready_sources AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
         },
         .{
             .name = "joined update mixed-side match expression",

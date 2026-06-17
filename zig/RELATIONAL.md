@@ -1113,10 +1113,10 @@ lowering, while `WITH ... UPDATE`, `WITH ... DELETE`, and `WITH ... MERGE` route
 to their own write families and currently fail closed unless the corresponding
 typed CTE-backed execution shape is implemented. Recursive CTE-backed writes do
 not enter a write family until recursive stream semantics have a native plan.
-The SQL/API parity corpus pins CTE-backed mutation failures with the stable
-`cte_mutation_source_plan` reason, so these statements cannot regress into
-point writes, unclaimed scans, or insert-source lowering while execution support
-is still absent. The long-term execution shape is a native mutation-source plan
+The SQL/API parity corpus pins CTE-backed `UPDATE`, `DELETE`, and `MERGE`
+failures with the stable `cte_mutation_source_plan` reason, so these statements
+cannot regress into point writes, unclaimed scans, or insert-source lowering
+while execution support is still absent. The long-term execution shape is a native mutation-source plan
 whose source can be a bounded, validated CTE materialization: planning must
 materialize the CTE output under explicit row/byte caps, prove the final stream
 is lockable back to target-row identity, reject ambiguous source-to-target

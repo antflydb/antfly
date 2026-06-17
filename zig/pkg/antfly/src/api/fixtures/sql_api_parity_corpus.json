@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 868,
-  "entry_count": 868,
+  "source_entry_count": 869,
+  "entry_count": 869,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -10015,6 +10015,13 @@
       "plan": "unsupported:delete_joined_source:requires=cte_mutation_source_plan",
       "classification_reason": "cte_mutation_source_plan",
       "sql": "WITH stale_sources AS (SELECT id FROM archived_records WHERE status = 'stale') DELETE FROM usage_records WHERE id IN (SELECT id FROM stale_sources) RETURNING id"
+    },
+    {
+      "name": "unsupported cte-backed merge mutation",
+      "family": "unsupported_merge_mutation",
+      "plan": "unsupported:merge_mutation:requires=cte_mutation_source_plan",
+      "classification_reason": "cte_mutation_source_plan",
+      "sql": "WITH ready_sources AS (SELECT id, status FROM archived_records WHERE status = 'ready') MERGE INTO usage_records AS target USING ready_sources AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status"
     },
     {
       "name": "joined update mixed-side match expression",

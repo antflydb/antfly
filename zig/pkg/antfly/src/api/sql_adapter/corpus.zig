@@ -27,6 +27,7 @@ pub const UnsupportedPlanFamily = enum {
     delete,
     update_joined_source,
     delete_joined_source,
+    merge_mutation,
 };
 
 pub fn unsupportedPlanFamilyToken(family: UnsupportedPlanFamily) []const u8 {

@@ -95,6 +95,48 @@ pub const GroupByAggregate = struct {
     }
 };
 
+pub const ExpressionFold = struct {
+    name: []u8,
+    value_column: []u8 = &.{},
+    op: AggregateOp,
+    value: AggregateValue,
+
+    pub fn deinit(self: *ExpressionFold, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.value_column.len != 0) alloc.free(self.value_column);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: ExpressionFold) !void {
+        if (self.name.len == 0) return error.InvalidAlgebraicSegment;
+        if (self.op != .count and self.value_column.len == 0) return error.InvalidAlgebraicSegment;
+        if (std.meta.activeTag(self.value) != self.op) return error.InvalidAlgebraicSegment;
+    }
+};
+
+pub const ExpressionMaterialization = struct {
+    source: SourceRef,
+    expressions: []ExpressionFold,
+
+    pub fn deinit(self: *ExpressionMaterialization, alloc: Allocator) void {
+        self.source.deinit(alloc);
+        for (self.expressions) |*expression| expression.deinit(alloc);
+        alloc.free(self.expressions);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: ExpressionMaterialization) !void {
+        try self.source.validate();
+        if (self.expressions.len == 0) return error.InvalidAlgebraicSegment;
+        for (self.expressions, 0..) |expression, idx| {
+            try expression.validate();
+            for (self.expressions[0..idx]) |previous| {
+                if (std.mem.eql(u8, previous.name, expression.name)) return error.InvalidAlgebraicSegment;
+            }
+        }
+    }
+};
+
 pub const Segment = struct {
     source: SourceRef,
     aggregate: GroupByAggregate,
@@ -113,6 +155,10 @@ pub const Segment = struct {
 
 pub fn freeSegment(alloc: Allocator, segment: *Segment) void {
     segment.deinit(alloc);
+}
+
+pub fn freeExpressionMaterialization(alloc: Allocator, materialization: *ExpressionMaterialization) void {
+    materialization.deinit(alloc);
 }
 
 test "algebraic segment validates group-by aggregate folds" {
@@ -137,4 +183,30 @@ test "algebraic segment validates group-by aggregate folds" {
         .value = .{ .sum_i64 = 42 },
     };
     try segment.validate();
+}
+
+test "algebraic segment validates expression folds" {
+    const alloc = std.testing.allocator;
+    var materialization = ExpressionMaterialization{
+        .source = .{
+            .kind = .external_iceberg,
+            .snapshot_id = try alloc.dupe(u8, "iceberg-1"),
+            .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+            .source_id = try alloc.dupe(u8, "events"),
+        },
+        .expressions = try alloc.alloc(ExpressionFold, 2),
+    };
+    defer materialization.deinit(alloc);
+    materialization.expressions[0] = .{
+        .name = try alloc.dupe(u8, "row_count"),
+        .op = .count,
+        .value = .{ .count = 3 },
+    };
+    materialization.expressions[1] = .{
+        .name = try alloc.dupe(u8, "amount_sum"),
+        .value_column = try alloc.dupe(u8, "amount"),
+        .op = .sum_i64,
+        .value = .{ .sum_i64 = 42 },
+    };
+    try materialization.validate();
 }
