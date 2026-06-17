@@ -2181,8 +2181,7 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
 
         if (records.items.len != 0) {
             const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, records.items);
-            defer alloc.free(encoded);
-            try writer.appendDelta(posting_id, records.items[0].sequence, encoded);
+            try writer.appendOwnedDelta(posting_id, records.items[0].sequence, encoded);
         }
         posting_start = posting_end;
     }
@@ -2373,8 +2372,11 @@ pub const Writer = struct {
 
     pub fn appendPostingBase(self: *Writer, base: posting.PostingBase) !void {
         const encoded = try posting.PostingFormat.encodeBase(self.alloc, base);
-        defer self.alloc.free(encoded);
-        try self.appendBase(base.posting_id, encoded);
+        try self.appendOwnedEntry(.{
+            .posting_id = base.posting_id,
+            .kind = .base,
+            .sequence = 0,
+        }, encoded);
     }
 
     pub fn appendCentroidDirectory(self: *Writer, posting_id: PostingId, value: []const u8) !void {
@@ -2387,8 +2389,11 @@ pub const Writer = struct {
 
     pub fn appendCentroidDirectoryRecord(self: *Writer, record: posting.CentroidDirectoryRecord) !void {
         const encoded = try posting.CentroidDirectoryFormat.encode(self.alloc, record);
-        defer self.alloc.free(encoded);
-        try self.appendCentroidDirectory(record.posting_id, encoded);
+        try self.appendOwnedEntry(.{
+            .posting_id = record.posting_id,
+            .kind = .centroid_directory,
+            .sequence = 0,
+        }, encoded);
     }
 
     pub fn appendDelta(self: *Writer, posting_id: PostingId, sequence: u64, value: []const u8) !void {
@@ -2404,8 +2409,15 @@ pub const Writer = struct {
         var min_sequence = records[0].sequence;
         for (records[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
         const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, records);
-        defer self.alloc.free(encoded);
-        try self.appendDelta(posting_id, min_sequence, encoded);
+        try self.appendOwnedDelta(posting_id, min_sequence, encoded);
+    }
+
+    fn appendOwnedDelta(self: *Writer, posting_id: PostingId, sequence: u64, value: []u8) !void {
+        try self.appendOwnedEntry(.{
+            .posting_id = posting_id,
+            .kind = .delta,
+            .sequence = sequence,
+        }, value);
     }
 
     fn appendEntry(self: *Writer, key: struct {
@@ -2420,6 +2432,20 @@ pub const Writer = struct {
             .kind = key.kind,
             .sequence = key.sequence,
             .value = owned,
+        });
+    }
+
+    fn appendOwnedEntry(self: *Writer, key: struct {
+        posting_id: PostingId,
+        kind: EntryKind,
+        sequence: u64,
+    }, value: []u8) !void {
+        errdefer self.alloc.free(value);
+        try self.entries.append(self.alloc, .{
+            .posting_id = key.posting_id,
+            .kind = key.kind,
+            .sequence = key.sequence,
+            .value = value,
         });
     }
 
@@ -2985,8 +3011,7 @@ pub const DirectoryBatchWriter = struct {
             var min_sequence = entry.value_ptr.records.items[0].sequence;
             for (entry.value_ptr.records.items[1..]) |record| min_sequence = @min(min_sequence, record.sequence);
             const encoded = try posting.PostingFormat.encodeDeltaTail(self.alloc, entry.value_ptr.records.items);
-            defer self.alloc.free(encoded);
-            try self.writer.appendDelta(entry.key_ptr.*, min_sequence, encoded);
+            try self.writer.appendOwnedDelta(entry.key_ptr.*, min_sequence, encoded);
         }
         self.clearPendingDeltaBatches();
     }
