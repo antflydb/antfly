@@ -109,6 +109,19 @@ func TestSourceFlagsGoogleDriveAccessTokenBuildsSource(t *testing.T) {
 	}
 }
 
+func TestSourceFlagsGoogleDriveInlineDefaultIsLargeEnoughForDocuments(t *testing.T) {
+	flags := parseSourceFlagsForTest(t,
+		"--source", "google-drive",
+		"--drive-folder", "folder-id",
+		"--drive-access-token", "token",
+		"--inline-content",
+	)
+	flags.normalizeForSource()
+	if got := *flags.maxInlineBytes; got != defaultDriveMaxInlineContentBytes {
+		t.Fatalf("maxInlineBytes = %d, want %d", got, defaultDriveMaxInlineContentBytes)
+	}
+}
+
 func TestGoogleDriveTokenCacheLoadTokenSource(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "google-drive-token.json")
 	cache := googleDriveTokenCache{
@@ -144,6 +157,31 @@ func TestGoogleDriveTokenCacheLoadTokenSource(t *testing.T) {
 	}
 	if token.AccessToken != "access-token" {
 		t.Fatalf("AccessToken = %q, want access-token", token.AccessToken)
+	}
+}
+
+func TestResolveGoogleDriveTokenSourceFallsBackToADCWhenCacheInvalid(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "google-drive-token.json")
+	if err := os.WriteFile(tokenFile, []byte("{"), 0600); err != nil {
+		t.Fatalf("write invalid token cache: %v", err)
+	}
+
+	originalADC := googleDriveADCTokenSource
+	googleDriveADCTokenSource = func(context.Context) (oauth2.TokenSource, error) {
+		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "adc-token"}), nil
+	}
+	t.Cleanup(func() { googleDriveADCTokenSource = originalADC })
+
+	source, err := resolveGoogleDriveTokenSource(context.Background(), tokenFile)
+	if err != nil {
+		t.Fatalf("resolve token source: %v", err)
+	}
+	token, err := source.Token()
+	if err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	if token.AccessToken != "adc-token" {
+		t.Fatalf("AccessToken = %q, want adc-token", token.AccessToken)
 	}
 }
 

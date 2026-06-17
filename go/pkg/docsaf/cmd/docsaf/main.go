@@ -20,6 +20,7 @@ import (
 const (
 	defaultDocsafMaxMergeRequestBytes  int64 = 48 << 20
 	defaultDocsafMaxInlineContentBytes int64 = 3 << 20
+	defaultDriveMaxInlineContentBytes  int64 = 128 << 20
 )
 
 // StringSliceFlag allows repeated flags to build a slice.
@@ -72,6 +73,9 @@ func registerSourceFlags(fs *flag.FlagSet) sourceFlags {
 }
 
 func (f sourceFlags) validate(ctx context.Context) error {
+	if err := f.validateInlineOptions(); err != nil {
+		return err
+	}
 	switch f.normalizedSourceType() {
 	case "filesystem":
 		return f.validateFilesystem()
@@ -85,6 +89,19 @@ func (f sourceFlags) validate(ctx context.Context) error {
 		return missingGoogleDriveAuthError()
 	default:
 		return fmt.Errorf("unknown --source %q; expected filesystem or google-drive", *f.sourceType)
+	}
+}
+
+func (f sourceFlags) validateInlineOptions() error {
+	if *f.inlineContent && *f.maxInlineBytes <= 0 {
+		return fmt.Errorf("--max-inline-bytes must be positive when --inline-content is set")
+	}
+	return nil
+}
+
+func (f sourceFlags) normalizeForSource() {
+	if f.normalizedSourceType() == "google-drive" && *f.inlineContent && *f.maxInlineBytes == defaultDocsafMaxInlineContentBytes {
+		*f.maxInlineBytes = defaultDriveMaxInlineContentBytes
 	}
 }
 
@@ -211,6 +228,7 @@ func prepareCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
+	sourceFlags.normalizeForSource()
 	ctx := context.Background()
 	if err := sourceFlags.validate(ctx); err != nil {
 		return err
@@ -343,6 +361,7 @@ func syncCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
+	sourceFlags.normalizeForSource()
 	ctx := context.Background()
 	if err := sourceFlags.validate(ctx); err != nil {
 		return err

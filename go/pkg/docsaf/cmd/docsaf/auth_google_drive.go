@@ -239,7 +239,7 @@ func resolveGoogleDriveTokenSource(ctx context.Context, tokenFile string) (oauth
 		if tokenSource, err := loadGoogleDriveTokenSource(ctx, tokenFile); err == nil {
 			return tokenSource, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
+			fmt.Fprintf(os.Stderr, "Warning: ignoring unusable Google Drive token file %q: %v\n", tokenFile, err)
 		}
 	}
 	if tokenSource, err := googleDriveADCTokenSource(ctx); err == nil {

@@ -322,7 +322,10 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 					Metadata: map[string]any{
 						"source_type":   "google_drive",
 						"drive_file_id": f.Id,
+						"etag":          f.Md5Checksum,
+						"file_size":     f.Size,
 						"mime_type":     f.MimeType,
+						"mod_time":      f.ModifiedTime,
 						"modified_time": f.ModifiedTime,
 						"md5_checksum":  f.Md5Checksum,
 						"size":          f.Size,
