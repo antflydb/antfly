@@ -233,6 +233,9 @@ const (
 	// ReasonHAAdminResultMissing indicates a completed HA admin action lacks typed result evidence.
 	ReasonHAAdminResultMissing = "HAAdminResultMissing"
 
+	// ReasonHAAdminURLMissing indicates an executable HA admin action lacks a target admin endpoint.
+	ReasonHAAdminURLMissing = "HAAdminURLMissing"
+
 	// ReasonHAPrimaryRouteSelectorMissing indicates the promoted standby lacks a public-api route selector.
 	ReasonHAPrimaryRouteSelectorMissing = "HAPrimaryRouteSelectorMissing"
 

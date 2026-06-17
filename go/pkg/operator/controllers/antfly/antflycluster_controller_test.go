@@ -1168,6 +1168,60 @@ func TestReconcileHAAdminJobsRejectsDirectRejoinWorkflowMismatchedAssessment(t *
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
 }
 
+func TestReconcileHAAdminJobsMarksExecutableActionMissingAdminURL(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionRewindFormerPrimary),
+					StandbyName:  "old-primary",
+					AdminCommand: []string{"rejoin", "rewind"},
+					AdminMethod:  http.MethodPost,
+					AdminPath:    "/admin/v1/ha/rejoin/rewind",
+				}, {
+					Kind:    string(haActionUpdatePrimaryRoute),
+					RouteTo: "standby-a",
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseMissingAdminURL))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(BeEmpty())
+
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminURLMissing))
+	g.Expect(degraded.Message).To(ContainSubstring("RewindFormerPrimary"))
+}
+
 func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	g := NewWithT(t)
 

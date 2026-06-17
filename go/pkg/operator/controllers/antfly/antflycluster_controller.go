@@ -84,6 +84,7 @@ const (
 	haAdminJobPhaseRunning           = "Running"
 	haAdminJobPhaseSucceeded         = "Succeeded"
 	haAdminJobPhaseFailed            = "Failed"
+	haAdminJobPhaseMissingAdminURL   = "MissingAdminURL"
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -3313,6 +3314,9 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 	for i := range cluster.Status.HAStatus.PlannedActions {
 		action := &cluster.Status.HAStatus.PlannedActions[i]
 		if strings.TrimSpace(action.AdminURL) == "" {
+			if haPlannedActionRequiresAdminTarget(*action) {
+				action.AdminJobPhase = haAdminJobPhaseMissingAdminURL
+			}
 			continue
 		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
@@ -3367,6 +3371,12 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 }
 
 const haAdminDirectAPIName = "direct-admin-api"
+
+func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) bool {
+	return len(action.AdminCommand) > 0 ||
+		strings.TrimSpace(action.AdminMethod) != "" ||
+		strings.TrimSpace(action.AdminPath) != ""
+}
 
 func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
 	if action == nil {
@@ -5566,6 +5576,19 @@ func haExpectedSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotNa
 
 func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
 	if cluster.Status.HAStatus == nil {
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhaseMissingAdminURL {
+			continue
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAAdminURLMissing,
+			fmt.Sprintf("HA admin action %s cannot execute because no target admin URL is configured", action.Kind),
+		)
 		return
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
