@@ -452,6 +452,26 @@ Recommended split:
   offline helpers where useful. CLI output should be derived from the same typed
   responses the admin API returns.
 
+The admin API is node-local even though it is typed and operator-facing. The
+operator must choose the target node deliberately:
+
+- primary-scoped actions such as slot create/drop/pause/resume, retention
+  inspection, standby seed scheduling, and reseed marking target the current
+  primary's admin URL;
+- standby-scoped actions such as bootstrap-seed, promotion readiness checks, and
+  promotion target the selected standby's admin URL;
+- former-primary rewind targets the former primary's admin URL because it needs
+  that node's local WAL/storage state;
+- former-primary reseed coordination targets the current primary when it marks
+  a slot or publishes a new seed, and uses a pod-local CLI helper only for the
+  actual local data replacement step on the former primary.
+
+This targeting rule is part of the production contract. A successful HTTP call
+to the wrong node is not enough evidence for failover automation; typed
+responses must include the acted-on node id, timeline, epoch, LSNs, fence token
+or receipt, and idempotency state so the operator can prove the intended node
+performed the intended step.
+
 Kubernetes Jobs that run `antfly ha ...` are acceptable as a bootstrap mechanism
 for workflows that need pod-local volume mounts or shared backup files. They
 should not become the only production automation path. The operator should move
@@ -590,6 +610,10 @@ be validated against that operator package.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.
+- Target former-primary rewind at the former primary's admin URL, not the
+  current primary. Target reseed scheduling/slot marking at the current primary,
+  then run any data-replacement step through a pod-local helper on the node being
+  reseeded.
 - Use CLI-backed Kubernetes Jobs only for workflows that need pod-local mounted
   files, shared backup volumes, or explicit break-glass execution.
 - Publish lag, degraded, unhealthy, and reseed-required conditions.
