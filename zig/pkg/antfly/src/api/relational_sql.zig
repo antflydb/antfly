@@ -2651,6 +2651,8 @@ const Token = struct {
     kind: TokenKind,
     text: []const u8,
     owned: bool = false,
+    source_start: usize = 0,
+    source_end: usize = 0,
 };
 
 const InsertColumnSpec = union(enum) {
@@ -3032,6 +3034,7 @@ fn expectTokenKeyword(tokens: []const Token, index: *usize, keyword: []const u8)
 }
 
 fn tokenStartOffset(sql: []const u8, token: Token) !usize {
+    if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
     const sql_start = @intFromPtr(sql.ptr);
     const sql_end = sql_start + sql.len;
     const token_start = @intFromPtr(token.text.ptr);
@@ -6078,6 +6081,7 @@ const Parser = struct {
         errdefer if (returns_type) |value| self.alloc.free(value);
         var language: ?[]const u8 = null;
         errdefer if (language) |value| self.alloc.free(value);
+        var body_seen = false;
         while (!self.atEnd() and !self.peekKind(.semicolon)) {
             if (self.matchKeyword("returns")) {
                 if (kind != .function or returns_type != null) return error.UnsupportedSqlShape;
@@ -6087,6 +6091,12 @@ const Parser = struct {
             if (self.matchKeyword("language")) {
                 if (language != null) return error.UnsupportedSqlShape;
                 language = try self.parseIdentifierOwned();
+                continue;
+            }
+            if (self.matchKeyword("as")) {
+                if (body_seen) return error.UnsupportedSqlShape;
+                if (self.match(.string) == null) return error.UnsupportedSqlShape;
+                body_seen = true;
                 continue;
             }
             return error.UnsupportedSqlShape;
@@ -38221,6 +38231,56 @@ fn windowOutputFieldIsUnique(
     return matches == 1;
 }
 
+fn finalizeTokenSourceSpans(sql: []const u8, tokens: []Token) !void {
+    const sql_start = @intFromPtr(sql.ptr);
+    const sql_end = sql_start + sql.len;
+    for (tokens) |*token| {
+        if (token.source_end > token.source_start or token.text.len == 0) continue;
+        const token_start = @intFromPtr(token.text.ptr);
+        if (token_start < sql_start or token_start + token.text.len > sql_end) return error.UnsupportedSqlShape;
+        token.source_start = token_start - sql_start;
+        token.source_end = token.source_start + token.text.len;
+    }
+}
+
+const SqlDollarQuote = struct {
+    body_start: usize,
+    body_end: usize,
+    token_end: usize,
+    closed: bool,
+};
+
+fn sqlDollarQuoteAt(sql: []const u8, dollar: usize) ?SqlDollarQuote {
+    if (dollar + 1 >= sql.len or sql[dollar] != '$') return null;
+    if (std.ascii.isDigit(sql[dollar + 1])) return null;
+
+    var delimiter_end = dollar + 1;
+    if (sql[delimiter_end] == '$') {
+        delimiter_end += 1;
+    } else {
+        if (!appParitySqlDollarQuoteTagStart(sql[delimiter_end])) return null;
+        delimiter_end += 1;
+        while (delimiter_end < sql.len and appParitySqlDollarQuoteTagContinue(sql[delimiter_end])) : (delimiter_end += 1) {}
+        if (delimiter_end >= sql.len or sql[delimiter_end] != '$') return null;
+        delimiter_end += 1;
+    }
+
+    const delimiter = sql[dollar..delimiter_end];
+    const body_start = delimiter_end;
+    const body_end = std.mem.indexOfPos(u8, sql, body_start, delimiter) orelse return .{
+        .body_start = body_start,
+        .body_end = sql.len,
+        .token_end = sql.len,
+        .closed = false,
+    };
+    return .{
+        .body_start = body_start,
+        .body_end = body_end,
+        .token_end = body_end + delimiter.len,
+        .closed = true,
+    };
+}
+
 fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmanaged(Token) {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     errdefer freeTokens(alloc, &tokens);
@@ -38264,6 +38324,7 @@ fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmana
             continue;
         }
         if (ch == '\'') {
+            const source_start = i;
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(alloc);
             i += 1;
@@ -38281,22 +38342,24 @@ fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmana
             }
             if (i >= sql.len) return error.UnsupportedSqlShape;
             const owned = try out.toOwnedSlice(alloc);
-            errdefer alloc.free(owned);
+            var owned_transferred = false;
+            errdefer if (!owned_transferred) alloc.free(owned);
             i += 1;
             if (sqlCastTypeAt(sql, i)) |cast_type| {
                 i = cast_type.end;
                 if (sqlCastTypeIsNumeric(cast_type.name)) {
                     if (!sqlStringIsJsonNumber(alloc, owned)) return error.UnsupportedSqlShape;
-                    try tokens.append(alloc, .{ .kind = .number, .text = owned, .owned = true });
+                    try tokens.append(alloc, .{ .kind = .number, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
                 } else if (sqlCastTypeIsBoolean(cast_type.name)) {
                     if (!std.ascii.eqlIgnoreCase(owned, "true") and !std.ascii.eqlIgnoreCase(owned, "false")) return error.UnsupportedSqlShape;
-                    try tokens.append(alloc, .{ .kind = .identifier, .text = owned, .owned = true });
+                    try tokens.append(alloc, .{ .kind = .identifier, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
                 } else {
-                    try tokens.append(alloc, .{ .kind = .string, .text = owned });
+                    try tokens.append(alloc, .{ .kind = .string, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
                 }
             } else {
-                try tokens.append(alloc, .{ .kind = .string, .text = owned });
+                try tokens.append(alloc, .{ .kind = .string, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
             }
+            owned_transferred = true;
             continue;
         }
         if (std.ascii.isDigit(ch)) {
@@ -38309,6 +38372,17 @@ fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmana
             continue;
         }
         if (ch == '$') {
+            if (sqlDollarQuoteAt(sql, i)) |quote| {
+                if (!quote.closed) return error.UnsupportedSqlShape;
+                try tokens.append(alloc, .{
+                    .kind = .string,
+                    .text = sql[quote.body_start..quote.body_end],
+                    .source_start = i,
+                    .source_end = quote.token_end,
+                });
+                i = quote.token_end;
+                continue;
+            }
             const start = i;
             i += 1;
             while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
@@ -38465,6 +38539,7 @@ fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmana
             else => return error.UnsupportedSqlShape,
         }
     }
+    try finalizeTokenSourceSpans(sql, tokens.items);
     return tokens;
 }
 
@@ -38639,7 +38714,7 @@ fn sqlIsLeapYear(year: i64) bool {
 
 fn freeTokens(alloc: std.mem.Allocator, tokens: *std.ArrayListUnmanaged(Token)) void {
     for (tokens.items) |token| {
-        if (token.kind == .string or token.owned) alloc.free(token.text);
+        if (token.owned) alloc.free(token.text);
     }
     tokens.deinit(alloc);
 }
@@ -49756,7 +49831,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(replace_function_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql", replace_function_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_function));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql AS 'body';"));
+
+    var create_function_body = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;");
+    defer create_function_body.deinit(alloc);
+    const create_function_body_fingerprint = try ddlFingerprintAlloc(alloc, create_function_body);
+    defer alloc.free(create_function_body_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=audit_body:args=0:replace=false:returns=trigger:language=plpgsql", create_function_body_fingerprint);
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
     defer drop_function.deinit(alloc);
@@ -87085,6 +87165,38 @@ test "postgres sql adapter lowers row_number window query plans" {
         schema,
         &.{},
     ));
+}
+
+test "postgres sql adapter lexer records source spans and dollar quoted literals" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT $$a $1 body$$ AS body, $tag$quoted 'text'$tag$ AS tagged FROM users WHERE id = $1";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expect(tokens.items.len > 0);
+    try std.testing.expectEqual(TokenKind.identifier, tokens.items[0].kind);
+    try std.testing.expectEqualStrings("SELECT", tokens.items[0].text);
+    try std.testing.expectEqualStrings("SELECT", sql[tokens.items[0].source_start..tokens.items[0].source_end]);
+
+    try std.testing.expectEqual(TokenKind.string, tokens.items[1].kind);
+    try std.testing.expectEqualStrings("a $1 body", tokens.items[1].text);
+    try std.testing.expectEqualStrings("$$a $1 body$$", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
+    try std.testing.expect(!tokens.items[1].owned);
+
+    try std.testing.expectEqual(TokenKind.string, tokens.items[5].kind);
+    try std.testing.expectEqualStrings("quoted 'text'", tokens.items[5].text);
+    try std.testing.expectEqualStrings("$tag$quoted 'text'$tag$", sql[tokens.items[5].source_start..tokens.items[5].source_end]);
+    try std.testing.expect(!tokens.items[5].owned);
+
+    try std.testing.expectEqual(TokenKind.placeholder, tokens.items[tokens.items.len - 1].kind);
+    try std.testing.expectEqualStrings("$1", tokens.items[tokens.items.len - 1].text);
+    try std.testing.expectEqualStrings("$1", sql[tokens.items[tokens.items.len - 1].source_start..tokens.items[tokens.items.len - 1].source_end]);
+}
+
+test "postgres sql adapter lexer rejects unterminated dollar quoted literals" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT $tag$unterminated"));
 }
 
 test "postgres sql adapter rejects unsupported application shapes explicitly" {
