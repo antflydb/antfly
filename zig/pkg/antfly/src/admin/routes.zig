@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const openapi = @import("antfly_admin_openapi");
 
 pub const base = "/admin/v1";
 pub const ha = base ++ "/ha";
@@ -155,6 +156,30 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/assess", ha_rejoin_assess);
 }
 
+test "admin routes match generated OpenAPI HA operations" {
+    try expectGeneratedRoute("getHAPrimaryStatus", "GET", ha_primary_status);
+    try expectGeneratedRoute("getHAStandbyStatus", "GET", ha_standby_status);
+    try expectGeneratedRoute("checkHACommit", "POST", ha_commit_check);
+    try expectGeneratedRoute("appendHACommit", "POST", ha_commit_append);
+    try expectGeneratedRoute("checkHARead", "POST", ha_read_check);
+    try expectGeneratedRoute("checkHAWrite", "POST", ha_write_check);
+    try expectGeneratedRoute("checkHAOwnerJob", "POST", ha_owner_job_check);
+    try expectGeneratedRoute("listHAReplicationSlots", "GET", ha_replication_slots);
+    try expectGeneratedRoute("createHAReplicationSlot", "POST", ha_replication_slots);
+    try expectGeneratedRoute("dropHAReplicationSlot", "DELETE", ha_replication_slot_prefix ++ "{slot_name}");
+    try expectGeneratedRoute("pauseHAReplicationSlot", "PUT", ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_pause_suffix);
+    try expectGeneratedRoute("resumeHAReplicationSlot", "PUT", ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_resume_suffix);
+    try expectGeneratedRoute("beginHABaseBackup", "POST", ha_base_backups);
+    try expectGeneratedRoute("finishHABaseBackup", "POST", ha_base_backups_finish);
+    try expectGeneratedRoute("bootstrapHAStandby", "POST", ha_standby_bootstrap);
+    try expectGeneratedRoute("acquireHAFence", "POST", ha_fence);
+    try expectGeneratedRoute("getHACurrentFence", "GET", ha_fence_current);
+    try expectGeneratedRoute("assessHAPromotion", "POST", ha_promotion_assess);
+    try expectGeneratedRoute("promoteHAWithCurrentFence", "POST", ha_promotion_current_fence);
+    try expectGeneratedRoute("promoteHA", "POST", ha_promotion);
+    try expectGeneratedRoute("assessHARejoin", "POST", ha_rejoin_assess);
+}
+
 test "admin routes build and match replication slot lifecycle paths" {
     const alloc = std.testing.allocator;
 
@@ -207,4 +232,19 @@ test "admin routes encode and decode replication slot path segments" {
         error.InvalidPercentEncoding,
         replicationSlotNameFromPathAlloc(alloc, "/admin/v1/ha/replication-slots/standby%XX", ""),
     );
+}
+
+fn expectGeneratedRoute(operation_id: []const u8, method: []const u8, full_path: []const u8) !void {
+    try std.testing.expect(std.mem.startsWith(u8, full_path, base));
+    const spec_path = full_path[base.len..];
+
+    for (openapi.server.routes) |route| {
+        if (!std.mem.eql(u8, route.operation_id, operation_id)) continue;
+        try std.testing.expectEqualStrings(method, route.method);
+        try std.testing.expectEqualStrings(spec_path, route.path);
+        return;
+    }
+
+    std.debug.print("missing generated admin OpenAPI route for operation '{s}'\n", .{operation_id});
+    return error.TestExpectedGeneratedRoute;
 }
