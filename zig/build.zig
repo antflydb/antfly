@@ -2811,6 +2811,19 @@ pub fn build(b: *std.Build) void {
     const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
     const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
     lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
+    const lib_ha_compat_default_filters = [_][]const u8{
+        "storage.ha compat decodes v1 replication record fixture",
+        "storage.ha compat keeps v1 replication record encoding stable",
+        "storage.ha compat decodes v1 timeline switch record fixture",
+        "storage.ha compat keeps v1 timeline switch encoding stable",
+    };
+    const lib_ha_compat_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
+    });
+    const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
+    const lib_ha_compat_test_step = b.step("ha-compat-test", "Run HA replication format compatibility tests");
+    lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
@@ -5241,6 +5254,7 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
+    compat_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),
