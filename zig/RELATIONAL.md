@@ -5411,10 +5411,12 @@ identity allocator `kind`, comment `kind`, transaction `starter`, advisory-lock
 `action`, and relation-population `mode` likewise reads exact string tokens, so
 suffix-like values such as `kind=table_extra` cannot satisfy a `kind=table`
 coverage requirement. DDL boolean/count coverage such as table/function
-`replace`, drop-table `cascade`, and truncate `restart_identity` is also parsed
-as exact tokens rather than substring matches. DDL family coverage that is
-already represented by the typed `ddl_tag`, such as `table_clone`, is satisfied
-from that tag rather than a second string search over the fingerprint.
+`replace`, drop-table `cascade`, truncate `restart_identity`, and temporal FK
+action counts is also parsed as exact tokens rather than substring matches.
+Aggregate zero-count coverage such as group-only `SELECT DISTINCT` likewise
+requires a well-formed exact `aggs=0` token. DDL family coverage that is already
+represented by the typed `ddl_tag`, such as `table_clone`, is satisfied from
+that tag rather than a second string search over the fingerprint.
 `EXPLAIN` fixture metadata and coverage use the same exact-token rule for
 `explain:kind`, `analyze`, and option tokens such as `format`, `verbose`, and
 `costs`; malformed option values or suffix-like `kind=write_extra` values cannot

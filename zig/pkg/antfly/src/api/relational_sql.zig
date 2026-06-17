@@ -65251,6 +65251,52 @@ test "app parity ddl boolean coverage tokens are exact" {
     try std.testing.expect(coverage.truncate_restart_identity);
 }
 
+test "app parity count coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0x:agg_expr=0:filter_expr=0:having=0:order=0:limit=none",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
+    });
+
+    try std.testing.expect(!coverage.aggregate_distinct_group_projection);
+    try std.testing.expect(!coverage.ddl_temporal_fk_delete_set_null_action);
+    try std.testing.expect(!coverage.ddl_temporal_fk_delete_cascade_action);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0:agg_expr=0:filter_expr=0:having=0:order=0:limit=none",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table },
+        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
+        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
+    });
+
+    try std.testing.expect(coverage.aggregate_distinct_group_projection);
+    try std.testing.expect(coverage.ddl_temporal_fk_delete_set_null_action);
+    try std.testing.expect(coverage.ddl_temporal_fk_delete_cascade_action);
+}
+
 test "app parity explain coverage tokens are exact" {
     const write_suffix = AppParityCorpusEntry{
         .family = .explain,
@@ -66302,7 +66348,9 @@ const AppParityCorpusCoverage = struct {
                 self.aggregate_distinct_json_array_expression = self.aggregate_distinct_json_array_expression or
                     std.mem.indexOf(u8, entry.sql, "array_agg(DISTINCT metadata->'flags')") != null and
                         appParityPlanHasNonZeroToken(entry.plan, ":agg_expr=");
-                self.aggregate_distinct_group_projection = self.aggregate_distinct_group_projection or (appParityPlanHasNonZeroToken(entry.plan, ":group=") and std.mem.indexOf(u8, entry.plan, ":aggs=0") != null);
+                self.aggregate_distinct_group_projection = self.aggregate_distinct_group_projection or
+                    (appParityPlanHasNonZeroToken(entry.plan, ":group=") and
+                        appParityPlanHasExactUsizeToken(entry.plan, ":aggs=", 0));
                 self.aggregate_cte_expression_access = self.aggregate_cte_expression_access or
                     (std.mem.indexOf(u8, entry.plan, ":cte0_expr_") != null or
                         (appParityPlanHasNonZeroToken(entry.plan, ":ctes=") and
@@ -66556,10 +66604,10 @@ const AppParityCorpusCoverage = struct {
                     self.ddl_create_table = true;
                     self.ddl_temporal_table = self.ddl_temporal_table or std.mem.indexOf(u8, entry.plan, ":periods=") != null;
                     self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
-                        (std.mem.indexOf(u8, entry.plan, ":temporal_fk=1") != null and
+                        (appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
                             std.mem.indexOf(u8, entry.sql, " ON DELETE SET NULL") != null);
                     self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
-                        (std.mem.indexOf(u8, entry.plan, ":temporal_fk=1") != null and
+                        (appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
                             std.mem.indexOf(u8, entry.sql, " ON DELETE CASCADE") != null);
                     self.ddl_replace_table = self.ddl_replace_table or appParityPlanHasExactBoolToken(entry.plan, ":replace=", true);
                 },
