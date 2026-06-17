@@ -161,29 +161,10 @@ test "admin routes define HA control-plane paths" {
 }
 
 test "admin routes match generated OpenAPI HA operations" {
-    try expectGeneratedRoute("getHAPrimaryStatus", "GET", ha_primary_status);
-    try expectGeneratedRoute("getHAStandbyStatus", "GET", ha_standby_status);
-    try expectGeneratedRoute("checkHACommit", "POST", ha_commit_check);
-    try expectGeneratedRoute("appendHACommit", "POST", ha_commit_append);
-    try expectGeneratedRoute("checkHARead", "POST", ha_read_check);
-    try expectGeneratedRoute("checkHAWrite", "POST", ha_write_check);
-    try expectGeneratedRoute("checkHAOwnerJob", "POST", ha_owner_job_check);
-    try expectGeneratedRoute("listHAReplicationSlots", "GET", ha_replication_slots);
-    try expectGeneratedRoute("createHAReplicationSlot", "POST", ha_replication_slots);
-    try expectGeneratedRoute("dropHAReplicationSlot", "DELETE", ha_replication_slot_prefix ++ "{slot_name}");
-    try expectGeneratedRoute("pauseHAReplicationSlot", "PUT", ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_pause_suffix);
-    try expectGeneratedRoute("resumeHAReplicationSlot", "PUT", ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_resume_suffix);
-    try expectGeneratedRoute("beginHABaseBackup", "POST", ha_base_backups);
-    try expectGeneratedRoute("finishHABaseBackup", "POST", ha_base_backups_finish);
-    try expectGeneratedRoute("bootstrapHAStandby", "POST", ha_standby_bootstrap);
-    try expectGeneratedRoute("acquireHAFence", "POST", ha_fence);
-    try expectGeneratedRoute("getHACurrentFence", "GET", ha_fence_current);
-    try expectGeneratedRoute("assessHAPromotion", "POST", ha_promotion_assess);
-    try expectGeneratedRoute("promoteHAWithCurrentFence", "POST", ha_promotion_current_fence);
-    try expectGeneratedRoute("promoteHA", "POST", ha_promotion);
-    try expectGeneratedRoute("assessHARejoin", "POST", ha_rejoin_assess);
-    try expectGeneratedRoute("rewindHARejoin", "POST", ha_rejoin_rewind);
-    try expectGeneratedRoute("reseedHARejoin", "POST", ha_rejoin_reseed);
+    for (expected_ha_routes) |route| {
+        try expectGeneratedRoute(route.operation_id, route.method, route.full_path);
+    }
+    try expectEveryGeneratedHARouteCovered();
 }
 
 test "admin routes build and match replication slot lifecycle paths" {
@@ -240,6 +221,38 @@ test "admin routes encode and decode replication slot path segments" {
     );
 }
 
+const ExpectedRoute = struct {
+    operation_id: []const u8,
+    method: []const u8,
+    full_path: []const u8,
+};
+
+const expected_ha_routes = [_]ExpectedRoute{
+    .{ .operation_id = "getHAPrimaryStatus", .method = "GET", .full_path = ha_primary_status },
+    .{ .operation_id = "getHAStandbyStatus", .method = "GET", .full_path = ha_standby_status },
+    .{ .operation_id = "checkHACommit", .method = "POST", .full_path = ha_commit_check },
+    .{ .operation_id = "appendHACommit", .method = "POST", .full_path = ha_commit_append },
+    .{ .operation_id = "checkHARead", .method = "POST", .full_path = ha_read_check },
+    .{ .operation_id = "checkHAWrite", .method = "POST", .full_path = ha_write_check },
+    .{ .operation_id = "checkHAOwnerJob", .method = "POST", .full_path = ha_owner_job_check },
+    .{ .operation_id = "listHAReplicationSlots", .method = "GET", .full_path = ha_replication_slots },
+    .{ .operation_id = "createHAReplicationSlot", .method = "POST", .full_path = ha_replication_slots },
+    .{ .operation_id = "dropHAReplicationSlot", .method = "DELETE", .full_path = ha_replication_slot_prefix ++ "{slot_name}" },
+    .{ .operation_id = "pauseHAReplicationSlot", .method = "PUT", .full_path = ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_pause_suffix },
+    .{ .operation_id = "resumeHAReplicationSlot", .method = "PUT", .full_path = ha_replication_slot_prefix ++ "{slot_name}" ++ ha_replication_slot_resume_suffix },
+    .{ .operation_id = "beginHABaseBackup", .method = "POST", .full_path = ha_base_backups },
+    .{ .operation_id = "finishHABaseBackup", .method = "POST", .full_path = ha_base_backups_finish },
+    .{ .operation_id = "bootstrapHAStandby", .method = "POST", .full_path = ha_standby_bootstrap },
+    .{ .operation_id = "acquireHAFence", .method = "POST", .full_path = ha_fence },
+    .{ .operation_id = "getHACurrentFence", .method = "GET", .full_path = ha_fence_current },
+    .{ .operation_id = "assessHAPromotion", .method = "POST", .full_path = ha_promotion_assess },
+    .{ .operation_id = "promoteHAWithCurrentFence", .method = "POST", .full_path = ha_promotion_current_fence },
+    .{ .operation_id = "promoteHA", .method = "POST", .full_path = ha_promotion },
+    .{ .operation_id = "assessHARejoin", .method = "POST", .full_path = ha_rejoin_assess },
+    .{ .operation_id = "rewindHARejoin", .method = "POST", .full_path = ha_rejoin_rewind },
+    .{ .operation_id = "reseedHARejoin", .method = "POST", .full_path = ha_rejoin_reseed },
+};
+
 fn expectGeneratedRoute(operation_id: []const u8, method: []const u8, full_path: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, full_path, base));
     const spec_path = full_path[base.len..];
@@ -253,4 +266,28 @@ fn expectGeneratedRoute(operation_id: []const u8, method: []const u8, full_path:
 
     std.debug.print("missing generated admin OpenAPI route for operation '{s}'\n", .{operation_id});
     return error.TestExpectedGeneratedRoute;
+}
+
+fn expectEveryGeneratedHARouteCovered() !void {
+    for (openapi.server.routes) |generated| {
+        if (!std.mem.startsWith(u8, generated.path, "/ha/")) continue;
+        if (expectedHARoute(generated) != null) continue;
+
+        std.debug.print(
+            "generated admin OpenAPI HA route {s} {s} ({s}) is not covered by zig/pkg/antfly/src/admin/routes.zig\n",
+            .{ generated.method, generated.path, generated.operation_id },
+        );
+        return error.TestExpectedGeneratedHARouteCovered;
+    }
+}
+
+fn expectedHARoute(generated: openapi.server.Route) ?ExpectedRoute {
+    for (expected_ha_routes) |expected| {
+        if (!std.mem.eql(u8, generated.operation_id, expected.operation_id)) continue;
+        if (!std.mem.eql(u8, generated.method, expected.method)) continue;
+        if (!std.mem.startsWith(u8, expected.full_path, base)) continue;
+        if (!std.mem.eql(u8, generated.path, expected.full_path[base.len..])) continue;
+        return expected;
+    }
+    return null;
 }
