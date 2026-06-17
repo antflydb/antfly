@@ -2079,6 +2079,17 @@ func TestValidateCreate_HighAvailabilityRuntimeAdminTokenAcceptsSecretRef(t *tes
 	if !strings.Contains(err.Error(), "adminTokenEnvVar is required when adminTokenSecretRef is set") {
 		t.Fatalf("expected adminTokenEnvVar-required validation error, got: %v", err)
 	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = "ANTFLY_HA_ADMIN_TOKEN"
+	optional := true
+	cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef.Optional = &optional
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected optional runtime admin token secret ref to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef.optional must be false") {
+		t.Fatalf("expected adminTokenSecretRef optional validation error, got: %v", err)
+	}
 }
 
 func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationSource(t *testing.T) {

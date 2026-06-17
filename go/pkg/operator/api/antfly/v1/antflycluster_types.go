@@ -676,8 +676,8 @@ type HARuntimeSpec struct {
 	// +optional
 	AdminTokenEnvVar string `json:"adminTokenEnvVar,omitempty"`
 
-	// AdminTokenSecretRef optionally injects AdminTokenEnvVar from a Secret key into the Antfly runtime container.
-	// Use this when the token is not already provided by spec.swarm.envFrom.
+	// AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into the Antfly runtime container.
+	// Use this when the token is not already provided by spec.swarm.envFrom. optional must not be true.
 	// +optional
 	AdminTokenSecretRef *corev1.SecretKeySelector `json:"adminTokenSecretRef,omitempty"`
 

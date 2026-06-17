@@ -1386,6 +1386,9 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 		if strings.TrimSpace(ref.Key) == "" {
 			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.key is required")
 		}
+		if ref.Optional != nil && *ref.Optional {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.optional must be false")
+		}
 	}
 	if ha.Identity == nil {
 		errors = append(errors, "spec.highAvailability.runtime requires spec.highAvailability.identity")

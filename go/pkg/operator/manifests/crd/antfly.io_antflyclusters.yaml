@@ -3682,8 +3682,8 @@ spec:
                         type: string
                       adminTokenSecretRef:
                         description: |-
-                          AdminTokenSecretRef optionally injects AdminTokenEnvVar from a Secret key into the Antfly runtime container.
-                          Use this when the token is not already provided by spec.swarm.envFrom.
+                          AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into the Antfly runtime container.
+                          Use this when the token is not already provided by spec.swarm.envFrom. optional must not be true.
                         properties:
                           key:
                             description: The key of the secret to select from.  Must

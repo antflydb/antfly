@@ -154,6 +154,8 @@ func haRuntimeAdminTokenEnv(ha *antflyv1.HighAvailabilitySpec) []corev1.EnvVar {
 		return nil
 	}
 	secretRef := ha.Runtime.AdminTokenSecretRef.DeepCopy()
+	optional := false
+	secretRef.Optional = &optional
 	return []corev1.EnvVar{{
 		Name: envVar,
 		ValueFrom: &corev1.EnvVarSource{

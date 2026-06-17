@@ -7809,12 +7809,14 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-a"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-b"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-failure "fail-closed"`))
+	optionalFalse := false
 	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
 		Name: "ANTFLY_HA_ADMIN_TOKEN",
 		ValueFrom: &corev1.EnvVarSource{
 			SecretKeyRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
 				Key:                  "token",
+				Optional:             &optionalFalse,
 			},
 		},
 	}))
@@ -7853,6 +7855,7 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			SecretKeyRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: "custom-ha-admin-token"},
 				Key:                  "custom-token",
+				Optional:             &optionalFalse,
 			},
 		},
 	}))
