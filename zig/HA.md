@@ -433,18 +433,22 @@ be a typed, versioned `/admin/v1/ha` API specified in
 break-glass interface, but long-term operator automation should not depend on
 shelling out to a command as the primary protocol.
 
-`specs/openapi/antfly/admin.yaml` is the source of truth for this surface. New
-HA administration methods must not be added first to the existing public DB
-OpenAPI specs, to `specs/openapi/antfly/internal.yaml`, or directly to ad hoc
-Zig HTTP handlers. The implementation path is:
+`specs/openapi/antfly/admin.yaml` is the source of truth for this surface and
+should be treated as a new, dedicated admin OpenAPI spec, not an extension point
+inside the existing public DB specs. New HA administration methods must not be
+added first to the existing public DB OpenAPI specs, to
+`specs/openapi/antfly/internal.yaml`, or directly to ad hoc Zig HTTP handlers.
+The implementation path is:
 
 1. define the operation, request schema, response schema, and error response in
    `specs/openapi/antfly/admin.yaml`;
 2. regenerate the Zig admin OpenAPI bindings;
-3. re-export shared request/response types and route constants from
-   `zig/pkg/antfly/src/admin/`;
+3. re-export shared request/response types and route constants from the Zig
+   admin package rooted at `zig/pkg/antfly/src/admin/`;
 4. implement the node-local handler by consuming those admin package types and
-   route constants; and
+   route constants, keeping HA admin routing and request/response glue under
+   `zig/pkg/antfly/src/admin/` rather than scattering it through unrelated
+   HTTP modules; and
 5. have the CLI and `go/pkg/operator` call the typed `/admin/v1/ha` contract.
 
 Recommended split:
@@ -590,6 +594,10 @@ and either rewind or reseed.
 - Generate and re-export Zig admin request/response types from that spec, and
   keep admin routing, request parsing, response generation, and shared route
   constants in `zig/pkg/antfly/src/admin/`.
+- Keep `specs/openapi/antfly/admin.yaml` and `zig/pkg/antfly/src/admin/` as the
+  only source locations for HA admin HTTP contract definitions. Public DB specs
+  and `/internal/v1` specs may reference HA concepts only as clients of the
+  contract, not as owners of HA operator actions.
 - Add a CI or unit-test guard that fails when a documented `/admin/v1/ha`
   route is implemented without a matching `operationId` in
   `specs/openapi/antfly/admin.yaml`.
