@@ -65174,6 +65174,20 @@ test "app parity create table empty-catalog detection uses exact bool tokens" {
     }));
 }
 
+test "app parity ddl submode coverage tokens are exact" {
+    const comment = "ddl:comment:kind=table_extra:object=users:comment=true";
+    try std.testing.expect(!appParityPlanHasExactStringToken(comment, ":kind=", "table"));
+    try std.testing.expect(appParityPlanHasExactStringToken(comment, ":kind=", "table_extra"));
+
+    const transaction = "ddl:transaction_control:kind=transaction_mode:starter=start_transaction_extra:isolation=serializable:access=none:deferrable=none";
+    try std.testing.expect(!appParityPlanHasExactStringToken(transaction, ":starter=", "start_transaction"));
+    try std.testing.expect(appParityPlanHasExactStringToken(transaction, ":starter=", "start_transaction_extra"));
+
+    const population = "relation_population:mode=create_table_as_extra:target=usage_archive:source=read:query:query:table=usage_records";
+    try std.testing.expect(!appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as"));
+    try std.testing.expect(appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as_extra"));
+}
+
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {
     return std.mem.indexOf(u8, sql, "lower(") != null and
         (std.mem.indexOf(u8, sql, " LIKE ") != null or std.mem.indexOf(u8, sql, " ILIKE ") != null);
@@ -66309,9 +66323,9 @@ const AppParityCorpusCoverage = struct {
             },
             .relation_population => {
                 self.relation_population_select_into = self.relation_population_select_into or
-                    appParityPlanHasToken(entry.plan, "relation_population:mode=select_into:");
+                    appParityPlanHasExactStringToken(entry.plan, "relation_population:mode=", "select_into");
                 self.relation_population_create_table_as = self.relation_population_create_table_as or
-                    appParityPlanHasToken(entry.plan, "relation_population:mode=create_table_as:");
+                    appParityPlanHasExactStringToken(entry.plan, "relation_population:mode=", "create_table_as");
             },
             .insert => self.insert = true,
             .insert_source => self.insert_source = true,
@@ -66472,8 +66486,8 @@ const AppParityCorpusCoverage = struct {
                 .refresh_materialized_view => self.ddl_materialized_view_refresh = true,
                 .drop_materialized_view => self.ddl_materialized_view_drop = true,
                 .relation_lifetime => {
-                    self.ddl_relation_lifetime_temporary = self.ddl_relation_lifetime_temporary or std.mem.indexOf(u8, entry.plan, "kind=temporary") != null;
-                    self.ddl_relation_lifetime_unlogged = self.ddl_relation_lifetime_unlogged or std.mem.indexOf(u8, entry.plan, "kind=unlogged") != null;
+                    self.ddl_relation_lifetime_temporary = self.ddl_relation_lifetime_temporary or appParityPlanHasExactStringToken(entry.plan, ":kind=", "temporary");
+                    self.ddl_relation_lifetime_unlogged = self.ddl_relation_lifetime_unlogged or appParityPlanHasExactStringToken(entry.plan, ":kind=", "unlogged");
                 },
                 .create_enum_type => self.ddl_enum_type_create = true,
                 .add_enum_value => self.ddl_enum_type_add_value = true,
@@ -66495,10 +66509,10 @@ const AppParityCorpusCoverage = struct {
                 },
                 .drop_sequence => self.ddl_sequence_drop = true,
                 .identity_allocator => {
-                    self.ddl_identity_allocator_serial = self.ddl_identity_allocator_serial or std.mem.indexOf(u8, entry.plan, ":kind=bigserial:") != null or std.mem.indexOf(u8, entry.plan, ":kind=serial:") != null;
-                    self.ddl_identity_allocator_generated = self.ddl_identity_allocator_generated or std.mem.indexOf(u8, entry.plan, ":kind=generated_") != null;
+                    self.ddl_identity_allocator_serial = self.ddl_identity_allocator_serial or appParityPlanHasAnyExactStringToken(entry.plan, ":kind=", &.{ "serial", "bigserial" });
+                    self.ddl_identity_allocator_generated = self.ddl_identity_allocator_generated or appParityPlanHasAnyExactStringToken(entry.plan, ":kind=", &.{ "generated_by_default", "generated_always" });
                     self.ddl_identity_allocator_generated_options = self.ddl_identity_allocator_generated_options or
-                        (std.mem.indexOf(u8, entry.plan, ":kind=generated_always:") != null and
+                        (appParityPlanHasExactStringToken(entry.plan, ":kind=", "generated_always") and
                             appParityPlanHasNonZeroToken(entry.plan, ":options="));
                 },
                 .create_schema_namespace => self.ddl_schema_namespace_create = true,
@@ -66565,21 +66579,21 @@ const AppParityCorpusCoverage = struct {
                 .release_savepoint => self.ddl_release_savepoint = true,
                 .rollback_to_savepoint => self.ddl_rollback_to_savepoint = true,
                 .comment_metadata => {
-                    self.ddl_comment_table = self.ddl_comment_table or std.mem.indexOf(u8, entry.plan, "kind=table") != null;
-                    self.ddl_comment_column = self.ddl_comment_column or std.mem.indexOf(u8, entry.plan, "kind=column") != null;
-                    self.ddl_comment_index = self.ddl_comment_index or std.mem.indexOf(u8, entry.plan, "kind=index") != null;
-                    self.ddl_comment_constraint = self.ddl_comment_constraint or std.mem.indexOf(u8, entry.plan, "kind=constraint") != null;
+                    self.ddl_comment_table = self.ddl_comment_table or appParityPlanHasExactStringToken(entry.plan, ":kind=", "table");
+                    self.ddl_comment_column = self.ddl_comment_column or appParityPlanHasExactStringToken(entry.plan, ":kind=", "column");
+                    self.ddl_comment_index = self.ddl_comment_index or appParityPlanHasExactStringToken(entry.plan, ":kind=", "index");
+                    self.ddl_comment_constraint = self.ddl_comment_constraint or appParityPlanHasExactStringToken(entry.plan, ":kind=", "constraint");
                 },
                 .table_lock => self.ddl_table_lock = true,
                 .constraint_mode => self.ddl_constraint_mode = true,
                 .transaction_mode => {
-                    self.ddl_set_transaction_mode = self.ddl_set_transaction_mode or std.mem.indexOf(u8, entry.plan, "starter=set_transaction") != null;
-                    self.ddl_start_transaction_mode = self.ddl_start_transaction_mode or std.mem.indexOf(u8, entry.plan, "starter=start_transaction") != null;
-                    self.ddl_begin_transaction_mode = self.ddl_begin_transaction_mode or std.mem.indexOf(u8, entry.plan, "starter=begin") != null;
+                    self.ddl_set_transaction_mode = self.ddl_set_transaction_mode or appParityPlanHasExactStringToken(entry.plan, ":starter=", "set_transaction");
+                    self.ddl_start_transaction_mode = self.ddl_start_transaction_mode or appParityPlanHasExactStringToken(entry.plan, ":starter=", "start_transaction");
+                    self.ddl_begin_transaction_mode = self.ddl_begin_transaction_mode or appParityPlanHasExactStringToken(entry.plan, ":starter=", "begin");
                 },
                 .advisory_lock => {
-                    self.ddl_advisory_lock = self.ddl_advisory_lock or std.mem.indexOf(u8, entry.plan, "action=lock") != null;
-                    self.ddl_advisory_unlock = self.ddl_advisory_unlock or std.mem.indexOf(u8, entry.plan, "action=unlock") != null;
+                    self.ddl_advisory_lock = self.ddl_advisory_lock or appParityPlanHasExactStringToken(entry.plan, ":action=", "lock");
+                    self.ddl_advisory_unlock = self.ddl_advisory_unlock or appParityPlanHasExactStringToken(entry.plan, ":action=", "unlock");
                 },
                 .create_index => {
                     self.ddl_create_index = true;

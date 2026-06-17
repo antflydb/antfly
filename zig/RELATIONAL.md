@@ -5406,6 +5406,11 @@ unvalidated constraint states are then satisfied from exact parsed fingerprint
 tokens. Base-schema selection for schema-applied `CREATE TABLE` fixtures also
 uses exact typed bool tokens for `if_not_exists` and `replace`, so stale or
 malformed flag-like substrings cannot redirect the catalog apply path.
+Coverage accounting for DDL sub-modes such as relation lifetime `kind`,
+identity allocator `kind`, comment `kind`, transaction `starter`, advisory-lock
+`action`, and relation-population `mode` likewise reads exact string tokens, so
+suffix-like values such as `kind=table_extra` cannot satisfy a `kind=table`
+coverage requirement.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 
