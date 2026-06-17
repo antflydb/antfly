@@ -427,9 +427,11 @@ choices.
 ## API and CLI Surface
 
 The HA control plane should be API-first. The stable automation contract should
-be a typed, versioned `/admin/v1/ha` API. The CLI should remain as an ergonomic
-human and break-glass interface, but long-term operator automation should not
-depend on shelling out to a command as the primary protocol.
+be a typed, versioned `/admin/v1/ha` API specified in
+`specs/openapi/antfly/admin.yaml`, with Zig admin API routing and helpers under
+`zig/pkg/antfly/src/admin/`. The CLI should remain as an ergonomic human and
+break-glass interface, but long-term operator automation should not depend on
+shelling out to a command as the primary protocol.
 
 Recommended split:
 
@@ -437,7 +439,9 @@ Recommended split:
   replication slot lifecycle, base-backup orchestration, HA status, fencing
   receipts, promotion, former-primary rejoin, rewind, and reseed workflows. It
   should return typed responses with action ids, LSNs, timelines, fence tokens,
-  receipts, and idempotency state.
+  receipts, and idempotency state. New HA admin endpoints and schemas should be
+  added to `specs/openapi/antfly/admin.yaml` first, then implemented in the Zig
+  admin package rather than mixed into the public DB API or runtime-internal API.
 - `/internal/v1`: runtime-to-runtime traffic inside a trusted deployment. This
   is where WAL streaming, replication pulls, standby status updates, identity
   probes, and other node-to-node mechanisms belong. It should not be the
@@ -544,7 +548,10 @@ and either rewind or reseed.
 
 ### Phase 8: CLI and Admin API
 
-- Define `/admin/v1/ha` as the stable typed control-plane API.
+- Define `/admin/v1/ha` as the stable typed control-plane API in
+  `specs/openapi/antfly/admin.yaml`.
+- Keep Zig admin routing, request parsing, response generation, and shared route
+  constants in `zig/pkg/antfly/src/admin/`.
 - Add admin API endpoints to create, drop, pause, resume, and list replication
   slots.
 - Add admin API endpoints to seed a standby from a base backup and report
