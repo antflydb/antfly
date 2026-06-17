@@ -6510,18 +6510,16 @@ func haPrimaryRouteActionHasPromotionEvidence(status *antflyv1.HAStatus, actions
 	if action.Kind != string(haActionUpdatePrimaryRoute) || action.RouteTo == "" || action.RouteTo == "primary" {
 		return true
 	}
-	if haPrimaryRouteActionMatchesRecordedPromotion(status, action) {
-		return true
-	}
+	recordedMatches := haPrimaryRouteActionMatchesRecordedPromotion(status, action)
 	for i := index - 1; i >= 0; i-- {
 		dependency := actions[i]
 		if dependency.Kind != string(haActionPromoteStandby) {
 			continue
 		}
 		return haAdminActionSucceededWithEvidence(dependency) &&
-			haPrimaryRouteActionMatchesPromotionResult(action, dependency.AdminResult)
+			haPrimaryRouteActionMatchesPromotionResult(status, action, dependency.AdminResult)
 	}
-	return false
+	return recordedMatches
 }
 
 func haPrimaryRouteActionMatchesRecordedPromotion(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
@@ -6545,7 +6543,7 @@ func haPrimaryRouteActionMatchesRecordedPromotion(status *antflyv1.HAStatus, act
 	return true
 }
 
-func haPrimaryRouteActionMatchesPromotionResult(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+func haPrimaryRouteActionMatchesPromotionResult(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
 	if result == nil ||
 		result.FenceForced ||
 		result.PromotionForce ||
@@ -6561,10 +6559,28 @@ func haPrimaryRouteActionMatchesPromotionResult(action antflyv1.HAPlannedActionS
 		return false
 	}
 	if action.TargetLSN != 0 {
-		return result.FenceRequiredLSN == action.TargetLSN &&
-			result.FenceObservedLSN >= action.TargetLSN
+		if result.FenceRequiredLSN != action.TargetLSN ||
+			result.FenceObservedLSN < action.TargetLSN {
+			return false
+		}
+	} else if result.FenceRequiredLSN == 0 || result.FenceObservedLSN < result.FenceRequiredLSN {
+		return false
 	}
-	return result.FenceRequiredLSN > 0 && result.FenceObservedLSN >= result.FenceRequiredLSN
+	if promotion := haPromotionReceipt(status); promotion != nil {
+		return !promotion.Forced &&
+			!promotion.DataLossPossible &&
+			strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(action.RouteTo) &&
+			(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
+			(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
+			(promotion.FenceToken == "" || promotion.FenceToken == result.FenceToken) &&
+			(promotion.ParentTimelineID == 0 || promotion.ParentTimelineID == result.FenceParentTimelineID) &&
+			(promotion.ParentEpoch == 0 || promotion.ParentEpoch == result.FenceParentEpoch) &&
+			(promotion.NewTimelineID == 0 || promotion.NewTimelineID == result.FenceNewTimelineID) &&
+			(promotion.NewEpoch == 0 || promotion.NewEpoch == result.FenceNewEpoch) &&
+			(haPromotionRequiredLSN(promotion) == 0 || haPromotionRequiredLSN(promotion) == result.FenceRequiredLSN) &&
+			haPromotionObservedLSN(promotion) >= result.FenceRequiredLSN
+	}
+	return true
 }
 
 func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) bool {

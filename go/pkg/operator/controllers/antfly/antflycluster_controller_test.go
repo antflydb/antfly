@@ -2622,6 +2622,75 @@ func TestHAPrimaryRouteActionRequiresMatchingPromotionEvidence(t *testing.T) {
 	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 0)).To(BeFalse())
 }
 
+func TestHAPrimaryRouteActionRequiresDirectPromotionResultToMatchRecordedPromotion(t *testing.T) {
+	g := NewWithT(t)
+
+	promote := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 7,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminNodeID:     "standby-a",
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:         1,
+			ActionID:              "promotion:standby-a",
+			ActionKind:            "promotion",
+			ActionTarget:          "standby-a",
+			ActionState:           "applied",
+			ActionNodeID:          "standby-a",
+			FenceGeneration:       7,
+			FenceToken:            "ha-fence-token",
+			FenceClusterID:        100,
+			FenceOldPrimaryID:     "primary-a",
+			FencePromotedNodeID:   "standby-a",
+			FenceParentTimelineID: 4,
+			FenceParentEpoch:      6,
+			FenceNewTimelineID:    5,
+			FenceNewEpoch:         7,
+			FenceRequiredLSN:      12,
+			FenceObservedLSN:      13,
+		},
+	}
+	route := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionUpdatePrimaryRoute),
+		DependsOn:       string(haActionPromoteStandby),
+		RouteTo:         "standby-a",
+		TargetLSN:       12,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 7,
+	}
+	actions := []antflyv1.HAPlannedActionStatus{promote, route}
+
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(&antflyv1.HAStatus{}, actions, 1)).To(BeTrue())
+
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			RequiredLSN:       12,
+			ObservedLSN:       13,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   7,
+			FenceToken:        "ha-fence-token",
+		},
+	}
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 1)).To(BeTrue())
+
+	status.LastPromotion.NewTimelineID = 6
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 1)).To(BeFalse())
+
+	status.LastPromotion.NewTimelineID = 5
+	status.LastPromotion.FenceToken = "different-token"
+	g.Expect(haPrimaryRouteActionHasPromotionEvidence(status, actions, 1)).To(BeFalse())
+}
+
 func TestHACLIActionDependenciesRequireMatchingActionReceipt(t *testing.T) {
 	g := NewWithT(t)
 
