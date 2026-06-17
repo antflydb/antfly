@@ -683,12 +683,19 @@ pub const Server = struct {
                 const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
-                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_rewind", assessment.former_node_id, "applied", assessment.former_node_id);
-                defer action_receipt.deinit(self.alloc);
-                return try self.handleTypedJson(RejoinRewindDocument{
-                    .action = action_receipt,
-                    .assessment = assessment,
-                    .rewind = rewind,
+                const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_rewind:{s}", .{assessment.former_node_id});
+                defer self.alloc.free(action_id);
+                return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
+                    .schema_version = 1,
+                    .action = .{
+                        .action_id = action_id,
+                        .action_kind = "rejoin_rewind",
+                        .target = assessment.former_node_id,
+                        .state = "applied",
+                        .node_id = assessment.former_node_id,
+                    },
+                    .assessment = try adminRejoinAssessment(assessment),
+                    .rewind = try adminRejoinRewindResult(rewind),
                 });
             }
             if (expected == .reseed) {
@@ -698,21 +705,35 @@ pub const Server = struct {
                 const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
                 };
-                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied", node_id);
-                defer action_receipt.deinit(self.alloc);
-                return try self.handleTypedJson(RejoinReseedDocument{
-                    .action = action_receipt,
-                    .assessment = assessment,
-                    .reseed = reseed,
+                const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_reseed:{s}", .{assessment.former_node_id});
+                defer self.alloc.free(action_id);
+                return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
+                    .schema_version = 1,
+                    .action = .{
+                        .action_id = action_id,
+                        .action_kind = "rejoin_reseed",
+                        .target = assessment.former_node_id,
+                        .state = "applied",
+                        .node_id = node_id,
+                    },
+                    .assessment = try adminRejoinAssessment(assessment),
+                    .reseed = try adminRejoinReseedResult(reseed),
                 });
             }
         }
 
-        var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_assess", assessment.former_node_id, "assessed", assessment.former_node_id);
-        defer action_receipt.deinit(self.alloc);
-        return try self.handleTypedJson(RejoinAssessDocument{
-            .action = action_receipt,
-            .assessment = assessment,
+        const action_id = try std.fmt.allocPrint(self.alloc, "rejoin_assess:{s}", .{assessment.former_node_id});
+        defer self.alloc.free(action_id);
+        return try self.handleTypedJson(admin_api.HARejoinAssessResponse{
+            .schema_version = 1,
+            .action = .{
+                .action_id = action_id,
+                .action_kind = "rejoin_assess",
+                .target = assessment.former_node_id,
+                .state = "assessed",
+                .node_id = assessment.former_node_id,
+            },
+            .assessment = try adminRejoinAssessment(assessment),
         });
     }
 
@@ -907,26 +928,6 @@ const PromotionResultDocument = struct {
     data_loss_possible: bool,
 };
 
-const RejoinAssessDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    assessment: rejoin.Assessment,
-};
-
-const RejoinRewindDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    assessment: rejoin.Assessment,
-    rewind: rejoin.RewindResult,
-};
-
-const RejoinReseedDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    assessment: rejoin.Assessment,
-    reseed: rejoin.ReseedResult,
-};
-
 const ActionReceiptDocument = struct {
     action_id: []const u8,
     action_kind: []const u8,
@@ -1000,6 +1001,47 @@ fn adminPromotionAssessment(assessment: status_mod.PromotionAssessment) !admin_a
         .requires_fencing = assessment.requires_fencing,
         .requires_force = assessment.requires_force,
         .can_promote = assessment.can_promote,
+    };
+}
+
+fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAssessment {
+    return .{
+        .action = @tagName(assessment.action),
+        .reason = @tagName(assessment.reason),
+        .former_node_id = assessment.former_node_id,
+        .target_timeline_id = try adminI64(assessment.target_timeline_id),
+        .target_epoch = try adminI64(assessment.target_epoch),
+        .fork_lsn = try adminI64(assessment.fork_lsn),
+        .former_last_lsn = try adminI64(assessment.former_last_lsn),
+        .retained_from_lsn = try adminI64(assessment.retained_from_lsn),
+        .data_loss_discarded = assessment.data_loss_discarded,
+    };
+}
+
+fn adminRejoinRewindResult(result: rejoin.RewindResult) !admin_api.HARejoinRewindResult {
+    return .{
+        .node_id = result.node_id,
+        .fork_lsn = try adminI64(result.fork_lsn),
+        .previous_last_lsn = try adminI64(result.previous_last_lsn),
+        .current_last_lsn = try adminI64(result.current_last_lsn),
+        .next_lsn = try adminI64(result.next_lsn),
+        .discarded_lsn_count = try adminI64(result.discarded_lsn_count),
+        .target_timeline_id = try adminI64(result.target_timeline_id),
+        .target_epoch = try adminI64(result.target_epoch),
+        .data_loss_discarded = result.data_loss_discarded,
+    };
+}
+
+fn adminRejoinReseedResult(result: rejoin.ReseedResult) !admin_api.HARejoinReseedResult {
+    return .{
+        .node_id = result.node_id,
+        .slot_name = result.slot_name,
+        .target_timeline_id = try adminI64(result.target_timeline_id),
+        .target_epoch = try adminI64(result.target_epoch),
+        .fork_lsn = try adminI64(result.fork_lsn),
+        .former_last_lsn = try adminI64(result.former_last_lsn),
+        .reseed_required = result.reseed_required,
+        .base_backup_required = result.base_backup_required,
     };
 }
 
