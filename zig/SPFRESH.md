@@ -103,6 +103,9 @@ Current status:
   restart on large cached tails. Sorted replay and compact base materialization
   size temporary output buffers from deduped live operations rather than raw
   tail length, so tombstone-heavy tails do not inflate scratch allocation.
+  Generic delta-tail scans now also append decoded records only after the
+  base-generation filter accepts them, avoiding decoded-record scratch growth
+  for stale folded LSM tail values.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and

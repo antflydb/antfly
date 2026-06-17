@@ -1415,7 +1415,6 @@ pub const PostingFormat = struct {
         base_generation: u64,
     ) !PostingDeltaTailStats {
         var iterator = try DeltaTailIterator.init(data);
-        try scratch.ensureDeltaRecordCapacity(alloc, scratch.deltaRecordCount() + iterator.recordCount());
         var stats = PostingDeltaTailStats{
             .records = iterator.recordCount(),
             .encoded_value_bytes = data.len,
@@ -1425,9 +1424,31 @@ pub const PostingFormat = struct {
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
             stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-            scratch.appendDeltaRecordAssumeCapacity(record);
+            try appendDeltaRecordToScratch(alloc, scratch, record);
         }
         return stats;
+    }
+
+    fn appendDeltaRecordToScratch(alloc: std.mem.Allocator, scratch: anytype, record: PostingDeltaRecord) !void {
+        const needed = scratch.deltaRecordCount() + 1;
+        const Scratch = std.meta.Child(@TypeOf(scratch));
+        if (comptime @hasField(Scratch, "delta_records")) {
+            if (needed > scratch.delta_records.len) {
+                try scratch.ensureDeltaRecordCapacity(alloc, nextScratchCapacity(scratch.delta_records.len, needed));
+            }
+        } else if (comptime @hasField(Scratch, "posting_delta_records")) {
+            if (needed > scratch.posting_delta_records.len) {
+                try scratch.ensureDeltaRecordCapacity(alloc, nextScratchCapacity(scratch.posting_delta_records.len, needed));
+            }
+        } else {
+            try scratch.ensureDeltaRecordCapacity(alloc, needed);
+        }
+        scratch.appendDeltaRecordAssumeCapacity(record);
+    }
+
+    fn nextScratchCapacity(current: usize, needed: usize) usize {
+        const doubled = current *| 2;
+        return @max(needed, @max(doubled, @as(usize, 8)));
     }
 
     pub fn scanDeltaTailAfterGenerationIntoOverlayPlan(
@@ -4930,6 +4951,44 @@ test "posting delta tail replay skips stale records without growing member scrat
     try std.testing.expectEqual(@as(usize, 1), member_count);
     try std.testing.expectEqual(@as(usize, 1), scratch.member_ids.len);
     try std.testing.expectEqual(@as(VectorId, 10), scratch.member_ids[0]);
+}
+
+test "posting delta tail scan skips stale records without growing delta scratch" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 1) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 1) << 32) | 2, .op = .tombstone, .vector_id = 50 },
+    };
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const stats = try PostingFormat.scanDeltaTailAfterGenerationIntoScratch(alloc, &scratch, encoded, 1);
+
+    try std.testing.expectEqual(@as(usize, records.len), stats.records);
+    try std.testing.expectEqual(@as(usize, 0), stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 0), scratch.deltaRecordCount());
+    try std.testing.expectEqual(@as(usize, 0), scratch.delta_records.len);
+}
+
+test "posting delta tail scan grows delta scratch geometrically for live records" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 2) << 32) | 2, .op = .tombstone, .vector_id = 50 },
+    };
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+
+    const stats = try PostingFormat.scanDeltaTailAfterGenerationIntoScratch(alloc, &scratch, encoded, 1);
+
+    try std.testing.expectEqual(@as(usize, records.len), stats.records_after_generation);
+    try std.testing.expectEqual(@as(usize, records.len), scratch.deltaRecordCount());
+    try std.testing.expectEqual(@as(usize, 8), scratch.delta_records.len);
+    try std.testing.expectEqualSlices(PostingDeltaRecord, records[0..], scratch.deltaRecordsMut());
 }
 
 test "posting delta tail uses varint encoding for small single-record values" {
