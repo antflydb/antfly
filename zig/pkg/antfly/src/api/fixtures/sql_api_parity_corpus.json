@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 754,
-  "entry_count": 754,
+  "source_entry_count": 755,
+  "entry_count": 755,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -7207,7 +7207,7 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=select_into:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=select_into:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'"
     },
     {
@@ -7763,8 +7763,17 @@
       "summary": {
         "table_name": "usage_archive"
       },
-      "plan": "relation_population:mode=create_table_as:target=usage_archive:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
       "sql": "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
+    },
+    {
+      "name": "create table if not exists as select relation population plan",
+      "family": "relation_population",
+      "summary": {
+        "table_name": "usage_archive"
+      },
+      "plan": "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'"
     },
     {
       "name": "create table like clone ddl",
