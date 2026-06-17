@@ -183,6 +183,10 @@ pub const Standby = struct {
     }
 
     pub fn receive(self: *Standby, record: replication_record.Record) !u64 {
+        if (record.kind == .timeline_switch) {
+            return try self.receiveTimelineSwitch(record);
+        }
+
         try self.validateRecord(record);
         if (record.lsn <= self.progress.received_lsn) return error.RecordAlreadyReceived;
 
@@ -208,6 +212,40 @@ pub const Standby = struct {
         next.received_lsn = lsn;
         try self.persistProgress(next);
         self.progress = next;
+        return lsn;
+    }
+
+    fn receiveTimelineSwitch(self: *Standby, record: replication_record.Record) !u64 {
+        if (record.cluster_id != self.identity.cluster_id) return error.WrongCluster;
+        if (record.shard_id != self.identity.shard_id) return error.WrongShard;
+        if (record.table_id != self.identity.table_id) return error.WrongTable;
+        if (record.timeline_id <= self.identity.timeline_id) return error.InvalidTimelineSwitch;
+        if (record.epoch <= self.identity.epoch) return error.InvalidTimelineSwitch;
+        if (record.lsn != self.progress.received_lsn + 1) return error.UnexpectedRecordLsn;
+        if (record.previous_lsn != self.progress.received_lsn) return error.UnexpectedPreviousLsn;
+        if (self.progress.applied_lsn != self.progress.received_lsn or
+            self.progress.safe_read_lsn != self.progress.applied_lsn) return error.TimelineSwitchRequiresAppliedProgress;
+
+        const lsn = try self.receive_log.append(self.alloc, record);
+        const old_identity = self.identity;
+        const old_progress = self.progress;
+        self.identity = .{
+            .cluster_id = record.cluster_id,
+            .shard_id = record.shard_id,
+            .table_id = record.table_id,
+            .timeline_id = record.timeline_id,
+            .epoch = record.epoch,
+        };
+        self.progress = .{
+            .received_lsn = lsn,
+            .applied_lsn = lsn,
+            .safe_read_lsn = lsn,
+        };
+        errdefer {
+            self.identity = old_identity;
+            self.progress = old_progress;
+        }
+        try self.persistProgress(self.progress);
         return lsn;
     }
 
@@ -613,6 +651,21 @@ fn baseRecord(identity: Identity, lsn: u64, payload: []const u8) replication_rec
     };
 }
 
+fn timelineSwitchRecord(identity: Identity, lsn: u64, previous_lsn: u64) replication_record.Record {
+    return .{
+        .kind = .timeline_switch,
+        .payload_codec = .json,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = lsn,
+        .previous_lsn = previous_lsn,
+        .payload = "{\"parent_timeline_id\":1,\"new_timeline_id\":2,\"parent_epoch\":1,\"new_epoch\":2,\"required_lsn\":2,\"forced\":false,\"data_loss_possible\":false}",
+    };
+}
+
 const TestPaths = struct {
     receive_log: [:0]u8,
     progress_wal: [:0]u8,
@@ -762,6 +815,49 @@ test "storage.ha standby rejects wrong identity and receive gaps" {
     try std.testing.expectError(error.UnexpectedRecordLsn, standby.receive(baseRecord(identity, 2, "gap")));
     _ = try standby.receive(baseRecord(identity, 1, "one"));
     try std.testing.expectError(error.RecordAlreadyReceived, standby.receive(baseRecord(identity, 1, "duplicate")));
+}
+
+test "storage.ha standby follows promoted timeline switch after applying parent timeline" {
+    const alloc = std.testing.allocator;
+    const parent = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 1, .epoch = 1 };
+    const promoted = Identity{ .cluster_id = 10, .shard_id = 20, .table_id = 30, .timeline_id = 2, .epoch = 2 };
+    const paths = try testPaths(alloc, "follow-timeline");
+    defer paths.deinit(alloc);
+
+    {
+        var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, parent, .{});
+        defer standby.close();
+
+        _ = try standby.receive(baseRecord(parent, 1, "one"));
+        _ = try standby.receive(baseRecord(parent, 2, "two"));
+        try std.testing.expectError(error.TimelineSwitchRequiresAppliedProgress, standby.receive(timelineSwitchRecord(promoted, 3, 2)));
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 2), try standby.applyAvailable(&capture, ApplyCapture.apply));
+
+        try std.testing.expectEqual(@as(u64, 3), try standby.receive(timelineSwitchRecord(promoted, 3, 2)));
+        try std.testing.expectEqual(promoted.timeline_id, standby.identity.timeline_id);
+        try std.testing.expectEqual(promoted.epoch, standby.identity.epoch);
+        try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().applied_lsn);
+        try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
+
+        _ = try standby.receive(baseRecord(promoted, 4, "new-timeline"));
+        try std.testing.expectError(error.WrongTimeline, standby.receive(baseRecord(parent, 5, "old-timeline")));
+    }
+
+    {
+        var reopened = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, promoted, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 4), reopened.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 3), reopened.currentProgress().applied_lsn);
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try reopened.applyAvailable(&capture, ApplyCapture.apply));
+        try std.testing.expectEqualStrings("new-timeline", capture.payloads.items[0]);
+    }
 }
 
 test "storage.ha standby receive retry reconciles durable record when progress lags" {
