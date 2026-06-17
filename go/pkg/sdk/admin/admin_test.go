@@ -1038,9 +1038,22 @@ func TestValidateHAGateResponses(t *testing.T) {
 	if err := ValidateHACommitAppendResponse(HACommitAppendResponse{SchemaVersion: 1, Lsn: 9, Gate: gate}); err != nil {
 		t.Fatalf("ValidateHACommitAppendResponse returned error: %v", err)
 	}
+	mismatchedGate := gate
+	mismatchedGate.Durability.TargetLsn = 8
+	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: mismatchedGate}); err == nil || !strings.Contains(err.Error(), "target_lsn") {
+		t.Fatalf("mismatched gate target error = %v, want target_lsn mismatch", err)
+	}
+	impossibleProgress := gate
+	impossibleProgress.Durability.ProgressLsn = 10
+	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: impossibleProgress}); err == nil || !strings.Contains(err.Error(), "progress_lsn") {
+		t.Fatalf("impossible durability progress error = %v, want progress_lsn mismatch", err)
+	}
+	if err := ValidateHACommitAppendResponse(HACommitAppendResponse{SchemaVersion: 1, Lsn: 8, Gate: gate}); err == nil || !strings.Contains(err.Error(), "does not match gate") {
+		t.Fatalf("mismatched append lsn error = %v, want gate lsn mismatch", err)
+	}
 	gate.Action = HACommitGateAction("unknown")
-	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: gate}); err == nil || !strings.Contains(err.Error(), "gate fields") {
-		t.Fatalf("invalid gate error = %v, want gate fields error", err)
+	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: gate}); err == nil || !strings.Contains(err.Error(), "invalid commit gate action") {
+		t.Fatalf("invalid gate error = %v, want invalid action error", err)
 	}
 
 	read := HAReadCheckResponse{

@@ -545,8 +545,8 @@ func ValidateHACommitCheckResponse(response HACommitCheckResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing commit check schema_version")
 	}
-	if !HACommitGateComplete(response.Gate) {
-		return fmt.Errorf("missing commit check gate fields")
+	if err := validateHACommitGate(response.Gate); err != nil {
+		return fmt.Errorf("invalid commit check gate: %w", err)
 	}
 	return nil
 }
@@ -555,8 +555,11 @@ func ValidateHACommitAppendResponse(response HACommitAppendResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing commit append schema_version")
 	}
-	if !HACommitGateComplete(response.Gate) {
-		return fmt.Errorf("missing commit append gate fields")
+	if err := validateHACommitGate(response.Gate); err != nil {
+		return fmt.Errorf("invalid commit append gate: %w", err)
+	}
+	if response.Lsn != response.Gate.TargetLsn {
+		return fmt.Errorf("commit append lsn=%d does not match gate target_lsn=%d", response.Lsn, response.Gate.TargetLsn)
 	}
 	return nil
 }
@@ -1168,6 +1171,16 @@ func HARejoinReseedComplete(reseed HARejoinReseedResult) bool {
 func HACommitGateComplete(gate HACommitGate) bool {
 	return HACommitGateActionValid(gate.Action) &&
 		HADurabilityDecisionComplete(gate.Durability)
+}
+
+func validateHACommitGate(gate HACommitGate) error {
+	if !HACommitGateActionValid(gate.Action) {
+		return fmt.Errorf("invalid commit gate action %q", gate.Action)
+	}
+	if gate.TargetLsn != gate.Durability.TargetLsn {
+		return fmt.Errorf("commit gate target_lsn=%d does not match durability target_lsn=%d", gate.TargetLsn, gate.Durability.TargetLsn)
+	}
+	return validateHADurabilityDecision(gate.Durability)
 }
 
 func validateHAPrimaryRetentionSnapshot(retention HARetentionSnapshot, currentLSN uint64, slotCount int) error {
