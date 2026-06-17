@@ -1286,12 +1286,14 @@ queue-style semantics.
 
 `CREATE UNIQUE INDEX ... NULLS DISTINCT` and `UNIQUE NULLS DISTINCT (...)`
 constraints are accepted as explicit syntax for the ordinary unique-owner
-semantics. `CREATE UNIQUE INDEX ... NULLS NOT DISTINCT` and `UNIQUE NULLS NOT
-DISTINCT (...)` constraints are intentionally classified as unsupported DDL
-shapes until null-equal uniqueness is represented in native unique-owner keys,
-conflict-target inference, validation jobs, repair, and write-time enforcement.
-The adapter must not normalize them to ordinary unique metadata, because
-ordinary unique semantics do not treat multiple `NULL` values as the same key.
+semantics, including `NOT DEFERRABLE` with optional `INITIALLY IMMEDIATE`.
+`CREATE UNIQUE INDEX ... NULLS NOT DISTINCT`, `UNIQUE NULLS NOT DISTINCT (...)`,
+and deferrable unique constraints are intentionally classified as unsupported
+DDL shapes until null-equal or deferred uniqueness is represented in native
+unique-owner keys, conflict-target inference, validation jobs, repair, and
+write-time enforcement. The adapter must not normalize them to ordinary unique
+metadata, because ordinary unique semantics do not treat multiple `NULL` values
+as the same key and do not defer conflict checks to transaction commit.
 
 The parity corpus includes same-table `UNION`, `INTERSECT`, and `EXCEPT`
 predicate-composition read plans, including identical expression-output

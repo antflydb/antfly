@@ -8422,6 +8422,7 @@ const Parser = struct {
             try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
+            try self.consumeOptionalDdlImmediateUniqueConstraintTiming();
             var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, columns.without_overlaps_period);
             if (constraint_name) |name| self.alloc.free(name);
             constraint_name_transferred = true;
@@ -8487,6 +8488,7 @@ const Parser = struct {
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
             if (self.matchKeyword("unique")) {
                 try self.consumeOptionalDdlUniqueNullsDistinct();
+                try self.consumeOptionalDdlImmediateUniqueConstraintTiming();
                 var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, null);
                 constraint.validation_state = .unvalidated;
                 try unique_constraints.append(self.alloc, constraint);
@@ -8506,6 +8508,7 @@ const Parser = struct {
                 errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
                 if (self.matchKeyword("unique")) {
                     try self.consumeOptionalDdlUniqueNullsDistinct();
+                    try self.consumeOptionalDdlImmediateUniqueConstraintTiming();
                     var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
@@ -9229,6 +9232,7 @@ const Parser = struct {
                 try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, null);
             } else if (self.matchKeyword("unique")) {
                 try self.consumeOptionalDdlUniqueNullsDistinct();
+                try self.consumeOptionalDdlImmediateUniqueConstraintTiming();
                 try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, null);
             } else if (self.matchKeyword("check")) {
                 const check = try self.parseDdlCheckConstraint(null);
@@ -9254,6 +9258,7 @@ const Parser = struct {
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("unique")) {
                     try self.consumeOptionalDdlUniqueNullsDistinct();
+                    try self.consumeOptionalDdlImmediateUniqueConstraintTiming();
                     try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
@@ -9544,6 +9549,7 @@ const Parser = struct {
             try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
+            try self.consumeOptionalDdlImmediateUniqueConstraintTiming();
             try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("foreign")) {
             const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
@@ -10250,6 +10256,16 @@ const Parser = struct {
         if (!self.matchKeyword("nulls")) return;
         if (self.matchKeyword("not")) return error.UnsupportedSqlShape;
         try self.expectKeyword("distinct");
+    }
+
+    fn consumeOptionalDdlImmediateUniqueConstraintTiming(self: *@This()) !void {
+        if (self.matchKeyword("deferrable")) return error.UnsupportedSqlShape;
+        if (!self.matchKeyword("not")) return;
+        try self.expectKeyword("deferrable");
+        if (self.matchKeyword("initially")) {
+            if (self.matchKeyword("deferred")) return error.UnsupportedSqlShape;
+            try self.expectKeyword("immediate");
+        }
     }
 
     fn peekDdlNotValid(self: *@This()) bool {
@@ -45506,9 +45522,9 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
         alloc,
         \\CREATE TABLE unique_nulls_distinct (
         \\  id uuid PRIMARY KEY,
-        \\  email text UNIQUE NULLS DISTINCT,
-        \\  tenant_id text CONSTRAINT unique_nulls_distinct_tenant_key UNIQUE NULLS DISTINCT,
-        \\  CONSTRAINT unique_nulls_distinct_tenant_email_key UNIQUE NULLS DISTINCT (tenant_id, email)
+        \\  email text UNIQUE NULLS DISTINCT NOT DEFERRABLE INITIALLY IMMEDIATE,
+        \\  tenant_id text CONSTRAINT unique_nulls_distinct_tenant_key UNIQUE NULLS DISTINCT NOT DEFERRABLE,
+        \\  CONSTRAINT unique_nulls_distinct_tenant_email_key UNIQUE NULLS DISTINCT (tenant_id, email) NOT DEFERRABLE INITIALLY IMMEDIATE
         \\);
         ,
     );
@@ -45540,6 +45556,14 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_table_unique_nulls (id uuid PRIMARY KEY, email text, CONSTRAINT bad_table_unique_nulls_email_key UNIQUE NULLS NOT DISTINCT (email));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_deferred_unique (id uuid PRIMARY KEY, email text UNIQUE DEFERRABLE);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_deferred_table_unique (id uuid PRIMARY KEY, email text, CONSTRAINT bad_deferred_table_unique_email_key UNIQUE (email) NOT DEFERRABLE INITIALLY DEFERRED);",
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
@@ -47203,7 +47227,7 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
 
     var explicit_nulls_distinct_unique = try lowerDdlPlanAlloc(
         alloc,
-        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS DISTINCT (email);",
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;",
     );
     defer explicit_nulls_distinct_unique.deinit(alloc);
     switch (explicit_nulls_distinct_unique) {
@@ -47225,6 +47249,10 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS NOT DISTINCT (email);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;",
     ));
 
     var drop_column = try lowerDdlPlanAlloc(
@@ -70807,6 +70835,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;",
         },
         .{
+            .name = "unsupported deferrable unique constraint",
+            .family = .unsupported_ddl,
+            .plan = "unsupported:ddl:requires=deferrable_unique_constraint",
+            .classification_reason = "deferrable_unique_constraint",
+            .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;",
+        },
+        .{
             .name = "schema replace table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 1 },
@@ -71049,7 +71084,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
             .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
-            .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_nulls_distinct_key UNIQUE NULLS DISTINCT (email);",
+            .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_nulls_distinct_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;",
         },
         .{
             .name = "schema validate unique constraint",
