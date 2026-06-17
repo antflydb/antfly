@@ -3730,8 +3730,10 @@ type haFenceAcquireRequest struct {
 }
 
 type haPromotionAssessRequest struct {
-	RequiredLSN     uint64 `json:"required_lsn,omitempty"`
-	UseCurrentFence bool   `json:"use_current_fence"`
+	RequiredLSN      uint64 `json:"required_lsn,omitempty"`
+	FencingConfirmed bool   `json:"fencing_confirmed"`
+	Force            bool   `json:"force"`
+	UseCurrentFence  bool   `json:"use_current_fence"`
 }
 
 type haFenceReceiptRequest struct {
@@ -3798,8 +3800,10 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 
 func haPromotionAssessBody(action antflyv1.HAPlannedActionStatus) haPromotionAssessRequest {
 	return haPromotionAssessRequest{
-		RequiredLSN:     action.TargetLSN,
-		UseCurrentFence: true,
+		RequiredLSN:      action.TargetLSN,
+		FencingConfirmed: false,
+		Force:            false,
+		UseCurrentFence:  true,
 	}
 }
 

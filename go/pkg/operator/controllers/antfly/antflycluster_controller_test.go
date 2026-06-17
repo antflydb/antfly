@@ -1103,6 +1103,8 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				var payload map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["required_lsn"]).To(Equal(float64(12)))
+				g.Expect(payload["fencing_confirmed"]).To(Equal(false))
+				g.Expect(payload["force"]).To(Equal(false))
 				g.Expect(payload["use_current_fence"]).To(Equal(true))
 				return &http.Response{
 					StatusCode: http.StatusOK,
@@ -1238,6 +1240,8 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 					var payload map[string]any
 					g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 					g.Expect(payload["required_lsn"]).To(Equal(float64(12)))
+					g.Expect(payload["fencing_confirmed"]).To(Equal(false))
+					g.Expect(payload["force"]).To(Equal(false))
 					g.Expect(payload["use_current_fence"]).To(Equal(true))
 					return &http.Response{
 						StatusCode: http.StatusOK,
