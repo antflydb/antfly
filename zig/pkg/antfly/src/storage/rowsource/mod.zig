@@ -13,6 +13,7 @@
 // limitations.
 
 pub const types = @import("types.zig");
+pub const local = @import("local.zig");
 pub const external = @import("external.zig");
 
 pub const SourceKind = types.SourceKind;
@@ -28,6 +29,10 @@ pub const ColumnValues = types.ColumnValues;
 pub const NullBitmap = types.NullBitmap;
 pub const ColumnVector = types.ColumnVector;
 pub const ColumnBatch = types.ColumnBatch;
+pub const LocalBatchSource = local.BatchSource;
+pub const relationalStoreSource = local.relationalStoreSource;
+pub const jsonMaterializedSource = local.jsonMaterializedSource;
+pub const validateLocalBatch = local.validateLocalBatch;
 pub const ExternalFormat = external.Format;
 pub const ExternalBinding = external.Binding;
 pub const ExternalFileRef = external.FileRef;
@@ -37,11 +42,13 @@ pub const validateExternalBatch = external.validateExternalBatch;
 
 test "rowsource module compiles" {
     _ = types;
+    _ = local;
     _ = external;
     _ = Source;
     _ = SnapshotRef;
     _ = RowRef;
     _ = ColumnVector;
     _ = ColumnBatch;
+    _ = LocalBatchSource;
     _ = ExternalBatchSource;
 }
