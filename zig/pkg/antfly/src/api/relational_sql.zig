@@ -10629,7 +10629,7 @@ const Parser = struct {
         op: SelectSetOperation,
     ) !void {
         if (!std.mem.eql(u8, lhs.table_name, rhs.table_name)) return error.UnsupportedSqlShape;
-        try self.validateSimpleSetOperationSelect(lhs.query, rhs.query);
+        try self.validateSimpleSetOperationSelect(lhs.query, rhs.query, op);
         if (!simpleSelectProjectionsEqual(lhs.query, rhs.query, lhs.select_outputs, rhs.select_outputs)) return error.UnsupportedSqlShape;
 
         switch (op) {
@@ -10687,11 +10687,20 @@ const Parser = struct {
         self: *@This(),
         lhs: db_mod.types.RelationalRowsQueryRequest,
         rhs: db_mod.types.RelationalRowsQueryRequest,
+        op: SelectSetOperation,
     ) !void {
         _ = self;
         if (!std.mem.eql(u8, lhs.source_cte, rhs.source_cte)) return error.UnsupportedSqlShape;
-        _ = querySimpleSetPredicateMode(lhs) orelse return error.UnsupportedSqlShape;
-        _ = querySimpleSetPredicateMode(rhs) orelse return error.UnsupportedSqlShape;
+        switch (op) {
+            .union_distinct, .union_all => {
+                if (!querySupportsSimpleUnionRewrite(lhs)) return error.UnsupportedSqlShape;
+                if (!querySupportsSimpleUnionRewrite(rhs)) return error.UnsupportedSqlShape;
+            },
+            .intersect, .except => {
+                _ = querySimpleSetPredicateMode(lhs) orelse return error.UnsupportedSqlShape;
+                _ = querySimpleSetPredicateMode(rhs) orelse return error.UnsupportedSqlShape;
+            },
+        }
     }
 
     fn applySimpleUnion(
@@ -10703,10 +10712,19 @@ const Parser = struct {
             freeRelationalChecks(self.alloc, lhs.query.predicates);
             if (lhs.query.predicates.len > 0) self.alloc.free(lhs.query.predicates);
             lhs.query.predicates = &.{};
+            freePredicateGroups(self.alloc, lhs.query.or_predicates);
+            if (lhs.query.or_predicates.len > 0) self.alloc.free(lhs.query.or_predicates);
+            lhs.query.or_predicates = &.{};
             freeExpressionConditions(self.alloc, lhs.query.expression_predicates);
             if (lhs.query.expression_predicates.len > 0) self.alloc.free(lhs.query.expression_predicates);
             lhs.query.expression_predicates = &.{};
+            freeExpressionPredicateGroups(self.alloc, lhs.query.expression_or_predicates);
+            if (lhs.query.expression_or_predicates.len > 0) self.alloc.free(lhs.query.expression_or_predicates);
+            lhs.query.expression_or_predicates = &.{};
             return;
+        }
+        if (lhs.query.or_predicates.len > 0 or rhs.or_predicates.len > 0) {
+            return try self.applySimpleScalarBranchUnion(lhs, rhs);
         }
         if (lhs.query.expression_predicates.len > 0 or rhs.expression_predicates.len > 0) {
             return try self.applySimpleExpressionUnion(lhs, rhs);
@@ -10738,6 +10756,32 @@ const Parser = struct {
     ) !void {
         if (!simpleSetQueriesProvablyDisjoint(lhs.query, rhs)) return error.UnsupportedSqlShape;
         try self.applySimpleUnion(lhs, rhs);
+    }
+
+    fn applySimpleScalarBranchUnion(
+        self: *@This(),
+        lhs: *LoweredSelect,
+        rhs: db_mod.types.RelationalRowsQueryRequest,
+    ) !void {
+        const lhs_branch_count = simpleScalarSetQueryBranchCount(lhs.query);
+        const rhs_branch_count = simpleScalarSetQueryBranchCount(rhs);
+        if (lhs_branch_count == 0 or rhs_branch_count == 0) return error.UnsupportedSqlShape;
+
+        const groups = try self.alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, lhs_branch_count + rhs_branch_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (groups[0..initialized]) |group| freePredicateGroup(self.alloc, group);
+            self.alloc.free(groups);
+        }
+        try cloneSimpleScalarSetQueryBranchesInto(self.alloc, groups, &initialized, lhs.query);
+        try cloneSimpleScalarSetQueryBranchesInto(self.alloc, groups, &initialized, rhs);
+
+        freeRelationalChecks(self.alloc, lhs.query.predicates);
+        if (lhs.query.predicates.len > 0) self.alloc.free(lhs.query.predicates);
+        lhs.query.predicates = &.{};
+        freePredicateGroups(self.alloc, lhs.query.or_predicates);
+        if (lhs.query.or_predicates.len > 0) self.alloc.free(lhs.query.or_predicates);
+        lhs.query.or_predicates = groups;
     }
 
     fn applySimpleExpressionUnion(
@@ -43067,13 +43111,39 @@ fn cloneQueryRelationalChecksConcatAlloc(
 }
 
 fn queryHasNoSimpleSetPredicates(query: db_mod.types.RelationalRowsQueryRequest) bool {
-    return query.predicates.len == 0 and query.expression_predicates.len == 0;
+    return query.predicates.len == 0 and
+        query.or_predicates.len == 0 and
+        query.expression_predicates.len == 0 and
+        query.expression_or_predicates.len == 0;
+}
+
+fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
+    if (!queryHasOnlySimpleSetPredicateSurface(query)) return false;
+    if (query.or_predicates.len > 0 and (query.predicates.len > 0 or query.expression_predicates.len > 0)) return false;
+    if (query.expression_or_predicates.len > 0) return false;
+    return true;
 }
 
 fn simpleSetQueriesProvablyDisjoint(
     lhs: db_mod.types.RelationalRowsQueryRequest,
     rhs: db_mod.types.RelationalRowsQueryRequest,
 ) bool {
+    if (lhs.or_predicates.len > 0 or rhs.or_predicates.len > 0) {
+        if (!querySupportsSimpleUnionRewrite(lhs) or !querySupportsSimpleUnionRewrite(rhs)) return false;
+        if (lhs.expression_predicates.len > 0 or rhs.expression_predicates.len > 0) return false;
+        const lhs_branch_count = simpleScalarSetQueryBranchCount(lhs);
+        const rhs_branch_count = simpleScalarSetQueryBranchCount(rhs);
+        if (lhs_branch_count == 0 or rhs_branch_count == 0) return false;
+        for (0..lhs_branch_count) |left_index| {
+            const left = simpleScalarSetQueryBranchAt(lhs, left_index) orelse return false;
+            for (0..rhs_branch_count) |right_index| {
+                const right = simpleScalarSetQueryBranchAt(rhs, right_index) orelse return false;
+                if (!relationalCheckBranchesProvablyDisjoint(left, right)) return false;
+            }
+        }
+        return true;
+    }
+
     for (lhs.predicates) |left| {
         for (rhs.predicates) |right| {
             if (relationalChecksProvablyDisjoint(left, right)) return true;
@@ -43091,6 +43161,52 @@ fn simpleSetQueriesProvablyDisjoint(
         }
     }
     return false;
+}
+
+fn simpleScalarSetQueryBranchCount(query: db_mod.types.RelationalRowsQueryRequest) usize {
+    if (query.or_predicates.len > 0) return query.or_predicates.len;
+    if (query.predicates.len > 0) return 1;
+    return 0;
+}
+
+fn simpleScalarSetQueryBranchAt(
+    query: db_mod.types.RelationalRowsQueryRequest,
+    index: usize,
+) ?[]const runtime_schema.RelationalCheck {
+    if (query.or_predicates.len > 0) {
+        if (index >= query.or_predicates.len) return null;
+        return query.or_predicates[index].predicates;
+    }
+    if (query.predicates.len > 0 and index == 0) return query.predicates;
+    return null;
+}
+
+fn relationalCheckBranchesProvablyDisjoint(
+    lhs: []const runtime_schema.RelationalCheck,
+    rhs: []const runtime_schema.RelationalCheck,
+) bool {
+    if (lhs.len == 0 or rhs.len == 0) return false;
+    for (lhs) |left| {
+        for (rhs) |right| {
+            if (relationalChecksProvablyDisjoint(left, right)) return true;
+        }
+    }
+    return false;
+}
+
+fn cloneSimpleScalarSetQueryBranchesInto(
+    alloc: std.mem.Allocator,
+    out: []db_mod.types.RelationalRowsPredicateGroup,
+    initialized: *usize,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const branch_count = simpleScalarSetQueryBranchCount(query);
+    if (branch_count == 0 or out.len - initialized.* < branch_count) return error.UnsupportedSqlShape;
+    for (0..branch_count) |index| {
+        const branch = simpleScalarSetQueryBranchAt(query, index) orelse return error.UnsupportedSqlShape;
+        out[initialized.*] = .{ .predicates = try cloneQueryRelationalChecksAlloc(alloc, branch) };
+        initialized.* += 1;
+    }
 }
 
 fn relationalChecksProvablyDisjoint(
@@ -43282,6 +43398,15 @@ fn jsonNumberLiteralValue(value: ?[]const u8) ?f64 {
 }
 
 fn querySimpleSetPredicateMode(query: db_mod.types.RelationalRowsQueryRequest) ?SimpleSetPredicateMode {
+    if (!queryHasOnlySimpleSetPredicateSurface(query)) return null;
+    if (query.or_predicates.len != 0 or query.expression_or_predicates.len != 0) return null;
+    if (query.predicates.len != 0 and query.expression_predicates.len != 0) return .mixed;
+    if (query.expression_predicates.len != 0) return .expression;
+    if (query.predicates.len != 0) return .scalar;
+    return .none;
+}
+
+fn queryHasOnlySimpleSetPredicateSurface(query: db_mod.types.RelationalRowsQueryRequest) bool {
     if (query.array_any.len != 0 or
         query.array_contains.len != 0 or
         query.array_eq.len != 0 or
@@ -43290,11 +43415,9 @@ fn querySimpleSetPredicateMode(query: db_mod.types.RelationalRowsQueryRequest) ?
         query.json_path_eq.len != 0 or
         query.json_path_exists.len != 0 or
         query.text_patterns.len != 0 or
-        query.or_predicates.len != 0 or
         query.not_predicates.len != 0 or
         query.access_or_predicates.len != 0 or
         query.access_not_predicates.len != 0 or
-        query.expression_or_predicates.len != 0 or
         query.expression_not_predicates.len != 0 or
         query.expression_array_contains.len != 0 or
         query.json_extract.len != 0 or
@@ -43309,12 +43432,9 @@ fn querySimpleSetPredicateMode(query: db_mod.types.RelationalRowsQueryRequest) ?
         query.limit != null or
         query.offset != 0)
     {
-        return null;
+        return false;
     }
-    if (query.predicates.len != 0 and query.expression_predicates.len != 0) return .mixed;
-    if (query.expression_predicates.len != 0) return .expression;
-    if (query.predicates.len != 0) return .scalar;
-    return .none;
+    return true;
 }
 
 fn expressionConditionFromRelationalCheckAlloc(
@@ -73325,6 +73445,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
         },
         .{
+            .name = "query union all scalar or disjoint set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
             .name = "query union all set operation ordered page",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .select = 1, .order_by = 1, .limit = 5, .offset = 2 },
@@ -73540,6 +73667,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=2:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "read union all scalar or disjoint set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
         },
         .{
             .name = "read union all boolean disjoint set operation",
@@ -81743,6 +81877,20 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(@as(u32, 5), disjoint_union.query.limit.?);
     try std.testing.expectEqual(@as(u32, 2), disjoint_union.query.offset);
 
+    var disjoint_or_union = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_or_union.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", disjoint_or_union.table_name);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_or_union.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_or_union.query.or_predicates.len);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_or_union.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_or_union.query.or_predicates[1].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_or_union.query.or_predicates[2].predicates[0].value_json.?);
+
     var except = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records EXCEPT SELECT id FROM usage_records WHERE status = 'deleted'",
@@ -81776,6 +81924,12 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'pending'",
         schema,
         &.{},
     ));
