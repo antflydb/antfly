@@ -701,11 +701,17 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 		Status: corev1.ConditionTrue,
 	}}
 	g.Expect(reconciler.Status().Update(context.Background(), finishJob)).To(Succeed())
+	cluster.Status.HAStatus.PlannedActions[2].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		ManifestID:   "base-standby-a-5",
+		EndRecordLSN: 5,
+	}
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	finish := cluster.Status.HAStatus.PlannedActions[2]
 	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(finish.AdminResult).NotTo(BeNil())
+	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
 	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
@@ -739,6 +745,10 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 		Kind:          string(haActionCreateSlot),
 		AdminCommand:  []string{"slot", "create"},
 		AdminJobPhase: haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SlotAction: "create",
+			SlotName:   "standby-a",
+		},
 	}, {
 		Kind:         string(haActionSeedStandby),
 		DependsOn:    string(haActionCreateSlot),
@@ -784,6 +794,28 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 	g.Expect(haAdminActionHash(fenced)).NotTo(Equal(fencedHash))
 }
 
+func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	actions := []antflyv1.HAPlannedActionStatus{{
+		Kind:          string(haActionCreateSlot),
+		AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+	}, {
+		Kind:         string(haActionSeedStandby),
+		DependsOn:    string(haActionCreateSlot),
+		AdminCommand: []string{"seed", "begin", "--slot", "standby-a"},
+	}}
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SlotAction: "create",
+		SlotName:   "standby-a",
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
+}
+
 func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
 	g := NewWithT(t)
 
@@ -820,6 +852,10 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 					AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
 					AdminURL:      "http://primary-ha.default.svc:8081",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						SlotAction: "create",
+						SlotName:   "standby-a",
+					},
 				}, {
 					Kind:         string(haActionSeedStandby),
 					DependsOn:    string(haActionCreateSlot),
@@ -1237,6 +1273,13 @@ func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
 	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration: 3,
+		FenceToken:      "lease-token-3",
+	}
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.LastPromotion.PromotedStandbyID).To(Equal("standby-a"))
 }
@@ -1268,6 +1311,10 @@ func TestUpdateHALastPromotionHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					Kind:          string(haActionAcquireFence),
 					AdminCommand:  []string{"fence", "acquire"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						FenceGeneration: 3,
+						FenceToken:      "lease-token-3",
+					},
 				}, {
 					Kind:            string(haActionPromoteStandby),
 					DependsOn:       string(haActionAcquireFence),

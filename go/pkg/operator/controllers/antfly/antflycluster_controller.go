@@ -4806,7 +4806,7 @@ func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool
 		if len(action.AdminCommand) == 0 {
 			continue
 		}
-		if action.AdminJobPhase != haAdminJobPhaseSucceeded {
+		if !haAdminActionSucceededWithEvidence(action) {
 			return false
 		}
 	}
@@ -4829,9 +4829,36 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 		if len(dependency.AdminCommand) == 0 {
 			return true
 		}
-		return dependency.AdminJobPhase == haAdminJobPhaseSucceeded
+		return haAdminActionSucceededWithEvidence(dependency)
 	}
 	return false
+}
+
+func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) bool {
+	if action.AdminJobPhase != haAdminJobPhaseSucceeded {
+		return false
+	}
+	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
+		return true
+	}
+	return action.AdminResult != nil
+}
+
+func haActionRequiresAdminResult(kind haActionKind) bool {
+	switch kind {
+	case haActionCreateSlot,
+		haActionResumeSlot,
+		haActionPauseSlot,
+		haActionDropSlot,
+		haActionSeedStandby,
+		haActionFinishStandbySeed,
+		haActionBootstrapStandbySeed,
+		haActionMarkReseed,
+		haActionAcquireFence:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
