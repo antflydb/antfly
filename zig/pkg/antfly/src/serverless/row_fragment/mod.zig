@@ -12,11 +12,22 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const backend_erased = @import("backend_erased.zig");
-pub const backend_types = @import("backend_types.zig");
-pub const background_runtime = @import("background_runtime.zig");
-pub const lsm_backend = @import("lsm_backend.zig");
-pub const resource_manager = @import("resource_manager.zig");
-pub const rowsource = @import("rowsource/mod.zig");
-pub const runtime_backend = @import("runtime_backend.zig");
-pub const sim_runtime = @import("sim_runtime.zig");
+pub const types = @import("types.zig");
+pub const codec = @import("codec.zig");
+
+pub const ColumnKind = types.ColumnKind;
+pub const CellValue = types.CellValue;
+pub const RowRef = types.RowRef;
+pub const Column = types.Column;
+pub const Fragment = types.Fragment;
+pub const freeFragment = types.freeFragment;
+pub const encodeAlloc = codec.encodeAlloc;
+pub const decodeAlloc = codec.decodeAlloc;
+
+test "serverless row fragment module compiles" {
+    _ = types;
+    _ = codec;
+    _ = Fragment;
+    _ = encodeAlloc;
+    _ = decodeAlloc;
+}

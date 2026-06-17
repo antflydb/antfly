@@ -22702,7 +22702,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const graph_indexes_json =
-        \\{"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
+        \\{"ft_v1":{"type":"full_text","store":true},"graph_idx":{"type":"graph","edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}}
     ;
     const graph_config_json =
         \\{"edge_types":[{"name":"cites"}],"metrics":{"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"manual","max_iterations":1,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
@@ -22728,6 +22728,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
             .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = group_id },
         });
         db_count += 1;
+        try dbs[shard_index].addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"store\":true}" });
         try dbs[shard_index].addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = graph_config_json });
 
         var writes: [4]db_mod.types.BatchWrite = undefined;
@@ -22764,7 +22765,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
 
         try dbs[shard_index].batch(.{
             .writes = writes[0..write_count],
-            .sync_level = .write,
+            .sync_level = .full_index,
         });
         try dbs[shard_index].runUntilIdle();
         var authority_status = try dbs[shard_index].refreshGraphMetric(alloc, "graph_idx", "hits_authority");
@@ -23023,6 +23024,40 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
             },
         },
         .limit = 0,
+    }, .read_index));
+
+    var rerank_response = (try hosted.source().query(alloc, "docs", .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "hits_authority",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 32,
+        .include_stored = false,
+        .profile = true,
+    }, .read_index)).?;
+    defer rerank_response.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"_score_details\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"hits_authority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, "\"state\":\"building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, published_generation_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rerank_response.json, building_generation_needle) != null);
+
+    try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "hits_authority",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 32,
+        .include_stored = false,
     }, .read_index));
 
     const hits_metric_reads = [_]graph_query_mod.GraphMetricRead{

@@ -166,6 +166,20 @@ pub const RoleSetting = struct {
     }
 };
 
+pub fn validateRoleSettingName(name: []const u8) !void {
+    if (!std.mem.startsWith(u8, name, "app.") or name.len == "app.".len) return error.UnsupportedRoleSetting;
+    var segments = std.mem.splitScalar(u8, name, '.');
+    var seen: usize = 0;
+    while (segments.next()) |segment| : (seen += 1) {
+        if (segment.len == 0) return error.UnsupportedRoleSetting;
+    }
+    if (seen < 2) return error.UnsupportedRoleSetting;
+}
+
+pub fn validateRoleSettingValue(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidRoleSetting;
+}
+
 pub const AuthSubjectKind = enum {
     user,
     role,
@@ -869,9 +883,34 @@ pub const UserManager = struct {
 
     pub fn setRoleSetting(self: *UserManager, role_subject: []const u8, setting_name: []const u8, setting_value: []const u8) !void {
         if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
-        if (setting_name.len == 0) return error.InvalidRoleSetting;
-        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name });
-        _ = try self.enforcer.addNamedPolicy("p3", &.{ role_subject, setting_name, setting_value });
+        try validateRoleSettingName(setting_name);
+        try validateRoleSettingValue(setting_value);
+
+        const existing_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{ role_subject, setting_name });
+        defer {
+            for (existing_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(existing_rules);
+        }
+
+        var setting_present = false;
+        for (existing_rules) |rule| {
+            if (rule.fields.len >= 3 and std.mem.eql(u8, rule.fields[2], setting_value)) {
+                setting_present = true;
+                break;
+            }
+        }
+        const inserted_new = if (setting_present)
+            false
+        else
+            try self.enforcer.addNamedPolicy("p3", &.{ role_subject, setting_name, setting_value });
+        errdefer if (inserted_new) {
+            _ = self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, setting_value }) catch {};
+        };
+
+        for (existing_rules) |rule| {
+            if (rule.fields.len < 3 or std.mem.eql(u8, rule.fields[2], setting_value)) continue;
+            _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, rule.fields[2] });
+        }
     }
 
     pub fn getRoleSetting(self: *const UserManager, role_subject: []const u8, setting_name: []const u8) ![]u8 {
@@ -1800,6 +1839,42 @@ test "usermgr default admin seed is idempotent and grants admin" {
     var authed = try manager.authenticateUser("admin", "admin");
     defer authed.deinit(alloc);
     try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
+}
+
+test "usermgr role settings are native app settings only and replace durably" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    try manager.createRoleSubject("role:app_writer");
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleSetting("role:app_writer", "statement_timeout", "5s"));
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleSetting("role:app_writer", "app.", "acme"));
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleSetting("role:app_writer", "app..tenant_id", "acme"));
+
+    try manager.setRoleSetting("role:app_writer", "app.tenant_id", "acme");
+    try manager.setRoleSetting("role:app_writer", "app.tenant_id", "other");
+    const setting = try manager.getRoleSetting("role:app_writer", "app.tenant_id");
+    defer alloc.free(setting);
+    try std.testing.expectEqualStrings("other", setting);
+
+    const settings = try manager.listRoleSettingsForSubject("role:app_writer");
+    defer {
+        for (settings) |*entry| entry.deinit(alloc);
+        alloc.free(settings);
+    }
+    try std.testing.expectEqual(@as(usize, 1), settings.len);
+    try std.testing.expectEqualStrings("app.tenant_id", settings[0].name);
+    try std.testing.expectEqualStrings("other", settings[0].value);
 }
 
 test "usermgr permissions and row filters mirror go semantics" {

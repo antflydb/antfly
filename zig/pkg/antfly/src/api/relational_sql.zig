@@ -5994,19 +5994,8 @@ const Parser = struct {
     }
 
     fn parseDeallocatePreparedStatementDdl(self: *@This()) !DeallocatePreparedStatementPlan {
-        _ = self.matchKeyword("prepare");
-        if (self.matchKeyword("all")) {
-            if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-            if (!self.atEnd()) return error.UnsupportedSqlShape;
-            return .{ .all = true };
-        }
-        const statement_name = try self.parseIdentifierOwned();
-        var statement_transferred = false;
-        errdefer if (!statement_transferred) self.alloc.free(statement_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        statement_transferred = true;
-        return .{ .statement_name = statement_name };
+        const syntax = try sql_adapter.parseDeallocatePreparedStatementTail(self.tokens, &self.pos);
+        return try self.deallocatePreparedStatementPlanFromSyntax(syntax);
     }
 
     fn parsePreparedStatementSubjectKind(self: *@This()) !PreparedStatementSubjectKind {
@@ -6139,18 +6128,8 @@ const Parser = struct {
     }
 
     fn parseCloseCursorPortalDdl(self: *@This()) !CloseCursorPortalPlan {
-        if (self.matchKeyword("all")) {
-            if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-            if (!self.atEnd()) return error.UnsupportedSqlShape;
-            return .{ .all = true };
-        }
-        const portal_name = try self.parseIdentifierOwned();
-        var portal_transferred = false;
-        errdefer if (!portal_transferred) self.alloc.free(portal_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        portal_transferred = true;
-        return .{ .portal_name = portal_name };
+        const syntax = try sql_adapter.parseCloseCursorPortalTail(self.tokens, &self.pos);
+        return try self.closeCursorPortalPlanFromSyntax(syntax);
     }
 
     fn parseSavepointTransactionDdl(self: *@This()) !SavepointNamePlan {
@@ -6170,6 +6149,18 @@ const Parser = struct {
 
     fn savepointNamePlanFromSyntax(self: *@This(), syntax: sql_adapter.SavepointNameSyntax) !SavepointNamePlan {
         return .{ .savepoint_name = try self.alloc.dupe(u8, syntax.savepoint_name) };
+    }
+
+    fn deallocatePreparedStatementPlanFromSyntax(self: *@This(), syntax: sql_adapter.NamedOrAllSyntax) !DeallocatePreparedStatementPlan {
+        if (syntax.all) return .{ .all = true };
+        const statement_name = syntax.name orelse return error.UnsupportedSqlShape;
+        return .{ .statement_name = try self.alloc.dupe(u8, statement_name) };
+    }
+
+    fn closeCursorPortalPlanFromSyntax(self: *@This(), syntax: sql_adapter.NamedOrAllSyntax) !CloseCursorPortalPlan {
+        if (syntax.all) return .{ .all = true };
+        const portal_name = syntax.name orelse return error.UnsupportedSqlShape;
+        return .{ .portal_name = try self.alloc.dupe(u8, portal_name) };
     }
 
     fn parseCommentMetadataDdl(self: *@This()) !CommentMetadataPlan {
@@ -48544,7 +48535,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_role:role=app_writer", create_role_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_role));
 
-    var alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';");
+    var alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';");
     defer alter_role.deinit(alloc);
     const alter_role_plan = switch (alter_role) {
         .authorization_catalog => |plan| switch (plan) {
@@ -48554,11 +48545,11 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("app_writer", alter_role_plan.role_name);
-    try std.testing.expectEqualStrings("statement_timeout", alter_role_plan.setting_name);
-    try std.testing.expectEqualStrings("5s", alter_role_plan.setting_value);
+    try std.testing.expectEqualStrings("app.tenant_id", alter_role_plan.setting_name);
+    try std.testing.expectEqualStrings("acme", alter_role_plan.setting_value);
     const alter_role_fingerprint = try ddlFingerprintAlloc(alloc, alter_role);
     defer alloc.free(alter_role_fingerprint);
-    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:setting=statement_timeout", alter_role_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:setting=app.tenant_id", alter_role_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, alter_role));
 
     var drop_role = try lowerDdlPlanAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
@@ -49314,6 +49305,12 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(deallocate_statement_fingerprint);
     try std.testing.expectEqualStrings("ddl:deallocate_statement:name=usage_plan", deallocate_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, deallocate_statement));
+
+    var deallocate_prepare_statement = try lowerDdlPlanAlloc(alloc, "DEALLOCATE PREPARE usage_plan;");
+    defer deallocate_prepare_statement.deinit(alloc);
+    const deallocate_prepare_statement_fingerprint = try ddlFingerprintAlloc(alloc, deallocate_prepare_statement);
+    defer alloc.free(deallocate_prepare_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:deallocate_statement:name=usage_plan", deallocate_prepare_statement_fingerprint);
 
     var deallocate_all_statements = try lowerDdlPlanAlloc(alloc, "DEALLOCATE ALL;");
     defer deallocate_all_statements.deinit(alloc);
@@ -75988,8 +75985,8 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "alter role catalog ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_role, .table_name = "app_writer", .operations = 1 },
-            .plan = "ddl:alter_role:role=app_writer:setting=statement_timeout",
-            .sql = "ALTER ROLE app_writer SET statement_timeout = '5s'",
+            .plan = "ddl:alter_role:role=app_writer:setting=app.tenant_id",
+            .sql = "ALTER ROLE app_writer SET app.tenant_id = 'acme'",
         },
         .{
             .name = "drop role catalog ddl",

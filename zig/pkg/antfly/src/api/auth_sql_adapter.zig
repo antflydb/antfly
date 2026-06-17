@@ -247,22 +247,14 @@ fn currentSettingRowFilterJsonAlloc(
     alloc: std.mem.Allocator,
     predicate: relational_sql.RowSecurityCurrentSettingPredicate,
 ) ![]u8 {
-    const auth_metadata_key = authMetadataKeyForSqlSetting(predicate.setting_name);
-    if (auth_metadata_key.len == 0) return error.UnsupportedSqlShape;
+    usermgr.validateRoleSettingName(predicate.setting_name) catch return error.UnsupportedSqlShape;
     const field_json = try std.json.Stringify.valueAlloc(alloc, predicate.field, .{});
     defer alloc.free(field_json);
-    const auth_path = try std.fmt.allocPrint(alloc, "metadata.{s}", .{auth_metadata_key});
+    const auth_path = try std.fmt.allocPrint(alloc, "settings.{s}", .{predicate.setting_name});
     defer alloc.free(auth_path);
     const auth_path_json = try std.json.Stringify.valueAlloc(alloc, auth_path, .{});
     defer alloc.free(auth_path_json);
     return try std.fmt.allocPrint(alloc, "{{\"term\":{{{s}:{{\"$auth\":{s}}}}}}}", .{ field_json, auth_path_json });
-}
-
-fn authMetadataKeyForSqlSetting(setting_name: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, setting_name, "app.") and setting_name.len > "app.".len) {
-        return setting_name["app.".len..];
-    }
-    return setting_name;
 }
 
 fn appendPermissionChange(
@@ -450,15 +442,16 @@ test "sql auth adapter creates roles and applies table grants through user manag
 
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
-    try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
+    try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';"));
 
     var recreated = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
     defer recreated.deinit(alloc);
-    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';")).?;
+    try std.testing.expectError(error.UnsupportedRoleSetting, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET app.tenant_id = 'acme';")).?;
     defer altered.deinit(alloc);
-    const statement_timeout = try manager.getRoleSetting("role:app_writer", "statement_timeout");
-    defer alloc.free(statement_timeout);
-    try std.testing.expectEqualStrings("5s", statement_timeout);
+    const tenant_setting = try manager.getRoleSetting("role:app_writer", "app.tenant_id");
+    defer alloc.free(tenant_setting);
+    try std.testing.expectEqualStrings("acme", tenant_setting);
     try manager.addRoleToUser("alice", "role:app_writer");
     const effective_settings = try manager.getEffectiveRoleSettings("alice");
     defer {
@@ -466,12 +459,12 @@ test "sql auth adapter creates roles and applies table grants through user manag
         alloc.free(effective_settings);
     }
     try std.testing.expectEqual(@as(usize, 1), effective_settings.len);
-    try std.testing.expectEqualStrings("statement_timeout", effective_settings[0].name);
-    try std.testing.expectEqualStrings("5s", effective_settings[0].value);
+    try std.testing.expectEqualStrings("app.tenant_id", effective_settings[0].name);
+    try std.testing.expectEqualStrings("acme", effective_settings[0].value);
     try manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped_with_setting = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
     defer dropped_with_setting.deinit(alloc);
-    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "statement_timeout"));
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "app.tenant_id"));
 }
 
 test "sql auth adapter resolves role setting conflicts deterministically" {
@@ -493,14 +486,14 @@ test "sql auth adapter resolves role setting conflicts deterministically" {
 
     try manager.createRoleSubject("role:fast");
     try manager.createRoleSubject("role:slow");
-    try manager.setRoleSetting("role:fast", "statement_timeout", "5s");
-    try manager.setRoleSetting("role:slow", "statement_timeout", "10s");
+    try manager.setRoleSetting("role:fast", "app.tenant_id", "acme");
+    try manager.setRoleSetting("role:slow", "app.tenant_id", "other");
     try manager.addRoleToUser("alice", "role:fast");
     try manager.addRoleToUser("alice", "role:slow");
 
     try std.testing.expectError(error.RoleSettingConflict, manager.getEffectiveRoleSettings("alice"));
 
-    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET statement_timeout = '3s';")).?;
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET app.tenant_id = 'direct';")).?;
     defer altered.deinit(alloc);
     const effective_settings = try manager.getEffectiveRoleSettings("alice");
     defer {
@@ -508,8 +501,8 @@ test "sql auth adapter resolves role setting conflicts deterministically" {
         alloc.free(effective_settings);
     }
     try std.testing.expectEqual(@as(usize, 1), effective_settings.len);
-    try std.testing.expectEqualStrings("statement_timeout", effective_settings[0].name);
-    try std.testing.expectEqualStrings("3s", effective_settings[0].value);
+    try std.testing.expectEqualStrings("app.tenant_id", effective_settings[0].name);
+    try std.testing.expectEqualStrings("direct", effective_settings[0].value);
 }
 
 test "user manager applies permission change batches atomically" {
@@ -574,18 +567,18 @@ test "sql auth adapter grants directly to existing antfly users" {
 
     try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
     try std.testing.expect(!(try manager.roleSubjectExists("role:alice")));
-    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET statement_timeout = '3s';")).?;
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET app.tenant_id = 'direct';")).?;
     defer altered.deinit(alloc);
-    const setting = try manager.getRoleSetting("alice", "statement_timeout");
+    const setting = try manager.getRoleSetting("alice", "app.tenant_id");
     defer alloc.free(setting);
-    try std.testing.expectEqualStrings("3s", setting);
+    try std.testing.expectEqualStrings("direct", setting);
     const effective_settings = try manager.getEffectiveRoleSettings("alice");
     defer {
         for (effective_settings) |*entry| entry.deinit(alloc);
         alloc.free(effective_settings);
     }
     try std.testing.expectEqual(@as(usize, 1), effective_settings.len);
-    try std.testing.expectEqualStrings("3s", effective_settings[0].value);
+    try std.testing.expectEqualStrings("direct", effective_settings[0].value);
 }
 
 test "sql auth adapter applies row security policies through user manager" {
@@ -615,7 +608,7 @@ test "sql auth adapter applies row security policies through user manager" {
     const stored = try manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
     defer alloc.free(stored);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"tenant_id\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stored, "\"$auth\":\"metadata.tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"$auth\":\"settings.app.tenant_id\"") != null);
 
     const filters = try manager.getRowFilters("alice");
     defer {
@@ -624,7 +617,7 @@ test "sql auth adapter applies row security policies through user manager" {
     }
     try std.testing.expectEqual(@as(usize, 1), filters.len);
     try std.testing.expectEqualStrings("usage_records", filters[0].table);
-    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"$auth\":\"metadata.tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"$auth\":\"settings.app.tenant_id\"") != null);
 
     try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
     var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;

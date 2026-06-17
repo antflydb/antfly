@@ -97,7 +97,8 @@ API keys should have explicit semantics:
 
 ## Supported First Slice
 
-The implemented auth references resolve username, inherited roles, and user metadata in stored row filters:
+The implemented auth references resolve username, inherited roles, user
+metadata, and native role settings in stored row filters:
 
 ```json
 { "term": { "owner": { "$auth": "username" } } }
@@ -105,6 +106,10 @@ The implemented auth references resolve username, inherited roles, and user meta
 
 ```json
 { "term": { "tenant_id": { "$auth": "metadata.tenant_id" } } }
+```
+
+```json
+{ "term": { "tenant_id": { "$auth": "settings.app.tenant_id" } } }
 ```
 
 ```json

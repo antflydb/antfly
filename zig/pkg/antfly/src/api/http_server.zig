@@ -9852,6 +9852,9 @@ fn authContextJsonValue(
         if (std.mem.eql(u8, path, "roles")) {
             return try rolesAuthJsonValue(alloc, identity.roles);
         }
+        if (std.mem.startsWith(u8, path, "settings.")) {
+            return try roleSettingAuthJsonValue(alloc, identity.role_settings, path["settings.".len..]);
+        }
         return try metadataAuthJsonValue(alloc, identity.metadata_json, path["metadata.".len..]);
     }
     return error.InvalidQueryRequest;
@@ -9860,6 +9863,10 @@ fn authContextJsonValue(
 fn isSupportedAuthPath(path: []const u8) bool {
     if (std.mem.eql(u8, path, "username")) return true;
     if (std.mem.eql(u8, path, "roles")) return true;
+    if (std.mem.startsWith(u8, path, "settings.")) {
+        usermgr.validateRoleSettingName(path["settings.".len..]) catch return false;
+        return true;
+    }
     if (!std.mem.startsWith(u8, path, "metadata.")) return false;
     var segments = std.mem.splitScalar(u8, path["metadata.".len..], '.');
     var seen = false;
@@ -9883,6 +9890,20 @@ fn rolesAuthJsonValue(
         try out.append(.{ .string = try alloc.dupe(u8, role) });
     }
     return .{ .array = out };
+}
+
+fn roleSettingAuthJsonValue(
+    alloc: std.mem.Allocator,
+    settings: []const usermgr.RoleSetting,
+    name: []const u8,
+) !std.json.Value {
+    usermgr.validateRoleSettingName(name) catch return error.InvalidQueryRequest;
+    for (settings) |setting| {
+        if (std.mem.eql(u8, setting.name, name)) {
+            return .{ .string = try alloc.dupe(u8, setting.value) };
+        }
+    }
+    return error.InvalidQueryRequest;
 }
 
 fn metadataAuthJsonValue(
@@ -9938,6 +9959,30 @@ test "auth row filter resolver expands metadata references" {
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"tier\":\"gold\"") != null);
 }
 
+test "auth row filter resolver expands native role setting references" {
+    const alloc = std.testing.allocator;
+    const role_settings = try alloc.alloc(usermgr.RoleSetting, 1);
+    role_settings[0] = try usermgr.RoleSetting.initOwned(alloc, "app.tenant_id", "acme");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .role_settings = role_settings,
+    };
+    defer identity.deinit(alloc);
+
+    const resolved = try resolveAuthRowFilterJson(
+        alloc,
+        identity,
+        "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}}",
+    );
+    defer alloc.free(resolved);
+
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"acme\"}}", resolved);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        resolveAuthRowFilterJson(alloc, identity, "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.missing\"}}}"),
+    );
+}
+
 test "auth row filter resolver expands role references" {
     const alloc = std.testing.allocator;
     const roles = try alloc.alloc([]u8, 2);
@@ -9963,7 +10008,7 @@ test "auth row filter resolver expands role references" {
 test "auth row filter validator accepts username references" {
     try validateAuthRowFilterJson(
         std.testing.allocator,
-        "{\"conjuncts\":[{\"term\":{\"owner\":{\"$auth\":\"username\"}}},{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}},{\"terms\":{\"acl.roles\":{\"$auth\":\"roles\"}}}]}",
+        "{\"conjuncts\":[{\"term\":{\"owner\":{\"$auth\":\"username\"}}},{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}},{\"terms\":{\"acl.roles\":{\"$auth\":\"roles\"}}}]}",
     );
 }
 
@@ -12451,7 +12496,7 @@ test "api http server applies authorization SQL DDL through user manager" {
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "future_table", .read)));
     const stored_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_tenant_policy", "usage_records");
     defer alloc.free(stored_policy);
-    try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"metadata.tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"settings.app.tenant_id\"") != null);
 
     try std.testing.expectError(error.RoleInUse, server.applyRelationalSqlDdl("DROP ROLE app_writer;"));
     var revoked = try server.applyRelationalSqlDdl("REVOKE SELECT ON TABLE usage_records FROM app_writer;");

@@ -16,4 +16,5 @@ pub const backend_erased = @import("storage/backend_erased.zig");
 pub const backend_types = @import("storage/backend_types.zig");
 pub const lsm_backend = @import("storage/lsm_backend.zig");
 pub const resource_manager = @import("storage/resource_manager.zig");
+pub const rowsource = @import("storage/rowsource/mod.zig");
 pub const sim_runtime = @import("storage/sim_runtime.zig");

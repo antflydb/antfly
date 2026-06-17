@@ -26,6 +26,10 @@ pub const ArtifactKind = enum(u8) {
     document_segment = 6,
     sparse_segment = 7,
     graph_segment = 8,
+    row_fragment = 9,
+    row_fragment_stats = 10,
+    algebraic_segment = 11,
+    external_base_source = 12,
 };
 
 pub const ArtifactRef = struct {

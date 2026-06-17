@@ -9295,8 +9295,8 @@
         "table_name": "app_writer",
         "operations": 1
       },
-      "plan": "ddl:alter_role:role=app_writer:setting=statement_timeout",
-      "sql": "ALTER ROLE app_writer SET statement_timeout = '5s'"
+      "plan": "ddl:alter_role:role=app_writer:setting=app.tenant_id",
+      "sql": "ALTER ROLE app_writer SET app.tenant_id = 'acme'"
     },
     {
       "name": "drop role catalog ddl",

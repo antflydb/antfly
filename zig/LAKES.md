@@ -351,6 +351,109 @@ that already operate on typed relational values should evaluate directly over
 column vectors where possible, falling back to row materialization only for
 operators that need it.
 
+## Antfly-Owned Lake-Native Scaffold
+
+The Antfly-owned path should be a first-class native lake fragment stack, not
+"Iceberg but ours" and not an extension of the current document segment alone.
+The north star is:
+
+```text
+LSM hot mutable layer
+  +
+Antfly serverless immutable fragments
+  +
+Antfly sidecar indexes/materializations
+  +
+one RowSource/SQL contract
+```
+
+The concrete scaffold:
+
+1. Add a shared `RowSource` layer.
+
+   Create `storage/rowsource/` with shared `SnapshotRef`, `RowRef`,
+   `ColumnVector`, and `ColumnBatch` types, plus initial adapters for JSON rows,
+   relational-store rows, serverless fragments, external Parquet, external
+   Iceberg, and external Lance. The first implementation can still adapt
+   `ColumnBatch` to JSON rows for the existing executor, but new lake/serverless
+   code should target typed batches.
+
+2. Define Antfly native lake fragments.
+
+   Add `serverless/row_fragment/` with `types.zig`, `codec.zig`, `writer.zig`,
+   `reader.zig`, and `mod.zig`. The first format should be an internal,
+   versioned artifact codec with a header, schema fingerprint, row count, row-ref
+   directory, column directory, column chunks, and optional min/max/null and
+   bounded dictionary stats. Optimize for stable row refs, range reads,
+   projection, point hydration, JSON subtree facts, vector payload colocation,
+   and algebraic fold inputs.
+
+3. Extend serverless manifest types.
+
+   Add artifact/source kinds such as `row_fragment`, `row_fragment_stats`,
+   `algebraic_segment`, and `external_base_source`. A manifest should describe
+   both the authoritative row source and derived sidecars, not only published
+   search artifacts. The source side should distinguish Antfly serverless
+   fragments, LSM overlays, external Parquet, external Iceberg, and external
+   Lance.
+
+4. Build a fragment publisher from LSM/relational rows.
+
+   Add `serverless/build/row_fragments.zig` to scan relational base rows or
+   collected row preimages, project declared relational columns, encode row
+   fragments, emit fragment stats, preserve stable row refs, write artifacts,
+   and attach them to the next manifest. This is the standalone Antfly lake path:
+   hot LSM/relational data can be published into immutable object-storage
+   fragments owned by Antfly.
+
+5. Add `ServerlessFragmentRowSource`.
+
+   Add a row-source implementation that reads pinned manifest row fragments and
+   produces `ColumnBatch`. This is the bridge from serverless artifacts to SQL
+   row plans and should share the same snapshot binding as existing query
+   sessions.
+
+6. Move algebraic materialization into serverless artifacts.
+
+   Add `serverless/algebraic_segment/` with codec, builder, and reader support
+   for group-by fold materializations, expression fold materializations,
+   adaptive recommendations, external-row-ref keyed aggregates, and
+   serverless-fragment keyed aggregates. Repeated analytical serving workloads
+   should move from scanning row fragments to reading fold artifacts.
+
+7. Treat current search segments as sidecars over `RowSource`.
+
+   Full-text, vector, sparse, and graph segments should declare source snapshot
+   id, source schema fingerprint, source row-ref kind, source column bindings,
+   and index config hash. The same sidecar model should work over document rows,
+   relational rows, serverless row fragments, Iceberg rows, and Lance rows.
+
+8. Add adaptive promotion policy.
+
+   Add policy for row-fragment publication, hot projection promotion, algebraic
+   materialization, and optional external-scan-to-fragment promotion. This turns
+   adaptive ownership into concrete behavior: external rows can stay external
+   until repeated workload observations justify Antfly-owned fragments or
+   materialized folds.
+
+9. Keep Iceberg and Lance as row sources, not the core.
+
+   `ExternalIcebergRowSource`, `ExternalLanceRowSource`,
+   `ExternalParquetRowSource`, `ServerlessFragmentRowSource`, and
+   `RelationalStoreRowSource` should all feed the same `ColumnBatch` contract.
+   Antfly-owned storage should not be coupled to Iceberg's protocol, and Iceberg
+   should not block Antfly-native fragments.
+
+10. Stage the implementation.
+
+   Land the pieces in this order: `rowsource/types.zig`; JSON adapter for the
+   existing row-query executor; `serverless/row_fragment` codec tests; publisher
+   from relational rows to row fragments; query path through
+   `ServerlessFragmentRowSource`; sidecar text/vector indexes over serverless
+   row refs; one algebraic segment for a simple group-by aggregate; external
+   Parquet/Iceberg row sources; and adaptive promotion from external scans to
+   Antfly row fragments/materializations.
+
 ## Object Storage Reads
 
 Antfly already has an object storage abstraction for S3, GCS, filesystem, and

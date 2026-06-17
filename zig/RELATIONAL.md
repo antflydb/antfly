@@ -4205,18 +4205,21 @@ request over those native objects instead of remaining an adapter no-op.
 
 Prepared statement, cursor, and explain syntax is protocol/query-control
 surface over typed plans rather than storage syntax. `PREPARE`, `EXECUTE`, and
-`DEALLOCATE` lower to typed prepared-statement intents that capture statement
-name, parameter or argument count, and the prepared subject family. They still
-fail closed when applied to storage until Antfly has a native prepared-plan
-cache keyed by typed plan fingerprints, parameter schemas, catalog epochs,
-authorization context, and invalidation rules. `DECLARE ... [BINARY]
+`DEALLOCATE [PREPARE] name|ALL` cleanup tails are parsed in
+`api/sql_adapter/grammar.zig`; the resulting typed prepared-statement intents
+capture statement name, parameter or argument count, and the prepared subject
+family. They still fail closed when applied to storage until Antfly has a native
+prepared-plan cache keyed by typed plan fingerprints, parameter schemas, catalog
+epochs, authorization context, and invalidation rules. `DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]
 cursor`, shorthand `FETCH cursor`, bare-count `FETCH n cursor`, and `CLOSE
 cursor|ALL` lower to typed cursor-portal intents that capture portal name,
-scroll/hold/binary metadata, fetch direction/count, and close scope. They still
-fail closed when applied to storage until there is a
-typed portal contract with snapshot lifetime, range ownership, ordering,
-backpressure, resume tokens, and transaction cleanup. Plain
+scroll/hold/binary metadata, fetch direction/count, and close scope. The
+`CLOSE` cleanup tail also lives in `api/sql_adapter/grammar.zig`, so protocol
+cleanup syntax stays adapter-owned while the lowerer allocates the typed plan.
+They still fail closed when applied to storage until there is a typed portal
+contract with snapshot lifetime, range ownership, ordering, backpressure, resume
+tokens, and transaction cleanup. Plain
 `EXPLAIN <statement>` lowers to a native explain wrapper over the same typed
 read-plan and write-plan lowering plus deterministic fingerprints used by the
 golden parity gate, so diagnostic output is anchored to the real planned work
@@ -4481,15 +4484,18 @@ predicates such as
 `tenant_id = current_setting('app.tenant_id')` as native policy metadata rather
 than raw SQL. Public API execution maps each supported policy to a hidden native
 row-filter policy subject, converts `current_setting('app.<key>')` to
-`{"$auth":"metadata.<key>"}`, and merges enabled-table filters into every user's
-effective row filters before row-query, aggregate, join, lateral, window, and
-document query execution. Creating a policy stores policy metadata but does not
-make the filter active until `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` marks
-that table as RLS-enabled in the native auth policy store. `DROP POLICY` removes
-the hidden policy subject for that table, while `DROP POLICY IF EXISTS` is an
-idempotent no-op. Unsupported policy expressions, policy replacement, and
-per-role `TO ...` policy targeting still fail closed until they have durable
-native policy state, request-context bindings, and planner/executor validation.
+`{"$auth":"settings.app.<key>"}`, and merges enabled-table filters into every
+user's effective row filters before row-query, aggregate, join, lateral, window,
+and document query execution. Those setting references are resolved from the
+authenticated user's effective native role settings; a missing setting fails
+closed during request filter resolution. Creating a policy stores policy
+metadata but does not make the filter active until `ALTER TABLE ... ENABLE ROW
+LEVEL SECURITY` marks that table as RLS-enabled in the native auth policy store.
+`DROP POLICY` removes the hidden policy subject for that table, while `DROP
+POLICY IF EXISTS` is an idempotent no-op. Unsupported policy expressions, policy
+replacement, and per-role `TO ...` policy targeting still fail closed until they
+have durable native policy state, request-context bindings, and
+planner/executor validation.
 `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` clears the native table enable bit
 idempotently; stored policies remain catalog metadata but stop contributing
 effective row filters until the table is enabled again. Storage must not
@@ -4517,10 +4523,14 @@ targets fail closed until schema namespaces have first-class authorization
 semantics. A grant target that is
 already an Antfly user is applied directly to that user; otherwise SQL
 principals must resolve to a SQL-created `role:<name>` subject instead of being
-created implicitly by `GRANT`. `ALTER ROLE ... SET ...` persists the setting
-through the native auth policy store as role-owned metadata, removes that
-metadata when the role is dropped, and authentication exposes merged effective
-role settings after role inheritance plus direct user settings. If inherited
+created implicitly by `GRANT`. `ALTER ROLE ... SET app.<key> = 'value'` persists
+the setting through the native auth policy store as role-owned metadata, removes
+that metadata when the role is dropped, and authentication exposes merged
+effective role settings after role inheritance plus direct user settings. This
+is the first native SQL role-setting model because `app.*` settings are consumed
+by row-security `current_setting('app.*')` policies. Unsupported role setting
+names, including PostgreSQL runtime settings such as `statement_timeout`, fail
+closed until Antfly has a native runtime setting owner for them. If inherited
 roles define the same setting with different values, effective-setting
 resolution fails closed; a direct user setting for the same key is an explicit
 override. Unsupported role-setting forms such as reset, database-scoped

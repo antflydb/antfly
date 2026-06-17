@@ -34,6 +34,11 @@ pub const SavepointNameSyntax = struct {
     savepoint_name: []const u8,
 };
 
+pub const NamedOrAllSyntax = struct {
+    name: ?[]const u8 = null,
+    all: bool = false,
+};
+
 pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAlterSyntax {
     const start = pos.*;
     var cursor = parser.Cursor.init(tokens, pos);
@@ -132,6 +137,17 @@ pub fn parseRollbackToSavepointTail(tokens: []const Token, pos: *usize) !Savepoi
     return try parseSavepointNameTailFromCursor(cursor);
 }
 
+pub fn parseDeallocatePreparedStatementTail(tokens: []const Token, pos: *usize) !NamedOrAllSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    _ = cursor.matchKeyword("prepare");
+    return try parseNamedOrAllTail(cursor);
+}
+
+pub fn parseCloseCursorPortalTail(tokens: []const Token, pos: *usize) !NamedOrAllSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    return try parseNamedOrAllTail(cursor);
+}
+
 fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
@@ -168,6 +184,16 @@ fn parseSavepointNameTailFromCursor(cursor: parser.Cursor) !SavepointNameSyntax 
     const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     try parseAdapterNoopStatementEnd(cursor);
     return .{ .savepoint_name = name.text };
+}
+
+fn parseNamedOrAllTail(cursor: parser.Cursor) !NamedOrAllSyntax {
+    if (cursor.matchKeyword("all")) {
+        try parseAdapterNoopStatementEnd(cursor);
+        return .{ .all = true };
+    }
+    const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{ .name = name.text };
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -618,4 +644,53 @@ test "sql adapter grammar parses savepoint transaction tails" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseSavepointTransactionTail(extra_tokens.items, &extra_pos));
+}
+
+test "sql adapter grammar parses protocol cleanup tails" {
+    const alloc = std.testing.allocator;
+
+    var deallocate_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan;");
+    defer lexer.freeTokens(alloc, &deallocate_tokens);
+    var deallocate_pos: usize = 0;
+    const deallocate = try parseDeallocatePreparedStatementTail(deallocate_tokens.items, &deallocate_pos);
+    try std.testing.expectEqualStrings("usage_plan", deallocate.name.?);
+    try std.testing.expect(!deallocate.all);
+    try std.testing.expectEqual(deallocate_tokens.items.len, deallocate_pos);
+
+    var deallocate_prepare_tokens = try lexer.tokenizeAlloc(alloc, "PREPARE usage_plan;");
+    defer lexer.freeTokens(alloc, &deallocate_prepare_tokens);
+    var deallocate_prepare_pos: usize = 0;
+    const deallocate_prepare = try parseDeallocatePreparedStatementTail(deallocate_prepare_tokens.items, &deallocate_prepare_pos);
+    try std.testing.expectEqualStrings("usage_plan", deallocate_prepare.name.?);
+    try std.testing.expect(!deallocate_prepare.all);
+    try std.testing.expectEqual(deallocate_prepare_tokens.items.len, deallocate_prepare_pos);
+
+    var deallocate_all_tokens = try lexer.tokenizeAlloc(alloc, "ALL;");
+    defer lexer.freeTokens(alloc, &deallocate_all_tokens);
+    var deallocate_all_pos: usize = 0;
+    const deallocate_all = try parseDeallocatePreparedStatementTail(deallocate_all_tokens.items, &deallocate_all_pos);
+    try std.testing.expect(deallocate_all.all);
+    try std.testing.expect(deallocate_all.name == null);
+    try std.testing.expectEqual(deallocate_all_tokens.items.len, deallocate_all_pos);
+
+    var close_tokens = try lexer.tokenizeAlloc(alloc, "usage_cursor;");
+    defer lexer.freeTokens(alloc, &close_tokens);
+    var close_pos: usize = 0;
+    const close = try parseCloseCursorPortalTail(close_tokens.items, &close_pos);
+    try std.testing.expectEqualStrings("usage_cursor", close.name.?);
+    try std.testing.expect(!close.all);
+    try std.testing.expectEqual(close_tokens.items.len, close_pos);
+
+    var close_all_tokens = try lexer.tokenizeAlloc(alloc, "ALL;");
+    defer lexer.freeTokens(alloc, &close_all_tokens);
+    var close_all_pos: usize = 0;
+    const close_all = try parseCloseCursorPortalTail(close_all_tokens.items, &close_all_pos);
+    try std.testing.expect(close_all.all);
+    try std.testing.expect(close_all.name == null);
+    try std.testing.expectEqual(close_all_tokens.items.len, close_all_pos);
+
+    var extra_tokens = try lexer.tokenizeAlloc(alloc, "usage_cursor; CLOSE ALL;");
+    defer lexer.freeTokens(alloc, &extra_tokens);
+    var extra_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCloseCursorPortalTail(extra_tokens.items, &extra_pos));
 }
