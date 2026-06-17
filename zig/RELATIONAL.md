@@ -5182,6 +5182,11 @@ mutation-source plan with explicit restart intent, while multi-table and cascade
 truncate forms still require a multi-table generation barrier before the adapter
 can lower them safely.
 
+Unsupported and adapter-noop classification reasons are exact fingerprint
+tokens. A fixture reason must match the full `requires` or `reason` token value,
+so prefix-only matches such as `session_setting_extra` cannot satisfy
+`session_setting`.
+
 Point-write returning fixtures pin the same deterministic row count in both the
 public summary metadata and the typed-plan fingerprint before row JSON is
 compared. This keeps returning coverage bound to the native mutation plan instead

@@ -61990,26 +61990,27 @@ fn appParityStableReasonToken(reason: []const u8) bool {
 }
 
 fn appParityPlanMatchesReason(
-    alloc: std.mem.Allocator,
     family: AppParityCorpusPlanFamily,
     plan: []const u8,
     reason: []const u8,
-) !bool {
+) bool {
     if (reason.len == 0) return false;
     switch (family) {
         .adapter_noop_ddl => {
             if (!std.mem.startsWith(u8, plan, "adapter_noop:")) return false;
-            const token = try std.fmt.allocPrint(alloc, ":reason={s}", .{reason});
-            defer alloc.free(token);
-            return std.mem.indexOf(u8, plan, token) != null;
+            return appParityPlanHasExactStringToken(plan, ":reason=", reason);
         },
         else => if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
-            const prefix = try std.fmt.allocPrint(alloc, "unsupported:{s}:", .{unsupported_family});
-            defer alloc.free(prefix);
+            const prefix = "unsupported:";
             if (!std.mem.startsWith(u8, plan, prefix)) return false;
-            const token = try std.fmt.allocPrint(alloc, ":requires={s}", .{reason});
-            defer alloc.free(token);
-            return std.mem.indexOf(u8, plan, token) != null;
+            const rest = plan[prefix.len..];
+            if (!std.mem.startsWith(u8, rest, unsupported_family) or
+                rest.len <= unsupported_family.len or
+                rest[unsupported_family.len] != ':')
+            {
+                return false;
+            }
+            return appParityPlanHasExactStringToken(plan, ":requires=", reason);
         } else return true,
     }
 }
@@ -63237,7 +63238,7 @@ fn validateAppParityFixtureMetadata(
         return error.TestUnexpectedResult;
     }
     if (appParityFixtureFamilyNeedsReason(entry.family) and
-        !(try appParityPlanMatchesReason(alloc, entry.family, entry.plan, entry.classification_reason)))
+        !appParityPlanMatchesReason(entry.family, entry.plan, entry.classification_reason))
     {
         return error.TestUnexpectedResult;
     }
@@ -64520,6 +64521,22 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .adapter_noop_ddl,
         .classification_reason = "session_setting",
         .plan = "adapter_noop:ddl:reason=transaction_control",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "adapter noop reason prefix mismatch",
+        .sql = "SET client_encoding = 'UTF8'",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "session_setting",
+        .plan = "adapter_noop:ddl:reason=session_setting_extra",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "unsupported reason prefix mismatch",
+        .sql = "TRUNCATE usage_records CASCADE",
+        .family = .unsupported_write,
+        .classification_reason = "multi_table_generation_barrier",
+        .plan = "unsupported:write:requires=multi_table_generation_barrier_extra",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
