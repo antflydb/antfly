@@ -61749,13 +61749,9 @@ fn appParityFixtureJsonAlloc(
     schema_json: []const u8,
     corpus: []const AppParityCorpusEntry,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.print(
-        "{{\n  \"fixture_format\": {},\n  \"schema_json\": {f},\n  \"entries\": [",
-        .{ app_parity_fixture_format, std.json.fmt(schema_json, .{}) },
-    );
+    var entries_out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer entries_out.deinit();
+    const entries_writer = &entries_out.writer;
     var written_entries: usize = 0;
     for (corpus) |entry| {
         var derived_applied_plan: ?[]u8 = null;
@@ -61770,26 +61766,37 @@ fn appParityFixtureJsonAlloc(
             break :applied derived_applied_plan.?;
         } else "";
 
-        if (written_entries > 0) try writer.writeByte(',');
+        if (written_entries > 0) try entries_writer.writeByte(',');
         written_entries += 1;
-        try writer.writeAll("\n    {\n");
+        try entries_writer.writeAll("\n    {\n");
         var first = true;
-        try appParityWriteStringField(writer, &first, "      ", "name", entry.name);
-        try appParityWriteStringField(writer, &first, "      ", "family", @tagName(entry.family));
-        try appParityWriteSummaryField(writer, &first, entry.summary);
-        try appParityWriteStringField(writer, &first, "      ", "plan", entry.plan);
-        if (entry.classification_reason.len > 0) try appParityWriteStringField(writer, &first, "      ", "classification_reason", entry.classification_reason);
-        try appParityWriteStringListField(writer, &first, "      ", "apply_setup_sql", entry.apply_setup_sql);
-        try appParityWriteStringListField(writer, &first, "      ", "returning_rows", entry.returning_rows);
-        if (applied_plan.len > 0) try appParityWriteStringField(writer, &first, "      ", "applied_plan", applied_plan);
-        if (entry.resolver_row_json.len > 0) try appParityWriteStringField(writer, &first, "      ", "resolver_row_json", entry.resolver_row_json);
-        if (entry.resolver_version != 0) try appParityWriteU64Field(writer, &first, "      ", "resolver_version", entry.resolver_version);
-        if (entry.resolver_exists) |exists| try appParityWriteBoolField(writer, &first, "      ", "resolver_exists", exists);
-        if (entry.source_schema_json.len > 0) try appParityWriteStringField(writer, &first, "      ", "source_schema_json", entry.source_schema_json);
-        try appParityWriteParamsField(writer, &first, "      ", entry.params);
-        try appParityWriteStringField(writer, &first, "      ", "sql", entry.sql);
-        try writer.writeAll("\n    }");
+        try appParityWriteStringField(entries_writer, &first, "      ", "name", entry.name);
+        try appParityWriteStringField(entries_writer, &first, "      ", "family", @tagName(entry.family));
+        try appParityWriteSummaryField(entries_writer, &first, entry.summary);
+        try appParityWriteStringField(entries_writer, &first, "      ", "plan", entry.plan);
+        if (entry.classification_reason.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "classification_reason", entry.classification_reason);
+        try appParityWriteStringListField(entries_writer, &first, "      ", "apply_setup_sql", entry.apply_setup_sql);
+        try appParityWriteStringListField(entries_writer, &first, "      ", "returning_rows", entry.returning_rows);
+        if (applied_plan.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "applied_plan", applied_plan);
+        if (entry.resolver_row_json.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "resolver_row_json", entry.resolver_row_json);
+        if (entry.resolver_version != 0) try appParityWriteU64Field(entries_writer, &first, "      ", "resolver_version", entry.resolver_version);
+        if (entry.resolver_exists) |exists| try appParityWriteBoolField(entries_writer, &first, "      ", "resolver_exists", exists);
+        if (entry.source_schema_json.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "source_schema_json", entry.source_schema_json);
+        try appParityWriteParamsField(entries_writer, &first, "      ", entry.params);
+        try appParityWriteStringField(entries_writer, &first, "      ", "sql", entry.sql);
+        try entries_writer.writeAll("\n    }");
     }
+    const entries_json = try entries_out.toOwnedSlice();
+    defer alloc.free(entries_json);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print(
+        "{{\n  \"fixture_format\": {},\n  \"entry_count\": {},\n  \"schema_json\": {f},\n  \"entries\": [",
+        .{ app_parity_fixture_format, written_entries, std.json.fmt(schema_json, .{}) },
+    );
+    try writer.writeAll(entries_json);
     try writer.writeAll("\n  ]\n}\n");
     return try out.toOwnedSlice();
 }
@@ -74611,9 +74618,10 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     defer parsed_fixture.deinit();
 
     const root = try appParityJsonObject(parsed_fixture.value);
-    try appParityRequireOnlyKeys(root, &.{ "fixture_format", "schema_json", "entries" });
+    try appParityRequireOnlyKeys(root, &.{ "fixture_format", "entry_count", "schema_json", "entries" });
     const fixture_format = try appParityJsonOptionalU64(root, "fixture_format", 0);
     if (fixture_format != app_parity_fixture_format) return error.TestUnexpectedResult;
+    const expected_entry_count = try appParityJsonOptionalUsize(root, "entry_count") orelse return error.TestUnexpectedResult;
     const schema_json = try appParityJsonString(root.get("schema_json") orelse return error.TestUnexpectedResult);
     const entries_value = root.get("entries") orelse return error.TestUnexpectedResult;
     const entries = switch (entries_value) {
@@ -74621,6 +74629,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(entries.items.len > 0);
+    try std.testing.expectEqual(expected_entry_count, entries.items.len);
 
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
