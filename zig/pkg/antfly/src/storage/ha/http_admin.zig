@@ -1114,8 +1114,8 @@ fn adminFenceReceiptFromOpenApi(receipt: admin_api.HAFenceReceipt) !fencing.Rece
 fn adminIdentityFromOpenApi(identity: admin_api.openapi.HAIdentity) !standby_mod.Identity {
     return .{
         .cluster_id = try positiveUint64FromJson(identity.cluster_id),
-        .shard_id = try positiveUint64FromJson(identity.shard_id),
-        .table_id = try positiveUint64FromJson(identity.table_id),
+        .shard_id = try uint64FromJson(identity.shard_id),
+        .table_id = try uint64FromJson(identity.table_id),
         .timeline_id = try positiveUint64FromJson(identity.timeline_id),
         .epoch = try positiveUint64FromJson(identity.epoch),
     };
@@ -1689,6 +1689,48 @@ test "storage.ha http admin reports unsafe promotion as conflict" {
     try expectContains(unsafe_promote.body, "PromotionNotAllowed");
     try std.testing.expectEqual(@as(u64, 1), standby.identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+}
+
+test "storage.ha http admin accepts whole instance identity" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "whole-instance-identity");
+    defer paths.deinit(alloc);
+    const identity = standby_mod.Identity{
+        .cluster_id = 100,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{ .standby = &standby, .fence_store = &fence_store });
+    defer server.deinit();
+
+    var typed_fence = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_fence,
+        .content_type = "application/json",
+        .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":0,\"force\":true,\"reason\":\"whole-instance\"}",
+    });
+    defer typed_fence.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_fence.status);
+    try expectContains(typed_fence.body, "\"identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0");
+    try expectContains(typed_fence.body, "\"forced\":true");
+
+    var typed_promote = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_promotion_current_fence,
+        .content_type = "application/json",
+    });
+    defer typed_promote.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_promote.status);
+    try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":0,\"table_id\":0,\"timeline_id\":2");
+    try expectContains(typed_promote.body, "\"forced\":true");
+    try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
 }
 
 test "storage.ha http admin serves typed base backup seed endpoints" {

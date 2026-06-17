@@ -44,6 +44,27 @@ func TestUpdateHAStatusDisabledClearsStatusAndPublishesConditions(t *testing.T) 
 	}
 }
 
+func TestHAReplicationIdentityAllowsWholeInstanceScope(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          0,
+			TableID:          0,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	identity := haReplicationIdentity(ha)
+	if identity == nil {
+		t.Fatal("expected whole-instance HA identity to be accepted")
+	}
+	if identity.ShardID != 0 || identity.TableID != 0 {
+		t.Fatalf("expected zero shard/table identity to be preserved, got %#v", identity)
+	}
+}
+
 func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	initial := uint64(5)
 	cluster := haCluster()

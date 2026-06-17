@@ -620,11 +620,11 @@ type HAReplicationIdentitySpec struct {
 	// +optional
 	ClusterID uint64 `json:"clusterID,omitempty"`
 
-	// ShardID is the replicated shard identifier.
+	// ShardID is the replicated shard identifier. Zero means whole-instance or default shard scope.
 	// +optional
 	ShardID uint64 `json:"shardID,omitempty"`
 
-	// TableID is the replicated table identifier.
+	// TableID is the replicated table identifier. Zero means whole-instance or default table scope.
 	// +optional
 	TableID uint64 `json:"tableID,omitempty"`
 

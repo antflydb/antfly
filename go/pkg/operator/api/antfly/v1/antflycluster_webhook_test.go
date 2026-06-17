@@ -1830,8 +1830,8 @@ func TestValidateCreate_HighAvailabilityHotStandbyValid(t *testing.T) {
 		},
 		Identity: &HAReplicationIdentitySpec{
 			ClusterID:        100,
-			ShardID:          10,
-			TableID:          20,
+			ShardID:          0,
+			TableID:          0,
 			TimelineID:       1,
 			Epoch:            1,
 			CurrentPrimaryID: "primary-a",

@@ -3630,11 +3630,13 @@ spec:
                         format: int64
                         type: integer
                       shardID:
-                        description: ShardID is the replicated shard identifier.
+                        description: ShardID is the replicated shard identifier. Zero
+                          means whole-instance or default shard scope.
                         format: int64
                         type: integer
                       tableID:
-                        description: TableID is the replicated table identifier.
+                        description: TableID is the replicated table identifier. Zero
+                          means whole-instance or default table scope.
                         format: int64
                         type: integer
                       timelineID:

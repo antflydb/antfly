@@ -1096,8 +1096,8 @@ func haReplicationIdentity(ha *antflyv1.HighAvailabilitySpec) *antflyv1.HAReplic
 		return nil
 	}
 	identity := ha.Identity
-	if identity.ClusterID == 0 || identity.ShardID == 0 || identity.TableID == 0 ||
-		identity.TimelineID == 0 || identity.Epoch == 0 || identity.CurrentPrimaryID == "" {
+	if identity.ClusterID == 0 || identity.TimelineID == 0 ||
+		identity.Epoch == 0 || identity.CurrentPrimaryID == "" {
 		return nil
 	}
 	return identity
