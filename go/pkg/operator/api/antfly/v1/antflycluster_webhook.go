@@ -1206,6 +1206,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 	}
 
+	if ha.Runtime != nil && r.effectiveMode() != ClusterModeSwarm {
+		errors = append(errors, "spec.highAvailability.runtime is only supported when spec.mode=Swarm")
+	}
 	errors = append(errors, validateHARuntime(ha)...)
 	errors = append(errors, r.validateHARuntimeAdminTokenSource(ha)...)
 

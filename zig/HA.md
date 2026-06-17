@@ -505,9 +505,10 @@ checks and node-to-node `/internal/v1` replication traffic are separate from
 this control-plane auth path. The operator should read its outbound bearer token
 from `spec.highAvailability.admin.tokenEnvVar`, defaulting to
 `ANTFLY_HA_ADMIN_TOKEN`, and the Antfly pods should receive the same token
-through `spec.highAvailability.runtime.adminTokenEnvVar`. Kubernetes should
-inject both process environments from Secrets; the operator should not need
-direct Secret read permissions merely to call the HA admin API.
+through `spec.highAvailability.runtime.adminTokenEnvVar`, with pod injection
+from `spec.highAvailability.runtime.adminTokenSecretRef` or `spec.swarm.envFrom`.
+Kubernetes should inject both process environments from Secrets; the operator
+should not need direct Secret read permissions merely to call the HA admin API.
 For human or break-glass operations, `antfly ha --ha-url <url>` with
 `--ha-token-env ANTFLY_HA_ADMIN_TOKEN` should resolve the token from the
 operator/admin environment and send the same bearer header to typed admin
@@ -740,6 +741,10 @@ be validated against that operator package.
   the same token through `spec.swarm.envFrom` or the explicit
   `spec.highAvailability.runtime.adminTokenSecretRef` secret-key injection, and
   the process should fail closed if the configured env var is missing or empty.
+- Scope `spec.highAvailability.runtime` to operator Swarm mode until the
+  split metadata/data topology has first-class HA process wiring. Admission
+  should reject runtime fields outside Swarm mode instead of accepting settings
+  that are never passed to the Zig process.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.

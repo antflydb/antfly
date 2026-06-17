@@ -1934,6 +1934,31 @@ func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *test
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRuntimeRequiresSwarmMode(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA runtime configuration outside swarm mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime is only supported when spec.mode=Swarm") {
+		t.Fatalf("expected HA runtime swarm-mode validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
