@@ -1302,7 +1302,7 @@ pub fn replaceManifestSegmentsWithStatsAlloc(
     stats.removed_segments = found_remove_count;
 
     for (new_entries) |entry| output_entries.appendAssumeCapacity(entry);
-    std.mem.sort(ManifestEntry, output_entries.items, {}, manifestEntryLessThan);
+    sortManifestEntriesIfNeeded(output_entries.items);
 
     var next_segment_id = manifest.next_segment_id;
     for (new_entries) |entry| {
@@ -2178,7 +2178,7 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
             }
         }
     }
-    std.mem.sort(DeltaCandidate, deltas.items, {}, deltaCandidateLessThan);
+    sortDeltaCandidatesIfNeeded(deltas.items);
 
     var writer = Writer.init(alloc);
     defer writer.deinit();
@@ -3628,6 +3628,16 @@ fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
     return lhs.meta.segment_id < rhs.meta.segment_id;
 }
 
+fn sortManifestEntriesIfNeeded(entries: []ManifestEntry) void {
+    var index: usize = 1;
+    while (index < entries.len) : (index += 1) {
+        if (entries[index].meta.segment_id < entries[index - 1].meta.segment_id) {
+            std.mem.sort(ManifestEntry, entries, {}, manifestEntryLessThan);
+            return;
+        }
+    }
+}
+
 fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
     return lhs.sequence < rhs.sequence;
 }
@@ -3709,6 +3719,16 @@ fn deltaCandidateLessThan(_: void, lhs: DeltaCandidate, rhs: DeltaCandidate) boo
     if (lhs.record.sequence < rhs.record.sequence) return true;
     if (lhs.record.sequence > rhs.record.sequence) return false;
     return lhs.segment_id < rhs.segment_id;
+}
+
+fn sortDeltaCandidatesIfNeeded(candidates: []DeltaCandidate) void {
+    var index: usize = 1;
+    while (index < candidates.len) : (index += 1) {
+        if (deltaCandidateLessThan({}, candidates[index], candidates[index - 1])) {
+            std.mem.sort(DeltaCandidate, candidates, {}, deltaCandidateLessThan);
+            return;
+        }
+    }
 }
 
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
