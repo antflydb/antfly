@@ -498,7 +498,7 @@ func TestReconcileHAAdminJobsDoesNotRunImplicitCLIJob(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
-func TestReconcileHAAdminJobsRunsExplicitCLIJob(t *testing.T) {
+func TestReconcileHAAdminJobsRejectsCLIJobForTypedAdminAction(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -546,15 +546,14 @@ func TestReconcileHAAdminJobsRunsExplicitCLIJob(t *testing.T) {
 	}
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("marked CLIJob"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("typed /admin/v1"))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
-	g.Expect(jobs.Items).To(HaveLen(1))
-	g.Expect(jobs.Items[0].Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-		"ha", "--ha-url", "http://primary-ha.default.svc:8081", "--", "slot", "create", "--slot", "standby-a",
-	}))
+	g.Expect(jobs.Items).To(BeEmpty())
 }
 
 func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {

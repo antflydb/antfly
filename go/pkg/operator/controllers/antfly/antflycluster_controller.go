@@ -3351,6 +3351,11 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		if action.Executor != string(haActionExecutorCLIJob) {
 			continue
 		}
+		if haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+			action.AdminJobPhase = haAdminJobPhaseFailed
+			action.AdminError = fmt.Sprintf("HA action %s is marked CLIJob but has a typed /admin/v1 request; use AdminAPI execution or a pod-local action without a typed admin operation", action.Kind)
+			continue
+		}
 		if len(action.AdminCommand) == 0 {
 			continue
 		}
