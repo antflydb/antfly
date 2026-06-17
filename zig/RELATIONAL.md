@@ -1012,12 +1012,15 @@ validation, rebuild, repair, and parity fingerprints.
 The split should happen incrementally to avoid a risky parser rewrite. First
 extract `token.zig` and `lexer.zig` behind the existing entrypoints, preserving
 the current zero-copy token behavior, source spans, dollar-quoted literal
-handling, and strict placeholder validation. Next extract the parser cursor and
-shared expression grammar, because expressions are reused by SELECT, DML, DDL
-checks, partial indexes, defaults, generated columns, conflict actions, and
-RETURNING. Then move statement families one at a time into AST plus binder plus
-lowerer modules, with the existing SQL/API parity tests as the acceptance gate.
-Only after those boundaries are stable should a generated grammar be considered.
+handling, and strict placeholder validation. Statement-family classification
+then belongs in `classifier.zig`, so raw SQL dispatch is owned by the adapter
+module before the large lowerers create typed plans. Next extract the parser
+cursor and shared expression grammar, because expressions are reused by SELECT,
+DML, DDL checks, partial indexes, defaults, generated columns, conflict actions,
+and RETURNING. Then move statement families one at a time into AST plus binder
+plus lowerer modules, with the existing SQL/API parity tests as the acceptance
+gate. Only after those boundaries are stable should a generated grammar be
+considered.
 
 Efficiency follows those same boundaries. Lexer and parser data should be
 statement-scoped and arena-allocated where useful. Token text should reference

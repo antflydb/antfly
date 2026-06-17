@@ -3816,10 +3816,9 @@ pub fn lowerWritePlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return error.UnsupportedSqlShape;
-    const first = tokens.items[0].text;
+    const write_kind = sql_adapter.classifyWriteStatement(tokens.items) orelse return error.UnsupportedSqlShape;
 
-    if (std.ascii.eqlIgnoreCase(first, "insert")) {
+    if (write_kind == .insert) {
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
         var point_insert_err: ?anyerror = null;
         if (lowerInsertWithResolverAlloc(alloc, sql, schema, params, resolver)) |lowered| {
@@ -3840,7 +3839,7 @@ pub fn lowerWritePlanAlloc(
         }
     }
 
-    if (std.ascii.eqlIgnoreCase(first, "with")) {
+    if (write_kind == .insert_source) {
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
         if (options.insert_source_schema) |source_schema| {
             return .{ .insert_source = try lowerInsertSourceWithSchemasAlloc(alloc, sql, schema, source_schema, params, resolver) };
@@ -3848,7 +3847,7 @@ pub fn lowerWritePlanAlloc(
         return .{ .insert_source = try lowerInsertSourceWithResolverAlloc(alloc, sql, schema, params, resolver) };
     }
 
-    if (std.ascii.eqlIgnoreCase(first, "update")) {
+    if (write_kind == .update) {
         if (options.row_claim) |row_claim| {
             const source_schema = options.joined_source_schema orelse schema;
             if (lowerUpdateJoinedMutationSourceWithSchemasAlloc(alloc, sql, schema, source_schema, params, row_claim)) |lowered| {
@@ -3866,7 +3865,7 @@ pub fn lowerWritePlanAlloc(
         return error.UnsupportedRowsSelector;
     }
 
-    if (std.ascii.eqlIgnoreCase(first, "delete")) {
+    if (write_kind == .delete) {
         if (options.row_claim) |row_claim| {
             const source_schema = options.joined_source_schema orelse schema;
             if (lowerDeleteJoinedMutationSourceWithSchemasAlloc(alloc, sql, schema, source_schema, params, row_claim)) |lowered| {
@@ -3884,12 +3883,12 @@ pub fn lowerWritePlanAlloc(
         return error.UnsupportedRowsSelector;
     }
 
-    if (std.ascii.eqlIgnoreCase(first, "truncate")) {
+    if (write_kind == .truncate) {
         const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
         return .{ .truncate_source = try lowerTruncateMutationSourceAlloc(alloc, sql, schema, row_claim) };
     }
 
-    if (std.ascii.eqlIgnoreCase(first, "merge")) {
+    if (write_kind == .merge) {
         const source_schema = options.joined_source_schema orelse schema;
         return .{ .merge_mutation = try lowerMergeMutationPlanAlloc(alloc, sql, schema, source_schema, params) };
     }
