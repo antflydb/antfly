@@ -38,6 +38,7 @@ const replication_api = @import("replication_api.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const session = @import("session.zig");
+const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
 const write_gate = @import("write_gate.zig");
@@ -161,6 +162,13 @@ pub fn renderJsonAlloc(alloc: Allocator, result: Result) ![]u8 {
 
 fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Result) ![]u8 {
     return switch (result) {
+        .primary_status => |snapshot| try renderPrimaryStatusJsonAlloc(alloc, snapshot),
+        .standby_status => |snapshot| try renderStandbyStatusJsonAlloc(alloc, snapshot),
+        .commit_check => |gate| try renderCommitCheckJsonAlloc(alloc, gate),
+        .commit_append => |append_result| try renderCommitAppendJsonAlloc(alloc, append_result),
+        .read_check => |decision| try renderReadCheckJsonAlloc(alloc, decision),
+        .write_check => |decision| try renderWriteCheckJsonAlloc(alloc, decision),
+        .owner_job_check => |decision| try renderOwnerJobCheckJsonAlloc(alloc, decision),
         .promote_assess => |assessment| {
             if (standbyActionNodeID(maybe_ctx)) |node_id| {
                 if (std.mem.trim(u8, node_id, " \t\r\n").len != 0) {
@@ -171,6 +179,58 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
         },
         else => try renderJsonAlloc(alloc, result),
     };
+}
+
+fn renderPrimaryStatusJsonAlloc(alloc: Allocator, snapshot: status.PrimarySnapshot) ![]u8 {
+    const response = admin_api.HAPrimaryStatusResponse{
+        .schema_version = 1,
+        .snapshot = try adminPrimarySnapshot(alloc, snapshot),
+    };
+    defer alloc.free(response.snapshot.slots);
+    return try std.json.Stringify.valueAlloc(alloc, response, .{});
+}
+
+fn renderStandbyStatusJsonAlloc(alloc: Allocator, snapshot: status.StandbySnapshot) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAStandbyStatusResponse{
+        .schema_version = 1,
+        .snapshot = try adminStandbySnapshot(snapshot),
+    }, .{});
+}
+
+fn renderCommitCheckJsonAlloc(alloc: Allocator, gate: commit_gate.GateResult) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HACommitCheckResponse{
+        .schema_version = 1,
+        .gate = try adminCommitGate(gate),
+    }, .{});
+}
+
+fn renderCommitAppendJsonAlloc(alloc: Allocator, append_result: commit_gate.AppendResult) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HACommitAppendResponse{
+        .schema_version = 1,
+        .lsn = try adminI64(append_result.lsn),
+        .gate = try adminCommitGate(append_result.gate),
+    }, .{});
+}
+
+fn renderReadCheckJsonAlloc(alloc: Allocator, decision: read_gate.Decision) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAReadCheckResponse{
+        .schema_version = 1,
+        .decision = try adminReadDecision(decision),
+    }, .{});
+}
+
+fn renderWriteCheckJsonAlloc(alloc: Allocator, decision: write_gate.Decision) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAWriteCheckResponse{
+        .schema_version = 1,
+        .decision = try adminWriteDecision(decision),
+    }, .{});
+}
+
+fn renderOwnerJobCheckJsonAlloc(alloc: Allocator, decision: owner_job_gate.Decision) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, admin_api.HAOwnerJobCheckResponse{
+        .schema_version = 1,
+        .decision = try adminOwnerJobDecision(decision),
+    }, .{});
 }
 
 fn renderPromotionAssessJsonAlloc(
@@ -213,6 +273,147 @@ fn adminPromotionAssessment(assessment: status.PromotionAssessment) !admin_api.H
 fn adminI64(value: u64) !i64 {
     if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.AdminOpenAPIIntegerOverflow;
     return @intCast(value);
+}
+
+fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
+    return .{
+        .cluster_id = try adminI64(identity.cluster_id),
+        .shard_id = try adminI64(identity.shard_id),
+        .table_id = try adminI64(identity.table_id),
+        .timeline_id = try adminI64(identity.timeline_id),
+        .epoch = try adminI64(identity.epoch),
+    };
+}
+
+fn adminPrimarySnapshot(alloc: Allocator, snapshot: status.PrimarySnapshot) !admin_api.HAPrimarySnapshot {
+    return .{
+        .role = @tagName(snapshot.role),
+        .identity = try adminIdentity(snapshot.identity),
+        .current_lsn = try adminI64(snapshot.current_lsn),
+        .slots = try adminSlotSnapshots(alloc, snapshot.slots),
+        .retention = try adminRetentionSnapshot(snapshot.retention),
+        .durability = if (snapshot.durability) |decision| try adminDurabilityDecision(decision) else null,
+    };
+}
+
+fn adminStandbySnapshot(snapshot: status.StandbySnapshot) !admin_api.HAStandbySnapshot {
+    return .{
+        .role = @tagName(snapshot.role),
+        .identity = try adminIdentity(snapshot.identity),
+        .received_lsn = try adminI64(snapshot.received_lsn),
+        .applied_lsn = try adminI64(snapshot.applied_lsn),
+        .safe_read_lsn = try adminI64(snapshot.safe_read_lsn),
+        .upstream_lsn = if (snapshot.upstream_lsn) |value| try adminI64(value) else null,
+        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| try adminI64(value) else null,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| try adminI64(value) else null,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| try adminI64(value) else null,
+        .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
+        .caught_up_to_received = snapshot.caught_up_to_received,
+        .can_serve_safe_reads = snapshot.can_serve_safe_reads,
+    };
+}
+
+fn adminSlotSnapshots(alloc: Allocator, slots: []const status.SlotSnapshot) ![]admin_api.HASlotSnapshot {
+    const admin_slots = try alloc.alloc(admin_api.HASlotSnapshot, slots.len);
+    errdefer alloc.free(admin_slots);
+    for (slots, 0..) |slot, idx| {
+        admin_slots[idx] = .{
+            .name = slot.name,
+            .timeline_id = try adminI64(slot.timeline_id),
+            .active = slot.active,
+            .reseed_required = slot.reseed_required,
+            .restart_lsn = try adminI64(slot.restart_lsn),
+            .received_lsn = try adminI64(slot.received_lsn),
+            .applied_lsn = try adminI64(slot.applied_lsn),
+            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
+            .write_lag_lsn = try adminI64(slot.write_lag_lsn),
+            .apply_lag_lsn = try adminI64(slot.apply_lag_lsn),
+            .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
+            .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
+            .status = @tagName(slot.status),
+            .last_error = slot.last_error,
+        };
+    }
+    return admin_slots;
+}
+
+fn adminRetentionSnapshot(snapshot: slot_store.RetentionSnapshot) !admin_api.HARetentionSnapshot {
+    return .{
+        .primary_lsn = try adminI64(snapshot.primary_lsn),
+        .oldest_restart_lsn = try adminI64(snapshot.oldest_restart_lsn),
+        .retained_lsn_count = try adminI64(snapshot.retained_lsn_count),
+        .active_slots = try adminI64(snapshot.active_slots),
+        .reseed_recommended = try adminI64(snapshot.reseed_recommended),
+    };
+}
+
+fn adminCommitGate(gate: commit_gate.GateResult) !admin_api.HACommitGate {
+    return .{
+        .target_lsn = try adminI64(gate.target_lsn),
+        .action = @tagName(gate.action),
+        .durability = try adminDurabilityDecision(gate.decision),
+    };
+}
+
+fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.HADurabilityDecision {
+    return .{
+        .status = @tagName(decision.status),
+        .mode = @tagName(decision.mode),
+        .selection = @tagName(decision.selection),
+        .target_lsn = try adminI64(decision.target_lsn),
+        .progress_lsn = try adminI64(decision.progress_lsn),
+        .missing_lsn_count = try adminI64(decision.missing_lsn_count),
+        .satisfied_count = try adminI64(decision.satisfied_count),
+        .required_count = try adminI64(decision.required_count),
+        .candidate_count = try adminI64(decision.candidate_count),
+    };
+}
+
+fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
+    return .{
+        .action = @tagName(decision.action),
+        .consistency = @tagName(decision.consistency),
+        .required_lsn = if (decision.required_lsn) |value| try adminI64(value) else null,
+        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| try adminI64(value) else null,
+        .received_lsn = try adminI64(decision.received_lsn),
+        .applied_lsn = try adminI64(decision.applied_lsn),
+        .safe_read_lsn = try adminI64(decision.safe_read_lsn),
+        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| try adminI64(value) else null,
+        .serve_lsn = if (decision.serve_lsn) |value| try adminI64(value) else null,
+        .missing_lsn_count = try adminI64(decision.missing_lsn_count),
+        .metadata_missing_lsn_count = try adminI64(decision.metadata_missing_lsn_count),
+    };
+}
+
+fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision {
+    return .{
+        .role = @tagName(decision.role),
+        .action = @tagName(decision.action),
+        .identity = try adminIdentity(decision.identity),
+        .durable_lsn = try adminI64(decision.durable_lsn),
+        .next_lsn = try adminI64(decision.next_lsn),
+        .promotion_handoff = if (decision.promotion_handoff) |handoff| try adminPromotionHandoff(handoff) else null,
+    };
+}
+
+fn adminOwnerJobDecision(decision: owner_job_gate.Decision) !admin_api.HAOwnerJobDecision {
+    return .{
+        .kind = @tagName(decision.kind),
+        .role = @tagName(decision.role),
+        .action = @tagName(decision.action),
+        .identity = try adminIdentity(decision.identity),
+        .durable_lsn = try adminI64(decision.durable_lsn),
+        .next_lsn = try adminI64(decision.next_lsn),
+        .promotion_handoff = if (decision.promotion_handoff) |handoff| try adminPromotionHandoff(handoff) else null,
+    };
+}
+
+fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPromotionHandoff {
+    return .{
+        .identity = try adminIdentity(handoff.identity),
+        .switch_lsn = try adminI64(handoff.switch_lsn),
+        .next_lsn = try adminI64(handoff.next_lsn),
+    };
 }
 
 pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
@@ -1529,6 +1730,14 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(status_table, "durability.missing_lsn_count=1\n");
     try expectContains(status_table, "slots.0.last_error=IntentionalApplyFailure\n");
 
+    var status_json = try executeAndRenderAlloc(alloc, .{ .primary = &primary }, primary_status_plan);
+    defer status_json.deinit(alloc);
+    try std.testing.expectEqualStrings("application/json", status_json.content_type);
+    try expectContains(status_json.body, "\"schema_version\":1");
+    try expectContains(status_json.body, "\"snapshot\"");
+    try expectContains(status_json.body, "\"durability\"");
+    try expectContains(status_json.body, "\"last_error\":\"IntentionalApplyFailure\"");
+
     var status_plan = try admin_cli.parse(alloc, &.{
         "status",
         "primary",
@@ -2230,7 +2439,9 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     var rendered_json = try executeAndRenderAlloc(alloc, .{ .standby = &standby }, json_plan);
     defer rendered_json.deinit(alloc);
     try std.testing.expectEqualStrings("application/json", rendered_json.content_type);
-    try expectContains(rendered_json.body, "\"read_check\"");
+    try expectContains(rendered_json.body, "\"schema_version\":1");
+    try expectContains(rendered_json.body, "\"decision\"");
+    try expectContains(rendered_json.body, "\"action\":\"serve_standby\"");
 
     var table_plan = try admin_cli.parse(alloc, &.{ "--table", "read", "check", "--at-least-lsn", "1" });
     defer table_plan.deinit(alloc);
