@@ -1474,6 +1474,23 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://old-primary-ha.default.svc:8081" {
 		t.Fatalf("expected former primary rejoin to target former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
+
+	cluster.Status.HAStatus.LastPromotion.Forced = true
+	cluster.Status.HAStatus.LastPromotion.DataLossPossible = true
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if len(cluster.Status.HAStatus.PlannedActions) != 2 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionReseedFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" {
+		t.Fatalf("expected forced promotion to require former-primary reseed, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	forcedCommand := strings.Join(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, " ")
+	if !strings.Contains(forcedCommand, "--fence-forced") {
+		t.Fatalf("expected forced rejoin command to carry forced fence evidence, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+	}
+	if strings.Contains(forcedCommand, "allow-rewind-after-forced-promotion") {
+		t.Fatalf("forced promotion must not opt into former-primary rewind automatically, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+	}
 }
 
 func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
