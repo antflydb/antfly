@@ -1580,6 +1580,22 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	SchemaVersion uint32 `json:"schemaVersion,omitempty"`
 
+	// ActionID is the stable typed HA admin action correlation id.
+	// +optional
+	ActionID string `json:"actionID,omitempty"`
+
+	// ActionKind is the typed HA admin action kind that produced this result.
+	// +optional
+	ActionKind string `json:"actionKind,omitempty"`
+
+	// ActionTarget is the node id, slot name, manifest id, or promotion boundary acted on.
+	// +optional
+	ActionTarget string `json:"actionTarget,omitempty"`
+
+	// ActionState is the idempotency state returned by the HA admin action.
+	// +optional
+	ActionState string `json:"actionState,omitempty"`
+
 	// SlotAction is the executed replication slot action.
 	// +optional
 	SlotAction string `json:"slotAction,omitempty"`

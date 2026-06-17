@@ -8773,6 +8773,22 @@ spec:
                           description: AdminResult records stable identifiers returned
                             by a successful typed /admin/v1 HA operation.
                           properties:
+                            actionID:
+                              description: ActionID is the stable typed HA admin action
+                                correlation id.
+                              type: string
+                            actionKind:
+                              description: ActionKind is the typed HA admin action
+                                kind that produced this result.
+                              type: string
+                            actionState:
+                              description: ActionState is the idempotency state returned
+                                by the HA admin action.
+                              type: string
+                            actionTarget:
+                              description: ActionTarget is the node id, slot name,
+                                manifest id, or promotion boundary acted on.
+                              type: string
                             backupLSN:
                               description: BackupLSN is the base-backup stream boundary
                                 returned by seed operations.

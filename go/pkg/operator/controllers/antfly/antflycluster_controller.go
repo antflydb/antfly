@@ -3717,9 +3717,17 @@ func haSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName strin
 	return fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)
 }
 
+type haAdminActionReceiptJSON struct {
+	ActionID   string `json:"action_id"`
+	ActionKind string `json:"action_kind"`
+	Target     string `json:"target"`
+	State      string `json:"state"`
+}
+
 type haDirectAdminActionResultJSON struct {
-	SchemaVersion uint32 `json:"schema_version"`
-	SlotAction    string `json:"slot_action"`
+	SchemaVersion uint32                   `json:"schema_version"`
+	Action        haAdminActionReceiptJSON `json:"action"`
+	SlotAction    string                   `json:"slot_action"`
 	Slot          struct {
 		SlotName string `json:"slot_name"`
 	} `json:"slot"`
@@ -3816,6 +3824,10 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 	}
 	status := &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion:         result.SchemaVersion,
+		ActionID:              strings.TrimSpace(result.Action.ActionID),
+		ActionKind:            strings.TrimSpace(result.Action.ActionKind),
+		ActionTarget:          strings.TrimSpace(result.Action.Target),
+		ActionState:           strings.TrimSpace(result.Action.State),
 		SlotAction:            strings.TrimSpace(result.SlotAction),
 		SlotName:              strings.TrimSpace(result.SlotName),
 		ManifestID:            strings.TrimSpace(result.ManifestID),
@@ -3843,6 +3855,10 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		status.SlotName = strings.TrimSpace(result.Slot.SlotName)
 	}
 	if status.SlotAction == "" &&
+		status.ActionID == "" &&
+		status.ActionKind == "" &&
+		status.ActionTarget == "" &&
+		status.ActionState == "" &&
 		status.SlotName == "" &&
 		status.ManifestID == "" &&
 		status.BackupLSN == 0 &&
@@ -3865,6 +3881,10 @@ func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionRes
 		result.StartRecordLSN != 0 ||
 		result.EndRecordLSN != 0 ||
 		result.CheckpointLSN != 0 ||
+		strings.TrimSpace(result.Action.ActionID) != "" ||
+		strings.TrimSpace(result.Action.ActionKind) != "" ||
+		strings.TrimSpace(result.Action.Target) != "" ||
+		strings.TrimSpace(result.Action.State) != "" ||
 		result.Receipt.Generation != 0 ||
 		strings.TrimSpace(result.Receipt.Token) != "" ||
 		result.Receipt.Identity.ClusterID != 0 ||
@@ -3952,10 +3972,14 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 		return nil, false
 	}
 	result := &antflyv1.HAAdminActionResultStatus{
-		SlotAction: strings.TrimSpace(lines["slot_action"]),
-		SlotName:   strings.TrimSpace(lines["slot_name"]),
-		ManifestID: strings.TrimSpace(lines["manifest_id"]),
-		FenceToken: strings.TrimSpace(lines["token"]),
+		ActionID:     strings.TrimSpace(lines["action.action_id"]),
+		ActionKind:   strings.TrimSpace(lines["action.action_kind"]),
+		ActionTarget: strings.TrimSpace(lines["action.target"]),
+		ActionState:  strings.TrimSpace(lines["action.state"]),
+		SlotAction:   strings.TrimSpace(lines["slot_action"]),
+		SlotName:     strings.TrimSpace(lines["slot_name"]),
+		ManifestID:   strings.TrimSpace(lines["manifest_id"]),
+		FenceToken:   strings.TrimSpace(lines["token"]),
 	}
 	if result.FenceToken == "" {
 		result.FenceToken = strings.TrimSpace(lines["fence_token"])
@@ -4002,6 +4026,10 @@ func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultSt
 		result.SlotAction = resultName
 	}
 	if result.SlotAction == "" &&
+		result.ActionID == "" &&
+		result.ActionKind == "" &&
+		result.ActionTarget == "" &&
+		result.ActionState == "" &&
 		result.SlotName == "" &&
 		result.ManifestID == "" &&
 		result.BackupLSN == 0 &&
@@ -4056,6 +4084,10 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 
 func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
+		ActionID:              strings.TrimSpace(result.ActionID),
+		ActionKind:            strings.TrimSpace(result.ActionKind),
+		ActionTarget:          strings.TrimSpace(result.ActionTarget),
+		ActionState:           strings.TrimSpace(result.ActionState),
 		FenceGeneration:       result.FenceGeneration,
 		FenceToken:            result.FenceToken,
 		FenceClusterID:        result.NewClusterID,
@@ -4369,6 +4401,10 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 }
 
 type haPromotionJobResult struct {
+	ActionID         string
+	ActionKind       string
+	ActionTarget     string
+	ActionState      string
 	PromotedNodeID   string
 	SwitchLSN        uint64
 	ParentClusterID  uint64
@@ -4398,6 +4434,10 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 
 	var result haPromotionJobResult
 	var ok bool
+	result.ActionID = strings.TrimSpace(lines["action.action_id"])
+	result.ActionKind = strings.TrimSpace(lines["action.action_kind"])
+	result.ActionTarget = strings.TrimSpace(lines["action.target"])
+	result.ActionState = strings.TrimSpace(lines["action.state"])
 	result.PromotedNodeID = strings.TrimSpace(lines["promotion.node_id"])
 	if result.PromotedNodeID == "" {
 		return haPromotionJobResult{}, false
@@ -4457,6 +4497,7 @@ type haPromotionAPIResultEnvelope struct {
 }
 
 type haPromotionAPIResult struct {
+	Action     haAdminActionReceiptJSON `json:"action"`
 	Assessment struct {
 		RequiredLSN uint64 `json:"required_lsn"`
 		ReceivedLSN uint64 `json:"received_lsn"`
@@ -4523,6 +4564,10 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		observedLSN = requiredLSN
 	}
 	return haPromotionJobResult{
+		ActionID:         strings.TrimSpace(result.Action.ActionID),
+		ActionKind:       strings.TrimSpace(result.Action.ActionKind),
+		ActionTarget:     strings.TrimSpace(result.Action.Target),
+		ActionState:      strings.TrimSpace(result.Action.State),
 		PromotedNodeID:   strings.TrimSpace(result.Promotion.NodeID),
 		SwitchLSN:        result.Promotion.SwitchLSN,
 		ParentClusterID:  result.Promotion.OldIdentity.ClusterID,
@@ -4545,6 +4590,10 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 }
 
 type haRejoinJobResult struct {
+	ActionID                 string
+	ActionKind               string
+	ActionTarget             string
+	ActionState              string
 	Action                   string
 	Reason                   string
 	FormerNodeID             string
@@ -4578,6 +4627,10 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 		return haRejoinJobResult{}, false
 	}
 	result := haRejoinJobResult{
+		ActionID:     strings.TrimSpace(lines["action.action_id"]),
+		ActionKind:   strings.TrimSpace(lines["action.action_kind"]),
+		ActionTarget: strings.TrimSpace(lines["action.target"]),
+		ActionState:  strings.TrimSpace(lines["action.state"]),
 		Action:       strings.TrimSpace(lines[assessmentPrefix+"action"]),
 		Reason:       strings.TrimSpace(lines[assessmentPrefix+"reason"]),
 		FormerNodeID: strings.TrimSpace(lines[assessmentPrefix+"former_node_id"]),
@@ -4689,9 +4742,10 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 }
 
 type haRejoinAPIResultEnvelope struct {
-	Assessment haRejoinAPIResult  `json:"assessment"`
-	Rewind     *haRejoinAPIRewind `json:"rewind,omitempty"`
-	Reseed     *haRejoinAPIReseed `json:"reseed,omitempty"`
+	Action     haAdminActionReceiptJSON `json:"action"`
+	Assessment haRejoinAPIResult        `json:"assessment"`
+	Rewind     *haRejoinAPIRewind       `json:"rewind,omitempty"`
+	Reseed     *haRejoinAPIReseed       `json:"reseed,omitempty"`
 }
 
 type haRejoinAPIResult struct {
@@ -4742,6 +4796,10 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 		return haRejoinJobResult{}, false
 	}
 	result := haRejoinJobResult{
+		ActionID:          strings.TrimSpace(envelope.Action.ActionID),
+		ActionKind:        strings.TrimSpace(envelope.Action.ActionKind),
+		ActionTarget:      strings.TrimSpace(envelope.Action.Target),
+		ActionState:       strings.TrimSpace(envelope.Action.State),
 		Action:            strings.TrimSpace(assessment.Action),
 		Reason:            strings.TrimSpace(assessment.Reason),
 		FormerNodeID:      strings.TrimSpace(assessment.FormerNodeID),
@@ -4806,6 +4864,10 @@ func applyHARejoinAdminActionResult(status *antflyv1.HAAdminActionResultStatus, 
 	if status == nil {
 		return
 	}
+	status.ActionID = strings.TrimSpace(result.ActionID)
+	status.ActionKind = strings.TrimSpace(result.ActionKind)
+	status.ActionTarget = strings.TrimSpace(result.ActionTarget)
+	status.ActionState = strings.TrimSpace(result.ActionState)
 	status.RejoinAction = result.Action
 	status.RejoinReason = result.Reason
 	status.FormerNodeID = result.FormerNodeID
@@ -4835,6 +4897,10 @@ func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus
 		return haRejoinJobResult{}, false
 	}
 	return haRejoinJobResult{
+		ActionID:                 strings.TrimSpace(result.ActionID),
+		ActionKind:               strings.TrimSpace(result.ActionKind),
+		ActionTarget:             strings.TrimSpace(result.ActionTarget),
+		ActionState:              strings.TrimSpace(result.ActionState),
 		Action:                   strings.TrimSpace(result.RejoinAction),
 		Reason:                   strings.TrimSpace(result.RejoinReason),
 		FormerNodeID:             strings.TrimSpace(result.FormerNodeID),

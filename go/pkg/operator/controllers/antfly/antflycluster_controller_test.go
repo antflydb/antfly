@@ -270,7 +270,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -281,7 +281,7 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
@@ -1357,13 +1357,13 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups":
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups/finish":
 				var body map[string]any
@@ -1372,7 +1372,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
 				}, nil
 			case "/admin/v1/ha/standby/bootstrap":
 				var body map[string]any
@@ -1382,7 +1382,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
@@ -1397,9 +1397,14 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionID).To(Equal("replication_slot_create:standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionKind).To(Equal("replication_slot_create"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionTarget).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.ActionState).To(Equal("applied"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
@@ -1408,6 +1413,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(finish.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(finish.AdminResult).NotTo(BeNil())
+	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
 	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
@@ -1415,6 +1421,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(bootstrap.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(bootstrap.AdminResult).NotTo(BeNil())
+	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
 	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(5)))
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/replication-slots",
@@ -2352,8 +2359,12 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(openAPIResult.ActionID).To(Equal("promotion:standby-a"))
+	g.Expect(openAPIResult.ActionKind).To(Equal("promotion"))
+	g.Expect(openAPIResult.ActionTarget).To(Equal("standby-a"))
+	g.Expect(openAPIResult.ActionState).To(Equal("applied"))
 	g.Expect(openAPIResult.PromotedNodeID).To(Equal("standby-a"))
 	g.Expect(openAPIResult.SwitchLSN).To(Equal(uint64(12)))
 	g.Expect(openAPIResult.ParentClusterID).To(Equal(uint64(100)))
@@ -2366,6 +2377,11 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(openAPIResult.ObservedLSN).To(Equal(uint64(13)))
 	g.Expect(openAPIResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIResult.FenceToken).To(Equal("ha-fence-token"))
+	openAPIStatus := haPromotionAdminActionResult(openAPIResult)
+	g.Expect(openAPIStatus.ActionID).To(Equal("promotion:standby-a"))
+	g.Expect(openAPIStatus.ActionKind).To(Equal("promotion"))
+	g.Expect(openAPIStatus.ActionTarget).To(Equal("standby-a"))
+	g.Expect(openAPIStatus.ActionState).To(Equal("applied"))
 
 	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
@@ -2388,9 +2404,13 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	seed, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
+	seed, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(seed.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(seed.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
+	g.Expect(seed.ActionKind).To(Equal("base_backup_begin"))
+	g.Expect(seed.ActionTarget).To(Equal("base-standby-a-5"))
+	g.Expect(seed.ActionState).To(Equal("applied"))
 	g.Expect(seed.SlotName).To(Equal("standby-a"))
 	g.Expect(seed.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(seed.BackupLSN).To(Equal(uint64(5)))
@@ -2454,12 +2474,20 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 
 	finish, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=seed_finish",
+		"action.action_id=base_backup_finish:base-standby-a-5",
+		"action.action_kind=base_backup_finish",
+		"action.target=base-standby-a-5",
+		"action.state=applied",
 		"manifest_id=base-standby-a-5",
 		"backup_lsn=5",
 		"end_record_lsn=8",
 		"",
 	}, "\n"))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(finish.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
+	g.Expect(finish.ActionKind).To(Equal("base_backup_finish"))
+	g.Expect(finish.ActionTarget).To(Equal("base-standby-a-5"))
+	g.Expect(finish.ActionState).To(Equal("applied"))
 	g.Expect(finish.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(finish.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
@@ -2488,6 +2516,10 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 
 	promotion, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=promote_current_fence",
+		"action.action_id=promotion:standby-a",
+		"action.action_kind=promotion",
+		"action.target=standby-a",
+		"action.state=applied",
 		"assessment.required_lsn=12",
 		"assessment.received_lsn=13",
 		"assessment.applied_lsn=12",
@@ -2504,6 +2536,10 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"",
 	}, "\n"))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(promotion.ActionID).To(Equal("promotion:standby-a"))
+	g.Expect(promotion.ActionKind).To(Equal("promotion"))
+	g.Expect(promotion.ActionTarget).To(Equal("standby-a"))
+	g.Expect(promotion.ActionState).To(Equal("applied"))
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceToken).To(Equal("promotion-token"))
 	g.Expect(promotion.FencePromotedNodeID).To(Equal("standby-a"))
@@ -2523,6 +2559,10 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 
 	rejoin, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=rejoin_assess",
+		"action.action_id=rejoin_assess:primary-a",
+		"action.action_kind=rejoin_assess",
+		"action.target=primary-a",
+		"action.state=assessed",
 		"action=rewind",
 		"reason=parent_timeline_retained",
 		"former_node_id=primary-a",
@@ -2535,6 +2575,10 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"",
 	}, "\n"))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(rejoin.ActionID).To(Equal("rejoin_assess:primary-a"))
+	g.Expect(rejoin.ActionKind).To(Equal("rejoin_assess"))
+	g.Expect(rejoin.ActionTarget).To(Equal("primary-a"))
+	g.Expect(rejoin.ActionState).To(Equal("assessed"))
 	g.Expect(rejoin.RejoinAction).To(Equal("rewind"))
 	g.Expect(rejoin.RejoinReason).To(Equal("parent_timeline_retained"))
 	g.Expect(rejoin.FormerNodeID).To(Equal("primary-a"))
@@ -2803,8 +2847,12 @@ func TestParseHARejoinJobResult(t *testing.T) {
 func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(result.ActionID).To(Equal("rejoin_rewind:primary-a"))
+	g.Expect(result.ActionKind).To(Equal("rejoin_rewind"))
+	g.Expect(result.ActionTarget).To(Equal("primary-a"))
+	g.Expect(result.ActionState).To(Equal("applied"))
 	g.Expect(result.Action).To(Equal("rewind"))
 	g.Expect(result.RewindExecuted).To(BeTrue())
 	g.Expect(result.RewindPreviousLastLSN).To(Equal(uint64(13)))
@@ -2814,6 +2862,10 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g.Expect(result.DataLossDiscarded).To(BeTrue())
 
 	status := haRejoinAdminActionResult(result)
+	g.Expect(status.ActionID).To(Equal("rejoin_rewind:primary-a"))
+	g.Expect(status.ActionKind).To(Equal("rejoin_rewind"))
+	g.Expect(status.ActionTarget).To(Equal("primary-a"))
+	g.Expect(status.ActionState).To(Equal("applied"))
 	g.Expect(status.RewindExecuted).To(BeTrue())
 	g.Expect(status.RewindPreviousLastLSN).To(Equal(uint64(13)))
 	g.Expect(status.RewindCurrentLastLSN).To(Equal(uint64(12)))
@@ -2822,6 +2874,7 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 
 	roundTripped, ok := haRejoinJobResultFromAdminResult(status)
 	g.Expect(ok).To(BeTrue())
+	g.Expect(roundTripped.ActionID).To(Equal("rejoin_rewind:primary-a"))
 	g.Expect(roundTripped.RewindExecuted).To(BeTrue())
 	g.Expect(roundTripped.RewindDiscardedLSNCount).To(Equal(uint64(1)))
 
@@ -2838,8 +2891,12 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g := NewWithT(t)
 
-	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"node_id":"primary-a","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
+	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_reseed:primary-a","action_kind":"rejoin_reseed","target":"primary-a","state":"applied"},"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"node_id":"primary-a","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(result.ActionID).To(Equal("rejoin_reseed:primary-a"))
+	g.Expect(result.ActionKind).To(Equal("rejoin_reseed"))
+	g.Expect(result.ActionTarget).To(Equal("primary-a"))
+	g.Expect(result.ActionState).To(Equal("applied"))
 	g.Expect(result.Action).To(Equal("reseed"))
 	g.Expect(result.ReseedExecuted).To(BeTrue())
 	g.Expect(result.ReseedSlotName).To(Equal("primary-a"))
@@ -2847,6 +2904,7 @@ func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g.Expect(result.ReseedBaseBackupRequired).To(BeTrue())
 
 	status := haRejoinAdminActionResult(result)
+	g.Expect(status.ActionID).To(Equal("rejoin_reseed:primary-a"))
 	g.Expect(status.ReseedExecuted).To(BeTrue())
 	g.Expect(status.ReseedSlotName).To(Equal("primary-a"))
 	g.Expect(status.ReseedRequired).To(BeTrue())
