@@ -335,6 +335,16 @@ func TestHAPlannedActionStatusesDropInvalidDirectAdminSuccess(t *testing.T) {
 		preserved[0].AdminResult != nil {
 		t.Fatalf("expected invalid direct admin success to be dropped, got %#v", preserved[0])
 	}
+
+	previous.AdminJobName = "legacy-cli-job"
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+	preserved = haPlannedActionStatuses(actions, ha, status)
+	if preserved[0].AdminJobName != "" ||
+		preserved[0].AdminJobPhase != "" ||
+		preserved[0].AdminError != "" ||
+		preserved[0].AdminResult != nil {
+		t.Fatalf("expected invalid CLI-backed admin success to be dropped, got %#v", preserved[0])
+	}
 }
 
 func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(t *testing.T) {
@@ -422,11 +432,15 @@ func TestHAPlannedActionStatusesDropFormerPrimarySuccessWithoutPromotionReceipt(
 func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			CurrentPrimaryID: "primary-a",
+		},
 	}
 	actions := []haPlannedAction{{
 		Kind:             haActionFinishStandbySeed,
 		DependsOn:        haActionSeedStandby,
 		StandbyName:      "standby-a",
+		TargetLSN:        5,
 		SeedManifestPath: "/backup/base-standby-a-5.afha",
 		Reason:           "SeedManifestReady",
 	}}
@@ -441,7 +455,14 @@ func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *te
 	previous.AdminJobPhase = haAdminJobPhaseSucceeded
 	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion: 1,
+		ActionID:      "base_backup_finish:base-standby-a-5",
+		ActionKind:    "base_backup_finish",
+		ActionTarget:  "base-standby-a-5",
+		ActionState:   "applied",
+		ActionNodeID:  "primary-a",
 		ManifestID:    "base-standby-a-5",
+		BackupLSN:     5,
+		EndRecordLSN:  5,
 	}
 
 	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
