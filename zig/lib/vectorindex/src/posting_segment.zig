@@ -987,19 +987,27 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     pub fn materializeMembersIntoScratch(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, scratch: anytype) !?usize {
-        var found_base = (try self.loadBase(alloc, posting_id)) orelse return null;
-        defer found_base.deinit(alloc);
+        const found_base_data = (try self.loadBaseData(alloc, posting_id)) orelse return null;
+        defer alloc.free(found_base_data);
 
         scratch.resetDeltaRecords();
         errdefer scratch.resetDeltaRecords();
 
-        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, found_base.generation, scratch);
+        var base_iter = try posting.PostingFormat.BaseMemberIterator.init(found_base_data);
+        const base_member_count = base_iter.memberCount();
+        try scratch.ensureMemberIdCapacity(alloc, base_member_count);
+        var member_count: usize = 0;
+        while (try base_iter.next()) |member| {
+            scratch.member_ids[member_count] = member;
+            member_count += 1;
+        }
+        try base_iter.finish();
+
+        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_iter.header.generation, scratch);
         const records = scratch.deltaRecordsMut();
         std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
 
-        try scratch.ensureMemberIdCapacity(alloc, found_base.members.len + posting.PostingFormat.liveDeltaRecordCount(records));
-        @memcpy(scratch.member_ids[0..found_base.members.len], found_base.members);
-        var member_count = found_base.members.len;
+        try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
         for (records) |record| {
             posting.PostingFormat.applyDeltaRecordToScratch(scratch, &member_count, record);
         }
