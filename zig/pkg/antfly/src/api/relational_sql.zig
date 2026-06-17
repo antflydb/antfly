@@ -62340,8 +62340,7 @@ fn appParityFixtureReturningSummaryMatchesPlan(entry: AppParityCorpusEntry, expe
 }
 
 fn appParityFixtureReturningAllSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
-    if (expected) return appParityPlanHasExactUsizeToken(entry.plan, ":returning_all=", 1);
-    return !appParityPlanHasExactUsizeToken(entry.plan, ":returning_all=", 1);
+    return appParityFixtureOptionalBool01SummaryMatchesPlan(entry.plan, ":returning_all=", expected);
 }
 
 fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool {
@@ -62356,8 +62355,7 @@ fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool 
 }
 
 fn appParityFixtureConflictWhereSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
-    if (expected) return appParityPlanHasExactUsizeToken(entry.plan, ":conflict_where=", 1);
-    return !appParityPlanHasExactUsizeToken(entry.plan, ":conflict_where=", 1);
+    return appParityFixtureOptionalBool01SummaryMatchesPlan(entry.plan, ":conflict_where=", expected);
 }
 
 fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
@@ -62476,6 +62474,11 @@ fn appParityPlanHasUsizeToken(plan: []const u8, token: []const u8) bool {
 fn appParityFixtureOptionalZeroSummaryMatchesPlan(plan: []const u8, token: []const u8, expected: usize) bool {
     if (appParityPlanHasExactUsizeToken(plan, token, expected)) return true;
     return expected == 0 and !appParityPlanHasUsizeToken(plan, token);
+}
+
+fn appParityFixtureOptionalBool01SummaryMatchesPlan(plan: []const u8, token: []const u8, expected: bool) bool {
+    const value = appParityPlanUsizeTokenValue(plan, token) orelse return !expected;
+    return value == @intFromBool(expected);
 }
 
 fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
@@ -62886,11 +62889,7 @@ fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) boo
 
 fn appParityFixtureFullQueryOutputSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
     if (entry.summary.select_all) |select_all| {
-        if (select_all) {
-            if (!appParityPlanHasExactUsizeToken(entry.plan, ":select_all=", 1)) return false;
-        } else if (appParityPlanHasExactUsizeToken(entry.plan, ":select_all=", 1)) {
-            return false;
-        }
+        if (!appParityFixtureOptionalBool01SummaryMatchesPlan(entry.plan, ":select_all=", select_all)) return false;
     }
     if (entry.summary.distinct_on) |distinct_on| {
         if (!appParityPlanHasExactUsizeToken(entry.plan, ":distinct_on=", distinct_on)) return false;
@@ -63620,6 +63619,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed returning all false summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning_all = false },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=2",
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid compact returning all false summary",
         .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
@@ -63642,6 +63649,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .insert,
         .summary = .{ .table_name = "usage_records", .conflict_where = false },
         .plan = "insert:table=usage_records:writes=1:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed conflict where false summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .conflict_where = false },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=2",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -64242,6 +64257,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .query,
         .summary = .{ .table_name = "usage_records", .select = 1, .select_all = false },
         .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:select_all=1",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed query select all false summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1, .select_all = false },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:select_all=2",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{

@@ -5295,8 +5295,8 @@ or `EXPLAIN` wrappers around those plans. Aggregate, join, lateral, window, and
 point-write families reject those fields because their runners do not read the
 full query-output contract. Query-output summaries must also match the typed
 fingerprint: `select_all=true` requires `select_all=1`, `select_all=false`
-requires that positive token to be absent or zero, and `distinct_on` must match
-the exact `distinct_on` count.
+requires that token to be absent or exactly `0`, and `distinct_on` must match the
+exact `distinct_on` count.
 
 Pagination summaries are scoped to typed stages that actually order or trim a
 row stream. `order_by`, `limit`, and `offset` are valid on row-query, aggregate,
@@ -5314,7 +5314,7 @@ Returning summaries are self-anchored to write fingerprints. Point writes must
 match `returning_rows`, source-query writes and merge mutations must match
 `returning`, and any explicit `returning_all=true` summary must match
 `returning_all=1`. Explicit `returning_all=false` is also meaningful coverage:
-it requires the positive all-fields token to be absent or zero, so compact
+it requires the all-fields token to be absent or exactly `0`, so compact
 fingerprints can assert the negative case without carrying extra noise. This
 keeps `RETURNING` coverage tied to the committed row image contract instead of
 allowing stale fixture metadata to claim result-shape coverage.
@@ -5327,7 +5327,7 @@ above, because each catalog operation family owns a different count token.
 
 Conflict guard summaries are boolean fingerprint evidence. A fixture may carry
 `conflict_where` only for insert or insert-source plans. `true` requires
-`conflict_where=1`; `false` requires that positive token to be absent or zero,
+`conflict_where=1`; `false` requires that token to be absent or exactly `0`,
 which lets the corpus assert both guarded and unguarded conflict actions without
 making omitted metadata ambiguous. This keeps `ON CONFLICT ... WHERE` coverage
 tied to the typed proposed/existing-row predicate contract.
