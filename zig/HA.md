@@ -451,6 +451,16 @@ The implementation path is:
    HTTP modules; and
 5. have the CLI and `go/pkg/operator` call the typed `/admin/v1/ha` contract.
 
+The generated Zig module for this spec should remain the admin contract module
+(`antfly_admin_openapi`) and should be surfaced through
+`zig/pkg/antfly/src/admin/mod.zig` plus route constants in
+`zig/pkg/antfly/src/admin/routes.zig`. Runtime replication handlers may import
+admin types when they need to produce the same receipt/status shape, but they
+must not define new HA administration paths under `zig/pkg/antfly/src/internal/`
+or `specs/openapi/antfly/internal.yaml`. The internal OpenAPI spec is reserved
+for node-to-node replication RPCs such as identify-system, start-replication,
+and standby-status-update.
+
 Recommended split:
 
 - `/admin/v1/ha`: human and operator control-plane actions. This API owns
