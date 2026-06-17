@@ -2398,6 +2398,7 @@ pub fn lowerSelectAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
+    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -2407,11 +2408,13 @@ pub fn lowerSelectAlloc(
     };
     var lowered = parser.parseQueryPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsQueryPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
 
@@ -2437,6 +2440,7 @@ pub fn lowerQueryPlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
+    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -2446,11 +2450,13 @@ pub fn lowerQueryPlanAlloc(
     };
     var lowered = parser.parseQueryPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsQueryPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     return lowered;
@@ -2878,6 +2884,10 @@ fn isSqlIdentifierByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
+fn sqlTokensStartWithKeyword(tokens: []const Token, keyword: []const u8) bool {
+    return tokens.len > 0 and tokens[0].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[0].text, keyword);
+}
+
 pub fn lowerWindowPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -2887,6 +2897,7 @@ pub fn lowerWindowPlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
+    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -2896,11 +2907,13 @@ pub fn lowerWindowPlanAlloc(
     };
     var lowered = parser.parseWindowPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsWindowPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     return lowered;
@@ -3965,6 +3978,7 @@ pub fn lowerAggregatePlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
+    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -3974,11 +3988,13 @@ pub fn lowerAggregatePlanAlloc(
     };
     var lowered = parser.parseAggregatePlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsAggregatePlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     return lowered;
@@ -4004,6 +4020,7 @@ pub fn lowerJoinWithSchemasAlloc(
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
+    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -4014,11 +4031,13 @@ pub fn lowerJoinWithSchemasAlloc(
     };
     var lowered = parser.parseJoinPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsJoinPlanCteOutputAlloc(alloc, schema, lowered.asPlan()) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     return lowered;
@@ -4044,6 +4063,7 @@ pub fn lowerLateralPlanWithSchemasAlloc(
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
+    const cte_adapter_shape = sqlTokensStartWithKeyword(tokens.items, "with");
 
     var parser = Parser{
         .alloc = alloc,
@@ -4054,11 +4074,13 @@ pub fn lowerLateralPlanWithSchemasAlloc(
     };
     var lowered = parser.parseLateralPlan() catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     errdefer lowered.deinit(alloc);
     relational_rows.validateRowsLateralPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
     return lowered;
@@ -84944,12 +84966,23 @@ test "postgres sql adapter lowers direct select set operation query plans" {
         schema,
         &.{},
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    var expression_or_in_intersect = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' INTERSECT SELECT id FROM usage_records WHERE status IN ('deleted')",
         schema,
         &.{},
-    ));
+    );
+    defer expression_or_in_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_or_in_intersect.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_or_in_intersect.query.select.len);
+    try std.testing.expectEqualStrings("id", expression_or_in_intersect.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_in_intersect.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_in_intersect.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_in_intersect.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", expression_or_in_intersect.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", expression_or_in_intersect.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", expression_or_in_intersect.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", expression_or_in_intersect.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status NOT IN ('deleted') AND lower(status) = 'archived'",
