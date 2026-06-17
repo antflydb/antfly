@@ -4195,17 +4195,19 @@ not lower to ordinary durable relational tables.
 
 Table-population syntax lowers to a native population intent before execution.
 `CREATE TABLE ... AS SELECT ...`, `CREATE TABLE IF NOT EXISTS ... AS SELECT
-...`, and read-path `SELECT ... INTO new_table ...` produce a
-`relation_population` plan with an explicit mode, target table,
-idempotent-creation flag, and source `LoweredReadPlan`; the source query is
-therefore pinned by the same typed row-query/aggregate/join/window fingerprints
-as ordinary reads rather than stored SQL text. Catalog-aware population lowering
-is exposed for API bridges, and the routed execution helper evaluates the typed
-source plan through the same `TableReadSource` path as ordinary query,
-aggregate, window, join, and lateral reads before normalizing its rows for the
-population job. The remaining production shape is the durable runner for that
-intent: derive or declare the target schema, honor the `IF NOT EXISTS` target
-identity check before scheduling work, create the table generation, run a
+...`, `CREATE TEMP[TEMPORARY] TABLE ... AS SELECT ...`, `CREATE UNLOGGED TABLE
+... AS SELECT ...`, and read-path `SELECT ... INTO new_table ...` produce a
+`relation_population` plan with an explicit mode, target table, target lifetime
+(`durable`, `temporary`, or `unlogged`), idempotent-creation flag, and source
+`LoweredReadPlan`; the source query is therefore pinned by the same typed
+row-query/aggregate/join/window fingerprints as ordinary reads rather than
+stored SQL text. Catalog-aware population lowering is exposed for API bridges,
+and the routed execution helper evaluates the typed source plan through the
+same `TableReadSource` path as ordinary query, aggregate, window, join, and
+lateral reads before normalizing its rows for the population job. The remaining
+production shape is the durable runner for that intent: derive or declare the
+target schema, honor the `IF NOT EXISTS` target identity check before scheduling
+work, create the table generation with the requested target lifetime, run a
 bounded insert-source or backfill job from the typed source query, record
 progress by owner range, and promote the populated generation atomically.
 `CREATE TABLE ... (LIKE source INCLUDING ...)` lowers to a native

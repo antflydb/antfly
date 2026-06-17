@@ -738,6 +738,7 @@ pub const ExplainFormat = enum {
 pub const LoweredRelationPopulationPlan = struct {
     mode: RelationPopulationMode,
     target_table_name: []const u8,
+    target_lifetime: ?RelationLifetimeKind = null,
     if_not_exists: bool = false,
     source: LoweredReadPlan,
 
@@ -2902,6 +2903,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAlloc(
     return .{
         .mode = parsed.mode,
         .target_table_name = target,
+        .target_lifetime = parsed.target_lifetime,
         .if_not_exists = parsed.if_not_exists,
         .source = source,
     };
@@ -2910,6 +2912,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAlloc(
 const ParsedRelationPopulationSql = struct {
     mode: RelationPopulationMode,
     target_table_name: []const u8,
+    target_lifetime: ?RelationLifetimeKind = null,
     if_not_exists: bool = false,
     source_sql: []u8,
 
@@ -2959,6 +2962,7 @@ fn parseSelectIntoPopulationSqlAlloc(
     return .{
         .mode = .select_into,
         .target_table_name = target,
+        .target_lifetime = null,
         .if_not_exists = false,
         .source_sql = source_sql,
     };
@@ -2970,6 +2974,12 @@ fn parseCreateTableAsPopulationSqlAlloc(
     tokens: []const Token,
 ) !ParsedRelationPopulationSql {
     var index: usize = 1;
+    const target_lifetime: ?RelationLifetimeKind = if (consumeKeyword(tokens, &index, "temporary") or consumeKeyword(tokens, &index, "temp"))
+        .temporary
+    else if (consumeKeyword(tokens, &index, "unlogged"))
+        .unlogged
+    else
+        null;
     if (!consumeKeyword(tokens, &index, "table")) return error.UnsupportedSqlShape;
     var if_not_exists = false;
     if (consumeKeyword(tokens, &index, "if")) {
@@ -2990,6 +3000,7 @@ fn parseCreateTableAsPopulationSqlAlloc(
     return .{
         .mode = .create_table_as,
         .target_table_name = target,
+        .target_lifetime = target_lifetime,
         .if_not_exists = if_not_exists,
         .source_sql = source_sql,
     };
@@ -60592,8 +60603,8 @@ fn relationPopulationFingerprintAlloc(
     defer alloc.free(source);
     return try std.fmt.allocPrint(
         alloc,
-        "relation_population:mode={s}:target={s}:if_not_exists={}:source={s}",
-        .{ relationPopulationModeName(lowered.mode), lowered.target_table_name, lowered.if_not_exists, source },
+        "relation_population:mode={s}:target={s}:lifetime={s}:if_not_exists={}:source={s}",
+        .{ relationPopulationModeName(lowered.mode), lowered.target_table_name, relationPopulationTargetLifetimeName(lowered.target_lifetime), lowered.if_not_exists, source },
     );
 }
 
@@ -60602,6 +60613,10 @@ fn relationPopulationModeName(mode: RelationPopulationMode) []const u8 {
         .create_table_as => "create_table_as",
         .select_into => "select_into",
     };
+}
+
+fn relationPopulationTargetLifetimeName(kind: ?RelationLifetimeKind) []const u8 {
+    return if (kind) |lifetime| relationLifetimeKindName(lifetime) else "durable";
 }
 
 fn mergeMatchedPredicateCount(arms: []const MergeMatchedArm) usize {
@@ -63985,7 +64000,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed' ORDER BY id LIMIT 5",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive", .limit = 5 },
-        .plan = "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -63993,7 +64008,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive", .select = 2 },
-        .plan = "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -64001,7 +64016,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive", .predicates = 1 },
-        .plan = "relation_population:mode=select_into:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+        .plan = "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -64009,7 +64024,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
         .family = .relation_population,
         .summary = .{ .table_name = "usage_archive" },
-        .plan = "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+        .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
@@ -65443,7 +65458,7 @@ test "app parity ddl submode coverage tokens are exact" {
     try std.testing.expect(!appParityPlanHasExactStringToken(transaction, ":starter=", "start_transaction"));
     try std.testing.expect(appParityPlanHasExactStringToken(transaction, ":starter=", "start_transaction_extra"));
 
-    const population = "relation_population:mode=create_table_as_extra:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records";
+    const population = "relation_population:mode=create_table_as_extra:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records";
     try std.testing.expect(!appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as"));
     try std.testing.expect(appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as_extra"));
 }
@@ -73460,7 +73475,7 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "select into relation population plan",
             .family = .relation_population,
             .summary = .{ .table_name = "usage_archive" },
-            .plan = "relation_population:mode=select_into:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .plan = "relation_population:mode=select_into:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "SELECT id, status INTO usage_archive FROM usage_records WHERE status = 'closed'",
         },
         .{
@@ -73831,15 +73846,29 @@ test "postgres sql adapter classifies application parity corpus" {
             .name = "create table as select relation population plan",
             .family = .relation_population,
             .summary = .{ .table_name = "usage_archive" },
-            .plan = "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "CREATE TABLE usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
         },
         .{
             .name = "create table if not exists as select relation population plan",
             .family = .relation_population,
             .summary = .{ .table_name = "usage_archive" },
-            .plan = "relation_population:mode=create_table_as:target=usage_archive:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .plan = "relation_population:mode=create_table_as:target=usage_archive:lifetime=durable:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
             .sql = "CREATE TABLE IF NOT EXISTS usage_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "create temp table as select relation population plan",
+            .family = .relation_population,
+            .summary = .{ .table_name = "usage_session_archive" },
+            .plan = "relation_population:mode=create_table_as:target=usage_session_archive:lifetime=temporary:if_not_exists=true:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "create unlogged table as select relation population plan",
+            .family = .relation_population,
+            .summary = .{ .table_name = "usage_ingest_archive" },
+            .plan = "relation_population:mode=create_table_as:target=usage_ingest_archive:lifetime=unlogged:if_not_exists=false:source=read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=2:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+            .sql = "CREATE UNLOGGED TABLE usage_ingest_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
         },
         .{
             .name = "create table like clone ddl",
