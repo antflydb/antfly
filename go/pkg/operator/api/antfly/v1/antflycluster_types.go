@@ -730,6 +730,7 @@ type HAAdminSpec struct {
 	// TokenEnvVar is the operator process environment variable containing the bearer token for typed /admin/v1/ha calls.
 	// This lets Kubernetes inject the token from a Secret into the operator pod without granting the operator Secret read permissions.
 	// Defaults to ANTFLY_HA_ADMIN_TOKEN when omitted and that environment variable is set.
+	// CLI-backed HA admin Jobs pass --ha-token-env only when this field is explicitly set; inject the same variable into those Jobs with envFrom when authenticated CLI fallback is needed.
 	// +optional
 	TokenEnvVar string `json:"tokenEnvVar,omitempty"`
 

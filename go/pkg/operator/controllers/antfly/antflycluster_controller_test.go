@@ -643,6 +643,122 @@ func TestReconcileHAAdminJobsUsesDefaultAdminTokenEnvVar(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 }
 
+func TestReconcileHAAdminJobsPassesConfiguredTokenEnvToCLIJob(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image:              "antfly:test",
+			ImagePullPolicy:    "IfNotPresent",
+			ServiceAccountName: "antfly-ha-admin",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "CUSTOM_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionUpdatePrimaryRoute),
+					Executor:     string(haActionExecutorCLIJob),
+					AdminCommand: []string{"identify"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Args).To(Equal([]string{
+		"ha",
+		"--ha-url", "http://primary-ha.default.svc:8081",
+		"--ha-token-env", "CUSTOM_HA_ADMIN_TOKEN",
+		"--",
+		"identify",
+	}))
+	g.Expect(container.EnvFrom).To(Equal(cluster.Spec.HighAvailability.Admin.EnvFrom))
+}
+
+func TestReconcileHAAdminJobsDoesNotPassDefaultTokenEnvToCLIJob(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionUpdatePrimaryRoute),
+					Executor:     string(haActionExecutorCLIJob),
+					AdminCommand: []string{"identify"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	g.Expect(jobs.Items[0].Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+		"ha",
+		"--ha-url", "http://primary-ha.default.svc:8081",
+		"--",
+		"identify",
+	}))
+}
+
 func TestReconcileHAAdminJobsRejectsDirectAPIMissingAdminNodeID(t *testing.T) {
 	g := NewWithT(t)
 

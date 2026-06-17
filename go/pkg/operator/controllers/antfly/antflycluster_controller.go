@@ -3805,12 +3805,11 @@ func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyClust
 }
 
 func haAdminBearerToken(cluster *antflyv1.AntflyCluster) string {
-	envVar := haAdminTokenDefaultEnvVar
+	var admin *antflyv1.HAAdminSpec
 	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Admin != nil {
-		if configured := strings.TrimSpace(cluster.Spec.HighAvailability.Admin.TokenEnvVar); configured != "" {
-			envVar = configured
-		}
+		admin = cluster.Spec.HighAvailability.Admin
 	}
+	envVar := haAdminTokenEnvVar(admin)
 	return strings.TrimSpace(os.Getenv(envVar))
 }
 
@@ -7071,7 +7070,12 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 }
 
 func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
-	args := append([]string{"ha", "--ha-url", action.AdminURL, "--"}, action.AdminCommand...)
+	args := []string{"ha", "--ha-url", action.AdminURL}
+	if tokenEnvVar := haAdminConfiguredTokenEnvVar(admin); tokenEnvVar != "" {
+		args = append(args, "--ha-token-env", tokenEnvVar)
+	}
+	args = append(args, "--")
+	args = append(args, action.AdminCommand...)
 	labels := haAdminJobLabels(cluster, action)
 	annotations := map[string]string{
 		"antfly.io/ha-action-kind":  action.Kind,
@@ -7122,6 +7126,20 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 			},
 		},
 	}
+}
+
+func haAdminTokenEnvVar(admin *antflyv1.HAAdminSpec) string {
+	if configured := haAdminConfiguredTokenEnvVar(admin); configured != "" {
+		return configured
+	}
+	return haAdminTokenDefaultEnvVar
+}
+
+func haAdminConfiguredTokenEnvVar(admin *antflyv1.HAAdminSpec) string {
+	if admin == nil {
+		return ""
+	}
+	return strings.TrimSpace(admin.TokenEnvVar)
 }
 
 func haAdminJobBackoffLimit(admin *antflyv1.HAAdminSpec) int32 {

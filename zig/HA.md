@@ -513,6 +513,12 @@ For human or break-glass operations, `antfly ha --ha-url <url>` with
 operator/admin environment and send the same bearer header to typed admin
 routes. Do not add a raw token CLI flag; tokens should not be exposed through
 process argv.
+If the operator ever uses a CLI-backed HA admin Job for compatibility or
+pod-local workflows against an authenticated admin endpoint, it should pass
+`--ha-token-env` only when `spec.highAvailability.admin.tokenEnvVar` is
+explicitly configured and should inject that variable into the Job with
+`spec.highAvailability.admin.envFrom`. Direct operator SDK calls may continue to
+default to `ANTFLY_HA_ADMIN_TOKEN` from the operator process environment.
 
 The admin API is node-local even though it is typed and operator-facing. The
 operator must choose the target node deliberately:
