@@ -4470,6 +4470,45 @@ func TestObserveHAPrimaryAdminStatusDoesNotFallbackToCommandEndpoint(t *testing.
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("HA admin API returned status 404"))
 }
 
+func TestObserveHAPrimaryAdminStatusRejectsMismatchedIdentityScope(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":99,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":12,"retained_lsn_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        1,
+					ShardID:          2,
+					TableID:          3,
+					TimelineID:       4,
+					Epoch:            5,
+					CurrentPrimaryID: "primary-a",
+				},
+			},
+		},
+	}
+
+	err := reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("identity scope mismatch"))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(0)))
+}
+
 func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g := NewWithT(t)
 
@@ -4583,6 +4622,54 @@ func TestObserveHAStandbyAdminStatusesSkipsPromotedPrimary(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
 	g.Expect(cluster.Status.HAStatus.Standbys[0].Name).To(Equal("standby-b"))
 	g.Expect(cluster.Status.HAStatus.Standbys[0].SlotName).To(Equal("slot-b"))
+}
+
+func TestObserveHAStandbyAdminStatusesRejectsMismatchedIdentityScope(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			body := `{"schema_version":1,"snapshot":{"role":"standby","identity":{"cluster_id":1,"shard_id":99,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"unapplied_lsn_count":1,"caught_up_to_received":true,"can_serve_safe_reads":true}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        1,
+					ShardID:          2,
+					TableID:          3,
+					TimelineID:       4,
+					Epoch:            5,
+					CurrentPrimaryID: "primary-a",
+				},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					SlotName: "slot-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode:       antflyv1.HAModeHotStandby,
+				PrimaryLSN: 13,
+			},
+		},
+	}
+
+	err := reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("identity scope mismatch"))
+	g.Expect(cluster.Status.HAStatus.Standbys).To(BeEmpty())
 }
 
 func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {

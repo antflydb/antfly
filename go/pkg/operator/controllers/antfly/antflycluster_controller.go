@@ -5654,7 +5654,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 		if !standbyDesired(standby) || strings.TrimSpace(standby.AdminURL) == "" {
 			continue
 		}
-		status, err := r.observeHAStandbyStatusTyped(ctx, standby.AdminURL, standby.Name, standbySlotName(standby), cluster.Status.HAStatus.PrimaryLSN)
+		status, err := r.observeHAStandbyStatusTyped(ctx, standby.AdminURL, standby.Name, standbySlotName(standby), cluster.Status.HAStatus.PrimaryLSN, ha)
 		if err != nil {
 			if observedErr == nil {
 				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
@@ -5671,15 +5671,29 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
-	return parseHAPrimaryStatusJSON(raw)
+	status, err := parseHAPrimaryStatusJSON(raw)
+	if err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	if err := haValidateObservedStatusScope(status.Identity, ha); err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	return status, nil
 }
 
-func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, baseURL string, standbyName string, slotName string, upstreamLSN uint64) (antflyv1.HAStandbyStatus, error) {
+func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, baseURL string, standbyName string, slotName string, upstreamLSN uint64, ha *antflyv1.HighAvailabilitySpec) (antflyv1.HAStandbyStatus, error) {
 	raw, err := r.getHAAdminJSON(ctx, baseURL, haAdminStandbyStatusPath, haStandbyStatusQuery(upstreamLSN))
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
-	return parseHAStandbyStatusJSON(raw, standbyName, slotName)
+	observed, err := parseHAStandbyStatusJSONWithIdentity(raw, standbyName, slotName)
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	if err := haValidateObservedStatusScope(observed.Identity, ha); err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	return observed.Status, nil
 }
 
 func (r *AntflyClusterReconciler) getHAAdminJSON(ctx context.Context, baseURL string, apiPath string, query url.Values) ([]byte, error) {
@@ -5833,6 +5847,20 @@ type haObservedPrimaryStatus struct {
 	Retention  antflyv1.HARetentionStatus
 	Standbys   []antflyv1.HAStandbyStatus
 	Sync       *antflyv1.HASyncStatus
+	Identity   haObservedIdentity
+}
+
+type haObservedStandbyStatus struct {
+	Status   antflyv1.HAStandbyStatus
+	Identity haObservedIdentity
+}
+
+type haObservedIdentity struct {
+	ClusterID  uint64
+	ShardID    uint64
+	TableID    uint64
+	TimelineID uint64
+	Epoch      uint64
 }
 
 type haAdminStatusJSON struct {
@@ -5959,6 +5987,7 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 		return haObservedPrimaryStatus{}, fmt.Errorf("missing slot snapshots")
 	}
 	status := haObservedPrimaryStatus{
+		Identity:   haObservedIdentityFromAdminJSON(snapshot.Identity),
 		PrimaryLSN: *snapshot.CurrentLSN,
 		Retention: antflyv1.HARetentionStatus{
 			OldestRestartLSN:  haUint64JSONValue(snapshot.Retention.OldestRestartLSN),
@@ -6064,34 +6093,42 @@ func haSyncActionFromAdminDurabilityStatus(raw string) (bool, string) {
 }
 
 func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {
+	observed, err := parseHAStandbyStatusJSONWithIdentity(raw, standbyName, slotName)
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	return observed.Status, nil
+}
+
+func parseHAStandbyStatusJSONWithIdentity(raw []byte, standbyName string, slotName string) (haObservedStandbyStatus, error) {
 	var direct haStandbyStatusEnvelopeJSON
 	if err := json.Unmarshal(raw, &direct); err != nil {
-		return antflyv1.HAStandbyStatus{}, err
+		return haObservedStandbyStatus{}, err
 	}
 	snapshot := direct.Snapshot
 	schemaVersion := direct.SchemaVersion
 	if snapshot == nil {
 		var doc haAdminStatusJSON
 		if err := json.Unmarshal(raw, &doc); err != nil {
-			return antflyv1.HAStandbyStatus{}, err
+			return haObservedStandbyStatus{}, err
 		}
 		snapshot = doc.Result.StandbyStatus
 		schemaVersion = doc.SchemaVersion
 	}
 	if schemaVersion == 0 {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status schema_version")
+		return haObservedStandbyStatus{}, fmt.Errorf("missing standby status schema_version")
 	}
 	if snapshot == nil {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status snapshot")
+		return haObservedStandbyStatus{}, fmt.Errorf("missing standby status snapshot")
 	}
 	if strings.TrimSpace(snapshot.Role) != "standby" {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("invalid standby status role")
+		return haObservedStandbyStatus{}, fmt.Errorf("invalid standby status role")
 	}
 	if !haAdminIdentityJSONComplete(snapshot.Identity) {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status identity")
+		return haObservedStandbyStatus{}, fmt.Errorf("missing standby status identity")
 	}
 	if !haStandbyStatusJSONComplete(snapshot) {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status fields")
+		return haObservedStandbyStatus{}, fmt.Errorf("missing standby status fields")
 	}
 	status := antflyv1.HAStandbyStatus{
 		Name:               standbyName,
@@ -6104,11 +6141,11 @@ func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (
 		CanServeSafeReads:  haBoolJSONValue(snapshot.CanServeSafeReads),
 	}
 	if snapshot.ReceivedLSN == nil {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing received_lsn")
+		return haObservedStandbyStatus{}, fmt.Errorf("missing received_lsn")
 	}
 	status.ReceivedLSN = *snapshot.ReceivedLSN
 	if snapshot.AppliedLSN == nil {
-		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing applied_lsn")
+		return haObservedStandbyStatus{}, fmt.Errorf("missing applied_lsn")
 	}
 	status.AppliedLSN = *snapshot.AppliedLSN
 	if snapshot.UpstreamLSN != nil {
@@ -6128,7 +6165,41 @@ func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (
 	} else if status.CanServeSafeReads && status.Status == "" {
 		status.Status = "healthy"
 	}
-	return status, nil
+	return haObservedStandbyStatus{
+		Status:   status,
+		Identity: haObservedIdentityFromAdminJSON(snapshot.Identity),
+	}, nil
+}
+
+func haObservedIdentityFromAdminJSON(identity haAdminIdentityJSON) haObservedIdentity {
+	return haObservedIdentity{
+		ClusterID:  haUint64JSONValue(identity.ClusterID),
+		ShardID:    haUint64JSONValue(identity.ShardID),
+		TableID:    haUint64JSONValue(identity.TableID),
+		TimelineID: haUint64JSONValue(identity.TimelineID),
+		Epoch:      haUint64JSONValue(identity.Epoch),
+	}
+}
+
+func haValidateObservedStatusScope(observed haObservedIdentity, ha *antflyv1.HighAvailabilitySpec) error {
+	identity := haReplicationIdentity(ha)
+	if identity == nil {
+		return nil
+	}
+	if observed.ClusterID != identity.ClusterID ||
+		observed.ShardID != identity.ShardID ||
+		observed.TableID != identity.TableID {
+		return fmt.Errorf(
+			"observed HA admin identity scope mismatch: got cluster_id=%d shard_id=%d table_id=%d, expected cluster_id=%d shard_id=%d table_id=%d",
+			observed.ClusterID,
+			observed.ShardID,
+			observed.TableID,
+			identity.ClusterID,
+			identity.ShardID,
+			identity.TableID,
+		)
+	}
+	return nil
 }
 
 func haAdminIdentityJSONComplete(identity haAdminIdentityJSON) bool {
