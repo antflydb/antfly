@@ -993,7 +993,7 @@
       "family": "adapter_noop_ddl",
       "plan": "adapter_noop:ddl:reason=session_setting",
       "classification_reason": "session_setting",
-      "sql": "SET LOCAL lock_timeout = '5s';"
+      "sql": "SET LOCAL client_min_messages = warning;"
     },
     {
       "name": "adapter-only client encoding session setting syntax",

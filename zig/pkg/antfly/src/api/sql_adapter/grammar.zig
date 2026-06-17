@@ -49,6 +49,102 @@ pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAl
     return .{ .table_identifier = table_token.text, .enabled = enabled };
 }
 
+pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("local")) _ = cursor.matchKeyword("session");
+
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(setting.text, "search_path")) {
+        try parseAdapterNoopPublicSearchPathTail(cursor);
+        return;
+    }
+    if (!adapterNoopSetSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
+
+    if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopSetValueTail(cursor, setting.text);
+}
+
+pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("all")) {
+        try parseAdapterNoopStatementEnd(cursor);
+        return;
+    }
+
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!adapterNoopResetSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
+pub fn parseAdapterNoopShowStatementTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!adapterNoopShowSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
+pub fn parseAdapterNoopDiscardStatementTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("all");
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
+fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
+    if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
+    const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(path.text, "public")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
+fn parseAdapterNoopSetValueTail(cursor: parser.Cursor, setting: []const u8) !void {
+    const value = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    if (!adapterNoopSetSessionSettingValueAllowed(setting, value.text)) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
+fn parseAdapterNoopStatementEnd(cursor: parser.Cursor) !void {
+    if (!cursor.atEnd() and !cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+    if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
+    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+}
+
+fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(setting, "client_encoding") or
+        std.ascii.eqlIgnoreCase(setting, "standard_conforming_strings") or
+        std.ascii.eqlIgnoreCase(setting, "check_function_bodies") or
+        std.ascii.eqlIgnoreCase(setting, "xmloption") or
+        std.ascii.eqlIgnoreCase(setting, "client_min_messages");
+}
+
+fn adapterNoopResetSessionSettingAllowed(setting: []const u8) bool {
+    return adapterNoopSetSessionSettingAllowed(setting);
+}
+
+fn adapterNoopShowSessionSettingAllowed(setting: []const u8) bool {
+    return adapterNoopSetSessionSettingAllowed(setting) or std.ascii.eqlIgnoreCase(setting, "search_path");
+}
+
+fn adapterNoopSetSessionSettingValueAllowed(setting: []const u8, value: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(setting, "client_encoding")) {
+        return std.ascii.eqlIgnoreCase(value, "UTF8") or std.ascii.eqlIgnoreCase(value, "UTF-8");
+    }
+    if (std.ascii.eqlIgnoreCase(setting, "standard_conforming_strings")) {
+        return std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "true");
+    }
+    if (std.ascii.eqlIgnoreCase(setting, "check_function_bodies")) {
+        return std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "false");
+    }
+    if (std.ascii.eqlIgnoreCase(setting, "xmloption")) {
+        return std.ascii.eqlIgnoreCase(value, "content");
+    }
+    if (std.ascii.eqlIgnoreCase(setting, "client_min_messages")) {
+        return std.ascii.eqlIgnoreCase(value, "warning") or
+            std.ascii.eqlIgnoreCase(value, "notice") or
+            std.ascii.eqlIgnoreCase(value, "error");
+    }
+    return false;
+}
+
 pub fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
 }
@@ -320,4 +416,67 @@ test "sql adapter grammar leaves non row security alter table to ddl parser" {
     var pos: usize = 0;
     try std.testing.expect((try parseAlterRowSecurity(tokens.items, &pos)) == null);
     try std.testing.expectEqual(@as(usize, 0), pos);
+}
+
+test "sql adapter grammar accepts allowlisted adapter session cleanup" {
+    const alloc = std.testing.allocator;
+
+    var set_tokens = try lexer.tokenizeAlloc(alloc, "LOCAL client_min_messages = warning;");
+    defer lexer.freeTokens(alloc, &set_tokens);
+    var set_pos: usize = 0;
+    try parseAdapterNoopSetStatementTail(set_tokens.items, &set_pos);
+    try std.testing.expectEqual(set_tokens.items.len, set_pos);
+
+    var search_path_tokens = try lexer.tokenizeAlloc(alloc, "search_path TO public;");
+    defer lexer.freeTokens(alloc, &search_path_tokens);
+    var search_path_pos: usize = 0;
+    try parseAdapterNoopSetStatementTail(search_path_tokens.items, &search_path_pos);
+    try std.testing.expectEqual(search_path_tokens.items.len, search_path_pos);
+
+    var reset_tokens = try lexer.tokenizeAlloc(alloc, "client_min_messages;");
+    defer lexer.freeTokens(alloc, &reset_tokens);
+    var reset_pos: usize = 0;
+    try parseAdapterNoopResetStatementTail(reset_tokens.items, &reset_pos);
+    try std.testing.expectEqual(reset_tokens.items.len, reset_pos);
+
+    var show_tokens = try lexer.tokenizeAlloc(alloc, "search_path;");
+    defer lexer.freeTokens(alloc, &show_tokens);
+    var show_pos: usize = 0;
+    try parseAdapterNoopShowStatementTail(show_tokens.items, &show_pos);
+    try std.testing.expectEqual(show_tokens.items.len, show_pos);
+
+    var discard_tokens = try lexer.tokenizeAlloc(alloc, "ALL;");
+    defer lexer.freeTokens(alloc, &discard_tokens);
+    var discard_pos: usize = 0;
+    try parseAdapterNoopDiscardStatementTail(discard_tokens.items, &discard_pos);
+    try std.testing.expectEqual(discard_tokens.items.len, discard_pos);
+}
+
+test "sql adapter grammar rejects semantic session changes as noops" {
+    const alloc = std.testing.allocator;
+
+    var tenant_path_tokens = try lexer.tokenizeAlloc(alloc, "search_path TO tenant_schema;");
+    defer lexer.freeTokens(alloc, &tenant_path_tokens);
+    var tenant_path_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopSetStatementTail(tenant_path_tokens.items, &tenant_path_pos));
+
+    var latin1_tokens = try lexer.tokenizeAlloc(alloc, "client_encoding = 'LATIN1';");
+    defer lexer.freeTokens(alloc, &latin1_tokens);
+    var latin1_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopSetStatementTail(latin1_tokens.items, &latin1_pos));
+
+    var timeout_tokens = try lexer.tokenizeAlloc(alloc, "statement_timeout = '1ms';");
+    defer lexer.freeTokens(alloc, &timeout_tokens);
+    var timeout_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopSetStatementTail(timeout_tokens.items, &timeout_pos));
+
+    var show_all_tokens = try lexer.tokenizeAlloc(alloc, "ALL;");
+    defer lexer.freeTokens(alloc, &show_all_tokens);
+    var show_all_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopShowStatementTail(show_all_tokens.items, &show_all_pos));
+
+    var discard_temp_tokens = try lexer.tokenizeAlloc(alloc, "TEMP;");
+    defer lexer.freeTokens(alloc, &discard_temp_tokens);
+    var discard_temp_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopDiscardStatementTail(discard_temp_tokens.items, &discard_temp_pos));
 }

@@ -4184,17 +4184,21 @@ subtransaction model.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
-`SET [LOCAL|SESSION]` for inert client presentation settings, `SET search_path
-TO public`, `RESET ALL`, `RESET`/`SHOW` for the same inert setting allowlist,
-and `DISCARD ALL`. These statements do not mutate Antfly table/catalog state
-today; they are pinned in the golden corpus so client/session boilerplate cannot
-drift into storage. Session-changing forms fail closed instead of becoming
-adapter no-ops: role/session authorization changes, arbitrary settings,
-non-public `search_path`, `SHOW ALL`, and partial `DISCARD` variants need
-native typed session semantics before the adapter may accept them. If Antfly
-later owns long-lived server-side prepared statements, cursors, temporary
-objects, or session-local variables, `DISCARD` must become a typed session-state
-cleanup request over those native objects instead of remaining an adapter no-op.
+exact-value `SET [LOCAL|SESSION]` forms for inert client presentation settings,
+`SET search_path TO public`, `RESET ALL`, `RESET`/`SHOW` for the same inert
+setting allowlist, and `DISCARD ALL`. These statements do not mutate Antfly
+table/catalog state today; they are pinned in the golden corpus so
+client/session boilerplate cannot drift into storage. Session-changing forms
+fail closed instead of becoming adapter no-ops: role/session authorization
+changes, arbitrary settings, timeout settings, default storage settings,
+non-public `search_path`, unsupported values for otherwise inert settings,
+`SHOW ALL`, and partial `DISCARD` variants need native typed session semantics
+before the adapter may accept them. The allowlist lives in
+`api/sql_adapter/grammar.zig` so new accepted session syntax must be explicit
+adapter grammar, not another raw token scan in the SQL lowerer. If Antfly later
+owns long-lived server-side prepared statements, cursors, temporary objects, or
+session-local variables, `DISCARD` must become a typed session-state cleanup
+request over those native objects instead of remaining an adapter no-op.
 
 Prepared statement, cursor, and explain syntax is protocol/query-control
 surface over typed plans rather than storage syntax. `PREPARE`, `EXECUTE`, and
