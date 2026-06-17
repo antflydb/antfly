@@ -158,12 +158,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.CommitCheckRequest,
     ) !ParsedOutput(admin_api.HACommitCheckResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HACommitCheckResponse,
             base_uri,
             admin_api.routes.ha_commit_check,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateCommitCheckResponse(result.parsed.value);
+        return result;
     }
 
     pub fn appendCommit(
@@ -171,12 +174,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.CommitAppendRequest,
     ) !ParsedOutput(admin_api.HACommitAppendResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HACommitAppendResponse,
             base_uri,
             admin_api.routes.ha_commit_append,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateCommitAppendResponse(result.parsed.value);
+        return result;
     }
 
     pub fn checkRead(
@@ -184,12 +190,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.ReadCheckRequest,
     ) !ParsedOutput(admin_api.HAReadCheckResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAReadCheckResponse,
             base_uri,
             admin_api.routes.ha_read_check,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateReadCheckResponse(result.parsed.value);
+        return result;
     }
 
     pub fn checkWrite(
@@ -197,12 +206,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.WriteCheckRequest,
     ) !ParsedOutput(admin_api.HAWriteCheckResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAWriteCheckResponse,
             base_uri,
             admin_api.routes.ha_write_check,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateWriteCheckResponse(result.parsed.value);
+        return result;
     }
 
     pub fn checkOwnerJob(
@@ -210,12 +222,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.OwnerJobCheckRequest,
     ) !ParsedOutput(admin_api.HAOwnerJobCheckResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAOwnerJobCheckResponse,
             base_uri,
             admin_api.routes.ha_owner_job_check,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateOwnerJobCheckResponse(result.parsed.value);
+        return result;
     }
 
     pub fn listReplicationSlots(
@@ -224,10 +239,13 @@ pub const Client = struct {
     ) !ParsedOutput(admin_api.HAReplicationSlotListResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.HAReplicationSlotListResponse, .{
+        var result = try self.executeJson(admin_api.HAReplicationSlotListResponse, .{
             .method = .GET,
             .uri = uri,
         });
+        errdefer result.deinit(self.alloc);
+        try validateReplicationSlotListResponse(result.parsed.value);
+        return result;
     }
 
     pub fn createReplicationSlot(
@@ -248,12 +266,15 @@ pub const Client = struct {
         );
         defer self.alloc.free(body);
 
-        return try self.executeJson(admin_api.HAReplicationSlotActionResponse, .{
+        var result = try self.executeJson(admin_api.HAReplicationSlotActionResponse, .{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
+        errdefer result.deinit(self.alloc);
+        try validateReplicationSlotActionResponse(result.parsed.value, "create", slot_name);
+        return result;
     }
 
     pub fn pauseReplicationSlot(
@@ -285,12 +306,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.BaseBackupStartRequest,
     ) !ParsedOutput(admin_api.HABaseBackupBeginResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HABaseBackupBeginResponse,
             base_uri,
             admin_api.routes.ha_base_backups,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateBaseBackupBeginResponse(result.parsed.value, request);
+        return result;
     }
 
     pub fn finishBaseBackup(
@@ -298,12 +322,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.BaseBackupManifestPathRequest,
     ) !ParsedOutput(admin_api.HABaseBackupFinishResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HABaseBackupFinishResponse,
             base_uri,
             admin_api.routes.ha_base_backups_finish,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateBaseBackupFinishResponse(result.parsed.value);
+        return result;
     }
 
     pub fn bootstrapStandby(
@@ -311,12 +338,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.StandbyBootstrapRequest,
     ) !ParsedOutput(admin_api.HAStandbyBootstrapResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAStandbyBootstrapResponse,
             base_uri,
             admin_api.routes.ha_standby_bootstrap,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateStandbyBootstrapResponse(result.parsed.value);
+        return result;
     }
 
     pub fn acquireFence(
@@ -324,12 +354,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.FenceAcquireRequest,
     ) !ParsedOutput(admin_api.HAFenceResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAFenceResponse,
             base_uri,
             admin_api.routes.ha_fence,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateFenceResponse(result.parsed.value, request);
+        return result;
     }
 
     pub fn currentFence(
@@ -338,10 +371,13 @@ pub const Client = struct {
     ) !ParsedOutput(admin_api.HACurrentFenceResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_fence_current);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.HACurrentFenceResponse, .{
+        var result = try self.executeJson(admin_api.HACurrentFenceResponse, .{
             .method = .GET,
             .uri = uri,
         });
+        errdefer result.deinit(self.alloc);
+        try validateCurrentFenceResponse(result.parsed.value);
+        return result;
     }
 
     pub fn assessPromotion(
@@ -349,12 +385,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.PromotionAssessRequest,
     ) !ParsedOutput(admin_api.HAPromotionAssessResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HAPromotionAssessResponse,
             base_uri,
             admin_api.routes.ha_promotion_assess,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validatePromotionAssessResponse(result.parsed.value, request);
+        return result;
     }
 
     pub fn promoteWithCurrentFence(
@@ -451,13 +490,20 @@ pub const Client = struct {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        return try self.executeJson(admin_api.HAReplicationSlotActionResponse, .{
+        var result = try self.executeJson(admin_api.HAReplicationSlotActionResponse, .{
             .method = switch (action) {
                 .drop => .DELETE,
                 .pause, .@"resume" => .PUT,
             },
             .uri = uri,
         });
+        errdefer result.deinit(self.alloc);
+        try validateReplicationSlotActionResponse(result.parsed.value, switch (action) {
+            .pause => "pause",
+            .@"resume" => "resume",
+            .drop => "drop",
+        }, slot_name);
+        return result;
     }
 
     fn executeJson(
@@ -614,6 +660,267 @@ fn isQueryValueUnreserved(byte: u8) bool {
 fn i64FromU64(value: u64) !i64 {
     if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.InvalidHaCommand;
     return @intCast(value);
+}
+
+fn validateSchemaVersion(version: i64, err: anyerror) !void {
+    if (version <= 0) return err;
+}
+
+fn validateActionReceipt(
+    receipt: admin_api.HAActionReceipt,
+    expected_kind: []const u8,
+    expected_state: []const u8,
+    expected_target: ?[]const u8,
+    err: anyerror,
+) !void {
+    if (receipt.action_id.len == 0) return err;
+    if (!std.mem.eql(u8, receipt.action_kind, expected_kind)) return err;
+    if (!std.mem.eql(u8, receipt.state, expected_state)) return err;
+    if (receipt.target.len == 0 or receipt.node_id.len == 0) return err;
+    if (expected_target) |target| {
+        if (!std.mem.eql(u8, receipt.target, target)) return err;
+        if (!std.mem.startsWith(u8, receipt.action_id, expected_kind)) return err;
+        if (receipt.action_id.len != expected_kind.len + 1 + target.len) return err;
+        if (receipt.action_id[expected_kind.len] != ':') return err;
+        if (!std.mem.eql(u8, receipt.action_id[expected_kind.len + 1 ..], target)) return err;
+    }
+}
+
+fn validateIdentity(identity: admin_api.HAIdentity, err: anyerror) !void {
+    if (identity.cluster_id <= 0 or identity.timeline_id <= 0 or identity.epoch <= 0) return err;
+    if (identity.shard_id < 0 or identity.table_id < 0) return err;
+}
+
+fn validateReplicationSlot(slot: admin_api.HAReplicationSlot) !void {
+    if (slot.slot_name.len == 0) return error.AdminReplicationSlotResponseMismatch;
+    if (slot.timeline_id <= 0) return error.AdminReplicationSlotResponseMismatch;
+    if (slot.restart_lsn < 0 or slot.received_lsn < 0 or slot.applied_lsn < 0 or slot.safe_read_lsn < 0 or slot.current_lsn < 0) {
+        return error.AdminReplicationSlotResponseMismatch;
+    }
+}
+
+fn validateReplicationSlotActionResponse(
+    response: admin_api.HAReplicationSlotActionResponse,
+    expected_action: []const u8,
+    expected_slot: []const u8,
+) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminReplicationSlotResponseMismatch);
+    if (!std.mem.eql(u8, response.slot_action, expected_action)) return error.AdminReplicationSlotResponseMismatch;
+    try validateReplicationSlot(response.slot);
+    if (!std.mem.eql(u8, response.slot.slot_name, expected_slot)) return error.AdminReplicationSlotResponseMismatch;
+    const expected_kind = if (std.mem.eql(u8, expected_action, "create"))
+        "replication_slot_create"
+    else if (std.mem.eql(u8, expected_action, "pause"))
+        "replication_slot_pause"
+    else if (std.mem.eql(u8, expected_action, "resume"))
+        "replication_slot_resume"
+    else if (std.mem.eql(u8, expected_action, "drop"))
+        "replication_slot_drop"
+    else
+        return error.AdminReplicationSlotResponseMismatch;
+    try validateActionReceipt(response.action, expected_kind, "applied", expected_slot, error.AdminReplicationSlotResponseMismatch);
+}
+
+fn validateReplicationSlotListResponse(response: admin_api.HAReplicationSlotListResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminReplicationSlotResponseMismatch);
+    for (response.slots) |slot| try validateReplicationSlot(slot);
+}
+
+fn validateBaseBackupBeginResponse(response: admin_api.HABaseBackupBeginResponse, request: admin_api.BaseBackupStartRequest) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminSeedResponseMismatch);
+    try validateActionReceipt(response.action, "base_backup_begin", "applied", response.manifest_id, error.AdminSeedResponseMismatch);
+    if (!std.mem.eql(u8, response.slot_name, request.slot_name)) return error.AdminSeedResponseMismatch;
+    if (!std.mem.eql(u8, response.manifest_id, request.manifest_id)) return error.AdminSeedResponseMismatch;
+    if (response.backup_lsn <= 0 or response.start_record_lsn <= 0) return error.AdminSeedResponseMismatch;
+}
+
+fn validateBaseBackupFinishResponse(response: admin_api.HABaseBackupFinishResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminSeedResponseMismatch);
+    try validateActionReceipt(response.action, "base_backup_finish", "applied", response.manifest_id, error.AdminSeedResponseMismatch);
+    if (response.manifest_id.len == 0) return error.AdminSeedResponseMismatch;
+    if (response.backup_lsn <= 0 or response.end_record_lsn <= 0) return error.AdminSeedResponseMismatch;
+}
+
+fn validateStandbyBootstrapResponse(response: admin_api.HAStandbyBootstrapResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminSeedResponseMismatch);
+    try validateActionReceipt(response.action, "standby_bootstrap", "applied", response.manifest_id, error.AdminSeedResponseMismatch);
+    if (response.manifest_id.len == 0) return error.AdminSeedResponseMismatch;
+    if (response.backup_lsn <= 0 or response.checkpoint_lsn <= 0) return error.AdminSeedResponseMismatch;
+}
+
+fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
+    try validateIdentity(receipt.identity, error.AdminFenceResponseMismatch);
+    if (receipt.old_primary_id.len == 0 or receipt.promoted_node_id.len == 0 or receipt.token.len == 0 or receipt.reason.len == 0) {
+        return error.AdminFenceResponseMismatch;
+    }
+    if (receipt.parent_timeline_id <= 0 or receipt.parent_epoch <= 0 or receipt.new_timeline_id <= 0 or receipt.new_epoch <= 0) {
+        return error.AdminFenceResponseMismatch;
+    }
+    if (receipt.required_lsn <= 0 or receipt.observed_lsn < 0 or receipt.generation <= 0) return error.AdminFenceResponseMismatch;
+}
+
+fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api.FenceAcquireRequest) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminFenceResponseMismatch);
+    try validateActionReceipt(response.action, "fence_acquire", "applied", request.promoted_node_id, error.AdminFenceResponseMismatch);
+    try validateFenceReceipt(response.receipt);
+    if (!std.mem.eql(u8, response.receipt.promoted_node_id, request.promoted_node_id)) return error.AdminFenceResponseMismatch;
+    if (!std.mem.eql(u8, response.receipt.old_primary_id, request.old_primary_id)) return error.AdminFenceResponseMismatch;
+    if (response.receipt.new_timeline_id != request.new_timeline_id or response.receipt.new_epoch != request.new_epoch) return error.AdminFenceResponseMismatch;
+    if (response.receipt.required_lsn != request.required_lsn or response.receipt.observed_lsn < request.observed_lsn) return error.AdminFenceResponseMismatch;
+}
+
+fn validateCurrentFenceResponse(response: admin_api.HACurrentFenceResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminFenceResponseMismatch);
+    if (response.held) {
+        const receipt = response.receipt orelse return error.AdminFenceResponseMismatch;
+        try validateFenceReceipt(receipt);
+    } else if (response.receipt != null) {
+        return error.AdminFenceResponseMismatch;
+    }
+}
+
+fn validateCommitGate(gate: admin_api.HACommitGate) !void {
+    if (!isCommitGateAction(gate.action)) return error.AdminGateResponseMismatch;
+    if (gate.target_lsn < 0) return error.AdminGateResponseMismatch;
+    try validateDurabilityDecision(gate.durability);
+}
+
+fn validateDurabilityDecision(decision: admin_api.HADurabilityDecision) !void {
+    if (!isDurabilityStatus(decision.status) or !isDurabilityMode(decision.mode) or !isDurabilitySelection(decision.selection)) {
+        return error.AdminGateResponseMismatch;
+    }
+    if (decision.target_lsn < 0 or decision.progress_lsn < 0 or decision.missing_lsn_count < 0 or
+        decision.satisfied_count < 0 or decision.required_count < 0 or decision.candidate_count < 0)
+    {
+        return error.AdminGateResponseMismatch;
+    }
+}
+
+fn validateCommitCheckResponse(response: admin_api.HACommitCheckResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminGateResponseMismatch);
+    try validateCommitGate(response.gate);
+}
+
+fn validateCommitAppendResponse(response: admin_api.HACommitAppendResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminGateResponseMismatch);
+    if (response.lsn < 0) return error.AdminGateResponseMismatch;
+    try validateCommitGate(response.gate);
+}
+
+fn validateReadCheckResponse(response: admin_api.HAReadCheckResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminGateResponseMismatch);
+    const decision = response.decision;
+    if (!isReadDecisionAction(decision.action) or !isReadConsistency(decision.consistency)) return error.AdminGateResponseMismatch;
+    if (decision.received_lsn < 0 or decision.applied_lsn < 0 or decision.safe_read_lsn < 0 or decision.missing_lsn_count < 0 or decision.metadata_missing_lsn_count < 0) {
+        return error.AdminGateResponseMismatch;
+    }
+}
+
+fn validateWriteCheckResponse(response: admin_api.HAWriteCheckResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminGateResponseMismatch);
+    const decision = response.decision;
+    if (!isWriteRole(decision.role) or !isWriteAction(decision.action)) return error.AdminGateResponseMismatch;
+    try validateIdentity(decision.identity, error.AdminGateResponseMismatch);
+    if (decision.durable_lsn < 0 or decision.next_lsn < 0) return error.AdminGateResponseMismatch;
+    if (decision.promotion_handoff) |handoff| try validatePromotionHandoff(handoff);
+}
+
+fn validateOwnerJobCheckResponse(response: admin_api.HAOwnerJobCheckResponse) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminGateResponseMismatch);
+    const decision = response.decision;
+    if (!isOwnerJobKind(decision.kind) or !isOwnerJobRole(decision.role) or !isOwnerJobAction(decision.action)) {
+        return error.AdminGateResponseMismatch;
+    }
+    try validateIdentity(decision.identity, error.AdminGateResponseMismatch);
+    if (decision.durable_lsn < 0 or decision.next_lsn < 0) return error.AdminGateResponseMismatch;
+    if (decision.promotion_handoff) |handoff| try validatePromotionHandoff(handoff);
+}
+
+fn validatePromotionAssessResponse(response: admin_api.HAPromotionAssessResponse, request: admin_api.PromotionAssessRequest) !void {
+    try validateSchemaVersion(response.schema_version, error.AdminPromotionResponseMismatch);
+    try validateActionReceipt(response.action, "promotion_assess", "assessed", null, error.AdminPromotionResponseMismatch);
+    if (response.assessment.required_lsn <= 0 or response.assessment.received_lsn < 0 or response.assessment.applied_lsn < 0) {
+        return error.AdminPromotionResponseMismatch;
+    }
+    if (request.required_lsn) |required_lsn| {
+        if (response.assessment.required_lsn != required_lsn) return error.AdminPromotionResponseMismatch;
+    }
+    if (response.assessment.force != request.force) return error.AdminPromotionResponseMismatch;
+    const expected_fencing_confirmed = request.fencing_confirmed or request.use_current_fence;
+    if (response.assessment.fencing_confirmed != expected_fencing_confirmed) return error.AdminPromotionResponseMismatch;
+}
+
+fn validatePromotionHandoff(handoff: admin_api.HAPromotionHandoff) !void {
+    try validateIdentity(handoff.identity, error.AdminGateResponseMismatch);
+    if (handoff.switch_lsn < 0 or handoff.next_lsn < 0) return error.AdminGateResponseMismatch;
+}
+
+fn isCommitGateAction(value: []const u8) bool {
+    return std.mem.eql(u8, value, "acknowledge") or
+        std.mem.eql(u8, value, "wait_for_standby") or
+        std.mem.eql(u8, value, "reject") or
+        std.mem.eql(u8, value, "acknowledge_degraded");
+}
+
+fn isDurabilityStatus(value: []const u8) bool {
+    return std.mem.eql(u8, value, "satisfied") or
+        std.mem.eql(u8, value, "would_block") or
+        std.mem.eql(u8, value, "fail_closed") or
+        std.mem.eql(u8, value, "degraded_to_async");
+}
+
+fn isDurabilityMode(value: []const u8) bool {
+    return std.mem.eql(u8, value, "async") or
+        std.mem.eql(u8, value, "remote_write") or
+        std.mem.eql(u8, value, "remote_apply");
+}
+
+fn isDurabilitySelection(value: []const u8) bool {
+    return std.mem.eql(u8, value, "any") or
+        std.mem.eql(u8, value, "first") or
+        std.mem.eql(u8, value, "all");
+}
+
+fn isReadDecisionAction(value: []const u8) bool {
+    return std.mem.eql(u8, value, "serve_standby") or
+        std.mem.eql(u8, value, "wait_for_apply") or
+        std.mem.eql(u8, value, "wait_for_metadata") or
+        std.mem.eql(u8, value, "route_to_primary");
+}
+
+fn isReadConsistency(value: []const u8) bool {
+    return std.mem.eql(u8, value, "stale_ok") or
+        std.mem.eql(u8, value, "at_least_lsn") or
+        std.mem.eql(u8, value, "primary");
+}
+
+fn isWriteRole(value: []const u8) bool {
+    return std.mem.eql(u8, value, "primary") or
+        std.mem.eql(u8, value, "standby") or
+        std.mem.eql(u8, value, "promoted_standby");
+}
+
+fn isWriteAction(value: []const u8) bool {
+    return std.mem.eql(u8, value, "allow_write") or
+        std.mem.eql(u8, value, "reject_read_only_standby") or
+        std.mem.eql(u8, value, "open_promoted_primary");
+}
+
+fn isOwnerJobKind(value: []const u8) bool {
+    return std.mem.eql(u8, value, "compaction_publish") or
+        std.mem.eql(u8, value, "derived_effect_writer") or
+        std.mem.eql(u8, value, "enrichment_writer") or
+        std.mem.eql(u8, value, "retention_advance");
+}
+
+fn isOwnerJobRole(value: []const u8) bool {
+    return isWriteRole(value);
+}
+
+fn isOwnerJobAction(value: []const u8) bool {
+    return std.mem.eql(u8, value, "run") or
+        std.mem.eql(u8, value, "disable_on_standby") or
+        std.mem.eql(u8, value, "open_promoted_primary");
 }
 
 fn validatePromotionResponse(
@@ -1530,6 +1837,72 @@ test "storage.ha http client rejects mismatched promotion admin responses" {
         .force = false,
         .reason = "http-client-test",
     }));
+}
+
+test "storage.ha http client rejects invalid typed admin responses" {
+    const alloc = std.testing.allocator;
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"create","slot":{"slot_name":"standby-b","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"current_lsn":0}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(
+            error.AdminReplicationSlotResponseMismatch,
+            client.createReplicationSlot("http://ha-admin.test", "standby-a", 0),
+        );
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"slots":[{"slot_name":"standby-a","timeline_id":0,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"current_lsn":0}]}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(
+            error.AdminReplicationSlotResponseMismatch,
+            client.listReplicationSlots("http://ha-admin.test"),
+        );
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"base_backup_begin:base-a","action_kind":"base_backup_begin","target":"base-a","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-a","backup_lsn":0,"start_record_lsn":1}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(error.AdminSeedResponseMismatch, client.beginBaseBackup("http://ha-admin.test", .{
+            .slot_name = "standby-a",
+            .manifest_id = "base-a",
+        }));
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"held":true}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(error.AdminFenceResponseMismatch, client.currentFence("http://ha-admin.test"));
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"decision":{"role":"primary","action":"mutate","identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":1,"epoch":1},"durable_lsn":1,"next_lsn":2}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+        try std.testing.expectError(error.AdminGateResponseMismatch, client.checkWrite("http://ha-admin.test", .{
+            .role = "primary",
+            .expected_identity = testAdminIdentity(),
+        }));
+    }
 }
 
 test "storage.ha http client maps admin errors" {
