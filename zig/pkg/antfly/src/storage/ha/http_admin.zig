@@ -577,11 +577,18 @@ pub const Server = struct {
         defer result.deinit(self.alloc);
         return switch (result) {
             .promote_assess => |assessment| blk: {
-                var receipt = try actionReceiptAlloc(self.alloc, "promotion_assess", node_id, "assessed", node_id);
-                defer receipt.deinit(self.alloc);
-                break :blk try self.handleTypedJson(PromotionAssessDocument{
-                    .action = receipt,
-                    .assessment = assessment,
+                const action_id = try std.fmt.allocPrint(self.alloc, "promotion_assess:{s}", .{node_id});
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(admin_api.HAPromotionAssessResponse{
+                    .schema_version = 1,
+                    .action = .{
+                        .action_id = action_id,
+                        .action_kind = "promotion_assess",
+                        .target = node_id,
+                        .state = "assessed",
+                        .node_id = node_id,
+                    },
+                    .assessment = try adminPromotionAssessment(assessment),
                 });
             },
             else => unreachable,
@@ -881,12 +888,6 @@ const CurrentFenceDocument = struct {
     receipt: ?fencing.Receipt,
 };
 
-const PromotionAssessDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    assessment: status_mod.PromotionAssessment,
-};
-
 const PromotionDocument = struct {
     schema_version: u32 = 1,
     action: ActionReceiptDocument,
@@ -983,6 +984,28 @@ fn commitGateDocument(gate: commit_gate.GateResult) CommitGateDocument {
         .action = gate.action,
         .durability = gate.decision,
     };
+}
+
+fn adminPromotionAssessment(assessment: status_mod.PromotionAssessment) !admin_api.HAPromotionAssessment {
+    return .{
+        .required_lsn = try adminI64(assessment.required_lsn),
+        .received_lsn = try adminI64(assessment.received_lsn),
+        .applied_lsn = try adminI64(assessment.applied_lsn),
+        .has_required_lsn = assessment.has_required_lsn,
+        .caught_up_to_received = assessment.caught_up_to_received,
+        .fencing_confirmed = assessment.fencing_confirmed,
+        .force = assessment.force,
+        .data_loss_possible = assessment.data_loss_possible,
+        .safe = assessment.safe,
+        .requires_fencing = assessment.requires_fencing,
+        .requires_force = assessment.requires_force,
+        .can_promote = assessment.can_promote,
+    };
+}
+
+fn adminI64(value: u64) !i64 {
+    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.AdminOpenAPIIntegerOverflow;
+    return @intCast(value);
 }
 
 const SlotDocument = struct {
