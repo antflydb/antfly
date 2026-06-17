@@ -1056,6 +1056,16 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 	if err := ValidateHARejoinAssessResponse(base); err != nil {
 		t.Fatalf("ValidateHARejoinAssessResponse returned error: %v", err)
 	}
+	wrongTarget := base
+	wrongTarget.Action.Target = "primary-b"
+	if err := ValidateHARejoinAssessResponse(wrongTarget); err == nil || !strings.Contains(err.Error(), "target") {
+		t.Fatalf("wrong target error = %v, want target mismatch error", err)
+	}
+	wrongAssessNode := base
+	wrongAssessNode.Action.NodeId = "primary-b"
+	if err := ValidateHARejoinAssessResponse(wrongAssessNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+		t.Fatalf("wrong assess executor error = %v, want executor node mismatch error", err)
+	}
 	base.Assessment.Reason = HARejoinAssessmentReason("unknown")
 	if err := ValidateHARejoinAssessResponse(base); err == nil || !strings.Contains(err.Error(), "assessment fields") {
 		t.Fatalf("invalid reason error = %v, want assessment fields error", err)
@@ -1063,6 +1073,7 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 	base.Assessment.Reason = HARejoinReasonCurrentTimeline
 
 	rewind := base
+	rewind.Action.ActionId = "rejoin_rewind:primary-a"
 	rewind.Action.ActionKind = HAActionKindRejoinRewind
 	rewind.Action.State = HAActionStateApplied
 	rewind.Assessment.Action = HARejoinActionRewind
@@ -1079,14 +1090,21 @@ func TestValidateHARejoinAssessResponse(t *testing.T) {
 	if err := ValidateHARejoinAssessResponse(rewind); err != nil {
 		t.Fatalf("ValidateHARejoinAssessResponse rewind returned error: %v", err)
 	}
+	wrongRewindNode := rewind
+	wrongRewindNode.Action.NodeId = "primary-b"
+	if err := ValidateHARejoinAssessResponse(wrongRewindNode); err == nil || !strings.Contains(err.Error(), "executor node mismatch") {
+		t.Fatalf("wrong rewind executor error = %v, want executor node mismatch error", err)
+	}
 	rewind.Rewind.NextLsn = 0
 	if err := ValidateHARejoinAssessResponse(rewind); err == nil || !strings.Contains(err.Error(), "rewind fields") {
 		t.Fatalf("missing rewind error = %v, want rewind fields error", err)
 	}
 
 	reseed := base
+	reseed.Action.ActionId = "rejoin_reseed:primary-a"
 	reseed.Action.ActionKind = HAActionKindRejoinReseed
 	reseed.Action.State = HAActionStateApplied
+	reseed.Action.NodeId = "primary-current"
 	reseed.Assessment.Action = HARejoinActionReseed
 	reseed.Assessment.Reason = HARejoinReasonParentTimelineWALExpired
 	reseed.Reseed = HARejoinReseedResult{

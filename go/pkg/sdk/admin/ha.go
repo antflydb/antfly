@@ -692,6 +692,56 @@ func ValidateHARejoinAssessResponse(response HARejoinAssessResponse) error {
 			return fmt.Errorf("missing rejoin reseed fields")
 		}
 	}
+	if err := validateHARejoinReceiptCorrelation(response); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateHARejoinReceiptCorrelation(response HARejoinAssessResponse) error {
+	action := response.Action
+	target := strings.TrimSpace(action.Target)
+	if target != strings.TrimSpace(response.Assessment.FormerNodeId) {
+		return fmt.Errorf("rejoin response action target does not match former node")
+	}
+	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+target {
+		return fmt.Errorf("rejoin response action id does not match action kind and target")
+	}
+
+	switch action.ActionKind {
+	case HAActionKindRejoinAssess:
+		if action.State != HAActionStateAssessed {
+			return fmt.Errorf("rejoin assess response action state mismatch")
+		}
+		if strings.TrimSpace(action.NodeId) != target {
+			return fmt.Errorf("rejoin assess response executor node mismatch")
+		}
+	case HAActionKindRejoinRewind:
+		if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
+			return fmt.Errorf("rejoin rewind response action state mismatch")
+		}
+		if strings.TrimSpace(action.NodeId) != target {
+			return fmt.Errorf("rejoin rewind response executor node mismatch")
+		}
+		if response.Assessment.Action != HARejoinActionRewind {
+			return fmt.Errorf("rejoin rewind response assessment action mismatch")
+		}
+		if strings.TrimSpace(response.Rewind.NodeId) != target {
+			return fmt.Errorf("rejoin rewind response result node mismatch")
+		}
+	case HAActionKindRejoinReseed:
+		if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
+			return fmt.Errorf("rejoin reseed response action state mismatch")
+		}
+		if response.Assessment.Action != HARejoinActionReseed {
+			return fmt.Errorf("rejoin reseed response assessment action mismatch")
+		}
+		if strings.TrimSpace(response.Reseed.NodeId) != target || strings.TrimSpace(response.Reseed.SlotName) != target {
+			return fmt.Errorf("rejoin reseed response result target mismatch")
+		}
+	default:
+		return fmt.Errorf("invalid rejoin response action kind %q", action.ActionKind)
+	}
 	return nil
 }
 
