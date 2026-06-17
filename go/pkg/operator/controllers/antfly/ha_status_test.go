@@ -226,6 +226,42 @@ func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t 
 	}
 }
 
+func TestHAPlannedActionStatusesDropInvalidDirectAdminSuccess(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+	}
+	actions := []haPlannedAction{{
+		Kind:        haActionCreateSlot,
+		StandbyName: "standby-a",
+		SlotName:    "standby-a",
+		TargetLSN:   5,
+		Reason:      "SlotMissing",
+	}}
+
+	initial := haPlannedActionStatuses(actions, ha, &antflyv1.HAStatus{})
+	if len(initial) != 1 {
+		t.Fatalf("expected one planned action, got %#v", initial)
+	}
+	previous := initial[0]
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminError = "weak direct-admin-api diagnostic"
+	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1,
+		SlotAction:    "create",
+		SlotName:      "standby-a",
+	}
+
+	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
+	preserved := haPlannedActionStatuses(actions, ha, status)
+	if preserved[0].AdminJobName != "" ||
+		preserved[0].AdminJobPhase != "" ||
+		preserved[0].AdminError != "" ||
+		preserved[0].AdminResult != nil {
+		t.Fatalf("expected invalid direct admin success to be dropped, got %#v", preserved[0])
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
