@@ -1968,12 +1968,17 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         stats.records += iterator.recordCount();
         stats.encoded_value_bytes += value.len;
+        var reserved = false;
         while (try iterator.next()) |record| {
             if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            if (!reserved) {
+                try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount());
+                reserved = true;
+            }
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
             stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-            try appendDeltaRecordToScratch(alloc, scratch, record);
+            scratch.appendDeltaRecordAssumeCapacity(record);
         }
     }
 }
@@ -2651,13 +2656,18 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntriesIntoScratchWithStats(alloc, scratch, &stats, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
+            var reserved = false;
             for (batch.records.items) |record| {
                 stats.records += 1;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!reserved) {
+                    try ensureDeltaRecordAppendCapacity(alloc, scratch, batch.records.items.len);
+                    reserved = true;
+                }
                 stats.records_after_generation += 1;
                 if (record.op == .tombstone) stats.tombstones_after_generation += 1;
                 stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-                try appendDeltaRecordToScratch(alloc, scratch, record);
+                scratch.appendDeltaRecordAssumeCapacity(record);
             }
         }
 
@@ -2987,12 +2997,17 @@ pub const DirectoryBatchWriter = struct {
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             stats.records += iterator.recordCount();
             stats.encoded_value_bytes += entry.value.len;
+            var reserved = false;
             while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!reserved) {
+                    try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount());
+                    reserved = true;
+                }
                 stats.records_after_generation += 1;
                 if (record.op == .tombstone) stats.tombstones_after_generation += 1;
                 stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-                try appendDeltaRecordToScratch(alloc, scratch, record);
+                scratch.appendDeltaRecordAssumeCapacity(record);
             }
         }
     }
@@ -3613,9 +3628,10 @@ fn sortPostingDeltaRecordsIfNeeded(records: []posting.PostingDeltaRecord) void {
     }
 }
 
-fn appendDeltaRecordToScratch(alloc: Allocator, scratch: anytype, record: posting.PostingDeltaRecord) !void {
+fn ensureDeltaRecordAppendCapacity(alloc: Allocator, scratch: anytype, additional: usize) !void {
+    if (additional == 0) return;
     const Scratch = std.meta.Child(@TypeOf(scratch));
-    const needed = scratch.deltaRecordCount() + 1;
+    const needed = try std.math.add(usize, scratch.deltaRecordCount(), additional);
     if (comptime @hasField(Scratch, "delta_records")) {
         if (needed > scratch.delta_records.len) {
             const doubled = scratch.delta_records.len *| 2;
@@ -3629,6 +3645,10 @@ fn appendDeltaRecordToScratch(alloc: Allocator, scratch: anytype, record: postin
     } else {
         try scratch.ensureDeltaRecordCapacity(alloc, needed);
     }
+}
+
+fn appendDeltaRecordToScratch(alloc: Allocator, scratch: anytype, record: posting.PostingDeltaRecord) !void {
+    try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
     scratch.appendDeltaRecordAssumeCapacity(record);
 }
 
