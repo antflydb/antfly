@@ -125,7 +125,10 @@ Current status:
 - `SearchScratch` already groups fixed query arrays into `query_storage`; cold
   scratch retention now also releases query, distance, member-id, vector-batch,
   and rerank-flag slabs when `max_retained_search_scratch_bytes` demands it,
-  then regrows them through the existing `ensure*Capacity` paths.
+  then regrows them through the existing `ensure*Capacity` paths. Query-side
+  posting delta-tail prefetch cache entries now grow their parallel record
+  arrays geometrically instead of reallocating all three arrays for each
+  appended cached record.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
   repeated linear membership checks to a temporary removal set for larger
   postings/delete lists, preserving member order while avoiding quadratic CPU

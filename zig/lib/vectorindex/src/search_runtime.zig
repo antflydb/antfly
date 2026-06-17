@@ -110,9 +110,14 @@ const PostingDeltaTailCacheEntry = struct {
 
     fn append(self: *PostingDeltaTailCacheEntry, alloc: Allocator, sequence: u64, vector_id: u64, op: u8) !void {
         const needed = self.count + 1;
-        if (self.sequences.len < needed) self.sequences = try alloc.realloc(self.sequences, needed);
-        if (self.ids.len < needed) self.ids = try alloc.realloc(self.ids, needed);
-        if (self.ops.len < needed) self.ops = try alloc.realloc(self.ops, needed);
+        if (self.sequences.len < needed or self.ids.len < needed or self.ops.len < needed) {
+            const current_capacity = @min(self.sequences.len, @min(self.ids.len, self.ops.len));
+            const doubled = current_capacity *| 2;
+            const capacity = @max(needed, @max(doubled, @as(usize, 8)));
+            self.sequences = try alloc.realloc(self.sequences, capacity);
+            self.ids = try alloc.realloc(self.ids, capacity);
+            self.ops = try alloc.realloc(self.ops, capacity);
+        }
         self.sequences[self.count] = sequence;
         self.ids[self.count] = vector_id;
         self.ops[self.count] = op;
@@ -911,6 +916,26 @@ test "SearchScratch caches multiple posting delta tails in a compact ring" {
     try std.testing.expect(scratch.cachedPostingDeltaTail(10) == null);
     try std.testing.expect(scratch.cachedPostingDeltaTail(11) != null);
     try std.testing.expect(scratch.cachedPostingDeltaTail(14) != null);
+}
+
+test "SearchScratch posting delta tail cache grows geometrically" {
+    const alloc = std.testing.allocator;
+    var entry = PostingDeltaTailCacheEntry{};
+    defer entry.deinit(alloc);
+
+    entry.reset(10);
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        try entry.append(alloc, @intCast(i + 1), @intCast(100 + i), @intCast(i % 3));
+    }
+
+    const view = entry.view();
+    try std.testing.expectEqual(@as(usize, 9), view.sequences.len);
+    try std.testing.expectEqual(@as(usize, 16), entry.sequences.len);
+    try std.testing.expectEqual(entry.sequences.len, entry.ids.len);
+    try std.testing.expectEqual(entry.sequences.len, entry.ops.len);
+    try std.testing.expectEqual(@as(u64, 1), view.sequences[0]);
+    try std.testing.expectEqual(@as(u64, 9), view.sequences[8]);
 }
 
 test "SearchScratch bounds posting member cache and reports evictions" {
