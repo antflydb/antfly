@@ -440,8 +440,10 @@ Recommended split:
   receipts, promotion, former-primary rejoin, rewind, and reseed workflows. It
   should return typed responses with action ids, LSNs, timelines, fence tokens,
   receipts, and idempotency state. New HA admin endpoints and schemas should be
-  added to `specs/openapi/antfly/admin.yaml` first, then implemented in the Zig
-  admin package rather than mixed into the public DB API or runtime-internal API.
+  added to the dedicated `specs/openapi/antfly/admin.yaml` spec first, generated
+  into Zig admin types, and implemented through `zig/pkg/antfly/src/admin/`
+  routing/helpers rather than mixed into the public DB API or runtime-internal
+  API.
 - `/internal/v1`: runtime-to-runtime traffic inside a trusted deployment. This
   is where WAL streaming, replication pulls, standby status updates, identity
   probes, and other node-to-node mechanisms belong. It should not be the
@@ -549,8 +551,10 @@ and either rewind or reseed.
 ### Phase 8: CLI and Admin API
 
 - Define `/admin/v1/ha` as the stable typed control-plane API in
-  `specs/openapi/antfly/admin.yaml`.
-- Keep Zig admin routing, request parsing, response generation, and shared route
+  the dedicated `specs/openapi/antfly/admin.yaml` OpenAPI spec, separate from
+  public DB and `/internal/v1` specs.
+- Generate and re-export Zig admin request/response types from that spec, and
+  keep admin routing, request parsing, response generation, and shared route
   constants in `zig/pkg/antfly/src/admin/`.
 - Add admin API endpoints to create, drop, pause, resume, and list replication
   slots.
@@ -580,6 +584,9 @@ be validated against that operator package.
 - Bootstrap standby pods from base backup and attach them to replication slots.
 - Manage slot lifecycle and WAL retention pressure.
 - Prefer typed `/admin/v1/ha` calls for idempotent operator actions.
+- Treat `specs/openapi/antfly/admin.yaml` plus `zig/pkg/antfly/src/admin/` as
+  the operator-facing contract source for admin HTTP method/path, request, and
+  response fields.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.
