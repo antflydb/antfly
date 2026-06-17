@@ -4086,6 +4086,7 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 
 func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:         result.SchemaVersion,
 		ActionID:              strings.TrimSpace(result.ActionID),
 		ActionKind:            strings.TrimSpace(result.ActionKind),
 		ActionTarget:          strings.TrimSpace(result.ActionTarget),
@@ -4403,6 +4404,7 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 }
 
 type haPromotionJobResult struct {
+	SchemaVersion    uint32
 	ActionID         string
 	ActionKind       string
 	ActionTarget     string
@@ -4499,8 +4501,9 @@ type haPromotionAPIResultEnvelope struct {
 }
 
 type haPromotionAPIResult struct {
-	Action     haAdminActionReceiptJSON `json:"action"`
-	Assessment struct {
+	SchemaVersion uint32                   `json:"schema_version"`
+	Action        haAdminActionReceiptJSON `json:"action"`
+	Assessment    struct {
 		RequiredLSN uint64 `json:"required_lsn"`
 		ReceivedLSN uint64 `json:"received_lsn"`
 		AppliedLSN  uint64 `json:"applied_lsn"`
@@ -4542,7 +4545,11 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if result == nil {
 		result = envelope.Result.Promote
 	}
+	if result != nil && result.SchemaVersion == 0 {
+		result.SchemaVersion = envelope.SchemaVersion
+	}
 	if result == nil || result.Promotion.SwitchLSN == 0 ||
+		result.SchemaVersion == 0 ||
 		strings.TrimSpace(result.Promotion.NodeID) == "" ||
 		result.Promotion.OldIdentity.ClusterID == 0 ||
 		result.Promotion.OldIdentity.TimelineID == 0 ||
@@ -4566,6 +4573,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		observedLSN = requiredLSN
 	}
 	return haPromotionJobResult{
+		SchemaVersion:    result.SchemaVersion,
 		ActionID:         strings.TrimSpace(result.Action.ActionID),
 		ActionKind:       strings.TrimSpace(result.Action.ActionKind),
 		ActionTarget:     strings.TrimSpace(result.Action.Target),
@@ -4592,6 +4600,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 }
 
 type haRejoinJobResult struct {
+	SchemaVersion            uint32
 	ActionID                 string
 	ActionKind               string
 	ActionTarget             string
@@ -4744,10 +4753,11 @@ func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
 }
 
 type haRejoinAPIResultEnvelope struct {
-	Action     haAdminActionReceiptJSON `json:"action"`
-	Assessment haRejoinAPIResult        `json:"assessment"`
-	Rewind     *haRejoinAPIRewind       `json:"rewind,omitempty"`
-	Reseed     *haRejoinAPIReseed       `json:"reseed,omitempty"`
+	SchemaVersion uint32                   `json:"schema_version"`
+	Action        haAdminActionReceiptJSON `json:"action"`
+	Assessment    haRejoinAPIResult        `json:"assessment"`
+	Rewind        *haRejoinAPIRewind       `json:"rewind,omitempty"`
+	Reseed        *haRejoinAPIReseed       `json:"reseed,omitempty"`
 }
 
 type haRejoinAPIResult struct {
@@ -4792,12 +4802,14 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 	}
 	assessment := envelope.Assessment
 	if strings.TrimSpace(assessment.Action) == "" ||
+		envelope.SchemaVersion == 0 ||
 		strings.TrimSpace(assessment.FormerNodeID) == "" ||
 		assessment.TargetTimelineID == 0 ||
 		assessment.TargetEpoch == 0 {
 		return haRejoinJobResult{}, false
 	}
 	result := haRejoinJobResult{
+		SchemaVersion:     envelope.SchemaVersion,
 		ActionID:          strings.TrimSpace(envelope.Action.ActionID),
 		ActionKind:        strings.TrimSpace(envelope.Action.ActionKind),
 		ActionTarget:      strings.TrimSpace(envelope.Action.Target),
@@ -4866,6 +4878,7 @@ func applyHARejoinAdminActionResult(status *antflyv1.HAAdminActionResultStatus, 
 	if status == nil {
 		return
 	}
+	status.SchemaVersion = result.SchemaVersion
 	status.ActionID = strings.TrimSpace(result.ActionID)
 	status.ActionKind = strings.TrimSpace(result.ActionKind)
 	status.ActionTarget = strings.TrimSpace(result.ActionTarget)
@@ -4899,6 +4912,7 @@ func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus
 		return haRejoinJobResult{}, false
 	}
 	return haRejoinJobResult{
+		SchemaVersion:            result.SchemaVersion,
 		ActionID:                 strings.TrimSpace(result.ActionID),
 		ActionKind:               strings.TrimSpace(result.ActionKind),
 		ActionTarget:             strings.TrimSpace(result.ActionTarget),

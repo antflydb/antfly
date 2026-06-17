@@ -2366,6 +2366,7 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 
 	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(openAPIResult.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(openAPIResult.ActionID).To(Equal("promotion:standby-a"))
 	g.Expect(openAPIResult.ActionKind).To(Equal("promotion"))
 	g.Expect(openAPIResult.ActionTarget).To(Equal("standby-a"))
@@ -2383,6 +2384,7 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(openAPIResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIResult.FenceToken).To(Equal("ha-fence-token"))
 	openAPIStatus := haPromotionAdminActionResult(openAPIResult)
+	g.Expect(openAPIStatus.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(openAPIStatus.ActionID).To(Equal("promotion:standby-a"))
 	g.Expect(openAPIStatus.ActionKind).To(Equal("promotion"))
 	g.Expect(openAPIStatus.ActionTarget).To(Equal("standby-a"))
@@ -2393,6 +2395,7 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 
 	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15},"promotion":{"node_id":"standby-a","switch_lsn":14,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(legacyResult.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(legacyResult.PromotedNodeID).To(Equal("standby-a"))
 	g.Expect(legacyResult.SwitchLSN).To(Equal(uint64(14)))
 	g.Expect(legacyResult.ParentClusterID).To(Equal(uint64(100)))
@@ -2854,6 +2857,7 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 
 	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":8,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":12,"previous_last_lsn":13,"current_last_lsn":12,"next_lsn":13,"discarded_lsn_count":1,"target_timeline_id":5,"target_epoch":7,"data_loss_discarded":true}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(result.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(result.ActionID).To(Equal("rejoin_rewind:primary-a"))
 	g.Expect(result.ActionKind).To(Equal("rejoin_rewind"))
 	g.Expect(result.ActionTarget).To(Equal("primary-a"))
@@ -2867,6 +2871,7 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 	g.Expect(result.DataLossDiscarded).To(BeTrue())
 
 	status := haRejoinAdminActionResult(result)
+	g.Expect(status.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(status.ActionID).To(Equal("rejoin_rewind:primary-a"))
 	g.Expect(status.ActionKind).To(Equal("rejoin_rewind"))
 	g.Expect(status.ActionTarget).To(Equal("primary-a"))
@@ -2879,6 +2884,7 @@ func TestParseHARejoinAPIResultRecordsRewindExecution(t *testing.T) {
 
 	roundTripped, ok := haRejoinJobResultFromAdminResult(status)
 	g.Expect(ok).To(BeTrue())
+	g.Expect(roundTripped.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(roundTripped.ActionID).To(Equal("rejoin_rewind:primary-a"))
 	g.Expect(roundTripped.RewindExecuted).To(BeTrue())
 	g.Expect(roundTripped.RewindDiscardedLSNCount).To(Equal(uint64(1)))
@@ -2898,6 +2904,7 @@ func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 
 	result, ok := parseHARejoinAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"rejoin_reseed:primary-a","action_kind":"rejoin_reseed","target":"primary-a","state":"applied"},"assessment":{"action":"reseed","reason":"parent_timeline_wal_expired","former_node_id":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"retained_from_lsn":14,"data_loss_discarded":false},"reseed":{"node_id":"primary-a","slot_name":"primary-a","target_timeline_id":5,"target_epoch":7,"fork_lsn":12,"former_last_lsn":13,"reseed_required":true,"base_backup_required":true}}`))
 	g.Expect(ok).To(BeTrue())
+	g.Expect(result.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(result.ActionID).To(Equal("rejoin_reseed:primary-a"))
 	g.Expect(result.ActionKind).To(Equal("rejoin_reseed"))
 	g.Expect(result.ActionTarget).To(Equal("primary-a"))
@@ -2909,6 +2916,7 @@ func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g.Expect(result.ReseedBaseBackupRequired).To(BeTrue())
 
 	status := haRejoinAdminActionResult(result)
+	g.Expect(status.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(status.ActionID).To(Equal("rejoin_reseed:primary-a"))
 	g.Expect(status.ReseedExecuted).To(BeTrue())
 	g.Expect(status.ReseedSlotName).To(Equal("primary-a"))
