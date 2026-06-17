@@ -2855,6 +2855,7 @@ pub fn build(b: *std.Build) void {
         "data server wires configured HA executors into API server",
         "data server propagates standby HA write gate into provisioned write sources",
         "data server applies routed HA replication records through standby write gate",
+        "data server pulls and applies HA standby replication through internal HTTP client",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
