@@ -105,7 +105,8 @@ Current status:
   tail length, so tombstone-heavy tails do not inflate scratch allocation.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
-  records.
+  records. Fold scratch compact-delta id/op arrays also grow geometrically,
+  which avoids one realloc per buffered compact delta in append-heavy scans.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full
