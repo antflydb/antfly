@@ -12,11 +12,15 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+pub const ast = @import("ast.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const token = @import("token.zig");
 pub const value = @import("value.zig");
 
+pub const SelectOutputKind = ast.SelectOutputKind;
+pub const SelectOutputRef = ast.SelectOutputRef;
+pub const SelectSetOperation = ast.SelectSetOperation;
 pub const SqlValue = value.SqlValue;
 pub const Token = token.Token;
 pub const TokenKind = token.TokenKind;

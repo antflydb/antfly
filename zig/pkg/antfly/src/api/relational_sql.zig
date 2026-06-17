@@ -29,6 +29,9 @@ const table_catalog = @import("table_catalog.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const SqlValue = sql_adapter.SqlValue;
+const SelectOutputKind = sql_adapter.SelectOutputKind;
+const SelectOutputRef = sql_adapter.SelectOutputRef;
+const SelectSetOperation = sql_adapter.SelectSetOperation;
 const Token = sql_adapter.Token;
 const TokenKind = sql_adapter.TokenKind;
 const freeTokens = sql_adapter.freeTokens;
@@ -289,27 +292,6 @@ fn rowExpressionBoundaryKeyword(text: []const u8) bool {
 }
 
 const InsertValueRows = []const []const []const u8;
-
-const SelectOutputKind = enum {
-    field,
-    json_extract,
-    array_length,
-    coalesce,
-    field_alias,
-    expression,
-};
-
-const SelectOutputRef = struct {
-    kind: SelectOutputKind,
-    index: usize,
-};
-
-const SelectSetOperation = enum {
-    union_distinct,
-    union_all,
-    intersect,
-    except,
-};
 
 pub const LoweredSelect = struct {
     table_name: []const u8,
