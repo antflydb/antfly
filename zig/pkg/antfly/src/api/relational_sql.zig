@@ -65101,6 +65101,16 @@ fn appParityPlanHasToken(plan: []const u8, token: []const u8) bool {
     return std.mem.indexOf(u8, plan, token) != null;
 }
 
+fn appParityAppliedPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
+    return appParityAppliedPlanIsStructured(plan) and
+        appParityPlanHasExactBoolToken(plan, token, expected);
+}
+
+fn appParityAppliedPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
+    return appParityAppliedPlanIsStructured(plan) and
+        appParityPlanHasExactUsizeToken(plan, token, expected);
+}
+
 fn appParityPlanHasAnyNonZeroToken(plan: []const u8, tokens: []const []const u8) bool {
     for (tokens) |token| {
         if (appParityPlanHasNonZeroToken(plan, token)) return true;
@@ -65113,6 +65123,15 @@ fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bo
         if (std.mem.indexOf(u8, value, needle) != null) return true;
     }
     return false;
+}
+
+test "app parity applied plan coverage tokens are exact" {
+    const plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=10:unvalidated_fk=1:unvalidated_check=0:update_policy=0";
+    try std.testing.expect(appParityAppliedPlanHasExactBoolToken(plan, "rebuild=", true));
+    try std.testing.expect(appParityAppliedPlanHasExactBoolToken(plan, "validation=", false));
+    try std.testing.expect(appParityAppliedPlanHasExactUsizeToken(plan, "unvalidated_unique=", 10));
+    try std.testing.expect(!appParityAppliedPlanHasExactUsizeToken(plan, "unvalidated_unique=", 1));
+    try std.testing.expect(!appParityAppliedPlanHasExactBoolToken("applied:rebuild=true:rewrite=false", "rebuild=", true));
 }
 
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {
@@ -66069,9 +66088,9 @@ const AppParityCorpusCoverage = struct {
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
         if (entry.applied_plan.len > 0) {
             self.applied_catalog_plan = true;
-            self.applied_catalog_rebuild = self.applied_catalog_rebuild or std.mem.indexOf(u8, entry.applied_plan, "rebuild=true") != null;
-            self.applied_catalog_validation = self.applied_catalog_validation or std.mem.indexOf(u8, entry.applied_plan, "validation=true") != null;
-            self.applied_catalog_rewrite = self.applied_catalog_rewrite or std.mem.indexOf(u8, entry.applied_plan, "rewrite=true") != null;
+            self.applied_catalog_rebuild = self.applied_catalog_rebuild or appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true);
+            self.applied_catalog_validation = self.applied_catalog_validation or appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
+            self.applied_catalog_rewrite = self.applied_catalog_rewrite or appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
         }
         switch (entry.family) {
             .ddl => self.ddl = true,
@@ -66533,27 +66552,27 @@ const AppParityCorpusCoverage = struct {
                     self.ddl_add_column_default_rewrite = self.ddl_add_column_default_rewrite or
                         std.mem.indexOf(u8, entry.sql, "ADD COLUMN") != null and
                             std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "rebuild=true") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "validation=true") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "rewrite=true") != null;
-                    self.ddl_add_unvalidated_unique = self.ddl_add_unvalidated_unique or std.mem.indexOf(u8, entry.applied_plan, "unvalidated_unique=1") != null;
-                    self.ddl_add_unvalidated_fk = self.ddl_add_unvalidated_fk or std.mem.indexOf(u8, entry.applied_plan, "unvalidated_fk=1") != null;
-                    self.ddl_add_unvalidated_check = self.ddl_add_unvalidated_check or std.mem.indexOf(u8, entry.applied_plan, "unvalidated_check=1") != null;
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true) and
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true) and
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
+                    self.ddl_add_unvalidated_unique = self.ddl_add_unvalidated_unique or appParityAppliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_unique=", 1);
+                    self.ddl_add_unvalidated_fk = self.ddl_add_unvalidated_fk or appParityAppliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_fk=", 1);
+                    self.ddl_add_unvalidated_check = self.ddl_add_unvalidated_check or appParityAppliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_check=", 1);
                     self.ddl_validate_constraint = self.ddl_validate_constraint or std.mem.indexOf(u8, entry.sql, "VALIDATE CONSTRAINT") != null;
                     self.ddl_drop_constraint = self.ddl_drop_constraint or std.mem.indexOf(u8, entry.sql, "DROP CONSTRAINT") != null;
                     self.ddl_drop_column = self.ddl_drop_column or std.mem.indexOf(u8, entry.sql, "DROP COLUMN") != null;
                     self.ddl_alter_column_default = self.ddl_alter_column_default or std.mem.indexOf(u8, entry.sql, "SET DEFAULT") != null or std.mem.indexOf(u8, entry.sql, "DROP DEFAULT") != null;
                     self.ddl_drop_column_default = self.ddl_drop_column_default or
                         std.mem.indexOf(u8, entry.sql, "DROP DEFAULT") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "rebuild=false") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "validation=false") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "rewrite=false") != null;
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
                     self.ddl_alter_column_not_null = self.ddl_alter_column_not_null or std.mem.indexOf(u8, entry.sql, "SET NOT NULL") != null or std.mem.indexOf(u8, entry.sql, "DROP NOT NULL") != null;
                     self.ddl_drop_column_not_null = self.ddl_drop_column_not_null or
                         std.mem.indexOf(u8, entry.sql, "DROP NOT NULL") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "rebuild=false") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "validation=false") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, "rewrite=false") != null;
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
+                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
                     self.ddl_alter_column_type = self.ddl_alter_column_type or std.mem.indexOf(u8, entry.sql, " TYPE ") != null or std.mem.indexOf(u8, entry.sql, " SET DATA TYPE ") != null;
                     self.ddl_rename_column = self.ddl_rename_column or std.mem.indexOf(u8, entry.sql, "RENAME COLUMN") != null;
                     self.ddl_rename_constraint = self.ddl_rename_constraint or std.mem.indexOf(u8, entry.sql, "RENAME CONSTRAINT") != null;
