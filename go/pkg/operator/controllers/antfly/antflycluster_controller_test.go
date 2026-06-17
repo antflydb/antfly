@@ -2647,6 +2647,14 @@ func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) 
 			tt.action.AdminNodeID = "node-a"
 			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
 
+			tt.action.AdminResult.ActionState = "already_applied"
+			if tt.wantState == "applied" {
+				g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
+			} else {
+				g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeFalse())
+			}
+			tt.action.AdminResult.ActionState = tt.wantState
+
 			tt.action.AdminResult.ActionNodeID = "node-b"
 			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeFalse())
 			tt.action.AdminResult.ActionNodeID = "node-a"

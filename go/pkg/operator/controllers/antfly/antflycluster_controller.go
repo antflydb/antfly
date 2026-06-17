@@ -4692,8 +4692,17 @@ func haJobResultActionReceiptMatches(actionID, actionKind, actionTarget, actionS
 	}
 	return actionKind == expectedKind &&
 		actionTarget == expectedTarget &&
-		actionState == expectedState &&
+		haJobResultActionStateMatches(actionState, expectedState) &&
 		actionID == expectedKind+":"+expectedTarget
+}
+
+func haJobResultActionStateMatches(actionState, expectedState string) bool {
+	actionState = strings.TrimSpace(actionState)
+	expectedState = strings.TrimSpace(expectedState)
+	if actionState == expectedState {
+		return true
+	}
+	return expectedState == "applied" && actionState == "already_applied"
 }
 
 func haPromotionFenceReason(action antflyv1.HAPlannedActionStatus) string {
