@@ -30,6 +30,7 @@ const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
+const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
@@ -291,6 +292,14 @@ pub fn assessFormerPrimaryRejoin(
     policy: rejoin.RejoinPolicy,
 ) rejoin.Assessment {
     return rejoin.assessFormerPrimary(former, receipt, policy);
+}
+
+pub fn rewindFormerPrimaryReplicationLog(
+    alloc: Allocator,
+    log: *replication_log.ReplicationLog,
+    assessment: rejoin.Assessment,
+) !rejoin.RewindResult {
+    return try rejoin.rewindReplicationLog(alloc, log, assessment);
 }
 
 fn cloneReceiptAlloc(alloc: Allocator, receipt: fencing.Receipt) !fencing.Receipt {

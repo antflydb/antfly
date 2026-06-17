@@ -22,7 +22,11 @@
 
 const std = @import("std");
 const fencing = @import("fencing.zig");
+const replication_log = @import("replication_log.zig");
+const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
+
+var test_path_counter: u64 = 0;
 
 pub const Action = enum {
     reject_unfenced,
@@ -64,6 +68,17 @@ pub const Assessment = struct {
     fork_lsn: u64,
     former_last_lsn: u64,
     retained_from_lsn: u64,
+    data_loss_discarded: bool,
+};
+
+pub const RewindResult = struct {
+    fork_lsn: u64,
+    previous_last_lsn: u64,
+    current_last_lsn: u64,
+    next_lsn: u64,
+    discarded_lsn_count: u64,
+    target_timeline_id: u64,
+    target_epoch: u64,
     data_loss_discarded: bool,
 };
 
@@ -133,6 +148,37 @@ pub fn assessFormerPrimary(
     };
 }
 
+pub fn rewindReplicationLog(
+    alloc: std.mem.Allocator,
+    log: *replication_log.ReplicationLog,
+    assessment: Assessment,
+) !RewindResult {
+    if (assessment.action != .rewind) return error.RejoinRewindNotAllowed;
+
+    const previous_last_lsn = log.lastLsn();
+    if (previous_last_lsn != assessment.former_last_lsn) return error.RejoinAssessmentStale;
+    if (assessment.fork_lsn < assessment.retained_from_lsn) return error.WalNoLongerRetained;
+    if (previous_last_lsn < assessment.fork_lsn) return error.FormerPrimaryBeforeFork;
+
+    if (assessment.fork_lsn > 0) {
+        var fork_entry = (try log.entryAt(alloc, assessment.fork_lsn)) orelse return error.WalNoLongerRetained;
+        defer fork_entry.deinit(alloc);
+    }
+
+    try log.truncateAfter(assessment.fork_lsn);
+    const current_last_lsn = log.lastLsn();
+    return .{
+        .fork_lsn = assessment.fork_lsn,
+        .previous_last_lsn = previous_last_lsn,
+        .current_last_lsn = current_last_lsn,
+        .next_lsn = log.nextLsn(),
+        .discarded_lsn_count = previous_last_lsn - current_last_lsn,
+        .target_timeline_id = assessment.target_timeline_id,
+        .target_epoch = assessment.target_epoch,
+        .data_loss_discarded = assessment.data_loss_discarded,
+    };
+}
+
 fn reseed(reason: Reason, former: FormerPrimaryState, receipt: fencing.Receipt, policy: RejoinPolicy) Assessment {
     return .{
         .action = .reseed,
@@ -144,6 +190,35 @@ fn reseed(reason: Reason, former: FormerPrimaryState, receipt: fencing.Receipt, 
         .former_last_lsn = former.last_lsn,
         .retained_from_lsn = policy.retained_from_lsn,
         .data_loss_discarded = false,
+    };
+}
+
+fn testPath(alloc: std.mem.Allocator, comptime name: []const u8) ![:0]u8 {
+    const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
+    const raw = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/ha-rejoin-" ++ name ++ "-{d}-{d}",
+        .{ std.testing.random_seed, nonce },
+    );
+    defer alloc.free(raw);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
+    return try alloc.dupeZ(u8, raw);
+}
+
+fn baseRecord(lsn: u64, payload: []const u8) replication_record.Record {
+    const identity = parentIdentity();
+    return .{
+        .kind = .batch_mutation,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = lsn,
+        .previous_lsn = lsn - 1,
+        .payload = payload,
     };
 }
 
@@ -264,4 +339,107 @@ test "storage.ha rejoin requires explicit policy for forced-promotion rewind" {
     });
     try std.testing.expectEqual(Action.rewind, assessment.action);
     try std.testing.expect(assessment.data_loss_discarded);
+}
+
+test "storage.ha rejoin rewind truncates former primary divergent log suffix" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "rewind-log");
+    defer alloc.free(path);
+
+    var log = try replication_log.ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    _ = try log.append(alloc, baseRecord(2, "two"));
+    _ = try log.append(alloc, baseRecord(3, "divergent-three"));
+    _ = try log.append(alloc, baseRecord(4, "divergent-four"));
+
+    var receipt = promotedReceipt();
+    receipt.required_lsn = 2;
+    receipt.observed_lsn = 2;
+    const assessment = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = log.lastLsn(),
+    }, receipt, .{ .retained_from_lsn = 1 });
+
+    const result = try rewindReplicationLog(alloc, &log, assessment);
+    try std.testing.expectEqual(@as(u64, 2), result.fork_lsn);
+    try std.testing.expectEqual(@as(u64, 4), result.previous_last_lsn);
+    try std.testing.expectEqual(@as(u64, 2), result.current_last_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.next_lsn);
+    try std.testing.expectEqual(@as(u64, 2), result.discarded_lsn_count);
+
+    const entries = try log.iterateFrom(alloc, 1);
+    defer replication_log.freeEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("one", entries[0].record.payload);
+    try std.testing.expectEqualStrings("two", entries[1].record.payload);
+
+    _ = try log.append(alloc, baseRecord(3, "new-timeline-switch-or-catchup"));
+    try std.testing.expectEqual(@as(u64, 3), log.lastLsn());
+}
+
+test "storage.ha rejoin rewind rejects stale or non-rewind assessments" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "rewind-reject");
+    defer alloc.free(path);
+
+    var log = try replication_log.ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    _ = try log.append(alloc, baseRecord(2, "two"));
+
+    var receipt = promotedReceipt();
+    receipt.required_lsn = 1;
+    receipt.observed_lsn = 1;
+    const assessment = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = log.lastLsn(),
+    }, receipt, .{ .retained_from_lsn = 1 });
+    try std.testing.expectEqual(Action.rewind, assessment.action);
+
+    _ = try log.append(alloc, baseRecord(3, "late-write"));
+    try std.testing.expectError(
+        error.RejoinAssessmentStale,
+        rewindReplicationLog(alloc, &log, assessment),
+    );
+
+    const no_fence = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = log.lastLsn(),
+    }, null, .{ .retained_from_lsn = 1 });
+    try std.testing.expectError(
+        error.RejoinRewindNotAllowed,
+        rewindReplicationLog(alloc, &log, no_fence),
+    );
+}
+
+test "storage.ha rejoin rewind requires retained fork record" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "rewind-retained");
+    defer alloc.free(path);
+
+    var log = try replication_log.ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    _ = try log.append(alloc, baseRecord(2, "two"));
+    _ = try log.append(alloc, baseRecord(3, "three"));
+
+    var receipt = promotedReceipt();
+    receipt.required_lsn = 2;
+    receipt.observed_lsn = 2;
+    const assessment = assessFormerPrimary(.{
+        .node_id = "primary-a",
+        .identity = parentIdentity(),
+        .last_lsn = log.lastLsn(),
+    }, receipt, .{ .retained_from_lsn = 1 });
+    try std.testing.expectEqual(Action.rewind, assessment.action);
+
+    try log.truncate(2);
+    try std.testing.expectError(
+        error.WalNoLongerRetained,
+        rewindReplicationLog(alloc, &log, assessment),
+    );
 }
