@@ -2024,6 +2024,40 @@ func TestHADirectAdminActionDependenciesRequireVersionedActionReceipt(t *testing
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
 }
 
+func TestHAImplicitDependenciesRequireTypedAdminActionWithoutCLIArgv(t *testing.T) {
+	g := NewWithT(t)
+
+	actions := []antflyv1.HAPlannedActionStatus{{
+		Kind:          string(haActionCreateSlot),
+		SlotName:      "standby-a",
+		AdminMethod:   "POST",
+		AdminPath:     "/admin/v1/ha/replication-slots",
+		AdminJobName:  haAdminDirectAPIName,
+		AdminJobPhase: haAdminJobPhasePending,
+	}, {
+		Kind:        string(haActionSeedStandby),
+		StandbyName: "standby-a",
+		AdminMethod: "POST",
+		AdminPath:   "/admin/v1/ha/base-backups",
+	}}
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1,
+		ActionID:      "replication_slot_create:standby-a",
+		ActionKind:    "replication_slot_create",
+		ActionTarget:  "standby-a",
+		ActionState:   "applied",
+		SlotAction:    "create",
+		SlotName:      "standby-a",
+	}
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
+}
+
 func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T) {
 	g := NewWithT(t)
 

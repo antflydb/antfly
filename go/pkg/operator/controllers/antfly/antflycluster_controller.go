@@ -5706,7 +5706,7 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 
 func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool {
 	for _, action := range actions {
-		if len(action.AdminCommand) == 0 {
+		if !haPlannedActionRequiresAdminTarget(action) {
 			continue
 		}
 		if !haAdminActionSucceededWithEvidence(action) {
