@@ -396,6 +396,48 @@ fn expectContains(body: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
 }
 
+test "storage.ha internal http adapter handles every generated HA replication route method" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, null);
+
+    for (internal_api.openapi.server.routes) |route| {
+        if (!std.mem.startsWith(u8, route.path, "/ha/replication/")) continue;
+
+        const path = try generatedRoutePathAlloc(alloc, route.path);
+        defer alloc.free(path);
+
+        const method = try methodFromText(route.method);
+        var response = try server.handle(.{ .method = method, .uri = path });
+        defer response.deinit(alloc);
+
+        if (response.status == 404 or response.status == 405) {
+            std.debug.print(
+                "generated internal OpenAPI HA replication route {s} {s} ({s}) was not dispatched by storage HA internal server\n",
+                .{ route.method, route.path, route.operation_id },
+            );
+            return error.TestExpectedGeneratedRouteDispatched;
+        }
+    }
+}
+
+test "storage.ha internal http adapter returns method errors for generated HA replication routes" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, null);
+
+    for (internal_api.openapi.server.routes) |route| {
+        if (!std.mem.startsWith(u8, route.path, "/ha/replication/")) continue;
+
+        const path = try generatedRoutePathAlloc(alloc, route.path);
+        defer alloc.free(path);
+
+        const method = generatedRouteUnsupportedMethod(route.method) orelse return error.TestExpectedUnsupportedMethod;
+        var response = try server.handle(.{ .method = method, .uri = path });
+        defer response.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u16, 405), response.status);
+    }
+}
+
 test "storage.ha internal http adapter serves replication pull and status update" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "replication-round-trip");
@@ -457,4 +499,41 @@ test "storage.ha internal http adapter serves replication pull and status update
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
+fn generatedRoutePathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, path, '{') == null) {
+        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ internal_api.routes.base, path });
+    }
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, internal_api.routes.base);
+
+    var idx: usize = 0;
+    while (idx < path.len) {
+        if (path[idx] != '{') {
+            try out.append(alloc, path[idx]);
+            idx += 1;
+            continue;
+        }
+        const end = std.mem.indexOfScalarPos(u8, path, idx, '}') orelse return error.InvalidGeneratedRoutePath;
+        try out.appendSlice(alloc, "test");
+        idx = end + 1;
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn methodFromText(method: []const u8) !http_common.Method {
+    if (std.mem.eql(u8, method, "GET")) return .GET;
+    if (std.mem.eql(u8, method, "POST")) return .POST;
+    if (std.mem.eql(u8, method, "PUT")) return .PUT;
+    if (std.mem.eql(u8, method, "DELETE")) return .DELETE;
+    return error.UnsupportedGeneratedMethod;
+}
+
+fn generatedRouteUnsupportedMethod(method: []const u8) ?http_common.Method {
+    if (std.mem.eql(u8, method, "GET")) return .POST;
+    return .GET;
 }
