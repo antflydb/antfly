@@ -65610,6 +65610,24 @@ test "app parity insert-source assignment expression coverage tokens are exact" 
     try std.testing.expect(coverage.insert_source_expression_assignment);
 }
 
+test "app parity merge mutation coverage requires typed-plan prefix" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .merge_mutation,
+        .plan = "write_wrapper:merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(!coverage.merge_mutation_typed_plan);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .merge_mutation,
+        .plan = "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(coverage.merge_mutation_typed_plan);
+}
+
 test "app parity conflict write count coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -66862,7 +66880,7 @@ const AppParityCorpusCoverage = struct {
             .truncate_source => self.truncate_source = true,
             .update_joined_source => self.update_joined_source = true,
             .delete_joined_source => self.delete_joined_source = true,
-            .merge_mutation => self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.indexOf(u8, entry.plan, "merge_mutation:") != null,
+            .merge_mutation => self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.startsWith(u8, entry.plan, "merge_mutation:"),
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
             .unsupported => self.unsupported_query = true,
             .unsupported_read => self.unsupported_read = true,
@@ -66941,7 +66959,6 @@ const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
         } else if (entry.family == .merge_mutation) {
-            self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.indexOf(u8, entry.plan, "merge_mutation:") != null;
             self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
                 (std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
                     appParityPlanHasNonZeroToken(entry.plan, ":matched_update_expr=") and
