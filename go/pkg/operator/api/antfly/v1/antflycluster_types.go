@@ -230,6 +230,9 @@ const (
 	// ReasonHAPromotionReceiptMissing indicates a completed promotion lacks the receipt needed for fenced rejoin.
 	ReasonHAPromotionReceiptMissing = "HAPromotionReceiptMissing"
 
+	// ReasonHAAdminResultMissing indicates a completed HA admin action lacks typed result evidence.
+	ReasonHAAdminResultMissing = "HAAdminResultMissing"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 

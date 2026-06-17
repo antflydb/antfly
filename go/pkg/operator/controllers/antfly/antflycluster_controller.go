@@ -4893,6 +4893,25 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		)
 		return
 	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
+			action.AdminResult != nil {
+			continue
+		}
+		jobName := action.AdminJobName
+		if jobName == "" {
+			jobName = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAAdminResultMissing,
+			fmt.Sprintf("HA admin action %s succeeded in Job %s, but the operator has not observed typed result evidence; dependent HA actions remain blocked", action.Kind, jobName),
+		)
+		return
+	}
 
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
 	if identity == nil {

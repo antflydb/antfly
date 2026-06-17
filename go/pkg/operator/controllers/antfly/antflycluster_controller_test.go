@@ -373,6 +373,38 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
+func TestUpdateHAAdminJobExecutionConditionReportsMissingResultEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionFinishStandbySeed),
+					AdminCommand:  []string{"seed", "finish"},
+					AdminJobName:  "finish-seed-job",
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+				}, {
+					Kind:         string(haActionBootstrapStandbySeed),
+					DependsOn:    string(haActionFinishStandbySeed),
+					AdminCommand: []string{"seed", "bootstrap"},
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminResultMissing))
+	g.Expect(degraded.Message).To(ContainSubstring("FinishStandbySeed"))
+	g.Expect(degraded.Message).To(ContainSubstring("finish-seed-job"))
+	g.Expect(degraded.Message).To(ContainSubstring("typed result evidence"))
+}
+
 func TestReconcileHAAdminJobsRejectsMismatchedTypedAdminOperation(t *testing.T) {
 	g := NewWithT(t)
 
