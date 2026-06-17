@@ -22691,10 +22691,10 @@ test "hosted cross-range graph metric fan-in merges nonuniform promotion shard l
 test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-pair";
-    const shard_count = 4;
-    const group_ids = [_]u64{ 7311, 7312, 7313, 7314 };
-    const prefixes = [_][]const u8{ "j", "k", "l", "m" };
-    const hub_counts = [_]usize{ 1, 2, 3, 2 };
+    const shard_count = 8;
+    const group_ids = [_]u64{ 7311, 7312, 7313, 7314, 7315, 7316, 7317, 7318 };
+    const prefixes = [_][]const u8{ "j", "k", "l", "m", "n", "o", "p", "q" };
+    const hub_counts = [_]usize{ 1, 2, 3, 2, 1, 3, 2, 1 };
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22783,7 +22783,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     }
 
     var active_target_generation: u64 = 0;
-    const active_shard_indices = [_]usize{ 1, 3 };
+    const active_shard_indices = [_]usize{ 1, 3, 5, 7 };
     for (active_shard_indices) |shard_index| {
         const prefix = prefixes[shard_index];
 
@@ -22857,6 +22857,10 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
             .{ .group_id = 7312, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7312, .namespace_range_id = 7312, .next_ordinal = 8, .allocated_ordinals = 7, .state_rows = 7, .live_ordinals = 7, .complete = true } },
             .{ .group_id = 7313, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7313, .namespace_range_id = 7313, .next_ordinal = 5, .allocated_ordinals = 4, .state_rows = 4, .live_ordinals = 4, .complete = true } },
             .{ .group_id = 7314, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7314, .namespace_range_id = 7314, .next_ordinal = 8, .allocated_ordinals = 7, .state_rows = 7, .live_ordinals = 7, .complete = true } },
+            .{ .group_id = 7315, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7315, .namespace_range_id = 7315, .next_ordinal = 3, .allocated_ordinals = 2, .state_rows = 2, .live_ordinals = 2, .complete = true } },
+            .{ .group_id = 7316, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7316, .namespace_range_id = 7316, .next_ordinal = 9, .allocated_ordinals = 8, .state_rows = 8, .live_ordinals = 8, .complete = true } },
+            .{ .group_id = 7317, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7317, .namespace_range_id = 7317, .next_ordinal = 4, .allocated_ordinals = 3, .state_rows = 3, .live_ordinals = 3, .complete = true } },
+            .{ .group_id = 7318, .doc_identity = .{ .namespace_table_id = 7, .namespace_shard_id = 7318, .namespace_range_id = 7318, .next_ordinal = 7, .allocated_ordinals = 6, .state_rows = 6, .live_ordinals = 6, .complete = true } },
         };
 
         fn iface() table_catalog.CatalogSource {
@@ -22882,7 +22886,11 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
                     .{ .group_id = 7311, .table_id = 7, .range_id = 7311, .start_key = "", .end_key = "doc:k:" },
                     .{ .group_id = 7312, .table_id = 7, .range_id = 7312, .start_key = "doc:k:", .end_key = "doc:l:" },
                     .{ .group_id = 7313, .table_id = 7, .range_id = 7313, .start_key = "doc:l:", .end_key = "doc:m:" },
-                    .{ .group_id = 7314, .table_id = 7, .range_id = 7314, .start_key = "doc:m:", .end_key = null },
+                    .{ .group_id = 7314, .table_id = 7, .range_id = 7314, .start_key = "doc:m:", .end_key = "doc:n:" },
+                    .{ .group_id = 7315, .table_id = 7, .range_id = 7315, .start_key = "doc:n:", .end_key = "doc:o:" },
+                    .{ .group_id = 7316, .table_id = 7, .range_id = 7316, .start_key = "doc:o:", .end_key = "doc:p:" },
+                    .{ .group_id = 7317, .table_id = 7, .range_id = 7317, .start_key = "doc:p:", .end_key = "doc:q:" },
+                    .{ .group_id = 7318, .table_id = 7, .range_id = 7318, .start_key = "doc:q:", .end_key = null },
                 })[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -23067,7 +23075,7 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     const traversal_query = graph_query_mod.GraphQuery{
         .query_type = .neighbors,
         .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{ "doc:j:hub:0", "doc:k:hub:0", "doc:l:hub:0", "doc:m:hub:0" } },
+        .start_nodes = .{ .keys = &.{ "doc:j:hub:0", "doc:k:hub:0", "doc:l:hub:0", "doc:m:hub:0", "doc:n:hub:0", "doc:o:hub:0", "doc:p:hub:0", "doc:q:hub:0" } },
         .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_results = 16 },
         .metrics = &hits_metric_reads,
         .include_metric_status = true,
