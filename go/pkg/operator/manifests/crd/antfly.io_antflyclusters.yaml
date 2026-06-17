@@ -3668,6 +3668,64 @@ spec:
                         format: int64
                         type: integer
                     type: object
+                  runtime:
+                    description: Runtime configures the local Zig antfly swarm HA
+                      runtime role and durable WAL paths.
+                    properties:
+                      nodeID:
+                        description: NodeID is the logical HA node id used in typed
+                          admin receipts and fencing.
+                        minLength: 1
+                        type: string
+                      primary:
+                        description: Primary configures primary-side durable HA state.
+                          Defaults are under /antflydb/ha.
+                        properties:
+                          logPath:
+                            description: |-
+                              LogPath is the durable HA primary replication log path.
+                              Defaults to /antflydb/ha/primary.wal.
+                            type: string
+                          slotsPath:
+                            description: |-
+                              SlotsPath is the durable HA replication slot store path.
+                              Defaults to /antflydb/ha/slots.
+                            type: string
+                        type: object
+                      role:
+                        description: Role selects whether this process opens primary
+                          or standby HA runtime state.
+                        enum:
+                        - Primary
+                        - Standby
+                        type: string
+                      standby:
+                        description: Standby configures standby-side durable HA state
+                          and optional continuous pull source.
+                        properties:
+                          logPath:
+                            description: |-
+                              LogPath is the durable received-WAL log path.
+                              Defaults to /antflydb/ha/standby.wal.
+                            type: string
+                          progressPath:
+                            description: |-
+                              ProgressPath is the durable standby apply progress WAL path.
+                              Defaults to /antflydb/ha/standby-progress.wal.
+                            type: string
+                          slotName:
+                            description: SlotName is the upstream replication slot
+                              used by this standby.
+                            type: string
+                          upstreamURL:
+                            description: UpstreamURL is the primary internal replication
+                              base URL for continuous pull/apply.
+                            type: string
+                        type: object
+                    required:
+                    - nodeID
+                    - role
+                    type: object
                   standbys:
                     description: Standbys declares desired standby replicas and replication
                       slots.

@@ -1915,6 +1915,64 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testin
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Runtime: &HARuntimeSpec{
+			Role: HARuntimeRolePrimary,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected incomplete HA runtime configuration to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.nodeID is required") ||
+		!strings.Contains(err.Error(), "runtime requires spec.highAvailability.identity") {
+		t.Fatalf("expected HA runtime identity/nodeID validation errors, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationSource(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRoleStandby,
+			NodeID: "standby-a",
+			Standby: &HAStandbyRuntimeSpec{
+				UpstreamURL: "grpc://primary.default.svc:8080",
+				SlotName:    "standby-a",
+			},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA standby runtime upstream URL to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.standby.upstreamURL") {
+		t.Fatalf("expected standby upstreamURL validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Standby.UpstreamURL = "http://primary.default.svc:8080"
+	cluster.Spec.HighAvailability.Runtime.Standby.SlotName = ""
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA standby runtime slotName to be required with upstreamURL")
+	}
+	if !strings.Contains(err.Error(), "runtime.standby.slotName is required when upstreamURL is set") {
+		t.Fatalf("expected standby slotName validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutDesiredStandbyAdminURL(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

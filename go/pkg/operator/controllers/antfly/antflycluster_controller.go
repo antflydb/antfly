@@ -80,6 +80,10 @@ const (
 	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
 	haPrimaryRouteSelectorAnnotation        = "antfly.io/ha-primary-route-selector-applied"
 	haAdminTokenDefaultEnvVar               = "ANTFLY_HA_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
+	defaultHAPrimaryLogPath                 = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath               = "/antflydb/ha/slots"
+	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
 
 	haAdminJobPhaseWaitingDependency = "WaitingDependency"
 	haAdminJobPhasePending           = "Pending"
@@ -145,6 +149,76 @@ func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 		return ""
 	}
 	return fmt.Sprintf(" \\\n  --secret-store-path %s", secretStorePath(store))
+}
+
+func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
+	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
+		return ""
+	}
+	runtime := ha.Runtime
+	identity := ha.Identity
+	var args strings.Builder
+	appendHAArg := func(name, value string) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(strconv.Quote(strings.TrimSpace(value)))
+	}
+	appendHAUint := func(name string, value uint64) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(strconv.FormatUint(value, 10))
+	}
+
+	switch runtime.Role {
+	case antflyv1.HARuntimeRolePrimary:
+		primary := runtime.Primary
+		logPath := defaultHAPrimaryLogPath
+		slotsPath := defaultHAPrimarySlotsPath
+		if primary != nil {
+			if value := strings.TrimSpace(primary.LogPath); value != "" {
+				logPath = value
+			}
+			if value := strings.TrimSpace(primary.SlotsPath); value != "" {
+				slotsPath = value
+			}
+		}
+		appendHAArg("--ha-primary-log", logPath)
+		appendHAArg("--ha-primary-slots", slotsPath)
+		appendHAArg("--ha-primary-node-id", runtime.NodeID)
+	case antflyv1.HARuntimeRoleStandby:
+		standby := runtime.Standby
+		logPath := defaultHAStandbyLogPath
+		progressPath := defaultHAStandbyProgressPath
+		if standby != nil {
+			if value := strings.TrimSpace(standby.LogPath); value != "" {
+				logPath = value
+			}
+			if value := strings.TrimSpace(standby.ProgressPath); value != "" {
+				progressPath = value
+			}
+		}
+		appendHAArg("--ha-standby-log", logPath)
+		appendHAArg("--ha-standby-progress", progressPath)
+		appendHAArg("--ha-standby-node-id", runtime.NodeID)
+		if standby != nil && strings.TrimSpace(standby.UpstreamURL) != "" && strings.TrimSpace(standby.SlotName) != "" {
+			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)
+			appendHAArg("--ha-standby-slot", standby.SlotName)
+		}
+	default:
+		return ""
+	}
+	appendHAUint("--ha-cluster-id", identity.ClusterID)
+	if identity.ShardID != 0 {
+		appendHAUint("--ha-shard-id", identity.ShardID)
+	}
+	if identity.TableID != 0 {
+		appendHAUint("--ha-table-id", identity.TableID)
+	}
+	appendHAUint("--ha-timeline-id", identity.TimelineID)
+	appendHAUint("--ha-epoch", identity.Epoch)
+	return args.String()
 }
 
 func secretStoreVolumeMounts(store *antflyv1.SecretStoreSpec) []corev1.VolumeMount {
@@ -2289,12 +2363,13 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 exec /antfly swarm --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
-  --health-port %d%s
+  --health-port %d%s%s
 							`,
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
 								swarm.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
+								swarmHAArgs(cluster.Spec.HighAvailability),
 							),
 						},
 						Resources: r.buildResourceRequirements(swarm.Resources),

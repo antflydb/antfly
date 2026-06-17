@@ -7574,6 +7574,66 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	}))
 }
 
+func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseSwarmControllerCluster()
+	cluster.Spec.HighAvailability = &antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            2,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role:   antflyv1.HARuntimeRolePrimary,
+			NodeID: "primary-a",
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	primaryArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-log "/antflydb/ha/primary.wal"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-slots "/antflydb/ha/slots"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-primary-node-id "primary-a"`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-cluster-id 100`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-shard-id 10`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-table-id 20`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-timeline-id 1`))
+	g.Expect(primaryArgs).To(ContainSubstring(`--ha-epoch 2`))
+
+	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
+		Role:   antflyv1.HARuntimeRoleStandby,
+		NodeID: "standby-a",
+		Standby: &antflyv1.HAStandbyRuntimeSpec{
+			LogPath:      "/antflydb/custom/standby.wal",
+			ProgressPath: "/antflydb/custom/progress.wal",
+			UpstreamURL:  "http://primary.default.svc:8080",
+			SlotName:     "standby-a",
+		},
+	}
+	g.Expect(reconciler.reconcileSwarmStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-swarm", Namespace: "default"}, sts)).To(Succeed())
+	standbyArgs := sts.Spec.Template.Spec.Containers[0].Args[0]
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-log "/antflydb/custom/standby.wal"`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-progress "/antflydb/custom/progress.wal"`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-node-id "standby-a"`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url "http://primary.default.svc:8080"`))
+	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot "standby-a"`))
+}
+
 func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 	g := NewWithT(t)
 

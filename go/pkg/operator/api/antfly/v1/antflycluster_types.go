@@ -556,6 +556,17 @@ const (
 	HAFencingAuthorityExternal        HAFencingAuthority = "External"
 )
 
+// HARuntimeRole selects how this Antfly process opens the HA runtime.
+type HARuntimeRole string
+
+const (
+	// HARuntimeRolePrimary opens the local process as the HA primary.
+	HARuntimeRolePrimary HARuntimeRole = "Primary"
+
+	// HARuntimeRoleStandby opens the local process as an HA standby.
+	HARuntimeRoleStandby HARuntimeRole = "Standby"
+)
+
 // HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
 type HighAvailabilitySpec struct {
 	// Mode selects whether hot standby is managed.
@@ -575,6 +586,10 @@ type HighAvailabilitySpec struct {
 	// Admin configures HA admin endpoints and optional operator execution.
 	// +optional
 	Admin *HAAdminSpec `json:"admin,omitempty"`
+
+	// Runtime configures the local Zig antfly swarm HA runtime role and durable WAL paths.
+	// +optional
+	Runtime *HARuntimeSpec `json:"runtime,omitempty"`
 
 	// SyncPolicy configures async, remote-write, or remote-apply durability.
 	// +optional
@@ -630,6 +645,59 @@ type HAStandbySpec struct {
 	// RouteSelector is the public-api Service selector to use when this standby is promoted.
 	// +optional
 	RouteSelector map[string]string `json:"routeSelector,omitempty"`
+}
+
+// HARuntimeSpec configures how the operator starts this Antfly process in the HA runtime.
+type HARuntimeSpec struct {
+	// Role selects whether this process opens primary or standby HA runtime state.
+	// +kubebuilder:validation:Enum=Primary;Standby
+	Role HARuntimeRole `json:"role"`
+
+	// NodeID is the logical HA node id used in typed admin receipts and fencing.
+	// +kubebuilder:validation:MinLength=1
+	NodeID string `json:"nodeID"`
+
+	// Primary configures primary-side durable HA state. Defaults are under /antflydb/ha.
+	// +optional
+	Primary *HAPrimaryRuntimeSpec `json:"primary,omitempty"`
+
+	// Standby configures standby-side durable HA state and optional continuous pull source.
+	// +optional
+	Standby *HAStandbyRuntimeSpec `json:"standby,omitempty"`
+}
+
+// HAPrimaryRuntimeSpec configures primary-side HA WAL and replication slot state.
+type HAPrimaryRuntimeSpec struct {
+	// LogPath is the durable HA primary replication log path.
+	// Defaults to /antflydb/ha/primary.wal.
+	// +optional
+	LogPath string `json:"logPath,omitempty"`
+
+	// SlotsPath is the durable HA replication slot store path.
+	// Defaults to /antflydb/ha/slots.
+	// +optional
+	SlotsPath string `json:"slotsPath,omitempty"`
+}
+
+// HAStandbyRuntimeSpec configures standby-side HA WAL, progress state, and pull source.
+type HAStandbyRuntimeSpec struct {
+	// LogPath is the durable received-WAL log path.
+	// Defaults to /antflydb/ha/standby.wal.
+	// +optional
+	LogPath string `json:"logPath,omitempty"`
+
+	// ProgressPath is the durable standby apply progress WAL path.
+	// Defaults to /antflydb/ha/standby-progress.wal.
+	// +optional
+	ProgressPath string `json:"progressPath,omitempty"`
+
+	// UpstreamURL is the primary internal replication base URL for continuous pull/apply.
+	// +optional
+	UpstreamURL string `json:"upstreamURL,omitempty"`
+
+	// SlotName is the upstream replication slot used by this standby.
+	// +optional
+	SlotName string `json:"slotName,omitempty"`
 }
 
 // HAAdminSpec configures operator access to HA admin endpoints.

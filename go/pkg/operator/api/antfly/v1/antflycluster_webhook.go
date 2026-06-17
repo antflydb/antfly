@@ -1204,6 +1204,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 	}
 
+	errors = append(errors, validateHARuntime(ha)...)
+
 	if identity := ha.Identity; identity != nil {
 		if identity.ClusterID == 0 {
 			errors = append(errors, "spec.highAvailability.identity.clusterID must be greater than 0")
@@ -1305,6 +1307,61 @@ func validateHAAdminURL(raw string, fieldPath string) []string {
 		return []string{fmt.Sprintf("%s must use http or https", fieldPath)}
 	}
 	return nil
+}
+
+func validateHARuntime(ha *HighAvailabilitySpec) []string {
+	if ha == nil || ha.Runtime == nil {
+		return nil
+	}
+	runtime := ha.Runtime
+	var errors []string
+	switch runtime.Role {
+	case HARuntimeRolePrimary:
+		if runtime.Standby != nil {
+			errors = append(errors, "spec.highAvailability.runtime.standby may only be set when runtime.role is Standby")
+		}
+		if primary := runtime.Primary; primary != nil {
+			if strings.TrimSpace(primary.LogPath) == "" && primary.LogPath != "" {
+				errors = append(errors, "spec.highAvailability.runtime.primary.logPath must not be whitespace")
+			}
+			if strings.TrimSpace(primary.SlotsPath) == "" && primary.SlotsPath != "" {
+				errors = append(errors, "spec.highAvailability.runtime.primary.slotsPath must not be whitespace")
+			}
+		}
+	case HARuntimeRoleStandby:
+		if runtime.Primary != nil {
+			errors = append(errors, "spec.highAvailability.runtime.primary may only be set when runtime.role is Primary")
+		}
+		if standby := runtime.Standby; standby != nil {
+			if strings.TrimSpace(standby.LogPath) == "" && standby.LogPath != "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.logPath must not be whitespace")
+			}
+			if strings.TrimSpace(standby.ProgressPath) == "" && standby.ProgressPath != "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.progressPath must not be whitespace")
+			}
+			errors = append(errors, validateHAAdminURL(standby.UpstreamURL, "spec.highAvailability.runtime.standby.upstreamURL")...)
+			slotName := strings.TrimSpace(standby.SlotName)
+			upstreamURL := strings.TrimSpace(standby.UpstreamURL)
+			if slotName == "" && standby.SlotName != "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not be whitespace")
+			}
+			if upstreamURL != "" && slotName == "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName is required when upstreamURL is set")
+			}
+			if slotName != "" && upstreamURL == "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.upstreamURL is required when slotName is set")
+			}
+		}
+	default:
+		errors = append(errors, "spec.highAvailability.runtime.role must be Primary or Standby")
+	}
+	if strings.TrimSpace(runtime.NodeID) == "" {
+		errors = append(errors, "spec.highAvailability.runtime.nodeID is required")
+	}
+	if ha.Identity == nil {
+		errors = append(errors, "spec.highAvailability.runtime requires spec.highAvailability.identity")
+	}
+	return errors
 }
 
 func validateHARouteSelector(selector map[string]string, fieldPath string) []string {
