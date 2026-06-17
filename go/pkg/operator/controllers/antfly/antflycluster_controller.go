@@ -5338,12 +5338,41 @@ func haRejoinAssessmentJSONComplete(assessment haRejoinAPIResult) bool {
 	return strings.TrimSpace(assessment.Action) != "" &&
 		strings.TrimSpace(assessment.Reason) != "" &&
 		strings.TrimSpace(assessment.FormerNodeID) != "" &&
+		haRejoinAssessmentActionJSONValid(assessment.Action) &&
+		haRejoinAssessmentReasonJSONValid(assessment.Reason) &&
 		assessment.TargetTimelineID != nil &&
 		assessment.TargetEpoch != nil &&
 		assessment.ForkLSN != nil &&
 		assessment.FormerLastLSN != nil &&
 		assessment.RetainedFromLSN != nil &&
 		assessment.DataLossDiscarded != nil
+}
+
+func haRejoinAssessmentActionJSONValid(action string) bool {
+	switch strings.TrimSpace(action) {
+	case "reject_unfenced", "already_current", "rewind", "reseed":
+		return true
+	default:
+		return false
+	}
+}
+
+func haRejoinAssessmentReasonJSONValid(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "no_fence",
+		"current_timeline",
+		"parent_timeline_retained",
+		"parent_timeline_wal_expired",
+		"incompatible_timeline",
+		"wrong_old_primary",
+		"wrong_cluster",
+		"wrong_shard",
+		"wrong_table",
+		"local_lsn_before_fork":
+		return true
+	default:
+		return false
+	}
 }
 
 func haRejoinRewindJSONComplete(rewind haRejoinAPIRewind) bool {
