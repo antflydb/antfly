@@ -231,7 +231,7 @@ pub const Server = struct {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
 
-        var parsed = admin_api.openapi.server.parseCreateHAReplicationSlotBody(
+        var parsed = admin_api.server.parseCreateHAReplicationSlotBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");
@@ -286,7 +286,7 @@ pub const Server = struct {
     fn handleAdminCommitCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA commit check request");
-        var parsed = admin_api.openapi.server.parseCheckHACommitBody(
+        var parsed = admin_api.server.parseCheckHACommitBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA commit check request");
@@ -309,7 +309,7 @@ pub const Server = struct {
     fn handleAdminCommitAppend(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA commit append request");
-        var parsed = admin_api.openapi.server.parseAppendHACommitBody(
+        var parsed = admin_api.server.parseAppendHACommitBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA commit append request");
@@ -335,7 +335,7 @@ pub const Server = struct {
         const request = if (req.body.len == 0)
             read_gate.Request{}
         else blk: {
-            var parsed = admin_api.openapi.server.parseCheckHAReadBody(
+            var parsed = admin_api.server.parseCheckHAReadBody(
                 self.alloc,
                 req.body,
             ) catch return try textResponse(self.alloc, 400, "invalid HA read check request");
@@ -352,7 +352,7 @@ pub const Server = struct {
 
     fn handleAdminWriteCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA write check request");
-        var parsed = admin_api.openapi.server.parseCheckHAWriteBody(
+        var parsed = admin_api.server.parseCheckHAWriteBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA write check request");
@@ -379,7 +379,7 @@ pub const Server = struct {
 
     fn handleAdminOwnerJobCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA owner job check request");
-        var parsed = admin_api.openapi.server.parseCheckHAOwnerJobBody(
+        var parsed = admin_api.server.parseCheckHAOwnerJobBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA owner job check request");
@@ -407,7 +407,7 @@ pub const Server = struct {
     fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup request");
-        var parsed = admin_api.openapi.server.parseBeginHABaseBackupBody(
+        var parsed = admin_api.server.parseBeginHABaseBackupBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup request");
@@ -432,7 +432,7 @@ pub const Server = struct {
 
     fn handleAdminFinishBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA base backup finish request");
-        var parsed = admin_api.openapi.server.parseFinishHABaseBackupBody(
+        var parsed = admin_api.server.parseFinishHABaseBackupBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA base backup finish request");
@@ -466,7 +466,7 @@ pub const Server = struct {
 
     fn handleAdminBootstrapStandby(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA standby bootstrap request");
-        var parsed = admin_api.openapi.server.parseBootstrapHAStandbyBody(
+        var parsed = admin_api.server.parseBootstrapHAStandbyBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA standby bootstrap request");
@@ -538,7 +538,7 @@ pub const Server = struct {
     fn handleAdminAssessPromotion(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         var command = admin_cli.PromoteAssessCommand{ .check = .{} };
         if (req.body.len != 0) {
-            var parsed = admin_api.openapi.server.parseAssessHAPromotionBody(
+            var parsed = admin_api.server.parseAssessHAPromotionBody(
                 self.alloc,
                 req.body,
             ) catch return try textResponse(self.alloc, 400, "invalid HA promotion assessment request");
@@ -612,7 +612,7 @@ pub const Server = struct {
 
     fn handleAdminRejoin(self: *Server, req: http_common.HttpRequest, expected_action: ?rejoin.Action) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA rejoin assessment request");
-        var parsed = admin_api.openapi.server.parseAssessHARejoinBody(
+        var parsed = admin_api.server.parseAssessHARejoinBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
@@ -693,7 +693,7 @@ pub const Server = struct {
 
     fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
         if (req.body.len == 0) return error.InvalidAdminRequest;
-        var parsed = admin_api.openapi.server.parseAcquireHAFenceBody(
+        var parsed = admin_api.server.parseAcquireHAFenceBody(
             self.alloc,
             req.body,
         ) catch return error.InvalidAdminRequest;
@@ -1334,7 +1334,7 @@ fn adminFenceReceiptFromOpenApi(receipt: admin_api.HAFenceReceipt) !fencing.Rece
     };
 }
 
-fn adminIdentityFromOpenApi(identity: admin_api.openapi.HAIdentity) !standby_mod.Identity {
+fn adminIdentityFromOpenApi(identity: admin_api.HAIdentity) !standby_mod.Identity {
     return .{
         .cluster_id = try positiveUint64FromJson(identity.cluster_id),
         .shard_id = try uint64FromJson(identity.shard_id),

@@ -120,7 +120,7 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
         options: PrimaryStatusOptions,
-    ) !ParsedOutput(admin_api.openapi.HAPrimaryStatusResponse) {
+    ) !ParsedOutput(admin_api.HAPrimaryStatusResponse) {
         var uri = try join(self.alloc, base_uri, admin_api.routes.ha_primary_status);
         defer self.alloc.free(uri);
         if (options.max_lag_lsn) |max_lag_lsn| {
@@ -130,7 +130,7 @@ pub const Client = struct {
             uri = try appendQuerySyncPolicy(self.alloc, uri, sync_policy);
         }
 
-        return try self.executeJson(admin_api.openapi.HAPrimaryStatusResponse, .{
+        return try self.executeJson(admin_api.HAPrimaryStatusResponse, .{
             .method = .GET,
             .uri = uri,
         });
@@ -140,14 +140,14 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
         upstream_lsn: ?u64,
-    ) !ParsedOutput(admin_api.openapi.HAStandbyStatusResponse) {
+    ) !ParsedOutput(admin_api.HAStandbyStatusResponse) {
         var uri = try join(self.alloc, base_uri, admin_api.routes.ha_standby_status);
         defer self.alloc.free(uri);
         if (upstream_lsn) |lsn| {
             uri = try appendQueryU64(self.alloc, uri, "upstream_lsn", lsn);
         }
 
-        return try self.executeJson(admin_api.openapi.HAStandbyStatusResponse, .{
+        return try self.executeJson(admin_api.HAStandbyStatusResponse, .{
             .method = .GET,
             .uri = uri,
         });
@@ -156,10 +156,10 @@ pub const Client = struct {
     pub fn checkCommit(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.CommitCheckRequest,
-    ) !ParsedOutput(admin_api.openapi.HACommitCheckResponse) {
+        request: admin_api.CommitCheckRequest,
+    ) !ParsedOutput(admin_api.HACommitCheckResponse) {
         return try self.postJson(
-            admin_api.openapi.HACommitCheckResponse,
+            admin_api.HACommitCheckResponse,
             base_uri,
             admin_api.routes.ha_commit_check,
             request,
@@ -169,10 +169,10 @@ pub const Client = struct {
     pub fn appendCommit(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.CommitAppendRequest,
-    ) !ParsedOutput(admin_api.openapi.HACommitAppendResponse) {
+        request: admin_api.CommitAppendRequest,
+    ) !ParsedOutput(admin_api.HACommitAppendResponse) {
         return try self.postJson(
-            admin_api.openapi.HACommitAppendResponse,
+            admin_api.HACommitAppendResponse,
             base_uri,
             admin_api.routes.ha_commit_append,
             request,
@@ -182,10 +182,10 @@ pub const Client = struct {
     pub fn checkRead(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.ReadCheckRequest,
-    ) !ParsedOutput(admin_api.openapi.HAReadCheckResponse) {
+        request: admin_api.ReadCheckRequest,
+    ) !ParsedOutput(admin_api.HAReadCheckResponse) {
         return try self.postJson(
-            admin_api.openapi.HAReadCheckResponse,
+            admin_api.HAReadCheckResponse,
             base_uri,
             admin_api.routes.ha_read_check,
             request,
@@ -195,10 +195,10 @@ pub const Client = struct {
     pub fn checkWrite(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.WriteCheckRequest,
-    ) !ParsedOutput(admin_api.openapi.HAWriteCheckResponse) {
+        request: admin_api.WriteCheckRequest,
+    ) !ParsedOutput(admin_api.HAWriteCheckResponse) {
         return try self.postJson(
-            admin_api.openapi.HAWriteCheckResponse,
+            admin_api.HAWriteCheckResponse,
             base_uri,
             admin_api.routes.ha_write_check,
             request,
@@ -208,10 +208,10 @@ pub const Client = struct {
     pub fn checkOwnerJob(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.OwnerJobCheckRequest,
-    ) !ParsedOutput(admin_api.openapi.HAOwnerJobCheckResponse) {
+        request: admin_api.OwnerJobCheckRequest,
+    ) !ParsedOutput(admin_api.HAOwnerJobCheckResponse) {
         return try self.postJson(
-            admin_api.openapi.HAOwnerJobCheckResponse,
+            admin_api.HAOwnerJobCheckResponse,
             base_uri,
             admin_api.routes.ha_owner_job_check,
             request,
@@ -221,10 +221,10 @@ pub const Client = struct {
     pub fn listReplicationSlots(
         self: *Client,
         base_uri: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotListResponse) {
+    ) !ParsedOutput(admin_api.HAReplicationSlotListResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.openapi.HAReplicationSlotListResponse, .{
+        return try self.executeJson(admin_api.HAReplicationSlotListResponse, .{
             .method = .GET,
             .uri = uri,
         });
@@ -235,12 +235,12 @@ pub const Client = struct {
         base_uri: []const u8,
         slot_name: []const u8,
         initial_lsn: ?u64,
-    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+    ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
-            admin_api.openapi.ReplicationSlotCreateRequest{
+            admin_api.ReplicationSlotCreateRequest{
                 .slot_name = slot_name,
                 .initial_lsn = if (initial_lsn) |lsn| try i64FromU64(lsn) else null,
             },
@@ -248,7 +248,7 @@ pub const Client = struct {
         );
         defer self.alloc.free(body);
 
-        return try self.executeJson(admin_api.openapi.HAReplicationSlotActionResponse, .{
+        return try self.executeJson(admin_api.HAReplicationSlotActionResponse, .{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -260,7 +260,7 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
         slot_name: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+    ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
         return try self.replicationSlotLifecycle(base_uri, slot_name, .pause);
     }
 
@@ -268,7 +268,7 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
         slot_name: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+    ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
         return try self.replicationSlotLifecycle(base_uri, slot_name, .@"resume");
     }
 
@@ -276,17 +276,17 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
         slot_name: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+    ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
         return try self.replicationSlotLifecycle(base_uri, slot_name, .drop);
     }
 
     pub fn beginBaseBackup(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.BaseBackupStartRequest,
-    ) !ParsedOutput(admin_api.openapi.HABaseBackupBeginResponse) {
+        request: admin_api.BaseBackupStartRequest,
+    ) !ParsedOutput(admin_api.HABaseBackupBeginResponse) {
         return try self.postJson(
-            admin_api.openapi.HABaseBackupBeginResponse,
+            admin_api.HABaseBackupBeginResponse,
             base_uri,
             admin_api.routes.ha_base_backups,
             request,
@@ -296,10 +296,10 @@ pub const Client = struct {
     pub fn finishBaseBackup(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.BaseBackupManifestPathRequest,
-    ) !ParsedOutput(admin_api.openapi.HABaseBackupFinishResponse) {
+        request: admin_api.BaseBackupManifestPathRequest,
+    ) !ParsedOutput(admin_api.HABaseBackupFinishResponse) {
         return try self.postJson(
-            admin_api.openapi.HABaseBackupFinishResponse,
+            admin_api.HABaseBackupFinishResponse,
             base_uri,
             admin_api.routes.ha_base_backups_finish,
             request,
@@ -309,10 +309,10 @@ pub const Client = struct {
     pub fn bootstrapStandby(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.StandbyBootstrapRequest,
-    ) !ParsedOutput(admin_api.openapi.HAStandbyBootstrapResponse) {
+        request: admin_api.StandbyBootstrapRequest,
+    ) !ParsedOutput(admin_api.HAStandbyBootstrapResponse) {
         return try self.postJson(
-            admin_api.openapi.HAStandbyBootstrapResponse,
+            admin_api.HAStandbyBootstrapResponse,
             base_uri,
             admin_api.routes.ha_standby_bootstrap,
             request,
@@ -322,10 +322,10 @@ pub const Client = struct {
     pub fn acquireFence(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.FenceAcquireRequest,
-    ) !ParsedOutput(admin_api.openapi.HAFenceResponse) {
+        request: admin_api.FenceAcquireRequest,
+    ) !ParsedOutput(admin_api.HAFenceResponse) {
         return try self.postJson(
-            admin_api.openapi.HAFenceResponse,
+            admin_api.HAFenceResponse,
             base_uri,
             admin_api.routes.ha_fence,
             request,
@@ -335,10 +335,10 @@ pub const Client = struct {
     pub fn currentFence(
         self: *Client,
         base_uri: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HACurrentFenceResponse) {
+    ) !ParsedOutput(admin_api.HACurrentFenceResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_fence_current);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.openapi.HACurrentFenceResponse, .{
+        return try self.executeJson(admin_api.HACurrentFenceResponse, .{
             .method = .GET,
             .uri = uri,
         });
@@ -347,10 +347,10 @@ pub const Client = struct {
     pub fn assessPromotion(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.PromotionAssessRequest,
-    ) !ParsedOutput(admin_api.openapi.HAPromotionAssessResponse) {
+        request: admin_api.PromotionAssessRequest,
+    ) !ParsedOutput(admin_api.HAPromotionAssessResponse) {
         return try self.postJson(
-            admin_api.openapi.HAPromotionAssessResponse,
+            admin_api.HAPromotionAssessResponse,
             base_uri,
             admin_api.routes.ha_promotion_assess,
             request,
@@ -360,10 +360,10 @@ pub const Client = struct {
     pub fn promoteWithCurrentFence(
         self: *Client,
         base_uri: []const u8,
-    ) !ParsedOutput(admin_api.openapi.HAPromotionResponse) {
+    ) !ParsedOutput(admin_api.HAPromotionResponse) {
         const uri = try join(self.alloc, base_uri, admin_api.routes.ha_promotion_current_fence);
         defer self.alloc.free(uri);
-        return try self.executeJson(admin_api.openapi.HAPromotionResponse, .{
+        return try self.executeJson(admin_api.HAPromotionResponse, .{
             .method = .POST,
             .uri = uri,
         });
@@ -372,10 +372,10 @@ pub const Client = struct {
     pub fn promote(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.FenceAcquireRequest,
-    ) !ParsedOutput(admin_api.openapi.HAPromotionResponse) {
+        request: admin_api.FenceAcquireRequest,
+    ) !ParsedOutput(admin_api.HAPromotionResponse) {
         return try self.postJson(
-            admin_api.openapi.HAPromotionResponse,
+            admin_api.HAPromotionResponse,
             base_uri,
             admin_api.routes.ha_promotion,
             request,
@@ -385,10 +385,10 @@ pub const Client = struct {
     pub fn assessRejoin(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.RejoinAssessRequest,
-    ) !ParsedOutput(admin_api.openapi.HARejoinAssessResponse) {
+        request: admin_api.RejoinAssessRequest,
+    ) !ParsedOutput(admin_api.HARejoinAssessResponse) {
         return try self.postJson(
-            admin_api.openapi.HARejoinAssessResponse,
+            admin_api.HARejoinAssessResponse,
             base_uri,
             admin_api.routes.ha_rejoin_assess,
             request,
@@ -398,10 +398,10 @@ pub const Client = struct {
     pub fn rewindRejoin(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.RejoinAssessRequest,
-    ) !ParsedOutput(admin_api.openapi.HARejoinAssessResponse) {
+        request: admin_api.RejoinAssessRequest,
+    ) !ParsedOutput(admin_api.HARejoinAssessResponse) {
         return try self.postJson(
-            admin_api.openapi.HARejoinAssessResponse,
+            admin_api.HARejoinAssessResponse,
             base_uri,
             admin_api.routes.ha_rejoin_rewind,
             request,
@@ -411,10 +411,10 @@ pub const Client = struct {
     pub fn reseedRejoin(
         self: *Client,
         base_uri: []const u8,
-        request: admin_api.openapi.RejoinAssessRequest,
-    ) !ParsedOutput(admin_api.openapi.HARejoinAssessResponse) {
+        request: admin_api.RejoinAssessRequest,
+    ) !ParsedOutput(admin_api.HARejoinAssessResponse) {
         return try self.postJson(
-            admin_api.openapi.HARejoinAssessResponse,
+            admin_api.HARejoinAssessResponse,
             base_uri,
             admin_api.routes.ha_rejoin_reseed,
             request,
@@ -426,7 +426,7 @@ pub const Client = struct {
         base_uri: []const u8,
         slot_name: []const u8,
         action: enum { pause, @"resume", drop },
-    ) !ParsedOutput(admin_api.openapi.HAReplicationSlotActionResponse) {
+    ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
         const path = switch (action) {
             .pause => try admin_api.routes.replicationSlotPausePathAlloc(self.alloc, slot_name),
             .@"resume" => try admin_api.routes.replicationSlotResumePathAlloc(self.alloc, slot_name),
@@ -436,7 +436,7 @@ pub const Client = struct {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        return try self.executeJson(admin_api.openapi.HAReplicationSlotActionResponse, .{
+        return try self.executeJson(admin_api.HAReplicationSlotActionResponse, .{
             .method = switch (action) {
                 .drop => .DELETE,
                 .pause, .@"resume" => .PUT,
@@ -677,7 +677,7 @@ fn testIdentity() standby_mod.Identity {
     };
 }
 
-fn testAdminIdentity() admin_api.openapi.HAIdentity {
+fn testAdminIdentity() admin_api.HAIdentity {
     const identity = testIdentity();
     return .{
         .cluster_id = @intCast(identity.cluster_id),
@@ -1223,7 +1223,7 @@ test "storage.ha http client round trips typed safety operations" {
     defer streamed.deinit(alloc);
     try expectContains(streamed.body, "applied_lsn=1\n");
 
-    const fence_request = admin_api.openapi.FenceAcquireRequest{
+    const fence_request = admin_api.FenceAcquireRequest{
         .identity = testAdminIdentity(),
         .old_primary_id = "primary-a",
         .promoted_node_id = "standby-a",
