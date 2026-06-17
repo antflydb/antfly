@@ -817,6 +817,11 @@ fn applyRelationalSqlDdlOnService(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (try extension_domain.sql_adapter.executeRelationalSqlDdlOnService(svc, alloc, sql)) |applied| {
+        try svc.runRound();
+        return applied;
+    }
+
     var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
     defer target.deinit(alloc);
 

@@ -233,6 +233,55 @@ Add an operation layer:
 These can be HTTP/OpenAPI operations first and CLI commands second. SQL-like
 syntax can be a compatibility layer later.
 
+SQL extension DDL should be a compatibility adapter over the canonical
+extension lifecycle, not a second extension implementation. The SQL parser
+should stay responsible only for syntax and typed catalog intent. Execution
+should live behind a small adapter, for example `extensions/sql_adapter.zig`,
+that maps `ExtensionCatalogPlan` values onto lifecycle calls:
+
+- `CREATE EXTENSION` maps to `extensions.lifecycle.installOnService`.
+- `ALTER EXTENSION ... UPDATE` maps to `extensions.lifecycle.updateOnService`.
+- `DROP EXTENSION` maps to `extensions.lifecycle.dropOnService`.
+
+The first supported SQL subset should be deliberately small:
+
+```sql
+CREATE EXTENSION [IF NOT EXISTS] name [VERSION 'version'];
+ALTER EXTENSION name UPDATE [TO 'version'];
+DROP EXTENSION [IF EXISTS] name [RESTRICT|CASCADE];
+```
+
+PostgreSQL details such as `WITH SCHEMA`, relocation, extension object
+membership edits, and multi-extension drop lists should fail closed until they
+have native lifecycle semantics.
+
+Use the SQL extension name as the installed extension name. Resolve the package
+name separately. Resolution should first consult a compatibility alias map for
+PostgreSQL names that do not match Antfly package names; otherwise the package
+name defaults to the SQL extension name. SQL `VERSION` maps to
+`InstallExtensionRequest.version`, while omitted version means "latest package
+version already present in the package catalog". SQL should not accept an
+arbitrary package digest in v1. Digest trust comes from the pre-registered
+package manifest and hosted package store policy, not from user SQL text.
+
+`IF EXISTS` and `IF NOT EXISTS` need strict, unsurprising semantics:
+
+- `CREATE EXTENSION IF NOT EXISTS name` is a no-op only when installed extension
+  `name` already exists.
+- If `VERSION` is supplied and the installed version differs, fail rather than
+  silently accepting a mismatch.
+- `DROP EXTENSION IF EXISTS name` is a no-op only when `name` is absent.
+- `DROP EXTENSION name RESTRICT` fails when dependent extensions exist.
+- `DROP EXTENSION name CASCADE` uses the lifecycle cascade behavior.
+
+Initial SQL extension DDL should be autocommit metadata DDL. Reject it inside a
+user data transaction until Antfly has a unified transactional boundary for SQL
+DDL, metadata transitions, extension member creation, and shard convergence.
+The execution path should branch on `.extension_catalog` before schema JSON
+mutation: ordinary relational schema DDL continues through the existing schema
+apply path, while extension DDL routes to the lifecycle adapter and produces
+metadata transition commands.
+
 Prefer slash-action HTTP endpoints for the extension lifecycle, matching the
 dominant public DB API shape (`/commit`, `/abort`, `/query`, `/batch`,
 `/backup`, `/restore`, `/merge`). Antfly has some colon-action endpoints today,

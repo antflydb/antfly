@@ -4824,9 +4824,15 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public`, is an
    adapter-only no-op with a stable `extension` reason. Other
    `CREATE EXTENSION` statements lower to typed extension catalog intent that captures extension name and
-   idempotency, then fail closed until a native extension/capability catalog
-   owns the functions, operators, casts, and privilege effects exposed by that
-   extension. PL/pgSQL
+   idempotency, then fail closed until execution can route through the canonical
+   extension lifecycle described in `EXTENSIONS.md`. That integration should be
+   a SQL compatibility adapter over `extensions.lifecycle.installOnService`,
+   `updateOnService`, and `dropOnService`, not a second extension
+   implementation: the parser owns syntax and typed intent, while the adapter
+   resolves SQL names to package manifests, enforces strict `IF EXISTS` /
+   `IF NOT EXISTS` semantics, rejects transactional use until metadata DDL has a
+   unified boundary, and emits extension metadata transition commands instead
+   of mutating relational schema JSON. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

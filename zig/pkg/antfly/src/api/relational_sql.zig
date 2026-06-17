@@ -1166,10 +1166,14 @@ pub const DatabaseCatalogPlan = union(enum) {
 
 pub const ExtensionCatalogPlan = union(enum) {
     create: CreateExtensionPlan,
+    update: UpdateExtensionPlan,
+    drop: DropExtensionPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .create => |*plan| plan.deinit(alloc),
+            .update => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
         }
         self.* = undefined;
     }
@@ -1177,7 +1181,31 @@ pub const ExtensionCatalogPlan = union(enum) {
 
 pub const CreateExtensionPlan = struct {
     extension_name: []const u8,
+    version: ?[]const u8 = null,
     if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.extension_name);
+        if (self.version) |version| alloc.free(version);
+        self.* = undefined;
+    }
+};
+
+pub const UpdateExtensionPlan = struct {
+    extension_name: []const u8,
+    target_version: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.extension_name);
+        if (self.target_version) |version| alloc.free(version);
+        self.* = undefined;
+    }
+};
+
+pub const DropExtensionPlan = struct {
+    extension_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.extension_name);
@@ -5620,6 +5648,7 @@ const Parser = struct {
             if (self.peekKeyword("domain")) return .{ .domain_catalog = .{ .alter = try self.parseAlterDomainDdl() } };
             if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .alter = try self.parseAlterSequenceDdl() } };
             if (self.peekKeyword("type")) return .{ .enum_type_catalog = .{ .add_value = try self.parseAlterEnumTypeDdl() } };
+            if (self.peekKeyword("extension")) return .{ .extension_catalog = .{ .update = try self.parseAlterExtensionDdl() } };
             if (self.peekKeyword("schema")) return .{ .schema_namespace_catalog = .{ .rename = try self.parseRenameSchemaNamespaceDdl() } };
             if (self.peekKeyword("database")) return .{ .database_catalog = .{ .alter = try self.parseAlterDatabaseDdl() } };
             if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .rename = try self.parseRenameTablespaceDdl() } };
@@ -5655,6 +5684,7 @@ const Parser = struct {
             if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .drop = try self.parseDropSequenceDdl() } };
             if (self.peekKeyword("type")) return .{ .enum_type_catalog = .{ .drop = try self.parseDropEnumTypeDdl() } };
             if (self.peekKeyword("schema")) return .{ .schema_namespace_catalog = .{ .drop = try self.parseDropSchemaNamespaceDdl() } };
+            if (self.peekKeyword("extension")) return .{ .extension_catalog = .{ .drop = try self.parseDropExtensionDdl() } };
             if (self.peekKeyword("database")) return .{ .database_catalog = .{ .drop = try self.parseDropDatabaseDdl() } };
             if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .drop = try self.parseDropTablespaceDdl() } };
             if (self.peekKeyword("publication")) return .{ .logical_replication = .{ .publication = .{ .drop = try self.parseDropPublicationDdl() } } };
@@ -5957,11 +5987,56 @@ const Parser = struct {
                 return error.UnsupportedSqlShape;
             }
         }
-        if (self.peekKeyword("version") or self.peekKeyword("from") or self.peekKeyword("cascade")) return error.UnsupportedSqlShape;
+        var version: ?[]const u8 = null;
+        var version_transferred = false;
+        errdefer if (!version_transferred) if (version) |owned| self.alloc.free(owned);
+        if (self.matchKeyword("version")) {
+            version = try self.parseSqlStringValueAlloc();
+        }
+        if (self.peekKeyword("from") or self.peekKeyword("cascade")) return error.UnsupportedSqlShape;
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
         extension_transferred = true;
-        return .{ .extension_name = extension_name, .if_not_exists = if_not_exists };
+        version_transferred = true;
+        return .{ .extension_name = extension_name, .version = version, .if_not_exists = if_not_exists };
+    }
+
+    fn parseAlterExtensionDdl(self: *@This()) !UpdateExtensionPlan {
+        try self.expectKeyword("extension");
+        const extension_name = try self.parseSqlObjectIdentifierOwned();
+        var extension_transferred = false;
+        errdefer if (!extension_transferred) self.alloc.free(extension_name);
+        try self.expectKeyword("update");
+
+        var target_version: ?[]const u8 = null;
+        var version_transferred = false;
+        errdefer if (!version_transferred) if (target_version) |owned| self.alloc.free(owned);
+        if (self.matchKeyword("to")) {
+            target_version = try self.parseSqlStringValueAlloc();
+        }
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        extension_transferred = true;
+        version_transferred = true;
+        return .{ .extension_name = extension_name, .target_version = target_version };
+    }
+
+    fn parseDropExtensionDdl(self: *@This()) !DropExtensionPlan {
+        try self.expectKeyword("extension");
+        var if_exists = false;
+        if (self.matchKeyword("if")) {
+            try self.expectKeyword("exists");
+            if_exists = true;
+        }
+        const extension_name = try self.parseSqlObjectIdentifierOwned();
+        var extension_transferred = false;
+        errdefer if (!extension_transferred) self.alloc.free(extension_name);
+        const cascade = self.matchKeyword("cascade");
+        if (!cascade) _ = self.matchKeyword("restrict");
+        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        extension_transferred = true;
+        return .{ .extension_name = extension_name, .if_exists = if_exists, .cascade = cascade };
     }
 
     fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
@@ -49173,6 +49248,7 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const create_extension_plan = switch (create_extension_catalog) {
         .extension_catalog => |plan| switch (plan) {
             .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
     };
@@ -49182,6 +49258,58 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(create_extension_catalog_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_extension:extension=postgis:if_not_exists=false", create_extension_catalog_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_extension_catalog));
+
+    var create_extension_versioned = try lowerDdlPlanAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
+    defer create_extension_versioned.deinit(alloc);
+    const create_extension_versioned_plan = switch (create_extension_versioned) {
+        .extension_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("postgis", create_extension_versioned_plan.extension_name);
+    try std.testing.expectEqualStrings("3.4.0", create_extension_versioned_plan.version.?);
+    const create_extension_versioned_fingerprint = try ddlFingerprintAlloc(alloc, create_extension_versioned);
+    defer alloc.free(create_extension_versioned_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_extension:extension=postgis:if_not_exists=false:version=3.4.0", create_extension_versioned_fingerprint);
+
+    var update_extension = try lowerDdlPlanAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
+    defer update_extension.deinit(alloc);
+    const update_extension_plan = switch (update_extension) {
+        .extension_catalog => |plan| switch (plan) {
+            .update => |update_plan| update_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("postgis", update_extension_plan.extension_name);
+    try std.testing.expectEqualStrings("3.5.0", update_extension_plan.target_version.?);
+    const update_extension_fingerprint = try ddlFingerprintAlloc(alloc, update_extension);
+    defer alloc.free(update_extension_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_extension_update:extension=postgis:version=3.5.0", update_extension_fingerprint);
+
+    var update_extension_latest = try lowerDdlPlanAlloc(alloc, "ALTER EXTENSION postgis UPDATE;");
+    defer update_extension_latest.deinit(alloc);
+    const update_extension_latest_fingerprint = try ddlFingerprintAlloc(alloc, update_extension_latest);
+    defer alloc.free(update_extension_latest_fingerprint);
+    try std.testing.expectEqualStrings("ddl:alter_extension_update:extension=postgis:version=latest", update_extension_latest_fingerprint);
+
+    var drop_extension = try lowerDdlPlanAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
+    defer drop_extension.deinit(alloc);
+    const drop_extension_plan = switch (drop_extension) {
+        .extension_catalog => |plan| switch (plan) {
+            .drop => |drop_plan| drop_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(drop_extension_plan.if_exists);
+    try std.testing.expect(drop_extension_plan.cascade);
+    const drop_extension_fingerprint = try ddlFingerprintAlloc(alloc, drop_extension);
+    defer alloc.free(drop_extension_fingerprint);
+    try std.testing.expectEqualStrings("ddl:drop_extension:extension=postgis:if_exists=true:cascade=true", drop_extension_fingerprint);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE EXTENSION pgcrypto WITH SCHEMA public;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA private;"));
 
@@ -59227,6 +59355,8 @@ const AppParityDdlTag = enum {
     rename_schema_namespace,
     drop_schema_namespace,
     create_extension,
+    alter_extension_update,
+    drop_extension,
     create_function,
     drop_function,
     create_procedure,
@@ -60417,11 +60547,42 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 ),
         },
         .extension_catalog => |plan| switch (plan) {
-            .create => |create| try std.fmt.allocPrint(
-                alloc,
-                "ddl:create_extension:extension={s}:if_not_exists={}",
-                .{ create.extension_name, create.if_not_exists },
-            ),
+            .create => |create| if (create.version) |version|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_extension:extension={s}:if_not_exists={}:version={s}",
+                    .{ create.extension_name, create.if_not_exists, version },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_extension:extension={s}:if_not_exists={}",
+                    .{ create.extension_name, create.if_not_exists },
+                ),
+            .update => |update| if (update.target_version) |version|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_extension_update:extension={s}:version={s}",
+                    .{ update.extension_name, version },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_extension_update:extension={s}:version=latest",
+                    .{update.extension_name},
+                ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_extension:extension={s}:if_exists={}:cascade=true",
+                    .{ drop.extension_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_extension:extension={s}:if_exists={}",
+                    .{ drop.extension_name, drop.if_exists },
+                ),
         },
         .function_catalog => |plan| switch (plan) {
             .create => |create| if (create.language) |language|
@@ -61319,6 +61480,14 @@ fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !voi
             .create => |create| {
                 try std.testing.expectEqual(AppParityDdlTag.create_extension, expected);
                 try expectOptionalTableName(summary.table_name, create.extension_name);
+            },
+            .update => |update| {
+                try std.testing.expectEqual(AppParityDdlTag.alter_extension_update, expected);
+                try expectOptionalTableName(summary.table_name, update.extension_name);
+            },
+            .drop => |drop| {
+                try std.testing.expectEqual(AppParityDdlTag.drop_extension, expected);
+                try expectOptionalTableName(summary.table_name, drop.extension_name);
             },
         },
         .function_catalog => |plan| switch (plan) {
@@ -64076,6 +64245,8 @@ fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, 
         .rename_schema_namespace,
         .drop_schema_namespace,
         .create_extension,
+        .alter_extension_update,
+        .drop_extension,
         .create_cast,
         .drop_cast,
         .deallocate_statement,
@@ -64958,7 +65129,7 @@ fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .create_sequence, .alter_sequence, .drop_sequence => false,
         .identity_allocator => false,
         .create_schema_namespace, .rename_schema_namespace, .drop_schema_namespace => false,
-        .create_extension => false,
+        .create_extension, .alter_extension_update, .drop_extension => false,
         .create_function, .drop_function, .create_procedure, .drop_procedure => false,
         .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
         .copy_from, .copy_to => false,
@@ -68944,6 +69115,7 @@ const AppParityCorpusCoverage = struct {
                 .rename_schema_namespace => self.ddl_schema_namespace_rename = true,
                 .drop_schema_namespace => self.ddl_schema_namespace_drop = true,
                 .create_extension => self.ddl_extension_create = true,
+                .alter_extension_update, .drop_extension => {},
                 .create_function => {
                     self.ddl_function_create = true;
                     self.ddl_function_replace = self.ddl_function_replace or appParityPlanHasExactBoolToken(entry.plan, ":replace=", true);
@@ -70954,6 +71126,41 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .create_extension, .table_name = "postgis" },
             .plan = "ddl:create_extension:extension=postgis:if_not_exists=false",
             .sql = "CREATE EXTENSION postgis;",
+        },
+        .{
+            .name = "create versioned extension catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_extension, .table_name = "postgis" },
+            .plan = "ddl:create_extension:extension=postgis:if_not_exists=false:version=3.4.0",
+            .sql = "CREATE EXTENSION postgis VERSION '3.4.0';",
+        },
+        .{
+            .name = "alter extension update catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .alter_extension_update, .table_name = "postgis" },
+            .plan = "ddl:alter_extension_update:extension=postgis:version=3.5.0",
+            .sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0';",
+        },
+        .{
+            .name = "alter extension update latest catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .alter_extension_update, .table_name = "postgis" },
+            .plan = "ddl:alter_extension_update:extension=postgis:version=latest",
+            .sql = "ALTER EXTENSION postgis UPDATE;",
+        },
+        .{
+            .name = "drop extension catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .drop_extension, .table_name = "postgis" },
+            .plan = "ddl:drop_extension:extension=postgis:if_exists=false",
+            .sql = "DROP EXTENSION postgis;",
+        },
+        .{
+            .name = "drop extension cascade catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .drop_extension, .table_name = "postgis" },
+            .plan = "ddl:drop_extension:extension=postgis:if_exists=true:cascade=true",
+            .sql = "DROP EXTENSION IF EXISTS postgis CASCADE;",
         },
         .{
             .name = "adapter-only transaction control syntax",
@@ -81699,6 +81906,63 @@ test "postgres sql adapter mutation source expression transforms execute through
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued:u1\",\"amount\":4}", rows.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"ready:u2\",\"amount\":8}", rows.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"SKIP\",\"amount\":8}", rows.rows[2]);
+
+    const text_txn_id = try db.beginTransaction(4_201);
+    var text_committed = false;
+    defer if (!text_committed) db.abortTransaction(text_txn_id, 4_202) catch {};
+    const text_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-expression-text-update",
+        .txn_id = text_txn_id,
+    };
+
+    var text_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE usage_records SET status = split_part(status, ':', 1) || '-done', amount = regexp_count(status, '[a-z]+') + position(':' in status) WHERE organization_id = 'o1' ORDER BY id ASC FOR UPDATE RETURNING id, status, amount, split_part(status, '-', 1) AS status_prefix",
+        schema,
+        &.{},
+        .{ .row_claim = text_claim },
+    );
+    defer text_plan.deinit(alloc);
+
+    switch (text_plan) {
+        .update_source => |update_source| {
+            try std.testing.expectEqual(@as(usize, 2), update_source.mutation.req.patch_expressions.len);
+            try std.testing.expectEqualStrings("status", update_source.mutation.req.patch_expressions[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, update_source.mutation.req.patch_expressions[0].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, update_source.mutation.req.patch_expressions[0].expression.operands[0].kind);
+            try std.testing.expectEqualStrings("amount", update_source.mutation.req.patch_expressions[1].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, update_source.mutation.req.patch_expressions[1].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, update_source.mutation.req.patch_expressions[1].expression.operands[0].kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.strpos, update_source.mutation.req.patch_expressions[1].expression.operands[1].kind);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.returning_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, update_source.mutation.req.returning_expressions[0].expression.kind);
+
+            var result = try db.mutateRelationalRowsFromSource(alloc, schema, update_source.mutation.req);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), result.matched);
+            try std.testing.expectEqual(@as(u32, 2), result.staged);
+            try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued-done\",\"amount\":9,\"status_prefix\":\"queued\"}", result.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"ready-done\",\"amount\":8,\"status_prefix\":\"ready\"}", result.returning_rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.commitTransaction(text_txn_id, 4_210);
+    text_committed = true;
+
+    var text_rows = try db.queryRelationalRows(alloc, schema, .{
+        .select = select[0..],
+        .order_by = order_by[0..],
+    });
+    defer text_rows.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), text_rows.total);
+    try std.testing.expectEqual(@as(usize, 3), text_rows.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"queued-done\",\"amount\":9}", text_rows.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"u2\",\"status\":\"ready-done\",\"amount\":8}", text_rows.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"u3\",\"status\":\"SKIP\",\"amount\":8}", text_rows.rows[2]);
 }
 
 test "postgres sql adapter insert source unique conflict executes through relational storage" {

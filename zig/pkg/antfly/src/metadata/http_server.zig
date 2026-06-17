@@ -2090,6 +2090,10 @@ fn applyRelationalSqlDdlOnMetadataService(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (try extension_domain.sql_adapter.executeRelationalSqlDdlOnService(service_impl, alloc, sql)) |applied| {
+        return applied;
+    }
+
     var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
     defer target.deinit(alloc);
 
@@ -3301,6 +3305,8 @@ test "metadata catalog validation applies sql drop table cascade through child s
             for (plan.table_upserts) |record| try self.manager.upsertTable(record);
             for (plan.table_removals) |table_id| _ = self.manager.removeTableTopology(table_id);
         }
+
+        pub fn proposeTransitionCommand(_: *@This(), _: anytype) !void {}
     };
 
     var fake = FakeService.init(alloc);
