@@ -78,6 +78,11 @@ type (
 	HAReadDecisionAction               = oapi.HAReadDecisionAction
 	HAReadDecisionConsistency          = oapi.HAReadDecisionConsistency
 	HARejoinAssessResponse             = oapi.HARejoinAssessResponse
+	HARejoinAssessment                 = oapi.HARejoinAssessment
+	HARejoinAssessmentAction           = oapi.HARejoinAssessmentAction
+	HARejoinAssessmentReason           = oapi.HARejoinAssessmentReason
+	HARejoinReseedResult               = oapi.HARejoinReseedResult
+	HARejoinRewindResult               = oapi.HARejoinRewindResult
 	HAReplicationSlot                  = oapi.HAReplicationSlot
 	HAReplicationSlotActionResponse    = oapi.HAReplicationSlotActionResponse
 	HAReplicationSlotAction            = oapi.HAReplicationSlotActionResponseSlotAction
@@ -182,6 +187,22 @@ const (
 	HASyncPolicyFailureBlock          = oapi.HASyncPolicyFailurePolicyBlock
 	HASyncPolicyFailureFailClosed     = oapi.HASyncPolicyFailurePolicyFailClosed
 	HASyncPolicyFailureDegradeToAsync = oapi.HASyncPolicyFailurePolicyDegradeToAsync
+
+	HARejoinActionAlreadyCurrent = oapi.HARejoinAssessmentActionAlreadyCurrent
+	HARejoinActionRejectUnfenced = oapi.HARejoinAssessmentActionRejectUnfenced
+	HARejoinActionReseed         = oapi.HARejoinAssessmentActionReseed
+	HARejoinActionRewind         = oapi.HARejoinAssessmentActionRewind
+
+	HARejoinReasonCurrentTimeline          = oapi.HARejoinAssessmentReasonCurrentTimeline
+	HARejoinReasonIncompatibleTimeline     = oapi.HARejoinAssessmentReasonIncompatibleTimeline
+	HARejoinReasonLocalLSNBeforeFork       = oapi.HARejoinAssessmentReasonLocalLsnBeforeFork
+	HARejoinReasonNoFence                  = oapi.HARejoinAssessmentReasonNoFence
+	HARejoinReasonParentTimelineRetained   = oapi.HARejoinAssessmentReasonParentTimelineRetained
+	HARejoinReasonParentTimelineWALExpired = oapi.HARejoinAssessmentReasonParentTimelineWalExpired
+	HARejoinReasonWrongCluster             = oapi.HARejoinAssessmentReasonWrongCluster
+	HARejoinReasonWrongOldPrimary          = oapi.HARejoinAssessmentReasonWrongOldPrimary
+	HARejoinReasonWrongShard               = oapi.HARejoinAssessmentReasonWrongShard
+	HARejoinReasonWrongTable               = oapi.HARejoinAssessmentReasonWrongTable
 
 	HAReplicationSlotActionCreate = oapi.HAReplicationSlotActionResponseSlotActionCreate
 	HAReplicationSlotActionDrop   = oapi.HAReplicationSlotActionResponseSlotActionDrop
@@ -414,6 +435,83 @@ func ValidateHAPromotionResponse(response HAPromotionResponse) error {
 		return fmt.Errorf("missing promotion fence_token")
 	}
 	return nil
+}
+
+func ValidateHARejoinAssessResponse(response HARejoinAssessResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing rejoin response schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing rejoin response action receipt")
+	}
+	if !HARejoinAssessmentComplete(response.Assessment) {
+		return fmt.Errorf("missing rejoin assessment fields")
+	}
+	switch response.Assessment.Action {
+	case HARejoinActionRewind:
+		if !HARejoinRewindComplete(response.Rewind) {
+			return fmt.Errorf("missing rejoin rewind fields")
+		}
+	case HARejoinActionReseed:
+		if !HARejoinReseedComplete(response.Reseed) {
+			return fmt.Errorf("missing rejoin reseed fields")
+		}
+	}
+	return nil
+}
+
+func HARejoinAssessmentComplete(assessment HARejoinAssessment) bool {
+	return HARejoinAssessmentActionValid(assessment.Action) &&
+		HARejoinAssessmentReasonValid(assessment.Reason) &&
+		strings.TrimSpace(assessment.FormerNodeId) != "" &&
+		assessment.TargetTimelineId > 0 &&
+		assessment.TargetEpoch > 0 &&
+		assessment.ParentClusterId > 0 &&
+		assessment.ParentTimelineId > 0 &&
+		assessment.ParentEpoch > 0
+}
+
+func HARejoinAssessmentActionValid(action HARejoinAssessmentAction) bool {
+	switch action {
+	case HARejoinActionRejectUnfenced, HARejoinActionAlreadyCurrent, HARejoinActionRewind, HARejoinActionReseed:
+		return true
+	default:
+		return false
+	}
+}
+
+func HARejoinAssessmentReasonValid(reason HARejoinAssessmentReason) bool {
+	switch reason {
+	case HARejoinReasonNoFence,
+		HARejoinReasonCurrentTimeline,
+		HARejoinReasonParentTimelineRetained,
+		HARejoinReasonParentTimelineWALExpired,
+		HARejoinReasonIncompatibleTimeline,
+		HARejoinReasonWrongOldPrimary,
+		HARejoinReasonWrongCluster,
+		HARejoinReasonWrongShard,
+		HARejoinReasonWrongTable,
+		HARejoinReasonLocalLSNBeforeFork:
+		return true
+	default:
+		return false
+	}
+}
+
+func HARejoinRewindComplete(rewind HARejoinRewindResult) bool {
+	return strings.TrimSpace(rewind.NodeId) != "" &&
+		rewind.TargetTimelineId > 0 &&
+		rewind.TargetEpoch > 0 &&
+		rewind.NextLsn > 0
+}
+
+func HARejoinReseedComplete(reseed HARejoinReseedResult) bool {
+	return strings.TrimSpace(reseed.NodeId) != "" &&
+		strings.TrimSpace(reseed.SlotName) != "" &&
+		reseed.TargetTimelineId > 0 &&
+		reseed.TargetEpoch > 0 &&
+		reseed.ReseedRequired &&
+		reseed.BaseBackupRequired
 }
 
 func HAPromotionAssessmentComplete(assessment HAPromotionAssessment) bool {

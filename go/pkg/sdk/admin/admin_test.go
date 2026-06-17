@@ -810,6 +810,89 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	}
 }
 
+func TestValidateHARejoinAssessResponse(t *testing.T) {
+	t.Parallel()
+
+	base := HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "rejoin_assess:primary-a",
+			ActionKind: HAActionKindRejoinAssess,
+			Target:     "primary-a",
+			State:      HAActionStateAssessed,
+			NodeId:     "primary-a",
+		},
+		Assessment: HARejoinAssessment{
+			Action:           HARejoinActionAlreadyCurrent,
+			Reason:           HARejoinReasonCurrentTimeline,
+			FormerNodeId:     "primary-a",
+			TargetTimelineId: 6,
+			TargetEpoch:      7,
+			ParentClusterId:  1,
+			ParentShardId:    2,
+			ParentTableId:    3,
+			ParentTimelineId: 4,
+			ParentEpoch:      5,
+			ForkLsn:          8,
+			FormerLastLsn:    8,
+			RetainedFromLsn:  1,
+		},
+	}
+	if err := ValidateHARejoinAssessResponse(base); err != nil {
+		t.Fatalf("ValidateHARejoinAssessResponse returned error: %v", err)
+	}
+	base.Assessment.Reason = HARejoinAssessmentReason("unknown")
+	if err := ValidateHARejoinAssessResponse(base); err == nil || !strings.Contains(err.Error(), "assessment fields") {
+		t.Fatalf("invalid reason error = %v, want assessment fields error", err)
+	}
+	base.Assessment.Reason = HARejoinReasonCurrentTimeline
+
+	rewind := base
+	rewind.Action.ActionKind = HAActionKindRejoinRewind
+	rewind.Action.State = HAActionStateApplied
+	rewind.Assessment.Action = HARejoinActionRewind
+	rewind.Assessment.Reason = HARejoinReasonParentTimelineRetained
+	rewind.Rewind = HARejoinRewindResult{
+		NodeId:           "primary-a",
+		TargetTimelineId: 6,
+		TargetEpoch:      7,
+		CurrentLastLsn:   8,
+		PreviousLastLsn:  10,
+		NextLsn:          9,
+		ForkLsn:          8,
+	}
+	if err := ValidateHARejoinAssessResponse(rewind); err != nil {
+		t.Fatalf("ValidateHARejoinAssessResponse rewind returned error: %v", err)
+	}
+	rewind.Rewind.NextLsn = 0
+	if err := ValidateHARejoinAssessResponse(rewind); err == nil || !strings.Contains(err.Error(), "rewind fields") {
+		t.Fatalf("missing rewind error = %v, want rewind fields error", err)
+	}
+
+	reseed := base
+	reseed.Action.ActionKind = HAActionKindRejoinReseed
+	reseed.Action.State = HAActionStateApplied
+	reseed.Assessment.Action = HARejoinActionReseed
+	reseed.Assessment.Reason = HARejoinReasonParentTimelineWALExpired
+	reseed.Reseed = HARejoinReseedResult{
+		NodeId:             "primary-a",
+		SlotName:           "primary-a",
+		TargetTimelineId:   6,
+		TargetEpoch:        7,
+		ForkLsn:            8,
+		FormerLastLsn:      10,
+		ReseedRequired:     true,
+		BaseBackupRequired: true,
+	}
+	if err := ValidateHARejoinAssessResponse(reseed); err != nil {
+		t.Fatalf("ValidateHARejoinAssessResponse reseed returned error: %v", err)
+	}
+	reseed.Reseed.SlotName = ""
+	if err := ValidateHARejoinAssessResponse(reseed); err == nil || !strings.Contains(err.Error(), "reseed fields") {
+		t.Fatalf("missing reseed error = %v, want reseed fields error", err)
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

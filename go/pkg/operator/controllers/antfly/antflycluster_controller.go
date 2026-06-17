@@ -3790,6 +3790,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			result, err = adminClient.AssessRejoinResponse(ctx, body)
 		}
 		raw, err := haAdminSDKResponseRaw(result, err)
+		if err == nil {
+			err = haValidateRejoinSDKResponse(result)
+		}
 		if err == nil && !r.applyHADirectRejoinAssessResult(cluster, action, raw) {
 			err = fmt.Errorf("HA admin action %s succeeded without typed rejoin assessment", action.Kind)
 		}
@@ -3907,6 +3910,16 @@ func haValidatePromotionSDKResponse(value *adminsdk.HAResponse[adminsdk.HAPromot
 		return fmt.Errorf("HA admin promotion response is nil")
 	}
 	if err := adminsdk.ValidateHAPromotionResponse(*value.Value); err != nil {
+		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+	}
+	return nil
+}
+
+func haValidateRejoinSDKResponse(value *adminsdk.HAResponse[adminsdk.HARejoinAssessResponse]) error {
+	if value == nil || value.Value == nil {
+		return fmt.Errorf("HA admin rejoin response is nil")
+	}
+	if err := adminsdk.ValidateHARejoinAssessResponse(*value.Value); err != nil {
 		return fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
 	}
 	return nil
