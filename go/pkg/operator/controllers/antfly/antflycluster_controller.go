@@ -6550,6 +6550,8 @@ func haPromotionAdminResultHasEvidence(action antflyv1.HAPlannedActionStatus, re
 		result.FenceGeneration == 0 ||
 		(action.FenceGeneration != 0 && result.FenceGeneration != action.FenceGeneration) ||
 		strings.TrimSpace(result.FenceToken) == "" ||
+		result.FenceClusterID == 0 ||
+		strings.TrimSpace(result.FenceOldPrimaryID) == "" ||
 		strings.TrimSpace(result.FencePromotedNodeID) == "" ||
 		(action.StandbyName != "" && result.FencePromotedNodeID != action.StandbyName) ||
 		result.FenceParentTimelineID == 0 ||

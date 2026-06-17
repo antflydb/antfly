@@ -206,6 +206,7 @@ func haReplicationSlotActionResponseJSON(actionKind, slotAction, slotName, nodeI
 
 func haPromotionAdminResult(generation uint64, token string, promotedNodeID string) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:         1,
 		ActionID:              "promotion:" + promotedNodeID,
 		ActionKind:            "promotion",
 		ActionTarget:          promotedNodeID,
@@ -216,6 +217,7 @@ func haPromotionAdminResult(generation uint64, token string, promotedNodeID stri
 		FenceClusterID:        100,
 		FenceShardID:          10,
 		FenceTableID:          20,
+		FenceOldPrimaryID:     "primary-a",
 		FencePromotedNodeID:   promotedNodeID,
 		FenceParentTimelineID: 4,
 		FenceParentEpoch:      6,
@@ -2492,6 +2494,33 @@ func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T
 	action.AdminResult.ActionID = "base_backup_finish:base-standby-a-5"
 	action.AdminResult.ActionTarget = "base-standby-a-5"
 	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
+}
+
+func TestHAPromotionAdminResultRequiresFenceScopeEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceGeneration: 3,
+		AdminNodeID:     "standby-a",
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult:     haPromotionAdminResult(3, "ha-fence-token", "standby-a"),
+	}
+
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
+
+	missingCluster := *action.AdminResult
+	missingCluster.FenceClusterID = 0
+	action.AdminResult = &missingCluster
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeFalse())
+
+	missingOldPrimary := *haPromotionAdminResult(3, "ha-fence-token", "standby-a")
+	missingOldPrimary.FenceOldPrimaryID = ""
+	action.AdminResult = &missingOldPrimary
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeFalse())
 }
 
 func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) {
