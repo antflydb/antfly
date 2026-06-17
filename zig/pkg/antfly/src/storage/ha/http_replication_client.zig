@@ -154,7 +154,8 @@ pub const Client = struct {
         if (options.verify_upstream) {
             try self.verifyCompatibleUpstream(base_uri, standby);
         }
-        var response = try self.startReplication(base_uri, slot_name, standby.nextReceiveLsn(), options);
+        const requested_lsn = standby.nextReceiveLsn();
+        var response = try self.startReplication(base_uri, slot_name, requested_lsn, options);
         defer response.deinit();
         try verifyStartReplicationResponse(response.parsed.value, standby.identity);
 
@@ -162,18 +163,21 @@ pub const Client = struct {
         const last_sent_lsn = try uint64FromJson(response.parsed.value.last_sent_lsn);
         const next_lsn = try positiveUint64FromJson(response.parsed.value.next_lsn);
 
-        var received_count: usize = 0;
-        for (response.parsed.value.records) |frame| {
-            const encoded = try decodeFrame(self.alloc, frame);
-            defer self.alloc.free(encoded);
-            const record = try replication_record.decode(encoded);
-            const frame_lsn = try positiveUint64FromJson(frame.lsn);
-            if (record.lsn != frame_lsn) return error.ReplicationFrameLsnMismatch;
-            _ = standby.receive(record) catch |err| {
+        const frames = try decodeAndValidateFrames(
+            self.alloc,
+            response.parsed.value,
+            requested_lsn,
+            current_lsn,
+            last_sent_lsn,
+            next_lsn,
+        );
+        defer freeVerifiedFrames(self.alloc, frames);
+
+        for (frames) |frame| {
+            _ = standby.receive(frame.record) catch |err| {
                 _ = self.updateStandbyStatus(base_uri, slot_name, standby) catch {};
                 return err;
             };
-            received_count += 1;
         }
 
         const applied_count = standby.applyAvailable(apply_ctx, apply_fn) catch |err| {
@@ -182,7 +186,7 @@ pub const Client = struct {
         };
         try self.updateStandbyStatus(base_uri, slot_name, standby);
         return .{
-            .received_count = received_count,
+            .received_count = frames.len,
             .applied_count = applied_count,
             .progress = standby.currentProgress(),
             .current_lsn = current_lsn,
@@ -384,6 +388,74 @@ fn ParsedResponse(comptime T: type) type {
     };
 }
 
+const VerifiedFrame = struct {
+    encoded: []u8,
+    record: replication_record.RecordView,
+
+    fn deinit(self: *VerifiedFrame, alloc: Allocator) void {
+        alloc.free(self.encoded);
+        self.* = undefined;
+    }
+};
+
+fn decodeAndValidateFrames(
+    alloc: Allocator,
+    response: internal_api.HAStartReplicationResponse,
+    requested_lsn: u64,
+    current_lsn: u64,
+    last_sent_lsn: u64,
+    next_lsn: u64,
+) ![]VerifiedFrame {
+    const response_from_lsn = try positiveUint64FromJson(response.from_lsn);
+    if (response_from_lsn != requested_lsn) return error.ReplicationResponseLsnMismatch;
+    if (last_sent_lsn > current_lsn) return error.ReplicationResponseLsnMismatch;
+    if (next_lsn != try std.math.add(u64, last_sent_lsn, 1)) return error.ReplicationResponseLsnMismatch;
+    if (next_lsn > try std.math.add(u64, current_lsn, 1)) return error.ReplicationResponseLsnMismatch;
+
+    const encoded_bytes = try uint64FromJson(response.encoded_bytes);
+    var actual_encoded_bytes: u64 = 0;
+    var expected_lsn = requested_lsn;
+
+    const frames = try alloc.alloc(VerifiedFrame, response.records.len);
+    var filled: usize = 0;
+    errdefer {
+        for (frames[0..filled]) |*frame| frame.deinit(alloc);
+        alloc.free(frames);
+    }
+
+    for (response.records, 0..) |wire_frame, idx| {
+        var encoded = try decodeFrame(alloc, wire_frame);
+        errdefer if (encoded.len > 0) alloc.free(encoded);
+        const record = try replication_record.decode(encoded);
+        try validateFrameMetadata(wire_frame, record);
+
+        const frame_lsn = try positiveUint64FromJson(wire_frame.lsn);
+        if (frame_lsn != expected_lsn or record.lsn != expected_lsn) {
+            return error.ReplicationFrameLsnMismatch;
+        }
+        actual_encoded_bytes = try std.math.add(u64, actual_encoded_bytes, encoded.len);
+
+        frames[idx] = .{
+            .encoded = encoded,
+            .record = record,
+        };
+        filled += 1;
+        encoded = &.{};
+        expected_lsn = try std.math.add(u64, expected_lsn, 1);
+    }
+
+    const expected_last_sent_lsn = expected_lsn - 1;
+    if (last_sent_lsn != expected_last_sent_lsn) return error.ReplicationResponseLsnMismatch;
+    if (encoded_bytes != actual_encoded_bytes) return error.ReplicationResponseEncodedBytesMismatch;
+
+    return frames;
+}
+
+fn freeVerifiedFrames(alloc: Allocator, frames: []VerifiedFrame) void {
+    for (frames) |*frame| frame.deinit(alloc);
+    alloc.free(frames);
+}
+
 fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplicationFrame) ![]u8 {
     if (frame.lsn <= 0) return error.InvalidReplicationFrame;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(frame.encoded);
@@ -391,6 +463,33 @@ fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplication
     errdefer alloc.free(out);
     try std.base64.standard.Decoder.decode(out, frame.encoded);
     return out;
+}
+
+fn validateFrameMetadata(frame: internal_api.openapi.types.HAReplicationFrame, record: replication_record.RecordView) !void {
+    if (record.kind != replicationRecordKind(frame.kind)) return error.ReplicationFrameKindMismatch;
+    if (record.payload_codec != replicationPayloadCodec(frame.payload_codec)) return error.ReplicationFramePayloadCodecMismatch;
+}
+
+fn replicationRecordKind(kind: internal_api.openapi.types.HARecordKind) replication_record.RecordKind {
+    return switch (kind) {
+        .batch_mutation => .batch_mutation,
+        .metadata_mutation => .metadata_mutation,
+        .derived_effect => .derived_effect,
+        .backup_start => .backup_start,
+        .backup_end => .backup_end,
+        .checkpoint => .checkpoint,
+        .manifest => .manifest,
+        .truncate => .truncate,
+        .timeline_switch => .timeline_switch,
+    };
+}
+
+fn replicationPayloadCodec(codec: internal_api.openapi.types.HAPayloadCodec) replication_record.PayloadCodec {
+    return switch (codec) {
+        .raw => .raw,
+        .json => .json,
+        .binary => .binary,
+    };
 }
 
 fn verifyIdentity(actual: anytype, expected: standby_mod.Identity) !void {
@@ -511,6 +610,92 @@ const ApplyCapture = struct {
     }
 };
 
+const CorruptFrameExecutor = struct {
+    identity: standby_mod.Identity,
+
+    fn executor(self: *CorruptFrameExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *CorruptFrameExecutor = @ptrCast(@alignCast(ptr));
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_start)) {
+            return try self.startResponse(alloc);
+        }
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_status)) {
+            return try jsonTestResponse(alloc, .{ .unexpected_status_update = true });
+        }
+        return .{
+            .status = 404,
+            .body = try alloc.dupe(u8, "not found"),
+        };
+    }
+
+    fn startResponse(self: *CorruptFrameExecutor, alloc: Allocator) !http_common.HttpResponse {
+        const encoded = try replication_record.encodeAlloc(alloc, .{
+            .kind = .batch_mutation,
+            .payload_codec = .raw,
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = self.identity.shard_id,
+            .table_id = self.identity.table_id,
+            .timeline_id = self.identity.timeline_id,
+            .epoch = self.identity.epoch,
+            .lsn = 1,
+            .previous_lsn = 0,
+            .payload = "one",
+        });
+        defer alloc.free(encoded);
+
+        const encoded_frame = try base64TestAlloc(alloc, encoded);
+        defer alloc.free(encoded_frame);
+        const records = [_]struct {
+            lsn: u64,
+            kind: []const u8,
+            payload_codec: []const u8,
+            encoded: []const u8,
+        }{.{
+            .lsn = 1,
+            .kind = "metadata-mutation",
+            .payload_codec = "raw",
+            .encoded = encoded_frame,
+        }};
+
+        return try jsonTestResponse(alloc, .{
+            .slot_name = "standby-a",
+            .identity = self.identity,
+            .record_format_version = replication_record.format_version,
+            .timeline_id = self.identity.timeline_id,
+            .from_lsn = 1,
+            .current_lsn = 1,
+            .last_sent_lsn = 1,
+            .next_lsn = 2,
+            .end_of_wal = true,
+            .encoded_bytes = encoded.len,
+            .records = &records,
+        });
+    }
+};
+
+fn base64TestAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const size = std.base64.standard.Encoder.calcSize(raw.len);
+    const out = try alloc.alloc(u8, size);
+    _ = std.base64.standard.Encoder.encode(out, raw);
+    return out;
+}
+
+fn jsonTestResponse(alloc: Allocator, value: anytype) !http_common.HttpResponse {
+    return .{
+        .status = 200,
+        .content_type = try alloc.dupe(u8, "application/json"),
+        .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
+    };
+}
+
 test "storage.ha http replication client pulls applies and acknowledges standby progress" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "replicate");
@@ -622,6 +807,36 @@ test "storage.ha http replication client verifies upstream identity before strea
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+}
+
+test "storage.ha http replication client rejects frame metadata mismatch before receive" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "frame-metadata");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var executor = CorruptFrameExecutor{ .identity = identity };
+    var client = Client.init(alloc, executor.executor());
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(
+        error.ReplicationFrameKindMismatch,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
 }
 
 test "storage.ha http replication client reports durable receive progress when apply fails" {
