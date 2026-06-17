@@ -947,6 +947,7 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     const raw_env_var = options.remote_token_env orelse return null;
     const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
     if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
+    if (!isHAAdminTokenEnvName(env_var)) return error.HAAdminTokenEnvInvalid;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -955,6 +956,23 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
     if (token.len == 0) return error.HAAdminTokenMissing;
     return try alloc.dupe(u8, token);
+}
+
+fn isHAAdminTokenEnvName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isEnvNameFirstByte(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!isEnvNameByte(byte)) return false;
+    }
+    return true;
+}
+
+fn isEnvNameFirstByte(byte: u8) bool {
+    return byte == '_' or (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z');
+}
+
+fn isEnvNameByte(byte: u8) bool {
+    return isEnvNameFirstByte(byte) or (byte >= '0' and byte <= '9');
 }
 
 fn parseU64(raw: []const u8) !u64 {
@@ -1036,6 +1054,24 @@ test "ha cmd parses remote admin URL before command" {
     try std.testing.expectEqualStrings("--table", parsed.command_args[0]);
     try std.testing.expectEqualStrings("status", parsed.command_args[1]);
     try std.testing.expectEqualStrings("primary", parsed.command_args[2]);
+}
+
+test "ha cmd validates remote bearer token env name" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try resolveRemoteBearerToken(alloc, .{})) == null);
+    try std.testing.expectError(error.HAAdminTokenEnvMissing, resolveRemoteBearerToken(alloc, .{
+        .remote_token_env = " \t ",
+    }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveRemoteBearerToken(alloc, .{
+        .remote_token_env = "bad-token-env",
+    }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveRemoteBearerToken(alloc, .{
+        .remote_token_env = "9TOKEN",
+    }));
+    try std.testing.expectError(error.HAAdminTokenMissing, resolveRemoteBearerToken(alloc, .{
+        .remote_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
+    }));
 }
 
 test "ha cmd remote commands prefer typed admin routes" {

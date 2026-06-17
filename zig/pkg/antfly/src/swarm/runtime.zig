@@ -2088,7 +2088,9 @@ fn validateHARole(cli: CliConfig) !void {
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_admin_token_env) |env_var| {
-        if (std.mem.trim(u8, env_var, " \t\r\n").len == 0) return error.HAAdminTokenEnvMissing;
+        const trimmed = std.mem.trim(u8, env_var, " \t\r\n");
+        if (trimmed.len == 0) return error.HAAdminTokenEnvMissing;
+        if (!isHAAdminTokenEnvName(trimmed)) return error.HAAdminTokenEnvInvalid;
     }
     if ((primary_requested or standby_requested) and cli.ha_fence_wal == null) return error.HAFenceWalMissing;
     if (haSyncPolicyRequested(cli) and !primary_requested) return error.HASyncPolicyRequiresPrimary;
@@ -2226,6 +2228,7 @@ fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?
     const raw_env_var = cli.ha_admin_token_env orelse return null;
     const env_var = std.mem.trim(u8, raw_env_var, " \t\r\n");
     if (env_var.len == 0) return error.HAAdminTokenEnvMissing;
+    if (!isHAAdminTokenEnvName(env_var)) return error.HAAdminTokenEnvInvalid;
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -2234,6 +2237,23 @@ fn resolveHAAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?
     const token = std.mem.trim(u8, std.mem.span(raw_token_z), " \t\r\n");
     if (token.len == 0) return error.HAAdminTokenMissing;
     return try alloc.dupe(u8, token);
+}
+
+fn isHAAdminTokenEnvName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isEnvNameFirstByte(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!isEnvNameByte(byte)) return false;
+    }
+    return true;
+}
+
+fn isEnvNameFirstByte(byte: u8) bool {
+    return byte == '_' or (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z');
+}
+
+fn isEnvNameByte(byte: u8) bool {
+    return isEnvNameFirstByte(byte) or (byte >= '0' and byte <= '9');
 }
 
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
@@ -2792,6 +2812,16 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_admin_token_env = " \t ",
     }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_admin_token_env = "bad-token-env",
+    }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_admin_token_env = "9TOKEN",
+    }));
     try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
     }));
@@ -2803,6 +2833,24 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_sync_mode = .remote_write,
         .ha_sync_required = 1,
+    }));
+}
+
+test "swarm HA runtime validates bearer token env name before lookup" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try resolveHAAdminBearerTokenFromCli(alloc, .{})) == null);
+    try std.testing.expectError(error.HAAdminTokenEnvMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
+        .ha_admin_token_env = " \t ",
+    }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveHAAdminBearerTokenFromCli(alloc, .{
+        .ha_admin_token_env = "bad-token-env",
+    }));
+    try std.testing.expectError(error.HAAdminTokenEnvInvalid, resolveHAAdminBearerTokenFromCli(alloc, .{
+        .ha_admin_token_env = "9TOKEN",
+    }));
+    try std.testing.expectError(error.HAAdminTokenMissing, resolveHAAdminBearerTokenFromCli(alloc, .{
+        .ha_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN_SHOULD_NOT_EXIST",
     }));
 }
 
