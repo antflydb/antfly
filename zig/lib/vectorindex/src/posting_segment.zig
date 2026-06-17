@@ -938,12 +938,12 @@ pub const LazyDirectorySnapshot = struct {
             const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
             defer alloc.free(index_data);
 
-            var delta_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-            while (delta_index < entry.meta.entry_count) : (delta_index += 1) {
-                const delta_entry = try indexEntryFromBytes(index_data[delta_index * index_entry_size ..][0..index_entry_size]);
-                if (delta_entry.posting_id != posting_id or delta_entry.kind != .delta) break;
-                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, delta_entry);
-                defer alloc.free(value);
+            const range = (try readSegmentDeltaValueRangeAlloc(alloc, self.io, self.dir, manifest_entry, index_data, posting_id)) orelse continue;
+            defer range.deinit(alloc);
+
+            var delta_index = range.first_index;
+            while (delta_index < range.past_index) : (delta_index += 1) {
+                const value = try deltaValueFromRange(index_data, range, delta_index);
                 var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
                 while (try iterator.next()) |record| {
                     if (record.vector_id != vector_id) continue;
