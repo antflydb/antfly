@@ -38301,6 +38301,7 @@ fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmana
             i += 1;
             while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
             if (i == start + 1) return error.UnsupportedSqlShape;
+            if (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) return error.UnsupportedSqlShape;
             if (i + 1 < sql.len and sql[i] == ':' and sql[i + 1] == ':') {
                 i += 2;
                 while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '[' or sql[i] == ']')) i += 1;
@@ -87103,6 +87104,12 @@ test "postgres sql adapter rejects unsupported application shapes explicitly" {
         schema,
         &.{},
     ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM users WHERE id = $1abc",
+        schema,
+        &.{.{ .string = "u1" }},
+    ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateAlloc(
         alloc,
         "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'",
@@ -87110,11 +87117,25 @@ test "postgres sql adapter rejects unsupported application shapes explicitly" {
         &.{},
         resolver_ctx.resolver(),
     ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateAlloc(
+        alloc,
+        "UPDATE users SET organization_id = 'o2' WHERE id = $1abc",
+        schema,
+        &.{.{ .string = "u1" }},
+        resolver_ctx.resolver(),
+    ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDeleteAlloc(
         alloc,
         "DELETE FROM users WHERE organization_id = 'o1'",
         schema,
         &.{},
+        resolver_ctx.resolver(),
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverAlloc(
+        alloc,
+        "INSERT INTO users (id, organization_id) VALUES ($1abc, 'o1')",
+        schema,
+        &.{.{ .string = "u1" }},
         resolver_ctx.resolver(),
     ));
     try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertWithResolverAlloc(
