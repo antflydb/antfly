@@ -50,7 +50,8 @@ const (
 type haActionExecutor string
 
 const (
-	haActionExecutorAdminCommand     haActionExecutor = "AdminCommand"
+	haActionExecutorAdminAPI         haActionExecutor = "AdminAPI"
+	haActionExecutorCLIJob           haActionExecutor = "CLIJob"
 	haActionExecutorControllerAction haActionExecutor = "ControllerAction"
 )
 
@@ -706,6 +707,9 @@ func haSameAdminCommandHint(a antflyv1.HAPlannedActionStatus, b antflyv1.HAPlann
 }
 
 func haPlannedActionUsesTypedAdminAPI(action antflyv1.HAPlannedActionStatus) bool {
+	if action.Executor == string(haActionExecutorCLIJob) {
+		return false
+	}
 	return haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) &&
 		strings.TrimSpace(action.AdminMethod) != "" &&
 		strings.TrimSpace(action.AdminPath) != ""
@@ -865,8 +869,12 @@ func haCLIActionPhase(raw string) (haActionPhase, bool) {
 
 func haCLIActionExecutor(raw string) (haActionExecutor, bool) {
 	switch strings.TrimSpace(raw) {
+	case "admin_api":
+		return haActionExecutorAdminAPI, true
 	case "admin_command":
-		return haActionExecutorAdminCommand, true
+		return haActionExecutorAdminAPI, true
+	case "cli_job":
+		return haActionExecutorCLIJob, true
 	case "controller_action":
 		return haActionExecutorControllerAction, true
 	default:
@@ -910,7 +918,7 @@ func haPlannedActionExecutor(kind haActionKind) haActionExecutor {
 	if kind == haActionUpdatePrimaryRoute {
 		return haActionExecutorControllerAction
 	}
-	return haActionExecutorAdminCommand
+	return haActionExecutorAdminAPI
 }
 
 func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIdentitySpec, status *antflyv1.HAStatus) []string {

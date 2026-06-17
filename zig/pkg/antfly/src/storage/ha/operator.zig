@@ -128,7 +128,8 @@ pub const ActionPhase = enum {
 };
 
 pub const ActionExecutor = enum {
-    admin_command,
+    admin_api,
+    cli_job,
     controller_action,
 };
 
@@ -142,7 +143,7 @@ pub const FencingPrecondition = struct {
 pub const Action = struct {
     kind: ActionKind,
     phase: ActionPhase = .reconcile,
-    executor: ActionExecutor = .admin_command,
+    executor: ActionExecutor = .admin_api,
     depends_on: ?ActionKind = null,
     fencing_precondition: ?FencingPrecondition = null,
     standby_name: ?[]const u8 = null,
@@ -1923,10 +1924,10 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     try std.testing.expectEqual(ActionPhase.promote, safe.actions[1].phase);
     try std.testing.expectEqual(ActionPhase.route, safe.actions[2].phase);
     try std.testing.expectEqual(ActionPhase.rejoin, safe.actions[3].phase);
-    try std.testing.expectEqual(ActionExecutor.admin_command, safe.actions[0].executor);
-    try std.testing.expectEqual(ActionExecutor.admin_command, safe.actions[1].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[0].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[1].executor);
     try std.testing.expectEqual(ActionExecutor.controller_action, safe.actions[2].executor);
-    try std.testing.expectEqual(ActionExecutor.admin_command, safe.actions[3].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[3].executor);
     try std.testing.expectEqual(@as(?ActionKind, null), safe.actions[0].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .acquire_fence), safe.actions[1].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[2].depends_on);
@@ -2040,7 +2041,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"lagging_standby_count\":0");
     try expectContains(rendered, "\"kind\":\"acquire_fence\"");
     try expectContains(rendered, "\"phase\":\"fence\"");
-    try expectContains(rendered, "\"executor\":\"admin_command\"");
+    try expectContains(rendered, "\"executor\":\"admin_api\"");
     try expectContains(rendered, "\"admin_url\":\"http://standby-a-ha.default.svc:8081\"");
     try expectContains(rendered, "\"admin_method\":\"POST\"");
     try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/fence\"");

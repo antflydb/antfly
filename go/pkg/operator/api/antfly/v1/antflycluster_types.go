@@ -1547,7 +1547,7 @@ type HAPlannedActionStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// Executor identifies whether the operator or an HA admin command executes this action.
+	// Executor identifies whether typed /admin/v1, a CLI-backed Job, or the Kubernetes controller executes this action.
 	// +optional
 	Executor string `json:"executor,omitempty"`
 

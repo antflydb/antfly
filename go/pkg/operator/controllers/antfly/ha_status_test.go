@@ -113,9 +113,9 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 		t.Fatalf("expected seed action to depend on create-slot, got %#v", cluster.Status.HAStatus.PlannedActions[1])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].Phase != string(haActionPhaseReconcile) ||
-		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminCommand) ||
+		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminAPI) ||
 		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhaseReconcile) ||
-		cluster.Status.HAStatus.PlannedActions[1].Executor != string(haActionExecutorAdminCommand) {
+		cluster.Status.HAStatus.PlannedActions[1].Executor != string(haActionExecutorAdminAPI) {
 		t.Fatalf("expected slot and seed actions to publish reconcile/admin executor metadata, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" ||
@@ -270,6 +270,22 @@ func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t 
 	}
 }
 
+func TestHAPlannedActionUsesTypedAdminAPISkipsCLIJob(t *testing.T) {
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionCreateSlot),
+		Executor:    string(haActionExecutorCLIJob),
+		AdminMethod: "POST",
+		AdminPath:   haAdminReplicationSlotsPath,
+	}
+	if haPlannedActionUsesTypedAdminAPI(action) {
+		t.Fatalf("CLI-backed action should not be treated as typed admin API execution: %#v", action)
+	}
+	action.Executor = string(haActionExecutorAdminAPI)
+	if !haPlannedActionUsesTypedAdminAPI(action) {
+		t.Fatalf("AdminAPI action with method/path should be treated as typed admin API execution: %#v", action)
+	}
+}
+
 func TestHAPlannedActionStatusesDropInvalidDirectAdminSuccess(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
@@ -353,7 +369,7 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		"action_count=4",
 		"actions.0.kind=acquire_fence",
 		"actions.0.phase=fence",
-		"actions.0.executor=admin_command",
+		"actions.0.executor=admin_api",
 		"actions.0.reason=AutomaticFailoverReady",
 		"actions.0.standby_name=standby-a",
 		"actions.0.target_lsn=12",
@@ -366,7 +382,7 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		"actions.0.admin_path=/admin/v1/ha/fence",
 		"actions.1.kind=promote_standby",
 		"actions.1.phase=promote",
-		"actions.1.executor=admin_command",
+		"actions.1.executor=admin_api",
 		"actions.1.depends_on=acquire_fence",
 		"actions.1.standby_name=standby-a",
 		"actions.1.target_lsn=12",
@@ -378,7 +394,7 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		"actions.2.route_to=standby-a",
 		"actions.3.kind=rewind_former_primary",
 		"actions.3.phase=rejoin",
-		"actions.3.executor=admin_command",
+		"actions.3.executor=admin_api",
 		"actions.3.depends_on=promote_standby",
 		"actions.3.standby_name=primary-a",
 		"actions.3.target_lsn=12",
@@ -400,7 +416,7 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 	}
 	if plan.Actions[0].Kind != string(haActionAcquireFence) ||
 		plan.Actions[0].Phase != string(haActionPhaseFence) ||
-		plan.Actions[0].Executor != string(haActionExecutorAdminCommand) ||
+		plan.Actions[0].Executor != string(haActionExecutorAdminAPI) ||
 		plan.Actions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		plan.Actions[0].FenceHolder != "standby-a" ||
 		plan.Actions[0].FenceGeneration != 3 ||
@@ -1221,7 +1237,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhasePromote) ||
 		cluster.Status.HAStatus.PlannedActions[2].Phase != string(haActionPhaseRoute) ||
 		cluster.Status.HAStatus.PlannedActions[3].Phase != string(haActionPhaseRejoin) ||
-		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminCommand) ||
+		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminAPI) ||
 		cluster.Status.HAStatus.PlannedActions[2].Executor != string(haActionExecutorControllerAction) {
 		t.Fatalf("expected promotion action status to publish phase/executor metadata, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}

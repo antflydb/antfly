@@ -1526,7 +1526,7 @@ test "storage.ha admin exec renders operator plan command" {
     try expectContains(table_body, "action_count=4\n");
     try expectContains(table_body, "actions.0.kind=acquire_fence\n");
     try expectContains(table_body, "actions.0.phase=fence\n");
-    try expectContains(table_body, "actions.0.executor=admin_command\n");
+    try expectContains(table_body, "actions.0.executor=admin_api\n");
     try expectContains(table_body, "actions.0.fence_authority=kubernetes_lease\n");
     try expectContains(table_body, "actions.0.admin_method=POST\n");
     try expectContains(table_body, "actions.0.admin_path=/admin/v1/ha/fence\n");

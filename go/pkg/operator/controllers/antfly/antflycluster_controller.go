@@ -3384,6 +3384,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	if action == nil {
 		return false, nil
 	}
+	if action.Executor == string(haActionExecutorCLIJob) {
+		return false, nil
+	}
 	if !haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
 		return false, nil
 	}
