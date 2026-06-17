@@ -491,6 +491,38 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 	}
 }
 
+func TestHAPromotionReceiptRequiresConcreteFenceAuthority(t *testing.T) {
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			RequiredLSN:       12,
+			ObservedLSN:       13,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   7,
+			FenceToken:        "ha-fence-token",
+		},
+	}
+
+	if haPromotionReceipt(status) == nil {
+		t.Fatalf("expected complete fenced promotion receipt")
+	}
+
+	status.LastPromotion.FenceAuthority = ""
+	if haPromotionReceipt(status) != nil {
+		t.Fatalf("expected promotion receipt without fence authority to be incomplete")
+	}
+
+	status.LastPromotion.FenceAuthority = antflyv1.HAFencingAuthorityNone
+	if haPromotionReceipt(status) != nil {
+		t.Fatalf("expected promotion receipt with None fence authority to be incomplete")
+	}
+}
+
 func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
@@ -1150,6 +1182,7 @@ func TestHAFormerPrimaryAdminCommandUsesExecutableRejoinSubcommands(t *testing.T
 		NewEpoch:          2,
 		RequiredLSN:       10,
 		ObservedLSN:       10,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 		FenceGeneration:   4,
 		FenceToken:        "token",
 	}}

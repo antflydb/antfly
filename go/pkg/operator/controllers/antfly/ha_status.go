@@ -1100,6 +1100,7 @@ func haPromotionReceipt(status *antflyv1.HAStatus) *antflyv1.HAPromotionStatus {
 		promotion.ParentTimelineID == 0 || promotion.ParentEpoch == 0 ||
 		promotion.NewTimelineID == 0 || promotion.NewEpoch == 0 ||
 		haPromotionRequiredLSN(promotion) == 0 || haPromotionObservedLSN(promotion) == 0 ||
+		promotion.FenceAuthority == "" || promotion.FenceAuthority == antflyv1.HAFencingAuthorityNone ||
 		promotion.FenceGeneration == 0 || promotion.FenceToken == "" {
 		return nil
 	}
