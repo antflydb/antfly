@@ -3352,6 +3352,9 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	_, ok = parseHADirectAdminActionResult([]byte(`{"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`))
 	g.Expect(ok).To(BeFalse())
 
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5}`))
+	g.Expect(ok).To(BeFalse())
+
 	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(finish.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
@@ -3363,6 +3366,9 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(finish.EndRecordLSN).To(Equal(uint64(8)))
 
 	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5}`))
 	g.Expect(ok).To(BeFalse())
 
 	legacyFinish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"seed_finish":{"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}}}`))
@@ -3380,6 +3386,9 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	g.Expect(bootstrap.CheckpointLSN).To(Equal(uint64(7)))
 
 	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}`))
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5}`))
 	g.Expect(ok).To(BeFalse())
 
 	legacyBootstrap, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"result":{"seed_bootstrap":{"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":7}}}`))

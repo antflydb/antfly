@@ -4041,6 +4041,9 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		!haReplicationSlotJSONComplete(result.Slot) {
 		return nil, false
 	}
+	if topLevel && !haDirectAdminActionPayloadComplete(*result) {
+		return nil, false
+	}
 	if strings.TrimSpace(result.Action.ActionKind) == "promotion_assess" &&
 		!haPromotionAssessmentJSONComplete(result.Assessment) {
 		return nil, false
@@ -4128,6 +4131,26 @@ func haReplicationSlotJSONComplete(slot haReplicationSlotJSON) bool {
 		slot.Active != nil &&
 		slot.ReseedRequired != nil &&
 		slot.CurrentLSN != nil
+}
+
+func haDirectAdminActionPayloadComplete(result haDirectAdminActionResultJSON) bool {
+	switch strings.TrimSpace(result.Action.ActionKind) {
+	case "base_backup_begin":
+		return strings.TrimSpace(result.SlotName) != "" &&
+			strings.TrimSpace(result.ManifestID) != "" &&
+			result.BackupLSN > 0 &&
+			result.StartRecordLSN > 0
+	case "base_backup_finish":
+		return strings.TrimSpace(result.ManifestID) != "" &&
+			result.BackupLSN > 0 &&
+			result.EndRecordLSN > 0
+	case "standby_bootstrap":
+		return strings.TrimSpace(result.ManifestID) != "" &&
+			result.BackupLSN > 0 &&
+			result.CheckpointLSN > 0
+	default:
+		return true
+	}
 }
 
 func haUint64JSONValue(value *uint64) uint64 {
