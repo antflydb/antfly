@@ -185,6 +185,14 @@ pub fn renderPrometheusAlloc(alloc: Allocator, result: Result) ![]u8 {
 }
 
 pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
+    return try renderTableWithContextAlloc(alloc, null, result);
+}
+
+pub fn renderTableForContextAlloc(alloc: Allocator, ctx: Context, result: Result) ![]u8 {
+    return try renderTableWithContextAlloc(alloc, ctx, result);
+}
+
+fn renderTableWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Result) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -196,23 +204,23 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendU64Line(alloc, &out, "next_lsn", response.next_lsn);
             try appendU64Line(alloc, &out, "record_format_version", response.record_format_version);
         },
-        .slot => |slot_result| try appendSlotResultLines(alloc, &out, slot_result),
+        .slot => |slot_result| try appendSlotResultLines(alloc, &out, slot_result, primaryActionNodeID(maybe_ctx)),
         .slot_list => |snapshot| try appendPrimarySnapshotLines(alloc, &out, snapshot),
         .seed_begin => |response| {
-            try appendActionReceiptLines(alloc, &out, "base_backup_begin", response.manifest_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "base_backup_begin", response.manifest_id, "applied", primaryActionNodeID(maybe_ctx));
             try appendLine(alloc, &out, "slot_name", response.slot_name);
             try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "start_record_lsn", response.start_record_lsn);
         },
         .seed_finish => |response| {
-            try appendActionReceiptLines(alloc, &out, "base_backup_finish", response.manifest_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "base_backup_finish", response.manifest_id, "applied", primaryActionNodeID(maybe_ctx));
             try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "end_record_lsn", response.end_record_lsn);
         },
         .seed_bootstrap => |response| {
-            try appendActionReceiptLines(alloc, &out, "standby_bootstrap", response.manifest_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "standby_bootstrap", response.manifest_id, "applied", standbyActionNodeID(maybe_ctx));
             try appendLine(alloc, &out, "manifest_id", response.manifest_id);
             try appendU64Line(alloc, &out, "backup_lsn", response.backup_lsn);
             try appendU64Line(alloc, &out, "checkpoint_lsn", response.checkpoint_lsn);
@@ -274,7 +282,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
         .write_check => |decision| try appendWriteGateLines(alloc, &out, decision),
         .owner_job_check => |decision| try appendOwnerJobGateLines(alloc, &out, decision),
         .fence_acquire => |fence_result| {
-            try appendActionReceiptLines(alloc, &out, "fence_acquire", fence_result.receipt.promoted_node_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "fence_acquire", fence_result.receipt.promoted_node_id, "applied", fence_result.receipt.promoted_node_id);
             try appendFenceReceiptLines(alloc, &out, fence_result.receipt);
         },
         .fence_current => |maybe_fence_result| {
@@ -289,19 +297,19 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendPromotionAssessmentLines(alloc, &out, "assessment", assessment);
         },
         .promote_current_fence => |promotion_result| {
-            try appendActionReceiptLines(alloc, &out, "promotion", promotion_result.promoted_node_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "promotion", promotion_result.promoted_node_id, "applied", promotion_result.promoted_node_id);
             try appendPromotionResultLines(alloc, &out, promotion_result);
         },
         .promote => |promotion_result| {
-            try appendActionReceiptLines(alloc, &out, "promotion", promotion_result.promoted_node_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "promotion", promotion_result.promoted_node_id, "applied", promotion_result.promoted_node_id);
             try appendPromotionResultLines(alloc, &out, promotion_result);
         },
         .rejoin_assess => |assessment| {
-            try appendActionReceiptLines(alloc, &out, "rejoin_assess", assessment.former_node_id, "assessed");
+            try appendActionReceiptLines(alloc, &out, "rejoin_assess", assessment.former_node_id, "assessed", assessment.former_node_id);
             try appendRejoinAssessmentLines(alloc, &out, "", assessment);
         },
         .rejoin_rewind => |rewind_result| {
-            try appendActionReceiptLines(alloc, &out, "rejoin_rewind", rewind_result.assessment.former_node_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "rejoin_rewind", rewind_result.assessment.former_node_id, "applied", rewind_result.assessment.former_node_id);
             try appendRejoinAssessmentLines(alloc, &out, "assessment", rewind_result.assessment);
             try appendLine(alloc, &out, "rewind.node_id", rewind_result.rewind.node_id);
             try appendU64Line(alloc, &out, "rewind.fork_lsn", rewind_result.rewind.fork_lsn);
@@ -314,7 +322,7 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendBoolLine(alloc, &out, "rewind.data_loss_discarded", rewind_result.rewind.data_loss_discarded);
         },
         .rejoin_reseed => |reseed_result| {
-            try appendActionReceiptLines(alloc, &out, "rejoin_reseed", reseed_result.assessment.former_node_id, "applied");
+            try appendActionReceiptLines(alloc, &out, "rejoin_reseed", reseed_result.assessment.former_node_id, "applied", primaryActionNodeID(maybe_ctx));
             try appendRejoinAssessmentLines(alloc, &out, "assessment", reseed_result.assessment);
             try appendLine(alloc, &out, "reseed.node_id", reseed_result.reseed.node_id);
             try appendLine(alloc, &out, "reseed.slot_name", reseed_result.reseed.slot_name);
@@ -369,7 +377,13 @@ pub fn renderOutputAlloc(alloc: Allocator, result: Result, output: admin_cli.Out
 pub fn executeAndRenderAlloc(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !RenderedOutput {
     var result = try execute(alloc, ctx, plan);
     defer result.deinit(alloc);
-    return try renderOutputAlloc(alloc, result, plan.output);
+    return switch (plan.output) {
+        .json, .prometheus => try renderOutputAlloc(alloc, result, plan.output),
+        .table => .{
+            .content_type = "text/plain; charset=utf-8",
+            .body = try renderTableForContextAlloc(alloc, ctx, result),
+        },
+    };
 }
 
 pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
@@ -717,25 +731,30 @@ fn resultName(result: Result) []const u8 {
     };
 }
 
-fn appendSlotResultLines(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), result: admin.SlotResult) !void {
+fn appendSlotResultLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    result: admin.SlotResult,
+    node_id: ?[]const u8,
+) !void {
     switch (result) {
         .create => |slot| {
-            try appendActionReceiptLines(alloc, out, "replication_slot_create", slot.slot_name, "applied");
+            try appendActionReceiptLines(alloc, out, "replication_slot_create", slot.slot_name, "applied", node_id);
             try appendLine(alloc, out, "slot_action", "create");
             try appendCreateSlotResponseLines(alloc, out, slot);
         },
         .pause => |slot| {
-            try appendActionReceiptLines(alloc, out, "replication_slot_pause", slot.slot_name, "applied");
+            try appendActionReceiptLines(alloc, out, "replication_slot_pause", slot.slot_name, "applied", node_id);
             try appendLine(alloc, out, "slot_action", "pause");
             try appendSlotLifecycleResponseLines(alloc, out, slot);
         },
         .@"resume" => |slot| {
-            try appendActionReceiptLines(alloc, out, "replication_slot_resume", slot.slot_name, "applied");
+            try appendActionReceiptLines(alloc, out, "replication_slot_resume", slot.slot_name, "applied", node_id);
             try appendLine(alloc, out, "slot_action", "resume");
             try appendSlotLifecycleResponseLines(alloc, out, slot);
         },
         .drop => |slot| {
-            try appendActionReceiptLines(alloc, out, "replication_slot_drop", slot.slot_name, "applied");
+            try appendActionReceiptLines(alloc, out, "replication_slot_drop", slot.slot_name, "applied", node_id);
             try appendLine(alloc, out, "slot_action", "drop");
             try appendSlotLifecycleResponseLines(alloc, out, slot);
         },
@@ -748,6 +767,7 @@ fn appendActionReceiptLines(
     action_kind: []const u8,
     target: []const u8,
     state: []const u8,
+    node_id: ?[]const u8,
 ) !void {
     const action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ action_kind, target });
     defer alloc.free(action_id);
@@ -755,6 +775,21 @@ fn appendActionReceiptLines(
     try appendLine(alloc, out, "action.action_kind", action_kind);
     try appendLine(alloc, out, "action.target", target);
     try appendLine(alloc, out, "action.state", state);
+    if (node_id) |raw_node_id| {
+        if (std.mem.trim(u8, raw_node_id, " \t\r\n").len != 0) {
+            try appendLine(alloc, out, "action.node_id", raw_node_id);
+        }
+    }
+}
+
+fn primaryActionNodeID(maybe_ctx: ?Context) ?[]const u8 {
+    const ctx = maybe_ctx orelse return null;
+    return ctx.primary_node_id;
+}
+
+fn standbyActionNodeID(maybe_ctx: ?Context) ?[]const u8 {
+    const ctx = maybe_ctx orelse return null;
+    return ctx.standby_node_id;
 }
 
 fn appendCreateSlotResponseLines(
@@ -1368,6 +1403,9 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(created_table, "action.target=standby-a\n");
     try expectContains(created_table, "action.state=applied\n");
     try expectContains(created_table, "last_error=-\n");
+    const created_context_table = try renderTableForContextAlloc(alloc, .{ .primary_node_id = "primary-a" }, created);
+    defer alloc.free(created_context_table);
+    try expectContains(created_context_table, "action.node_id=primary-a\n");
 
     var ack_plan = try admin_cli.parse(alloc, &.{ "standby", "ack", "--slot", "standby-a", "--timeline-id", "1", "--received-lsn", "2", "--applied-lsn", "1", "--safe-read-lsn", "1" });
     defer ack_plan.deinit(alloc);
@@ -1814,6 +1852,9 @@ test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
     try expectContains(table_body, "action.action_id=standby_bootstrap:base-0001\n");
     try expectContains(table_body, "manifest_id=base-0001\n");
     try expectContains(table_body, "checkpoint_lsn=2\n");
+    const context_table_body = try renderTableForContextAlloc(alloc, .{ .standby_node_id = "standby-a" }, bootstrapped);
+    defer alloc.free(context_table_body);
+    try expectContains(context_table_body, "action.node_id=standby-a\n");
 }
 
 test "storage.ha admin exec streams one local replication session" {

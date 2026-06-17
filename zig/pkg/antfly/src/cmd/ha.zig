@@ -25,8 +25,10 @@ const LocalOptions = struct {
     remote_url: ?[]const u8 = null,
     primary_log: ?[]const u8 = null,
     primary_slots: ?[]const u8 = null,
+    primary_node_id: ?[]const u8 = null,
     standby_log: ?[]const u8 = null,
     standby_progress: ?[]const u8 = null,
+    standby_node_id: ?[]const u8 = null,
     fence_wal: ?[]const u8 = null,
     former_primary_log: ?[]const u8 = null,
     identity: IdentityOptions = .{},
@@ -179,7 +181,9 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 
     var rendered = try ha.admin_exec.executeAndRenderAlloc(alloc, .{
         .primary = if (primary) |*handle| handle else null,
+        .primary_node_id = parsed.options.primary_node_id,
         .standby = if (standby) |*handle| handle else null,
+        .standby_node_id = parsed.options.standby_node_id,
         .fence_store = if (fence_store) |*handle| handle else null,
         .former_primary_log = if (former_primary_log) |*handle| handle else null,
     }, plan);
@@ -642,12 +646,18 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
         } else if (std.mem.eql(u8, arg, "--primary-slots")) {
             command_start += 1;
             options.primary_slots = try value(argv, &command_start, "--primary-slots");
+        } else if (std.mem.eql(u8, arg, "--primary-node-id")) {
+            command_start += 1;
+            options.primary_node_id = try value(argv, &command_start, "--primary-node-id");
         } else if (std.mem.eql(u8, arg, "--standby-log")) {
             command_start += 1;
             options.standby_log = try value(argv, &command_start, "--standby-log");
         } else if (std.mem.eql(u8, arg, "--standby-progress")) {
             command_start += 1;
             options.standby_progress = try value(argv, &command_start, "--standby-progress");
+        } else if (std.mem.eql(u8, arg, "--standby-node-id")) {
+            command_start += 1;
+            options.standby_node_id = try value(argv, &command_start, "--standby-node-id");
         } else if (std.mem.eql(u8, arg, "--fence-wal")) {
             command_start += 1;
             options.fence_wal = try value(argv, &command_start, "--fence-wal");
@@ -707,8 +717,10 @@ fn printUsage(argv0: []const u8) void {
         \\  --ha-url URL
         \\  --primary-log PATH
         \\  --primary-slots PATH
+        \\  --primary-node-id NODE
         \\  --standby-log PATH
         \\  --standby-progress PATH
+        \\  --standby-node-id NODE
         \\  --fence-wal PATH
         \\  --former-primary-log PATH
         \\  --ha-cluster-id N
@@ -730,19 +742,21 @@ fn printUsage(argv0: []const u8) void {
 test "ha cmd parses local handles before admin command" {
     const alloc = std.testing.allocator;
     var parsed = try parseLocalArgs(alloc, &.{
-        "--primary-log",    "p.wal",
-        "--primary-slots",  "slots.wal",
-        "--ha-cluster-id",  "10",
-        "--ha-shard-id",    "20",
-        "--ha-table-id",    "30",
-        "--ha-timeline-id", "1",
-        "--ha-epoch",       "2",
-        "--",               "--table",
-        "slot",             "list",
+        "--primary-log",     "p.wal",
+        "--primary-slots",   "slots.wal",
+        "--primary-node-id", "primary-a",
+        "--ha-cluster-id",   "10",
+        "--ha-shard-id",     "20",
+        "--ha-table-id",     "30",
+        "--ha-timeline-id",  "1",
+        "--ha-epoch",        "2",
+        "--",                "--table",
+        "slot",              "list",
     });
     defer parsed.deinit(alloc);
 
     try std.testing.expectEqualStrings("p.wal", parsed.options.primary_log.?);
+    try std.testing.expectEqualStrings("primary-a", parsed.options.primary_node_id.?);
     try std.testing.expectEqual(@as(u64, 10), parsed.options.identity.cluster_id.?);
     try std.testing.expectEqual(@as(usize, 3), parsed.command_args.len);
     try std.testing.expectEqualStrings("--table", parsed.command_args[0]);
