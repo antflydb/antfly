@@ -1588,7 +1588,10 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 			g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/promotion/assess"}))
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
-			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("safe typed promotion assessment"))
+			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(SatisfyAny(
+				ContainSubstring("safe typed promotion assessment"),
+				ContainSubstring("promotion assessment field evidence"),
+			))
 			g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).To(BeNil())
 		})
 	}

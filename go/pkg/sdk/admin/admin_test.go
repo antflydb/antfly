@@ -896,6 +896,46 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	}
 }
 
+func TestValidateHAResponseEvidence(t *testing.T) {
+	t.Parallel()
+
+	fence := `{"schema_version":1,"action":{"action_id":"fence_acquire:standby-a","action_kind":"fence_acquire","target":"standby-a","state":"applied","node_id":"standby-a"},"receipt":{"identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"old_primary_id":"primary-a","promoted_node_id":"standby-a","parent_timeline_id":2,"parent_epoch":3,"new_timeline_id":4,"new_epoch":5,"required_lsn":8,"observed_lsn":8,"generation":9,"forced":false,"token":"fence-token","reason":""}}`
+	if err := ValidateHAFenceResponseEvidence([]byte(fence)); err != nil {
+		t.Fatalf("ValidateHAFenceResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAFenceResponseEvidence([]byte(strings.Replace(fence, `,"forced":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "receipt field evidence") {
+		t.Fatalf("missing fence forced evidence error = %v, want receipt evidence error", err)
+	}
+	if err := ValidateHACurrentFenceResponseEvidence([]byte(`{"schema_version":1}`)); err == nil || !strings.Contains(err.Error(), "held field evidence") {
+		t.Fatalf("missing held evidence error = %v, want held evidence error", err)
+	}
+
+	assessment := `"assessment":{"required_lsn":8,"received_lsn":8,"applied_lsn":8,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}`
+	promotionAssess := `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},` + assessment + `}`
+	if err := ValidateHAPromotionAssessResponseEvidence([]byte(promotionAssess)); err != nil {
+		t.Fatalf("ValidateHAPromotionAssessResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAPromotionAssessResponseEvidence([]byte(strings.Replace(promotionAssess, `,"force":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "assessment field evidence") {
+		t.Fatalf("missing promotion force evidence error = %v, want assessment evidence error", err)
+	}
+
+	promotion := `{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},` + assessment + `,"fence_generation":9,"fence_token":"fence-token","forced":false,"promotion":{"node_id":"standby-a","switch_lsn":9,"old_identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":2,"epoch":3},"new_identity":{"cluster_id":1,"shard_id":0,"table_id":0,"timeline_id":4,"epoch":5},"data_loss_possible":false,"forced":false}}`
+	if err := ValidateHAPromotionResponseEvidence([]byte(promotion)); err != nil {
+		t.Fatalf("ValidateHAPromotionResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHAPromotionResponseEvidence([]byte(strings.Replace(promotion, `,"data_loss_possible":false,"forced":false}}`, `,"forced":false}}`, 1))); err == nil || !strings.Contains(err.Error(), "promotion result field evidence") {
+		t.Fatalf("missing promotion result evidence error = %v, want promotion result evidence error", err)
+	}
+
+	rejoin := `{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":4,"target_epoch":5,"parent_cluster_id":1,"parent_shard_id":0,"parent_table_id":0,"parent_timeline_id":2,"parent_epoch":3,"fork_lsn":8,"former_last_lsn":9,"retained_from_lsn":7,"data_loss_discarded":false},"rewind":{"node_id":"primary-a","target_timeline_id":4,"target_epoch":5,"next_lsn":9,"current_last_lsn":9,"previous_last_lsn":10,"fork_lsn":8,"discarded_lsn_count":1,"data_loss_discarded":false}}`
+	if err := ValidateHARejoinAssessResponseEvidence([]byte(rejoin)); err != nil {
+		t.Fatalf("ValidateHARejoinAssessResponseEvidence returned error: %v", err)
+	}
+	if err := ValidateHARejoinAssessResponseEvidence([]byte(strings.Replace(rejoin, `,"data_loss_discarded":false`, "", 1))); err == nil || !strings.Contains(err.Error(), "rejoin assessment field evidence") {
+		t.Fatalf("missing rejoin assessment evidence error = %v, want assessment evidence error", err)
+	}
+}
+
 func TestValidateHAGateResponses(t *testing.T) {
 	t.Parallel()
 

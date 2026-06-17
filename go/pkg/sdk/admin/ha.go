@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -567,6 +568,17 @@ func ValidateHAFenceResponse(response HAFenceResponse) error {
 	return nil
 }
 
+func ValidateHAFenceResponseEvidence(raw []byte) error {
+	var response haFenceResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if !haFenceReceiptEvidenceComplete(response.Receipt) {
+		return fmt.Errorf("missing fence response receipt field evidence")
+	}
+	return nil
+}
+
 func ValidateHACurrentFenceResponse(response HACurrentFenceResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing current fence schema_version")
@@ -583,6 +595,20 @@ func ValidateHACurrentFenceResponse(response HACurrentFenceResponse) error {
 	return nil
 }
 
+func ValidateHACurrentFenceResponseEvidence(raw []byte) error {
+	var response haCurrentFenceResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.Held == nil {
+		return fmt.Errorf("missing current fence held field evidence")
+	}
+	if *response.Held && !haFenceReceiptEvidenceComplete(response.Receipt) {
+		return fmt.Errorf("missing current fence receipt field evidence")
+	}
+	return nil
+}
+
 func ValidateHAPromotionAssessResponse(response HAPromotionAssessResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing promotion assess schema_version")
@@ -592,6 +618,17 @@ func ValidateHAPromotionAssessResponse(response HAPromotionAssessResponse) error
 	}
 	if !HAPromotionAssessmentComplete(response.Assessment) {
 		return fmt.Errorf("missing promotion assessment fields")
+	}
+	return nil
+}
+
+func ValidateHAPromotionAssessResponseEvidence(raw []byte) error {
+	var response haPromotionAssessResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if !haPromotionAssessmentEvidenceComplete(response.Assessment) {
+		return fmt.Errorf("missing promotion assessment field evidence")
 	}
 	return nil
 }
@@ -618,6 +655,23 @@ func ValidateHAPromotionResponse(response HAPromotionResponse) error {
 	return nil
 }
 
+func ValidateHAPromotionResponseEvidence(raw []byte) error {
+	var response haPromotionResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if response.Forced == nil {
+		return fmt.Errorf("missing promotion forced field evidence")
+	}
+	if !haPromotionAssessmentEvidenceComplete(response.Assessment) {
+		return fmt.Errorf("missing promotion assessment field evidence")
+	}
+	if !haPromotionResultEvidenceComplete(response.Promotion) {
+		return fmt.Errorf("missing promotion result field evidence")
+	}
+	return nil
+}
+
 func ValidateHARejoinAssessResponse(response HARejoinAssessResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing rejoin response schema_version")
@@ -639,6 +693,198 @@ func ValidateHARejoinAssessResponse(response HARejoinAssessResponse) error {
 		}
 	}
 	return nil
+}
+
+func ValidateHARejoinAssessResponseEvidence(raw []byte) error {
+	var response haRejoinAssessResponseEvidence
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return err
+	}
+	if !haRejoinAssessmentEvidenceComplete(response.Assessment) {
+		return fmt.Errorf("missing rejoin assessment field evidence")
+	}
+	switch strings.TrimSpace(response.Assessment.Action) {
+	case string(HARejoinActionRewind):
+		if !haRejoinRewindEvidenceComplete(response.Rewind) {
+			return fmt.Errorf("missing rejoin rewind field evidence")
+		}
+	case string(HARejoinActionReseed):
+		if !haRejoinReseedEvidenceComplete(response.Reseed) {
+			return fmt.Errorf("missing rejoin reseed field evidence")
+		}
+	}
+	return nil
+}
+
+type haPromotionAssessmentEvidence struct {
+	RequiredLsn        *uint64 `json:"required_lsn"`
+	ReceivedLsn        *uint64 `json:"received_lsn"`
+	AppliedLsn         *uint64 `json:"applied_lsn"`
+	HasRequiredLsn     *bool   `json:"has_required_lsn"`
+	CaughtUpToReceived *bool   `json:"caught_up_to_received"`
+	FencingConfirmed   *bool   `json:"fencing_confirmed"`
+	Force              *bool   `json:"force"`
+	DataLossPossible   *bool   `json:"data_loss_possible"`
+	Safe               *bool   `json:"safe"`
+	RequiresFencing    *bool   `json:"requires_fencing"`
+	RequiresForce      *bool   `json:"requires_force"`
+	CanPromote         *bool   `json:"can_promote"`
+}
+
+type haPromotionAssessResponseEvidence struct {
+	Assessment haPromotionAssessmentEvidence `json:"assessment"`
+}
+
+type haPromotionResultEvidence struct {
+	DataLossPossible *bool `json:"data_loss_possible"`
+	Forced           *bool `json:"forced"`
+}
+
+type haPromotionResponseEvidence struct {
+	Assessment haPromotionAssessmentEvidence `json:"assessment"`
+	Forced     *bool                         `json:"forced"`
+	Promotion  haPromotionResultEvidence     `json:"promotion"`
+}
+
+type haFenceReceiptIdentityEvidence struct {
+	ClusterId  *uint64 `json:"cluster_id"`
+	ShardId    *uint64 `json:"shard_id"`
+	TableId    *uint64 `json:"table_id"`
+	TimelineId *uint64 `json:"timeline_id"`
+	Epoch      *uint64 `json:"epoch"`
+}
+
+type haFenceReceiptEvidence struct {
+	Identity         haFenceReceiptIdentityEvidence `json:"identity"`
+	ParentTimelineId *uint64                        `json:"parent_timeline_id"`
+	ParentEpoch      *uint64                        `json:"parent_epoch"`
+	NewTimelineId    *uint64                        `json:"new_timeline_id"`
+	NewEpoch         *uint64                        `json:"new_epoch"`
+	RequiredLsn      *uint64                        `json:"required_lsn"`
+	ObservedLsn      *uint64                        `json:"observed_lsn"`
+	Generation       *uint64                        `json:"generation"`
+	Forced           *bool                          `json:"forced"`
+	Reason           *string                        `json:"reason"`
+}
+
+type haFenceResponseEvidence struct {
+	Receipt haFenceReceiptEvidence `json:"receipt"`
+}
+
+type haCurrentFenceResponseEvidence struct {
+	Held    *bool                  `json:"held"`
+	Receipt haFenceReceiptEvidence `json:"receipt"`
+}
+
+type haRejoinAssessmentEvidence struct {
+	Action            string  `json:"action"`
+	DataLossDiscarded *bool   `json:"data_loss_discarded"`
+	ForkLsn           *uint64 `json:"fork_lsn"`
+	FormerLastLsn     *uint64 `json:"former_last_lsn"`
+	ParentClusterId   *uint64 `json:"parent_cluster_id"`
+	ParentShardId     *uint64 `json:"parent_shard_id"`
+	ParentTableId     *uint64 `json:"parent_table_id"`
+	ParentTimelineId  *uint64 `json:"parent_timeline_id"`
+	ParentEpoch       *uint64 `json:"parent_epoch"`
+	RetainedFromLsn   *uint64 `json:"retained_from_lsn"`
+	TargetTimelineId  *uint64 `json:"target_timeline_id"`
+	TargetEpoch       *uint64 `json:"target_epoch"`
+}
+
+type haRejoinRewindEvidence struct {
+	CurrentLastLsn    *uint64 `json:"current_last_lsn"`
+	DataLossDiscarded *bool   `json:"data_loss_discarded"`
+	DiscardedLsnCount *uint64 `json:"discarded_lsn_count"`
+	ForkLsn           *uint64 `json:"fork_lsn"`
+	NextLsn           *uint64 `json:"next_lsn"`
+	PreviousLastLsn   *uint64 `json:"previous_last_lsn"`
+	TargetTimelineId  *uint64 `json:"target_timeline_id"`
+	TargetEpoch       *uint64 `json:"target_epoch"`
+}
+
+type haRejoinReseedEvidence struct {
+	BaseBackupRequired *bool   `json:"base_backup_required"`
+	ForkLsn            *uint64 `json:"fork_lsn"`
+	FormerLastLsn      *uint64 `json:"former_last_lsn"`
+	ReseedRequired     *bool   `json:"reseed_required"`
+	TargetTimelineId   *uint64 `json:"target_timeline_id"`
+	TargetEpoch        *uint64 `json:"target_epoch"`
+}
+
+type haRejoinAssessResponseEvidence struct {
+	Assessment haRejoinAssessmentEvidence `json:"assessment"`
+	Rewind     haRejoinRewindEvidence     `json:"rewind"`
+	Reseed     haRejoinReseedEvidence     `json:"reseed"`
+}
+
+func haPromotionAssessmentEvidenceComplete(assessment haPromotionAssessmentEvidence) bool {
+	return assessment.RequiredLsn != nil &&
+		assessment.ReceivedLsn != nil &&
+		assessment.AppliedLsn != nil &&
+		assessment.HasRequiredLsn != nil &&
+		assessment.CaughtUpToReceived != nil &&
+		assessment.FencingConfirmed != nil &&
+		assessment.Force != nil &&
+		assessment.DataLossPossible != nil &&
+		assessment.Safe != nil &&
+		assessment.RequiresFencing != nil &&
+		assessment.RequiresForce != nil &&
+		assessment.CanPromote != nil
+}
+
+func haPromotionResultEvidenceComplete(result haPromotionResultEvidence) bool {
+	return result.DataLossPossible != nil && result.Forced != nil
+}
+
+func haFenceReceiptEvidenceComplete(receipt haFenceReceiptEvidence) bool {
+	return receipt.Identity.ClusterId != nil &&
+		receipt.Identity.ShardId != nil &&
+		receipt.Identity.TableId != nil &&
+		receipt.Identity.TimelineId != nil &&
+		receipt.Identity.Epoch != nil &&
+		receipt.ParentTimelineId != nil &&
+		receipt.ParentEpoch != nil &&
+		receipt.NewTimelineId != nil &&
+		receipt.NewEpoch != nil &&
+		receipt.RequiredLsn != nil &&
+		receipt.ObservedLsn != nil &&
+		receipt.Generation != nil &&
+		receipt.Forced != nil &&
+		receipt.Reason != nil
+}
+
+func haRejoinAssessmentEvidenceComplete(assessment haRejoinAssessmentEvidence) bool {
+	return assessment.DataLossDiscarded != nil &&
+		assessment.ForkLsn != nil &&
+		assessment.FormerLastLsn != nil &&
+		assessment.ParentClusterId != nil &&
+		assessment.ParentShardId != nil &&
+		assessment.ParentTableId != nil &&
+		assessment.ParentTimelineId != nil &&
+		assessment.ParentEpoch != nil &&
+		assessment.RetainedFromLsn != nil &&
+		assessment.TargetTimelineId != nil &&
+		assessment.TargetEpoch != nil
+}
+
+func haRejoinRewindEvidenceComplete(rewind haRejoinRewindEvidence) bool {
+	return rewind.CurrentLastLsn != nil &&
+		rewind.DataLossDiscarded != nil &&
+		rewind.DiscardedLsnCount != nil &&
+		rewind.ForkLsn != nil &&
+		rewind.NextLsn != nil &&
+		rewind.PreviousLastLsn != nil &&
+		rewind.TargetTimelineId != nil &&
+		rewind.TargetEpoch != nil
+}
+
+func haRejoinReseedEvidenceComplete(reseed haRejoinReseedEvidence) bool {
+	return reseed.BaseBackupRequired != nil &&
+		reseed.ForkLsn != nil &&
+		reseed.FormerLastLsn != nil &&
+		reseed.ReseedRequired != nil &&
+		reseed.TargetTimelineId != nil &&
+		reseed.TargetEpoch != nil
 }
 
 func HARejoinAssessmentComplete(assessment HARejoinAssessment) bool {
@@ -1241,12 +1487,21 @@ func requireHAJSON200[T any](operation string, statusCode int, body []byte, valu
 }
 
 func requireHAJSON200Validated[T any](operation string, statusCode int, body []byte, value *T, err error, validate func(T) error) (*HAResponse[T], error) {
+	return requireHAJSON200ValidatedEvidence(operation, statusCode, body, value, err, validate, nil)
+}
+
+func requireHAJSON200ValidatedEvidence[T any](operation string, statusCode int, body []byte, value *T, err error, validate func(T) error, validateEvidence func([]byte) error) (*HAResponse[T], error) {
 	response, err := requireHAJSON200(operation, statusCode, body, value, err)
 	if err != nil {
 		return nil, err
 	}
 	if validate != nil {
 		if err := validate(*response.Value); err != nil {
+			return nil, &HAResponseValidationError{Operation: operation, Err: err}
+		}
+	}
+	if validateEvidence != nil {
+		if err := validateEvidence(response.Body); err != nil {
 			return nil, &HAResponseValidationError{Operation: operation, Err: err}
 		}
 	}
@@ -1505,7 +1760,7 @@ func (c *HAClient) AcquireFenceResponse(ctx context.Context, body FenceAcquireRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("acquire HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAFenceResponse)
+	return requireHAJSON200ValidatedEvidence("acquire HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAFenceResponse, ValidateHAFenceResponseEvidence)
 }
 
 func (c *HAClient) AcquireFence(ctx context.Context, body FenceAcquireRequest) (*HAFenceResponse, error) {
@@ -1517,7 +1772,7 @@ func (c *HAClient) CurrentFenceResponse(ctx context.Context) (*HAResponse[HACurr
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("get current HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHACurrentFenceResponse)
+	return requireHAJSON200ValidatedEvidence("get current HA fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHACurrentFenceResponse, ValidateHACurrentFenceResponseEvidence)
 }
 
 func (c *HAClient) CurrentFence(ctx context.Context) (*HACurrentFenceResponse, error) {
@@ -1529,7 +1784,7 @@ func (c *HAClient) AssessPromotionResponse(ctx context.Context, body PromotionAs
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("assess HA promotion", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionAssessResponse)
+	return requireHAJSON200ValidatedEvidence("assess HA promotion", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionAssessResponse, ValidateHAPromotionAssessResponseEvidence)
 }
 
 func (c *HAClient) AssessPromotion(ctx context.Context, body PromotionAssessRequest) (*HAPromotionAssessResponse, error) {
@@ -1541,7 +1796,7 @@ func (c *HAClient) PromoteResponse(ctx context.Context, body FenceAcquireRequest
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("promote HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionResponse)
+	return requireHAJSON200ValidatedEvidence("promote HA standby", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionResponse, ValidateHAPromotionResponseEvidence)
 }
 
 func (c *HAClient) Promote(ctx context.Context, body FenceAcquireRequest) (*HAPromotionResponse, error) {
@@ -1553,7 +1808,7 @@ func (c *HAClient) PromoteWithCurrentFenceResponse(ctx context.Context) (*HAResp
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("promote HA standby with current fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionResponse)
+	return requireHAJSON200ValidatedEvidence("promote HA standby with current fence", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPromotionResponse, ValidateHAPromotionResponseEvidence)
 }
 
 func (c *HAClient) PromoteWithCurrentFence(ctx context.Context) (*HAPromotionResponse, error) {
@@ -1565,7 +1820,7 @@ func (c *HAClient) AssessRejoinResponse(ctx context.Context, body RejoinAssessRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("assess HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse)
+	return requireHAJSON200ValidatedEvidence("assess HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse, ValidateHARejoinAssessResponseEvidence)
 }
 
 func (c *HAClient) AssessRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
@@ -1577,7 +1832,7 @@ func (c *HAClient) RewindRejoinResponse(ctx context.Context, body RejoinAssessRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("rewind HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse)
+	return requireHAJSON200ValidatedEvidence("rewind HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse, ValidateHARejoinAssessResponseEvidence)
 }
 
 func (c *HAClient) RewindRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
@@ -1589,7 +1844,7 @@ func (c *HAClient) ReseedRejoinResponse(ctx context.Context, body RejoinAssessRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("reseed HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse)
+	return requireHAJSON200ValidatedEvidence("reseed HA rejoin", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHARejoinAssessResponse, ValidateHARejoinAssessResponseEvidence)
 }
 
 func (c *HAClient) ReseedRejoin(ctx context.Context, body RejoinAssessRequest) (*HARejoinAssessResponse, error) {
