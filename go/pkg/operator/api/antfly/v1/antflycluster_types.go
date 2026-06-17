@@ -643,6 +643,12 @@ type HAAdminSpec struct {
 	// +optional
 	ExecutePlannedActions bool `json:"executePlannedActions,omitempty"`
 
+	// TokenEnvVar is the operator process environment variable containing the bearer token for typed /admin/v1/ha calls.
+	// This lets Kubernetes inject the token from a Secret into the operator pod without granting the operator Secret read permissions.
+	// Defaults to ANTFLY_HA_ADMIN_TOKEN when omitted and that environment variable is set.
+	// +optional
+	TokenEnvVar string `json:"tokenEnvVar,omitempty"`
+
 	// JobBackoffLimit is the CLI-backed HA admin Job retry count before Kubernetes marks it failed.
 	// +optional
 	JobBackoffLimit *int32 `json:"jobBackoffLimit,omitempty"`

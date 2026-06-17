@@ -1182,6 +1182,11 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 
 	if admin := ha.Admin; admin != nil {
 		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		if tokenEnvVar := strings.TrimSpace(admin.TokenEnvVar); tokenEnvVar != "" {
+			if envErrs := utilvalidation.IsEnvVarName(tokenEnvVar); len(envErrs) > 0 {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.admin.tokenEnvVar is invalid: %s", strings.Join(envErrs, "; ")))
+			}
+		}
 		if admin.JobBackoffLimit != nil && *admin.JobBackoffLimit < 0 {
 			errors = append(errors, "spec.highAvailability.admin.jobBackoffLimit must not be negative")
 		}

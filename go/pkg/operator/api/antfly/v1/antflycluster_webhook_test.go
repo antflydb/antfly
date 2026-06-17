@@ -1895,6 +1895,26 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminURLs(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+			TokenEnvVar:           "bad=token",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected invalid HA admin token environment variable to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.tokenEnvVar") {
+		t.Fatalf("expected admin.tokenEnvVar validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutDesiredStandbyAdminURL(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

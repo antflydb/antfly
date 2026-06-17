@@ -677,6 +677,11 @@ be validated against that operator package.
   The operator may keep path constants only for status display and plan
   summaries; live calls and request/response decoding should go through the
   SDK wrapper.
+- Support authenticated admin endpoints by letting the operator read a bearer
+  token from a configured process environment variable, defaulting to
+  `ANTFLY_HA_ADMIN_TOKEN`. Kubernetes should inject that variable into the
+  operator pod from a Secret; the operator should not require broad direct
+  Secret read permissions just to make HA admin API calls.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.

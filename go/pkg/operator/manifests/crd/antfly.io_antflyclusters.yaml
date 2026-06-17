@@ -1598,6 +1598,12 @@ spec:
                         description: PrimaryURL is the primary HA admin endpoint used
                           for typed status, slot, seed, and fence actions.
                         type: string
+                      tokenEnvVar:
+                        description: |-
+                          TokenEnvVar is the operator process environment variable containing the bearer token for typed /admin/v1/ha calls.
+                          This lets Kubernetes inject the token from a Secret into the operator pod without granting the operator Secret read permissions.
+                          Defaults to ANTFLY_HA_ADMIN_TOKEN when omitted and that environment variable is set.
+                        type: string
                       volumeMounts:
                         description: VolumeMounts are added to the CLI-backed HA admin
                           Job container.
