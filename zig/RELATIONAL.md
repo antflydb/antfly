@@ -1023,12 +1023,13 @@ validation and generated corpus promotion share the same adapter-owned contract.
 Next extract the parser cursor and shared expression grammar, because
 expressions are reused by SELECT, DML, DDL checks, partial indexes, defaults,
 generated columns, conflict actions, and RETURNING. The binder boundary should
-own catalog source lookup, cross-table source schema derivation, identifier
-normalization, and scope resolution so statement lowerers consume typed schemas
-instead of re-reading metadata snapshots directly. Then move statement families
-one at a time into AST plus binder plus lowerer modules, with the existing
-SQL/API parity tests as the acceptance gate. Only after those boundaries are
-stable should a generated grammar be considered.
+own catalog source lookup, cross-table source-name pre-scans for read,
+insert-source, and joined-write statements, cross-table source schema
+derivation, identifier normalization, and scope resolution so statement lowerers
+consume typed schemas instead of re-reading metadata snapshots directly. Then
+move statement families one at a time into AST plus binder plus lowerer modules,
+with the existing SQL/API parity tests as the acceptance gate. Only after those
+boundaries are stable should a generated grammar be considered.
 
 Efficiency follows those same boundaries. Lexer and parser data should be
 statement-scoped and arena-allocated where useful. Token text should reference
