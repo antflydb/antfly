@@ -2533,7 +2533,7 @@ pub fn lowerReadPlanWithCatalogAlloc(
         var tables = resolved_tables;
         defer tables.deinit(alloc);
         if (!std.mem.eql(u8, tables.left, tables.source)) {
-            const source_schema = try catalogRuntimeSchemaAlloc(alloc, catalog, tables.source);
+            const source_schema = try sql_adapter.runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
             defer runtime_schema.freeSchema(alloc, source_schema);
             return try lowerReadPlanWithSchemasAlloc(alloc, sql, schema, source_schema, params);
         }
@@ -3915,7 +3915,7 @@ pub fn lowerWritePlanWithCatalogAlloc(
             var tables = resolved_tables;
             defer tables.deinit(alloc);
             if (!std.mem.eql(u8, tables.target, tables.source)) {
-                owned_insert_source_schema = try catalogRuntimeSchemaAlloc(alloc, catalog, tables.source);
+                owned_insert_source_schema = try sql_adapter.runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
                 effective_options.insert_source_schema = owned_insert_source_schema.?;
             }
         }
@@ -3925,7 +3925,7 @@ pub fn lowerWritePlanWithCatalogAlloc(
             var tables = resolved_tables;
             defer tables.deinit(alloc);
             if (!std.mem.eql(u8, tables.target, tables.source)) {
-                owned_joined_source_schema = try catalogRuntimeSchemaAlloc(alloc, catalog, tables.source);
+                owned_joined_source_schema = try sql_adapter.runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
                 effective_options.joined_source_schema = owned_joined_source_schema.?;
             }
         }
@@ -5129,27 +5129,6 @@ fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
 
 fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usize {
     return sql_adapter.findMatchingRParenIndex(tokens, lparen_index);
-}
-
-fn catalogRuntimeSchemaAlloc(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-) !runtime_schema.TableSchema {
-    var snapshot = try catalog.adminSnapshot();
-    defer catalog.freeAdminSnapshot(&snapshot);
-    const schema_json = catalogTableSchemaJson(&snapshot, table_name) orelse return error.InvalidSqlCatalog;
-    if (schema_json.len == 0) return error.InvalidSqlCatalog;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-}
-
-fn catalogTableSchemaJson(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?[]const u8 {
-    for (snapshot.tables) |table| {
-        if (std.mem.eql(u8, table.name, table_name)) return table.schema_json;
-    }
-    return null;
 }
 
 const AppParitySourceSchemaCatalog = struct {

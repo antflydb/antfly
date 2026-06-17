@@ -13,6 +13,7 @@
 // limitations.
 
 pub const ast = @import("ast.zig");
+pub const binder = @import("binder.zig");
 pub const classifier = @import("classifier.zig");
 pub const corpus = @import("corpus.zig");
 pub const diagnostics = @import("diagnostics.zig");
@@ -55,6 +56,7 @@ pub const matchToken = parser.matchToken;
 pub const peekKeyword = parser.peekKeyword;
 pub const peekKind = parser.peekKind;
 pub const rowExpressionBoundaryKeyword = grammar.rowExpressionBoundaryKeyword;
+pub const runtimeSchemaForCatalogTableAlloc = binder.runtimeSchemaForCatalogTableAlloc;
 pub const sqlAssignmentTailKeyword = grammar.sqlAssignmentTailKeyword;
 pub const sqlJoinedSourceAliasTerminator = grammar.sqlJoinedSourceAliasTerminator;
 pub const sqlJsonExtractPathFunctionAsText = grammar.sqlJsonExtractPathFunctionAsText;
@@ -96,6 +98,7 @@ pub const sqlKeywordIsTrimVariantFunction = grammar.sqlKeywordIsTrimVariantFunct
 pub const sqlKeywordIsUuidV4Function = grammar.sqlKeywordIsUuidV4Function;
 pub const sqlKeywordStartsScalarPredicate = grammar.sqlKeywordStartsScalarPredicate;
 pub const tokenizeAlloc = lexer.tokenizeAlloc;
+pub const tableSchemaJson = binder.tableSchemaJson;
 pub const unsupportedFingerprintAlloc = corpus.unsupportedFingerprintAlloc;
 pub const unsupportedPlanFamilyToken = corpus.unsupportedPlanFamilyToken;
 pub const unsupportedPlanMatchesFamily = corpus.unsupportedPlanMatchesFamily;
