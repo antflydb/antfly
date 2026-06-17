@@ -1,6 +1,7 @@
 """Main client interface for Antfly SDK."""
 
 import base64
+import json
 from typing import Any, cast
 from urllib.parse import quote
 
@@ -22,6 +23,8 @@ from antfly.client_generated.models import (
 from antfly.client_generated.types import UNSET
 
 from .exceptions import AntflyException
+
+DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -47,6 +50,7 @@ class AntflyClient:
         api_key: tuple[str, str] | None = None,
         token: str | None = None,
         timeout: float = 30.0,
+        max_write_request_bytes: int = DEFAULT_WRITE_MAX_REQUEST_BYTES,
     ):
         """
         Initialize Antfly client.
@@ -63,8 +67,10 @@ class AntflyClient:
             api_key: Tuple of (key_id, key_secret) for API key authentication (optional)
             token: Token string for token authentication (optional)
             timeout: Request timeout in seconds
+            max_write_request_bytes: Maximum encoded JSON bytes for write requests
         """
         self.base_url = normalize_base_url(base_url)
+        self.max_write_request_bytes = max_write_request_bytes
 
         httpx_args: dict[str, Any] = {}
 
@@ -121,6 +127,16 @@ class AntflyClient:
         if response.status_code == 204:
             return None
         return response.json()
+
+    def _check_write_request_size(self, operation: str, body: dict[str, Any]) -> None:
+        if self.max_write_request_bytes <= 0:
+            return
+        encoded = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+        if len(encoded) > self.max_write_request_bytes:
+            raise AntflyException(
+                f"{operation} request encoded to {len(encoded)} bytes, exceeding max write request size "
+                f"{self.max_write_request_bytes}"
+            )
 
     # Table operations
 
@@ -243,10 +259,9 @@ class AntflyClient:
         Raises:
             AntflyException: If batch operation fails
         """
-        request = BatchRequest(
-            inserts=cast(BatchRequestInserts, inserts) if inserts is not None else UNSET,
-            deletes=deletes or [],
-        )
+        batch_inserts = BatchRequestInserts.from_dict(inserts) if inserts is not None else UNSET
+        request = BatchRequest(inserts=batch_inserts, deletes=deletes or [])
+        self._check_write_request_size("Batch", request.to_dict())
 
         response = batch.sync(
             table_name=table,

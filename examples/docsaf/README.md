@@ -37,7 +37,7 @@ are derived from those units.
 From the repository root:
 
 ```bash
-go build -o docsaf ./examples/docsaf
+(cd go/pkg/docsaf && go build -o ../../../examples/docsaf/docsaf ./cmd/docsaf)
 ```
 
 ## Commands

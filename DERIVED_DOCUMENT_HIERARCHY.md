@@ -265,6 +265,96 @@ Example merge plan:
 
 Downstream enrichments should use the same pattern. If page 301 changes, Antfly should re-chunk, re-embed, and re-extract entities for page 301 without touching pages 1 through 300.
 
+## Streaming Extraction And Memory Bounds
+
+Large files must not require Antfly to hold every extracted unit, chunk payload, and derived replay document in memory at the same time.
+
+The extraction API supports a sink-style stream:
+
+```text
+downloaded bytes
+  -> extractor route begin(content_type, route_type)
+  -> unit(page/section/slide/sheet/part)
+  -> unit(...)
+  -> extractor route end
+```
+
+The async enrichment runtime uses this as a bounded multi-pass stream:
+
+1. First pass:
+   - route the file
+   - emit units one at a time
+   - complete generated text for pending OCR/transcription units when configured
+   - cache completed generated-text units by unit id for this extraction attempt
+   - collect compact unit keys, unit fingerprints, chunk keys, and unit text lengths
+   - build source state and manifest range descriptors from compact metadata
+2. Second pass:
+   - re-run the extractor stream
+   - reuse cached OCR/transcription output instead of invoking the producer again
+   - materialize each unit and its chunks
+   - flush store writes in bounded batches
+   - write the converged manifest after materialization
+3. Replay publish pass:
+   - re-run the extractor stream after the converged manifest commit
+   - reuse cached OCR/transcription output
+   - enqueue changed artifact keys and full-text replay documents for the normal replay window
+   - write the compact source state only after replay publication succeeds
+
+This deliberately trades extra deterministic parsing work for bounded resident memory. Generated text is not recomputed across passes, because OCR and transcription can be expensive and nondeterministic; generated text is cached in-memory for the extraction attempt and counted in the document extraction working-set slice. For PDFs, page text is emitted and freed page by page instead of collecting the full `Result.units` array. Non-PDF routes currently use a buffered compatibility adapter and can move to native streaming incrementally.
+
+The manifest should not need full unit payloads to describe child ranges. It can use unit keys, chunk keys, and unit text lengths to preserve the same range policy:
+
+```text
+unit range boundary = min(256 units, 1 MiB unit text)
+chunk range boundary = 256 chunks
+```
+
+The synchronous precompute path still uses the compatibility `Result.units` API. That path is protected by the hard payload limit described below, while async replay is the path that needs bounded streamed materialization.
+
+### Source Payload Limits
+
+Inline `data:` sources are preflighted before persistence and before async replay. Valid data URIs whose decoded size is greater than the configured remote-content maximum are rejected with the same oversized-stream error used by remote fetches.
+
+This is intentionally separate from resource management. A hard source limit prevents a single oversized inline PDF from being persisted, decoded, or routed in the first place. Resource-manager pressure only controls work that is otherwise within the configured document size envelope.
+
+### Durability And Staging
+
+The compact descriptor ledger is in-memory in the current implementation. If extraction crashes before the final manifest/state write, the next replay can recompute descriptors from the source bytes.
+
+However, streamed artifact payloads need stronger semantics before this becomes fully crash-atomic. Writing directly to stable unit/chunk keys before the final manifest can expose mixed old/new content after a crash if readers bypass or outlive the in-progress manifest. The fully correct design is generation-scoped staging:
+
+```text
+/_internal/doc_extract_stage/<parent>/<artifact>/<generation>/units/page:000001
+/_internal/doc_extract_stage/<parent>/<artifact>/<generation>/chunks/page:000001/chunk:000000
+```
+
+Then the final manifest atomically publishes the generation by referencing the staged generation, and readers resolve artifact keys through the manifest generation. A janitor removes stage generations that are not referenced by a converged manifest and whose attempt marker has expired.
+
+Until generation-scoped staging is implemented, streamed writes are a bounded-memory improvement, not a complete atomicity boundary. Search and artifact readers should continue to treat the manifest/state as authoritative. Downstream derived replay is published only after the converged manifest commit, and the source state used by skip-by-hash is written only after replay publication succeeds. That keeps replay publication retryable if the worker fails between the manifest commit and replay publish. The remaining gap is crash atomicity between stable child artifact writes and the final manifest, which generation-scoped staging is intended to close.
+
+### Resource Management
+
+Document extraction has a dedicated `document_extraction.working_set` resource-manager slice. The async streaming runtime accounts:
+
+- downloaded bytes
+- current unit text and layout metadata
+- generated OCR/transcription cache bytes retained for this extraction attempt
+- chunker output for the current unit
+- pending store-write batches
+- pending derived replay-window payloads
+
+The runtime updates this slice as the current working set changes and releases it on all exits. Temporary pressure from other work returns `ResourceBudgetExceeded`; the enrichment worker treats that as retryable. If the document extraction working set itself exceeds the slice hard limit, the runtime returns a non-retryable extraction error and writes a failed manifest instead of livelocking one oversized document.
+
+The remaining resource-manager improvement is a first-class reservation classification API:
+
+```text
+granted
+would_fit_later
+exceeds_hard_limit
+```
+
+The current runtime implements that split locally for document extraction. A later shared API should expose the same distinction directly so other pipelines can avoid open-coded hard-limit checks.
+
 ## Delete Semantics
 
 Deleting a source document should tombstone the parent and then remove all artifacts under the parent hierarchy:

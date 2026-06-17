@@ -142,3 +142,15 @@ class TestAntflyClient:
             client.get(table="users", key="user:1")
 
         assert "Failed to get key 'user:1' from table 'users'" in str(exc_info.value)
+
+    @patch("antfly.client.Client")
+    @patch("antfly.client.batch")
+    def test_batch_rejects_oversized_request(self, mock_batch: MagicMock, mock_client_class: MagicMock) -> None:
+        """Test client-side write request size enforcement."""
+        client = AntflyClient(base_url="http://localhost:8080", max_write_request_bytes=32)
+
+        with pytest.raises(AntflyException) as exc_info:
+            client.batch(table="users", inserts={"user:1": {"bio": "x" * 128}})
+
+        assert "exceeding max write request size 32" in str(exc_info.value)
+        mock_batch.sync.assert_not_called()
