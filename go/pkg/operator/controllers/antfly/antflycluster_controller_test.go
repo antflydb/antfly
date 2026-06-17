@@ -1002,6 +1002,9 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionState).To(Equal("applied"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceOldPrimaryID).To(Equal("primary-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceReason).To(Equal("LeaseAcquired"))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -2899,7 +2902,13 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 		StandbyName:     "standby-a",
 		TargetLSN:       12,
 		FenceGeneration: 3,
+		FenceReason:     "LeaseAcquired",
 	}
+	enrichHAPromotionAdminActionResult(adminResult, identity, action)
+	g.Expect(adminResult.FenceOldPrimaryID).To(Equal("primary-a"))
+	g.Expect(adminResult.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(adminResult.FenceReason).To(Equal("LeaseAcquired"))
+
 	promotion := &antflyv1.HAPromotionStatus{
 		OldPrimaryID:      "primary-a",
 		PromotedStandbyID: "standby-a",

@@ -4010,6 +4010,9 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 	if !ok {
 		return
 	}
+	if haActionKind(action.Kind) == haActionPromoteStandby {
+		enrichHAPromotionAdminActionResult(result, haReplicationIdentity(cluster.Spec.HighAvailability), *action)
+	}
 	action.AdminResult = result
 }
 
@@ -4120,6 +4123,7 @@ func (r *AntflyClusterReconciler) applyHADirectPromotionResult(cluster *antflyv1
 		return false
 	}
 	action.AdminResult = haPromotionAdminActionResult(result)
+	enrichHAPromotionAdminActionResult(action.AdminResult, identity, *action)
 	if cluster.Status.HAStatus.LastPromotion == nil ||
 		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, *action) {
 		now := metav1.Now()
@@ -4161,6 +4165,32 @@ func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdmin
 		FenceRequiredLSN:      result.RequiredLSN,
 		FenceObservedLSN:      result.ObservedLSN,
 		FenceForced:           result.Forced,
+	}
+}
+
+func enrichHAPromotionAdminActionResult(result *antflyv1.HAAdminActionResultStatus, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) {
+	if result == nil {
+		return
+	}
+	if identity != nil {
+		if result.FenceClusterID == 0 {
+			result.FenceClusterID = identity.ClusterID
+		}
+		if result.FenceShardID == 0 {
+			result.FenceShardID = identity.ShardID
+		}
+		if result.FenceTableID == 0 {
+			result.FenceTableID = identity.TableID
+		}
+		if result.FenceOldPrimaryID == "" {
+			result.FenceOldPrimaryID = identity.CurrentPrimaryID
+		}
+	}
+	if result.FencePromotedNodeID == "" {
+		result.FencePromotedNodeID = strings.TrimSpace(action.StandbyName)
+	}
+	if result.FenceReason == "" {
+		result.FenceReason = haPromotionFenceReason(action)
 	}
 }
 
