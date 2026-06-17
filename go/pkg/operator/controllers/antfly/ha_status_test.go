@@ -708,6 +708,12 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 			operationID: "acquireHAFence",
 		},
 		{
+			name:        "assess promotion",
+			action:      haPlannedAction{Kind: haActionAssessPromotion, StandbyName: "standby-a"},
+			openAPIPath: "/ha/promotion/assess",
+			operationID: "assessHAPromotion",
+		},
+		{
 			name:        "promote standby",
 			action:      haPlannedAction{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
 			openAPIPath: "/ha/promotion/current-fence",
@@ -763,6 +769,7 @@ func TestHADirectAdminSupportMatchesAdminOperations(t *testing.T) {
 		{Kind: haActionFinishStandbySeed, StandbyName: "standby-a", SeedManifestPath: "/backups/base-standby-a-5.afha"},
 		{Kind: haActionBootstrapStandbySeed, StandbyName: "standby-a", SeedManifestPath: "/backups/base-standby-a-5.afha"},
 		{Kind: haActionAcquireFence, StandbyName: "standby-a"},
+		{Kind: haActionAssessPromotion, StandbyName: "standby-a"},
 		{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
 		{Kind: haActionDemoteFormerPrimary, StandbyName: "primary-a"},
 		{Kind: haActionRewindFormerPrimary, StandbyName: "primary-a"},
@@ -826,6 +833,10 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 		name:   "standby scoped fence acquire without node url",
 		action: haPlannedAction{Kind: haActionAcquireFence, StandbyName: "missing-standby"},
 		want:   "",
+	}, {
+		name:   "standby scoped promotion assessment",
+		action: haPlannedAction{Kind: haActionAssessPromotion, StandbyName: "standby-a"},
+		want:   "http://standby-a-ha.default.svc:8081",
 	}, {
 		name:   "standby scoped promotion",
 		action: haPlannedAction{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
@@ -1424,39 +1435,46 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		t.Fatalf("expected failover-ready condition, got %#v", failover)
 	}
 	plan := planHA(cluster)
-	if len(plan.Actions) != 4 {
+	if len(plan.Actions) != 5 {
 		t.Fatalf("expected fenced promotion action chain, got %#v", plan.Actions)
 	}
 	if plan.PromotionStandbyName != "standby-a" {
 		t.Fatalf("expected promotion standby standby-a, got %q", plan.PromotionStandbyName)
 	}
-	if plan.Actions[0].Kind != haActionAcquireFence || plan.Actions[1].Kind != haActionPromoteStandby {
+	if plan.Actions[0].Kind != haActionAcquireFence ||
+		plan.Actions[1].Kind != haActionAssessPromotion ||
+		plan.Actions[2].Kind != haActionPromoteStandby {
 		t.Fatalf("unexpected promotion actions: %#v", plan.Actions)
 	}
-	if plan.Actions[1].StandbyName != "standby-a" || plan.Actions[2].RouteTo != "standby-a" {
+	if plan.Actions[1].StandbyName != "standby-a" ||
+		plan.Actions[2].StandbyName != "standby-a" ||
+		plan.Actions[3].RouteTo != "standby-a" {
 		t.Fatalf("expected promotion and route actions to target standby-a, got %#v", plan.Actions)
 	}
-	if len(cluster.Status.HAStatus.PlannedActions) != 4 {
+	if len(cluster.Status.HAStatus.PlannedActions) != 5 {
 		t.Fatalf("expected fenced promotion action chain in status, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionAcquireFence) ||
-		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionPromoteStandby) {
+		cluster.Status.HAStatus.PlannedActions[1].Kind != string(haActionAssessPromotion) ||
+		cluster.Status.HAStatus.PlannedActions[2].Kind != string(haActionPromoteStandby) {
 		t.Fatalf("unexpected promotion action status: %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].Phase != string(haActionPhaseFence) ||
 		cluster.Status.HAStatus.PlannedActions[1].Phase != string(haActionPhasePromote) ||
-		cluster.Status.HAStatus.PlannedActions[2].Phase != string(haActionPhaseRoute) ||
-		cluster.Status.HAStatus.PlannedActions[3].Phase != string(haActionPhaseRejoin) ||
+		cluster.Status.HAStatus.PlannedActions[2].Phase != string(haActionPhasePromote) ||
+		cluster.Status.HAStatus.PlannedActions[3].Phase != string(haActionPhaseRoute) ||
+		cluster.Status.HAStatus.PlannedActions[4].Phase != string(haActionPhaseRejoin) ||
 		cluster.Status.HAStatus.PlannedActions[0].Executor != string(haActionExecutorAdminAPI) ||
-		cluster.Status.HAStatus.PlannedActions[2].Executor != string(haActionExecutorControllerAction) {
+		cluster.Status.HAStatus.PlannedActions[3].Executor != string(haActionExecutorControllerAction) {
 		t.Fatalf("expected promotion action status to publish phase/executor metadata, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	if cluster.Status.HAStatus.PlannedActions[1].StandbyName != "standby-a" ||
 		cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionAcquireFence) ||
-		cluster.Status.HAStatus.PlannedActions[2].DependsOn != string(haActionPromoteStandby) ||
+		cluster.Status.HAStatus.PlannedActions[2].DependsOn != string(haActionAssessPromotion) ||
 		cluster.Status.HAStatus.PlannedActions[3].DependsOn != string(haActionPromoteStandby) ||
-		cluster.Status.HAStatus.PlannedActions[2].RouteFrom != "primary" ||
-		cluster.Status.HAStatus.PlannedActions[2].RouteTo != "standby-a" {
+		cluster.Status.HAStatus.PlannedActions[4].DependsOn != string(haActionPromoteStandby) ||
+		cluster.Status.HAStatus.PlannedActions[3].RouteFrom != "primary" ||
+		cluster.Status.HAStatus.PlannedActions[3].RouteTo != "standby-a" {
 		t.Fatalf("expected planned action status to publish route target, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 	expectedAcquireCommand := []string{
@@ -1477,24 +1495,29 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, expectedAcquireCommand) {
 		t.Fatalf("unexpected acquire-fence admin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "--current-fence"}) {
-		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"promote", "assess", "--current-fence"}) {
+		t.Fatalf("unexpected promotion-assessment admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
+	}
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[2].AdminCommand, []string{"promote", "--current-fence"}) {
+		t.Fatalf("unexpected promote admin command: %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://standby-a-ha.default.svc:8081" {
 		t.Fatalf("expected acquire-fence action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
-	if cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://standby-a-ha.default.svc:8081" {
-		t.Fatalf("expected promote action to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1])
+	if cluster.Status.HAStatus.PlannedActions[1].AdminURL != "http://standby-a-ha.default.svc:8081" ||
+		cluster.Status.HAStatus.PlannedActions[2].AdminURL != "http://standby-a-ha.default.svc:8081" {
+		t.Fatalf("expected promotion actions to target standby HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[1:3])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].AdminNodeID != "standby-a" ||
-		cluster.Status.HAStatus.PlannedActions[1].AdminNodeID != "standby-a" {
-		t.Fatalf("expected fence/promote actions to require standby node receipts, got %#v", cluster.Status.HAStatus.PlannedActions[:2])
+		cluster.Status.HAStatus.PlannedActions[1].AdminNodeID != "standby-a" ||
+		cluster.Status.HAStatus.PlannedActions[2].AdminNodeID != "standby-a" {
+		t.Fatalf("expected fence/promotion actions to require standby node receipts, got %#v", cluster.Status.HAStatus.PlannedActions[:3])
 	}
-	if cluster.Status.HAStatus.PlannedActions[2].AdminCommand != nil {
-		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[2].AdminCommand)
+	if cluster.Status.HAStatus.PlannedActions[3].AdminCommand != nil {
+		t.Fatalf("route action should not publish an HA admin command without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[3].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[2].AdminURL != "" {
-		t.Fatalf("route action should not publish an HA admin URL without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[2].AdminURL)
+	if cluster.Status.HAStatus.PlannedActions[3].AdminURL != "" {
+		t.Fatalf("route action should not publish an HA admin URL without service execution context, got %#v", cluster.Status.HAStatus.PlannedActions[3].AdminURL)
 	}
 	expectedDemoteCommand := []string{
 		"rejoin", "assess",
@@ -1507,14 +1530,14 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		"--last-lsn", "12",
 		"--retained-from-lsn", "0",
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[3].AdminCommand, expectedDemoteCommand) {
-		t.Fatalf("unexpected former-primary demote admin command: %#v", cluster.Status.HAStatus.PlannedActions[3].AdminCommand)
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[4].AdminCommand, expectedDemoteCommand) {
+		t.Fatalf("unexpected former-primary demote admin command: %#v", cluster.Status.HAStatus.PlannedActions[4].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[3].AdminURL != "" {
-		t.Fatalf("expected former-primary demote to require a former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[3])
+	if cluster.Status.HAStatus.PlannedActions[4].AdminURL != "" {
+		t.Fatalf("expected former-primary demote to require a former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[4])
 	}
-	if cluster.Status.HAStatus.PlannedActions[3].AdminNodeID != "primary-a" {
-		t.Fatalf("expected former-primary demote to require old primary node receipt, got %#v", cluster.Status.HAStatus.PlannedActions[3])
+	if cluster.Status.HAStatus.PlannedActions[4].AdminNodeID != "primary-a" {
+		t.Fatalf("expected former-primary demote to require old primary node receipt, got %#v", cluster.Status.HAStatus.PlannedActions[4])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||
@@ -1561,7 +1584,7 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWhenAdminExecutionDisabled(t *tes
 		t.Fatalf("expected admin-execution-disabled condition, got %#v", failover)
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
-		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionAssessPromotion) || action.Kind == string(haActionPromoteStandby) {
 			t.Fatalf("expected no automatic promotion actions when admin execution is disabled, got %#v", cluster.Status.HAStatus.PlannedActions)
 		}
 	}
@@ -1602,7 +1625,7 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithUnsupportedFencingAuthority(t
 		t.Fatalf("expected unsupported-fencing-authority condition, got %#v", failover)
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
-		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionAssessPromotion) || action.Kind == string(haActionPromoteStandby) {
 			t.Fatalf("expected no automatic promotion actions with unsupported fencing authority, got %#v", cluster.Status.HAStatus.PlannedActions)
 		}
 	}
@@ -1635,7 +1658,7 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithoutRouteSelector(t *testing.T
 		t.Fatalf("expected route-selector-missing condition, got %#v", failover)
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
-		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionAssessPromotion) || action.Kind == string(haActionPromoteStandby) {
 			t.Fatalf("expected no automatic promotion actions without route selector, got %#v", cluster.Status.HAStatus.PlannedActions)
 		}
 	}
@@ -1668,7 +1691,7 @@ func TestUpdateHAStatusBlocksAutomaticPromotionWithoutStandbyAdminURL(t *testing
 		t.Fatalf("expected fence-not-ready condition for holder without admin URL, got %#v", failover)
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
-		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionPromoteStandby) {
+		if action.Kind == string(haActionAcquireFence) || action.Kind == string(haActionAssessPromotion) || action.Kind == string(haActionPromoteStandby) {
 			t.Fatalf("expected no automatic promotion actions without standby admin URL, got %#v", cluster.Status.HAStatus.PlannedActions)
 		}
 	}

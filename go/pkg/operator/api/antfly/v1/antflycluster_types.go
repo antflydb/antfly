@@ -1684,6 +1684,26 @@ type HAAdminActionResultStatus struct {
 	// +optional
 	CheckpointLSN uint64 `json:"checkpointLSN,omitempty"`
 
+	// PromotionRequiredLSN is the minimum LSN checked by a promotion assessment.
+	// +optional
+	PromotionRequiredLSN uint64 `json:"promotionRequiredLSN,omitempty"`
+
+	// PromotionReceivedLSN is the standby received LSN observed by a promotion assessment.
+	// +optional
+	PromotionReceivedLSN uint64 `json:"promotionReceivedLSN,omitempty"`
+
+	// PromotionAppliedLSN is the standby applied LSN observed by a promotion assessment.
+	// +optional
+	PromotionAppliedLSN uint64 `json:"promotionAppliedLSN,omitempty"`
+
+	// PromotionCanPromote reports whether a promotion assessment permits promotion.
+	// +optional
+	PromotionCanPromote bool `json:"promotionCanPromote,omitempty"`
+
+	// PromotionFenced reports whether promotion assessment observed a fence.
+	// +optional
+	PromotionFenced bool `json:"promotionFenced,omitempty"`
+
 	// FenceGeneration is the promotion fence generation returned by fence operations.
 	// +optional
 	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`

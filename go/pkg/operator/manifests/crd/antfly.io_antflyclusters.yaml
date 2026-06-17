@@ -8908,6 +8908,29 @@ spec:
                               description: ManifestID is the base-backup manifest/action
                                 id returned by seed operations.
                               type: string
+                            promotionAppliedLSN:
+                              description: PromotionAppliedLSN is the standby applied
+                                LSN observed by a promotion assessment.
+                              format: int64
+                              type: integer
+                            promotionCanPromote:
+                              description: PromotionCanPromote reports whether a promotion
+                                assessment permits promotion.
+                              type: boolean
+                            promotionFenced:
+                              description: PromotionFenced reports whether promotion
+                                assessment observed a fence.
+                              type: boolean
+                            promotionReceivedLSN:
+                              description: PromotionReceivedLSN is the standby received
+                                LSN observed by a promotion assessment.
+                              format: int64
+                              type: integer
+                            promotionRequiredLSN:
+                              description: PromotionRequiredLSN is the minimum LSN
+                                checked by a promotion assessment.
+                              format: int64
+                              type: integer
                             rejoinAction:
                               description: RejoinAction is the former-primary rejoin
                                 action returned by a rejoin assessment.

@@ -30,6 +30,7 @@ const (
 	haActionBootstrapStandbySeed haActionKind = "BootstrapStandbySeed"
 	haActionMarkReseed           haActionKind = "MarkReseed"
 	haActionAcquireFence         haActionKind = "AcquireFence"
+	haActionAssessPromotion      haActionKind = "AssessPromotion"
 	haActionPromoteStandby       haActionKind = "PromoteStandby"
 	haActionUpdatePrimaryRoute   haActionKind = "UpdatePrimaryRoute"
 	haActionDemoteFormerPrimary  haActionKind = "DemoteFormerPrimary"
@@ -511,8 +512,19 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				Reason:          "AutomaticFailoverReady",
 			},
 			haPlannedAction{
-				Kind:            haActionPromoteStandby,
+				Kind:            haActionAssessPromotion,
 				DependsOn:       haActionAcquireFence,
+				StandbyName:     plan.PromotionStandbyName,
+				TargetLSN:       status.PrimaryLSN,
+				FenceAuthority:  fence.Authority,
+				FenceHolder:     fence.Holder,
+				FenceGeneration: fence.Generation,
+				FenceReason:     fence.Reason,
+				Reason:          "AutomaticFailoverReady",
+			},
+			haPlannedAction{
+				Kind:            haActionPromoteStandby,
+				DependsOn:       haActionAssessPromotion,
 				StandbyName:     plan.PromotionStandbyName,
 				TargetLSN:       status.PrimaryLSN,
 				FenceAuthority:  fence.Authority,
@@ -841,6 +853,8 @@ func haCLIActionKind(raw string) (haActionKind, bool) {
 		return haActionMarkReseed, true
 	case "acquire_fence":
 		return haActionAcquireFence, true
+	case "assess_promotion", "promotion_assess":
+		return haActionAssessPromotion, true
 	case "promote_standby":
 		return haActionPromoteStandby, true
 	case "update_primary_endpoint":
@@ -909,7 +923,7 @@ func haPlannedActionPhase(kind haActionKind) haActionPhase {
 	switch kind {
 	case haActionAcquireFence:
 		return haActionPhaseFence
-	case haActionPromoteStandby:
+	case haActionAssessPromotion, haActionPromoteStandby:
 		return haActionPhasePromote
 	case haActionUpdatePrimaryRoute:
 		return haActionPhaseRoute
@@ -971,6 +985,8 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			args = append(args, "--content-root", action.SeedContentRoot)
 		}
 		return args
+	case haActionAssessPromotion:
+		return []string{"promote", "assess", "--current-fence"}
 	case haActionPromoteStandby:
 		return []string{"promote", "--current-fence"}
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
@@ -1113,7 +1129,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionBootstrapStandbySeed:
 		return haStandbyAdminURL(ha, action.StandbyName)
-	case haActionPromoteStandby:
+	case haActionAssessPromotion, haActionPromoteStandby:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
 		return haStandbyAdminURL(ha, action.StandbyName)
@@ -1141,7 +1157,7 @@ func haAdminNodeID(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, st
 	switch action.Kind {
 	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
 		return haCurrentPrimaryNodeID(ha, status)
-	case haActionAcquireFence, haActionBootstrapStandbySeed, haActionPromoteStandby:
+	case haActionAcquireFence, haActionBootstrapStandbySeed, haActionAssessPromotion, haActionPromoteStandby:
 		return strings.TrimSpace(action.StandbyName)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
 		return strings.TrimSpace(action.StandbyName)
@@ -1193,6 +1209,8 @@ func haAdminOperation(action haPlannedAction) (string, string) {
 		return "POST", haAdminStandbyBootstrapPath
 	case haActionAcquireFence:
 		return "POST", haAdminFencePath
+	case haActionAssessPromotion:
+		return "POST", haAdminPromotionAssessPath
 	case haActionPromoteStandby:
 		return "POST", haAdminPromotionCurrentFencePath
 	case haActionDemoteFormerPrimary:

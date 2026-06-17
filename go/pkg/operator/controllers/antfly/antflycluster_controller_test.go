@@ -1050,8 +1050,19 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
 					AdminNodeID:     "standby-a",
 				}, {
-					Kind:            string(haActionPromoteStandby),
+					Kind:            string(haActionAssessPromotion),
 					DependsOn:       string(haActionAcquireFence),
+					StandbyName:     "standby-a",
+					TargetLSN:       12,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 3,
+					FenceReason:     "LeaseAcquired",
+					AdminCommand:    []string{"promote", "assess", "--current-fence"},
+					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
+				}, {
+					Kind:            string(haActionPromoteStandby),
+					DependsOn:       string(haActionAssessPromotion),
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
@@ -1087,6 +1098,17 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
 					Body:       io.NopCloser(strings.NewReader(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token"))),
 				}, nil
+			case "/admin/v1/ha/promotion/assess":
+				g.Expect(req.Method).To(Equal(http.MethodPost))
+				var payload map[string]any
+				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
+				g.Expect(payload["required_lsn"]).To(Equal(float64(12)))
+				g.Expect(payload["use_current_fence"]).To(Equal(true))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":12,"fencing_confirmed":true,"can_promote":true}}`)),
+				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
 				return &http.Response{
@@ -1104,6 +1126,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/fence",
+		"POST /admin/v1/ha/promotion/assess",
 		"POST /admin/v1/ha/promotion/current-fence",
 	}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
@@ -1117,14 +1140,23 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("promotion:standby-a"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionKind).To(Equal("promotion"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionState).To(Equal("applied"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceGeneration).To(Equal(uint64(3)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceToken).To(Equal("ha-fence-token"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceOldPrimaryID).To(Equal("primary-a"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FencePromotedNodeID).To(Equal("standby-a"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.FenceReason).To(Equal("LeaseAcquired"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("promotion_assess:standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionKind).To(Equal("promotion_assess"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionState).To(Equal("assessed"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionRequiredLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionAppliedLSN).To(Equal(uint64(12)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.PromotionCanPromote).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult).NotTo(BeNil())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.ActionID).To(Equal("promotion:standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.ActionKind).To(Equal("promotion"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.ActionState).To(Equal("applied"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FenceGeneration).To(Equal(uint64(3)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FenceToken).To(Equal("ha-fence-token"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FenceOldPrimaryID).To(Equal("primary-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FencePromotedNodeID).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminResult.FenceReason).To(Equal("LeaseAcquired"))
 
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
@@ -1186,14 +1218,14 @@ func TestReconcileHAAdminJobsRejectsMismatchedDirectFenceReceipt(t *testing.T) {
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
 					AdminNodeID:     "standby-a",
 				}, {
-					Kind:            string(haActionPromoteStandby),
+					Kind:            string(haActionAssessPromotion),
 					DependsOn:       string(haActionAcquireFence),
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 					FenceGeneration: 3,
 					FenceReason:     "LeaseAcquired",
-					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminCommand:    []string{"promote", "assess", "--current-fence"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
 					AdminNodeID:     "standby-a",
 				}},
@@ -1271,13 +1303,13 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
 					AdminNodeID:     "standby-a",
 				}, {
-					Kind:            string(haActionPromoteStandby),
+					Kind:            string(haActionAssessPromotion),
 					DependsOn:       string(haActionAcquireFence),
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
 					FenceGeneration: 3,
-					AdminCommand:    []string{"promote", "--current-fence"},
+					AdminCommand:    []string{"promote", "assess", "--current-fence"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
 					AdminNodeID:     "standby-a",
 				}},
@@ -1295,11 +1327,11 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
 					Body:       io.NopCloser(strings.NewReader(haFenceResponseJSON("primary-a", "standby-a", 3, "ha-fence-token"))),
 				}, nil
-			case "/admin/v1/ha/promotion/current-fence":
+			case "/admin/v1/ha/promotion/assess":
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"fencing_confirmed":true,"can_promote":false}}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)

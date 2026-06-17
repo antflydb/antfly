@@ -3563,6 +3563,20 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			err = requireHADirectFenceAcquireResult(cluster, action, raw)
 		}
 		return true, err
+	case string(haActionAssessPromotion):
+		body := haPromotionAssessBody(*action)
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		if err == nil {
+			err = requireHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionPromoteStandby):
 		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
 		if !ok {
@@ -3643,6 +3657,8 @@ func haDirectAdminActionReceiptSpec(kind haActionKind) (string, string, bool) {
 		return "standby_bootstrap", "applied", true
 	case haActionAcquireFence:
 		return "fence_acquire", "applied", true
+	case haActionAssessPromotion:
+		return "promotion_assess", "assessed", true
 	case haActionPromoteStandby:
 		return "promotion", "applied", true
 	case haActionDemoteFormerPrimary:
@@ -3713,6 +3729,11 @@ type haFenceAcquireRequest struct {
 	Reason         string                 `json:"reason,omitempty"`
 }
 
+type haPromotionAssessRequest struct {
+	RequiredLSN     uint64 `json:"required_lsn,omitempty"`
+	UseCurrentFence bool   `json:"use_current_fence"`
+}
+
 type haFenceReceiptRequest struct {
 	Identity         haAdminIdentityRequest `json:"identity"`
 	OldPrimaryID     string                 `json:"old_primary_id"`
@@ -3773,6 +3794,13 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 		ObservedLSN:    action.TargetLSN,
 		Reason:         reason,
 	}, true
+}
+
+func haPromotionAssessBody(action antflyv1.HAPlannedActionStatus) haPromotionAssessRequest {
+	return haPromotionAssessRequest{
+		RequiredLSN:     action.TargetLSN,
+		UseCurrentFence: true,
+	}
 }
 
 func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (haRejoinAssessRequest, bool) {
@@ -3884,7 +3912,14 @@ type haDirectAdminActionResultJSON struct {
 	StartRecordLSN uint64 `json:"start_record_lsn"`
 	EndRecordLSN   uint64 `json:"end_record_lsn"`
 	CheckpointLSN  uint64 `json:"checkpoint_lsn"`
-	Receipt        struct {
+	Assessment     struct {
+		RequiredLSN  uint64 `json:"required_lsn"`
+		ReceivedLSN  uint64 `json:"received_lsn"`
+		AppliedLSN   uint64 `json:"applied_lsn"`
+		CanPromote   bool   `json:"can_promote"`
+		FencingReady bool   `json:"fencing_confirmed"`
+	} `json:"assessment"`
+	Receipt struct {
 		Identity struct {
 			ClusterID  uint64 `json:"cluster_id"`
 			ShardID    uint64 `json:"shard_id"`
@@ -3992,6 +4027,11 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		StartRecordLSN:        result.StartRecordLSN,
 		EndRecordLSN:          result.EndRecordLSN,
 		CheckpointLSN:         result.CheckpointLSN,
+		PromotionRequiredLSN:  result.Assessment.RequiredLSN,
+		PromotionReceivedLSN:  result.Assessment.ReceivedLSN,
+		PromotionAppliedLSN:   result.Assessment.AppliedLSN,
+		PromotionCanPromote:   result.Assessment.CanPromote,
+		PromotionFenced:       result.Assessment.FencingReady,
 		FenceGeneration:       result.Receipt.Generation,
 		FenceToken:            strings.TrimSpace(result.Receipt.Token),
 		FenceClusterID:        result.Receipt.Identity.ClusterID,
@@ -5934,6 +5974,9 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
 			result.FenceToken != "" &&
 			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
+	case haActionAssessPromotion:
+		return result.PromotionCanPromote &&
+			(action.TargetLSN == 0 || result.PromotionRequiredLSN == 0 || result.PromotionRequiredLSN == action.TargetLSN)
 	case haActionPromoteStandby:
 		return haPromotionAdminResultHasEvidence(action, result)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
@@ -6010,7 +6053,7 @@ func haDirectAdminActionReceiptTarget(action antflyv1.HAPlannedActionStatus) str
 		return expectedManifestID
 	case haActionFinishStandbySeed, haActionBootstrapStandbySeed:
 		return expectedManifestID
-	case haActionAcquireFence, haActionPromoteStandby, haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+	case haActionAcquireFence, haActionAssessPromotion, haActionPromoteStandby, haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return strings.TrimSpace(action.StandbyName)
 	default:
 		return ""
