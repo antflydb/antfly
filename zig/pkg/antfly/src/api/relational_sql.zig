@@ -65470,6 +65470,36 @@ test "app parity conflict write count coverage tokens are exact" {
     try std.testing.expect(coverage.conflict_guard_where_skip);
 }
 
+test "app parity temporal conflict transform count coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
+        .plan = "insert:table=prices:writes=0:transforms=10:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+        .apply_setup_sql = &.{
+            "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));",
+        },
+        .resolver_row_json = "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
+        .resolver_version = 45,
+    });
+
+    try std.testing.expect(!coverage.schema_temporal_unique_conflict_upsert);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
+        .plan = "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+        .apply_setup_sql = &.{
+            "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));",
+        },
+        .resolver_row_json = "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
+        .resolver_version = 45,
+    });
+
+    try std.testing.expect(coverage.schema_temporal_unique_conflict_upsert);
+}
+
 test "app parity explain coverage tokens are exact" {
     const write_suffix = AppParityCorpusEntry{
         .family = .explain,
@@ -66178,7 +66208,7 @@ const AppParityCorpusCoverage = struct {
         self.schema_temporal_unique_conflict_upsert = self.schema_temporal_unique_conflict_upsert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT prices_sku_time_key") != null and
             appParityPlanHasExactStringToken(entry.plan, "insert:table=", "prices") and
-            std.mem.indexOf(u8, entry.plan, "transforms=1") != null and
+            appParityPlanHasExactUsizeToken(entry.plan, ":transforms=", 1) and
             entry.apply_setup_sql.len > 0 and
             entry.resolver_row_json.len > 0);
         self.query_set_operation_order_limit = self.query_set_operation_order_limit or (entry.family == .query and
