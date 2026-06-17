@@ -117,23 +117,22 @@ pub fn encodeAlloc(alloc: Allocator, record: Record) ![]u8 {
     const len = try encodedLen(record.payload.len);
     const out = try alloc.alloc(u8, len);
     errdefer alloc.free(out);
-    encodeInto(out, record) catch |err| {
-        alloc.free(out);
-        return err;
-    };
+    try encodeInto(out, record);
     return out;
 }
 
 pub fn encodeInto(out: []u8, record: Record) !void {
     const required = try encodedLen(record.payload.len);
     if (out.len != required) return error.InvalidOutputLength;
+    const record_kind = try decodeRecordKind(@intFromEnum(record.kind));
+    const payload_codec = try decodePayloadCodec(@intFromEnum(record.payload_codec));
 
     @memset(out[0..header_size], 0);
     @memcpy(out[0..8], &magic);
     std.mem.writeInt(u16, out[version_offset..][0..2], format_version, .little);
     std.mem.writeInt(u16, out[header_len_offset..][0..2], header_size, .little);
-    std.mem.writeInt(u16, out[record_kind_offset..][0..2], @intFromEnum(record.kind), .little);
-    std.mem.writeInt(u16, out[payload_codec_offset..][0..2], @intFromEnum(record.payload_codec), .little);
+    std.mem.writeInt(u16, out[record_kind_offset..][0..2], @intFromEnum(record_kind), .little);
+    std.mem.writeInt(u16, out[payload_codec_offset..][0..2], @intFromEnum(payload_codec), .little);
     std.mem.writeInt(u32, out[flags_offset..][0..4], record.flags, .little);
     std.mem.writeInt(u64, out[cluster_id_offset..][0..8], record.cluster_id, .little);
     std.mem.writeInt(u64, out[shard_id_offset..][0..8], record.shard_id, .little);
@@ -318,4 +317,26 @@ test "ha replication record rejects unknown current-version kind and codec" {
     std.mem.writeInt(u16, encoded[payload_codec_offset..][0..2], 0xffff, .little);
     std.mem.writeInt(u32, encoded[header_crc_offset..][0..4], Crc32.hash(encoded[0..header_crc_offset]), .little);
     try std.testing.expectError(error.UnsupportedPayloadCodec, decode(encoded));
+}
+
+test "ha replication record refuses to encode unknown current-version kind and codec" {
+    try std.testing.expectError(error.UnsupportedRecordKind, encodeAlloc(std.testing.allocator, .{
+        .kind = @enumFromInt(0xffff),
+        .payload_codec = .raw,
+        .cluster_id = 1,
+        .timeline_id = 2,
+        .epoch = 3,
+        .lsn = 4,
+        .previous_lsn = 3,
+    }));
+
+    try std.testing.expectError(error.UnsupportedPayloadCodec, encodeAlloc(std.testing.allocator, .{
+        .kind = .batch_mutation,
+        .payload_codec = @enumFromInt(0xffff),
+        .cluster_id = 1,
+        .timeline_id = 2,
+        .epoch = 3,
+        .lsn = 4,
+        .previous_lsn = 3,
+    }));
 }
