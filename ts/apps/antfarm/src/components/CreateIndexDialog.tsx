@@ -29,6 +29,22 @@ interface CreateIndexDialogProps {
   schema: TableSchema | null;
 }
 
+export function getSchemaFieldNames(schema: TableSchema | null): string[] {
+  if (!schema?.document_schemas || typeof schema.document_schemas !== "object") {
+    return [];
+  }
+
+  const fields = Object.values(schema.document_schemas).flatMap((documentSchema) => {
+    const properties = documentSchema?.schema?.properties;
+    if (!properties || typeof properties !== "object") {
+      return [];
+    }
+    return Object.keys(properties);
+  });
+
+  return [...new Set(fields)].sort((a, b) => a.localeCompare(b));
+}
+
 const indexFormSchema = z.object({
   name: z.string().min(1, "Index name is required."),
   dimension: z.number().optional(),
@@ -206,10 +222,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
     setViewMode(newMode);
   };
 
-  const schemaFields =
-    schema?.document_schemas && Object.values(schema.document_schemas)[0]
-      ? Object.keys(Object.values(schema.document_schemas)[0].schema.properties)
-      : [];
+  const schemaFields = getSchemaFieldNames(schema);
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
