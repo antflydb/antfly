@@ -731,9 +731,13 @@ pub const Catalog = struct {
             while (try iter.next()) |delta_value| {
                 var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
                 if (min_generation) |generation| {
-                    try records.ensureUnusedCapacity(alloc, delta_iter.recordCount());
+                    var reserved = false;
                     while (try delta_iter.next()) |record| {
                         if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                        if (!reserved) {
+                            try records.ensureUnusedCapacity(alloc, delta_iter.recordCount() - delta_iter.index + 1);
+                            reserved = true;
+                        }
                         records.appendAssumeCapacity(record);
                     }
                 } else {
@@ -1898,9 +1902,13 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
         const value = try deltaValueFromRange(index_data, range, index);
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         if (min_generation) |generation| {
-            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            var reserved = false;
             while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                if (!reserved) {
+                    try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
+                    reserved = true;
+                }
                 records.appendAssumeCapacity(record);
             }
         } else {
@@ -1935,9 +1943,13 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         stats.records += iterator.recordCount();
         stats.encoded_value_bytes += value.len;
-        try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+        var reserved = false;
         while (try iterator.next()) |record| {
             if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            if (!reserved) {
+                try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
+                reserved = true;
+            }
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
             stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
@@ -1972,7 +1984,7 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
         while (try iterator.next()) |record| {
             if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
             if (!reserved) {
-                try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount());
+                try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount() - iterator.index + 1);
                 reserved = true;
             }
             stats.records_after_generation += 1;
@@ -2603,9 +2615,13 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntries(alloc, &records, posting_id, min_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             if (min_generation) |generation| {
-                try records.ensureUnusedCapacity(alloc, batch.records.items.len);
-                for (batch.records.items) |record| {
+                var reserved = false;
+                for (batch.records.items, 0..) |record, i| {
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                    if (!reserved) {
+                        try records.ensureUnusedCapacity(alloc, batch.records.items.len - i);
+                        reserved = true;
+                    }
                     records.appendAssumeCapacity(record);
                 }
             } else {
@@ -2626,10 +2642,14 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntriesWithStats(alloc, &records, &stats, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
-            try records.ensureUnusedCapacity(alloc, batch.records.items.len);
-            for (batch.records.items) |record| {
+            var reserved = false;
+            for (batch.records.items, 0..) |record, i| {
                 stats.records += 1;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!reserved) {
+                    try records.ensureUnusedCapacity(alloc, batch.records.items.len - i);
+                    reserved = true;
+                }
                 stats.records_after_generation += 1;
                 if (record.op == .tombstone) stats.tombstones_after_generation += 1;
                 stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
@@ -2657,11 +2677,11 @@ pub const DirectoryBatchWriter = struct {
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
             var reserved = false;
-            for (batch.records.items) |record| {
+            for (batch.records.items, 0..) |record, i| {
                 stats.records += 1;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 if (!reserved) {
-                    try ensureDeltaRecordAppendCapacity(alloc, scratch, batch.records.items.len);
+                    try ensureDeltaRecordAppendCapacity(alloc, scratch, batch.records.items.len - i);
                     reserved = true;
                 }
                 stats.records_after_generation += 1;
@@ -2948,9 +2968,13 @@ pub const DirectoryBatchWriter = struct {
             if (entry.posting_id != posting_id or entry.kind != .delta) continue;
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             if (min_generation) |generation| {
-                try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+                var reserved = false;
                 while (try iterator.next()) |record| {
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                    if (!reserved) {
+                        try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
+                        reserved = true;
+                    }
                     records.appendAssumeCapacity(record);
                 }
             } else {
@@ -2973,9 +2997,13 @@ pub const DirectoryBatchWriter = struct {
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             stats.records += iterator.recordCount();
             stats.encoded_value_bytes += entry.value.len;
-            try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+            var reserved = false;
             while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!reserved) {
+                    try records.ensureUnusedCapacity(alloc, iterator.recordCount() - iterator.index + 1);
+                    reserved = true;
+                }
                 stats.records_after_generation += 1;
                 if (record.op == .tombstone) stats.tombstones_after_generation += 1;
                 stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
@@ -3001,7 +3029,7 @@ pub const DirectoryBatchWriter = struct {
             while (try iterator.next()) |record| {
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 if (!reserved) {
-                    try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount());
+                    try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount() - iterator.index + 1);
                     reserved = true;
                 }
                 stats.records_after_generation += 1;

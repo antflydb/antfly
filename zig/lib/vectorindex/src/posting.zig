@@ -1440,18 +1440,24 @@ pub const PostingFormat = struct {
             .records = iterator.recordCount(),
             .encoded_value_bytes = data.len,
         };
+        var reserved = false;
         while (try iterator.next()) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            if (!reserved) {
+                try ensureDeltaRecordAppendCapacity(alloc, scratch, iterator.recordCount() - iterator.index + 1);
+                reserved = true;
+            }
             stats.records_after_generation += 1;
             if (record.op == .tombstone) stats.tombstones_after_generation += 1;
             stats.max_sequence_after_generation = @max(stats.max_sequence_after_generation, record.sequence);
-            try appendDeltaRecordToScratch(alloc, scratch, record);
+            scratch.appendDeltaRecordAssumeCapacity(record);
         }
         return stats;
     }
 
-    fn appendDeltaRecordToScratch(alloc: std.mem.Allocator, scratch: anytype, record: PostingDeltaRecord) !void {
-        const needed = scratch.deltaRecordCount() + 1;
+    fn ensureDeltaRecordAppendCapacity(alloc: std.mem.Allocator, scratch: anytype, additional: usize) !void {
+        if (additional == 0) return;
+        const needed = try std.math.add(usize, scratch.deltaRecordCount(), additional);
         const Scratch = std.meta.Child(@TypeOf(scratch));
         if (comptime @hasField(Scratch, "delta_records")) {
             if (needed > scratch.delta_records.len) {
@@ -1464,6 +1470,10 @@ pub const PostingFormat = struct {
         } else {
             try scratch.ensureDeltaRecordCapacity(alloc, needed);
         }
+    }
+
+    fn appendDeltaRecordToScratch(alloc: std.mem.Allocator, scratch: anytype, record: PostingDeltaRecord) !void {
+        try ensureDeltaRecordAppendCapacity(alloc, scratch, 1);
         scratch.appendDeltaRecordAssumeCapacity(record);
     }
 
