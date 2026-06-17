@@ -208,8 +208,11 @@ Current status:
   allocating the decoded delta array. Segment-backed delta record loads,
   member materialization, and compaction now also stream `DeltaTailIterator`
   records directly into their output/scratch buffers instead of allocating a
-  decoded array per delta value. A bounded segment directory batch writer can
-  accumulate posting-local records under entry/byte caps and flush them through
+  decoded array per delta value. Segment and pending-batch delta readers now
+  also grow decoded-record scratch only after a record survives base-generation
+  filtering, so stale folded tail values do not inflate retained segment replay
+  scratch. A bounded segment directory batch writer can accumulate
+  posting-local records under entry/byte caps and flush them through
   the existing atomic segment+manifest commit path, including coalescing
   individual and multi-record posting delta appends into one encoded delta-tail
   value per posting, which gives the future runtime backend an explicit
