@@ -5968,7 +5968,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
 			antflyv1.ReasonHAAdminResultMissing,
-			fmt.Sprintf("HA admin action %s succeeded in Job %s, but the operator has not observed typed result evidence; dependent HA actions remain blocked", action.Kind, jobName),
+			fmt.Sprintf("HA admin action %s succeeded in Job %s, but the operator has not observed typed result evidence and a matching action receipt; dependent HA actions remain blocked", action.Kind, jobName),
 		)
 		return
 	}

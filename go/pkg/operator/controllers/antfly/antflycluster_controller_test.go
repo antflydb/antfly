@@ -684,6 +684,46 @@ func TestUpdateHAAdminJobExecutionConditionReportsMismatchedDirectAdminReceipt(t
 	g.Expect(degraded.Message).To(ContainSubstring("typed result evidence"))
 }
 
+func TestUpdateHAAdminJobExecutionConditionReportsMismatchedCLIReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionCreateSlot),
+					SlotName:      "standby-a",
+					AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
+					AdminJobName:  "create-slot-job",
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						ActionID:     "replication_slot_create:standby-b",
+						ActionKind:   "replication_slot_create",
+						ActionTarget: "standby-b",
+						ActionState:  "applied",
+						SlotAction:   "create",
+						SlotName:     "standby-a",
+					},
+				}, {
+					Kind:      string(haActionSeedStandby),
+					DependsOn: string(haActionCreateSlot),
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminResultMissing))
+	g.Expect(degraded.Message).To(ContainSubstring("CreateSlot"))
+	g.Expect(degraded.Message).To(ContainSubstring("create-slot-job"))
+	g.Expect(degraded.Message).To(ContainSubstring("matching action receipt"))
+}
+
 func TestReconcileHAAdminJobsRejectsMismatchedTypedAdminOperation(t *testing.T) {
 	g := NewWithT(t)
 
