@@ -36922,74 +36922,43 @@ const Parser = struct {
     }
 
     fn matchSubstringFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsSubstringFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsSubstringFunction) != null;
     }
 
     fn matchOverlayFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsOverlayFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsOverlayFunction) != null;
     }
 
     fn matchSplitPartFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsSplitPartFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsSplitPartFunction) != null;
     }
 
     fn matchStrposFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsStrposFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsStrposFunction) != null;
     }
 
     fn matchArrayLengthFunctionKeyword(self: *@This()) ?[]const u8 {
-        if (self.pos >= self.tokens.len) return null;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsArrayLengthFunction(token.text)) return null;
-        self.pos += 1;
+        const token = self.cursor().matchIdentifierIf(sqlKeywordIsArrayLengthFunction) orelse return null;
         return token.text;
     }
 
     fn matchArrayPositionFunctionKeyword(self: *@This()) ?[]const u8 {
-        if (self.pos >= self.tokens.len) return null;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsArrayPositionFunction(token.text)) return null;
-        self.pos += 1;
+        const token = self.cursor().matchIdentifierIf(sqlKeywordIsArrayPositionFunction) orelse return null;
         return token.text;
     }
 
     fn matchJsonArrayLengthFunctionKeyword(self: *@This()) ?[]const u8 {
-        if (self.pos >= self.tokens.len) return null;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsJsonArrayLengthFunction(token.text)) return null;
-        self.pos += 1;
+        const token = self.cursor().matchIdentifierIf(sqlKeywordIsJsonArrayLengthFunction) orelse return null;
         return token.text;
     }
 
     fn matchJsonTypeofFunctionKeyword(self: *@This()) ?[]const u8 {
-        if (self.pos >= self.tokens.len) return null;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsJsonTypeofFunction(token.text)) return null;
-        self.pos += 1;
+        const token = self.cursor().matchIdentifierIf(sqlKeywordIsJsonTypeofFunction) orelse return null;
         return token.text;
     }
 
     fn matchJsonExtractPathFunctionKeyword(self: *@This()) ?[]const u8 {
-        if (self.pos >= self.tokens.len) return null;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsJsonExtractPathFunction(token.text)) return null;
-        self.pos += 1;
+        const token = self.cursor().matchIdentifierIf(sqlKeywordIsJsonExtractPathFunction) orelse return null;
         return token.text;
     }
 
@@ -37012,67 +36981,35 @@ const Parser = struct {
     }
 
     fn matchRepeatFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsRepeatFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsRepeatFunction) != null;
     }
 
     fn matchReverseFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsReverseFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsReverseFunction) != null;
     }
 
     fn matchInitcapFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsInitcapFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsInitcapFunction) != null;
     }
 
     fn matchMd5FunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsMd5Function(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsMd5Function) != null;
     }
 
     fn peekJsonArrayLengthFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsJsonArrayLengthFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsJsonArrayLengthFunction);
     }
 
     fn peekJsonTypeofFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsJsonTypeofFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsJsonTypeofFunction);
     }
 
     fn peekJsonExtractPathFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsJsonExtractPathFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsJsonExtractPathFunction);
     }
 
     fn peekJsonBuildObjectFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsJsonBuildObjectFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsJsonBuildObjectFunction);
     }
 
     fn peekArrayLengthFunctionCall(self: *@This()) bool {
@@ -37084,17 +37021,11 @@ const Parser = struct {
     }
 
     fn arrayPositionFunctionStartsAt(self: *@This(), index: usize) bool {
-        if (index + 1 >= self.tokens.len) return false;
-        const token = self.tokens[index];
-        return token.kind == .identifier and sqlKeywordIsArrayPositionFunction(token.text) and self.tokens[index + 1].kind == .lparen;
+        return self.cursor().functionCallStartsAtIf(index, sqlKeywordIsArrayPositionFunction);
     }
 
     fn arrayLengthFunctionStartsAt(self: *@This(), index: usize) bool {
-        if (index + 1 >= self.tokens.len) return false;
-        const token = self.tokens[index];
-        return token.kind == .identifier and
-            sqlKeywordIsArrayLengthFunction(token.text) and
-            self.tokens[index + 1].kind == .lparen;
+        return self.cursor().functionCallStartsAtIf(index, sqlKeywordIsArrayLengthFunction);
     }
 
     fn parseArrayLengthFunctionTail(self: *@This(), keyword: []const u8) !void {
@@ -37107,35 +37038,19 @@ const Parser = struct {
     }
 
     fn matchStartsWithFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsStartsWithFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsStartsWithFunction) != null;
     }
 
     fn matchEndsWithFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsEndsWithFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsEndsWithFunction) != null;
     }
 
     fn matchDateTruncFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsDateTruncFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsDateTruncFunction) != null;
     }
 
     fn matchDateBinFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsDateBinFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsDateBinFunction) != null;
     }
 
     fn matchTrimVariantFunctionKind(self: *@This()) ?db_mod.types.RelationalRowsExpressionKind {
@@ -37149,11 +37064,7 @@ const Parser = struct {
     }
 
     fn matchTranslateFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsTranslateFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsTranslateFunction) != null;
     }
 
     fn peekKeyword(self: *@This(), keyword: []const u8) bool {
@@ -37167,19 +37078,11 @@ const Parser = struct {
     }
 
     fn peekAsciiFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsAsciiFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsAsciiFunction);
     }
 
     fn peekChrFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsChrFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsChrFunction);
     }
 
     fn peekSubstringFunctionKeyword(self: *@This()) bool {
@@ -37189,19 +37092,11 @@ const Parser = struct {
     }
 
     fn peekOverlayFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsOverlayFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsOverlayFunction);
     }
 
     fn peekTranslateFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsTranslateFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsTranslateFunction);
     }
 
     fn peekSplitPartFunctionKeyword(self: *@This()) bool {
@@ -37217,183 +37112,95 @@ const Parser = struct {
     }
 
     fn peekLeftRightFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsLeftRightFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsLeftRightFunction);
     }
 
     fn peekPadFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsPadFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsPadFunction);
     }
 
     fn peekRepeatFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsRepeatFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsRepeatFunction);
     }
 
     fn peekReverseFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsReverseFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsReverseFunction);
     }
 
     fn peekInitcapFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsInitcapFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsInitcapFunction);
     }
 
     fn peekMd5FunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsMd5Function(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsMd5Function);
     }
 
     fn peekStartsWithFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsStartsWithFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsStartsWithFunction);
     }
 
     fn peekEndsWithFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsEndsWithFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsEndsWithFunction);
     }
 
     fn peekDateTruncFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsDateTruncFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsDateTruncFunction);
     }
 
     fn peekDateBinFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsDateBinFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsDateBinFunction);
     }
 
     fn peekDatePartFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsDatePartFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsDatePartFunction);
     }
 
     fn peekUuidV4FunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsUuidV4Function(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsUuidV4Function);
     }
 
     fn peekTrimVariantFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsTrimVariantFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsTrimVariantFunction);
     }
 
     fn functionCallStartsAt(self: *@This(), index: usize, keyword: []const u8) bool {
-        if (index + 1 >= self.tokens.len) return false;
-        const token = self.tokens[index];
-        return token.kind == .identifier and
-            std.ascii.eqlIgnoreCase(token.text, keyword) and
-            self.tokens[index + 1].kind == .lparen;
+        return self.cursor().functionCallStartsAt(index, keyword);
     }
 
     fn peekFunctionCall(self: *@This(), keyword: []const u8) bool {
-        return self.functionCallStartsAt(self.pos, keyword);
+        return self.cursor().peekFunctionCall(keyword);
     }
 
     fn peekRegexpMatchFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsRegexpMatchFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsRegexpMatchFunction);
     }
 
     fn peekRegexpCountFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsRegexpCountFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsRegexpCountFunction);
     }
 
     fn peekRegexpSubstrFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsRegexpSubstrFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsRegexpSubstrFunction);
     }
 
     fn peekRegexpInstrFunctionCall(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and
-            sqlKeywordIsRegexpInstrFunction(token.text) and
-            self.tokens[self.pos + 1].kind == .lparen;
+        return self.cursor().peekFunctionCallIf(sqlKeywordIsRegexpInstrFunction);
     }
 
     fn matchRegexpMatchFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsRegexpMatchFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsRegexpMatchFunction) != null;
     }
 
     fn matchRegexpCountFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsRegexpCountFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsRegexpCountFunction) != null;
     }
 
     fn matchRegexpSubstrFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsRegexpSubstrFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsRegexpSubstrFunction) != null;
     }
 
     fn matchRegexpInstrFunctionKeyword(self: *@This()) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !sqlKeywordIsRegexpInstrFunction(token.text)) return false;
-        self.pos += 1;
-        return true;
+        return self.cursor().matchIdentifierIf(sqlKeywordIsRegexpInstrFunction) != null;
     }
 
     fn match(self: *@This(), kind: TokenKind) ?Token {

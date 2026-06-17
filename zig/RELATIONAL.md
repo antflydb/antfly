@@ -1021,18 +1021,18 @@ as required-feature classifications. Golden-plan fingerprint helpers and
 unsupported/adapter-noop plan matching belong in `corpus.zig`, so fixture
 validation and generated corpus promotion share the same adapter-owned contract.
 The shared parser cursor belongs in `parser.zig`, so checkpoint/restore,
-expect, match, peek, and end-of-input behavior are adapter-owned before
-statement-specific grammar moves out of the large lowerer file. Next extract
-the shared expression grammar, because expressions are reused by SELECT, DML,
-DDL checks, partial indexes, defaults, generated columns, conflict actions, and
-RETURNING. The binder boundary should own catalog source lookup, cross-table
-source-name pre-scans for read, insert-source, and joined-write statements,
-cross-table source schema derivation, identifier normalization, and scope
-resolution so statement lowerers consume typed schemas instead of re-reading
-metadata snapshots directly. Then move statement families one at a time into
-AST plus binder plus lowerer modules, with the existing SQL/API parity tests as
-the acceptance gate. Only after those boundaries are stable should a generated
-grammar be considered.
+expect, match, peek, identifier-predicate matching, function-call detection,
+and end-of-input behavior are adapter-owned before statement-specific grammar
+moves out of the large lowerer file. Next extract the shared expression grammar,
+because expressions are reused by SELECT, DML, DDL checks, partial indexes,
+defaults, generated columns, conflict actions, and RETURNING. The binder
+boundary should own catalog source lookup, cross-table source-name pre-scans for
+read, insert-source, and joined-write statements, cross-table source schema
+derivation, identifier normalization, and scope resolution so statement lowerers
+consume typed schemas instead of re-reading metadata snapshots directly. Then
+move statement families one at a time into AST plus binder plus lowerer modules,
+with the existing SQL/API parity tests as the acceptance gate. Only after those
+boundaries are stable should a generated grammar be considered.
 
 Efficiency follows those same boundaries. Lexer and parser data should be
 statement-scoped and arena-allocated where useful. Token text should reference
