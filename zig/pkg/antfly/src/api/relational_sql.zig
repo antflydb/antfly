@@ -2696,9 +2696,9 @@ fn parseSelectIntoPopulationSqlAlloc(
     sql: []const u8,
     tokens: []const Token,
 ) !ParsedRelationPopulationSql {
-    const into_relative = findTopLevelKeyword(tokens[1..], "into") orelse return error.UnsupportedSqlShape;
+    const into_relative = sql_adapter.findTopLevelKeyword(tokens[1..], "into") orelse return error.UnsupportedSqlShape;
     const into_index = 1 + into_relative;
-    const from_relative = findTopLevelKeyword(tokens[into_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
+    const from_relative = sql_adapter.findTopLevelKeyword(tokens[into_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
     const from_index = into_index + 1 + from_relative;
     if (from_index != into_index + 2) return error.UnsupportedSqlShape;
     if (tokens[into_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
@@ -4865,14 +4865,6 @@ fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) !void {
     if (consumeKeyword(tokens, index, "not") and !consumeKeyword(tokens, index, "materialized")) {
         return error.UnsupportedSqlShape;
     }
-}
-
-fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
-    return sql_adapter.findTopLevelKeyword(tokens, keyword);
-}
-
-fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usize {
-    return sql_adapter.findMatchingRParenIndex(tokens, lparen_index);
 }
 
 const AppParitySourceSchemaCatalog = struct {
@@ -9394,7 +9386,7 @@ const Parser = struct {
 
     fn ddlCheckParenthesizedGroupCanStartAt(self: *@This(), index: usize) bool {
         if (index >= self.tokens.len or self.tokens[index].kind != .lparen) return false;
-        const close = findMatchingRParenIndex(self.tokens, index) orelse return false;
+        const close = sql_adapter.findMatchingRParenIndex(self.tokens, index) orelse return false;
         if (close + 1 >= self.tokens.len) return true;
         const next = self.tokens[close + 1];
         switch (next.kind) {
@@ -13106,7 +13098,7 @@ const Parser = struct {
         planned_ctes: []const relational_rows.RowsPlannedCte,
     ) !?runtime_schema.TableSchema {
         if (planned_ctes.len == 0) return null;
-        const from_index = findTopLevelKeyword(self.tokens[start..end], "from") orelse return null;
+        const from_index = sql_adapter.findTopLevelKeyword(self.tokens[start..end], "from") orelse return null;
         var source_index = start + from_index + 1;
         _ = consumeKeyword(self.tokens, &source_index, "only");
         if (source_index >= end or self.tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
@@ -25361,7 +25353,7 @@ const Parser = struct {
 
     fn parenthesizedWhereHasTopLevelOr(self: *@This()) bool {
         if (!self.peekKind(.lparen)) return false;
-        const close_index = findMatchingRParenIndex(self.tokens, self.pos) orelse return false;
+        const close_index = sql_adapter.findMatchingRParenIndex(self.tokens, self.pos) orelse return false;
         var depth: usize = 0;
         var index = self.pos + 1;
         while (index < close_index) : (index += 1) {
@@ -26440,7 +26432,7 @@ const Parser = struct {
         if (index >= self.tokens.len or self.tokens[index].kind != .lparen) return false;
         const inner = self.predicateStartIndexAfterOpenParens(index);
         if (!self.booleanExpressionCanStartAt(inner)) return false;
-        const close = findMatchingRParenIndex(self.tokens, index) orelse return false;
+        const close = sql_adapter.findMatchingRParenIndex(self.tokens, index) orelse return false;
         if (close + 2 >= self.tokens.len) return false;
         if (self.tokens[close + 1].kind != .identifier or
             !std.ascii.eqlIgnoreCase(self.tokens[close + 1].text, "is"))
