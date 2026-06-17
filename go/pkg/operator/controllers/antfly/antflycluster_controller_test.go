@@ -254,6 +254,12 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 						MountPath: "/backup",
 					}},
 				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
+				},
 				Standbys: []antflyv1.HAStandbySpec{{
 					Name:       "standby-a",
 					InitialLSN: &initial,
@@ -1209,6 +1215,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 					FenceGeneration: 3,
 					AdminCommand:    []string{"fence", "acquire"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
 				}, {
 					Kind:            string(haActionPromoteStandby),
 					DependsOn:       string(haActionAcquireFence),
@@ -1218,6 +1225,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 					FenceGeneration: 3,
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminURL:        "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:     "standby-a",
 				}},
 			},
 		},
@@ -1370,6 +1378,7 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 					FenceGeneration: 3,
 					AdminCommand:    []string{"rejoin", "rewind"},
 					AdminURL:        "http://old-primary-ha.default.svc:8081",
+					AdminNodeID:     "primary-a",
 				}},
 			},
 		},
@@ -1600,6 +1609,7 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 		TargetLSN:       12,
 		ObservedLSN:     13,
 		RetainedFromLSN: 8,
+		AdminNodeID:     "primary-a",
 	}
 	result := haRejoinJobResult{
 		FormerNodeID:     "primary-a",
@@ -1680,6 +1690,12 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				Admin: &antflyv1.HAAdminSpec{
 					PrimaryURL:            "http://primary-ha.default.svc:8081",
 					ExecutePlannedActions: true,
+				},
+				Identity: &antflyv1.HAReplicationIdentitySpec{
+					ClusterID:        100,
+					TimelineID:       4,
+					Epoch:            6,
+					CurrentPrimaryID: "primary-a",
 				},
 				Standbys: []antflyv1.HAStandbySpec{{
 					Name:             "standby-a",
@@ -2080,6 +2096,7 @@ func TestHADirectAdminActionDependenciesRequireVersionedActionReceipt(t *testing
 	actions := []antflyv1.HAPlannedActionStatus{{
 		Kind:          string(haActionCreateSlot),
 		SlotName:      "standby-a",
+		AdminNodeID:   "primary-a",
 		AdminJobName:  haAdminDirectAPIName,
 		AdminJobPhase: haAdminJobPhaseSucceeded,
 		AdminResult: &antflyv1.HAAdminActionResultStatus{
@@ -2113,6 +2130,7 @@ func TestHAImplicitDependenciesRequireTypedAdminActionWithoutCLIArgv(t *testing.
 		SlotName:      "standby-a",
 		AdminMethod:   "POST",
 		AdminPath:     "/admin/v1/ha/replication-slots",
+		AdminNodeID:   "primary-a",
 		AdminJobName:  haAdminDirectAPIName,
 		AdminJobPhase: haAdminJobPhasePending,
 	}, {
@@ -2146,6 +2164,7 @@ func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T
 	action := antflyv1.HAPlannedActionStatus{
 		Kind:             string(haActionFinishStandbySeed),
 		SeedManifestPath: "/backup/base-standby-a-5.afha",
+		AdminNodeID:      "primary-a",
 		AdminJobName:     haAdminDirectAPIName,
 		AdminJobPhase:    haAdminJobPhaseSucceeded,
 		AdminResult: &antflyv1.HAAdminActionResultStatus{
@@ -2316,7 +2335,7 @@ func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) 
 				ActionState:   tt.wantState,
 				ActionNodeID:  "node-a",
 			}
-			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
+			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeFalse())
 
 			tt.action.AdminNodeID = "node-a"
 			g.Expect(haDirectAdminActionReceiptMatches(tt.action)).To(BeTrue())
@@ -2384,6 +2403,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 					StandbyName:  "standby-a",
 					AdminCommand: []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "operator-base-standby-a-7"},
 					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
 				}},
 			},
 		},

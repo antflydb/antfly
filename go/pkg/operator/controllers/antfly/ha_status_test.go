@@ -177,6 +177,12 @@ func TestPlanHAWaitsForPrimaryLSNBeforeReseedBaseBackup(t *testing.T) {
 func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       4,
+			Epoch:            6,
+			CurrentPrimaryID: "primary-a",
+		},
 	}
 	actions := []haPlannedAction{{
 		Kind:        haActionCreateSlot,
@@ -234,6 +240,12 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       4,
+			Epoch:            6,
+			CurrentPrimaryID: "primary-a",
+		},
 	}
 	actions := []haPlannedAction{{
 		Kind:        haActionCreateSlot,

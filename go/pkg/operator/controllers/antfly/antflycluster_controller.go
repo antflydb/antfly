@@ -5861,6 +5861,15 @@ func haDirectAdminActionNodeMatches(action antflyv1.HAPlannedActionStatus, resul
 		return false
 	}
 	expectedNodeID := strings.TrimSpace(action.AdminNodeID)
+	return expectedNodeID != "" && resultNodeID == expectedNodeID
+}
+
+func haAdminActionNodeMatches(action antflyv1.HAPlannedActionStatus, resultNodeID string) bool {
+	resultNodeID = strings.TrimSpace(resultNodeID)
+	if resultNodeID == "" {
+		return false
+	}
+	expectedNodeID := strings.TrimSpace(action.AdminNodeID)
 	return expectedNodeID == "" || resultNodeID == expectedNodeID
 }
 
@@ -5869,7 +5878,7 @@ func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
 	if result == nil {
 		return false
 	}
-	if !haDirectAdminActionNodeMatches(action, result.ActionNodeID) {
+	if !haAdminActionNodeMatches(action, result.ActionNodeID) {
 		return false
 	}
 	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
