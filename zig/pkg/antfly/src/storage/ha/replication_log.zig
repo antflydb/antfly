@@ -134,6 +134,10 @@ pub const ReplicationLog = struct {
     pub fn truncate(self: *ReplicationLog, up_to_lsn: u64) !void {
         try self.wal.truncate(up_to_lsn);
     }
+
+    pub fn truncateAfter(self: *ReplicationLog, keep_lsn: u64) !void {
+        try self.wal.truncateAfter(keep_lsn);
+    }
 };
 
 pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
@@ -284,6 +288,42 @@ test "storage.ha replication log truncates acknowledged entries" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 3), entries[0].record.lsn);
     try std.testing.expectEqualStrings("three", entries[0].record.payload);
+}
+
+test "storage.ha replication log truncates divergent suffix and reuses next lsn" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "truncate-suffix");
+    defer alloc.free(path);
+
+    {
+        var log = try ReplicationLog.open(path.ptr, .{});
+        defer log.close();
+
+        _ = try log.append(alloc, baseRecord(1, "one"));
+        _ = try log.append(alloc, baseRecord(2, "two"));
+        _ = try log.append(alloc, baseRecord(3, "divergent-three"));
+        _ = try log.append(alloc, baseRecord(4, "divergent-four"));
+        try std.testing.expectEqual(@as(u64, 4), log.lastLsn());
+
+        try log.truncateAfter(2);
+        try std.testing.expectEqual(@as(u64, 2), log.lastLsn());
+        try std.testing.expect((try log.entryAt(alloc, 3)) == null);
+        try std.testing.expectEqual(@as(u64, 3), try log.append(alloc, baseRecord(3, "new-three")));
+    }
+
+    {
+        var reopened = try ReplicationLog.open(path.ptr, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 3), reopened.lastLsn());
+        try std.testing.expectEqual(@as(u64, 4), reopened.nextLsn());
+
+        const entries = try reopened.iterateFrom(alloc, 1);
+        defer freeEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 3), entries.len);
+        try std.testing.expectEqualStrings("one", entries[0].record.payload);
+        try std.testing.expectEqualStrings("two", entries[1].record.payload);
+        try std.testing.expectEqualStrings("new-three", entries[2].record.payload);
+    }
 }
 
 test "storage.ha replication log bootstraps an empty log at a checkpoint lsn" {
