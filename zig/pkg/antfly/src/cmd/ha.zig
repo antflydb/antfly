@@ -201,6 +201,7 @@ fn runRemoteArgv(
 
     var client = ha.http_client.Client.init(alloc, executor);
     if (try executeTypedRemote(alloc, io, &client, remote_url, plan)) return;
+    if (!remoteCommandEndpointAllowed(plan.command, plan.output)) return error.HaRemoteTypedAdminRequired;
 
     var rendered = try client.executeCommand(remote_url, command_args);
     defer rendered.deinit(alloc);
@@ -419,6 +420,18 @@ fn executeTypedRemote(
         .operator_plan,
         => return false,
     }
+}
+
+fn remoteCommandEndpointAllowed(command: ha.admin_cli.Command, output: ha.admin_cli.OutputFormat) bool {
+    if (output == .prometheus) return false;
+    return switch (command) {
+        .identify_system,
+        .start_replication,
+        .stream_once,
+        .standby_status_update,
+        => true,
+        else => false,
+    };
 }
 
 fn writeRemoteBody(io: std.Io, body: []const u8) void {
@@ -946,6 +959,51 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
 }
 
+test "ha cmd remote rejects legacy command fallback for production admin operations" {
+    const alloc = std.testing.allocator;
+    var executor = RejectingExecutor{};
+
+    try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "operator",
+        "plan",
+        "--standby",
+        "standby-a",
+    }, executor.executor()));
+    try std.testing.expect(!executor.called);
+
+    try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "--prometheus",
+        "status",
+        "primary",
+        "--view",
+        "metrics",
+    }, executor.executor()));
+    try std.testing.expect(!executor.called);
+}
+
+test "ha cmd remote keeps command endpoint for replication compatibility operations" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "remote-compat-command");
+    defer paths.deinit(alloc);
+
+    var primary = try ha.primary.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+
+    var server = ha.http_admin.Server.init(alloc, .{
+        .primary = &primary,
+    });
+    defer server.deinit();
+    var recorder = RecordingExecutor.init(alloc, server.executor());
+    defer recorder.deinit();
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "identify",
+    }, recorder.executor());
+
+    try std.testing.expectEqual(http_common.Method.POST, recorder.last_method.?);
+    try expectContains(recorder.last_uri.?, ha.http_admin.Routes.command);
+}
+
 test "ha cmd renders typed JSON responses as dotted table fields" {
     const alloc = std.testing.allocator;
     const table = try renderJsonTableAlloc(alloc,
@@ -1147,6 +1205,27 @@ const RecordingExecutor = struct {
         self.last_uri = try self.alloc.dupe(u8, req.uri);
         self.last_method = req.method;
         return try self.inner.execute(alloc, req);
+    }
+};
+
+const RejectingExecutor = struct {
+    called: bool = false,
+
+    fn executor(self: *RejectingExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *RejectingExecutor = @ptrCast(@alignCast(ptr));
+        _ = alloc;
+        _ = req;
+        self.called = true;
+        return error.TestUnexpectedRemoteRequest;
     }
 };
 
