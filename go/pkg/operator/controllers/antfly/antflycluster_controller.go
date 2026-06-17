@@ -6584,6 +6584,13 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 	return haActionHasRequiredAdminResult(action)
 }
 
+func haAdminActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if haFormerPrimaryActionKind(action.Kind) {
+		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)
+	}
+	return haAdminActionSucceededWithEvidence(action)
+}
+
 func haActionRequiresAdminResult(kind haActionKind) bool {
 	_, _, ok := haDirectAdminActionReceiptSpec(kind)
 	return ok
@@ -6929,7 +6936,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
-			haAdminActionSucceededWithEvidence(action) {
+			haAdminActionSucceededWithStatusEvidence(cluster.Status.HAStatus, action) {
 			continue
 		}
 		jobName := action.AdminJobName

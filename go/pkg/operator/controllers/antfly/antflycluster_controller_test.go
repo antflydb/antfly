@@ -1005,6 +1005,72 @@ func TestUpdateHAAdminJobExecutionConditionReportsMissingResultEvidence(t *testi
 	g.Expect(degraded.Message).To(ContainSubstring("typed result evidence"))
 }
 
+func TestUpdateHAAdminJobExecutionConditionReportsFormerPrimaryResultWithoutPromotionReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	cluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  4,
+					ParentEpoch:       6,
+					NewTimelineID:     5,
+					NewEpoch:          7,
+					SwitchLSN:         12,
+					RequiredLSN:       12,
+					ObservedLSN:       12,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   3,
+				},
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:            string(haActionRewindFormerPrimary),
+					StandbyName:     "primary-a",
+					TargetLSN:       12,
+					ObservedLSN:     13,
+					RetainedFromLSN: 8,
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 3,
+					AdminNodeID:     "primary-a",
+					AdminJobName:    haAdminDirectAPIName,
+					AdminJobPhase:   haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						SchemaVersion:           1,
+						ActionID:                "rejoin_rewind:primary-a",
+						ActionKind:              "rejoin_rewind",
+						ActionTarget:            "primary-a",
+						ActionState:             "applied",
+						ActionNodeID:            "primary-a",
+						RejoinAction:            "rewind",
+						FormerNodeID:            "primary-a",
+						TargetTimelineID:        5,
+						TargetEpoch:             7,
+						ForkLSN:                 12,
+						FormerLastLSN:           13,
+						RetainedFromLSN:         8,
+						RewindExecuted:          true,
+						RewindPreviousLastLSN:   13,
+						RewindCurrentLastLSN:    12,
+						RewindNextLSN:           13,
+						RewindDiscardedLSNCount: 1,
+					},
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminResultMissing))
+	g.Expect(degraded.Message).To(ContainSubstring("RewindFormerPrimary"))
+	g.Expect(degraded.Message).To(ContainSubstring("dependent HA actions remain blocked"))
+}
+
 func TestUpdateHAAdminJobExecutionConditionReportsMismatchedDirectAdminReceipt(t *testing.T) {
 	g := NewWithT(t)
 
