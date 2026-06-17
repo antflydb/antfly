@@ -230,7 +230,10 @@ pub const Server = struct {
         defer snapshot.deinit(self.alloc);
         const slots = try slotListDocuments(self.alloc, snapshot);
         defer self.alloc.free(slots);
-        return try self.handleTypedJson(SlotListDocument{ .slots = slots });
+        return try self.handleTypedJson(admin_api.HAReplicationSlotListResponse{
+            .schema_version = 1,
+            .slots = slots,
+        });
     }
 
     fn handleAdminCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -255,10 +258,12 @@ pub const Server = struct {
         }) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        var receipt = try actionReceiptAlloc(self.alloc, "replication_slot_create", parsed.value.slot_name, "applied", node_id);
-        defer receipt.deinit(self.alloc);
         return switch (result) {
-            .create => |slot| try self.handleTypedJson(slotActionDocument(receipt, "create", slot, null)),
+            .create => |slot| blk: {
+                const action_id = try std.fmt.allocPrint(self.alloc, "replication_slot_create:{s}", .{parsed.value.slot_name});
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, "replication_slot_create", parsed.value.slot_name, node_id, "create", slot, null));
+            },
             else => unreachable,
         };
     }
@@ -281,13 +286,23 @@ pub const Server = struct {
             .@"resume" => "replication_slot_resume",
             .drop => "replication_slot_drop",
         };
-        var receipt = try actionReceiptAlloc(self.alloc, action_kind, slot_name, "applied", node_id);
-        defer receipt.deinit(self.alloc);
         return switch (result) {
             .create => unreachable,
-            .pause => |slot| try self.handleTypedJson(slotActionDocument(receipt, "pause", slot, slot.dropped)),
-            .@"resume" => |slot| try self.handleTypedJson(slotActionDocument(receipt, "resume", slot, slot.dropped)),
-            .drop => |slot| try self.handleTypedJson(slotActionDocument(receipt, "drop", slot, slot.dropped)),
+            .pause => |slot| blk: {
+                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ action_kind, slot_name });
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, "pause", slot, slot.dropped));
+            },
+            .@"resume" => |slot| blk: {
+                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ action_kind, slot_name });
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, "resume", slot, slot.dropped));
+            },
+            .drop => |slot| blk: {
+                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ action_kind, slot_name });
+                defer self.alloc.free(action_id);
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, "drop", slot, slot.dropped));
+            },
         };
     }
 
@@ -863,13 +878,6 @@ fn legacyCommandEndpointAllowed(command: admin_cli.Command, output: admin_cli.Ou
     };
 }
 
-const SlotActionDocument = struct {
-    schema_version: u32 = 1,
-    action: ActionReceiptDocument,
-    slot_action: []const u8,
-    slot: SlotDocument,
-};
-
 const CommitCheckDocument = struct {
     schema_version: u32 = 1,
     gate: CommitGateDocument,
@@ -1059,65 +1067,56 @@ fn adminI64(value: u64) !i64 {
     return @intCast(value);
 }
 
-const SlotDocument = struct {
-    slot_name: []const u8,
-    timeline_id: u64,
-    restart_lsn: u64,
-    received_lsn: u64,
-    applied_lsn: u64,
-    safe_read_lsn: u64,
-    active: bool,
-    reseed_required: bool,
-    last_error: ?[]const u8,
-    current_lsn: u64,
-    dropped: ?bool = null,
-};
-
-const SlotListDocument = struct {
-    schema_version: u32 = 1,
-    slots: []const SlotDocument,
-};
-
-fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]SlotDocument {
-    const slots = try alloc.alloc(SlotDocument, snapshot.slots.len);
+fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]admin_api.HAReplicationSlot {
+    const slots = try alloc.alloc(admin_api.HAReplicationSlot, snapshot.slots.len);
     errdefer alloc.free(slots);
     for (snapshot.slots, 0..) |slot, idx| {
         slots[idx] = .{
             .slot_name = slot.name,
-            .timeline_id = slot.timeline_id,
-            .restart_lsn = slot.restart_lsn,
-            .received_lsn = slot.received_lsn,
-            .applied_lsn = slot.applied_lsn,
-            .safe_read_lsn = slot.safe_read_lsn,
+            .timeline_id = try adminI64(slot.timeline_id),
+            .restart_lsn = try adminI64(slot.restart_lsn),
+            .received_lsn = try adminI64(slot.received_lsn),
+            .applied_lsn = try adminI64(slot.applied_lsn),
+            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
             .active = slot.active,
             .reseed_required = slot.reseed_required,
             .last_error = slot.last_error,
-            .current_lsn = snapshot.current_lsn,
+            .current_lsn = try adminI64(snapshot.current_lsn),
         };
     }
     return slots;
 }
 
 fn slotActionDocument(
-    action_receipt: ActionReceiptDocument,
+    action_id: []const u8,
+    action_kind: []const u8,
+    target: []const u8,
+    node_id: []const u8,
     action: []const u8,
     slot: anytype,
     dropped: ?bool,
-) SlotActionDocument {
+) !admin_api.HAReplicationSlotActionResponse {
     return .{
-        .action = action_receipt,
+        .schema_version = 1,
+        .action = .{
+            .action_id = action_id,
+            .action_kind = action_kind,
+            .target = target,
+            .state = "applied",
+            .node_id = node_id,
+        },
         .slot_action = action,
         .slot = .{
             .slot_name = slot.slot_name,
-            .timeline_id = slot.timeline_id,
-            .restart_lsn = slot.restart_lsn,
-            .received_lsn = slot.received_lsn,
-            .applied_lsn = slot.applied_lsn,
-            .safe_read_lsn = slot.safe_read_lsn,
+            .timeline_id = try adminI64(slot.timeline_id),
+            .restart_lsn = try adminI64(slot.restart_lsn),
+            .received_lsn = try adminI64(slot.received_lsn),
+            .applied_lsn = try adminI64(slot.applied_lsn),
+            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
             .active = slot.active,
             .reseed_required = slot.reseed_required,
             .last_error = slot.last_error,
-            .current_lsn = slot.current_lsn,
+            .current_lsn = try adminI64(slot.current_lsn),
             .dropped = dropped,
         },
     };
