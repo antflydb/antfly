@@ -6156,19 +6156,55 @@ func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
 		slot.ApplyLagLSN != nil &&
 		slot.SafeReadLagLSN != nil &&
 		slot.RetentionLagLSN != nil &&
-		strings.TrimSpace(slot.Status) != ""
+		haSlotStatusJSONValid(slot.Status)
 }
 
 func haDurabilityStatusJSONComplete(durability haDurabilityStatusJSON) bool {
-	return strings.TrimSpace(durability.Status) != "" &&
-		strings.TrimSpace(durability.Mode) != "" &&
-		strings.TrimSpace(durability.Selection) != "" &&
+	return haDurabilityDecisionStatusJSONValid(durability.Status) &&
+		haDurabilityModeJSONValid(durability.Mode) &&
+		haStandbySelectionJSONValid(durability.Selection) &&
 		durability.TargetLSN != nil &&
 		durability.ProgressLSN != nil &&
 		durability.MissingLSNCount != nil &&
 		durability.SatisfiedCount != nil &&
 		durability.RequiredCount != nil &&
 		durability.CandidateCount != nil
+}
+
+func haSlotStatusJSONValid(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "healthy", "lagging", "reseed_required":
+		return true
+	default:
+		return false
+	}
+}
+
+func haDurabilityDecisionStatusJSONValid(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "satisfied", "would_block", "fail_closed", "degraded_to_async":
+		return true
+	default:
+		return false
+	}
+}
+
+func haDurabilityModeJSONValid(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case "async", "remote_write", "remote_apply":
+		return true
+	default:
+		return false
+	}
+}
+
+func haStandbySelectionJSONValid(selection string) bool {
+	switch strings.TrimSpace(selection) {
+	case "any", "first", "all":
+		return true
+	default:
+		return false
+	}
 }
 
 func haStandbyStatusJSONComplete(snapshot *haStandbyStatusJSON) bool {
