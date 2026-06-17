@@ -602,7 +602,7 @@ func TestPlanHAEscapesSlotNamesInAdminPaths(t *testing.T) {
 
 func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	operations := loadAdminOpenAPIOperations(t)
-	statusOperations := []struct {
+	fixedOperations := []struct {
 		name        string
 		method      string
 		path        string
@@ -630,8 +630,22 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 			openAPIPath: "/ha/promotion/assess",
 			operationID: "assessHAPromotion",
 		},
+		{
+			name:        "current fence",
+			method:      "GET",
+			path:        haAdminFenceCurrentPath,
+			openAPIPath: "/ha/fence/current",
+			operationID: "getHACurrentFence",
+		},
+		{
+			name:        "combined fence and promote",
+			method:      "POST",
+			path:        haAdminPromotionPath,
+			openAPIPath: "/ha/promotion",
+			operationID: "promoteHA",
+		},
 	}
-	for _, tt := range statusOperations {
+	for _, tt := range fixedOperations {
 		t.Run(tt.name, func(t *testing.T) {
 			path := strings.TrimPrefix(tt.path, haAdminBasePath)
 			if path != tt.openAPIPath {
