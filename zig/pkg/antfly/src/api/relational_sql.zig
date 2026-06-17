@@ -11036,6 +11036,13 @@ const Parser = struct {
             lhs.query.not_predicates = groups;
             return;
         }
+        if (rhs.in_predicates.len > 0 and rhs.expression_or_predicates.len > 0) {
+            const groups = try expressionGroupsFromInSetQueryAlloc(self.alloc, rhs);
+            freeExpressionPredicateGroups(self.alloc, lhs.query.expression_not_predicates);
+            if (lhs.query.expression_not_predicates.len > 0) self.alloc.free(lhs.query.expression_not_predicates);
+            lhs.query.expression_not_predicates = groups;
+            return;
+        }
         if (rhs.expression_or_predicates.len > 0) {
             const groups = try cloneExpressionPredicateGroupsAlloc(self.alloc, rhs.expression_or_predicates);
             freeExpressionPredicateGroups(self.alloc, lhs.query.expression_not_predicates);
@@ -25335,6 +25342,8 @@ const Parser = struct {
                 }
             } else if (try self.canParseBareBooleanWhereExpression()) {
                 try self.parseBareBooleanWhereExpression(expression_predicates);
+            } else if (self.parenthesizedWhereHasTopLevelOr()) {
+                try self.parseExpressionOrWhere(expression_or_predicates);
             } else if (try self.canParseExpressionWhereCondition()) {
                 try self.parseExpressionWhereConditions(expression_predicates, expression_or_predicates, expression_not_predicates);
             } else {
@@ -25342,6 +25351,24 @@ const Parser = struct {
             }
             if (!self.matchKeyword("and")) break;
         }
+    }
+
+    fn parenthesizedWhereHasTopLevelOr(self: *@This()) bool {
+        if (!self.peekKind(.lparen)) return false;
+        const close_index = findMatchingRParenIndex(self.tokens, self.pos) orelse return false;
+        var depth: usize = 0;
+        var index = self.pos + 1;
+        while (index < close_index) : (index += 1) {
+            switch (self.tokens[index].kind) {
+                .lparen => depth += 1,
+                .rparen => if (depth == 0) return false else {
+                    depth -= 1;
+                },
+                .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(self.tokens[index].text, "or")) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn canParseBareBooleanWhereExpression(self: *@This()) !bool {
@@ -43435,7 +43462,8 @@ fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryReques
 fn querySupportsSimpleIntersectExceptRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
     if (!queryHasOnlySimpleIntersectExceptPredicateSurface(query)) return false;
     if (query.expression_or_predicates.len != 0) {
-        if (query.predicates.len != 0 or query.or_predicates.len != 0 or query.in_predicates.len != 0 or query.expression_predicates.len != 0) return false;
+        if (query.or_predicates.len != 0) return false;
+        if (query.in_predicates.len == 0 and (query.predicates.len != 0 or query.expression_predicates.len != 0)) return false;
     }
     if (query.or_predicates.len != 0 and
         (query.predicates.len != 0 or query.in_predicates.len != 0 or query.expression_predicates.len != 0))
@@ -43932,6 +43960,29 @@ fn expressionGroupsFromInSetQueryAlloc(
 
         groups[initialized] = .{ .conditions = conditions };
         initialized += 1;
+    }
+
+    errdefer {
+        freeExpressionPredicateGroups(alloc, groups);
+        alloc.free(groups);
+    }
+    if (query.expression_or_predicates.len != 0) {
+        if (groups.len > max_scalar_or_expanded_branches / query.expression_or_predicates.len) return error.UnsupportedSqlShape;
+        const combined = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, groups.len * query.expression_or_predicates.len);
+        var combined_initialized: usize = 0;
+        errdefer {
+            for (combined[0..combined_initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+            alloc.free(combined);
+        }
+        for (groups) |left| {
+            for (query.expression_or_predicates) |right| {
+                combined[combined_initialized] = .{ .conditions = try cloneExpressionConditionsConcatAlloc(alloc, left.conditions, right.conditions) };
+                combined_initialized += 1;
+            }
+        }
+        freeExpressionPredicateGroups(alloc, groups);
+        alloc.free(groups);
+        return combined;
     }
 
     return groups;
@@ -74353,6 +74404,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'",
         },
         .{
+            .name = "query except scalar in expression or set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_not_predicates = 4, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=4:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
+        },
+        .{
             .name = "query intersect expression set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .predicates = 2 },
@@ -74722,6 +74780,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_not_predicates = 2, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=2:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
             .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'",
+        },
+        .{
+            .name = "read except scalar in expression or set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .expression_not_predicates = 4, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=1:array_any=0:expr_pred=0:expr_or=0:expr_not=4:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
         },
         .{
             .name = "read union all boolean disjoint set operation",
@@ -83126,6 +83191,25 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqualStrings("\"deleted\"", mixed_except.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_except.query.expression_not_predicates[0].conditions[1].lhs.kind);
     try std.testing.expectEqualStrings("\"archived\"", mixed_except.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+
+    var in_expression_or_except = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
+        schema,
+        &.{},
+    );
+    defer in_expression_or_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_or_except.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_except.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_except.query.access_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 4), in_expression_or_except.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_or_except.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", in_expression_or_except.query.expression_not_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", in_expression_or_except.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_or_except.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"deleted\"", in_expression_or_except.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_or_except.query.expression_not_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"archived\"", in_expression_or_except.query.expression_not_predicates[2].conditions[0].rhs[0].value_json);
 
     var in_except = try lowerSelectAlloc(
         alloc,
