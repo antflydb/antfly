@@ -980,6 +980,36 @@ func (im *IndexManager) Unregister(name string) error {
 	return nil
 }
 
+// UnregisterMissing removes the on-disk artifacts and Pebble keys for an index that
+// is NOT currently loaded in the live manager — for example one whose Open() failed
+// at startup because its artifacts were corrupt. It constructs a fresh, un-opened
+// index object from the stored config purely to drive its Delete(), so a corrupt
+// index can still be dropped without first being loaded.
+func (im *IndexManager) UnregisterMissing(name string, config indexes.IndexConfig) error {
+	index, err := indexes.MakeIndex(
+		im.logger.Named(name),
+		im.antflyConfig,
+		im.db,
+		im.dir,
+		name,
+		&config,
+		im.cache,
+	)
+	if err != nil {
+		return fmt.Errorf("constructing index %s for deletion: %w", name, err)
+	}
+	// Delete() bounds its enrichment-key scan by the index byte range, which is
+	// normally set during Open(). Supply the shard byte range explicitly so the
+	// cleanup covers the full range.
+	if err := index.UpdateRange(im.byteRange); err != nil {
+		return fmt.Errorf("setting byte range for index %s deletion: %w", name, err)
+	}
+	if err := index.Delete(); err != nil {
+		return fmt.Errorf("deleting index %s: %w", name, err)
+	}
+	return nil
+}
+
 func (im *IndexManager) Stats() map[string]indexes.IndexStats {
 	stats := make(map[string]indexes.IndexStats, im.indexes.Size())
 	im.indexes.Range(func(name string, idx Index) bool {

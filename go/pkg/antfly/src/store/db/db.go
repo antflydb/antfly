@@ -316,6 +316,9 @@ type DB interface {
 	AddIndex(config indexes.IndexConfig) error
 	DeleteIndex(name string) error
 	HasIndex(name string) bool
+	// HasIndexConfig reports whether the index has a persisted config even if it is
+	// not currently loaded (for example after a failed open). Used by the drop path.
+	HasIndexConfig(name string) bool
 	GetIndexes() map[string]indexes.IndexConfig
 
 	LeaderFactory(ctx context.Context, persistEmbeddings PersistFunc) error
@@ -375,6 +378,11 @@ type DBImpl struct {
 	// Indexes configured at creation passed to IndexManager
 	indexesMu sync.RWMutex
 	indexes   map[string]indexes.IndexConfig
+	// failedIndexes records indexes whose Open() failed at startup (for example
+	// when their on-disk artifacts are corrupt). Their config stays in `indexes`
+	// so they remain known and droppable, but they are absent from the live
+	// IndexManager and the shard runs degraded. Guarded by indexesMu.
+	failedIndexes map[string]error
 
 	byteRange          atomic.Pointer[types.Range]
 	splitState         *SplitState // Raft-replicated split state (replaces local pendingSplitKey)
@@ -517,6 +525,45 @@ func (db *DBImpl) HasIndex(name string) bool {
 	return false
 }
 
+// HasIndexConfig reports whether the named index has a persisted config, regardless
+// of whether it is currently loaded in the live IndexManager. An index that failed
+// to open at startup still has a config, so this is used by the drop path to allow
+// removing it. Safe for concurrent access.
+func (db *DBImpl) HasIndexConfig(name string) bool {
+	db.indexesMu.RLock()
+	defer db.indexesMu.RUnlock()
+	_, ok := db.indexes[name]
+	return ok
+}
+
+// markIndexFailed records that an index failed to open (degraded startup). Safe for
+// concurrent access.
+func (db *DBImpl) markIndexFailed(name string, err error) {
+	db.indexesMu.Lock()
+	defer db.indexesMu.Unlock()
+	if db.failedIndexes == nil {
+		db.failedIndexes = make(map[string]error)
+	}
+	db.failedIndexes[name] = err
+}
+
+// clearFailedIndex removes any failed-open marker for an index (for example after a
+// successful re-open or a drop). Safe for concurrent access.
+func (db *DBImpl) clearFailedIndex(name string) {
+	db.indexesMu.Lock()
+	defer db.indexesMu.Unlock()
+	delete(db.failedIndexes, name)
+}
+
+// IsIndexFailed reports whether the named index failed to open at startup and is
+// therefore unavailable until dropped or recreated. Safe for concurrent access.
+func (db *DBImpl) IsIndexFailed(name string) bool {
+	db.indexesMu.RLock()
+	defer db.indexesMu.RUnlock()
+	_, ok := db.failedIndexes[name]
+	return ok
+}
+
 // getByteRange returns the current byte range, safe for concurrent access.
 func (db *DBImpl) getByteRange() types.Range {
 	if p := db.byteRange.Load(); p != nil {
@@ -550,13 +597,32 @@ func (db *DBImpl) DeleteIndex(name string) error {
 	db.indexesMu.Lock()
 	savedConfig, hadConfig := db.indexes[name]
 	delete(db.indexes, name)
-	if err := db.getIndexManager().Unregister(name); err != nil {
+
+	// Route based on whether the index is actually loaded. An index that failed to
+	// open at startup (for example with corrupt artifacts) has a persisted config but
+	// is absent from the live manager; clean its artifacts up directly so it can still
+	// be dropped. A name with neither a live index nor a config is not registered.
+	im := db.getIndexManager()
+	var unregErr error
+	switch {
+	case im != nil && im.HasIndex(name):
+		unregErr = im.Unregister(name)
+	case hadConfig:
+		// Persisted config but not loaded: clean up artifacts directly.
+		if im != nil {
+			unregErr = im.UnregisterMissing(name, savedConfig)
+		}
+	default:
+		unregErr = fmt.Errorf("index %s not registered", name)
+	}
+	if unregErr != nil {
 		if hadConfig {
 			db.indexes[name] = savedConfig
 		}
 		db.indexesMu.Unlock()
-		return fmt.Errorf("unregistering index %s: %w", name, err)
+		return fmt.Errorf("unregistering index %s: %w", name, unregErr)
 	}
+	delete(db.failedIndexes, name)
 	db.indexesMu.Unlock()
 
 	// Save updated indexes to Pebble
@@ -2212,8 +2278,16 @@ func (db *DBImpl) openIndex(dir string, recoverIndex bool) error {
 	for idx, conf := range db.indexes {
 		db.logger.Debug("Opening index", zap.String("index", idx), zap.Any("index_config", conf))
 		if err := db.getIndexManager().Register(idx, !recoverIndex, conf); err != nil {
-			return fmt.Errorf("registering preconfigured index: %w", err)
+			// A single index that fails to open (for example a corrupt on-disk
+			// artifact) must not bring down the whole shard. Run degraded: keep
+			// the config so the index stays known and droppable, record the
+			// failure, and continue opening the remaining indexes.
+			db.logger.Error("Failed to open index; shard will run degraded until it is dropped or recreated",
+				zap.String("index", idx), zap.Error(err))
+			db.markIndexFailed(idx, err)
+			continue
 		}
+		db.clearFailedIndex(idx)
 	}
 
 	if err := db.getIndexManager().Start(!recoverIndex); err != nil {
