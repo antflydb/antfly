@@ -1049,52 +1049,50 @@ pub const LazyDirectorySnapshot = struct {
         return segment_data;
     }
 
-    fn readPointValueAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, kind: EntryKind) !?[]u8 {
-        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-        return try readSegmentPointValueAlloc(alloc, self.io, self.dir, .{
-            .meta = entry.meta,
-            .path = entry.path,
-        }, posting_id, kind);
-    }
-
     fn readLatestPointValueAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?[]u8 {
         var best_segment_id: u64 = 0;
-        var best_value: ?[]u8 = null;
-        errdefer if (best_value) |value| alloc.free(value);
+        var best_manifest_entry: ?ManifestEntry = null;
+        var best_index_entry: IndexEntry = undefined;
 
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.segment_id <= best_segment_id) continue;
+            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
-            const value = (try self.readPointValueAlloc(alloc, entry, posting_id, kind)) orelse continue;
-            if (best_value) |previous| alloc.free(previous);
-            best_value = value;
+            const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
+            const found = (try readSegmentPointIndexEntryAlloc(alloc, self.io, self.dir, manifest_entry, posting_id, kind)) orelse continue;
             best_segment_id = entry.meta.segment_id;
+            best_manifest_entry = manifest_entry;
+            best_index_entry = found;
         }
-        return best_value;
-    }
 
-    fn readBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
-        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-        return try readSegmentBaseHeader(alloc, self.io, self.dir, .{
-            .meta = entry.meta,
-            .path = entry.path,
-        }, posting_id);
+        const manifest_entry = best_manifest_entry orelse return null;
+        return try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, best_index_entry);
     }
 
     fn readLatestBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
         var best_segment_id: u64 = 0;
-        var best_header: ?posting.PostingBaseHeader = null;
+        var best_manifest_entry: ?ManifestEntry = null;
+        var best_index_entry: IndexEntry = undefined;
 
         for (self.manifest.segments) |entry| {
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.segment_id <= best_segment_id) continue;
+            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
-            const header = (try self.readBaseHeader(alloc, entry, posting_id)) orelse continue;
-            best_header = header;
+            const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
+            const found = (try readSegmentPointIndexEntryAlloc(alloc, self.io, self.dir, manifest_entry, posting_id, .base)) orelse continue;
             best_segment_id = entry.meta.segment_id;
+            best_manifest_entry = manifest_entry;
+            best_index_entry = found;
         }
-        return best_header;
+
+        const manifest_entry = best_manifest_entry orelse return null;
+        var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
+        try readSegmentEntryValuePrefixInto(self.io, self.dir, manifest_entry, best_index_entry, &header_data);
+        const header = try posting.PostingFormat.decodeBaseHeader(&header_data);
+        if (header.posting_id != posting_id) return error.CorruptedPostingSegment;
+        return header;
     }
 
     fn readDeltaRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
@@ -1873,6 +1871,11 @@ pub fn readSegmentFileAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path:
 }
 
 pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, kind: EntryKind) !?[]u8 {
+    const found = (try readSegmentPointIndexEntryAlloc(alloc, io, dir, entry, posting_id, kind)) orelse return null;
+    return try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+}
+
+fn readSegmentPointIndexEntryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, kind: EntryKind) !?IndexEntry {
     if (kind == .delta) return error.InvalidPostingSegmentEntryKind;
     const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
     defer alloc.free(index_data);
@@ -1881,18 +1884,11 @@ pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
     if (match_index >= entry.meta.entry_count) return null;
     const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
     if (found.posting_id != posting_id or found.kind != kind or found.sequence != 0) return null;
-
-    return try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+    return found;
 }
 
 pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
-    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
-    defer alloc.free(index_data);
-
-    const match_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .base, 0);
-    if (match_index >= entry.meta.entry_count) return null;
-    const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
-    if (found.posting_id != posting_id or found.kind != .base or found.sequence != 0) return null;
+    const found = (try readSegmentPointIndexEntryAlloc(alloc, io, dir, entry, posting_id, .base)) orelse return null;
 
     var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
     try readSegmentEntryValuePrefixInto(io, dir, entry, found, &header_data);
