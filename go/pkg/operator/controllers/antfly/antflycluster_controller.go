@@ -4621,6 +4621,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return haPromotionJobResult{}, false
 	}
+	topLevel := envelope.Promotion.SwitchLSN != 0
 	result := &envelope.haPromotionAPIResult
 	if result.Promotion.SwitchLSN == 0 {
 		result = envelope.Result.PromoteCurrentFence
@@ -4642,6 +4643,9 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		result.Promotion.NewIdentity.Epoch == 0 ||
 		result.FenceGeneration == 0 ||
 		strings.TrimSpace(result.FenceToken) == "" {
+		return haPromotionJobResult{}, false
+	}
+	if topLevel && !haAdminActionReceiptPresent(result.Action) {
 		return haPromotionJobResult{}, false
 	}
 	observedLSN := result.Assessment.ReceivedLSN
@@ -4680,6 +4684,13 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		Forced:           result.Forced || result.Promotion.Forced,
 		DataLossPossible: result.Promotion.DataLossPossible,
 	}, true
+}
+
+func haAdminActionReceiptPresent(action haAdminActionReceiptJSON) bool {
+	return strings.TrimSpace(action.ActionID) != "" &&
+		strings.TrimSpace(action.ActionKind) != "" &&
+		strings.TrimSpace(action.Target) != "" &&
+		strings.TrimSpace(action.State) != ""
 }
 
 type haRejoinJobResult struct {
@@ -4886,6 +4897,7 @@ func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
 	assessment := envelope.Assessment
 	if strings.TrimSpace(assessment.Action) == "" ||
 		envelope.SchemaVersion == 0 ||
+		!haAdminActionReceiptPresent(envelope.Action) ||
 		strings.TrimSpace(assessment.FormerNodeID) == "" ||
 		assessment.TargetTimelineID == 0 ||
 		assessment.TargetEpoch == 0 {
