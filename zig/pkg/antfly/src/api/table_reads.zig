@@ -23024,6 +23024,118 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
         },
         .limit = 0,
     }, .read_index));
+
+    const hits_metric_reads = [_]graph_query_mod.GraphMetricRead{
+        .{ .name = "hits_authority", .freshness = .published },
+        .{ .name = "hits_hub", .freshness = .published },
+    };
+    const traversal_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{ "doc:j:hub:0", "doc:k:hub:0", "doc:l:hub:0", "doc:m:hub:0" } },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_results = 16 },
+        .metrics = &hits_metric_reads,
+        .include_metric_status = true,
+    };
+    var traversal_response = (try hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 0,
+        .graph_queries = &.{.{ .name = "hits_neighbors", .query = traversal_query }},
+    }, .read_index)).?;
+    defer traversal_response.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"graph_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"metric_status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"hits_authority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"hits_hub\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, "\"state\":\"building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, published_generation_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, building_generation_needle) != null);
+    for (prefixes) |prefix| {
+        const authority_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:authority\"", .{prefix});
+        defer alloc.free(authority_needle);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, authority_needle) != null);
+    }
+    for (active_shard_indices) |shard_index| {
+        const active_authority_needle = try std.fmt.allocPrint(alloc, "\"doc:{s}:active-authority\"", .{prefixes[shard_index]});
+        defer alloc.free(active_authority_needle);
+        try std.testing.expect(std.mem.indexOf(u8, traversal_response.json, active_authority_needle) == null);
+    }
+
+    const hits_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "hits_authority",
+        .freshness = .published,
+    }};
+    var ordered_traversal_query = traversal_query;
+    ordered_traversal_query.order_by = &hits_metric_orders;
+    var ordered_traversal_response = (try hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 0,
+        .graph_queries = &.{.{ .name = "ordered_hits_neighbors", .query = ordered_traversal_query }},
+    }, .read_index)).?;
+    defer ordered_traversal_response.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_traversal_response.json, "\"graph_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_traversal_response.json, "\"hits_authority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_traversal_response.json, "\"state\":\"building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_traversal_response.json, published_generation_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, ordered_traversal_response.json, building_generation_needle) != null);
+
+    const hits_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "hits_authority",
+        .op = .gte,
+        .value = 0.0,
+        .freshness = .published,
+    }};
+    var filtered_traversal_query = traversal_query;
+    filtered_traversal_query.where_metric = &hits_metric_filters;
+    var filtered_traversal_response = (try hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 0,
+        .graph_queries = &.{.{ .name = "filtered_hits_neighbors", .query = filtered_traversal_query }},
+    }, .read_index)).?;
+    defer filtered_traversal_response.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_traversal_response.json, "\"graph_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_traversal_response.json, "\"hits_authority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_traversal_response.json, "\"state\":\"building\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_traversal_response.json, published_generation_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered_traversal_response.json, building_generation_needle) != null);
+
+    const fresh_hits_metric_reads = [_]graph_query_mod.GraphMetricRead{
+        .{ .name = "hits_authority", .freshness = .fresh },
+        .{ .name = "hits_hub", .freshness = .fresh },
+    };
+    var fresh_traversal_query = traversal_query;
+    fresh_traversal_query.metrics = &fresh_hits_metric_reads;
+    try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 0,
+        .graph_queries = &.{.{ .name = "fresh_hits_neighbors", .query = fresh_traversal_query }},
+    }, .read_index));
+
+    const fresh_hits_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "hits_authority",
+        .freshness = .fresh,
+    }};
+    var fresh_ordered_traversal_query = traversal_query;
+    fresh_ordered_traversal_query.order_by = &fresh_hits_metric_orders;
+    try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 0,
+        .graph_queries = &.{.{ .name = "fresh_ordered_hits_neighbors", .query = fresh_ordered_traversal_query }},
+    }, .read_index));
+
+    const fresh_hits_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "hits_authority",
+        .op = .gte,
+        .value = 0.0,
+        .freshness = .fresh,
+    }};
+    var fresh_filtered_traversal_query = traversal_query;
+    fresh_filtered_traversal_query.where_metric = &fresh_hits_metric_filters;
+    try std.testing.expectError(error.MetricStale, hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 0,
+        .graph_queries = &.{.{ .name = "fresh_filtered_hits_neighbors", .query = fresh_filtered_traversal_query }},
+    }, .read_index));
 }
 
 test "hosted cross-range graph metric fan-in rejects incompatible remote hits pair" {
