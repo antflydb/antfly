@@ -1068,10 +1068,9 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec) strin
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionPromoteStandby:
 		return haStandbyAdminURL(ha, action.StandbyName)
-	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
-		if url := haStandbyAdminURL(ha, action.StandbyName); url != "" {
-			return url
-		}
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary:
+		return haStandbyAdminURL(ha, action.StandbyName)
+	case haActionReseedFormerPrimary:
 		if ha.Admin == nil {
 			return ""
 		}

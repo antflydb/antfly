@@ -587,6 +587,57 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	}
 }
 
+func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "standby-a",
+			AdminURL: "http://standby-a-ha.default.svc:8081",
+		}, {
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}},
+	}
+
+	tests := []struct {
+		name   string
+		action haPlannedAction
+		want   string
+	}{{
+		name:   "primary scoped slot",
+		action: haPlannedAction{Kind: haActionCreateSlot, StandbyName: "standby-a"},
+		want:   "http://primary-ha.default.svc:8081",
+	}, {
+		name:   "standby scoped promotion",
+		action: haPlannedAction{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
+		want:   "http://standby-a-ha.default.svc:8081",
+	}, {
+		name:   "former primary assess",
+		action: haPlannedAction{Kind: haActionDemoteFormerPrimary, StandbyName: "old-primary"},
+		want:   "http://old-primary-ha.default.svc:8081",
+	}, {
+		name:   "former primary rewind",
+		action: haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "old-primary"},
+		want:   "http://old-primary-ha.default.svc:8081",
+	}, {
+		name:   "former primary reseed scheduling",
+		action: haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "old-primary"},
+		want:   "http://primary-ha.default.svc:8081",
+	}, {
+		name:   "former primary rewind without node url",
+		action: haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "missing-old-primary"},
+		want:   "",
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := haAdminURL(tt.action, ha); got != tt.want {
+				t.Fatalf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestHAFormerPrimaryAdminCommandUsesExecutableRejoinSubcommands(t *testing.T) {
 	identity := &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
@@ -983,8 +1034,8 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[3].AdminCommand, expectedDemoteCommand) {
 		t.Fatalf("unexpected former-primary demote admin command: %#v", cluster.Status.HAStatus.PlannedActions[3].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[3].AdminURL != "http://primary-ha.default.svc:8081" {
-		t.Fatalf("expected former-primary demote to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[3])
+	if cluster.Status.HAStatus.PlannedActions[3].AdminURL != "" {
+		t.Fatalf("expected former-primary demote to require a former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[3])
 	}
 	if cluster.Status.HAStatus.PlannedActions[0].FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		cluster.Status.HAStatus.PlannedActions[0].FenceHolder != "standby-a" ||
@@ -1323,7 +1374,8 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
-		Name: "old-primary",
+		Name:     "old-primary",
+		AdminURL: "http://old-primary-ha.default.svc:8081",
 	}}
 	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
 		ClusterID:        100,
@@ -1415,8 +1467,8 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, expected) {
 		t.Fatalf("unexpected fenced rejoin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
 	}
-	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://primary-ha.default.svc:8081" {
-		t.Fatalf("expected former primary rejoin to target primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
+	if cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://old-primary-ha.default.svc:8081" {
+		t.Fatalf("expected former primary rejoin to target former-primary HA admin URL, got %#v", cluster.Status.HAStatus.PlannedActions[0])
 	}
 }
 
