@@ -137,6 +137,9 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 	if snapshot.Slots == nil {
 		return nil, fmt.Errorf("missing slot snapshots")
 	}
+	if err := haRetentionStatusJSONConsistent(*snapshot.CurrentLSN, snapshot.Retention, len(*snapshot.Slots)); err != nil {
+		return nil, err
+	}
 	parsed := &ParsedHAPrimaryStatus{
 		HasDurability: snapshot.Durability != nil,
 		Response: HAPrimaryStatusResponse{
@@ -158,6 +161,9 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 	for _, slot := range *snapshot.Slots {
 		if !haSlotStatusJSONComplete(slot) {
 			return nil, fmt.Errorf("missing slot snapshot fields")
+		}
+		if err := haSlotStatusJSONConsistent(*snapshot.CurrentLSN, slot); err != nil {
+			return nil, err
 		}
 		lastError := ""
 		if slot.LastError != nil {
@@ -183,6 +189,9 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 	if snapshot.Durability != nil {
 		if !haDurabilityStatusJSONComplete(*snapshot.Durability) {
 			return nil, fmt.Errorf("missing durability status fields")
+		}
+		if err := haDurabilityStatusJSONConsistent(*snapshot.Durability); err != nil {
+			return nil, err
 		}
 		parsed.Response.Snapshot.Durability = HADurabilityDecision{
 			Status:          HADurabilityDecisionStatus(strings.TrimSpace(snapshot.Durability.Status)),
@@ -231,6 +240,9 @@ func ParseHAStandbyStatus(raw []byte) (*HAStandbyStatusResponse, error) {
 	}
 	if !haStandbyStatusJSONComplete(snapshot) {
 		return nil, fmt.Errorf("missing standby status fields")
+	}
+	if err := haStandbyStatusJSONConsistent(snapshot); err != nil {
+		return nil, err
 	}
 	return &HAStandbyStatusResponse{
 		SchemaVersion: schemaVersion,
@@ -281,6 +293,31 @@ func haRetentionStatusJSONComplete(retention *haRetentionStatusJSON) bool {
 		retention.ReseedRecommended != nil
 }
 
+func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionStatusJSON, slotCount int) error {
+	primaryLSN := haUint64StatusValue(retention.PrimaryLSN)
+	oldestRestartLSN := haUint64StatusValue(retention.OldestRestartLSN)
+	retainedLSNCount := haUint64StatusValue(retention.RetainedLSNCount)
+	activeSlots := haUint64StatusValue(retention.ActiveSlots)
+	reseedRecommended := haUint64StatusValue(retention.ReseedRecommended)
+
+	if primaryLSN != currentLSN {
+		return fmt.Errorf("primary retention snapshot inconsistent: primary_lsn=%d current_lsn=%d", primaryLSN, currentLSN)
+	}
+	if oldestRestartLSN > primaryLSN {
+		return fmt.Errorf("primary retention snapshot inconsistent: oldest_restart_lsn=%d primary_lsn=%d", oldestRestartLSN, primaryLSN)
+	}
+	if retainedLSNCount != primaryLSN-oldestRestartLSN {
+		return fmt.Errorf("primary retention snapshot inconsistent: retained_lsn_count=%d expected=%d", retainedLSNCount, primaryLSN-oldestRestartLSN)
+	}
+	if activeSlots > uint64(slotCount) {
+		return fmt.Errorf("primary retention snapshot inconsistent: active_slots=%d slots=%d", activeSlots, slotCount)
+	}
+	if reseedRecommended > uint64(slotCount) {
+		return fmt.Errorf("primary retention snapshot inconsistent: reseed_recommended=%d slots=%d", reseedRecommended, slotCount)
+	}
+	return nil
+}
+
 func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
 	return strings.TrimSpace(slot.Name) != "" &&
 		slot.TimelineID != nil &&
@@ -298,6 +335,41 @@ func haSlotStatusJSONComplete(slot haSlotStatusJSON) bool {
 		haSlotStatusJSONValid(slot.Status)
 }
 
+func haSlotStatusJSONConsistent(currentLSN uint64, slot haSlotStatusJSON) error {
+	name := strings.TrimSpace(slot.Name)
+	restartLSN := haUint64StatusValue(slot.RestartLSN)
+	receivedLSN := haUint64StatusValue(slot.ReceivedLSN)
+	appliedLSN := haUint64StatusValue(slot.AppliedLSN)
+	safeReadLSN := haUint64StatusValue(slot.SafeReadLSN)
+	writeLagLSN := haUint64StatusValue(slot.WriteLagLSN)
+	applyLagLSN := haUint64StatusValue(slot.ApplyLagLSN)
+	safeReadLagLSN := haUint64StatusValue(slot.SafeReadLagLSN)
+	retentionLagLSN := haUint64StatusValue(slot.RetentionLagLSN)
+
+	if restartLSN > currentLSN || receivedLSN > currentLSN {
+		return fmt.Errorf("slot %s snapshot inconsistent: progress exceeds primary_lsn", name)
+	}
+	if appliedLSN > receivedLSN {
+		return fmt.Errorf("slot %s snapshot inconsistent: applied_lsn=%d received_lsn=%d", name, appliedLSN, receivedLSN)
+	}
+	if safeReadLSN > appliedLSN {
+		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lsn=%d applied_lsn=%d", name, safeReadLSN, appliedLSN)
+	}
+	if writeLagLSN != haSaturatingSub(currentLSN, receivedLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: write_lag_lsn=%d expected=%d", name, writeLagLSN, haSaturatingSub(currentLSN, receivedLSN))
+	}
+	if applyLagLSN != haSaturatingSub(currentLSN, appliedLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: apply_lag_lsn=%d expected=%d", name, applyLagLSN, haSaturatingSub(currentLSN, appliedLSN))
+	}
+	if safeReadLagLSN != haSaturatingSub(currentLSN, safeReadLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: safe_read_lag_lsn=%d expected=%d", name, safeReadLagLSN, haSaturatingSub(currentLSN, safeReadLSN))
+	}
+	if retentionLagLSN != haSaturatingSub(currentLSN, restartLSN) {
+		return fmt.Errorf("slot %s snapshot inconsistent: retention_lag_lsn=%d expected=%d", name, retentionLagLSN, haSaturatingSub(currentLSN, restartLSN))
+	}
+	return nil
+}
+
 func haDurabilityStatusJSONComplete(durability haDurabilityStatusJSON) bool {
 	return haDurabilityDecisionStatusJSONValid(durability.Status) &&
 		haDurabilityModeJSONValid(durability.Mode) &&
@@ -308,6 +380,32 @@ func haDurabilityStatusJSONComplete(durability haDurabilityStatusJSON) bool {
 		durability.SatisfiedCount != nil &&
 		durability.RequiredCount != nil &&
 		durability.CandidateCount != nil
+}
+
+func haDurabilityStatusJSONConsistent(durability haDurabilityStatusJSON) error {
+	targetLSN := haUint64StatusValue(durability.TargetLSN)
+	progressLSN := haUint64StatusValue(durability.ProgressLSN)
+	missingLSNCount := haUint64StatusValue(durability.MissingLSNCount)
+	satisfiedCount := haUint64StatusValue(durability.SatisfiedCount)
+	requiredCount := haUint64StatusValue(durability.RequiredCount)
+	candidateCount := haUint64StatusValue(durability.CandidateCount)
+
+	if progressLSN > targetLSN {
+		return fmt.Errorf("durability status inconsistent: progress_lsn=%d target_lsn=%d", progressLSN, targetLSN)
+	}
+	if missingLSNCount != targetLSN-progressLSN {
+		return fmt.Errorf("durability status inconsistent: missing_lsn_count=%d expected=%d", missingLSNCount, targetLSN-progressLSN)
+	}
+	if satisfiedCount > candidateCount {
+		return fmt.Errorf("durability status inconsistent: satisfied_count=%d candidate_count=%d", satisfiedCount, candidateCount)
+	}
+	if requiredCount > candidateCount {
+		return fmt.Errorf("durability status inconsistent: required_count=%d candidate_count=%d", requiredCount, candidateCount)
+	}
+	if HADurabilityDecisionStatus(strings.TrimSpace(durability.Status)) == HADurabilityStatusSatisfied && satisfiedCount < requiredCount {
+		return fmt.Errorf("durability status inconsistent: satisfied_count=%d required_count=%d", satisfiedCount, requiredCount)
+	}
+	return nil
 }
 
 func haSlotStatusJSONValid(status string) bool {
@@ -356,6 +454,44 @@ func haStandbyStatusJSONComplete(snapshot *haStandbyStatusJSON) bool {
 		snapshot.CanServeSafeReads != nil
 }
 
+func haStandbyStatusJSONConsistent(snapshot *haStandbyStatusJSON) error {
+	receivedLSN := haUint64StatusValue(snapshot.ReceivedLSN)
+	appliedLSN := haUint64StatusValue(snapshot.AppliedLSN)
+	safeReadLSN := haUint64StatusValue(snapshot.SafeReadLSN)
+	unappliedLSNCount := haUint64StatusValue(snapshot.UnappliedLSNCount)
+	caughtUpToReceived := haBoolStatusValue(snapshot.CaughtUpToReceived)
+	canServeSafeReads := haBoolStatusValue(snapshot.CanServeSafeReads)
+
+	if appliedLSN > receivedLSN {
+		return fmt.Errorf("standby status inconsistent: applied_lsn=%d received_lsn=%d", appliedLSN, receivedLSN)
+	}
+	if safeReadLSN > appliedLSN {
+		return fmt.Errorf("standby status inconsistent: safe_read_lsn=%d applied_lsn=%d", safeReadLSN, appliedLSN)
+	}
+	if unappliedLSNCount != receivedLSN-appliedLSN {
+		return fmt.Errorf("standby status inconsistent: unapplied_lsn_count=%d expected=%d", unappliedLSNCount, receivedLSN-appliedLSN)
+	}
+	if caughtUpToReceived != (appliedLSN >= receivedLSN) {
+		return fmt.Errorf("standby status inconsistent: caught_up_to_received=%t expected=%t", caughtUpToReceived, appliedLSN >= receivedLSN)
+	}
+	if canServeSafeReads != (safeReadLSN <= appliedLSN) {
+		return fmt.Errorf("standby status inconsistent: can_serve_safe_reads=%t expected=%t", canServeSafeReads, safeReadLSN <= appliedLSN)
+	}
+	if snapshot.UpstreamLSN != nil {
+		upstreamLSN := haUint64StatusValue(snapshot.UpstreamLSN)
+		if snapshot.WriteLagLSN != nil && haUint64StatusValue(snapshot.WriteLagLSN) != haSaturatingSub(upstreamLSN, receivedLSN) {
+			return fmt.Errorf("standby status inconsistent: write_lag_lsn=%d expected=%d", haUint64StatusValue(snapshot.WriteLagLSN), haSaturatingSub(upstreamLSN, receivedLSN))
+		}
+		if snapshot.ReceiveLagLSN != nil && haUint64StatusValue(snapshot.ReceiveLagLSN) != haSaturatingSub(upstreamLSN, receivedLSN) {
+			return fmt.Errorf("standby status inconsistent: receive_lag_lsn=%d expected=%d", haUint64StatusValue(snapshot.ReceiveLagLSN), haSaturatingSub(upstreamLSN, receivedLSN))
+		}
+		if snapshot.ApplyLagLSN != nil && haUint64StatusValue(snapshot.ApplyLagLSN) != haSaturatingSub(upstreamLSN, appliedLSN) {
+			return fmt.Errorf("standby status inconsistent: apply_lag_lsn=%d expected=%d", haUint64StatusValue(snapshot.ApplyLagLSN), haSaturatingSub(upstreamLSN, appliedLSN))
+		}
+	}
+	return nil
+}
+
 func haUint64StatusValue(value *uint64) uint64 {
 	if value == nil {
 		return 0
@@ -365,4 +501,11 @@ func haUint64StatusValue(value *uint64) uint64 {
 
 func haBoolStatusValue(value *bool) bool {
 	return value != nil && *value
+}
+
+func haSaturatingSub(a, b uint64) uint64 {
+	if b >= a {
+		return 0
+	}
+	return a - b
 }

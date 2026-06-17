@@ -69,6 +69,21 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"mode":"remote_write"`, `"mode":"remote-write"`, 1),
 			wantErr: "durability",
 		},
+		{
+			name:    "inconsistent retention count",
+			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"retained_lsn_count":5`, `"retained_lsn_count":4`, 1),
+			wantErr: "retention",
+		},
+		{
+			name:    "slot applied beyond received",
+			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"applied_lsn":12`, `"applied_lsn":13`, 1),
+			wantErr: "slot",
+		},
+		{
+			name:    "inconsistent durability missing count",
+			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"missing_lsn_count":0`, `"missing_lsn_count":1`, 1),
+			wantErr: "durability",
+		},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -118,6 +133,46 @@ func TestHAStatusParserRejectsMissingStandbySafeReadFlag(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "standby status fields") {
 		t.Fatalf("error = %q, want standby status fields", err.Error())
+	}
+}
+
+func TestHAStatusParserRejectsInconsistentStandbyProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name:    "applied beyond received",
+			body:    strings.Replace(haLegacyStandbyStatusJSON(), `"applied_lsn":11`, `"applied_lsn":13`, 1),
+			wantErr: "applied_lsn",
+		},
+		{
+			name:    "caught up flag lies",
+			body:    strings.Replace(haLegacyStandbyStatusJSON(), `"caught_up_to_received":false`, `"caught_up_to_received":true`, 1),
+			wantErr: "caught_up_to_received",
+		},
+		{
+			name:    "upstream apply lag lies",
+			body:    strings.Replace(haLegacyStandbyStatusJSON(), `"apply_lag_lsn":1`, `"apply_lag_lsn":0`, 1),
+			wantErr: "apply_lag_lsn",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := ParseHAStandbyStatus([]byte(tt.body))
+			if err == nil {
+				t.Fatalf("ParseHAStandbyStatus returned nil error, want %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -221,7 +276,7 @@ func haLegacyPrimaryStatusJSON() string {
 					"write_lag_lsn":0,
 					"apply_lag_lsn":0,
 					"safe_read_lag_lsn":0,
-					"retention_lag_lsn":0,
+					"retention_lag_lsn":5,
 					"status":"healthy",
 					"last_error":""
 				}]
