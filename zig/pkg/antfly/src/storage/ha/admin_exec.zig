@@ -1548,9 +1548,9 @@ test "storage.ha admin exec renders operator plan command" {
     var result = try execute(alloc, .{ .primary = &primary }, plan);
     defer result.deinit(alloc);
     try std.testing.expect(result.operator_plan.automatic_promotion_allowed);
-    try std.testing.expectEqual(@as(usize, 4), result.operator_plan.actions.len);
-    try std.testing.expectEqual(operator.ActionKind.update_primary_endpoint, result.operator_plan.actions[2].kind);
-    try std.testing.expectEqual(@as(u64, 9), result.operator_plan.actions[2].fencing_precondition.?.generation);
+    try std.testing.expectEqual(@as(usize, 5), result.operator_plan.actions.len);
+    try std.testing.expectEqual(operator.ActionKind.update_primary_endpoint, result.operator_plan.actions[3].kind);
+    try std.testing.expectEqual(@as(u64, 9), result.operator_plan.actions[3].fencing_precondition.?.generation);
 
     const json_body = try renderJsonAlloc(alloc, result);
     defer alloc.free(json_body);
@@ -1563,21 +1563,24 @@ test "storage.ha admin exec renders operator plan command" {
     defer alloc.free(table_body);
     try expectContains(table_body, "result=operator_plan\n");
     try expectContains(table_body, "automatic_promotion_allowed=true\n");
-    try expectContains(table_body, "action_count=4\n");
+    try expectContains(table_body, "action_count=5\n");
     try expectContains(table_body, "actions.0.kind=acquire_fence\n");
     try expectContains(table_body, "actions.0.phase=fence\n");
     try expectContains(table_body, "actions.0.executor=admin_api\n");
     try expectContains(table_body, "actions.0.fence_authority=kubernetes_lease\n");
     try expectContains(table_body, "actions.0.admin_method=POST\n");
     try expectContains(table_body, "actions.0.admin_path=/admin/v1/ha/fence\n");
-    try expectContains(table_body, "actions.1.kind=promote_standby\n");
+    try expectContains(table_body, "actions.1.kind=assess_promotion\n");
     try expectContains(table_body, "actions.1.depends_on=acquire_fence\n");
-    try expectContains(table_body, "actions.1.admin_path=/admin/v1/ha/promotion/current-fence\n");
-    try expectContains(table_body, "actions.2.kind=update_primary_endpoint\n");
-    try expectContains(table_body, "actions.2.executor=controller_action\n");
-    try expectContains(table_body, "actions.2.route_to=standby-a\n");
-    try expectContains(table_body, "actions.3.kind=demote_former_primary\n");
-    try expectContains(table_body, "actions.3.admin_path=/admin/v1/ha/rejoin/assess\n");
+    try expectContains(table_body, "actions.1.admin_path=/admin/v1/ha/promotion/assess\n");
+    try expectContains(table_body, "actions.2.kind=promote_standby\n");
+    try expectContains(table_body, "actions.2.depends_on=assess_promotion\n");
+    try expectContains(table_body, "actions.2.admin_path=/admin/v1/ha/promotion/current-fence\n");
+    try expectContains(table_body, "actions.3.kind=update_primary_endpoint\n");
+    try expectContains(table_body, "actions.3.executor=controller_action\n");
+    try expectContains(table_body, "actions.3.route_to=standby-a\n");
+    try expectContains(table_body, "actions.4.kind=demote_former_primary\n");
+    try expectContains(table_body, "actions.4.admin_path=/admin/v1/ha/rejoin/assess\n");
 }
 
 test "storage.ha admin exec operator plan assesses former primary rejoin" {

@@ -112,6 +112,7 @@ pub const ActionKind = enum {
     bootstrap_standby_seed,
     mark_reseed,
     acquire_fence,
+    assess_promotion,
     promote_standby,
     update_primary_endpoint,
     demote_former_primary,
@@ -292,6 +293,7 @@ fn adminUrlForAction(spec: Spec, action: Action) ?[]const u8 {
         .acquire_fence => standbyAdminUrl(spec, action.standby_name) orelse spec.primary_admin_url,
 
         .bootstrap_standby_seed,
+        .assess_promotion,
         .promote_standby,
         => standbyAdminUrl(spec, action.standby_name),
 
@@ -322,6 +324,7 @@ fn adminOperationForAction(alloc: Allocator, action: Action) !AdminOperation {
         .finish_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_base_backups_finish) },
         .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_standby_bootstrap) },
         .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_fence) },
+        .assess_promotion => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_promotion_assess) },
         .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_promotion_current_fence) },
         .demote_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_assess) },
         .rewind_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_rewind) },
@@ -541,9 +544,18 @@ pub fn reconcile(alloc: Allocator, spec: Spec, observed: Observed) !Plan {
             .reason = "AutomaticFailoverReady",
         });
         try actions.append(alloc, .{
-            .kind = .promote_standby,
+            .kind = .assess_promotion,
             .phase = .promote,
             .depends_on = .acquire_fence,
+            .fencing_precondition = fence_precondition,
+            .standby_name = promoted_node_id,
+            .target_lsn = observed.primary.current_lsn,
+            .reason = "AutomaticFailoverReady",
+        });
+        try actions.append(alloc, .{
+            .kind = .promote_standby,
+            .phase = .promote,
+            .depends_on = .assess_promotion,
             .fencing_precondition = fence_precondition,
             .standby_name = promoted_node_id,
             .target_lsn = observed.primary.current_lsn,
@@ -689,6 +701,17 @@ pub fn adminCommandForAction(
             if (options.force) try appendArg(alloc, &argv, "--force");
             try appendArg(alloc, &argv, "--reason");
             try appendArg(alloc, &argv, options.reason);
+        },
+        .assess_promotion => {
+            try appendArg(alloc, &argv, "promote");
+            try appendArg(alloc, &argv, "assess");
+            if (options.promote_from_current_fence) {
+                try appendArg(alloc, &argv, "--current-fence");
+            } else if (action.target_lsn) |target_lsn| {
+                try appendArg(alloc, &argv, "--required-lsn");
+                try appendOwnedFmt(alloc, &argv, &owned_args, "{d}", .{target_lsn});
+                try appendArg(alloc, &argv, "--fencing-confirmed");
+            }
         },
         .promote_standby => {
             try appendArg(alloc, &argv, "promote");
@@ -1717,6 +1740,7 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     );
     for (route_missing.actions) |action| {
         try std.testing.expect(action.kind != .acquire_fence);
+        try std.testing.expect(action.kind != .assess_promotion);
         try std.testing.expect(action.kind != .promote_standby);
     }
 
@@ -1915,35 +1939,42 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
     });
     defer safe.deinit(alloc);
     try std.testing.expect(safe.automatic_promotion_allowed);
-    try std.testing.expectEqual(@as(usize, 4), safe.actions.len);
+    try std.testing.expectEqual(@as(usize, 5), safe.actions.len);
     try std.testing.expectEqual(ActionKind.acquire_fence, safe.actions[0].kind);
-    try std.testing.expectEqual(ActionKind.promote_standby, safe.actions[1].kind);
-    try std.testing.expectEqual(ActionKind.update_primary_endpoint, safe.actions[2].kind);
-    try std.testing.expectEqual(ActionKind.demote_former_primary, safe.actions[3].kind);
+    try std.testing.expectEqual(ActionKind.assess_promotion, safe.actions[1].kind);
+    try std.testing.expectEqual(ActionKind.promote_standby, safe.actions[2].kind);
+    try std.testing.expectEqual(ActionKind.update_primary_endpoint, safe.actions[3].kind);
+    try std.testing.expectEqual(ActionKind.demote_former_primary, safe.actions[4].kind);
     try std.testing.expectEqual(ActionPhase.fence, safe.actions[0].phase);
     try std.testing.expectEqual(ActionPhase.promote, safe.actions[1].phase);
-    try std.testing.expectEqual(ActionPhase.route, safe.actions[2].phase);
-    try std.testing.expectEqual(ActionPhase.rejoin, safe.actions[3].phase);
+    try std.testing.expectEqual(ActionPhase.promote, safe.actions[2].phase);
+    try std.testing.expectEqual(ActionPhase.route, safe.actions[3].phase);
+    try std.testing.expectEqual(ActionPhase.rejoin, safe.actions[4].phase);
     try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[0].executor);
     try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[1].executor);
-    try std.testing.expectEqual(ActionExecutor.controller_action, safe.actions[2].executor);
-    try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[3].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[2].executor);
+    try std.testing.expectEqual(ActionExecutor.controller_action, safe.actions[3].executor);
+    try std.testing.expectEqual(ActionExecutor.admin_api, safe.actions[4].executor);
     try std.testing.expectEqual(@as(?ActionKind, null), safe.actions[0].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .acquire_fence), safe.actions[1].depends_on);
-    try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[2].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .assess_promotion), safe.actions[2].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[3].depends_on);
+    try std.testing.expectEqual(@as(?ActionKind, .promote_standby), safe.actions[4].depends_on);
     try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", safe.actions[0].admin_url.?);
     try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", safe.actions[1].admin_url.?);
-    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_url);
-    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", safe.actions[3].admin_url.?);
+    try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", safe.actions[2].admin_url.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[3].admin_url);
+    try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", safe.actions[4].admin_url.?);
     try std.testing.expectEqualStrings("POST", safe.actions[0].admin_method.?);
     try std.testing.expectEqualStrings("/admin/v1/ha/fence", safe.actions[0].admin_path.?);
     try std.testing.expectEqualStrings("POST", safe.actions[1].admin_method.?);
-    try std.testing.expectEqualStrings("/admin/v1/ha/promotion/current-fence", safe.actions[1].admin_path.?);
-    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_method);
-    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[2].admin_path);
-    try std.testing.expectEqualStrings("POST", safe.actions[3].admin_method.?);
-    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/assess", safe.actions[3].admin_path.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/promotion/assess", safe.actions[1].admin_path.?);
+    try std.testing.expectEqualStrings("POST", safe.actions[2].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/promotion/current-fence", safe.actions[2].admin_path.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[3].admin_method);
+    try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[3].admin_path);
+    try std.testing.expectEqualStrings("POST", safe.actions[4].admin_method.?);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/assess", safe.actions[4].admin_path.?);
     for (safe.actions) |action| {
         const precondition = action.fencing_precondition orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(FencingAuthority.kubernetes_lease, precondition.authority);
@@ -1952,10 +1983,10 @@ test "storage.ha operator gates automatic promotion on fencing and caught up sta
         try std.testing.expectEqualStrings("LeaseAcquired", precondition.reason);
     }
     try std.testing.expectEqualStrings("standby-a", safe.actions[2].standby_name.?);
-    try std.testing.expectEqualStrings("primary-a", safe.actions[2].route_from.?);
-    try std.testing.expectEqualStrings("standby-a", safe.actions[2].route_to.?);
-    try std.testing.expectEqualStrings("primary-a", safe.actions[3].standby_name.?);
-    try std.testing.expect((try adminCommandForAction(alloc, safe.actions[2], primary.identity, .{})) == null);
+    try std.testing.expectEqualStrings("primary-a", safe.actions[3].route_from.?);
+    try std.testing.expectEqualStrings("standby-a", safe.actions[3].route_to.?);
+    try std.testing.expectEqualStrings("primary-a", safe.actions[4].standby_name.?);
+    try std.testing.expect((try adminCommandForAction(alloc, safe.actions[3], primary.identity, .{})) == null);
     try std.testing.expect((condition(safe, .automatic_failover_ready) orelse return error.TestExpectedEqual).status);
 }
 
@@ -2045,6 +2076,8 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"admin_url\":\"http://standby-a-ha.default.svc:8081\"");
     try expectContains(rendered, "\"admin_method\":\"POST\"");
     try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/fence\"");
+    try expectContains(rendered, "\"kind\":\"assess_promotion\"");
+    try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/promotion/assess\"");
     try expectContains(rendered, "\"admin_path\":\"/admin/v1/ha/promotion/current-fence\"");
     try expectContains(rendered, "\"executor\":\"controller_action\"");
     try expectContains(rendered, "\"admin_url\":\"http://primary-ha.default.svc:8081\"");
@@ -2055,6 +2088,7 @@ test "storage.ha operator renders versioned json plan for controllers" {
     try expectContains(rendered, "\"generation\":11");
     try expectContains(rendered, "\"holder\":\"standby-a\"");
     try expectContains(rendered, "\"depends_on\":\"acquire_fence\"");
+    try expectContains(rendered, "\"depends_on\":\"assess_promotion\"");
     try expectContains(rendered, "\"severity\":\"info\"");
     try expectContains(rendered, "\"type\":\"automatic_failover_ready\"");
     try expectContains(rendered, "\"reason\":\"FencedPromotionReady\"");
@@ -2119,6 +2153,33 @@ test "storage.ha operator renders executable admin command for fenced promotion"
     try std.testing.expectEqual(@as(u64, 12), acquire_fence.required_lsn);
     try std.testing.expectEqual(@as(u64, 12), acquire_fence.observed_lsn);
     try std.testing.expectEqualStrings("operator-approved", acquire_fence.reason);
+
+    var assess_command = (try adminCommandForAction(alloc, .{
+        .kind = .assess_promotion,
+        .standby_name = "standby-a",
+        .target_lsn = 12,
+        .reason = "AutomaticFailoverReady",
+    }, identity, .{})).?;
+    defer assess_command.deinit(alloc);
+
+    var assess_plan = try assess_command.parsePlan(alloc);
+    defer assess_plan.deinit(alloc);
+    try std.testing.expect(assess_plan.command.promote_assess.use_current_fence);
+
+    var explicit_assess_command = (try adminCommandForAction(alloc, .{
+        .kind = .assess_promotion,
+        .standby_name = "standby-a",
+        .target_lsn = 12,
+        .reason = "AutomaticFailoverReady",
+    }, identity, .{
+        .promote_from_current_fence = false,
+    })).?;
+    defer explicit_assess_command.deinit(alloc);
+
+    var explicit_assess_plan = try explicit_assess_command.parsePlan(alloc);
+    defer explicit_assess_plan.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 12), explicit_assess_plan.command.promote_assess.check.required_lsn);
+    try std.testing.expect(explicit_assess_plan.command.promote_assess.check.fencing_confirmed);
 
     var command = (try adminCommandForAction(alloc, .{
         .kind = .promote_standby,
