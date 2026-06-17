@@ -776,9 +776,7 @@ pub const LazyDirectorySnapshot = struct {
     options: OpenStoreOptions,
 
     pub fn loadBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
-        const base_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .base)) orelse return null;
-        defer alloc.free(base_data);
-        return try posting.PostingFormat.decodeBaseHeader(base_data);
+        return try self.readLatestBaseHeader(alloc, posting_id);
     }
 
     pub fn loadBaseStats(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseStats {
@@ -1097,6 +1095,29 @@ pub const LazyDirectorySnapshot = struct {
             best_segment_id = entry.meta.segment_id;
         }
         return best_value;
+    }
+
+    fn readBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
+        if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
+        return try readSegmentBaseHeader(alloc, self.io, self.dir, .{
+            .meta = entry.meta,
+            .path = entry.path,
+        }, posting_id);
+    }
+
+    fn readLatestBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
+        var best_segment_id: u64 = 0;
+        var best_header: ?posting.PostingBaseHeader = null;
+
+        for (self.manifest.segments) |entry| {
+            if (!entry.meta.mayContainPosting(posting_id)) continue;
+            if (entry.meta.segment_id <= best_segment_id) continue;
+
+            const header = (try self.readBaseHeader(alloc, entry, posting_id)) orelse continue;
+            best_header = header;
+            best_segment_id = entry.meta.segment_id;
+        }
+        return best_header;
     }
 
     fn readDeltaRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator, entry: OwnedManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
@@ -1885,6 +1906,22 @@ pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
     if (found.posting_id != posting_id or found.kind != kind or found.sequence != 0) return null;
 
     return try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
+}
+
+pub fn readSegmentBaseHeader(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId) !?posting.PostingBaseHeader {
+    const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
+    defer alloc.free(index_data);
+
+    const match_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .base, 0);
+    if (match_index >= entry.meta.entry_count) return null;
+    const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
+    if (found.posting_id != posting_id or found.kind != .base or found.sequence != 0) return null;
+
+    var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
+    try readSegmentEntryValuePrefixInto(io, dir, entry, found, &header_data);
+    const header = try posting.PostingFormat.decodeBaseHeader(&header_data);
+    if (header.posting_id != posting_id) return error.CorruptedPostingSegment;
+    return header;
 }
 
 pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
@@ -3427,6 +3464,14 @@ fn readSegmentEntryValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, ent
     return value;
 }
 
+fn readSegmentEntryValuePrefixInto(io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, found: IndexEntry, out: []u8) !void {
+    if (found.len < out.len) return error.CorruptedPostingSegment;
+    const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
+    const prefix_end = std.math.add(usize, found.offset, out.len) catch return error.CorruptedPostingSegment;
+    if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset or prefix_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+    try readFileRangeInto(io, dir, entry.path, @intCast(found.offset), out);
+}
+
 fn readSegmentDeltaValueRangeAlloc(
     alloc: Allocator,
     io: std.Io,
@@ -3530,6 +3575,18 @@ fn readFileRangeAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path: []con
         else => return err,
     };
     return out;
+}
+
+fn readFileRangeInto(io: std.Io, dir: std.Io.Dir, path: []const u8, offset: u64, out: []u8) !void {
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    try reader.seekTo(offset);
+    reader.interface.readSliceAll(out) catch |err| switch (err) {
+        error.EndOfStream => return error.CorruptedPostingSegment,
+        else => return err,
+    };
 }
 
 fn segmentChecksum(data: []const u8) u32 {
@@ -3940,6 +3997,11 @@ pub fn testSegmentPointValueRangeReadsVerifyIndexAndValue() !void {
     const loaded = (try readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .base)).?;
     defer alloc.free(loaded);
     try std.testing.expectEqualSlices(u8, base, loaded);
+    const header = (try readSegmentBaseHeader(alloc, std.testing.io, tmp.dir, entry, 7)).?;
+    try std.testing.expectEqual(@as(PostingId, 7), header.posting_id);
+    try std.testing.expectEqual(@as(u64, 2), header.generation);
+    try std.testing.expectEqual(@as(usize, 3), header.member_count);
+    try std.testing.expect(try readSegmentBaseHeader(alloc, std.testing.io, tmp.dir, entry, 8) == null);
     try std.testing.expect(try readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 8, .base) == null);
     try std.testing.expectError(error.InvalidPostingSegmentEntryKind, readSegmentPointValueAlloc(alloc, std.testing.io, tmp.dir, entry, 7, .delta));
     const delta_records = try readSegmentDeltaRecordsAlloc(alloc, std.testing.io, tmp.dir, entry, 7, null);
