@@ -960,7 +960,7 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 	g.Expect(haDirectPromotionResultMatchesAction(unappliedBoundary, identity, &action)).To(BeFalse())
 }
 
-func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
+func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -1029,7 +1029,7 @@ func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
 			g.Expect(req.Method).To(Equal(http.MethodPost))
-			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/rejoin/assess"))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/rejoin/rewind"))
 			var payload map[string]any
 			g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 			g.Expect(payload["node_id"]).To(Equal("primary-a"))
@@ -1053,7 +1053,7 @@ func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 	}
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
-	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/rejoin/assess"}))
+	g.Expect(observed).To(Equal([]string{"POST /admin/v1/ha/rejoin/rewind"}))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
@@ -1084,7 +1084,7 @@ func TestReconcileHAAdminJobsExecutesRejoinAssessViaAdminAPI(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
-func TestReconcileHAAdminJobsRejectsDirectRejoinMismatchedAssessment(t *testing.T) {
+func TestReconcileHAAdminJobsRejectsDirectRejoinWorkflowMismatchedAssessment(t *testing.T) {
 	g := NewWithT(t)
 
 	s := runtime.NewScheme()
@@ -1148,7 +1148,7 @@ func TestReconcileHAAdminJobsRejectsDirectRejoinMismatchedAssessment(t *testing.
 		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/rejoin/assess"))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/rejoin/rewind"))
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},

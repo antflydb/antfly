@@ -38,6 +38,8 @@ pub const ha_promotion = ha ++ "/promotion";
 pub const ha_promotion_assess = ha_promotion ++ "/assess";
 pub const ha_promotion_current_fence = ha_promotion ++ "/current-fence";
 pub const ha_rejoin_assess = ha ++ "/rejoin/assess";
+pub const ha_rejoin_rewind = ha ++ "/rejoin/rewind";
+pub const ha_rejoin_reseed = ha ++ "/rejoin/reseed";
 
 pub fn replicationSlotPathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
     const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
@@ -154,6 +156,8 @@ test "admin routes define HA control-plane paths" {
     try std.testing.expectEqualStrings("/admin/v1/ha/promotion/assess", ha_promotion_assess);
     try std.testing.expectEqualStrings("/admin/v1/ha/promotion/current-fence", ha_promotion_current_fence);
     try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/assess", ha_rejoin_assess);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/rewind", ha_rejoin_rewind);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/reseed", ha_rejoin_reseed);
 }
 
 test "admin routes match generated OpenAPI HA operations" {
@@ -178,6 +182,8 @@ test "admin routes match generated OpenAPI HA operations" {
     try expectGeneratedRoute("promoteHAWithCurrentFence", "POST", ha_promotion_current_fence);
     try expectGeneratedRoute("promoteHA", "POST", ha_promotion);
     try expectGeneratedRoute("assessHARejoin", "POST", ha_rejoin_assess);
+    try expectGeneratedRoute("rewindHARejoin", "POST", ha_rejoin_rewind);
+    try expectGeneratedRoute("reseedHARejoin", "POST", ha_rejoin_reseed);
 }
 
 test "admin routes build and match replication slot lifecycle paths" {

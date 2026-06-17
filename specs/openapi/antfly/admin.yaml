@@ -481,6 +481,50 @@ paths:
                 $ref: "#/components/schemas/HARejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+  /ha/rejoin/rewind:
+    post:
+      tags: [ha]
+      operationId: rewindHARejoin
+      summary: Rewind a fenced former primary onto the promoted timeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejoinAssessRequest"
+      responses:
+        "200":
+          description: Former-primary rewind assessment accepted for execution.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HARejoinAssessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/rejoin/reseed:
+    post:
+      tags: [ha]
+      operationId: reseedHARejoin
+      summary: Reseed a fenced former primary when rewind is unsafe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejoinAssessRequest"
+      responses:
+        "200":
+          description: Former-primary reseed assessment accepted for execution.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HARejoinAssessResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
 components:
   parameters:
     SlotName:

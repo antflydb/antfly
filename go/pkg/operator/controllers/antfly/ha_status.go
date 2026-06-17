@@ -1081,8 +1081,12 @@ func haAdminOperation(action haPlannedAction) (string, string) {
 		return "POST", "/admin/v1/ha/fence"
 	case haActionPromoteStandby:
 		return "POST", "/admin/v1/ha/promotion/current-fence"
-	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+	case haActionDemoteFormerPrimary:
 		return "POST", "/admin/v1/ha/rejoin/assess"
+	case haActionRewindFormerPrimary:
+		return "POST", "/admin/v1/ha/rejoin/rewind"
+	case haActionReseedFormerPrimary:
+		return "POST", "/admin/v1/ha/rejoin/reseed"
 	}
 	return "", ""
 }

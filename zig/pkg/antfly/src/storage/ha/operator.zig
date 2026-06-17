@@ -321,10 +321,9 @@ fn adminOperationForAction(alloc: Allocator, action: Action) !AdminOperation {
         .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_standby_bootstrap) },
         .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_fence) },
         .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_promotion_current_fence) },
-        .demote_former_primary,
-        .rewind_former_primary,
-        .reseed_former_primary,
-        => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_assess) },
+        .demote_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_assess) },
+        .rewind_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_rewind) },
+        .reseed_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_reseed) },
         .update_primary_endpoint => .{},
     };
 }
@@ -2265,6 +2264,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     try std.testing.expectEqual(rejoin.Action.rewind, rewind.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.rewind_former_primary, rewind.actions[0].kind);
     try std.testing.expectEqual(ActionPhase.rejoin, rewind.actions[0].phase);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/rewind", rewind.actions[0].admin_path.?);
     try std.testing.expectEqual(@as(?u64, 10), rewind.actions[0].target_lsn);
     const rewind_fence = rewind.actions[0].fencing_precondition orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(FencingAuthority.kubernetes_lease, rewind_fence.authority);
@@ -2317,6 +2317,7 @@ test "storage.ha operator plans former primary rewind or reseed from fence recei
     defer reseed.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.reseed, reseed.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.reseed_former_primary, reseed.actions[0].kind);
+    try std.testing.expectEqualStrings("/admin/v1/ha/rejoin/reseed", reseed.actions[0].admin_path.?);
     try std.testing.expectEqualStrings("FormerPrimaryRequiresReseed", reseed.actions[0].reason);
     const reseed_fence = reseed.actions[0].fencing_precondition orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(FencingAuthority.kubernetes_lease, reseed_fence.authority);

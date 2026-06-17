@@ -339,7 +339,7 @@ func TestParseHAOperatorPlanTableActions(t *testing.T) {
 		plan.Actions[3].SeedManifestPath != "/backup/base.afha" ||
 		plan.Actions[3].SeedContentRoot != "/backup/base" ||
 		plan.Actions[3].AdminMethod != "POST" ||
-		plan.Actions[3].AdminPath != "/admin/v1/ha/rejoin/assess" {
+		plan.Actions[3].AdminPath != "/admin/v1/ha/rejoin/rewind" {
 		t.Fatalf("unexpected parsed former-primary action: %#v", plan.Actions[3])
 	}
 }
@@ -557,14 +557,14 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 		{
 			name:        "rewind former primary",
 			action:      haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "primary-a"},
-			openAPIPath: "/ha/rejoin/assess",
-			operationID: "assessHARejoin",
+			openAPIPath: "/ha/rejoin/rewind",
+			operationID: "rewindHARejoin",
 		},
 		{
 			name:        "reseed former primary",
 			action:      haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "primary-a"},
-			openAPIPath: "/ha/rejoin/assess",
-			operationID: "assessHARejoin",
+			openAPIPath: "/ha/rejoin/reseed",
+			operationID: "reseedHARejoin",
 		},
 	}
 

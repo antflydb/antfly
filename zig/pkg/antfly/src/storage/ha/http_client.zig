@@ -394,6 +394,32 @@ pub const Client = struct {
         );
     }
 
+    pub fn rewindRejoin(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.RejoinAssessRequest,
+    ) !ParsedOutput(admin_api.openapi.HARejoinAssessResponse) {
+        return try self.postJson(
+            admin_api.openapi.HARejoinAssessResponse,
+            base_uri,
+            admin_api.routes.ha_rejoin_rewind,
+            request,
+        );
+    }
+
+    pub fn reseedRejoin(
+        self: *Client,
+        base_uri: []const u8,
+        request: admin_api.openapi.RejoinAssessRequest,
+    ) !ParsedOutput(admin_api.openapi.HARejoinAssessResponse) {
+        return try self.postJson(
+            admin_api.openapi.HARejoinAssessResponse,
+            base_uri,
+            admin_api.routes.ha_rejoin_reseed,
+            request,
+        );
+    }
+
     fn replicationSlotLifecycle(
         self: *Client,
         base_uri: []const u8,
@@ -1202,6 +1228,24 @@ test "storage.ha http client round trips typed safety operations" {
     defer rejoin.deinit(alloc);
     try std.testing.expectEqualStrings("rewind", rejoin.parsed.value.assessment.action);
     try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
+
+    var rewind = try client.rewindRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 2,
+        .retained_from_lsn = 0,
+        .receipt = fence.parsed.value.receipt,
+    });
+    defer rewind.deinit(alloc);
+    try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
+
+    try std.testing.expectError(error.HaCommandConflict, client.reseedRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 2,
+        .retained_from_lsn = 0,
+        .receipt = fence.parsed.value.receipt,
+    }));
 }
 
 test "storage.ha http client maps admin errors" {

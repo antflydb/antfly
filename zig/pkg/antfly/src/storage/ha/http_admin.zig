@@ -144,6 +144,12 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess)) {
                     return try self.handleAdminAssessRejoin(req);
                 }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_rewind)) {
+                    return try self.handleAdminRewindRejoin(req);
+                }
+                if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed)) {
+                    return try self.handleAdminReseedRejoin(req);
+                }
                 return try textResponse(self.alloc, 404, "not found");
             },
             .PUT => {
@@ -560,6 +566,18 @@ pub const Server = struct {
     }
 
     fn handleAdminAssessRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        return try self.handleAdminRejoin(req, null);
+    }
+
+    fn handleAdminRewindRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        return try self.handleAdminRejoin(req, .rewind);
+    }
+
+    fn handleAdminReseedRejoin(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
+        return try self.handleAdminRejoin(req, .reseed);
+    }
+
+    fn handleAdminRejoin(self: *Server, req: http_common.HttpRequest, expected_action: ?rejoin.Action) !http_common.HttpResponse {
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA rejoin assessment request");
         var parsed = admin_api.openapi.server.parseAssessHARejoinBody(
             self.alloc,
@@ -583,16 +601,27 @@ pub const Server = struct {
         else
             null;
 
-        return try self.handleTypedJson(RejoinAssessDocument{
-            .assessment = ha_admin.assessFormerPrimaryRejoin(.{
-                .node_id = parsed.value.node_id,
-                .identity = identity,
-                .last_lsn = last_lsn,
-            }, receipt, .{
-                .retained_from_lsn = retained_from_lsn,
-                .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion orelse false,
-            }),
+        const assessment = ha_admin.assessFormerPrimaryRejoin(.{
+            .node_id = parsed.value.node_id,
+            .identity = identity,
+            .last_lsn = last_lsn,
+        }, receipt, .{
+            .retained_from_lsn = retained_from_lsn,
+            .allow_rewind_after_forced_promotion = parsed.value.allow_rewind_after_forced_promotion orelse false,
         });
+
+        if (expected_action) |expected| {
+            if (assessment.action != expected) {
+                const message = switch (expected) {
+                    .rewind => "HA rejoin assessment does not allow rewind",
+                    .reseed => "HA rejoin assessment does not allow reseed",
+                    else => "HA rejoin assessment does not allow requested action",
+                };
+                return try textResponse(self.alloc, 409, message);
+            }
+        }
+
+        return try self.handleTypedJson(RejoinAssessDocument{ .assessment = assessment });
     }
 
     fn parseFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
@@ -864,7 +893,9 @@ fn knownFixedRoute(path: []const u8) bool {
         std.mem.eql(u8, path, admin_api.routes.ha_promotion) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion_assess) or
         std.mem.eql(u8, path, admin_api.routes.ha_promotion_current_fence) or
-        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess);
+        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_assess) or
+        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_rewind) or
+        std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed);
 }
 
 const GateRole = enum {
@@ -1677,6 +1708,27 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_rejoin_fenced.body, "\"assessment\"");
     try expectContains(typed_rejoin_fenced.body, "\"action\":\"rewind\"");
     try expectContains(typed_rejoin_fenced.body, "\"target_timeline_id\":2");
+
+    var typed_rejoin_rewind = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_rewind,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer typed_rejoin_rewind.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_rewind.status);
+    try std.testing.expectEqualStrings("application/json", typed_rejoin_rewind.content_type.?);
+    try expectContains(typed_rejoin_rewind.body, "\"action\":\"rewind\"");
+
+    var typed_rejoin_reseed_mismatch = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_reseed,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer typed_rejoin_reseed_mismatch.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_reseed_mismatch.status);
+    try expectContains(typed_rejoin_reseed_mismatch.body, "does not allow reseed");
 
     var typed_promote_assess = try server.handle(.{
         .method = .POST,
