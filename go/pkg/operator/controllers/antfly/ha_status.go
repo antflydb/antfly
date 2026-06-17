@@ -2023,8 +2023,14 @@ func haApplyFormerPrimaryAssessment(evaluation *haFormerPrimaryEvaluation, forme
 }
 
 func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAPromotionStatus) bool {
+	if status == nil || promotion == nil {
+		return false
+	}
 	if promotion.FenceGeneration == 0 {
 		return false
+	}
+	if haPromotionReceipt(status) == promotion {
+		return true
 	}
 	if promotion.FenceAuthority != "" && status.Fencing.Authority != promotion.FenceAuthority {
 		return false

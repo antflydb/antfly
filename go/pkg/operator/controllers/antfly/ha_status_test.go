@@ -1840,6 +1840,98 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}
 }
 
+func TestUpdateHAStatusUsesPromotionReceiptForFormerPrimaryRejoinAfterFenceExpires(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "old-primary",
+	}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:     "old-primary",
+		AdminURL: "http://old-primary-ha.default.svc:8081",
+	}, {
+		Name:     "standby-a",
+		AdminURL: "http://standby-a-ha.default.svc:8081",
+	}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 12,
+		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+			CurrentTarget:   "standby-a",
+			FenceGeneration: 4,
+		},
+		Retention: antflyv1.HARetentionStatus{
+			OldestRestartLSN: 8,
+		},
+		Fencing: antflyv1.HAFencingStatus{
+			Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			Ready:      false,
+			Holder:     "standby-a",
+			Generation: 4,
+			Reason:     "LeaseExpired",
+		},
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			SwitchLSN:         10,
+			RequiredLSN:       10,
+			ObservedLSN:       10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   4,
+			FenceReason:       "operator-approved",
+			FenceToken:        "token",
+		},
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:        "old-primary",
+			SlotName:    "old-primary",
+			Active:      true,
+			TimelineID:  4,
+			ReceivedLSN: 10,
+			AppliedLSN:  10,
+		}, {
+			Name:        "standby-a",
+			SlotName:    "standby-a",
+			Active:      true,
+			TimelineID:  5,
+			ReceivedLSN: 12,
+			AppliedLSN:  12,
+			SafeReadLSN: 12,
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former := cluster.Status.HAStatus.FormerPrimary
+	if former == nil ||
+		!former.Fenced ||
+		!former.RejoinRequired ||
+		!former.RewindPossible ||
+		former.ReseedRequired ||
+		former.Action != string(haActionRewindFormerPrimary) ||
+		former.Reason != "FormerPrimaryNeedsRewind" {
+		t.Fatalf("expected promotion receipt to permit rewind after live fence expiry, got %#v", former)
+	}
+	if len(cluster.Status.HAStatus.PlannedActions) != 1 ||
+		cluster.Status.HAStatus.PlannedActions[0].Kind != string(haActionRewindFormerPrimary) ||
+		cluster.Status.HAStatus.PlannedActions[0].AdminURL != "http://old-primary-ha.default.svc:8081" {
+		t.Fatalf("expected executable former-primary rewind, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+	command := strings.Join(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, " ")
+	if !strings.Contains(command, "--fence-token token") ||
+		!strings.Contains(command, "--fence-generation 4") {
+		t.Fatalf("expected rejoin command to carry durable fence receipt, got %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
+	}
+}
+
 func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.T) {
 	cluster := haCluster()
 	disabled := false
