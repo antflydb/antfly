@@ -3983,6 +3983,57 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g.Expect(standby.Status).To(Equal("lagging"))
 }
 
+func TestObserveHAStandbyAdminStatusesSkipsPromotedPrimary(t *testing.T) {
+	g := NewWithT(t)
+
+	var observedHosts []string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			g.Expect(req.URL.Host).NotTo(Equal("standby-a-ha.default.svc:8081"))
+			observedHosts = append(observedHosts, req.URL.Host)
+			body := `{"schema_version":1,"snapshot":{"role":"standby","identity":{"timeline_id":5},"received_lsn":20,"applied_lsn":20,"safe_read_lsn":20,"upstream_lsn":21,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":1,"unapplied_lsn_count":0,"caught_up_to_received":true,"can_serve_safe_reads":true}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					SlotName: "slot-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}, {
+					Name:     "standby-b",
+					SlotName: "slot-b",
+					AdminURL: "http://standby-b-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode:       antflyv1.HAModeHotStandby,
+				PrimaryLSN: 21,
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					PromotedStandbyID: "standby-a",
+				},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)).To(Succeed())
+	g.Expect(observedHosts).To(Equal([]string{"standby-b-ha.default.svc:8081"}))
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].Name).To(Equal("standby-b"))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].SlotName).To(Equal("slot-b"))
+}
+
 func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {
 	g := NewWithT(t)
 

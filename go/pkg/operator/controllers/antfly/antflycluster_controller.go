@@ -5256,8 +5256,12 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
 	}
 
+	currentPrimaryID := haCurrentPrimaryNodeID(ha, cluster.Status.HAStatus)
 	var observedErr error
 	for _, standby := range ha.Standbys {
+		if strings.TrimSpace(standby.Name) == currentPrimaryID {
+			continue
+		}
 		if !standbyDesired(standby) || strings.TrimSpace(standby.AdminURL) == "" {
 			continue
 		}
