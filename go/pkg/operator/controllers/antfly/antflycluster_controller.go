@@ -5223,13 +5223,17 @@ func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Contex
 func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
 	ha := cluster.Spec.HighAvailability
 	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
-		ha.Admin == nil || strings.TrimSpace(ha.Admin.PrimaryURL) == "" {
+		ha.Admin == nil {
 		return nil
 	}
 	if cluster.Status.HAStatus == nil {
 		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
 	}
-	status, err := r.observeHAPrimaryStatusTyped(ctx, ha.Admin.PrimaryURL, ha)
+	adminURL := haCurrentPrimaryAdminURL(ha, cluster.Status.HAStatus)
+	if strings.TrimSpace(adminURL) == "" {
+		return nil
+	}
+	status, err := r.observeHAPrimaryStatusTyped(ctx, adminURL, ha)
 	if err != nil {
 		cluster.Status.HAStatus.PrimaryAdminReachable = false
 		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()

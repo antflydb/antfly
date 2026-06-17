@@ -3844,6 +3844,48 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(ContainSubstring("primary admin refused connection"))
 }
 
+func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T) {
+	g := NewWithT(t)
+
+	var observedHost string
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
+			observedHost = req.URL.Host
+			body := `{"schema_version":1,"snapshot":{"role":"primary","current_lsn":21,"slots":[],"retention":{}}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode:  antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://old-primary-ha.default.svc:8081"},
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{PromotedStandbyID: "standby-a"},
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAPrimaryAdminStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(observedHost).To(Equal("standby-a-ha.default.svc:8081"))
+	g.Expect(cluster.Status.HAStatus.PrimaryLSN).To(Equal(uint64(21)))
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminReachable).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(BeEmpty())
+}
+
 func TestObserveHAPrimaryAdminStatusDoesNotFallbackToCommandEndpoint(t *testing.T) {
 	g := NewWithT(t)
 
