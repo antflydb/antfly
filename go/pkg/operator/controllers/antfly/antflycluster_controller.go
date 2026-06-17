@@ -5229,6 +5229,7 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 		return false
 	}
 	expectedSlotName := haActionSlotName(action)
+	expectedManifestID := haExpectedSeedBeginManifestID(action, expectedSlotName)
 	switch haActionKind(action.Kind) {
 	case haActionCreateSlot:
 		return result.SlotAction == "create" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
@@ -5240,15 +5241,15 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 		return result.SlotAction == "drop" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
 	case haActionSeedStandby, haActionMarkReseed:
 		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
-			haResultManifestMatches(result.ManifestID, haExpectedSeedBeginManifestID(action, expectedSlotName)) &&
+			haResultManifestMatches(result.ManifestID, expectedManifestID) &&
 			result.BackupLSN > 0 &&
 			result.StartRecordLSN > 0
 	case haActionFinishStandbySeed:
-		return result.ManifestID != "" &&
+		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
 			result.BackupLSN > 0 &&
 			result.EndRecordLSN > 0
 	case haActionBootstrapStandbySeed:
-		return result.ManifestID != "" &&
+		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
 			result.BackupLSN > 0 &&
 			result.CheckpointLSN > 0
 	case haActionAcquireFence:

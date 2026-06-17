@@ -1356,6 +1356,46 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	}
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 
+	seedFileActions := []antflyv1.HAPlannedActionStatus{{
+		Kind:          string(haActionFinishStandbySeed),
+		StandbyName:   "standby-a",
+		SlotName:      "standby-a",
+		TargetLSN:     5,
+		AdminCommand:  []string{"seed", "finish", "--manifest", "/backup/base-standby-a-5.afha"},
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			ManifestID:   "base-standby-b-5",
+			BackupLSN:    5,
+			EndRecordLSN: 5,
+		},
+	}, {
+		Kind:      string(haActionBootstrapStandbySeed),
+		DependsOn: string(haActionFinishStandbySeed),
+		AdminCommand: []string{
+			"seed", "bootstrap",
+			"--manifest", "/backup/base-standby-a-5.afha",
+			"--content-root", "/backup/base-standby-a-5",
+		},
+	}}
+	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeFalse())
+
+	seedFileActions[0].AdminResult.ManifestID = "base-standby-a-5"
+	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeTrue())
+
+	seedFileActions[1].AdminJobPhase = haAdminJobPhaseSucceeded
+	seedFileActions[1].StandbyName = "standby-a"
+	seedFileActions[1].SlotName = "standby-a"
+	seedFileActions[1].TargetLSN = 5
+	seedFileActions[1].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		ManifestID:    "base-standby-b-5",
+		BackupLSN:     5,
+		CheckpointLSN: 5,
+	}
+	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeFalse())
+
+	seedFileActions[1].AdminResult.ManifestID = "base-standby-a-5"
+	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeTrue())
+
 	promotionActions := []antflyv1.HAPlannedActionStatus{{
 		Kind:            string(haActionPromoteStandby),
 		StandbyName:     "standby-a",
