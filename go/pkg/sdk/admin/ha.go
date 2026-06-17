@@ -15,10 +15,20 @@ type (
 	HAActionReceipt                    = oapi.HAActionReceipt
 	HABaseBackupBeginResponse          = oapi.HABaseBackupBeginResponse
 	HABaseBackupFinishResponse         = oapi.HABaseBackupFinishResponse
+	HACommitAppendResponse             = oapi.HACommitAppendResponse
+	HACommitCheckResponse              = oapi.HACommitCheckResponse
+	HACommitGate                       = oapi.HACommitGate
+	HACommitGateAction                 = oapi.HACommitGateAction
 	HACurrentFenceResponse             = oapi.HACurrentFenceResponse
+	HADurabilityDecision               = oapi.HADurabilityDecision
 	HAFenceReceipt                     = oapi.HAFenceReceipt
 	HAFenceResponse                    = oapi.HAFenceResponse
 	HAIdentity                         = oapi.HAIdentity
+	HAOwnerJobCheckResponse            = oapi.HAOwnerJobCheckResponse
+	HAOwnerJobDecision                 = oapi.HAOwnerJobDecision
+	HAOwnerJobDecisionAction           = oapi.HAOwnerJobDecisionAction
+	HAOwnerJobDecisionKind             = oapi.HAOwnerJobDecisionKind
+	HAOwnerJobDecisionRole             = oapi.HAOwnerJobDecisionRole
 	HAPrimaryStatusParams              = oapi.GetHAPrimaryStatusParams
 	HAPrimaryStatusParamsSyncMode      = oapi.GetHAPrimaryStatusParamsSyncMode
 	HAPrimaryStatusParamsSyncSelection = oapi.GetHAPrimaryStatusParamsSyncSelection
@@ -26,20 +36,43 @@ type (
 	HAPrimaryStatusResponse            = oapi.HAPrimaryStatusResponse
 	HAPromotionAssessResponse          = oapi.HAPromotionAssessResponse
 	HAPromotionResponse                = oapi.HAPromotionResponse
+	HAReadCheckResponse                = oapi.HAReadCheckResponse
+	HAReadDecision                     = oapi.HAReadDecision
+	HAReadDecisionAction               = oapi.HAReadDecisionAction
+	HAReadDecisionConsistency          = oapi.HAReadDecisionConsistency
 	HARejoinAssessResponse             = oapi.HARejoinAssessResponse
 	HAReplicationSlotActionResponse    = oapi.HAReplicationSlotActionResponse
 	HAReplicationSlotListResponse      = oapi.HAReplicationSlotListResponse
 	HAStandbyBootstrapResponse         = oapi.HAStandbyBootstrapResponse
 	HAStandbyStatusParams              = oapi.GetHAStandbyStatusParams
 	HAStandbyStatusResponse            = oapi.HAStandbyStatusResponse
+	HASyncPolicy                       = oapi.HASyncPolicy
+	HASyncPolicyFailurePolicy          = oapi.HASyncPolicyFailurePolicy
+	HASyncPolicyMode                   = oapi.HASyncPolicyMode
+	HASyncPolicySelection              = oapi.HASyncPolicySelection
+	HAWriteCheckResponse               = oapi.HAWriteCheckResponse
+	HAWriteDecision                    = oapi.HAWriteDecision
+	HAWriteDecisionAction              = oapi.HAWriteDecisionAction
+	HAWriteDecisionRole                = oapi.HAWriteDecisionRole
 
 	BaseBackupManifestPathRequest = oapi.BaseBackupManifestPathRequest
 	BaseBackupStartRequest        = oapi.BaseBackupStartRequest
+	CommitAppendRequest           = oapi.CommitAppendRequest
+	CommitAppendRequestKind       = oapi.CommitAppendRequestKind
+	CommitAppendRequestCodec      = oapi.CommitAppendRequestPayloadCodec
+	CommitCheckRequest            = oapi.CommitCheckRequest
 	FenceAcquireRequest           = oapi.FenceAcquireRequest
+	OwnerJobCheckRequest          = oapi.OwnerJobCheckRequest
+	OwnerJobCheckRequestKind      = oapi.OwnerJobCheckRequestKind
+	OwnerJobCheckRequestRole      = oapi.OwnerJobCheckRequestRole
 	PromotionAssessRequest        = oapi.PromotionAssessRequest
+	ReadCheckRequest              = oapi.ReadCheckRequest
+	ReadCheckRequestConsistency   = oapi.ReadCheckRequestConsistency
 	RejoinAssessRequest           = oapi.RejoinAssessRequest
 	ReplicationSlotCreateRequest  = oapi.ReplicationSlotCreateRequest
 	StandbyBootstrapRequest       = oapi.StandbyBootstrapRequest
+	WriteCheckRequest             = oapi.WriteCheckRequest
+	WriteCheckRequestRole         = oapi.WriteCheckRequestRole
 )
 
 const (
@@ -54,6 +87,47 @@ const (
 	HAPrimaryStatusSyncFailureBlock          = oapi.GetHAPrimaryStatusParamsSyncFailureBlock
 	HAPrimaryStatusSyncFailureFailClosed     = oapi.GetHAPrimaryStatusParamsSyncFailureFailClosed
 	HAPrimaryStatusSyncFailureDegradeToAsync = oapi.GetHAPrimaryStatusParamsSyncFailureDegradeToAsync
+
+	HASyncPolicyModeAsync       = oapi.HASyncPolicyModeAsync
+	HASyncPolicyModeRemoteWrite = oapi.HASyncPolicyModeRemoteWrite
+	HASyncPolicyModeRemoteApply = oapi.HASyncPolicyModeRemoteApply
+
+	HASyncPolicySelectionAny   = oapi.HASyncPolicySelectionAny
+	HASyncPolicySelectionFirst = oapi.HASyncPolicySelectionFirst
+	HASyncPolicySelectionAll   = oapi.HASyncPolicySelectionAll
+
+	HASyncPolicyFailureBlock          = oapi.HASyncPolicyFailurePolicyBlock
+	HASyncPolicyFailureFailClosed     = oapi.HASyncPolicyFailurePolicyFailClosed
+	HASyncPolicyFailureDegradeToAsync = oapi.HASyncPolicyFailurePolicyDegradeToAsync
+
+	CommitAppendKindBatchMutation    = oapi.CommitAppendRequestKindBatchMutation
+	CommitAppendKindMetadataMutation = oapi.CommitAppendRequestKindMetadataMutation
+	CommitAppendKindDerivedEffect    = oapi.CommitAppendRequestKindDerivedEffect
+	CommitAppendKindTimelineSwitch   = oapi.CommitAppendRequestKindTimelineSwitch
+	CommitAppendKindBackupStart      = oapi.CommitAppendRequestKindBackupStart
+	CommitAppendKindBackupEnd        = oapi.CommitAppendRequestKindBackupEnd
+	CommitAppendKindCheckpoint       = oapi.CommitAppendRequestKindCheckpoint
+	CommitAppendKindManifest         = oapi.CommitAppendRequestKindManifest
+	CommitAppendKindTruncate         = oapi.CommitAppendRequestKindTruncate
+
+	CommitAppendCodecRaw    = oapi.CommitAppendRequestPayloadCodecRaw
+	CommitAppendCodecJSON   = oapi.CommitAppendRequestPayloadCodecJson
+	CommitAppendCodecBinary = oapi.CommitAppendRequestPayloadCodecBinary
+
+	ReadCheckConsistencyStaleOK    = oapi.ReadCheckRequestConsistencyStaleOk
+	ReadCheckConsistencyAtLeastLSN = oapi.ReadCheckRequestConsistencyAtLeastLsn
+	ReadCheckConsistencyPrimary    = oapi.ReadCheckRequestConsistencyPrimary
+
+	WriteCheckRolePrimary = oapi.WriteCheckRequestRolePrimary
+	WriteCheckRoleStandby = oapi.WriteCheckRequestRoleStandby
+
+	OwnerJobCheckKindCompactionPublish   = oapi.OwnerJobCheckRequestKindCompactionPublish
+	OwnerJobCheckKindRetentionAdvance    = oapi.OwnerJobCheckRequestKindRetentionAdvance
+	OwnerJobCheckKindDerivedEffectWriter = oapi.OwnerJobCheckRequestKindDerivedEffectWriter
+	OwnerJobCheckKindEnrichmentWriter    = oapi.OwnerJobCheckRequestKindEnrichmentWriter
+
+	OwnerJobCheckRolePrimary = oapi.OwnerJobCheckRequestRolePrimary
+	OwnerJobCheckRoleStandby = oapi.OwnerJobCheckRequestRoleStandby
 )
 
 // HAClient is a typed client for the stable /admin/v1/ha API.
@@ -186,6 +260,66 @@ func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyS
 
 func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
 	return haResponseValue(c.StandbyStatusResponse(ctx, params))
+}
+
+func (c *HAClient) AppendCommitResponse(ctx context.Context, body CommitAppendRequest) (*HAResponse[HACommitAppendResponse], error) {
+	resp, err := c.client.AppendHACommitWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("append HA commit", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) AppendCommit(ctx context.Context, body CommitAppendRequest) (*HACommitAppendResponse, error) {
+	return haResponseValue(c.AppendCommitResponse(ctx, body))
+}
+
+func (c *HAClient) CheckCommitResponse(ctx context.Context, body CommitCheckRequest) (*HAResponse[HACommitCheckResponse], error) {
+	resp, err := c.client.CheckHACommitWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("check HA commit", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) CheckCommit(ctx context.Context, body CommitCheckRequest) (*HACommitCheckResponse, error) {
+	return haResponseValue(c.CheckCommitResponse(ctx, body))
+}
+
+func (c *HAClient) CheckReadResponse(ctx context.Context, body ReadCheckRequest) (*HAResponse[HAReadCheckResponse], error) {
+	resp, err := c.client.CheckHAReadWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("check HA read", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) CheckRead(ctx context.Context, body ReadCheckRequest) (*HAReadCheckResponse, error) {
+	return haResponseValue(c.CheckReadResponse(ctx, body))
+}
+
+func (c *HAClient) CheckWriteResponse(ctx context.Context, body WriteCheckRequest) (*HAResponse[HAWriteCheckResponse], error) {
+	resp, err := c.client.CheckHAWriteWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("check HA write", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) CheckWrite(ctx context.Context, body WriteCheckRequest) (*HAWriteCheckResponse, error) {
+	return haResponseValue(c.CheckWriteResponse(ctx, body))
+}
+
+func (c *HAClient) CheckOwnerJobResponse(ctx context.Context, body OwnerJobCheckRequest) (*HAResponse[HAOwnerJobCheckResponse], error) {
+	resp, err := c.client.CheckHAOwnerJobWithResponse(ctx, body, c.editors...)
+	if resp == nil {
+		return nil, err
+	}
+	return requireHAJSON200("check HA owner job", resp.StatusCode(), resp.Body, resp.JSON200, err)
+}
+
+func (c *HAClient) CheckOwnerJob(ctx context.Context, body OwnerJobCheckRequest) (*HAOwnerJobCheckResponse, error) {
+	return haResponseValue(c.CheckOwnerJobResponse(ctx, body))
 }
 
 func (c *HAClient) ListReplicationSlotsResponse(ctx context.Context) (*HAResponse[HAReplicationSlotListResponse], error) {
