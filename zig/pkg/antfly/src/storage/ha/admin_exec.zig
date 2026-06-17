@@ -294,6 +294,9 @@ fn renderTableWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Re
             }
         },
         .promote_assess => |assessment| {
+            if (standbyActionNodeID(maybe_ctx)) |node_id| {
+                try appendActionReceiptLines(alloc, &out, "promotion_assess", node_id, "assessed", node_id);
+            }
             try appendPromotionAssessmentLines(alloc, &out, "assessment", assessment);
         },
         .promote_current_fence => |promotion_result| {
@@ -2081,6 +2084,14 @@ test "storage.ha admin exec runs read commit promote and rejoin commands" {
     defer alloc.free(direct_assess_table);
     try expectContains(direct_assess_table, "result=promote_assess\n");
     try expectContains(direct_assess_table, "assessment.can_promote=true\n");
+
+    const direct_assess_context_table = try renderTableForContextAlloc(alloc, .{ .standby_node_id = "standby-a" }, direct_assess);
+    defer alloc.free(direct_assess_context_table);
+    try expectContains(direct_assess_context_table, "action.action_id=promotion_assess:standby-a\n");
+    try expectContains(direct_assess_context_table, "action.action_kind=promotion_assess\n");
+    try expectContains(direct_assess_context_table, "action.target=standby-a\n");
+    try expectContains(direct_assess_context_table, "action.state=assessed\n");
+    try expectContains(direct_assess_context_table, "action.node_id=standby-a\n");
 
     var fenced_assess_plan = try admin_cli.parse(alloc, &.{ "--prometheus", "promote", "assess", "--current-fence" });
     defer fenced_assess_plan.deinit(alloc);
