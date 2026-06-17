@@ -10728,6 +10728,11 @@ const Parser = struct {
             lhs.query.expression_or_predicates = &.{};
             return;
         }
+        if ((lhs.query.in_predicates.len > 0 or rhs.in_predicates.len > 0) and
+            (lhs.query.expression_predicates.len > 0 or rhs.expression_predicates.len > 0))
+        {
+            return try self.applySimpleInExpressionBranchUnion(lhs, rhs);
+        }
         if (lhs.query.in_predicates.len > 0 or rhs.in_predicates.len > 0) {
             return try self.applySimpleAccessBranchUnion(lhs, rhs);
         }
@@ -10849,6 +10854,40 @@ const Parser = struct {
         freeExpressionPredicateGroups(self.alloc, lhs.query.expression_or_predicates);
         if (lhs.query.expression_or_predicates.len > 0) self.alloc.free(lhs.query.expression_or_predicates);
         lhs.query.expression_or_predicates = groups;
+    }
+
+    fn applySimpleInExpressionBranchUnion(
+        self: *@This(),
+        lhs: *LoweredSelect,
+        rhs: db_mod.types.RelationalRowsQueryRequest,
+    ) !void {
+        const left_groups = try expressionGroupsFromSimpleUnionQueryAlloc(self.alloc, lhs.query);
+        defer {
+            freeExpressionPredicateGroups(self.alloc, left_groups);
+            if (left_groups.len > 0) self.alloc.free(left_groups);
+        }
+        const right_groups = try expressionGroupsFromSimpleUnionQueryAlloc(self.alloc, rhs);
+        defer {
+            freeExpressionPredicateGroups(self.alloc, right_groups);
+            if (right_groups.len > 0) self.alloc.free(right_groups);
+        }
+
+        const groups = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, left_groups.len + right_groups.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (groups[0..initialized]) |group| freeExpressionPredicateGroup(self.alloc, group);
+            self.alloc.free(groups);
+        }
+        for (left_groups) |group| {
+            groups[initialized] = .{ .conditions = try cloneExpressionConditionsAlloc(self.alloc, group.conditions) };
+            initialized += 1;
+        }
+        for (right_groups) |group| {
+            groups[initialized] = .{ .conditions = try cloneExpressionConditionsAlloc(self.alloc, group.conditions) };
+            initialized += 1;
+        }
+
+        self.replaceQueryWithExpressionOrBranches(lhs, groups);
     }
 
     fn applySimpleIntersect(
@@ -10977,6 +11016,12 @@ const Parser = struct {
         freePredicateGroups(self.alloc, lhs.query.or_predicates);
         if (lhs.query.or_predicates.len > 0) self.alloc.free(lhs.query.or_predicates);
         lhs.query.or_predicates = &.{};
+        freeInPredicates(self.alloc, lhs.query.in_predicates);
+        if (lhs.query.in_predicates.len > 0) self.alloc.free(lhs.query.in_predicates);
+        lhs.query.in_predicates = &.{};
+        freeAccessPredicateGroups(self.alloc, lhs.query.access_or_predicates);
+        if (lhs.query.access_or_predicates.len > 0) self.alloc.free(lhs.query.access_or_predicates);
+        lhs.query.access_or_predicates = &.{};
         freeExpressionConditions(self.alloc, lhs.query.expression_predicates);
         if (lhs.query.expression_predicates.len > 0) self.alloc.free(lhs.query.expression_predicates);
         lhs.query.expression_predicates = &.{};
@@ -11006,7 +11051,7 @@ const Parser = struct {
             return;
         }
         if (rhs.in_predicates.len > 0 and rhs.expression_predicates.len > 0) {
-            const groups = try expressionNotGroupsFromInExpressionSetQueryAlloc(self.alloc, rhs);
+            const groups = try expressionGroupsFromInSetQueryAlloc(self.alloc, rhs);
             freeExpressionPredicateGroups(self.alloc, lhs.query.expression_not_predicates);
             if (lhs.query.expression_not_predicates.len > 0) self.alloc.free(lhs.query.expression_not_predicates);
             lhs.query.expression_not_predicates = groups;
@@ -43389,11 +43434,7 @@ fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryReques
     {
         return false;
     }
-    if (query.in_predicates.len > 0 and
-        (query.predicates.len > 0 or query.or_predicates.len > 0 or query.expression_predicates.len > 0))
-    {
-        return false;
-    }
+    if (query.in_predicates.len > 0 and query.or_predicates.len > 0) return false;
     if (query.expression_or_predicates.len > 0) return false;
     return true;
 }
@@ -43789,11 +43830,11 @@ fn inPredicateExpansionBranchCount(expansions: []const InPredicateExpansion) !us
     return total;
 }
 
-fn expressionNotGroupsFromInExpressionSetQueryAlloc(
+fn expressionGroupsFromInSetQueryAlloc(
     alloc: std.mem.Allocator,
     query: db_mod.types.RelationalRowsQueryRequest,
 ) ![]db_mod.types.RelationalRowsExpressionPredicateGroup {
-    if (query.in_predicates.len == 0 or query.expression_predicates.len == 0) return error.UnsupportedSqlShape;
+    if (query.in_predicates.len == 0) return error.UnsupportedSqlShape;
 
     const expansions = try inPredicateExpansionsAlloc(alloc, query.in_predicates);
     defer freeInPredicateExpansions(alloc, expansions);
@@ -43844,6 +43885,23 @@ fn expressionNotGroupsFromInExpressionSetQueryAlloc(
         initialized += 1;
     }
 
+    return groups;
+}
+
+fn expressionGroupsFromSimpleUnionQueryAlloc(
+    alloc: std.mem.Allocator,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]db_mod.types.RelationalRowsExpressionPredicateGroup {
+    if (query.in_predicates.len > 0) return try expressionGroupsFromInSetQueryAlloc(alloc, query);
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, 1);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    groups[0] = .{ .conditions = try expressionConditionsFromSimpleSetQueryAlloc(alloc, query) };
+    initialized += 1;
     return groups;
 }
 
@@ -74162,6 +74220,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
         },
         .{
+            .name = "query union scalar in expression set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
             .name = "query intersect scalar in set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .select = 1 },
@@ -74503,6 +74568,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .access_or_predicates = 2, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:access_or=2",
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
+        },
+        .{
+            .name = "read union scalar in expression set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 3, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=3:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
         },
         .{
             .name = "read intersect scalar in set operation",
@@ -82819,6 +82891,25 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(@as(usize, 2), distinct_in_union.query.access_or_predicates.len);
     try std.testing.expectEqualStrings("[\"open\",\"pending\"]", distinct_in_union.query.access_or_predicates[0].in_predicates[0].values_json);
     try std.testing.expectEqualStrings("\"closed\"", distinct_in_union.query.access_or_predicates[1].predicates[0].value_json.?);
+
+    var in_expression_union = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_expression_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_union.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_union.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), in_expression_union.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_union.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_union.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_union.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_union.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_union.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_union.query.expression_or_predicates[1].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", in_expression_union.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", in_expression_union.query.expression_or_predicates[2].conditions[0].lhs.field);
 
     var in_intersect = try lowerSelectAlloc(
         alloc,
