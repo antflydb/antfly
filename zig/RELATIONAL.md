@@ -4458,12 +4458,17 @@ PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 `REVOKE`, and role lifecycle statements lower to typed authorization-catalog
 intent that captures role names, privilege counts, object kind/name, principal
 identity, and role setting names, then fail closed when applied to table schema
-or runtime storage. Production execution needs first-class authorization
-catalog objects, role/principal bindings, transactional privilege changes, and
-request-time enforcement in the same typed plan path used by REST/SDK calls.
-The PostgreSQL adapter can map role and privilege syntax into those native
-objects, but migration replay must not record successful SQL privilege changes
-that the storage engine cannot enforce.
+storage. Public API execution routes authorization-catalog SQL through the
+native user-management surface instead: `CREATE ROLE app_writer` creates the
+Antfly auth subject `role:app_writer`, `DROP ROLE` removes that subject's
+permissions, inheritance edges, assignments, and row filters, and table
+`GRANT`/`REVOKE` statements map PostgreSQL privileges onto Antfly
+`read`/`write`/`admin` table permissions, with `ALL [PRIVILEGES]` expanded to
+all three native permission bits. A grant target that is already an Antfly user
+is applied directly to that user; otherwise SQL principals must resolve to a
+SQL-created `role:<name>` subject instead of being created implicitly by
+`GRANT`. Role settings such as `ALTER ROLE ... SET ...` still fail closed until
+Antfly has a durable native setting model.
 
 `COPY FROM` and `COPY TO` lower to typed bulk import/export intent that captures
 table identity, column count, stream endpoint, direction, and format, then fails

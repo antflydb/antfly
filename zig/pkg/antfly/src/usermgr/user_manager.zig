@@ -31,6 +31,8 @@ pub const default_rbac_model_text =
     \\m = g(r.sub, p.sub) && (r.typ == p.typ || p.typ == "*") && (r.obj == p.obj || p.obj == "*") && (r.act == p.act || p.act == "*")
 ;
 
+const sql_role_catalog_subject = "__antfly_sql_role_catalog__";
+
 pub const ResourceType = enum {
     table,
     user,
@@ -640,6 +642,10 @@ pub const UserManager = struct {
         return out;
     }
 
+    pub fn hasUser(self: *const UserManager, username: []const u8) bool {
+        return self.users.contains(username);
+    }
+
     pub fn enforce(
         self: *const UserManager,
         username: []const u8,
@@ -653,6 +659,15 @@ pub const UserManager = struct {
 
     pub fn addPermissionToSubject(self: *UserManager, subject: []const u8, permission: Permission) !void {
         _ = try self.enforcer.addPolicy(&.{
+            subject,
+            permission.resource_type.slice(),
+            permission.resource,
+            permission.type.slice(),
+        });
+    }
+
+    pub fn removePermissionFromSubjectExact(self: *UserManager, subject: []const u8, permission: Permission) !void {
+        _ = try self.enforcer.removeFilteredPolicy(0, &.{
             subject,
             permission.resource_type.slice(),
             permission.resource,
@@ -707,6 +722,39 @@ pub const UserManager = struct {
     pub fn addRoleToSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
         if (subject.len == 0 or role.len == 0) return error.InvalidRole;
         _ = try self.enforcer.addNamedPolicy("g", &.{ subject, role });
+    }
+
+    pub fn createRoleSubject(self: *UserManager, role_subject: []const u8) !void {
+        if (role_subject.len == 0) return error.InvalidRole;
+        if (try self.roleSubjectExists(role_subject)) return error.RoleExists;
+        _ = try self.enforcer.addNamedPolicy("g", &.{ sql_role_catalog_subject, role_subject });
+    }
+
+    pub fn dropRoleSubject(self: *UserManager, role_subject: []const u8) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        _ = try self.enforcer.removeFilteredPolicy(0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("g", 1, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{role_subject});
+    }
+
+    pub fn roleSubjectExists(self: *const UserManager, role_subject: []const u8) !bool {
+        if (role_subject.len == 0) return false;
+        if (self.users.contains(role_subject)) return true;
+        if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("g", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("g", 1, role_subject)) return true;
+        return false;
+    }
+
+    fn hasFilteredPolicy(self: *const UserManager, ptype: []const u8, field_index: usize, value: []const u8) !bool {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, ptype, field_index, &.{value});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        return rules.len > 0;
     }
 
     pub fn addRoleToUser(self: *UserManager, username: []const u8, role: []const u8) !void {
@@ -1176,6 +1224,7 @@ fn putAuthSubject(
     kind: AuthSubjectKind,
 ) !void {
     if (subject.len == 0) return;
+    if (std.mem.eql(u8, subject, sql_role_catalog_subject)) return;
     const owned_subject = try alloc.dupe(u8, subject);
     errdefer alloc.free(owned_subject);
     const gop = try subjects.getOrPut(alloc, owned_subject);

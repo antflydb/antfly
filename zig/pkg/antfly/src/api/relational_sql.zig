@@ -5908,6 +5908,7 @@ const Parser = struct {
             if (self.peekKeyword("on")) break;
             const privilege = try self.parseIdentifierOwned();
             try privileges.append(self.alloc, privilege);
+            if (std.ascii.eqlIgnoreCase(privilege, "all")) _ = self.matchKeyword("privileges");
             if (self.match(.comma) != null) continue;
             break;
         }
@@ -49212,6 +49213,22 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(grant_privilege_fingerprint);
     try std.testing.expectEqualStrings("ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=2", grant_privilege_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, grant_privilege));
+
+    var grant_all_privileges = try lowerDdlPlanAlloc(alloc, "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;");
+    defer grant_all_privileges.deinit(alloc);
+    const grant_all_privileges_plan = switch (grant_all_privileges) {
+        .authorization_catalog => |plan| switch (plan) {
+            .grant_privilege => |grant_plan| grant_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), grant_all_privileges_plan.privileges.len);
+    try std.testing.expectEqualStrings("ALL", grant_all_privileges_plan.privileges[0]);
+    const grant_all_privileges_fingerprint = try ddlFingerprintAlloc(alloc, grant_all_privileges);
+    defer alloc.free(grant_all_privileges_fingerprint);
+    try std.testing.expectEqualStrings("ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1", grant_all_privileges_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, grant_all_privileges));
 
     var revoke_privilege = try lowerDdlPlanAlloc(alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;");
     defer revoke_privilege.deinit(alloc);

@@ -62,6 +62,7 @@ const http_route_helpers = @import("http_route_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const routes = @import("http_routes.zig");
+const auth_sql_adapter = @import("auth_sql_adapter.zig");
 const runtime_status = @import("runtime_status.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("../platform/time.zig");
@@ -1779,6 +1780,15 @@ pub const ApiHttpServer = struct {
 
     pub fn cleanupExpiredSessions(self: *ApiHttpServer, cutoff_ns: u64) !usize {
         return try self.txn_sessions.cleanupExpired(self.alloc, cutoff_ns);
+    }
+
+    pub fn applyRelationalSqlDdl(self: *ApiHttpServer, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+        if (self.cfg.user_manager) |manager| {
+            if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManager(manager, self.alloc, sql)) |applied| {
+                return applied;
+            }
+        }
+        return try self.source.applyRelationalSqlDdl(self.alloc, sql);
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
@@ -12309,6 +12319,59 @@ test "api http server serves user management routes when auth is enabled" {
     try std.testing.expectEqual(@as(u16, 204), delete_resp.status);
 
     try std.testing.expectError(error.UserNotFound, auth.manager.getUser("alice"));
+}
+
+test "api http server applies authorization SQL DDL through user manager" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl = applyRelationalSqlDdl,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdl(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .user_manager = &auth.manager,
+    }, source.iface(), null, null);
+
+    var created = try server.applyRelationalSqlDdl("CREATE ROLE app_writer;");
+    defer created.deinit(alloc);
+    var granted = try server.applyRelationalSqlDdl("GRANT SELECT ON TABLE usage_records TO app_writer;");
+    defer granted.deinit(alloc);
+
+    try auth.manager.addRoleToUser("alice", "role:app_writer");
+    try std.testing.expect(try auth.manager.enforce("alice", .table, "usage_records", .read));
+
+    var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
+    defer dropped.deinit(alloc);
+    try std.testing.expect(!(try auth.manager.enforce("alice", .table, "usage_records", .read)));
 }
 
 test "api http server serves api key and row filter routes" {
