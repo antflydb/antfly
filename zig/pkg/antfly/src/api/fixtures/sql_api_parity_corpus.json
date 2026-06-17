@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 831,
-  "entry_count": 831,
+  "source_entry_count": 836,
+  "entry_count": 836,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3558,6 +3558,12 @@
       "sql": "WITH filtered_usage AS (SELECT id, status, metadata, created_at FROM usage_records WHERE lower(status) IS NOT DISTINCT FROM 'open' AND metadata->>'source' IS DISTINCT FROM 'internal') SELECT id FROM filtered_usage ORDER BY created_at DESC LIMIT 5"
     },
     {
+      "name": "read classifier materialized cte expression query",
+      "family": "read",
+      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:cte0_expr_pred=2",
+      "sql": "WITH filtered_usage AS MATERIALIZED (SELECT id, status, metadata, created_at FROM usage_records WHERE lower(status) IS NOT DISTINCT FROM 'open' AND metadata->>'source' IS DISTINCT FROM 'internal') SELECT id FROM filtered_usage ORDER BY created_at DESC LIMIT 5"
+    },
+    {
       "name": "read classifier cte expression aggregate",
       "family": "read",
       "plan": "read:aggregate:aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5:ctes=1:cte0_expr_pred=2",
@@ -4064,6 +4070,21 @@
       "sql": "WITH open_usage AS (SELECT tenant_id, amount, status, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(amount) AS total FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' GROUP BY tenant_id ORDER BY total DESC LIMIT 5"
     },
     {
+      "name": "not materialized cte consumer expression aggregate",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "expression_predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "group_by": 1,
+        "aggregations": 1
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5:ctes=1",
+      "sql": "WITH open_usage AS NOT MATERIALIZED (SELECT tenant_id, amount, status, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(amount) AS total FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' GROUP BY tenant_id ORDER BY total DESC LIMIT 5"
+    },
+    {
       "name": "chained cte query",
       "family": "query",
       "summary": {
@@ -4076,6 +4097,20 @@
       },
       "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
       "sql": "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2"
+    },
+    {
+      "name": "chained cte query materialization hints",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 2,
+        "predicates": 0,
+        "select": 1,
+        "order_by": 1,
+        "limit": 2
+      },
+      "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+      "sql": "WITH open_usage AS MATERIALIZED (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS NOT MATERIALIZED (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2"
     },
     {
       "name": "cte producer expression null-safe predicates",
@@ -4926,6 +4961,21 @@
       "sql": "WITH open_usage AS (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2"
     },
     {
+      "name": "materialized cte window with value expressions",
+      "family": "window",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "predicates": 0,
+        "select": 2,
+        "order_by": 1,
+        "limit": 2,
+        "windows": 2
+      },
+      "plan": "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=2:window_expr=2:window_default=1:window_frame_sig=0:select=2:order=1:limit=2",
+      "sql": "WITH open_usage AS MATERIALIZED (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2"
+    },
+    {
       "name": "cte producer expression window",
       "family": "window",
       "summary": {
@@ -5671,6 +5721,20 @@
       },
       "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=1:source_limit=3:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1",
       "sql": "WITH ready_sources AS (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status"
+    },
+    {
+      "name": "materialized cte-backed insert select expression assignment",
+      "family": "insert_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "order_by": 1,
+        "limit": 3,
+        "operations": 3,
+        "returning": 2
+      },
+      "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=1:source_limit=3:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1",
+      "sql": "WITH ready_sources AS MATERIALIZED (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status"
     },
     {
       "name": "cross-table insert select source plan",

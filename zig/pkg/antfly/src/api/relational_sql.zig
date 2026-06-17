@@ -5158,6 +5158,7 @@ fn insertSourceTableNamesFromWithAlloc(
             index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
         }
         if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+        try consumeCteMaterializationHint(tokens, &index);
         if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
         const from_index = findTopLevelKeyword(tokens[index + 1 .. close_index], "from") orelse return error.UnsupportedSqlShape;
@@ -5339,6 +5340,13 @@ fn consumeKeyword(tokens: []const Token, index: *usize, keyword: []const u8) boo
     if (token.kind != .identifier or !std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
     index.* += 1;
     return true;
+}
+
+fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) !void {
+    if (consumeKeyword(tokens, index, "materialized")) return;
+    if (consumeKeyword(tokens, index, "not") and !consumeKeyword(tokens, index, "materialized")) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
@@ -10469,6 +10477,7 @@ const Parser = struct {
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
             try self.expectKeyword("as");
+            try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
             const close_index = try self.findMatchingRParen();
             var sub = Parser{
@@ -10496,6 +10505,13 @@ const Parser = struct {
         }
 
         return try ctes.toOwnedSlice(self.alloc);
+    }
+
+    fn parseOptionalCteMaterializationHint(self: *@This()) !void {
+        if (self.matchKeyword("materialized")) return;
+        if (self.matchKeyword("not")) {
+            try self.expectKeyword("materialized");
+        }
     }
 
     fn parseQueryPlan(self: *@This()) !LoweredQueryPlan {
@@ -10537,6 +10553,7 @@ const Parser = struct {
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
             try self.expectKeyword("as");
+            try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
             const close_index = try self.findMatchingRParen();
             var sub = Parser{
@@ -11144,6 +11161,7 @@ const Parser = struct {
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
             try self.expectKeyword("as");
+            try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
             const close_index = try self.findMatchingRParen();
             var sub = Parser{
@@ -11215,6 +11233,7 @@ const Parser = struct {
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
             try self.expectKeyword("as");
+            try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
             const close_index = try self.findMatchingRParen();
             var sub = Parser{
@@ -72255,6 +72274,12 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "WITH filtered_usage AS (SELECT id, status, metadata, created_at FROM usage_records WHERE lower(status) IS NOT DISTINCT FROM 'open' AND metadata->>'source' IS DISTINCT FROM 'internal') SELECT id FROM filtered_usage ORDER BY created_at DESC LIMIT 5",
         },
         .{
+            .name = "read classifier materialized cte expression query",
+            .family = .read,
+            .plan = "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:cte0_expr_pred=2",
+            .sql = "WITH filtered_usage AS MATERIALIZED (SELECT id, status, metadata, created_at FROM usage_records WHERE lower(status) IS NOT DISTINCT FROM 'open' AND metadata->>'source' IS DISTINCT FROM 'internal') SELECT id FROM filtered_usage ORDER BY created_at DESC LIMIT 5",
+        },
+        .{
             .name = "read classifier cte expression aggregate",
             .family = .read,
             .plan = "read:aggregate:aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5:ctes=1:cte0_expr_pred=2",
@@ -72522,11 +72547,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "WITH open_usage AS (SELECT tenant_id, amount, status, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(amount) AS total FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' GROUP BY tenant_id ORDER BY total DESC LIMIT 5",
         },
         .{
+            .name = "not materialized cte consumer expression aggregate",
+            .family = .aggregate,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .expression_predicates = 1, .group_by = 1, .aggregations = 1, .order_by = 1, .limit = 5 },
+            .plan = "aggregate:table=usage_records:source_pred=0:source_array_any=0:source_expr_pred=1:source_expr_or=0:source_expr_not=0:source_expr_array=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5:ctes=1",
+            .sql = "WITH open_usage AS NOT MATERIALIZED (SELECT tenant_id, amount, status, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(amount) AS total FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' GROUP BY tenant_id ORDER BY total DESC LIMIT 5",
+        },
+        .{
             .name = "chained cte query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .ctes = 2, .predicates = 0, .select = 1, .order_by = 1, .limit = 2 },
             .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2",
+        },
+        .{
+            .name = "chained cte query materialization hints",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .ctes = 2, .predicates = 0, .select = 1, .order_by = 1, .limit = 2 },
+            .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
+            .sql = "WITH open_usage AS MATERIALIZED (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS NOT MATERIALIZED (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2",
         },
         .{
             .name = "cte producer expression null-safe predicates",
@@ -72963,6 +73002,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .select = 2, .windows = 2, .order_by = 1, .limit = 2 },
             .plan = "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=2:window_expr=2:window_default=1:window_frame_sig=0:select=2:order=1:limit=2",
             .sql = "WITH open_usage AS (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2",
+        },
+        .{
+            .name = "materialized cte window with value expressions",
+            .family = .window,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .select = 2, .windows = 2, .order_by = 1, .limit = 2 },
+            .plan = "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=2:window_expr=2:window_default=1:window_frame_sig=0:select=2:order=1:limit=2",
+            .sql = "WITH open_usage AS MATERIALIZED (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2",
         },
         .{
             .name = "cte producer expression window",
@@ -73538,6 +73584,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .ctes = 1, .operations = 3, .order_by = 1, .limit = 3, .returning = 2 },
             .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=1:source_limit=3:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1",
             .sql = "WITH ready_sources AS (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
+        },
+        .{
+            .name = "materialized cte-backed insert select expression assignment",
+            .family = .insert_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .operations = 3, .order_by = 1, .limit = 3, .returning = 2 },
+            .plan = "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=1:source_limit=3:assignments=3:conflict=0:returning=2:returning_expr=0:returning_all=0:ctes=1:source_cte=1:cte0_expr_pred=1",
+            .sql = "WITH ready_sources AS MATERIALIZED (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
         },
         .{
             .name = "cross-table insert select source plan",
@@ -83420,6 +83473,21 @@ test "postgres sql adapter lowers non recursive cte query plans" {
     try std.testing.expectEqualStrings("created_at", direct_select.query.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 5), direct_select.query.limit.?);
 
+    var hinted = try lowerQueryPlanAlloc(
+        alloc,
+        "WITH open_orders AS MATERIALIZED (SELECT id, status, created_at FROM orders WHERE status = 'open'), ordered_orders AS NOT MATERIALIZED (SELECT id, created_at FROM open_orders WHERE created_at > 0) SELECT id FROM ordered_orders ORDER BY created_at DESC LIMIT 3",
+        schema,
+        &.{},
+    );
+    defer hinted.deinit(alloc);
+    try std.testing.expectEqualStrings("orders", hinted.table_name);
+    try std.testing.expectEqual(@as(usize, 2), hinted.plan.ctes.len);
+    try std.testing.expectEqualStrings("open_orders", hinted.plan.ctes[0].name);
+    try std.testing.expectEqualStrings("ordered_orders", hinted.plan.ctes[1].name);
+    try std.testing.expectEqualStrings("open_orders", hinted.plan.ctes[1].query.source_cte);
+    try std.testing.expectEqualStrings("ordered_orders", hinted.plan.query.source_cte);
+    try std.testing.expectEqual(@as(u32, 3), hinted.plan.query.limit.?);
+
     var plain = try lowerQueryPlanAlloc(
         alloc,
         "SELECT id FROM orders WHERE status = 'open'",
@@ -83988,6 +84056,18 @@ test "postgres sql adapter lowers non recursive cte aggregate plans" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations.len);
     try std.testing.expectEqualStrings("total_amount", lowered.plan.aggregate.aggregations[0].name);
     try std.testing.expectEqualStrings("amount", lowered.plan.aggregate.aggregations[0].field.?);
+
+    var hinted = try lowerAggregatePlanAlloc(
+        alloc,
+        "WITH open_usage AS NOT MATERIALIZED (SELECT tenant, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(amount) AS total_amount FROM open_usage GROUP BY tenant ORDER BY total_amount DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer hinted.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", hinted.table_name);
+    try std.testing.expectEqual(@as(usize, 1), hinted.plan.ctes.len);
+    try std.testing.expectEqualStrings("open_usage", hinted.plan.ctes[0].name);
+    try std.testing.expectEqualStrings("open_usage", hinted.plan.aggregate.source.source_cte);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregatePlanAlloc(
         alloc,
@@ -85158,6 +85238,19 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expectEqual(@as(usize, 1), cte.plan.ctes.len);
     try std.testing.expectEqualStrings("open_usage", cte.plan.window.source.source_cte);
     try std.testing.expectEqualStrings("rn", cte.plan.window.windows[0].output);
+
+    var hinted_cte = try lowerWindowPlanAlloc(
+        alloc,
+        "WITH open_usage AS MATERIALIZED (SELECT tenant, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY created_at ASC) AS rn FROM open_usage LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer hinted_cte.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", hinted_cte.table_name);
+    try std.testing.expectEqual(@as(usize, 1), hinted_cte.plan.ctes.len);
+    try std.testing.expectEqualStrings("open_usage", hinted_cte.plan.window.source.source_cte);
+    try std.testing.expectEqualStrings("rn", hinted_cte.plan.window.windows[0].output);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanAlloc(
         alloc,
         "SELECT tenant, id, rank() FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC) AS bad_rank FROM usage_records",

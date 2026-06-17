@@ -3704,6 +3704,10 @@ The PostgreSQL adapter exposes this through `lowerQueryPlanAlloc`: non-recursive
 `WITH name AS (SELECT ...) ... SELECT ... FROM name` lowers to ordered CTE
 queries plus a final `source_cte` query, while plain `lowerSelectAlloc` remains
 the single-select API and rejects `WITH`.
+PostgreSQL `AS MATERIALIZED` and `AS NOT MATERIALIZED` CTE hints are accepted
+as adapter-only syntax over the same bounded native CTE materialization
+contract; they do not introduce SQL text or planner-private behavior into
+storage.
 Recursive CTEs are a separate graph/fixpoint feature and should be treated as a
 distinct planner extension.
 
