@@ -61742,6 +61742,8 @@ fn appParityAppliedDdlPlanAlloc(
     return try ddlAppliedFingerprintAlloc(alloc, applied);
 }
 
+const app_parity_fixture_format: u64 = 1;
+
 fn appParityFixtureJsonAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
@@ -61750,7 +61752,10 @@ fn appParityFixtureJsonAlloc(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.print("{{\n  \"schema_json\": {f},\n  \"entries\": [", .{std.json.fmt(schema_json, .{})});
+    try writer.print(
+        "{{\n  \"fixture_format\": {},\n  \"schema_json\": {f},\n  \"entries\": [",
+        .{ app_parity_fixture_format, std.json.fmt(schema_json, .{}) },
+    );
     var written_entries: usize = 0;
     for (corpus) |entry| {
         var derived_applied_plan: ?[]u8 = null;
@@ -74606,7 +74611,9 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     defer parsed_fixture.deinit();
 
     const root = try appParityJsonObject(parsed_fixture.value);
-    try appParityRequireOnlyKeys(root, &.{ "schema_json", "entries" });
+    try appParityRequireOnlyKeys(root, &.{ "fixture_format", "schema_json", "entries" });
+    const fixture_format = try appParityJsonOptionalU64(root, "fixture_format", 0);
+    if (fixture_format != app_parity_fixture_format) return error.TestUnexpectedResult;
     const schema_json = try appParityJsonString(root.get("schema_json") orelse return error.TestUnexpectedResult);
     const entries_value = root.get("entries") orelse return error.TestUnexpectedResult;
     const entries = switch (entries_value) {

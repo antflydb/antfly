@@ -5447,6 +5447,10 @@ claim write/read-plan coverage. Wrapped read/write coverage is satisfied only
 from a single `inner=` payload whose plan starts with the expected typed-plan
 family; stray family-looking text elsewhere in the explain fingerprint cannot
 claim coverage.
+The checked-in SQL/API parity fixture also carries a root `fixture_format`
+version. Fixture-backed gates reject missing or mismatched format versions, so
+future corpus schema changes must be intentional and regenerated through the
+fixture-promotion step rather than silently parsed as the current contract.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 
