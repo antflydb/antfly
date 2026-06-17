@@ -3325,7 +3325,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
 			if action.AdminJobName == "" && action.AdminJobPhase == "" {
 				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
 			}
@@ -4561,7 +4561,7 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			action.StandbyName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
 			continue
 		}
 		if action.AdminResult == nil {
@@ -4746,13 +4746,13 @@ func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context
 			action.AdminJobName == "" {
 			continue
 		}
-		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
 			continue
 		}
 		if action.AdminResult == nil {
 			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
 		}
-		if !haAdminActionSucceededWithEvidence(*action) {
+		if !haFormerPrimaryActionSucceededWithPromotionEvidence(cluster.Status.HAStatus, *action) {
 			return
 		}
 		result, ok := haRejoinJobResultFromAdminResult(action.AdminResult)
@@ -6472,6 +6472,36 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 	return false
 }
 
+func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
+	if !haPlannedActionDependenciesSucceeded(actions, index) {
+		return false
+	}
+	action := actions[index]
+	if action.DependsOn == "" {
+		for i := 0; i < index; i++ {
+			dependency := actions[i]
+			if !haFormerPrimaryActionKind(dependency.Kind) {
+				continue
+			}
+			if !haFormerPrimaryActionSucceededWithPromotionEvidence(status, dependency) {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < index; i++ {
+		dependency := actions[i]
+		if dependency.Kind != action.DependsOn {
+			continue
+		}
+		if !haFormerPrimaryActionKind(dependency.Kind) {
+			return true
+		}
+		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, dependency)
+	}
+	return false
+}
+
 func haPrimaryRouteActionHasPromotionEvidence(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
 	if index < 0 || index >= len(actions) {
 		return false
@@ -6774,6 +6804,40 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 		return false
 	}
 	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
+		return false
+	}
+	return true
+}
+
+func haFormerPrimaryActionSucceededWithPromotionEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	return haAdminActionSucceededWithEvidence(action) &&
+		haRejoinResultMatchesPromotion(status, action, action.AdminResult)
+}
+
+func haRejoinResultMatchesPromotion(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if !haRejoinResultMatchesRequiredAdminResult(action, result) {
+		return false
+	}
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return false
+	}
+	if strings.TrimSpace(result.FormerNodeID) != strings.TrimSpace(promotion.OldPrimaryID) {
+		return false
+	}
+	if result.TargetTimelineID != promotion.NewTimelineID || result.TargetEpoch != promotion.NewEpoch {
+		return false
+	}
+	if promotion.SwitchLSN != 0 && result.ForkLSN != promotion.SwitchLSN {
+		return false
+	}
+	if promotion.RequiredLSN != 0 && result.ForkLSN != promotion.RequiredLSN {
+		return false
+	}
+	if action.FenceAuthority != "" && promotion.FenceAuthority != action.FenceAuthority {
+		return false
+	}
+	if action.FenceGeneration != 0 && promotion.FenceGeneration != action.FenceGeneration {
 		return false
 	}
 	return true

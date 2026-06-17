@@ -1998,6 +1998,76 @@ func TestHADirectRejoinResultMatchesPlannedAssessment(t *testing.T) {
 	g.Expect(haDirectRejoinResultMatchesAction(wrongObserved, status, action)).To(BeFalse())
 }
 
+func TestHAFormerPrimaryActionRequiresPromotionReceiptEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  4,
+			ParentEpoch:       6,
+			NewTimelineID:     5,
+			NewEpoch:          7,
+			SwitchLSN:         12,
+			RequiredLSN:       12,
+			ObservedLSN:       12,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   3,
+			FenceToken:        "ha-fence-token",
+		},
+	}
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionRewindFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 3,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			ActionID:                "rejoin_rewind:primary-a",
+			ActionKind:              "rejoin_rewind",
+			ActionTarget:            "primary-a",
+			ActionState:             "applied",
+			ActionNodeID:            "primary-a",
+			RejoinAction:            "rewind",
+			FormerNodeID:            "primary-a",
+			TargetTimelineID:        5,
+			TargetEpoch:             7,
+			ForkLSN:                 12,
+			FormerLastLSN:           13,
+			RetainedFromLSN:         8,
+			RewindExecuted:          true,
+			RewindPreviousLastLSN:   13,
+			RewindCurrentLastLSN:    12,
+			RewindNextLSN:           13,
+			RewindDiscardedLSNCount: 1,
+		},
+	}
+
+	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeTrue())
+	actions := []antflyv1.HAPlannedActionStatus{action, {
+		Kind:      string(haActionSeedStandby),
+		DependsOn: string(haActionRewindFormerPrimary),
+	}}
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, actions, 1)).To(BeTrue())
+
+	status.LastPromotion.FenceToken = ""
+	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
+
+	status.LastPromotion.FenceToken = "ha-fence-token"
+	action.AdminResult.TargetTimelineID = 6
+	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
+
+	action.AdminResult.TargetTimelineID = 5
+	action.AdminResult.ForkLSN = 11
+	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
+	actions[0] = action
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, actions, 1)).To(BeFalse())
+}
+
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g := NewWithT(t)
 
@@ -4248,10 +4318,15 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 					OldPrimaryID:      "primary-a",
 					PromotedStandbyID: "standby-a",
 					ParentTimelineID:  4,
+					ParentEpoch:       6,
 					NewTimelineID:     5,
-					SwitchLSN:         10,
+					NewEpoch:          7,
+					SwitchLSN:         12,
+					RequiredLSN:       12,
+					ObservedLSN:       12,
 					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
 					FenceGeneration:   3,
+					FenceToken:        "ha-fence-token",
 				},
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:          string(haActionPromoteStandby),
@@ -4334,6 +4409,20 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 	cluster := &antflyv1.AntflyCluster{
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  4,
+					ParentEpoch:       6,
+					NewTimelineID:     5,
+					NewEpoch:          7,
+					SwitchLSN:         12,
+					RequiredLSN:       12,
+					ObservedLSN:       12,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   3,
+					FenceToken:        "ha-fence-token",
+				},
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:          string(haActionPauseSlot),
 					AdminCommand:  []string{"slot", "pause"},
@@ -4348,6 +4437,7 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					Kind:          string(haActionDemoteFormerPrimary),
 					DependsOn:     string(haActionPromoteStandby),
 					StandbyName:   "primary-a",
+					TargetLSN:     12,
 					AdminCommand:  []string{"rejoin", "assess"},
 					AdminJobName:  "demote-job",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
@@ -4362,6 +4452,7 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 						FormerNodeID:     "primary-a",
 						TargetTimelineID: 5,
 						TargetEpoch:      7,
+						ForkLSN:          12,
 					},
 				}},
 			},
