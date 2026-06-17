@@ -25,6 +25,7 @@ pub const default_rbac_model_text =
     \\[policy_definition]
     \\p = sub, typ, obj, act
     \\p2 = sub, obj, filter
+    \\p3 = sub, setting, value
     \\[role_definition]
     \\g = _, _
     \\[matchers]
@@ -630,6 +631,7 @@ pub const UserManager = struct {
         _ = try self.enforcer.removeFilteredPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{username});
     }
 
     pub fn listUsers(self: *const UserManager) ![][]u8 {
@@ -735,6 +737,7 @@ pub const UserManager = struct {
         if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
         if (try self.roleSubjectHasDependencies(role_subject)) return error.RoleInUse;
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{ sql_role_catalog_subject, role_subject });
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
     }
 
     pub fn dropRoleSubjectCascade(self: *UserManager, role_subject: []const u8) !void {
@@ -743,6 +746,7 @@ pub const UserManager = struct {
         _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 1, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
     }
 
     pub fn roleSubjectHasDependencies(self: *const UserManager, role_subject: []const u8) !bool {
@@ -780,6 +784,28 @@ pub const UserManager = struct {
             self.alloc.free(rules);
         }
         return rules.len > 0;
+    }
+
+    pub fn setRoleSetting(self: *UserManager, role_subject: []const u8, setting_name: []const u8, setting_value: []const u8) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        if (setting_name.len == 0) return error.InvalidRoleSetting;
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name });
+        _ = try self.enforcer.addNamedPolicy("p3", &.{ role_subject, setting_name, setting_value });
+    }
+
+    pub fn getRoleSetting(self: *const UserManager, role_subject: []const u8, setting_name: []const u8) ![]u8 {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{ role_subject, setting_name });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 3) return error.RoleSettingNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[2]);
+    }
+
+    pub fn removeRoleSetting(self: *UserManager, role_subject: []const u8, setting_name: []const u8) !void {
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name });
+        if (!removed) return error.RoleSettingNotFound;
     }
 
     pub fn createSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8) !void {

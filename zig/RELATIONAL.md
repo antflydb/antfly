@@ -4470,11 +4470,16 @@ subject has no remaining permissions, row filters, inheritance edges, or user
 assignments, and table
 `GRANT`/`REVOKE` statements map PostgreSQL privileges onto Antfly
 `read`/`write`/`admin` table permissions, with `ALL [PRIVILEGES]` expanded to
-all three native permission bits. A grant target that is already an Antfly user
-is applied directly to that user; otherwise SQL principals must resolve to a
-SQL-created `role:<name>` subject instead of being created implicitly by
-`GRANT`. Role settings such as `ALTER ROLE ... SET ...` still fail closed until
-Antfly has a durable native setting model.
+all three native permission bits. `GRANT`/`REVOKE ... ON ALL TABLES IN SCHEMA
+public` maps to the native wildcard table resource `*`; non-public schema-wide
+targets fail closed until schema namespaces have first-class authorization
+semantics. A grant target that is already an Antfly user is applied directly to
+that user; otherwise SQL principals must resolve to a SQL-created `role:<name>`
+subject instead of being created implicitly by `GRANT`. `ALTER ROLE ... SET ...`
+persists the setting through the native auth policy store as role-owned metadata
+and removes that metadata when the role is dropped. Unsupported role-setting
+forms such as reset, database-scoped settings, and multi-token expressions still
+fail closed until they have explicit native semantics.
 
 `COPY FROM` and `COPY TO` lower to typed bulk import/export intent that captures
 table identity, column count, stream endpoint, direction, and format, then fails

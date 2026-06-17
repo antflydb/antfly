@@ -1061,10 +1061,12 @@ pub const CreateRolePlan = struct {
 pub const AlterRolePlan = struct {
     role_name: []const u8,
     setting_name: []const u8,
+    setting_value: []const u8,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.role_name);
         alloc.free(self.setting_name);
+        alloc.free(self.setting_value);
         self.* = undefined;
     }
 };
@@ -5878,10 +5880,17 @@ const Parser = struct {
         errdefer self.alloc.free(setting_name);
         try self.expect(.eq);
         if (self.atEnd() or self.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+        const setting_value_token = self.tokens[self.pos];
         self.pos += 1;
+        const setting_value = try self.alloc.dupe(u8, setting_value_token.text);
+        errdefer self.alloc.free(setting_value);
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
-        return .{ .role_name = role_name, .setting_name = setting_name };
+        return .{
+            .role_name = role_name,
+            .setting_name = setting_name,
+            .setting_value = setting_value,
+        };
     }
 
     fn parseDropRoleDdl(self: *@This()) !DropRolePlan {
@@ -5920,10 +5929,23 @@ const Parser = struct {
         const privileges = try self.parsePrivilegeListAlloc();
         errdefer freeStringSlice(self.alloc, privileges);
         try self.expectKeyword("on");
-        const object_kind = try self.parseIdentifierOwned();
-        errdefer self.alloc.free(object_kind);
-        const object_name = try self.parseSqlObjectIdentifierOwned();
-        errdefer self.alloc.free(object_name);
+        var object_kind: ?[]const u8 = null;
+        var object_kind_transferred = false;
+        errdefer if (!object_kind_transferred) if (object_kind) |value| self.alloc.free(value);
+        var object_name: ?[]const u8 = null;
+        var object_name_transferred = false;
+        errdefer if (!object_name_transferred) if (object_name) |value| self.alloc.free(value);
+
+        if (self.matchKeyword("all")) {
+            try self.expectKeyword("tables");
+            try self.expectKeyword("in");
+            try self.expectKeyword("schema");
+            object_kind = try self.alloc.dupe(u8, "ALL_TABLES_IN_SCHEMA");
+            object_name = try self.parseSqlObjectIdentifierOwned();
+        } else {
+            object_kind = try self.parseIdentifierOwned();
+            object_name = try self.parseSqlObjectIdentifierOwned();
+        }
         switch (action) {
             .grant => try self.expectKeyword("to"),
             .revoke => try self.expectKeyword("from"),
@@ -5932,10 +5954,12 @@ const Parser = struct {
         errdefer self.alloc.free(principal_name);
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
+        object_kind_transferred = true;
+        object_name_transferred = true;
         return .{
             .privileges = privileges,
-            .object_kind = object_kind,
-            .object_name = object_name,
+            .object_kind = object_kind.?,
+            .object_name = object_name.?,
             .principal_name = principal_name,
         };
     }
@@ -49230,6 +49254,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1", grant_all_privileges_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, grant_all_privileges));
 
+    var grant_all_tables = try lowerDdlPlanAlloc(alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;");
+    defer grant_all_tables.deinit(alloc);
+    const grant_all_tables_plan = switch (grant_all_tables) {
+        .authorization_catalog => |plan| switch (plan) {
+            .grant_privilege => |grant_plan| grant_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), grant_all_tables_plan.privileges.len);
+    try std.testing.expectEqualStrings("SELECT", grant_all_tables_plan.privileges[0]);
+    try std.testing.expectEqualStrings("ALL_TABLES_IN_SCHEMA", grant_all_tables_plan.object_kind);
+    try std.testing.expectEqualStrings("public", grant_all_tables_plan.object_name);
+    try std.testing.expectEqualStrings("app_writer", grant_all_tables_plan.principal_name);
+    const grant_all_tables_fingerprint = try ddlFingerprintAlloc(alloc, grant_all_tables);
+    defer alloc.free(grant_all_tables_fingerprint);
+    try std.testing.expectEqualStrings("ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1", grant_all_tables_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, grant_all_tables));
+
     var revoke_privilege = try lowerDdlPlanAlloc(alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;");
     defer revoke_privilege.deinit(alloc);
     const revoke_privilege_fingerprint = try ddlFingerprintAlloc(alloc, revoke_privilege);
@@ -49246,6 +49289,16 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
 
     var alter_role = try lowerDdlPlanAlloc(alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';");
     defer alter_role.deinit(alloc);
+    const alter_role_plan = switch (alter_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("app_writer", alter_role_plan.role_name);
+    try std.testing.expectEqualStrings("statement_timeout", alter_role_plan.setting_name);
+    try std.testing.expectEqualStrings("5s", alter_role_plan.setting_value);
     const alter_role_fingerprint = try ddlFingerprintAlloc(alloc, alter_role);
     defer alloc.free(alter_role_fingerprint);
     try std.testing.expectEqualStrings("ddl:alter_role:role=app_writer:setting=statement_timeout", alter_role_fingerprint);

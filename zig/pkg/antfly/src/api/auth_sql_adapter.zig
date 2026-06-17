@@ -30,7 +30,7 @@ pub fn executeRelationalSqlDdlOnUserManager(
     switch (plan) {
         .authorization_catalog => |authorization_plan| switch (authorization_plan) {
             .create_role => |create| return try executeCreateRole(manager, alloc, create),
-            .alter_role => return error.UnsupportedSqlShape,
+            .alter_role => |alter| return try executeAlterRole(manager, alloc, alter),
             .drop_role => |drop| return try executeDropRole(manager, alloc, drop),
             .grant_privilege => |grant| return try executePrivilegeChange(manager, alloc, grant, .grant),
             .revoke_privilege => |revoke| return try executePrivilegeChange(manager, alloc, revoke, .revoke),
@@ -52,6 +52,17 @@ fn executeCreateRole(
     const subject = try sqlRoleSubjectAlloc(alloc, plan.role_name);
     defer alloc.free(subject);
     try manager.createRoleSubject(subject);
+    return try changedRecordAlloc(alloc);
+}
+
+fn executeAlterRole(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: relational_sql.AlterRolePlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    const subject = try principalSubjectAlloc(manager, alloc, plan.role_name);
+    defer alloc.free(subject);
+    try manager.setRoleSetting(subject, plan.setting_name, plan.setting_value);
     return try changedRecordAlloc(alloc);
 }
 
@@ -81,7 +92,7 @@ fn executePrivilegeChange(
     plan: relational_sql.PrivilegeChangePlan,
     kind: PrivilegeChangeKind,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    const resource_type = try resourceTypeForSqlObjectKind(plan.object_kind);
+    const resource_target = try resourceTargetForSqlPrivilegeObject(plan.object_kind, plan.object_name);
     var mapped_privileges: usize = 0;
     for (plan.privileges) |privilege_name| {
         const privilege_count = sqlPrivilegeMappingCount(privilege_name);
@@ -94,7 +105,7 @@ fn executePrivilegeChange(
     defer alloc.free(subject);
 
     for (plan.privileges) |privilege_name| {
-        try executeSqlPrivilegeMapping(manager, alloc, subject, resource_type, plan.object_name, privilege_name, kind);
+        try executeSqlPrivilegeMapping(manager, alloc, subject, resource_target.resource_type, resource_target.resource_name, privilege_name, kind);
     }
     return try changedRecordAlloc(alloc);
 }
@@ -133,10 +144,19 @@ fn executeDropRowSecurityPolicy(
     return try changedRecordAlloc(alloc);
 }
 
-fn resourceTypeForSqlObjectKind(object_kind: []const u8) !usermgr.ResourceType {
-    if (std.ascii.eqlIgnoreCase(object_kind, "table")) return .table;
-    if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .user;
-    if (std.mem.eql(u8, object_kind, "*")) return .@"*";
+const SqlPrivilegeResourceTarget = struct {
+    resource_type: usermgr.ResourceType,
+    resource_name: []const u8,
+};
+
+fn resourceTargetForSqlPrivilegeObject(object_kind: []const u8, object_name: []const u8) !SqlPrivilegeResourceTarget {
+    if (std.ascii.eqlIgnoreCase(object_kind, "table")) return .{ .resource_type = .table, .resource_name = object_name };
+    if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .{ .resource_type = .user, .resource_name = object_name };
+    if (std.mem.eql(u8, object_kind, "*")) return .{ .resource_type = .@"*", .resource_name = object_name };
+    if (std.ascii.eqlIgnoreCase(object_kind, "all_tables_in_schema")) {
+        if (!std.ascii.eqlIgnoreCase(object_name, "public")) return error.UnsupportedSqlShape;
+        return .{ .resource_type = .table, .resource_name = "*" };
+    }
     return error.UnsupportedSqlShape;
 }
 
@@ -310,6 +330,17 @@ test "sql auth adapter creates roles and applies table grants through user manag
     }
     try std.testing.expect(found_role);
 
+    var schema_granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;")).?;
+    defer schema_granted.deinit(alloc);
+    try manager.addRoleToUser("alice", "role:app_writer");
+    try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .read));
+    try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
+    var schema_revoked = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer;")).?;
+    defer schema_revoked.deinit(alloc);
+    try std.testing.expect(!(try manager.enforce("alice", .table, "docs", .read)));
+    try manager.removeRoleFromUser("alice", "role:app_writer");
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON ALL TABLES IN SCHEMA private TO app_writer;"));
+
     var granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;")).?;
     defer granted.deinit(alloc);
     try manager.addRoleToUser("alice", "role:app_writer");
@@ -346,7 +377,18 @@ test "sql auth adapter creates roles and applies table grants through user manag
 
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
+    try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
+
+    var recreated = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
+    defer recreated.deinit(alloc);
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';")).?;
+    defer altered.deinit(alloc);
+    const statement_timeout = try manager.getRoleSetting("role:app_writer", "statement_timeout");
+    defer alloc.free(statement_timeout);
+    try std.testing.expectEqualStrings("5s", statement_timeout);
+    var dropped_with_setting = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
+    defer dropped_with_setting.deinit(alloc);
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleSetting("role:app_writer", "statement_timeout"));
 }
 
 test "sql auth adapter grants directly to existing antfly users" {
@@ -371,6 +413,11 @@ test "sql auth adapter grants directly to existing antfly users" {
 
     try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
     try std.testing.expect(!(try manager.roleSubjectExists("role:alice")));
+    var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE alice SET statement_timeout = '3s';")).?;
+    defer altered.deinit(alloc);
+    const setting = try manager.getRoleSetting("alice", "statement_timeout");
+    defer alloc.free(setting);
+    try std.testing.expectEqualStrings("3s", setting);
 }
 
 test "sql auth adapter applies row security policies through user manager" {
