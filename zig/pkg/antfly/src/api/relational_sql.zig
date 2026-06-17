@@ -59,236 +59,52 @@ const SqlPatternQuantifier = enum {
     all,
 };
 
-fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
-}
-
-fn sqlKeywordStartsScalarPredicate(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "is") or
-        std.ascii.eqlIgnoreCase(text, "isnull") or
-        std.ascii.eqlIgnoreCase(text, "in") or
-        std.ascii.eqlIgnoreCase(text, "between") or
-        std.ascii.eqlIgnoreCase(text, "like") or
-        std.ascii.eqlIgnoreCase(text, "ilike") or
-        std.ascii.eqlIgnoreCase(text, "notnull") or
-        sqlKeywordIsAnyOrSome(text) or
-        std.ascii.eqlIgnoreCase(text, "all");
-}
+const arrayLengthDefaultOutput = sql_adapter.arrayLengthDefaultOutput;
+const rowExpressionBoundaryKeyword = sql_adapter.rowExpressionBoundaryKeyword;
+const sqlAssignmentTailKeyword = sql_adapter.sqlAssignmentTailKeyword;
+const sqlJoinedSourceAliasTerminator = sql_adapter.sqlJoinedSourceAliasTerminator;
+const sqlJsonExtractPathFunctionAsText = sql_adapter.sqlJsonExtractPathFunctionAsText;
+const sqlKeywordIsAnyOrSome = sql_adapter.sqlKeywordIsAnyOrSome;
+const sqlKeywordIsArrayLengthFunction = sql_adapter.sqlKeywordIsArrayLengthFunction;
+const sqlKeywordIsArrayPositionFunction = sql_adapter.sqlKeywordIsArrayPositionFunction;
+const sqlKeywordIsArrayToStringFunction = sql_adapter.sqlKeywordIsArrayToStringFunction;
+const sqlKeywordIsAsciiFunction = sql_adapter.sqlKeywordIsAsciiFunction;
+const sqlKeywordIsBitLengthFunction = sql_adapter.sqlKeywordIsBitLengthFunction;
+const sqlKeywordIsCardinalityFunction = sql_adapter.sqlKeywordIsCardinalityFunction;
+const sqlKeywordIsChrFunction = sql_adapter.sqlKeywordIsChrFunction;
+const sqlKeywordIsDateBinFunction = sql_adapter.sqlKeywordIsDateBinFunction;
+const sqlKeywordIsDatePartFunction = sql_adapter.sqlKeywordIsDatePartFunction;
+const sqlKeywordIsDateTruncFunction = sql_adapter.sqlKeywordIsDateTruncFunction;
+const sqlKeywordIsEndsWithFunction = sql_adapter.sqlKeywordIsEndsWithFunction;
+const sqlKeywordIsInitcapFunction = sql_adapter.sqlKeywordIsInitcapFunction;
+const sqlKeywordIsJsonArrayLengthFunction = sql_adapter.sqlKeywordIsJsonArrayLengthFunction;
+const sqlKeywordIsJsonBuildObjectFunction = sql_adapter.sqlKeywordIsJsonBuildObjectFunction;
+const sqlKeywordIsJsonExtractPathFunction = sql_adapter.sqlKeywordIsJsonExtractPathFunction;
+const sqlKeywordIsJsonTypeofFunction = sql_adapter.sqlKeywordIsJsonTypeofFunction;
+const sqlKeywordIsLeftRightFunction = sql_adapter.sqlKeywordIsLeftRightFunction;
+const sqlKeywordIsLengthFunction = sql_adapter.sqlKeywordIsLengthFunction;
+const sqlKeywordIsMd5Function = sql_adapter.sqlKeywordIsMd5Function;
+const sqlKeywordIsOctetLengthFunction = sql_adapter.sqlKeywordIsOctetLengthFunction;
+const sqlKeywordIsOverlayFunction = sql_adapter.sqlKeywordIsOverlayFunction;
+const sqlKeywordIsPadFunction = sql_adapter.sqlKeywordIsPadFunction;
+const sqlKeywordIsRegexpCountFunction = sql_adapter.sqlKeywordIsRegexpCountFunction;
+const sqlKeywordIsRegexpInstrFunction = sql_adapter.sqlKeywordIsRegexpInstrFunction;
+const sqlKeywordIsRegexpMatchFunction = sql_adapter.sqlKeywordIsRegexpMatchFunction;
+const sqlKeywordIsRegexpSubstrFunction = sql_adapter.sqlKeywordIsRegexpSubstrFunction;
+const sqlKeywordIsRepeatFunction = sql_adapter.sqlKeywordIsRepeatFunction;
+const sqlKeywordIsReverseFunction = sql_adapter.sqlKeywordIsReverseFunction;
+const sqlKeywordIsSplitPartFunction = sql_adapter.sqlKeywordIsSplitPartFunction;
+const sqlKeywordIsStartsWithFunction = sql_adapter.sqlKeywordIsStartsWithFunction;
+const sqlKeywordIsStrposFunction = sql_adapter.sqlKeywordIsStrposFunction;
+const sqlKeywordIsSubstringFunction = sql_adapter.sqlKeywordIsSubstringFunction;
+const sqlKeywordIsTranslateFunction = sql_adapter.sqlKeywordIsTranslateFunction;
+const sqlKeywordIsTrimVariantFunction = sql_adapter.sqlKeywordIsTrimVariantFunction;
+const sqlKeywordIsUuidV4Function = sql_adapter.sqlKeywordIsUuidV4Function;
+const sqlKeywordStartsScalarPredicate = sql_adapter.sqlKeywordStartsScalarPredicate;
 
 fn currentUtcDateStartNs() u64 {
     const now_ns = platform_time.realtimeNs();
     return now_ns - (now_ns % ns_per_day);
-}
-
-fn sqlJoinedSourceAliasTerminator(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "where") or
-        std.ascii.eqlIgnoreCase(text, "returning") or
-        std.ascii.eqlIgnoreCase(text, "order") or
-        std.ascii.eqlIgnoreCase(text, "limit") or
-        std.ascii.eqlIgnoreCase(text, "offset") or
-        std.ascii.eqlIgnoreCase(text, "for");
-}
-
-fn sqlAssignmentTailKeyword(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "where") or
-        std.ascii.eqlIgnoreCase(text, "from") or
-        std.ascii.eqlIgnoreCase(text, "returning") or
-        std.ascii.eqlIgnoreCase(text, "order") or
-        std.ascii.eqlIgnoreCase(text, "limit") or
-        std.ascii.eqlIgnoreCase(text, "offset") or
-        std.ascii.eqlIgnoreCase(text, "for");
-}
-
-fn sqlKeywordIsLengthFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "length") or
-        std.ascii.eqlIgnoreCase(text, "char_length") or
-        std.ascii.eqlIgnoreCase(text, "character_length");
-}
-
-fn sqlKeywordIsOctetLengthFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "octet_length");
-}
-
-fn sqlKeywordIsBitLengthFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "bit_length");
-}
-
-fn sqlKeywordIsJsonArrayLengthFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "json_array_length") or
-        std.ascii.eqlIgnoreCase(text, "jsonb_array_length");
-}
-
-fn sqlKeywordIsCardinalityFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "cardinality");
-}
-
-fn sqlKeywordIsArrayLengthFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "array_length") or
-        sqlKeywordIsCardinalityFunction(text);
-}
-
-fn sqlKeywordIsArrayPositionFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "array_position") or
-        std.ascii.eqlIgnoreCase(text, "array_positions");
-}
-
-fn sqlKeywordIsArrayToStringFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "array_to_string");
-}
-
-fn arrayLengthDefaultOutput(keyword: []const u8) []const u8 {
-    if (sqlKeywordIsCardinalityFunction(keyword)) return "cardinality";
-    return "array_length";
-}
-
-fn sqlKeywordIsJsonTypeofFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "json_typeof") or
-        std.ascii.eqlIgnoreCase(text, "jsonb_typeof");
-}
-
-fn sqlKeywordIsJsonExtractPathFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "json_extract_path") or
-        std.ascii.eqlIgnoreCase(text, "json_extract_path_text") or
-        std.ascii.eqlIgnoreCase(text, "jsonb_extract_path") or
-        std.ascii.eqlIgnoreCase(text, "jsonb_extract_path_text");
-}
-
-fn sqlKeywordIsJsonBuildObjectFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "json_build_object") or
-        std.ascii.eqlIgnoreCase(text, "jsonb_build_object");
-}
-
-fn sqlJsonExtractPathFunctionAsText(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "json_extract_path_text") or
-        std.ascii.eqlIgnoreCase(text, "jsonb_extract_path_text");
-}
-
-fn sqlKeywordIsAsciiFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "ascii");
-}
-
-fn sqlKeywordIsChrFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "chr");
-}
-
-fn sqlKeywordIsSubstringFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "substring") or
-        std.ascii.eqlIgnoreCase(text, "substr");
-}
-
-fn sqlKeywordIsOverlayFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "overlay");
-}
-
-fn sqlKeywordIsTranslateFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "translate");
-}
-
-fn sqlKeywordIsSplitPartFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "split_part");
-}
-
-fn sqlKeywordIsStrposFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "strpos");
-}
-
-fn sqlKeywordIsLeftRightFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "left") or
-        std.ascii.eqlIgnoreCase(text, "right");
-}
-
-fn sqlKeywordIsPadFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "lpad") or
-        std.ascii.eqlIgnoreCase(text, "rpad");
-}
-
-fn sqlKeywordIsRepeatFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "repeat");
-}
-
-fn sqlKeywordIsReverseFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "reverse");
-}
-
-fn sqlKeywordIsInitcapFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "initcap");
-}
-
-fn sqlKeywordIsMd5Function(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "md5");
-}
-
-fn sqlKeywordIsStartsWithFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "starts_with");
-}
-
-fn sqlKeywordIsEndsWithFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "ends_with");
-}
-
-fn sqlKeywordIsDateTruncFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "date_trunc");
-}
-
-fn sqlKeywordIsDateBinFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "date_bin");
-}
-
-fn sqlKeywordIsDatePartFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "date_part") or
-        std.ascii.eqlIgnoreCase(text, "extract");
-}
-
-fn sqlKeywordIsTrimVariantFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "btrim") or
-        std.ascii.eqlIgnoreCase(text, "ltrim") or
-        std.ascii.eqlIgnoreCase(text, "rtrim");
-}
-
-fn sqlKeywordIsUuidV4Function(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "gen_random_uuid") or
-        std.ascii.eqlIgnoreCase(text, "uuid_generate_v4");
-}
-
-fn sqlKeywordIsRegexpMatchFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "regexp_match") or
-        std.ascii.eqlIgnoreCase(text, "regexp_like");
-}
-
-fn sqlKeywordIsRegexpCountFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "regexp_count");
-}
-
-fn sqlKeywordIsRegexpSubstrFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "regexp_substr");
-}
-
-fn sqlKeywordIsRegexpInstrFunction(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "regexp_instr");
-}
-
-fn rowExpressionBoundaryKeyword(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "as") or
-        std.ascii.eqlIgnoreCase(text, "from") or
-        std.ascii.eqlIgnoreCase(text, "where") or
-        std.ascii.eqlIgnoreCase(text, "and") or
-        std.ascii.eqlIgnoreCase(text, "or") or
-        std.ascii.eqlIgnoreCase(text, "group") or
-        std.ascii.eqlIgnoreCase(text, "having") or
-        std.ascii.eqlIgnoreCase(text, "order") or
-        std.ascii.eqlIgnoreCase(text, "limit") or
-        std.ascii.eqlIgnoreCase(text, "offset") or
-        std.ascii.eqlIgnoreCase(text, "fetch") or
-        std.ascii.eqlIgnoreCase(text, "for") or
-        std.ascii.eqlIgnoreCase(text, "asc") or
-        std.ascii.eqlIgnoreCase(text, "desc") or
-        std.ascii.eqlIgnoreCase(text, "nulls") or
-        std.ascii.eqlIgnoreCase(text, "then") or
-        std.ascii.eqlIgnoreCase(text, "else") or
-        std.ascii.eqlIgnoreCase(text, "end") or
-        std.ascii.eqlIgnoreCase(text, "when") or
-        std.ascii.eqlIgnoreCase(text, "filter") or
-        std.ascii.eqlIgnoreCase(text, "over");
 }
 
 const InsertValueRows = []const []const []const u8;
