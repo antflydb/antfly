@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -932,6 +933,98 @@ func TestHAFormerPrimaryAdminCommandUsesExecutableRejoinSubcommands(t *testing.T
 			}
 		})
 	}
+}
+
+func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		RequiredLSN:       12,
+		ObservedLSN:       13,
+		FenceGeneration:   3,
+		FenceToken:        "ha-fence-token",
+		FenceReason:       "LeaseAcquired",
+	}}
+
+	fence, ok := haFenceAcquireBody(cluster, antflyv1.HAPlannedActionStatus{
+		StandbyName: "standby-a",
+		TargetLSN:   12,
+		Reason:      "AutomaticFailoverReady",
+	})
+	if !ok {
+		t.Fatal("expected fence request body")
+	}
+	fenceJSON := marshalJSONMap(t, fence)
+	if fenceJSON["old_primary_id"] != "primary-a" ||
+		fenceJSON["promoted_node_id"] != "standby-a" ||
+		fenceJSON["new_timeline_id"] != float64(5) ||
+		fenceJSON["new_epoch"] != float64(7) ||
+		fenceJSON["required_lsn"] != float64(12) ||
+		fenceJSON["observed_lsn"] != float64(12) ||
+		fenceJSON["reason"] != "AutomaticFailoverReady" {
+		t.Fatalf("unexpected fence request JSON: %#v", fenceJSON)
+	}
+	fenceIdentity := fenceJSON["identity"].(map[string]any)
+	if fenceIdentity["cluster_id"] != float64(100) ||
+		fenceIdentity["timeline_id"] != float64(4) ||
+		fenceIdentity["epoch"] != float64(6) {
+		t.Fatalf("unexpected fence identity JSON: %#v", fenceIdentity)
+	}
+
+	rejoin, ok := haRejoinAssessBody(cluster, antflyv1.HAPlannedActionStatus{
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+	})
+	if !ok {
+		t.Fatal("expected rejoin request body")
+	}
+	rejoinJSON := marshalJSONMap(t, rejoin)
+	if rejoinJSON["node_id"] != "primary-a" ||
+		rejoinJSON["last_lsn"] != float64(13) ||
+		rejoinJSON["retained_from_lsn"] != float64(8) ||
+		rejoinJSON["allow_rewind_after_forced_promotion"] != false {
+		t.Fatalf("unexpected rejoin request JSON: %#v", rejoinJSON)
+	}
+	receipt := rejoinJSON["receipt"].(map[string]any)
+	if receipt["old_primary_id"] != "primary-a" ||
+		receipt["promoted_node_id"] != "standby-a" ||
+		receipt["generation"] != float64(3) ||
+		receipt["token"] != "ha-fence-token" ||
+		receipt["reason"] != "LeaseAcquired" {
+		t.Fatalf("unexpected rejoin receipt JSON: %#v", receipt)
+	}
+	receiptIdentity := receipt["identity"].(map[string]any)
+	if receiptIdentity["timeline_id"] != float64(5) || receiptIdentity["epoch"] != float64(7) {
+		t.Fatalf("expected rejoin receipt identity to use promoted timeline, got %#v", receiptIdentity)
+	}
+}
+
+func marshalJSONMap(t *testing.T, value any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal JSON map: %v", err)
+	}
+	return out
 }
 
 func TestHASeedAdminCommandRequiresTargetLSN(t *testing.T) {
