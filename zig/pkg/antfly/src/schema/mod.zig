@@ -383,10 +383,16 @@ fn deriveRuntimePrimaryKey(alloc: std.mem.Allocator, schema: ParsedTableSchema) 
         for (columns) |column| alloc.free(column);
         if (columns.len > 0) alloc.free(columns);
     }
+    const include_columns = try cloneStringSlice(alloc, primary_key.include_columns);
+    errdefer {
+        for (include_columns) |column| alloc.free(column);
+        if (include_columns.len > 0) alloc.free(include_columns);
+    }
     const without_overlaps_period = if (primary_key.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
     return .{
         .name = name,
         .columns = columns,
+        .include_columns = include_columns,
         .without_overlaps_period = without_overlaps_period,
     };
 }
@@ -395,6 +401,8 @@ fn freeRuntimePrimaryKey(alloc: std.mem.Allocator, primary_key: storage_schema.P
     if (primary_key.name) |name| alloc.free(name);
     for (primary_key.columns) |column| alloc.free(column);
     if (primary_key.columns.len > 0) alloc.free(primary_key.columns);
+    for (primary_key.include_columns) |column| alloc.free(column);
+    if (primary_key.include_columns.len > 0) alloc.free(primary_key.include_columns);
     if (primary_key.without_overlaps_period) |period| alloc.free(period);
 }
 
@@ -1470,7 +1478,7 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}]}
     );
     defer parsed.deinit(alloc);
 
@@ -1497,6 +1505,9 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqual(@as(usize, 2), runtime.primary_key.?.columns.len);
     try std.testing.expectEqualStrings("tenant_id", runtime.primary_key.?.columns[0]);
     try std.testing.expectEqualStrings("id", runtime.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), runtime.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("created_at", runtime.primary_key.?.include_columns[0]);
+    try std.testing.expectEqualStrings("customer_id", runtime.primary_key.?.include_columns[1]);
     try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
     try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);

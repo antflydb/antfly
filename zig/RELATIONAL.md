@@ -136,9 +136,10 @@ fields belong behind an explicit `json` column.
 
 Constraints in scope: primary identity is either the existing document key or a
 declared `primary_key.columns` tuple with optional durable `primary_key.name`
-constraint metadata; `NOT NULL` via required schema fields; unique constraints
-over one or more ordered declared non-`json` relational columns, including
-optional non-key covering payload columns on unique constraints;
+constraint metadata, including optional non-key covering payload columns;
+`NOT NULL` via required schema fields; unique constraints over one or more
+ordered declared non-`json` relational columns, including optional non-key
+covering payload columns on unique constraints;
 `on_delete: "restrict"` foreign keys; bounded local nullable-column
 `on_delete: "set_null"` foreign keys; and bounded local
 `on_delete: "cascade"` foreign keys from declared scalar child columns to either
@@ -1677,9 +1678,10 @@ stores the stable DDL/catalog identity for the derived secondary index, and
 constraints store the same non-key covering payload columns as first-class
 constraint metadata, and SQL `UNIQUE (...) INCLUDE (...)` lowers to that typed
 metadata for both `CREATE TABLE` constraints and additive `ALTER TABLE` unique
-constraints. `PRIMARY KEY (...) INCLUDE (...)` fails closed until primary-key
-catalog metadata can represent non-identity covering payload columns without
-changing the row identity contract.
+constraints. Primary-key metadata has the same explicit covering payload list:
+SQL `PRIMARY KEY (...) INCLUDE (...)` lowers to `primary_key.include_columns`
+while row identity, physical keys, FK targets, and conflict binding continue to
+use only `primary_key.columns`.
 `x-antfly-index-where` stores the typed predicate. Writes evaluate the predicate against the same
 committed packed row that supplies the column values. Matching rows receive the
 ordinary column-major, array-element, or JSON-value side rows; non-matching rows

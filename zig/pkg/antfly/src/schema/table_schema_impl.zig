@@ -80,12 +80,15 @@ pub const TableSchema = struct {
 pub const PrimaryKey = struct {
     name: ?[]const u8 = null,
     columns: [][]const u8 = &.{},
+    include_columns: [][]const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.name) |name| alloc.free(name);
         for (self.columns) |column| alloc.free(column);
         if (self.columns.len > 0) alloc.free(self.columns);
+        for (self.include_columns) |column| alloc.free(column);
+        if (self.include_columns.len > 0) alloc.free(self.include_columns);
         if (self.without_overlaps_period) |period| alloc.free(period);
         self.* = undefined;
     }
@@ -1059,6 +1062,7 @@ fn validatePrimaryKey(value: std.json.Value) !void {
     while (field_it.next()) |entry| {
         if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
             !std.mem.eql(u8, entry.key_ptr.*, "columns") and
+            !std.mem.eql(u8, entry.key_ptr.*, "include_columns") and
             !std.mem.eql(u8, entry.key_ptr.*, "without_overlaps_period"))
         {
             return error.InvalidSchemaUpdateRequest;
@@ -1069,6 +1073,7 @@ fn validatePrimaryKey(value: std.json.Value) !void {
     }
     const columns = object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
     try validateStringArray(columns, true);
+    if (object.get("include_columns")) |include_columns| try validateStringArray(include_columns, false);
     if (object.get("without_overlaps_period")) |period| {
         if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
     }
@@ -2262,6 +2267,14 @@ fn validateRelationalPrimaryKey(schema: TableSchema) !void {
             if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
         }
     }
+    for (primary_key.include_columns, 0..) |column, column_index| {
+        if (stringSlicesContains(primary_key.columns, column)) return error.InvalidSchemaUpdateRequest;
+        const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
+        for (primary_key.include_columns[0..column_index]) |previous_column| {
+            if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
 }
 
 fn validateRelationalPeriods(schema: TableSchema) !void {
@@ -2968,6 +2981,7 @@ fn isRelationalTextLikeProperty(property: DocumentProperty) bool {
 fn uniqueConstraintsEquivalent(a: UniqueConstraint, b: UniqueConstraint) bool {
     if (!stringSlicesEqual(a.columns, b.columns)) return false;
     if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
+    if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
     return uniquePredicateSlicesEqual(a.where, b.where) and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }
@@ -4271,10 +4285,16 @@ fn parsePrimaryKey(alloc: std.mem.Allocator, value: std.json.Value) !PrimaryKey 
         for (columns) |column| alloc.free(column);
         if (columns.len > 0) alloc.free(columns);
     }
+    const include_columns: [][]const u8 = if (object.get("include_columns")) |include_columns_value| try parseStringArrayAlloc(alloc, include_columns_value) else &.{};
+    errdefer {
+        for (include_columns) |column| alloc.free(column);
+        if (include_columns.len > 0) alloc.free(include_columns);
+    }
     const without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null;
     return .{
         .name = name,
         .columns = columns,
+        .include_columns = include_columns,
         .without_overlaps_period = without_overlaps_period,
     };
 }
@@ -6149,7 +6169,7 @@ test "relational schema parses application-time temporal constraints" {
 test "relational schema parses and validates composite primary keys" {
     var parsed = try parseSchema(
         std.testing.allocator,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"orders_pkey\",\"columns\":[\"tenant_id\",\"order_id\"]},\"foreign_keys\":[{\"name\":\"order_parent_fkey\",\"columns\":[\"tenant_id\",\"customer_id\"],\"references\":{\"table\":\"order\",\"columns\":[\"tenant_id\",\"order_id\"]},\"on_delete\":\"restrict\"}]}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"orders_pkey\",\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"status\",\"customer_id\"]},\"foreign_keys\":[{\"name\":\"order_parent_fkey\",\"columns\":[\"tenant_id\",\"customer_id\"],\"references\":{\"table\":\"order\",\"columns\":[\"tenant_id\",\"order_id\"]},\"on_delete\":\"restrict\"}]}",
     );
     defer parsed.deinit(std.testing.allocator);
 
@@ -6158,6 +6178,9 @@ test "relational schema parses and validates composite primary keys" {
     try std.testing.expectEqual(@as(usize, 2), parsed.primary_key.?.columns.len);
     try std.testing.expectEqualStrings("tenant_id", parsed.primary_key.?.columns[0]);
     try std.testing.expectEqualStrings("order_id", parsed.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("status", parsed.primary_key.?.include_columns[0]);
+    try std.testing.expectEqualStrings("customer_id", parsed.primary_key.?.include_columns[1]);
     try std.testing.expectEqual(@as(usize, 1), parsed.foreign_keys.len);
     try std.testing.expectEqualStrings("tenant_id", parsed.foreign_keys[0].references.columns[0]);
     try std.testing.expectEqualStrings("order_id", parsed.foreign_keys[0].references.columns[1]);
@@ -6188,6 +6211,34 @@ test "relational schema parses and validates composite primary keys" {
         parseSchema(
             std.testing.allocator,
             "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"orders_email_key\",\"columns\":[\"tenant_id\",\"order_id\"]},\"unique_constraints\":[{\"name\":\"orders_email_key\",\"columns\":[\"email\"]}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"tenant_id\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"status\",\"status\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"missing\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"payload\":{\"type\":\"json\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"payload\"]}}",
         ),
     );
 }

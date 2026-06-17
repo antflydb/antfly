@@ -8412,9 +8412,10 @@ const Parser = struct {
             try self.expectKeyword("key");
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
-            if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
+            const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
+            defer freeStringSlice(self.alloc, include_columns);
             try self.consumeOptionalDdlImmediateConstraintTiming();
-            const primary_key = try self.makeDdlPrimaryKey(constraint_name, columns.columns, columns.without_overlaps_period);
+            const primary_key = try self.makeDdlPrimaryKey(constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
             if (constraint_name) |name| self.alloc.free(name);
             constraint_name_transferred = true;
             try self.appendAlterTableOperation(operations, .{ .add_primary_key = primary_key });
@@ -9237,9 +9238,10 @@ const Parser = struct {
             } else if (self.matchKeyword("primary")) {
                 try self.expectKeyword("key");
                 column.nullable = false;
-                if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
+                const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
+                defer freeStringSlice(self.alloc, include_columns);
                 try self.consumeOptionalDdlImmediateConstraintTiming();
-                try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, null);
+                try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, include_columns, null);
             } else if (self.matchKeyword("unique")) {
                 try self.consumeOptionalDdlUniqueNullsDistinct();
                 const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
@@ -9265,9 +9267,10 @@ const Parser = struct {
                 if (self.matchKeyword("primary")) {
                     try self.expectKeyword("key");
                     column.nullable = false;
-                    if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
+                    const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
+                    defer freeStringSlice(self.alloc, include_columns);
                     try self.consumeOptionalDdlImmediateConstraintTiming();
-                    try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, null);
+                    try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, include_columns, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("unique")) {
@@ -9560,9 +9563,10 @@ const Parser = struct {
             try self.expectKeyword("key");
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
-            if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
+            const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
+            defer freeStringSlice(self.alloc, include_columns);
             try self.consumeOptionalDdlImmediateConstraintTiming();
-            try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, columns.without_overlaps_period);
+            try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("unique")) {
             try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
@@ -10498,26 +10502,31 @@ const Parser = struct {
         primary_key: *?runtime_schema.PrimaryKey,
         constraint_name: ?[]const u8,
         columns: []const []const u8,
+        include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
     ) !void {
         if (primary_key.* != null) return error.UnsupportedSqlShape;
-        primary_key.* = try self.makeDdlPrimaryKey(constraint_name, columns, without_overlaps_period);
+        primary_key.* = try self.makeDdlPrimaryKey(constraint_name, columns, include_columns, without_overlaps_period);
     }
 
     fn makeDdlPrimaryKey(
         self: *@This(),
         constraint_name: ?[]const u8,
         columns: []const []const u8,
+        include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
     ) !runtime_schema.PrimaryKey {
         const name = if (constraint_name) |value| try self.alloc.dupe(u8, value) else null;
         errdefer if (name) |value| self.alloc.free(value);
         const cloned_columns = try cloneStringSlice(self.alloc, columns);
         errdefer freeStringSlice(self.alloc, cloned_columns);
+        const cloned_include_columns = try cloneStringSlice(self.alloc, include_columns);
+        errdefer freeStringSlice(self.alloc, cloned_include_columns);
         const period = if (without_overlaps_period) |value| try self.alloc.dupe(u8, value) else null;
         return .{
             .name = name,
             .columns = cloned_columns,
+            .include_columns = cloned_include_columns,
             .without_overlaps_period = period,
         };
     }
@@ -40503,6 +40512,7 @@ fn renamePrimaryKeyJsonFields(
 ) !void {
     if (primary_key.* != .object) return error.InvalidSqlCatalog;
     try renameStringInJsonArray(alloc, primary_key.object.getPtr("columns"), old_name, new_name);
+    try renameStringInJsonArray(alloc, primary_key.object.getPtr("include_columns"), old_name, new_name);
 }
 
 fn renameSchemaPropertyReferences(
@@ -40778,6 +40788,7 @@ fn validateCreateIndexIncludeColumnsForSchemaJsonProperties(
         if (property != .object) return error.InvalidSqlCatalog;
         const property_type = property.object.get("type") orelse return error.InvalidSqlCatalog;
         if (property_type != .string) return error.InvalidSqlCatalog;
+        if (std.mem.eql(u8, property_type.string, "json") or std.mem.eql(u8, property_type.string, "array")) return error.InvalidSqlCatalog;
     }
 }
 
@@ -40868,6 +40879,9 @@ fn rejectPrimaryKeyDropFromSchemaJson(root: *std.json.ObjectMap, fields: []const
     if (primary_key != .object) return error.InvalidSqlCatalog;
     const columns = primary_key.object.get("columns") orelse return error.InvalidSqlCatalog;
     if (jsonStringArrayReferencesAny(columns, fields)) return error.UnsupportedSqlShape;
+    if (primary_key.object.get("include_columns")) |include_columns| {
+        if (jsonStringArrayReferencesAny(include_columns, fields)) return error.UnsupportedSqlShape;
+    }
 }
 
 const JsonConstraintKind = enum {
@@ -41011,6 +41025,7 @@ fn schemaJsonPrimaryKeyAlloc(alloc: std.mem.Allocator, primary_key: runtime_sche
     var object = std.json.ObjectMap.empty;
     if (primary_key.name) |name| try putJsonString(alloc, &object, "name", name);
     try object.put(alloc, try alloc.dupe(u8, "columns"), try schemaJsonStringArrayAlloc(alloc, primary_key.columns));
+    if (primary_key.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, primary_key.include_columns));
     if (primary_key.without_overlaps_period) |period| try putJsonString(alloc, &object, "without_overlaps_period", period);
     return .{ .object = object };
 }
@@ -41376,10 +41391,13 @@ fn cloneDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.Prim
     errdefer if (name) |value| alloc.free(value);
     const columns = try cloneStringSlice(alloc, primary_key.columns);
     errdefer freeStringSlice(alloc, columns);
+    const include_columns = try cloneStringSlice(alloc, primary_key.include_columns);
+    errdefer freeStringSlice(alloc, include_columns);
     const period = if (primary_key.without_overlaps_period) |value| try alloc.dupe(u8, value) else null;
     return .{
         .name = name,
         .columns = columns,
+        .include_columns = include_columns,
         .without_overlaps_period = period,
     };
 }
@@ -41651,6 +41669,7 @@ fn renameRelationalColumnAlloc(
         try renameExpressionConditionsAlloc(alloc, column.index_where_expressions, operation.old_name, operation.new_name);
     }
     if (schema.primary_key) |*primary_key| try renameStringSliceValuesAlloc(alloc, primary_key.columns, operation.old_name, operation.new_name);
+    if (schema.primary_key) |*primary_key| try renameStringSliceValuesAlloc(alloc, primary_key.include_columns, operation.old_name, operation.new_name);
     for (@constCast(schema.unique_constraints)) |*constraint| {
         try renameStringSliceValuesAlloc(alloc, constraint.columns, operation.old_name, operation.new_name);
         for (@constCast(constraint.expressions)) |*expression| {
@@ -42547,6 +42566,7 @@ fn validatePrimaryKeyColumns(columns: []const runtime_schema.RelationalColumn, p
         const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
         if (found.nullable) return error.InvalidSqlCatalog;
     }
+    try validateCreateIndexIncludeColumns(columns, primary_key.columns, primary_key.include_columns);
 }
 
 fn validateRelationalPeriodCatalog(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod) !void {
@@ -43026,7 +43046,8 @@ fn validateCreateIndexIncludeColumns(
 ) !void {
     for (include_columns) |column| {
         if (stringSlicesContains(key_columns, column)) return error.InvalidSqlCatalog;
-        _ = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.field_type == .json or found.field_type == .array) return error.InvalidSqlCatalog;
     }
 }
 
@@ -43343,6 +43364,7 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
 fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {
     if (primary_key.name) |name| alloc.free(name);
     freeStringSlice(alloc, primary_key.columns);
+    freeStringSlice(alloc, primary_key.include_columns);
     if (primary_key.without_overlaps_period) |period| alloc.free(period);
 }
 
@@ -45590,7 +45612,8 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
         \\CREATE TABLE table_primary_key_timing (
         \\  tenant_id text NOT NULL,
         \\  id uuid NOT NULL,
-        \\  CONSTRAINT table_primary_key_timing_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY IMMEDIATE
+        \\  status text,
+        \\  CONSTRAINT table_primary_key_timing_pk PRIMARY KEY (tenant_id, id) INCLUDE (status) NOT DEFERRABLE INITIALLY IMMEDIATE
         \\);
         ,
     );
@@ -45603,6 +45626,8 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
             try std.testing.expectEqual(@as(usize, 2), plan.primary_key.?.columns.len);
             try std.testing.expectEqualStrings("tenant_id", plan.primary_key.?.columns[0]);
             try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[1]);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.include_columns.len);
+            try std.testing.expectEqualStrings("status", plan.primary_key.?.include_columns[0]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -45651,7 +45676,7 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
     var covering_unique_constraints = try lowerDdlPlanAlloc(
         alloc,
         \\CREATE TABLE covering_unique_constraints (
-        \\  id uuid PRIMARY KEY,
+        \\  id uuid PRIMARY KEY INCLUDE (tenant_id),
         \\  tenant_id text,
         \\  status text,
         \\  email text UNIQUE INCLUDE (tenant_id),
@@ -45663,6 +45688,10 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
     switch (covering_unique_constraints) {
         .create_table => |plan| {
             try std.testing.expectEqualStrings("covering_unique_constraints", plan.table_name);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.primary_key.?.include_columns[0]);
             try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints.len);
             try std.testing.expectEqualStrings("email_key", plan.unique_constraints[0].name);
             try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
@@ -45676,6 +45705,9 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
 
             const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
             defer runtime_schema.freeSchema(alloc, applied);
+            try std.testing.expect(applied.primary_key != null);
+            try std.testing.expectEqual(@as(usize, 1), applied.primary_key.?.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", applied.primary_key.?.include_columns[0]);
             try std.testing.expectEqual(@as(usize, 2), applied.unique_constraints.len);
             try std.testing.expectEqual(@as(usize, 2), applied.unique_constraints[1].include_columns.len);
             try std.testing.expectEqualStrings("tenant_id", applied.unique_constraints[1].include_columns[0]);
@@ -45714,11 +45746,7 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
-        "CREATE TABLE bad_primary_include (id uuid PRIMARY KEY INCLUDE (tenant_id), tenant_id text);",
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
-        alloc,
-        "CREATE TABLE bad_table_primary_include (tenant_id text, id uuid, status text, PRIMARY KEY (tenant_id, id) INCLUDE (status));",
+        "CREATE TABLE bad_primary_include_overlap (id uuid PRIMARY KEY INCLUDE (id));",
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
@@ -47440,10 +47468,6 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
     }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
-        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status);",
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
-        alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (email);",
     ));
 
@@ -47471,6 +47495,34 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE;",
+    ));
+
+    var explicit_covering_primary_key = try lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+    );
+    defer explicit_covering_primary_key.deinit(alloc);
+    switch (explicit_covering_primary_key) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_stage", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_primary_key => |primary_key| {
+                    try std.testing.expectEqualStrings("usage_stage_pk", primary_key.name.?);
+                    try std.testing.expectEqual(@as(usize, 2), primary_key.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", primary_key.columns[0]);
+                    try std.testing.expectEqualStrings("id", primary_key.columns[1]);
+                    try std.testing.expectEqual(@as(usize, 1), primary_key.include_columns.len);
+                    try std.testing.expectEqualStrings("status", primary_key.include_columns[0]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (id);",
     ));
 
     var drop_column = try lowerDdlPlanAlloc(
@@ -48074,6 +48126,7 @@ test "postgres sql adapter applies additive alter table ddl plan to runtime sche
         .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
         .{ .name = "valid_from", .path = "valid_from", .field_type = .numeric, .nullable = false },
         .{ .name = "valid_to", .path = "valid_to", .field_type = .numeric, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword, .nullable = true },
     };
     const no_pk_schema: runtime_schema.TableSchema = .{
         .version = 1,
@@ -48088,7 +48141,7 @@ test "postgres sql adapter applies additive alter table ddl plan to runtime sche
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD PERIOD FOR valid_time (valid_from, valid_to),
-        \\  ADD CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id, valid_time WITHOUT OVERLAPS);
+        \\  ADD CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id, valid_time WITHOUT OVERLAPS) INCLUDE (status);
         ,
     );
     defer add_primary_key.deinit(alloc);
@@ -48098,6 +48151,8 @@ test "postgres sql adapter applies additive alter table ddl plan to runtime sche
     try std.testing.expectEqualStrings("usage_records_pk", primary_keyed.primary_key.?.name.?);
     try std.testing.expectEqualStrings("tenant_id", primary_keyed.primary_key.?.columns[0]);
     try std.testing.expectEqualStrings("id", primary_keyed.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), primary_keyed.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("status", primary_keyed.primary_key.?.include_columns[0]);
     try std.testing.expectEqualStrings("valid_time", primary_keyed.primary_key.?.without_overlaps_period.?);
     try std.testing.expectEqual(@as(usize, 1), primary_keyed.periods.len);
     try std.testing.expectEqualStrings("valid_time", primary_keyed.periods[0].name);
@@ -50874,7 +50929,7 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
 
     var create_no_pk = try lowerDdlPlanAlloc(
         alloc,
-        "CREATE TABLE usage_records (tenant_id text NOT NULL, id uuid NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL);",
+        "CREATE TABLE usage_records (tenant_id text NOT NULL, id uuid NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text);",
     );
     defer create_no_pk.deinit(alloc);
     var no_pk = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create_no_pk);
@@ -50884,13 +50939,13 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     const no_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_no_pk);
     defer runtime_schema.freeSchema(alloc, no_pk_runtime);
     try std.testing.expect(no_pk_runtime.primary_key == null);
-    try std.testing.expectEqual(@as(usize, 4), no_pk_runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 5), no_pk_runtime.relational_columns.len);
 
     var add_primary_key = try lowerDdlPlanAlloc(
         alloc,
         \\ALTER TABLE usage_records
         \\  ADD PERIOD FOR valid_time (valid_from, valid_to),
-        \\  ADD CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id, valid_time WITHOUT OVERLAPS);
+        \\  ADD CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id, valid_time WITHOUT OVERLAPS) INCLUDE (status);
         ,
     );
     defer add_primary_key.deinit(alloc);
@@ -50907,6 +50962,8 @@ test "postgres sql adapter applies incremental ddl plans to public schema json" 
     try std.testing.expectEqualStrings("usage_records_pk", primary_keyed_runtime.primary_key.?.name.?);
     try std.testing.expectEqualStrings("tenant_id", primary_keyed_runtime.primary_key.?.columns[0]);
     try std.testing.expectEqualStrings("id", primary_keyed_runtime.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), primary_keyed_runtime.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("status", primary_keyed_runtime.primary_key.?.include_columns[0]);
     try std.testing.expectEqualStrings("valid_time", primary_keyed_runtime.primary_key.?.without_overlaps_period.?);
     try std.testing.expectEqual(@as(usize, 1), primary_keyed_runtime.periods.len);
     try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, primary_keyed.schema_json, add_primary_key));
@@ -70847,6 +70904,17 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY IMMEDIATE;",
         },
         .{
+            .name = "schema add covering primary key migration",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_stage", .operations = 1 },
+            .plan = "ddl:alter_table:table=usage_stage:ops=1:if_exists=false:add_pk=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);",
+            },
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status);",
+        },
+        .{
             .name = "schema drop primary key migration",
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_stage", .operations = 1 },
@@ -71076,13 +71144,6 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "unsupported:ddl:requires=deferrable_primary_key",
             .classification_reason = "deferrable_primary_key",
             .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE;",
-        },
-        .{
-            .name = "unsupported primary key include columns",
-            .family = .unsupported_ddl,
-            .plan = "unsupported:ddl:requires=primary_key_include_columns",
-            .classification_reason = "primary_key_include_columns",
-            .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status);",
         },
         .{
             .name = "schema replace table",

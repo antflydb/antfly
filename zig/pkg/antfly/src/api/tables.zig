@@ -1369,7 +1369,8 @@ fn validateConstraintCatalogTransition(current_runtime: runtime_schema_mod.Table
 fn primaryKeysEqual(a: ?runtime_schema_mod.PrimaryKey, b: ?runtime_schema_mod.PrimaryKey) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
-    return stringSlicesEqual(a.?.columns, b.?.columns);
+    return stringSlicesEqual(a.?.columns, b.?.columns) and
+        stringSlicesEqual(a.?.include_columns, b.?.include_columns);
 }
 
 fn findUniqueConstraintByName(unique_constraints: []const runtime_schema_mod.UniqueConstraint, name: []const u8) ?runtime_schema_mod.UniqueConstraint {
@@ -1387,7 +1388,9 @@ fn findForeignKeyByName(foreign_keys: []const runtime_schema_mod.ForeignKey, nam
 }
 
 fn uniqueConstraintsEqual(a: runtime_schema_mod.UniqueConstraint, b: runtime_schema_mod.UniqueConstraint) bool {
-    return std.mem.eql(u8, a.name, b.name) and stringSlicesEqual(a.columns, b.columns);
+    return std.mem.eql(u8, a.name, b.name) and
+        stringSlicesEqual(a.columns, b.columns) and
+        stringSlicesEqual(a.include_columns, b.include_columns);
 }
 
 fn foreignKeysSameDefinition(a: runtime_schema_mod.ForeignKey, b: runtime_schema_mod.ForeignKey) bool {

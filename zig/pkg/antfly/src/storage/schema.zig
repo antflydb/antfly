@@ -451,6 +451,7 @@ pub const RelationalPeriodRangeType = enum(u8) {
 pub const PrimaryKey = struct {
     name: ?[]const u8 = null,
     columns: []const []const u8 = &.{},
+    include_columns: []const []const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
 };
 
@@ -579,6 +580,7 @@ pub fn primaryKeyCatalogsEqual(current: ?PrimaryKey, next: ?PrimaryKey) bool {
     if (current == null or next == null) return false;
     return optionalStringsEqual(current.?.name, next.?.name) and
         stringSlicesEqual(current.?.columns, next.?.columns) and
+        stringSlicesEqual(current.?.include_columns, next.?.include_columns) and
         optionalStringsEqual(current.?.without_overlaps_period, next.?.without_overlaps_period);
 }
 
@@ -695,7 +697,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 36); // format version
+    try appendU32(&buf, alloc, 37); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -849,6 +851,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         for (primary_key.columns) |column| try appendStr(&buf, alloc, column);
         try appendOptStr(&buf, alloc, primary_key.without_overlaps_period);
         try appendOptStr(&buf, alloc, primary_key.name);
+        try appendStringSlice(&buf, alloc, primary_key.include_columns);
     } else {
         try buf.append(alloc, 0);
     }
@@ -896,7 +899,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 36) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 37) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1371,7 +1374,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         errdefer if (without_overlaps_period) |period| alloc.free(period);
         const name = if (fmt_version >= 32) try readOptStrAlloc(alloc, data, &pos) else null;
         errdefer if (name) |value| alloc.free(value);
-        break :key_blk .{ .name = name, .columns = columns, .without_overlaps_period = without_overlaps_period };
+        const include_columns = if (fmt_version >= 37) try readStringSliceAlloc(alloc, data, &pos) else &.{};
+        errdefer freeStringSlice(alloc, include_columns);
+        break :key_blk .{ .name = name, .columns = columns, .include_columns = include_columns, .without_overlaps_period = without_overlaps_period };
     } else key_blk: {
         if (fmt_version >= 17) pos += 1;
         break :key_blk null;
@@ -1721,6 +1726,7 @@ pub fn freeRelationalRowsExpression(alloc: Allocator, expression: RelationalRows
 fn freePrimaryKey(alloc: Allocator, primary_key: PrimaryKey) void {
     if (primary_key.name) |name| alloc.free(name);
     freeStringSlice(alloc, primary_key.columns);
+    freeStringSlice(alloc, primary_key.include_columns);
     if (primary_key.without_overlaps_period) |period| alloc.free(period);
 }
 
@@ -2550,7 +2556,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .{ .name = "tenant_key", .path = "tenant_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .lower, .field = "tenant_id" } },
             .{ .name = "tenant_upper_key", .path = "tenant_upper_key", .field_type = .keyword, .nullable = true, .generated = .{ .op = .upper, .field = "tenant_id" } },
         },
-        .primary_key = .{ .name = "orders_pkey", .columns = &.{ "tenant_id", "id" }, .without_overlaps_period = "valid_time" },
+        .primary_key = .{ .name = "orders_pkey", .columns = &.{ "tenant_id", "id" }, .include_columns = &.{ "created_at", "request_id" }, .without_overlaps_period = "valid_time" },
         .periods = &.{.{ .name = "valid_time", .start_column = "created_at", .end_column = "created_day", .range_type = .daterange }},
         .foreign_keys = &.{
             .{
@@ -2657,6 +2663,9 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 2), loaded.primary_key.?.columns.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.primary_key.?.columns[0]);
     try std.testing.expectEqualStrings("id", loaded.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("created_at", loaded.primary_key.?.include_columns[0]);
+    try std.testing.expectEqualStrings("request_id", loaded.primary_key.?.include_columns[1]);
     try std.testing.expectEqualStrings("valid_time", loaded.primary_key.?.without_overlaps_period.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.periods.len);
     try std.testing.expectEqualStrings("valid_time", loaded.periods[0].name);
