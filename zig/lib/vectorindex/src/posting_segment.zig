@@ -693,7 +693,7 @@ pub const Catalog = struct {
                 try deltas.append(alloc, delta);
             }
         }
-        std.mem.sort(DeltaValue, deltas.items, {}, deltaValueLessThan);
+        sortDeltaValuesIfNeeded(deltas.items);
         return try deltas.toOwnedSlice(alloc);
     }
 
@@ -709,7 +709,7 @@ pub const Catalog = struct {
                 try deltas.append(alloc, delta);
             }
         }
-        std.mem.sort(DeltaValue, deltas.items, {}, deltaValueLessThan);
+        sortDeltaValuesIfNeeded(deltas.items);
         return try deltas.toOwnedSlice(alloc);
     }
 
@@ -868,7 +868,7 @@ pub const LazyDirectorySnapshot = struct {
         }
 
         const records = scratch.deltaRecordsMut();
-        std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records);
 
         if (base_members_are_sorted and records.len <= compact_sorted_delta_max_records) {
             var compact_ids: [compact_sorted_delta_max_records]posting.VectorId = undefined;
@@ -1005,7 +1005,7 @@ pub const LazyDirectorySnapshot = struct {
 
         _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_iter.header.generation, scratch);
         const records = scratch.deltaRecordsMut();
-        std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records);
 
         try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
         for (records) |record| {
@@ -1027,7 +1027,7 @@ pub const LazyDirectorySnapshot = struct {
 
         _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_header.generation, scratch);
         const records = scratch.deltaRecordsMut();
-        std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records);
         try scratch.ensureCompactDeltaCapacity(alloc, records.len);
         for (records) |record| {
             scratch.appendCompactDeltaRecordAssumeCapacity(record);
@@ -1054,7 +1054,7 @@ pub const LazyDirectorySnapshot = struct {
             try self.readDeltaRecordsWithStatsAlloc(alloc, entry, posting_id, min_generation, &records, &stats);
         }
 
-        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records.items);
         return .{
             .records = try records.toOwnedSlice(alloc),
             .stats = stats,
@@ -1174,7 +1174,7 @@ pub const Snapshot = struct {
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
         try self.catalog.appendDeltaRecords(alloc, posting_id, null, &records);
-        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records.items);
         return try records.toOwnedSlice(alloc);
     }
 
@@ -1182,7 +1182,7 @@ pub const Snapshot = struct {
         var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
         errdefer records.deinit(alloc);
         try self.catalog.appendDeltaRecords(alloc, posting_id, generation, &records);
-        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records.items);
         return try records.toOwnedSlice(alloc);
     }
 
@@ -2605,7 +2605,7 @@ pub const DirectoryBatchWriter = struct {
             }
         }
 
-        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records.items);
         return try records.toOwnedSlice(alloc);
     }
 
@@ -2627,7 +2627,7 @@ pub const DirectoryBatchWriter = struct {
             }
         }
 
-        std.mem.sort(posting.PostingDeltaRecord, records.items, {}, postingDeltaRecordLessThan);
+        sortPostingDeltaRecordsIfNeeded(records.items);
         return .{
             .records = try records.toOwnedSlice(alloc),
             .stats = stats,
@@ -3582,8 +3582,28 @@ fn deltaValueLessThan(_: void, lhs: DeltaValue, rhs: DeltaValue) bool {
     return lhs.sequence < rhs.sequence;
 }
 
+fn sortDeltaValuesIfNeeded(values: []DeltaValue) void {
+    var index: usize = 1;
+    while (index < values.len) : (index += 1) {
+        if (values[index].sequence < values[index - 1].sequence) {
+            std.mem.sort(DeltaValue, values, {}, deltaValueLessThan);
+            return;
+        }
+    }
+}
+
 fn postingDeltaRecordLessThan(_: void, lhs: posting.PostingDeltaRecord, rhs: posting.PostingDeltaRecord) bool {
     return lhs.sequence < rhs.sequence;
+}
+
+fn sortPostingDeltaRecordsIfNeeded(records: []posting.PostingDeltaRecord) void {
+    var index: usize = 1;
+    while (index < records.len) : (index += 1) {
+        if (records[index].sequence < records[index - 1].sequence) {
+            std.mem.sort(posting.PostingDeltaRecord, records, {}, postingDeltaRecordLessThan);
+            return;
+        }
+    }
 }
 
 fn appendDeltaRecordToScratch(alloc: Allocator, scratch: anytype, record: posting.PostingDeltaRecord) !void {
