@@ -1346,10 +1346,12 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 		},
 	}
 
+	var observed []string
 	reconciler := &AntflyClusterReconciler{
 		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
 		Scheme: s,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			observed = append(observed, req.Method+" "+req.URL.Path)
 			switch req.URL.Path {
 			case "/admin/v1/ha/replication-slots":
 				return &http.Response{
@@ -1363,8 +1365,27 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
 					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
 				}, nil
+			case "/admin/v1/ha/base-backups/finish":
+				var body map[string]any
+				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+				}, nil
+			case "/admin/v1/ha/standby/bootstrap":
+				var body map[string]any
+				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
+				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-5"))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+				}, nil
 			default:
-				t.Fatalf("unexpected direct HA admin request before seed file jobs: %s", req.URL.Path)
+				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
 				return nil, nil
 			}
 		})},
@@ -1382,61 +1403,25 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
-	finishJob := &batchv1.Job{}
-	g.Expect(reconciler.Get(
-		context.Background(),
-		types.NamespacedName{Name: cluster.Status.HAStatus.PlannedActions[2].AdminJobName, Namespace: cluster.Namespace},
-		finishJob,
-	)).To(Succeed())
-	g.Expect(finishJob.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-		"ha",
-		"--ha-url",
-		"http://primary-ha.default.svc:8081",
-		"--",
-		"seed",
-		"finish",
-		"--manifest",
-		"/backup/base-standby-a-5.afha",
-	}))
-	g.Expect(finishJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-method", "POST"))
-	g.Expect(finishJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-path", "/admin/v1/ha/base-backups/finish"))
-	finishJob.Status.Conditions = []batchv1.JobCondition{{
-		Type:   batchv1.JobComplete,
-		Status: corev1.ConditionTrue,
-	}}
-	g.Expect(reconciler.Status().Update(context.Background(), finishJob)).To(Succeed())
-	cluster.Status.HAStatus.PlannedActions[2].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		ManifestID:   "base-standby-a-5",
-		BackupLSN:    5,
-		EndRecordLSN: 5,
-	}
-
-	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	finish := cluster.Status.HAStatus.PlannedActions[2]
 	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(finish.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(finish.AdminResult).NotTo(BeNil())
 	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
 	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
-	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhasePending))
-	bootstrapJob := &batchv1.Job{}
-	g.Expect(reconciler.Get(context.Background(), types.NamespacedName{Name: bootstrap.AdminJobName, Namespace: cluster.Namespace}, bootstrapJob)).To(Succeed())
-	g.Expect(bootstrapJob.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-		"ha",
-		"--ha-url",
-		"http://standby-a-ha.default.svc:8081",
-		"--",
-		"seed",
-		"bootstrap",
-		"--manifest",
-		"/backup/base-standby-a-5.afha",
-		"--content-root",
-		"/backup/base-standby-a-5",
+	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	g.Expect(bootstrap.AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(bootstrap.AdminResult).NotTo(BeNil())
+	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(5)))
+	g.Expect(observed).To(Equal([]string{
+		"POST /admin/v1/ha/replication-slots",
+		"POST /admin/v1/ha/base-backups",
+		"POST /admin/v1/ha/base-backups/finish",
+		"POST /admin/v1/ha/standby/bootstrap",
 	}))
-	g.Expect(bootstrapJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-method", "POST"))
-	g.Expect(bootstrapJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-admin-path", "/admin/v1/ha/standby/bootstrap"))
 }
 
 func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {

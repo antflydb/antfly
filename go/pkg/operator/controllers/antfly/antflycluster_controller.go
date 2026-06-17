@@ -3467,6 +3467,37 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 			err = requireHADirectAdminActionResult(action, raw)
 		}
 		return true, err
+	case string(haActionFinishStandbySeed):
+		if strings.TrimSpace(action.SeedManifestPath) == "" {
+			return false, nil
+		}
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		body := map[string]any{"manifest_path": strings.TrimSpace(action.SeedManifestPath)}
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		if err == nil {
+			err = requireHADirectAdminActionResult(action, raw)
+		}
+		return true, err
+	case string(haActionBootstrapStandbySeed):
+		if strings.TrimSpace(action.SeedManifestPath) == "" {
+			return false, nil
+		}
+		method, apiPath, ok := haPlannedActionDirectAdminOperation(*action)
+		if !ok {
+			return false, nil
+		}
+		body := map[string]any{"manifest_path": strings.TrimSpace(action.SeedManifestPath)}
+		if strings.TrimSpace(action.SeedContentRoot) != "" {
+			body["content_root"] = strings.TrimSpace(action.SeedContentRoot)
+		}
+		raw, err := r.requestHAAdminJSONBodyRaw(ctx, method, action.AdminURL, apiPath, body)
+		if err == nil {
+			err = requireHADirectAdminActionResult(action, raw)
+		}
+		return true, err
 	case string(haActionAcquireFence):
 		body, ok := haFenceAcquireBody(cluster, *action)
 		if !ok {
@@ -3533,6 +3564,8 @@ func haPlannedActionSupportsDirectAdminAPI(kind haActionKind) bool {
 		haActionDropSlot,
 		haActionSeedStandby,
 		haActionMarkReseed,
+		haActionFinishStandbySeed,
+		haActionBootstrapStandbySeed,
 		haActionAcquireFence,
 		haActionPromoteStandby,
 		haActionDemoteFormerPrimary,

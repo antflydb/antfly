@@ -215,7 +215,7 @@ func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t 
 	}
 }
 
-func TestHAPlannedActionStatusesRequireAdminCommandMatchForFileBackedActions(t *testing.T) {
+func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
 	}
@@ -241,11 +241,12 @@ func TestHAPlannedActionStatusesRequireAdminCommandMatchForFileBackedActions(t *
 	}
 
 	status := &antflyv1.HAStatus{PlannedActions: []antflyv1.HAPlannedActionStatus{previous}}
-	notPreserved := haPlannedActionStatuses(actions, ha, status)
-	if notPreserved[0].AdminJobName != "" ||
-		notPreserved[0].AdminJobPhase != "" ||
-		notPreserved[0].AdminResult != nil {
-		t.Fatalf("expected file-backed action with changed command to drop execution state, got %#v", notPreserved[0])
+	preserved := haPlannedActionStatuses(actions, ha, status)
+	if preserved[0].AdminJobName != "seed-finish-job" ||
+		preserved[0].AdminJobPhase != haAdminJobPhaseSucceeded ||
+		preserved[0].AdminResult == nil ||
+		preserved[0].AdminResult.ManifestID != "base-standby-a-5" {
+		t.Fatalf("expected typed seed finish execution state to survive CLI hint drift, got %#v", preserved[0])
 	}
 }
 
