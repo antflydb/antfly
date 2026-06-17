@@ -3776,7 +3776,9 @@ func requireHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, ra
 	if action == nil || !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return nil
 	}
-	if applyHADirectAdminActionResult(action, raw) && haActionHasRequiredAdminResult(*action) {
+	if applyHADirectAdminActionResult(action, raw) &&
+		haActionHasRequiredAdminResult(*action) &&
+		haDirectAdminActionReceiptMatches(*action) {
 		return nil
 	}
 	action.AdminResult = nil
@@ -3912,6 +3914,7 @@ func requireHADirectFenceAcquireResult(cluster *antflyv1.AntflyCluster, action *
 	}
 	if applyHADirectAdminActionResult(action, raw) &&
 		haActionHasRequiredAdminResult(*action) &&
+		haDirectAdminActionReceiptMatches(*action) &&
 		haFenceAcquireResultMatchesAction(cluster, action, action.AdminResult) {
 		return nil
 	}
@@ -5644,7 +5647,7 @@ func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStat
 		if dependency.Kind != action.DependsOn {
 			continue
 		}
-		if len(dependency.AdminCommand) == 0 {
+		if dependency.AdminJobName != haAdminDirectAPIName && !haPlannedActionRequiresAdminTarget(dependency) {
 			return true
 		}
 		return haAdminActionSucceededWithEvidence(dependency)
@@ -5658,6 +5661,9 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 	}
 	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return true
+	}
+	if action.AdminJobName == haAdminDirectAPIName && !haDirectAdminActionReceiptMatches(action) {
+		return false
 	}
 	return haActionHasRequiredAdminResult(action)
 }
@@ -5723,6 +5729,56 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 		return haRejoinResultMatchesRequiredAdminResult(action, result)
 	default:
 		return true
+	}
+}
+
+func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	result := action.AdminResult
+	if result == nil || result.SchemaVersion == 0 {
+		return false
+	}
+	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
+	return haJobResultActionReceiptMatches(
+		result.ActionID,
+		result.ActionKind,
+		result.ActionTarget,
+		result.ActionState,
+		expectedKind,
+		expectedTarget,
+		expectedState,
+	)
+}
+
+func haDirectAdminActionReceiptExpectation(action antflyv1.HAPlannedActionStatus) (string, string, string) {
+	expectedSlotName := haActionSlotName(action)
+	expectedManifestID := haExpectedSeedBeginManifestID(action, expectedSlotName)
+	switch haActionKind(action.Kind) {
+	case haActionCreateSlot:
+		return "replication_slot_create", expectedSlotName, "applied"
+	case haActionResumeSlot:
+		return "replication_slot_resume", expectedSlotName, "applied"
+	case haActionPauseSlot:
+		return "replication_slot_pause", expectedSlotName, "applied"
+	case haActionDropSlot:
+		return "replication_slot_drop", expectedSlotName, "applied"
+	case haActionSeedStandby, haActionMarkReseed:
+		return "base_backup_begin", expectedManifestID, "applied"
+	case haActionFinishStandbySeed:
+		return "base_backup_finish", expectedManifestID, "applied"
+	case haActionBootstrapStandbySeed:
+		return "standby_bootstrap", expectedManifestID, "applied"
+	case haActionAcquireFence:
+		return "fence_acquire", strings.TrimSpace(action.StandbyName), "applied"
+	case haActionPromoteStandby:
+		return "promotion", strings.TrimSpace(action.StandbyName), "applied"
+	case haActionDemoteFormerPrimary:
+		return "rejoin_assess", strings.TrimSpace(action.StandbyName), "assessed"
+	case haActionRewindFormerPrimary:
+		return "rejoin_rewind", strings.TrimSpace(action.StandbyName), "applied"
+	case haActionReseedFormerPrimary:
+		return "rejoin_reseed", strings.TrimSpace(action.StandbyName), "applied"
+	default:
+		return "", "", ""
 	}
 }
 
@@ -5826,10 +5882,25 @@ func haExpectedSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotNa
 			return strings.TrimSpace(action.AdminCommand[i+1])
 		}
 	}
+	if manifestID := haManifestIDFromPath(action.SeedManifestPath); manifestID != "" {
+		return manifestID
+	}
 	if strings.TrimSpace(slotName) == "" || action.TargetLSN == 0 {
 		return ""
 	}
 	return fmt.Sprintf("base-%s-%d", strings.TrimSpace(slotName), action.TargetLSN)
+}
+
+func haManifestIDFromPath(manifestPath string) string {
+	manifestPath = strings.TrimSpace(manifestPath)
+	if manifestPath == "" {
+		return ""
+	}
+	name := path.Base(manifestPath)
+	if name == "." || name == "/" {
+		return ""
+	}
+	return strings.TrimSuffix(name, ".afha")
 }
 
 func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {

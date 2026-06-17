@@ -39,6 +39,12 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64, token string) string {
 	body, err := json.Marshal(map[string]any{
 		"schema_version": 1,
+		"action": map[string]any{
+			"action_id":   "fence_acquire:" + promotedNodeID,
+			"action_kind": "fence_acquire",
+			"target":      promotedNodeID,
+			"state":       "applied",
+		},
 		"receipt": map[string]any{
 			"identity": map[string]any{
 				"cluster_id":  100,
@@ -362,7 +368,7 @@ func TestReconcileHAAdminJobsExecutesTypedActionWithoutCLIArgv(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"replication_slot_create:standby-a","action_kind":"replication_slot_create","target":"standby-a","state":"applied"},"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
 			}, nil
 		})},
 	}
@@ -1680,6 +1686,63 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haPlannedActionDependenciesSucceeded(reseedActions, 1)).To(BeTrue())
 }
 
+func TestHADirectAdminActionDependenciesRequireVersionedActionReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	actions := []antflyv1.HAPlannedActionStatus{{
+		Kind:          string(haActionCreateSlot),
+		SlotName:      "standby-a",
+		AdminJobName:  haAdminDirectAPIName,
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion: 1,
+			SlotAction:    "create",
+			SlotName:      "standby-a",
+		},
+	}, {
+		Kind:      string(haActionSeedStandby),
+		DependsOn: string(haActionCreateSlot),
+	}}
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult.ActionID = "replication_slot_create:standby-a"
+	actions[0].AdminResult.ActionKind = "replication_slot_create"
+	actions[0].AdminResult.ActionTarget = "standby-a"
+	actions[0].AdminResult.ActionState = "applied"
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
+
+	actions[0].AdminResult.SchemaVersion = 0
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+}
+
+func TestHADirectAdminSeedManifestPathRequiresMatchingActionReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:             string(haActionFinishStandbySeed),
+		SeedManifestPath: "/backup/base-standby-a-5.afha",
+		AdminJobName:     haAdminDirectAPIName,
+		AdminJobPhase:    haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion: 1,
+			ActionID:      "base_backup_finish:base-standby-b-5",
+			ActionKind:    "base_backup_finish",
+			ActionTarget:  "base-standby-b-5",
+			ActionState:   "applied",
+			ManifestID:    "base-standby-a-5",
+			BackupLSN:     5,
+			EndRecordLSN:  5,
+		},
+	}
+
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeFalse())
+
+	action.AdminResult.ActionID = "base_backup_finish:base-standby-a-5"
+	action.AdminResult.ActionTarget = "base-standby-a-5"
+	g.Expect(haAdminActionSucceededWithEvidence(action)).To(BeTrue())
+}
+
 func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *testing.T) {
 	g := NewWithT(t)
 
@@ -1751,7 +1814,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:operator-base-standby-a-7","action_kind":"base_backup_begin","target":"operator-base-standby-a-7","state":"applied"},"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
 			}, nil
 		})},
 	}

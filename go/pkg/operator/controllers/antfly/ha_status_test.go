@@ -152,6 +152,10 @@ func TestHAPlannedActionStatusesPreserveExecutionOnlyForSameOperation(t *testing
 	previous.AdminError = "previous direct-admin-api diagnostic"
 	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion: 1,
+		ActionID:      "replication_slot_create:standby-a",
+		ActionKind:    "replication_slot_create",
+		ActionTarget:  "standby-a",
+		ActionState:   "applied",
 		SlotAction:    "create",
 		SlotName:      "standby-a",
 	}
@@ -204,6 +208,10 @@ func TestHAPlannedActionStatusesPreserveTypedExecutionAcrossAdminCommandHints(t 
 	previous.AdminJobPhase = haAdminJobPhaseSucceeded
 	previous.AdminResult = &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion: 1,
+		ActionID:      "replication_slot_create:standby-a",
+		ActionKind:    "replication_slot_create",
+		ActionTarget:  "standby-a",
+		ActionState:   "applied",
 		SlotAction:    "create",
 		SlotName:      "standby-a",
 	}
