@@ -1532,11 +1532,11 @@ type HAPlannedActionStatus struct {
 
 	FenceReason string `json:"fenceReason,omitempty"`
 
-	// AdminCommand is an antfly HA admin argv for executable planned actions.
+	// AdminCommand is a compatibility CLI argv hint for HA actions that need a Kubernetes Job or break-glass execution.
 	// +optional
 	AdminCommand []string `json:"adminCommand,omitempty"`
 
-	// AdminURL is the HA admin endpoint that should execute AdminCommand.
+	// AdminURL is the HA admin endpoint for typed /admin/v1/ha execution or CLI-backed job targeting.
 	// +optional
 	AdminURL string `json:"adminURL,omitempty"`
 
@@ -1560,11 +1560,11 @@ type HAPlannedActionStatus struct {
 	// +optional
 	SeedContentRoot string `json:"seedContentRoot,omitempty"`
 
-	// AdminJobName is the Kubernetes Job created to execute AdminCommand.
+	// AdminJobName records direct-admin-api for typed execution or the Kubernetes Job created for CLI-backed execution.
 	// +optional
 	AdminJobName string `json:"adminJobName,omitempty"`
 
-	// AdminJobPhase summarizes dependency wait state or the Kubernetes Job state for AdminCommand.
+	// AdminJobPhase summarizes dependency wait state, direct admin API execution, or CLI-backed Kubernetes Job state.
 	// +optional
 	AdminJobPhase string `json:"adminJobPhase,omitempty"`
 

@@ -8745,18 +8745,21 @@ spec:
                         action.
                       properties:
                         adminCommand:
-                          description: AdminCommand is an antfly HA admin argv for
-                            executable planned actions.
+                          description: AdminCommand is a compatibility CLI argv hint
+                            for HA actions that need a Kubernetes Job or break-glass
+                            execution.
                           items:
                             type: string
                           type: array
                         adminJobName:
-                          description: AdminJobName is the Kubernetes Job created
-                            to execute AdminCommand.
+                          description: AdminJobName records direct-admin-api for typed
+                            execution or the Kubernetes Job created for CLI-backed
+                            execution.
                           type: string
                         adminJobPhase:
-                          description: AdminJobPhase summarizes dependency wait state
-                            or the Kubernetes Job state for AdminCommand.
+                          description: AdminJobPhase summarizes dependency wait state,
+                            direct admin API execution, or CLI-backed Kubernetes Job
+                            state.
                           type: string
                         adminMethod:
                           description: AdminMethod is the HTTP method for the typed
@@ -8920,8 +8923,8 @@ spec:
                               type: integer
                           type: object
                         adminURL:
-                          description: AdminURL is the HA admin endpoint that should
-                            execute AdminCommand.
+                          description: AdminURL is the HA admin endpoint for typed
+                            /admin/v1/ha execution or CLI-backed job targeting.
                           type: string
                         dependsOn:
                           description: DependsOn names the action kind that must complete
