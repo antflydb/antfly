@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const admin_api = @import("../../admin/mod.zig");
 const admin_cli = @import("admin_cli.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
@@ -308,56 +309,37 @@ const AdminOperation = struct {
 
 fn adminOperationForAction(alloc: Allocator, action: Action) !AdminOperation {
     return switch (action.kind) {
-        .create_slot => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/replication-slots") },
+        .create_slot => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_replication_slots) },
         .resume_slot => try slotAdminOperation(alloc, action, "PUT", "resume"),
         .pause_slot => try slotAdminOperation(alloc, action, "PUT", "pause"),
         .drop_slot => try slotAdminOperation(alloc, action, "DELETE", null),
         .seed_standby,
         .mark_reseed,
-        => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/base-backups") },
-        .finish_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/base-backups/finish") },
-        .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/standby/bootstrap") },
-        .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/fence") },
-        .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/promotion/current-fence") },
+        => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_base_backups) },
+        .finish_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_base_backups_finish) },
+        .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_standby_bootstrap) },
+        .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_fence) },
+        .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_promotion_current_fence) },
         .demote_former_primary,
         .rewind_former_primary,
         .reseed_former_primary,
-        => .{ .method = "POST", .path = try alloc.dupe(u8, "/admin/v1/ha/rejoin/assess") },
+        => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_assess) },
         .update_primary_endpoint => .{},
     };
 }
 
 fn slotAdminOperation(alloc: Allocator, action: Action, method: []const u8, suffix: ?[]const u8) !AdminOperation {
     const slot_name = action.slot_name orelse action.standby_name orelse return .{};
-    const escaped_slot = try percentEncodePathSegmentAlloc(alloc, slot_name);
-    defer alloc.free(escaped_slot);
     const path = if (suffix) |value|
-        try std.fmt.allocPrint(alloc, "/admin/v1/ha/replication-slots/{s}/{s}", .{ escaped_slot, value })
+        if (std.mem.eql(u8, value, "pause"))
+            try admin_api.routes.replicationSlotPausePathAlloc(alloc, slot_name)
+        else if (std.mem.eql(u8, value, "resume"))
+            try admin_api.routes.replicationSlotResumePathAlloc(alloc, slot_name)
+        else
+            return error.InvalidAdminOperation
     else
-        try std.fmt.allocPrint(alloc, "/admin/v1/ha/replication-slots/{s}", .{escaped_slot});
+        try admin_api.routes.replicationSlotPathAlloc(alloc, slot_name);
     return .{ .method = method, .path = path };
-}
-
-fn percentEncodePathSegmentAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    for (raw) |byte| {
-        if (isPathSegmentUnreserved(byte)) {
-            try out.append(alloc, byte);
-        } else {
-            var buf: [3]u8 = undefined;
-            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{byte});
-            try out.appendSlice(alloc, encoded);
-        }
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-fn isPathSegmentUnreserved(byte: u8) bool {
-    return (byte >= 'A' and byte <= 'Z') or
-        (byte >= 'a' and byte <= 'z') or
-        (byte >= '0' and byte <= '9') or
-        byte == '-' or byte == '.' or byte == '_' or byte == '~';
 }
 
 fn standbyAdminUrl(spec: Spec, standby_name: ?[]const u8) ?[]const u8 {

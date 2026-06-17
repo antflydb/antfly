@@ -147,10 +147,12 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 404, "not found");
             },
             .PUT => {
-                if (admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix)) |slot_name| {
+                if (self.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_pause_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
+                    defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .pause);
                 }
-                if (admin_api.routes.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix)) |slot_name| {
+                if (self.replicationSlotNameFromPath(path, admin_api.routes.ha_replication_slot_resume_suffix) catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
+                    defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .@"resume");
                 }
                 if (knownFixedRoute(path)) {
@@ -159,7 +161,8 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 404, "not found");
             },
             .DELETE => {
-                if (admin_api.routes.replicationSlotNameFromPath(path, "")) |slot_name| {
+                if (self.replicationSlotNameFromPath(path, "") catch return try textResponse(self.alloc, 400, "invalid HA replication slot path")) |slot_name| {
+                    defer self.alloc.free(slot_name);
                     return try self.handleAdminReplicationSlotLifecycle(slot_name, .drop);
                 }
                 if (knownFixedRoute(path)) {
@@ -168,6 +171,10 @@ pub const Server = struct {
                 return try textResponse(self.alloc, 404, "not found");
             },
         }
+    }
+
+    fn replicationSlotNameFromPath(self: *Server, path: []const u8, suffix: []const u8) !?[]u8 {
+        return try admin_api.routes.replicationSlotNameFromPathAlloc(self.alloc, path, suffix);
     }
 
     fn handleAdminPrimaryStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -1404,6 +1411,14 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_drop.body, "\"slot_action\":\"drop\"");
     try expectContains(typed_drop.body, "\"slot_name\":\"standby-b\"");
     try expectContains(typed_drop.body, "\"dropped\":true");
+
+    var invalid_typed_slot_path = try server.handle(.{
+        .method = .DELETE,
+        .uri = "/admin/v1/ha/replication-slots/standby%XX",
+    });
+    defer invalid_typed_slot_path.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid_typed_slot_path.status);
+    try expectContains(invalid_typed_slot_path.body, "invalid HA replication slot path");
 
     var invalid_typed_create = try server.handle(.{
         .method = .POST,

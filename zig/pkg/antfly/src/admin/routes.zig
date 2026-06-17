@@ -39,21 +39,27 @@ pub const ha_promotion_current_fence = ha_promotion ++ "/current-fence";
 pub const ha_rejoin_assess = ha ++ "/rejoin/assess";
 
 pub fn replicationSlotPathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ ha_replication_slot_prefix, slot_name });
+    const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
+    defer alloc.free(escaped);
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ ha_replication_slot_prefix, escaped });
 }
 
 pub fn replicationSlotPausePathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
+    const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
+    defer alloc.free(escaped);
     return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
         ha_replication_slot_prefix,
-        slot_name,
+        escaped,
         ha_replication_slot_pause_suffix,
     });
 }
 
 pub fn replicationSlotResumePathAlloc(alloc: Allocator, slot_name: []const u8) ![]u8 {
+    const escaped = try percentEncodePathSegmentAlloc(alloc, slot_name);
+    defer alloc.free(escaped);
     return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
         ha_replication_slot_prefix,
-        slot_name,
+        escaped,
         ha_replication_slot_resume_suffix,
     });
 }
@@ -69,6 +75,64 @@ pub fn replicationSlotNameFromPath(path: []const u8, suffix: []const u8) ?[]cons
     const name = path[name_start..name_end];
     if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
     return name;
+}
+
+pub fn replicationSlotNameFromPathAlloc(alloc: Allocator, path: []const u8, suffix: []const u8) !?[]u8 {
+    const encoded = replicationSlotNameFromPath(path, suffix) orelse return null;
+    return try percentDecodePathSegmentAlloc(alloc, encoded);
+}
+
+pub fn percentEncodePathSegmentAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (raw) |byte| {
+        if (isPathSegmentUnreserved(byte)) {
+            try out.append(alloc, byte);
+        } else {
+            var buf: [3]u8 = undefined;
+            const encoded = try std.fmt.bufPrint(&buf, "%{X:0>2}", .{byte});
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn percentDecodePathSegmentAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var idx: usize = 0;
+    while (idx < encoded.len) {
+        const byte = encoded[idx];
+        if (byte != '%') {
+            try out.append(alloc, byte);
+            idx += 1;
+            continue;
+        }
+        if (idx + 2 >= encoded.len) return error.InvalidPercentEncoding;
+        const hi = hexValue(encoded[idx + 1]) orelse return error.InvalidPercentEncoding;
+        const lo = hexValue(encoded[idx + 2]) orelse return error.InvalidPercentEncoding;
+        try out.append(alloc, (hi << 4) | lo);
+        idx += 3;
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn hexValue(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+fn isPathSegmentUnreserved(byte: u8) bool {
+    return (byte >= 'A' and byte <= 'Z') or
+        (byte >= 'a' and byte <= 'z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '-' or byte == '.' or byte == '_' or byte == '~';
 }
 
 test "admin routes define HA control-plane paths" {
@@ -120,4 +184,27 @@ test "admin routes build and match replication slot lifecycle paths" {
 
     try std.testing.expect(replicationSlotNameFromPath("/admin/v1/ha/replication-slots/standby-a/extra", "") == null);
     try std.testing.expect(replicationSlotNameFromPath("/admin/v1/ha/replication-slots/standby-a", ha_replication_slot_pause_suffix) == null);
+}
+
+test "admin routes encode and decode replication slot path segments" {
+    const alloc = std.testing.allocator;
+
+    const slot_name = "standby/a b%";
+    const pause_path = try replicationSlotPausePathAlloc(alloc, slot_name);
+    defer alloc.free(pause_path);
+    try std.testing.expectEqualStrings("/admin/v1/ha/replication-slots/standby%2Fa%20b%25/pause", pause_path);
+    try std.testing.expectEqualStrings("standby%2Fa%20b%25", replicationSlotNameFromPath(pause_path, ha_replication_slot_pause_suffix).?);
+
+    const decoded = (try replicationSlotNameFromPathAlloc(alloc, pause_path, ha_replication_slot_pause_suffix)).?;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(slot_name, decoded);
+
+    try std.testing.expectError(
+        error.InvalidPercentEncoding,
+        replicationSlotNameFromPathAlloc(alloc, "/admin/v1/ha/replication-slots/standby%2", ""),
+    );
+    try std.testing.expectError(
+        error.InvalidPercentEncoding,
+        replicationSlotNameFromPathAlloc(alloc, "/admin/v1/ha/replication-slots/standby%XX", ""),
+    );
 }

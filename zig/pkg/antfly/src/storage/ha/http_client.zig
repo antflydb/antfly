@@ -701,6 +701,29 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqualStrings("drop", typed_dropped.parsed.value.slot_action);
     try std.testing.expectEqual(@as(?bool, true), typed_dropped.parsed.value.slot.dropped);
 
+    var encoded_created = try client.createReplicationSlot("http://ha-admin.test", "standby/a b%", 0);
+    defer encoded_created.deinit(alloc);
+    try std.testing.expectEqualStrings("create", encoded_created.parsed.value.slot_action);
+    try std.testing.expectEqualStrings("standby/a b%", encoded_created.parsed.value.slot.slot_name);
+
+    var encoded_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby/a b%");
+    defer encoded_paused.deinit(alloc);
+    try std.testing.expectEqualStrings("pause", encoded_paused.parsed.value.slot_action);
+    try std.testing.expectEqualStrings("standby/a b%", encoded_paused.parsed.value.slot.slot_name);
+    try std.testing.expect(!encoded_paused.parsed.value.slot.active);
+
+    var encoded_resumed = try client.resumeReplicationSlot("http://ha-admin.test", "standby/a b%");
+    defer encoded_resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("resume", encoded_resumed.parsed.value.slot_action);
+    try std.testing.expectEqualStrings("standby/a b%", encoded_resumed.parsed.value.slot.slot_name);
+    try std.testing.expect(encoded_resumed.parsed.value.slot.active);
+
+    var encoded_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby/a b%");
+    defer encoded_dropped.deinit(alloc);
+    try std.testing.expectEqualStrings("drop", encoded_dropped.parsed.value.slot_action);
+    try std.testing.expectEqualStrings("standby/a b%", encoded_dropped.parsed.value.slot.slot_name);
+    try std.testing.expectEqual(@as(?bool, true), encoded_dropped.parsed.value.slot.dropped);
+
     var created = try client.executeCommand("http://ha-admin.test/", &.{ "slot", "create", "standby-a", "--initial-lsn", "0" });
     defer created.deinit(alloc);
     try std.testing.expectEqualStrings("application/json", created.content_type);

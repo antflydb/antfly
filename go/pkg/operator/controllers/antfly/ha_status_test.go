@@ -351,6 +351,37 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	}
 }
 
+func TestPlanHAEscapesSlotNamesInAdminPaths(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
+		Name:     "standby-special",
+		SlotName: "standby/a b%",
+	}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 10,
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:     "standby-special",
+			SlotName: "standby/a b%",
+			Active:   false,
+		}},
+	}
+
+	reconciler := &AntflyClusterReconciler{}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	actions := cluster.Status.HAStatus.PlannedActions
+	if len(actions) != 1 {
+		t.Fatalf("expected one resume action, got %#v", actions)
+	}
+	if actions[0].Kind != string(haActionResumeSlot) ||
+		!reflect.DeepEqual(actions[0].AdminCommand, []string{"slot", "resume", "--slot", "standby/a b%"}) ||
+		actions[0].AdminMethod != "PUT" ||
+		actions[0].AdminPath != "/admin/v1/ha/replication-slots/standby%2Fa%20b%25/resume" {
+		t.Fatalf("unexpected escaped slot action: %#v", actions[0])
+	}
+}
+
 func TestPlanHALeavesUndesiredSlotPausedUnlessDropIsExplicit(t *testing.T) {
 	undesired := false
 	cluster := haCluster()
