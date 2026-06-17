@@ -71,6 +71,7 @@ type (
 	HAPrimaryStatusResponse            = oapi.HAPrimaryStatusResponse
 	HAPromotionAssessResponse          = oapi.HAPromotionAssessResponse
 	HAPromotionAssessment              = oapi.HAPromotionAssessment
+	HAPromotionHandoff                 = oapi.HAPromotionHandoff
 	HAPromotionResponse                = oapi.HAPromotionResponse
 	HAPromotionResult                  = oapi.HAPromotionResult
 	HAReadCheckResponse                = oapi.HAReadCheckResponse
@@ -187,6 +188,41 @@ const (
 	HASyncPolicyFailureBlock          = oapi.HASyncPolicyFailurePolicyBlock
 	HASyncPolicyFailureFailClosed     = oapi.HASyncPolicyFailurePolicyFailClosed
 	HASyncPolicyFailureDegradeToAsync = oapi.HASyncPolicyFailurePolicyDegradeToAsync
+
+	HACommitGateActionAcknowledge         = oapi.HACommitGateActionAcknowledge
+	HACommitGateActionAcknowledgeDegraded = oapi.HACommitGateActionAcknowledgeDegraded
+	HACommitGateActionReject              = oapi.HACommitGateActionReject
+	HACommitGateActionWaitForStandby      = oapi.HACommitGateActionWaitForStandby
+
+	HAReadDecisionActionRouteToPrimary  = oapi.HAReadDecisionActionRouteToPrimary
+	HAReadDecisionActionServeStandby    = oapi.HAReadDecisionActionServeStandby
+	HAReadDecisionActionWaitForApply    = oapi.HAReadDecisionActionWaitForApply
+	HAReadDecisionActionWaitForMetadata = oapi.HAReadDecisionActionWaitForMetadata
+
+	HAReadDecisionConsistencyAtLeastLSN = oapi.HAReadDecisionConsistencyAtLeastLsn
+	HAReadDecisionConsistencyPrimary    = oapi.HAReadDecisionConsistencyPrimary
+	HAReadDecisionConsistencyStaleOK    = oapi.HAReadDecisionConsistencyStaleOk
+
+	HAWriteDecisionActionAllowWrite          = oapi.HAWriteDecisionActionAllowWrite
+	HAWriteDecisionActionOpenPromotedPrimary = oapi.HAWriteDecisionActionOpenPromotedPrimary
+	HAWriteDecisionActionRejectReadOnly      = oapi.HAWriteDecisionActionRejectReadOnlyStandby
+
+	HAWriteDecisionRolePrimary         = oapi.HAWriteDecisionRolePrimary
+	HAWriteDecisionRolePromotedStandby = oapi.HAWriteDecisionRolePromotedStandby
+	HAWriteDecisionRoleStandby         = oapi.HAWriteDecisionRoleStandby
+
+	HAOwnerJobDecisionActionDisableOnStandby    = oapi.HAOwnerJobDecisionActionDisableOnStandby
+	HAOwnerJobDecisionActionOpenPromotedPrimary = oapi.HAOwnerJobDecisionActionOpenPromotedPrimary
+	HAOwnerJobDecisionActionRun                 = oapi.HAOwnerJobDecisionActionRun
+
+	HAOwnerJobDecisionKindCompactionPublish   = oapi.HAOwnerJobDecisionKindCompactionPublish
+	HAOwnerJobDecisionKindDerivedEffectWriter = oapi.HAOwnerJobDecisionKindDerivedEffectWriter
+	HAOwnerJobDecisionKindEnrichmentWriter    = oapi.HAOwnerJobDecisionKindEnrichmentWriter
+	HAOwnerJobDecisionKindRetentionAdvance    = oapi.HAOwnerJobDecisionKindRetentionAdvance
+
+	HAOwnerJobDecisionRolePrimary         = oapi.HAOwnerJobDecisionRolePrimary
+	HAOwnerJobDecisionRolePromotedStandby = oapi.HAOwnerJobDecisionRolePromotedStandby
+	HAOwnerJobDecisionRoleStandby         = oapi.HAOwnerJobDecisionRoleStandby
 
 	HARejoinActionAlreadyCurrent = oapi.HARejoinAssessmentActionAlreadyCurrent
 	HARejoinActionRejectUnfenced = oapi.HARejoinAssessmentActionRejectUnfenced
@@ -389,6 +425,56 @@ func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) err
 	return nil
 }
 
+func ValidateHACommitCheckResponse(response HACommitCheckResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing commit check schema_version")
+	}
+	if !HACommitGateComplete(response.Gate) {
+		return fmt.Errorf("missing commit check gate fields")
+	}
+	return nil
+}
+
+func ValidateHACommitAppendResponse(response HACommitAppendResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing commit append schema_version")
+	}
+	if !HACommitGateComplete(response.Gate) {
+		return fmt.Errorf("missing commit append gate fields")
+	}
+	return nil
+}
+
+func ValidateHAReadCheckResponse(response HAReadCheckResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing read check schema_version")
+	}
+	if !HAReadDecisionComplete(response.Decision) {
+		return fmt.Errorf("missing read decision fields")
+	}
+	return nil
+}
+
+func ValidateHAWriteCheckResponse(response HAWriteCheckResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing write check schema_version")
+	}
+	if !HAWriteDecisionComplete(response.Decision) {
+		return fmt.Errorf("missing write decision fields")
+	}
+	return nil
+}
+
+func ValidateHAOwnerJobCheckResponse(response HAOwnerJobCheckResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing owner job check schema_version")
+	}
+	if !HAOwnerJobDecisionComplete(response.Decision) {
+		return fmt.Errorf("missing owner job decision fields")
+	}
+	return nil
+}
+
 func ValidateHAFenceResponse(response HAFenceResponse) error {
 	if response.SchemaVersion == 0 {
 		return fmt.Errorf("missing fence response schema_version")
@@ -512,6 +598,161 @@ func HARejoinReseedComplete(reseed HARejoinReseedResult) bool {
 		reseed.TargetEpoch > 0 &&
 		reseed.ReseedRequired &&
 		reseed.BaseBackupRequired
+}
+
+func HACommitGateComplete(gate HACommitGate) bool {
+	return HACommitGateActionValid(gate.Action) &&
+		HADurabilityDecisionComplete(gate.Durability)
+}
+
+func HACommitGateActionValid(action HACommitGateAction) bool {
+	switch action {
+	case HACommitGateActionAcknowledge,
+		HACommitGateActionWaitForStandby,
+		HACommitGateActionReject,
+		HACommitGateActionAcknowledgeDegraded:
+		return true
+	default:
+		return false
+	}
+}
+
+func HADurabilityDecisionComplete(decision HADurabilityDecision) bool {
+	return HADurabilityDecisionStatusValid(decision.Status) &&
+		HADurabilityDecisionModeValid(decision.Mode) &&
+		HADurabilityDecisionSelectionValid(decision.Selection)
+}
+
+func HADurabilityDecisionStatusValid(status HADurabilityDecisionStatus) bool {
+	switch status {
+	case HADurabilityStatusSatisfied,
+		HADurabilityStatusWouldBlock,
+		HADurabilityStatusFailClosed,
+		HADurabilityStatusDegradedToAsync:
+		return true
+	default:
+		return false
+	}
+}
+
+func HADurabilityDecisionModeValid(mode HADurabilityDecisionMode) bool {
+	switch mode {
+	case HADurabilityModeAsync, HADurabilityModeRemoteWrite, HADurabilityModeRemoteApply:
+		return true
+	default:
+		return false
+	}
+}
+
+func HADurabilityDecisionSelectionValid(selection HADurabilityDecisionSelection) bool {
+	switch selection {
+	case HADurabilitySelectionAny, HADurabilitySelectionFirst, HADurabilitySelectionAll:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAReadDecisionComplete(decision HAReadDecision) bool {
+	return HAReadDecisionActionValid(decision.Action) &&
+		HAReadDecisionConsistencyValid(decision.Consistency)
+}
+
+func HAReadDecisionActionValid(action HAReadDecisionAction) bool {
+	switch action {
+	case HAReadDecisionActionServeStandby,
+		HAReadDecisionActionWaitForApply,
+		HAReadDecisionActionWaitForMetadata,
+		HAReadDecisionActionRouteToPrimary:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAReadDecisionConsistencyValid(consistency HAReadDecisionConsistency) bool {
+	switch consistency {
+	case HAReadDecisionConsistencyStaleOK,
+		HAReadDecisionConsistencyAtLeastLSN,
+		HAReadDecisionConsistencyPrimary:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAWriteDecisionComplete(decision HAWriteDecision) bool {
+	return HAWriteDecisionRoleValid(decision.Role) &&
+		HAWriteDecisionActionValid(decision.Action) &&
+		HAIdentityComplete(decision.Identity) &&
+		HAPromotionHandoffCompleteOrEmpty(decision.PromotionHandoff)
+}
+
+func HAWriteDecisionRoleValid(role HAWriteDecisionRole) bool {
+	switch role {
+	case HAWriteDecisionRolePrimary, HAWriteDecisionRoleStandby, HAWriteDecisionRolePromotedStandby:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAWriteDecisionActionValid(action HAWriteDecisionAction) bool {
+	switch action {
+	case HAWriteDecisionActionAllowWrite,
+		HAWriteDecisionActionRejectReadOnly,
+		HAWriteDecisionActionOpenPromotedPrimary:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAOwnerJobDecisionComplete(decision HAOwnerJobDecision) bool {
+	return HAOwnerJobDecisionKindValid(decision.Kind) &&
+		HAOwnerJobDecisionRoleValid(decision.Role) &&
+		HAOwnerJobDecisionActionValid(decision.Action) &&
+		HAIdentityComplete(decision.Identity) &&
+		HAPromotionHandoffCompleteOrEmpty(decision.PromotionHandoff)
+}
+
+func HAOwnerJobDecisionKindValid(kind HAOwnerJobDecisionKind) bool {
+	switch kind {
+	case HAOwnerJobDecisionKindCompactionPublish,
+		HAOwnerJobDecisionKindDerivedEffectWriter,
+		HAOwnerJobDecisionKindEnrichmentWriter,
+		HAOwnerJobDecisionKindRetentionAdvance:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAOwnerJobDecisionRoleValid(role HAOwnerJobDecisionRole) bool {
+	switch role {
+	case HAOwnerJobDecisionRolePrimary, HAOwnerJobDecisionRoleStandby, HAOwnerJobDecisionRolePromotedStandby:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAOwnerJobDecisionActionValid(action HAOwnerJobDecisionAction) bool {
+	switch action {
+	case HAOwnerJobDecisionActionRun,
+		HAOwnerJobDecisionActionDisableOnStandby,
+		HAOwnerJobDecisionActionOpenPromotedPrimary:
+		return true
+	default:
+		return false
+	}
+}
+
+func HAPromotionHandoffCompleteOrEmpty(handoff HAPromotionHandoff) bool {
+	if !HAIdentityComplete(handoff.Identity) && handoff.SwitchLsn == 0 && handoff.NextLsn == 0 {
+		return true
+	}
+	return HAIdentityComplete(handoff.Identity)
 }
 
 func HAPromotionAssessmentComplete(assessment HAPromotionAssessment) bool {
@@ -781,6 +1022,19 @@ func requireHAJSON200[T any](operation string, statusCode int, body []byte, valu
 	}, nil
 }
 
+func requireHAJSON200Validated[T any](operation string, statusCode int, body []byte, value *T, err error, validate func(T) error) (*HAResponse[T], error) {
+	response, err := requireHAJSON200(operation, statusCode, body, value, err)
+	if err != nil {
+		return nil, err
+	}
+	if validate != nil {
+		if err := validate(*response.Value); err != nil {
+			return nil, fmt.Errorf("%s response invalid: %w", operation, err)
+		}
+	}
+	return response, nil
+}
+
 func requireHA2xx(operation string, statusCode int, body []byte, err error) error {
 	if err != nil {
 		return err
@@ -877,7 +1131,7 @@ func (c *HAClient) AppendCommitResponse(ctx context.Context, body CommitAppendRe
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("append HA commit", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("append HA commit", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHACommitAppendResponse)
 }
 
 func (c *HAClient) AppendCommit(ctx context.Context, body CommitAppendRequest) (*HACommitAppendResponse, error) {
@@ -889,7 +1143,7 @@ func (c *HAClient) CheckCommitResponse(ctx context.Context, body CommitCheckRequ
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("check HA commit", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("check HA commit", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHACommitCheckResponse)
 }
 
 func (c *HAClient) CheckCommit(ctx context.Context, body CommitCheckRequest) (*HACommitCheckResponse, error) {
@@ -901,7 +1155,7 @@ func (c *HAClient) CheckReadResponse(ctx context.Context, body ReadCheckRequest)
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("check HA read", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("check HA read", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAReadCheckResponse)
 }
 
 func (c *HAClient) CheckRead(ctx context.Context, body ReadCheckRequest) (*HAReadCheckResponse, error) {
@@ -913,7 +1167,7 @@ func (c *HAClient) CheckWriteResponse(ctx context.Context, body WriteCheckReques
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("check HA write", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("check HA write", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAWriteCheckResponse)
 }
 
 func (c *HAClient) CheckWrite(ctx context.Context, body WriteCheckRequest) (*HAWriteCheckResponse, error) {
@@ -925,7 +1179,7 @@ func (c *HAClient) CheckOwnerJobResponse(ctx context.Context, body OwnerJobCheck
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200("check HA owner job", resp.StatusCode(), resp.Body, resp.JSON200, err)
+	return requireHAJSON200Validated("check HA owner job", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAOwnerJobCheckResponse)
 }
 
 func (c *HAClient) CheckOwnerJob(ctx context.Context, body OwnerJobCheckRequest) (*HAOwnerJobCheckResponse, error) {

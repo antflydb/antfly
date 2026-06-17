@@ -304,6 +304,28 @@ func TestHAClientGateOperationsUseAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientGateOperationsRejectInvalidTypedResponses(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/admin/v1/ha/write/check" {
+			t.Fatalf("path = %s, want /admin/v1/ha/write/check", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, strings.Replace(haWriteDecisionResponseJSON(), `"action":"reject_read_only_standby"`, `"action":"unknown"`, 1))
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.CheckWrite(context.Background(), WriteCheckRequest{Role: WriteCheckRoleStandby})
+	if err == nil || !strings.Contains(err.Error(), "write decision fields") {
+		t.Fatalf("CheckWrite error = %v, want write decision fields", err)
+	}
+}
+
 func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	t.Parallel()
 
@@ -807,6 +829,95 @@ func TestValidateHAPromotionResponses(t *testing.T) {
 	promotion.Promotion.SwitchLsn = 0
 	if err := ValidateHAPromotionResponse(promotion); err == nil || !strings.Contains(err.Error(), "promotion result") {
 		t.Fatalf("missing promotion result error = %v, want promotion result error", err)
+	}
+}
+
+func TestValidateHAGateResponses(t *testing.T) {
+	t.Parallel()
+
+	durability := HADurabilityDecision{
+		Status:          HADurabilityStatusSatisfied,
+		Mode:            HADurabilityModeRemoteWrite,
+		Selection:       HADurabilitySelectionAny,
+		TargetLsn:       9,
+		ProgressLsn:     9,
+		RequiredCount:   1,
+		SatisfiedCount:  1,
+		CandidateCount:  1,
+		MissingLsnCount: 0,
+	}
+	gate := HACommitGate{
+		Action:     HACommitGateActionAcknowledge,
+		TargetLsn:  9,
+		Durability: durability,
+	}
+	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: gate}); err != nil {
+		t.Fatalf("ValidateHACommitCheckResponse returned error: %v", err)
+	}
+	if err := ValidateHACommitAppendResponse(HACommitAppendResponse{SchemaVersion: 1, Lsn: 9, Gate: gate}); err != nil {
+		t.Fatalf("ValidateHACommitAppendResponse returned error: %v", err)
+	}
+	gate.Action = HACommitGateAction("unknown")
+	if err := ValidateHACommitCheckResponse(HACommitCheckResponse{SchemaVersion: 1, Gate: gate}); err == nil || !strings.Contains(err.Error(), "gate fields") {
+		t.Fatalf("invalid gate error = %v, want gate fields error", err)
+	}
+
+	read := HAReadCheckResponse{
+		SchemaVersion: 1,
+		Decision: HAReadDecision{
+			Action:                  HAReadDecisionActionServeStandby,
+			Consistency:             HAReadDecisionConsistencyAtLeastLSN,
+			ReceivedLsn:             9,
+			AppliedLsn:              9,
+			SafeReadLsn:             9,
+			MissingLsnCount:         0,
+			MetadataMissingLsnCount: 0,
+		},
+	}
+	if err := ValidateHAReadCheckResponse(read); err != nil {
+		t.Fatalf("ValidateHAReadCheckResponse returned error: %v", err)
+	}
+	read.Decision.Consistency = HAReadDecisionConsistency("unknown")
+	if err := ValidateHAReadCheckResponse(read); err == nil || !strings.Contains(err.Error(), "read decision fields") {
+		t.Fatalf("invalid read decision error = %v, want read decision fields error", err)
+	}
+
+	identity := HAIdentity{ClusterId: 1, TimelineId: 2, Epoch: 3}
+	write := HAWriteCheckResponse{
+		SchemaVersion: 1,
+		Decision: HAWriteDecision{
+			Action:     HAWriteDecisionActionRejectReadOnly,
+			Role:       HAWriteDecisionRoleStandby,
+			Identity:   identity,
+			DurableLsn: 9,
+			NextLsn:    10,
+		},
+	}
+	if err := ValidateHAWriteCheckResponse(write); err != nil {
+		t.Fatalf("ValidateHAWriteCheckResponse returned error: %v", err)
+	}
+	write.Decision.Identity = HAIdentity{}
+	if err := ValidateHAWriteCheckResponse(write); err == nil || !strings.Contains(err.Error(), "write decision fields") {
+		t.Fatalf("invalid write decision error = %v, want write decision fields error", err)
+	}
+
+	owner := HAOwnerJobCheckResponse{
+		SchemaVersion: 1,
+		Decision: HAOwnerJobDecision{
+			Action:     HAOwnerJobDecisionActionRun,
+			Kind:       HAOwnerJobDecisionKindCompactionPublish,
+			Role:       HAOwnerJobDecisionRolePrimary,
+			Identity:   identity,
+			DurableLsn: 9,
+			NextLsn:    10,
+		},
+	}
+	if err := ValidateHAOwnerJobCheckResponse(owner); err != nil {
+		t.Fatalf("ValidateHAOwnerJobCheckResponse returned error: %v", err)
+	}
+	owner.Decision.Kind = HAOwnerJobDecisionKind("unknown")
+	if err := ValidateHAOwnerJobCheckResponse(owner); err == nil || !strings.Contains(err.Error(), "owner job decision fields") {
+		t.Fatalf("invalid owner job decision error = %v, want owner job decision fields error", err)
 	}
 }
 
