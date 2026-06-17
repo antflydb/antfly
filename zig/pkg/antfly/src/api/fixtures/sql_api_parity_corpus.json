@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 864,
-  "entry_count": 864,
+  "source_entry_count": 866,
+  "entry_count": 866,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -994,6 +994,20 @@
       "plan": "adapter_noop:ddl:reason=session_setting",
       "classification_reason": "session_setting",
       "sql": "SET LOCAL lock_timeout = '5s';"
+    },
+    {
+      "name": "adapter-only client encoding session setting syntax",
+      "family": "adapter_noop_ddl",
+      "plan": "adapter_noop:ddl:reason=session_setting",
+      "classification_reason": "session_setting",
+      "sql": "SET client_encoding = 'UTF8';"
+    },
+    {
+      "name": "adapter-only public search path session setting syntax",
+      "family": "adapter_noop_ddl",
+      "plan": "adapter_noop:ddl:reason=session_setting",
+      "classification_reason": "session_setting",
+      "sql": "SET search_path TO public;"
     },
     {
       "name": "adapter-only reset session setting syntax",

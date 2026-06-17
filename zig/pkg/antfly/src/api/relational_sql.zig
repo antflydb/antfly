@@ -5078,19 +5078,19 @@ const Parser = struct {
         if (self.matchKeyword("set")) {
             if (self.peekKeyword("constraints")) return .{ .transaction_control = .{ .constraint_mode = try self.parseConstraintModeDdl() } };
             if (self.peekKeyword("transaction")) return .{ .transaction_control = .{ .transaction_mode = try self.parseTransactionModeDdl(.set_transaction) } };
-            try self.parseAdapterNoopStatementTail();
+            try self.parseAdapterNoopSetStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("reset")) {
-            try self.parseAdapterNoopStatementTail();
+            try self.parseAdapterNoopResetStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("show")) {
-            try self.parseAdapterNoopStatementTail();
+            try self.parseAdapterNoopShowStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("discard")) {
-            try self.parseAdapterNoopStatementTail();
+            try self.parseAdapterNoopDiscardStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("start")) {
@@ -5113,12 +5113,96 @@ const Parser = struct {
         return error.UnsupportedSqlShape;
     }
 
-    fn parseAdapterNoopStatementTail(self: *@This()) !void {
-        while (!self.atEnd() and !self.peekKind(.semicolon)) {
-            self.pos += 1;
+    fn parseAdapterNoopSetStatementTail(self: *@This()) !void {
+        if (!self.matchKeyword("local")) _ = self.matchKeyword("session");
+
+        const setting = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        if (std.ascii.eqlIgnoreCase(setting.text, "search_path")) {
+            try self.parseAdapterNoopPublicSearchPathTail();
+            return;
         }
+        if (!adapterNoopSetSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
+
+        if (self.match(.eq) == null and !self.matchKeyword("to")) return error.UnsupportedSqlShape;
+        try self.parseAdapterNoopSetValueTail(setting.text);
+    }
+
+    fn parseAdapterNoopResetStatementTail(self: *@This()) !void {
+        if (self.matchKeyword("all")) {
+            try self.parseAdapterNoopStatementEnd();
+            return;
+        }
+
+        const setting = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        if (!adapterNoopResetSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
+        try self.parseAdapterNoopStatementEnd();
+    }
+
+    fn parseAdapterNoopShowStatementTail(self: *@This()) !void {
+        const setting = self.match(.identifier) orelse return error.UnsupportedSqlShape;
+        if (!adapterNoopShowSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
+        try self.parseAdapterNoopStatementEnd();
+    }
+
+    fn parseAdapterNoopDiscardStatementTail(self: *@This()) !void {
+        try self.expectKeyword("all");
+        try self.parseAdapterNoopStatementEnd();
+    }
+
+    fn parseAdapterNoopPublicSearchPathTail(self: *@This()) !void {
+        if (self.match(.eq) == null and !self.matchKeyword("to")) return error.UnsupportedSqlShape;
+        const path = self.match(.identifier) orelse self.match(.string) orelse return error.UnsupportedSqlShape;
+        if (!std.ascii.eqlIgnoreCase(path.text, "public")) return error.UnsupportedSqlShape;
+        try self.parseAdapterNoopStatementEnd();
+    }
+
+    fn parseAdapterNoopSetValueTail(self: *@This(), setting: []const u8) !void {
+        const value = self.match(.identifier) orelse self.match(.string) orelse self.match(.number) orelse return error.UnsupportedSqlShape;
+        if (!adapterNoopSetSessionSettingValueAllowed(setting, value.text)) return error.UnsupportedSqlShape;
+        try self.parseAdapterNoopStatementEnd();
+    }
+
+    fn parseAdapterNoopStatementEnd(self: *@This()) !void {
+        if (!self.atEnd() and !self.peekKind(.semicolon)) return error.UnsupportedSqlShape;
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
+    }
+
+    fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(setting, "client_encoding") or
+            std.ascii.eqlIgnoreCase(setting, "standard_conforming_strings") or
+            std.ascii.eqlIgnoreCase(setting, "check_function_bodies") or
+            std.ascii.eqlIgnoreCase(setting, "xmloption") or
+            std.ascii.eqlIgnoreCase(setting, "client_min_messages");
+    }
+
+    fn adapterNoopResetSessionSettingAllowed(setting: []const u8) bool {
+        return adapterNoopSetSessionSettingAllowed(setting);
+    }
+
+    fn adapterNoopShowSessionSettingAllowed(setting: []const u8) bool {
+        return adapterNoopSetSessionSettingAllowed(setting) or std.ascii.eqlIgnoreCase(setting, "search_path");
+    }
+
+    fn adapterNoopSetSessionSettingValueAllowed(setting: []const u8, value: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(setting, "client_encoding")) {
+            return std.ascii.eqlIgnoreCase(value, "UTF8") or std.ascii.eqlIgnoreCase(value, "UTF-8");
+        }
+        if (std.ascii.eqlIgnoreCase(setting, "standard_conforming_strings")) {
+            return std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "true");
+        }
+        if (std.ascii.eqlIgnoreCase(setting, "check_function_bodies")) {
+            return std.ascii.eqlIgnoreCase(value, "off") or std.ascii.eqlIgnoreCase(value, "false");
+        }
+        if (std.ascii.eqlIgnoreCase(setting, "xmloption")) {
+            return std.ascii.eqlIgnoreCase(value, "content");
+        }
+        if (std.ascii.eqlIgnoreCase(setting, "client_min_messages")) {
+            return std.ascii.eqlIgnoreCase(value, "warning") or
+                std.ascii.eqlIgnoreCase(value, "notice") or
+                std.ascii.eqlIgnoreCase(value, "error");
+        }
+        return false;
     }
 
     const AdapterNoopTransactionBoundaryTail = struct {
@@ -49238,11 +49322,29 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(set_local_session_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", set_local_session_fingerprint);
 
+    var set_client_encoding = try lowerDdlPlanAlloc(alloc, "SET client_encoding = 'UTF8';");
+    defer set_client_encoding.deinit(alloc);
+    const set_client_encoding_fingerprint = try ddlFingerprintAlloc(alloc, set_client_encoding);
+    defer alloc.free(set_client_encoding_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", set_client_encoding_fingerprint);
+
+    var set_public_search_path = try lowerDdlPlanAlloc(alloc, "SET search_path TO public;");
+    defer set_public_search_path.deinit(alloc);
+    const set_public_search_path_fingerprint = try ddlFingerprintAlloc(alloc, set_public_search_path);
+    defer alloc.free(set_public_search_path_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", set_public_search_path_fingerprint);
+
     var reset_session = try lowerDdlPlanAlloc(alloc, "RESET ALL;");
     defer reset_session.deinit(alloc);
     const reset_session_fingerprint = try ddlFingerprintAlloc(alloc, reset_session);
     defer alloc.free(reset_session_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", reset_session_fingerprint);
+
+    var reset_timeout = try lowerDdlPlanAlloc(alloc, "RESET statement_timeout;");
+    defer reset_timeout.deinit(alloc);
+    const reset_timeout_fingerprint = try ddlFingerprintAlloc(alloc, reset_timeout);
+    defer alloc.free(reset_timeout_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", reset_timeout_fingerprint);
 
     var show_session = try lowerDdlPlanAlloc(alloc, "SHOW search_path;");
     defer show_session.deinit(alloc);
@@ -49255,6 +49357,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const discard_session_fingerprint = try ddlFingerprintAlloc(alloc, discard_session);
     defer alloc.free(discard_session_fingerprint);
     try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", discard_session_fingerprint);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET search_path TO tenant_schema;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET ROLE app_user;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET row_security = off;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET unknown_setting = 'x';"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SHOW ALL;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "DISCARD TEMP;"));
 
     var advisory_lock = try lowerDdlPlanAlloc(alloc, "SELECT pg_advisory_lock(42);");
     defer advisory_lock.deinit(alloc);
@@ -70654,6 +70763,20 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "adapter_noop:ddl:reason=session_setting",
             .classification_reason = "session_setting",
             .sql = "SET LOCAL lock_timeout = '5s';",
+        },
+        .{
+            .name = "adapter-only client encoding session setting syntax",
+            .family = .adapter_noop_ddl,
+            .plan = "adapter_noop:ddl:reason=session_setting",
+            .classification_reason = "session_setting",
+            .sql = "SET client_encoding = 'UTF8';",
+        },
+        .{
+            .name = "adapter-only public search path session setting syntax",
+            .family = .adapter_noop_ddl,
+            .plan = "adapter_noop:ddl:reason=session_setting",
+            .classification_reason = "session_setting",
+            .sql = "SET search_path TO public;",
         },
         .{
             .name = "adapter-only reset session setting syntax",

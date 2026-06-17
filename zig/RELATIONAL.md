@@ -4182,14 +4182,19 @@ durable prepared-transaction model. This keeps savepoint and prepared-transactio
 syntax out of storage while preserving a stable typed boundary for the future
 subtransaction model.
 
-Adapter-only session cleanup covers `RESET`, `SHOW`, selected `SET LOCAL`
-syntax, and `DISCARD ALL` as explicit `session_setting` classifications. These
-statements do not mutate Antfly table/catalog state today; they are pinned in
-the golden corpus so client/session boilerplate cannot drift into storage. If
-Antfly later owns long-lived server-side prepared statements, cursors,
-temporary objects, or session-local variables, `DISCARD` must become a typed
-session-state cleanup request over those native objects instead of remaining an
-adapter no-op.
+Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
+client/dump boilerplate as explicit `session_setting` classifications:
+`SET [LOCAL|SESSION]` for inert client presentation settings, `SET search_path
+TO public`, `RESET ALL`, `RESET`/`SHOW` for the same inert setting allowlist,
+and `DISCARD ALL`. These statements do not mutate Antfly table/catalog state
+today; they are pinned in the golden corpus so client/session boilerplate cannot
+drift into storage. Session-changing forms fail closed instead of becoming
+adapter no-ops: role/session authorization changes, arbitrary settings,
+non-public `search_path`, `SHOW ALL`, and partial `DISCARD` variants need
+native typed session semantics before the adapter may accept them. If Antfly
+later owns long-lived server-side prepared statements, cursors, temporary
+objects, or session-local variables, `DISCARD` must become a typed session-state
+cleanup request over those native objects instead of remaining an adapter no-op.
 
 Prepared statement, cursor, and explain syntax is protocol/query-control
 surface over typed plans rather than storage syntax. `PREPARE`, `EXECUTE`, and
