@@ -841,34 +841,11 @@ pub const LazyDirectorySnapshot = struct {
         scratch.resetDeltaRecords();
         errdefer scratch.resetDeltaRecords();
 
-        var result = posting.DeltaReplayResult{};
-        for (self.manifest.segments) |entry| {
-            if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= base_generation) continue;
-            if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-
-            const manifest_entry = ManifestEntry{
-                .meta = entry.meta,
-                .path = entry.path,
-            };
-            const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
-            defer alloc.free(index_data);
-
-            var delta_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-            while (delta_index < entry.meta.entry_count) : (delta_index += 1) {
-                const delta_entry = try indexEntryFromBytes(index_data[delta_index * index_entry_size ..][0..index_entry_size]);
-                if (delta_entry.posting_id != posting_id or delta_entry.kind != .delta) break;
-                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, delta_entry);
-                defer alloc.free(value);
-                var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
-                while (try iterator.next()) |record| {
-                    if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                    try appendDeltaRecordToScratch(alloc, scratch, record);
-                    result.records += 1;
-                    result.max_sequence = @max(result.max_sequence, record.sequence);
-                }
-            }
-        }
+        const stats = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_generation, scratch);
+        const result = posting.DeltaReplayResult{
+            .records = stats.records_after_generation,
+            .max_sequence = stats.max_sequence_after_generation,
+        };
 
         const records = scratch.deltaRecordsMut();
         sortPostingDeltaRecordsIfNeeded(records);
