@@ -63046,24 +63046,32 @@ fn appParityFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_ta
     };
 }
 
-fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) ?usize {
-    if (dollar + 1 >= sql.len) return null;
-    if (sql[dollar] != '$') return null;
-    if (sql[dollar + 1] < '0' or sql[dollar + 1] > '9') return null;
+const AppParitySqlParameterScan = union(enum) {
+    absent,
+    value: usize,
+    invalid,
+};
+
+fn appParitySqlParameterIndexAt(sql: []const u8, dollar: usize) AppParitySqlParameterScan {
+    if (dollar + 1 >= sql.len) return .absent;
+    if (sql[dollar] != '$') return .absent;
+    if (sql[dollar + 1] < '0' or sql[dollar + 1] > '9') return .absent;
 
     var index = dollar + 1;
     var value: usize = 0;
     while (index < sql.len and sql[index] >= '0' and sql[index] <= '9') : (index += 1) {
         value = value * 10 + (sql[index] - '0');
     }
-    return value;
+    if (index < sql.len and (std.ascii.isAlphanumeric(sql[index]) or sql[index] == '_')) return .invalid;
+    return .{ .value = value };
 }
 
 fn appParitySqlHasParameterIndex(sql: []const u8, expected: usize) bool {
     var index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
-        if (appParitySqlParameterIndexAt(sql, dollar)) |param_index| {
-            if (param_index == expected) return true;
+        switch (appParitySqlParameterIndexAt(sql, dollar)) {
+            .value => |param_index| if (param_index == expected) return true,
+            .absent, .invalid => {},
         }
         index = dollar + 1;
     }
@@ -63071,25 +63079,37 @@ fn appParitySqlHasParameterIndex(sql: []const u8, expected: usize) bool {
 }
 
 fn appParitySqlParameterCoverageMatches(sql: []const u8, param_count: usize) bool {
-    if (param_count == 0) return true;
-
     var index: usize = 0;
     var saw_parameter = false;
     var max_index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, sql, index, '$')) |dollar| {
-        if (appParitySqlParameterIndexAt(sql, dollar)) |param_index| {
-            if (param_index == 0 or param_index > param_count) return false;
-            saw_parameter = true;
-            max_index = @max(max_index, param_index);
+        switch (appParitySqlParameterIndexAt(sql, dollar)) {
+            .value => |param_index| {
+                if (param_index == 0 or param_index > param_count) return false;
+                saw_parameter = true;
+                max_index = @max(max_index, param_index);
+            },
+            .invalid => return false,
+            .absent => {},
         }
         index = dollar + 1;
     }
+    if (param_count == 0) return !saw_parameter;
     if (!saw_parameter or max_index != param_count) return false;
 
     for (1..param_count + 1) |param_index| {
         if (!appParitySqlHasParameterIndex(sql, param_index)) return false;
     }
     return true;
+}
+
+fn appParityFixtureSqlParameterCoverageMatches(entry: AppParityCorpusEntry) bool {
+    if (entry.family == .ddl and entry.summary.ddl_tag == .prepare_statement) {
+        if (entry.params.len != 0) return false;
+        const prepared_params = appParityPlanUsizeTokenValue(entry.plan, ":params=") orelse return false;
+        return appParitySqlParameterCoverageMatches(entry.sql, prepared_params);
+    }
+    return appParitySqlParameterCoverageMatches(entry.sql, entry.params.len);
 }
 
 fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
@@ -63482,7 +63502,7 @@ fn validateAppParityFixtureMetadata(
     for (entry.returning_rows) |returning_row| {
         if (!(try appParityJsonTextIsObject(alloc, returning_row))) return error.TestUnexpectedResult;
     }
-    if (!appParitySqlParameterCoverageMatches(entry.sql, entry.params.len)) {
+    if (!appParityFixtureSqlParameterCoverageMatches(entry)) {
         return error.TestUnexpectedResult;
     }
     const has_resolver_hint = entry.resolver_row_json.len > 0 or
@@ -64786,6 +64806,31 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "usage_records" },
         .plan = "query:table=usage_records",
         .params = &.{.{ .string = "u1" }},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "placeholder without params",
+        .sql = "SELECT id FROM usage_records WHERE id = $1",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "malformed placeholder suffix",
+        .sql = "SELECT id FROM usage_records WHERE id = $1abc",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "query:table=usage_records",
+        .params = &.{.{ .string = "u1" }},
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "prepare statement placeholder mismatch",
+        .sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = 'open'",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .prepare_statement, .table_name = "usage_plan", .operations = 1 },
+        .plan = "ddl:prepare_statement:name=usage_plan:params=1:subject=read",
     }, &seen, alloc));
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
