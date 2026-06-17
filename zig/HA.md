@@ -648,6 +648,11 @@ and either rewind or reseed.
   local/offline helpers only where direct filesystem access is required.
 - Keep CLI table and JSON output aligned with admin API response schemas so
   humans, tests, and the operator observe the same fields.
+- Wire the supported Zig `antfly swarm` runtime so a primary can be started with
+  durable HA replication log, slot store, node id, and identity flags. That
+  runtime path should attach the same `/admin/v1/ha` executor and
+  `/internal/v1/ha/replication` executor used by tests and the CLI, rather than
+  requiring a bespoke harness to expose primary-side HA operations.
 - Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
   `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
   operations following the style of the other SDK APIs.

@@ -59,6 +59,14 @@ const CliConfig = struct {
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
+    ha_primary_log: ?[]const u8 = null,
+    ha_primary_slots: ?[]const u8 = null,
+    ha_primary_node_id: ?[]const u8 = null,
+    ha_cluster_id: ?u64 = null,
+    ha_shard_id: ?u64 = null,
+    ha_table_id: ?u64 = null,
+    ha_timeline_id: ?u64 = null,
+    ha_epoch: ?u64 = null,
     help: bool = false,
 };
 
@@ -711,6 +719,9 @@ pub fn runFromIterator(
     );
     defer local_metadata.deinit();
 
+    var ha_primary = try openHAPrimaryFromCli(alloc, setup_io.io(), cli);
+    defer if (ha_primary) |*primary| primary.close();
+
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
@@ -735,6 +746,12 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
+        .ha = if (ha_primary) |*primary| .{
+            .admin_context = .{
+                .primary = primary,
+                .primary_node_id = cli.ha_primary_node_id.?,
+            },
+        } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     defer data_server.deinit();
@@ -1759,6 +1776,38 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--ha-primary-log")) {
+            cfg.ha_primary_log = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-primary-slots")) {
+            cfg.ha_primary_slots = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-primary-node-id")) {
+            cfg.ha_primary_node_id = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
+            cfg.ha_cluster_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-shard-id")) {
+            cfg.ha_shard_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-table-id")) {
+            cfg.ha_table_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-timeline-id")) {
+            cfg.ha_timeline_id = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ha-epoch")) {
+            cfg.ha_epoch = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         return error.InvalidArguments;
     }
     return cfg;
@@ -1909,6 +1958,44 @@ fn resolvePublicListener(cli: CliConfig) antfly.metadata.runtime.ListenerConfig 
     };
 }
 
+fn haPrimaryRequested(cli: CliConfig) bool {
+    return cli.ha_primary_log != null or
+        cli.ha_primary_slots != null or
+        cli.ha_primary_node_id != null or
+        cli.ha_cluster_id != null or
+        cli.ha_shard_id != null or
+        cli.ha_table_id != null or
+        cli.ha_timeline_id != null or
+        cli.ha_epoch != null;
+}
+
+fn haPrimaryIdentity(cli: CliConfig) !antfly.ha.primary.Identity {
+    return .{
+        .cluster_id = cli.ha_cluster_id orelse return error.HAClusterIdMissing,
+        .shard_id = cli.ha_shard_id orelse 0,
+        .table_id = cli.ha_table_id orelse 0,
+        .timeline_id = cli.ha_timeline_id orelse return error.HATimelineIdMissing,
+        .epoch = cli.ha_epoch orelse return error.HAEpochMissing,
+    };
+}
+
+fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.primary.Primary {
+    if (!haPrimaryRequested(cli)) return null;
+    const log_path = cli.ha_primary_log orelse return error.HAPrimaryLogMissing;
+    const slots_path = cli.ha_primary_slots orelse return error.HAPrimarySlotsMissing;
+    if (cli.ha_primary_node_id == null) return error.HAPrimaryNodeIdMissing;
+
+    try ensureParent(io, log_path);
+    try ensureParent(io, slots_path);
+
+    const log_z = try alloc.dupeZ(u8, log_path);
+    defer alloc.free(log_z);
+    const slots_z = try alloc.dupeZ(u8, slots_path);
+    defer alloc.free(slots_z);
+
+    return try antfly.ha.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
+}
+
 fn ensureDirPath(io: std.Io, dir_path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
 }
@@ -1982,6 +2069,14 @@ fn printUsage() void {
         \\  --replica-catalog-path <path>         Replica catalog file path
         \\  --snapshot-root-dir <path>            Snapshot root directory
         \\  --secret-store-path <path>            Antfly secrets.json file path
+        \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
+        \\  --ha-primary-slots <path>             HA primary replication slot store path
+        \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
+        \\  --ha-cluster-id <id>                  HA replicated cluster id
+        \\  --ha-shard-id <id>                    HA replicated shard id (default: 0)
+        \\  --ha-table-id <id>                    HA replicated table id (default: 0)
+        \\  --ha-timeline-id <id>                 HA primary timeline id
+        \\  --ha-epoch <id>                       HA primary epoch
         \\  -h, --help                            Show this help
         \\
     , .{});
@@ -2217,6 +2312,51 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
+}
+
+test "parse cli accepts HA primary runtime flags" {
+    var argv = [_][*:0]const u8{
+        "--ha-primary-log",
+        "/tmp/ha-primary.log",
+        "--ha-primary-slots",
+        "/tmp/ha-slots.wal",
+        "--ha-primary-node-id",
+        "primary-a",
+        "--ha-cluster-id",
+        "100",
+        "--ha-shard-id",
+        "10",
+        "--ha-table-id",
+        "20",
+        "--ha-timeline-id",
+        "3",
+        "--ha-epoch",
+        "4",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try std.testing.expect(haPrimaryRequested(cfg));
+    try std.testing.expectEqualStrings("/tmp/ha-primary.log", cfg.ha_primary_log.?);
+    try std.testing.expectEqualStrings("/tmp/ha-slots.wal", cfg.ha_primary_slots.?);
+    try std.testing.expectEqualStrings("primary-a", cfg.ha_primary_node_id.?);
+    try std.testing.expectEqual(@as(u64, 100), cfg.ha_cluster_id.?);
+    try std.testing.expectEqual(@as(u64, 10), cfg.ha_shard_id.?);
+    try std.testing.expectEqual(@as(u64, 20), cfg.ha_table_id.?);
+    try std.testing.expectEqual(@as(u64, 3), cfg.ha_timeline_id.?);
+    try std.testing.expectEqual(@as(u64, 4), cfg.ha_epoch.?);
+}
+
+test "swarm HA primary identity defaults shard and table to whole instance" {
+    const identity = try haPrimaryIdentity(.{
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    });
+    try std.testing.expectEqual(@as(u64, 100), identity.cluster_id);
+    try std.testing.expectEqual(@as(u64, 0), identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), identity.table_id);
+    try std.testing.expectEqual(@as(u64, 3), identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 4), identity.epoch);
 }
 
 test "swarm runtime defaults public listener to antfarm port" {
