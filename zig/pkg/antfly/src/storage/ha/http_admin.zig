@@ -97,6 +97,9 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, admin_api.routes.ha_fence_current)) {
                     return try self.handleAdminFenceCurrent();
                 }
+                if (knownFixedRoute(path)) {
+                    return try textResponse(self.alloc, 405, "method not allowed");
+                }
                 return try textResponse(self.alloc, 404, "not found");
             },
             .POST => {
@@ -150,6 +153,9 @@ pub const Server = struct {
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_rejoin_reseed)) {
                     return try self.handleAdminReseedRejoin(req);
+                }
+                if (knownFixedRoute(path)) {
+                    return try textResponse(self.alloc, 405, "method not allowed");
                 }
                 return try textResponse(self.alloc, 404, "not found");
             },
@@ -2261,6 +2267,14 @@ test "storage.ha http admin returns route method and command errors" {
     var wrong_method = try server.handle(.{ .method = .PUT, .uri = Routes.command });
     defer wrong_method.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 405), wrong_method.status);
+
+    var get_to_post_route = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_fence });
+    defer get_to_post_route.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), get_to_post_route.status);
+
+    var post_to_get_route = try server.handle(.{ .method = .POST, .uri = admin_api.routes.ha_fence_current });
+    defer post_to_get_route.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), post_to_get_route.status);
 
     var bad_json = try server.handle(.{
         .method = .POST,
