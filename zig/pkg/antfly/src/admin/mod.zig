@@ -104,6 +104,30 @@ test "admin facade re-exports HA action receipt result types" {
     try std.testing.expect(@hasField(HARejoinAssessResponse, "reseed"));
 }
 
+test "admin facade preserves HA failover receipt schema fields" {
+    inline for (ha_action_receipt_fields) |name| {
+        try expectFacadeStructField(HAActionReceipt, name);
+    }
+    inline for (ha_promotion_assessment_fields) |name| {
+        try expectFacadeStructField(HAPromotionAssessment, name);
+    }
+    inline for (ha_promotion_response_fields) |name| {
+        try expectFacadeStructField(HAPromotionResponse, name);
+    }
+    inline for (ha_promotion_result_fields) |name| {
+        try expectFacadeStructField(HAPromotionResult, name);
+    }
+    inline for (ha_rejoin_assess_response_fields) |name| {
+        try expectFacadeStructField(HARejoinAssessResponse, name);
+    }
+    inline for (ha_rejoin_rewind_result_fields) |name| {
+        try expectFacadeStructField(HARejoinRewindResult, name);
+    }
+    inline for (ha_rejoin_reseed_result_fields) |name| {
+        try expectFacadeStructField(HARejoinReseedResult, name);
+    }
+}
+
 const ha_contract_type_names = [_][]const u8{
     "ReplicationSlotCreateRequest",
     "BaseBackupStartRequest",
@@ -156,8 +180,86 @@ const ha_contract_type_names = [_][]const u8{
     "HAActionReceipt",
 };
 
+const ha_action_receipt_fields = [_][]const u8{
+    "action_id",
+    "action_kind",
+    "target",
+    "state",
+    "node_id",
+};
+
+const ha_promotion_assessment_fields = [_][]const u8{
+    "required_lsn",
+    "received_lsn",
+    "applied_lsn",
+    "has_required_lsn",
+    "caught_up_to_received",
+    "fencing_confirmed",
+    "force",
+    "data_loss_possible",
+    "safe",
+    "requires_fencing",
+    "requires_force",
+    "can_promote",
+};
+
+const ha_promotion_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "assessment",
+    "promotion",
+    "fence_generation",
+    "fence_token",
+    "forced",
+};
+
+const ha_promotion_result_fields = [_][]const u8{
+    "node_id",
+    "switch_lsn",
+    "old_identity",
+    "new_identity",
+    "forced",
+    "data_loss_possible",
+};
+
+const ha_rejoin_assess_response_fields = [_][]const u8{
+    "schema_version",
+    "action",
+    "assessment",
+    "rewind",
+    "reseed",
+};
+
+const ha_rejoin_rewind_result_fields = [_][]const u8{
+    "node_id",
+    "fork_lsn",
+    "previous_last_lsn",
+    "current_last_lsn",
+    "next_lsn",
+    "discarded_lsn_count",
+    "target_timeline_id",
+    "target_epoch",
+    "data_loss_discarded",
+};
+
+const ha_rejoin_reseed_result_fields = [_][]const u8{
+    "node_id",
+    "slot_name",
+    "target_timeline_id",
+    "target_epoch",
+    "fork_lsn",
+    "former_last_lsn",
+    "reseed_required",
+    "base_backup_required",
+};
+
 fn expectFacadeTypeAlias(comptime name: []const u8) !void {
     try std.testing.expect(@hasDecl(@This(), name));
     try std.testing.expect(@hasDecl(openapi, name));
     try std.testing.expect(@field(@This(), name) == @field(openapi, name));
+}
+
+fn expectFacadeStructField(comptime T: type, comptime field_name: []const u8) !void {
+    try std.testing.expect(@typeInfo(T) == .@"struct");
+    try std.testing.expect(@hasField(T, field_name));
 }
