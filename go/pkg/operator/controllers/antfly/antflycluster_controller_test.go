@@ -4146,7 +4146,7 @@ func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T)
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 			observedHost = req.URL.Host
-			body := `{"schema_version":1,"snapshot":{"role":"primary","current_lsn":21,"slots":[],"retention":{}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -4320,7 +4320,7 @@ func TestObserveHAStandbyAdminStatusesSkipsPromotedPrimary(t *testing.T) {
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
 			g.Expect(req.URL.Host).NotTo(Equal("standby-a-ha.default.svc:8081"))
 			observedHosts = append(observedHosts, req.URL.Host)
-			body := `{"schema_version":1,"snapshot":{"role":"standby","identity":{"timeline_id":5},"received_lsn":20,"applied_lsn":20,"safe_read_lsn":20,"upstream_lsn":21,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":1,"unapplied_lsn_count":0,"caught_up_to_received":true,"can_serve_safe_reads":true}}`
+			body := `{"schema_version":1,"snapshot":{"role":"standby","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"received_lsn":20,"applied_lsn":20,"safe_read_lsn":20,"upstream_lsn":21,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":1,"unapplied_lsn_count":0,"caught_up_to_received":true,"can_serve_safe_reads":true}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -4364,7 +4364,7 @@ func TestObserveHAStandbyAdminStatusesSkipsPromotedPrimary(t *testing.T) {
 func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {
 	g := NewWithT(t)
 
-	primary, err := parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply"}}}}`))
+	primary, err := parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}}`))
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(primary.PrimaryLSN).To(Equal(uint64(12)))
 	g.Expect(primary.Standbys).To(HaveLen(1))
@@ -4377,6 +4377,12 @@ func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {
 	g.Expect(standby.SlotName).To(Equal("slot-a"))
 	g.Expect(standby.ReceivedLSN).To(Equal(uint64(12)))
 	g.Expect(standby.ApplyLagLSN).To(Equal(uint64(2)))
+
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"active_slots":1,"reseed_recommended":0}}}`))
+	g.Expect(err).To(HaveOccurred())
+
+	_, err = parseHAStandbyStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"standby","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"unapplied_lsn_count":1,"caught_up_to_received":true}}`), "standby-a", "slot-a")
+	g.Expect(err).To(HaveOccurred())
 }
 
 // T005: Unit test for applyDefaults() setting PublicAPI.Enabled=false
