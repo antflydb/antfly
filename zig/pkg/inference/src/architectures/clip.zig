@@ -186,7 +186,7 @@ pub fn visionEncoderForward(
     const patch_shape = [_]i32{ @intCast(batch * num_patches), @intCast(patch_dim) };
     const patches_ct = try cb.fromFloat32Shape(patches, &patch_shape);
     defer cb.free(patches_ct);
-    const embedded = if (cb.kind() == .native)
+    const embedded = if (cb.kind() == .native or cb.kind() == .cuda)
         try cb.linearNoBias(patches_ct, patch_w, batch * num_patches, patch_dim, H)
     else blk: {
         const patch_w_data = try cb.toFloat32(patch_w, allocator);

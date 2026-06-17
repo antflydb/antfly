@@ -512,7 +512,18 @@ fn buildRelativePositionEmbInfo(
     defer cb.free(ln_w);
     const ln_b = try cb.getWeight("encoder.LayerNorm.bias");
     defer cb.free(ln_b);
-    const normed_rel = try cb.layerNorm(rel_weight, ln_w, ln_b, H, config.layer_norm_eps);
+    const normed_rel = cb.layerNorm(rel_weight, ln_w, ln_b, H, config.layer_norm_eps) catch |err| switch (err) {
+        error.UnsupportedTensorType => blk: {
+            const rel_data = try cb.toFloat32(rel_weight, allocator);
+            defer allocator.free(rel_data);
+            if (rel_data.len % H != 0) return error.InvalidShape;
+            const rel_shape = [_]i32{ @intCast(rel_data.len / H), @intCast(H) };
+            const rel_f32 = try cb.fromFloat32Shape(rel_data, &rel_shape);
+            defer cb.free(rel_f32);
+            break :blk try cb.layerNorm(rel_f32, ln_w, ln_b, H, config.layer_norm_eps);
+        },
+        else => return err,
+    };
     defer cb.free(normed_rel);
 
     // Build bucket IDs for all relative positions: we need unique positions from -(seq_len-1) to +(seq_len-1)

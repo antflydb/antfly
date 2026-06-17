@@ -65,6 +65,11 @@ const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
+const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
+    clipclap,
+    deberta_reranker,
+    gliner2,
+};
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
 const GpuHostedCompute = void;
 const gpu_hosted_mod = struct {
@@ -322,7 +327,7 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
         };
     }
     return switch (model_type) {
-        .classifier => .classifier,
+        .classifier, .reranker => .classifier,
         .recognizer => .recognizer,
         else => .generic,
     };
@@ -941,10 +946,11 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     defer native_session.close();
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
-    if (!cudaSupportsArch(native_impl.arch_config)) return error.UnsupportedCudaArchitecture;
+    const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
 
     var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
     errdefer cuda_compute.deinit();
+    try cuda_compute.requireProfile(cuda_profile);
     var it = native_impl.backend_data.native.resident_weights.iterator();
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
@@ -966,12 +972,31 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 }
 
 fn cudaSupportsArch(arch_config: ArchConfig) bool {
+    return cudaProfileForArch(arch_config) != null;
+}
+
+fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
     return switch (arch_config) {
-        .deberta, .gliner, .clip, .clap => true,
-        else => false,
+        .clip, .clap => .clipclap,
+        .deberta => .deberta_reranker,
+        .gliner => .gliner2,
+        else => null,
     };
 }
 
+test "cuda support gate admits only supported encoder architectures" {
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .gemma } }));
+    try std.testing.expect(!cudaSupportsArch(.{ .gpt = .{ .family = .qwen2 } }));
+    try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
+    if (comptime build_options.enable_cuda) {
+        try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
+    }
+}
 fn eagerLoadResidentsFromStore(
     allocator: std.mem.Allocator,
     resident_weights: anytype,
@@ -3417,8 +3442,10 @@ test "makeBertConfig carries num_labels from manifest" {
 
 test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.classifier, null));
+    try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.reranker, null));
     try std.testing.expectEqual(@as(SessionTask, .recognizer), sessionTaskForModelType(.recognizer, null));
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.embedder, null));
+    try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
 test "detectArchitecture recognizes generic deberta classifier configs" {
@@ -4405,11 +4432,12 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
             const attention_mask = inputs[1].asInt64();
-            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
-            defer allocator.free(hidden);
 
             if (self.task == .classifier) {
-                const logits = try runDebertaSequenceClassifier(&cb, allocator, cfg, hidden, batch, seq_len);
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+                defer cb.free(hidden_ct);
+
+                const logits = try runDebertaSequenceClassifierCt(&cb, allocator, cfg, hidden_ct, batch, seq_len);
                 defer allocator.free(logits);
 
                 const logits_shape = [_]i64{ @intCast(batch), @intCast(cfg.num_labels) };
@@ -4420,6 +4448,10 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                 result[0] = output_tensor;
                 return result;
             }
+
+            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            defer allocator.free(hidden);
+
             if (self.task == .recognizer) {
                 const logits = try runTokenClassifier(&cb, allocator, hidden, batch, seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
@@ -4936,6 +4968,96 @@ fn runDebertaSequenceClassifier(
     defer allocator.free(pooled);
 
     return runLinearHead(allocator, cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
+}
+
+fn runDebertaSequenceClassifierCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: deberta_mod.Config,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+) ![]f32 {
+    const H: usize = @intCast(cfg.hidden_size);
+    const cls_embeddings = try extractClsEmbeddingsCt(cb, allocator, hidden, batch, seq_len, H);
+    defer cb.free(cls_embeddings);
+
+    const pooled = try maybeApplyPoolerCt(cb, allocator, cls_embeddings, batch, H, "pooler.dense.weight", "pooler.dense.bias");
+    defer cb.free(pooled);
+
+    const logits = try runLinearHeadCt(cb, pooled, batch, H, cfg.num_labels, "classifier.weight", "classifier.bias");
+    defer cb.free(logits);
+    return try cb.toFloat32(logits, allocator);
+}
+
+fn extractClsEmbeddingsCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    hidden: ops.CT,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) !ops.CT {
+    const row_ids = try allocator.alloc(u32, batch);
+    defer allocator.free(row_ids);
+    for (0..batch) |b| row_ids[b] = @intCast(b * seq_len);
+
+    if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |cls| {
+        return cls;
+    }
+
+    const hidden_f32 = try cb.toFloat32(hidden, allocator);
+    defer allocator.free(hidden_f32);
+    const cls_f32 = try extractClsEmbeddings(allocator, hidden_f32, batch, seq_len, hidden_size);
+    defer allocator.free(cls_f32);
+    const shape = [_]i32{ @intCast(batch), @intCast(hidden_size) };
+    return try cb.fromFloat32Shape(cls_f32, &shape);
+}
+
+fn maybeApplyPoolerCt(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cls_embeddings: ops.CT,
+    batch: usize,
+    hidden_size: usize,
+    weight_name: []const u8,
+    bias_name: []const u8,
+) !ops.CT {
+    const pool_w = cb.getWeight(weight_name) catch |err| switch (err) {
+        error.WeightNotFound => {
+            const shape = [_]i32{ @intCast(batch), @intCast(hidden_size) };
+            if (try cb.cloneTensorShape(cls_embeddings, &shape)) |clone| return clone;
+            const cls_f32 = try cb.toFloat32(cls_embeddings, allocator);
+            defer allocator.free(cls_f32);
+            return try cb.fromFloat32Shape(cls_f32, &shape);
+        },
+        else => return err,
+    };
+    defer cb.free(pool_w);
+    const pool_b = try cb.getWeight(bias_name);
+    defer cb.free(pool_b);
+
+    const pooled_ct = try cb.linear(cls_embeddings, pool_w, pool_b, batch, hidden_size, hidden_size);
+    defer cb.free(pooled_ct);
+
+    return try cb.tanh_act(pooled_ct);
+}
+
+fn runLinearHeadCt(
+    cb: *const ops.ComputeBackend,
+    input: ops.CT,
+    batch: usize,
+    input_dim: usize,
+    output_dim_u32: u32,
+    weight_name: []const u8,
+    bias_name: []const u8,
+) !ops.CT {
+    const output_dim: usize = @intCast(output_dim_u32);
+    const weight = try cb.getWeight(weight_name);
+    defer cb.free(weight);
+    const bias = try cb.getWeight(bias_name);
+    defer cb.free(bias);
+    return try cb.linear(input, weight, bias, batch, input_dim, output_dim);
 }
 
 fn runTokenClassifier(
