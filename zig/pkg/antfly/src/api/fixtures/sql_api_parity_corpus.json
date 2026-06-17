@@ -1,9 +1,8 @@
 {
   "fixture_format": 1,
   "source_entry_count": 748,
-  "entry_count": 747,
+  "entry_count": 748,
   "skipped_entries": [
-    "schema additive foreign key"
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
   "entries": [
@@ -456,6 +455,19 @@
       "sql": "DROP INDEX CONCURRENTLY usage_records_status_idx;"
     },
     {
+      "name": "schema additive foreign key",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_table",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_fk=1",
+      "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY);"],
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
+      "sql": "ALTER TABLE usage_records ADD COLUMN user_id text REFERENCES users(id);"
+    },
+    {
       "name": "schema upper generated column",
       "family": "ddl",
       "summary": {
@@ -526,6 +538,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
+      "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);"],
       "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;"
     },

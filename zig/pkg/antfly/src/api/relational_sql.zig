@@ -68877,6 +68877,9 @@ test "postgres sql adapter classifies application parity corpus" {
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
             .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_fk=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE usage_records (id uuid PRIMARY KEY);",
+            },
             .sql = "ALTER TABLE usage_records ADD COLUMN user_id text REFERENCES users(id);",
         },
         .{
@@ -68929,6 +68932,9 @@ test "postgres sql adapter classifies application parity corpus" {
             .family = .ddl,
             .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
             .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_fk=1",
+            .apply_setup_sql = &.{
+                "CREATE TABLE usage_records (id uuid PRIMARY KEY, user_id text);",
+            },
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=1:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;",
         },
