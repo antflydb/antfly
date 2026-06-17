@@ -387,12 +387,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.RejoinAssessRequest,
     ) !ParsedOutput(admin_api.HARejoinAssessResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HARejoinAssessResponse,
             base_uri,
             admin_api.routes.ha_rejoin_assess,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateRejoinResponse(result.parsed.value, request, .assess);
+        return result;
     }
 
     pub fn rewindRejoin(
@@ -400,12 +403,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.RejoinAssessRequest,
     ) !ParsedOutput(admin_api.HARejoinAssessResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HARejoinAssessResponse,
             base_uri,
             admin_api.routes.ha_rejoin_rewind,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateRejoinResponse(result.parsed.value, request, .rewind);
+        return result;
     }
 
     pub fn reseedRejoin(
@@ -413,12 +419,15 @@ pub const Client = struct {
         base_uri: []const u8,
         request: admin_api.RejoinAssessRequest,
     ) !ParsedOutput(admin_api.HARejoinAssessResponse) {
-        return try self.postJson(
+        var result = try self.postJson(
             admin_api.HARejoinAssessResponse,
             base_uri,
             admin_api.routes.ha_rejoin_reseed,
             request,
         );
+        errdefer result.deinit(self.alloc);
+        try validateRejoinResponse(result.parsed.value, request, .reseed);
+        return result;
     }
 
     fn replicationSlotLifecycle(
@@ -601,6 +610,100 @@ fn i64FromU64(value: u64) !i64 {
     return @intCast(value);
 }
 
+const RejoinResponseKind = enum {
+    assess,
+    rewind,
+    reseed,
+};
+
+fn validateRejoinResponse(
+    response: admin_api.HARejoinAssessResponse,
+    request: admin_api.RejoinAssessRequest,
+    expected: RejoinResponseKind,
+) !void {
+    if (response.schema_version <= 0) return error.AdminRejoinResponseMismatch;
+
+    const expected_action_kind = switch (expected) {
+        .assess => "rejoin_assess",
+        .rewind => "rejoin_rewind",
+        .reseed => "rejoin_reseed",
+    };
+    const expected_state = switch (expected) {
+        .assess => "assessed",
+        .rewind, .reseed => "applied",
+    };
+    if (!std.mem.eql(u8, response.action.action_kind, expected_action_kind)) {
+        return error.AdminRejoinResponseMismatch;
+    }
+    if (!std.mem.eql(u8, response.action.target, request.node_id)) {
+        return error.AdminRejoinResponseMismatch;
+    }
+    if (!std.mem.eql(u8, response.action.state, expected_state)) {
+        return error.AdminRejoinResponseMismatch;
+    }
+
+    const assessment = response.assessment;
+    if (!std.mem.eql(u8, assessment.former_node_id, request.node_id)) {
+        return error.AdminRejoinResponseMismatch;
+    }
+    if (assessment.former_last_lsn != request.last_lsn) return error.AdminRejoinResponseMismatch;
+    if (assessment.retained_from_lsn != request.retained_from_lsn) return error.AdminRejoinResponseMismatch;
+
+    switch (expected) {
+        .assess => {},
+        .rewind => if (!std.mem.eql(u8, assessment.action, "rewind")) return error.AdminRejoinResponseMismatch,
+        .reseed => if (!std.mem.eql(u8, assessment.action, "reseed")) return error.AdminRejoinResponseMismatch,
+    }
+
+    if (request.receipt) |receipt| {
+        if (assessment.target_timeline_id != receipt.new_timeline_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.target_epoch != receipt.new_epoch) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_cluster_id != receipt.identity.cluster_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_shard_id != receipt.identity.shard_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_table_id != receipt.identity.table_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_timeline_id != receipt.parent_timeline_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_epoch != receipt.parent_epoch) return error.AdminRejoinResponseMismatch;
+        if (assessment.fork_lsn != receipt.observed_lsn) return error.AdminRejoinResponseMismatch;
+    } else {
+        if (!std.mem.eql(u8, assessment.action, "reject_unfenced")) return error.AdminRejoinResponseMismatch;
+        if (assessment.target_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.target_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_cluster_id != request.identity.cluster_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_shard_id != request.identity.shard_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_table_id != request.identity.table_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
+        if (assessment.parent_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
+        if (assessment.fork_lsn != request.last_lsn) return error.AdminRejoinResponseMismatch;
+    }
+
+    switch (expected) {
+        .assess => {
+            if (response.rewind != null or response.reseed != null) return error.AdminRejoinResponseMismatch;
+        },
+        .rewind => {
+            const rewind = response.rewind orelse return error.AdminRejoinResponseMismatch;
+            if (response.reseed != null) return error.AdminRejoinResponseMismatch;
+            if (!std.mem.eql(u8, rewind.node_id, request.node_id)) return error.AdminRejoinResponseMismatch;
+            if (rewind.fork_lsn != assessment.fork_lsn) return error.AdminRejoinResponseMismatch;
+            if (rewind.previous_last_lsn != assessment.former_last_lsn) return error.AdminRejoinResponseMismatch;
+            if (rewind.current_last_lsn != assessment.fork_lsn) return error.AdminRejoinResponseMismatch;
+            if (rewind.target_timeline_id != assessment.target_timeline_id) return error.AdminRejoinResponseMismatch;
+            if (rewind.target_epoch != assessment.target_epoch) return error.AdminRejoinResponseMismatch;
+        },
+        .reseed => {
+            const reseed = response.reseed orelse return error.AdminRejoinResponseMismatch;
+            if (response.rewind != null) return error.AdminRejoinResponseMismatch;
+            if (!std.mem.eql(u8, reseed.node_id, request.node_id)) return error.AdminRejoinResponseMismatch;
+            if (!std.mem.eql(u8, reseed.slot_name, request.node_id)) return error.AdminRejoinResponseMismatch;
+            if (reseed.target_timeline_id != assessment.target_timeline_id) return error.AdminRejoinResponseMismatch;
+            if (reseed.target_epoch != assessment.target_epoch) return error.AdminRejoinResponseMismatch;
+            if (reseed.fork_lsn != assessment.fork_lsn) return error.AdminRejoinResponseMismatch;
+            if (reseed.former_last_lsn != assessment.former_last_lsn) return error.AdminRejoinResponseMismatch;
+            if (!reseed.reseed_required or !reseed.base_backup_required) return error.AdminRejoinResponseMismatch;
+        },
+    }
+}
+
 const TestPaths = struct {
     primary_log: [:0]u8,
     primary_slots: [:0]u8,
@@ -688,12 +791,58 @@ fn testAdminIdentity() admin_api.HAIdentity {
     };
 }
 
+fn testFenceReceipt() admin_api.HAFenceReceipt {
+    return .{
+        .identity = .{
+            .cluster_id = 100,
+            .shard_id = 10,
+            .table_id = 20,
+            .timeline_id = 2,
+            .epoch = 2,
+        },
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .parent_timeline_id = 1,
+        .parent_epoch = 1,
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .generation = 1,
+        .forced = false,
+        .token = "token",
+        .reason = "http-client-test",
+    };
+}
+
 fn seedFiles() [2]backup_manifest.FileEntry {
     return .{
         .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
         .{ .path = "sst/0001", .kind = .sstable, .size_bytes = 7, .crc32 = backup_manifest.crc32("sstable") },
     };
 }
+
+const StaticJsonExecutor = struct {
+    body: []const u8,
+
+    fn executor(self: *@This()) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = execute,
+            },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = 200,
+            .content_type = try alloc.dupe(u8, "application/json"),
+            .body = try alloc.dupe(u8, self.body),
+        };
+    }
+};
 
 fn testRecord(identity: standby_mod.Identity, lsn: u64, payload: []const u8) replication_record.Record {
     return .{
@@ -1248,6 +1397,11 @@ test "storage.ha http client round trips typed safety operations" {
     defer rejoin.deinit(alloc);
     try std.testing.expectEqualStrings("rewind", rejoin.parsed.value.assessment.action);
     try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
+    try std.testing.expectEqual(@as(i64, 100), rejoin.parsed.value.assessment.parent_cluster_id);
+    try std.testing.expectEqual(@as(i64, 10), rejoin.parsed.value.assessment.parent_shard_id);
+    try std.testing.expectEqual(@as(i64, 20), rejoin.parsed.value.assessment.parent_table_id);
+    try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_timeline_id);
+    try std.testing.expectEqual(@as(i64, 1), rejoin.parsed.value.assessment.parent_epoch);
 
     var rewind = try client.rewindRejoin("http://ha-admin.test", .{
         .node_id = "primary-a",
@@ -1258,6 +1412,7 @@ test "storage.ha http client round trips typed safety operations" {
     });
     defer rewind.deinit(alloc);
     try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
+    try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.assessment.parent_timeline_id);
     try std.testing.expect(rewind.parsed.value.rewind != null);
     try std.testing.expectEqual(@as(i64, 2), rewind.parsed.value.rewind.?.previous_last_lsn);
     try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.rewind.?.current_last_lsn);
@@ -1269,6 +1424,24 @@ test "storage.ha http client round trips typed safety operations" {
         .last_lsn = 2,
         .retained_from_lsn = 0,
         .receipt = fence.parsed.value.receipt,
+    }));
+}
+
+test "storage.ha http client rejects mismatched rejoin admin responses" {
+    const alloc = std.testing.allocator;
+    var executor = StaticJsonExecutor{
+        .body =
+        \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":99,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true}}
+        ,
+    };
+    var client = Client.init(alloc, executor.executor());
+
+    try std.testing.expectError(error.AdminRejoinResponseMismatch, client.assessRejoin("http://ha-admin.test", .{
+        .node_id = "primary-a",
+        .identity = testAdminIdentity(),
+        .last_lsn = 2,
+        .retained_from_lsn = 0,
+        .receipt = testFenceReceipt(),
     }));
 }
 
