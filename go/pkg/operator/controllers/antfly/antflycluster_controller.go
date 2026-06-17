@@ -3901,6 +3901,18 @@ func haDirectPromotionResultMatchesAction(result haPromotionJobResult, identity 
 	if identity == nil || action == nil {
 		return false
 	}
+	if result.ParentClusterID != 0 &&
+		(result.ParentClusterID != identity.ClusterID ||
+			result.ParentShardID != identity.ShardID ||
+			result.ParentTableID != identity.TableID) {
+		return false
+	}
+	if result.NewClusterID != 0 &&
+		(result.NewClusterID != identity.ClusterID ||
+			result.NewShardID != identity.ShardID ||
+			result.NewTableID != identity.TableID) {
+		return false
+	}
 	if result.ParentTimelineID != identity.TimelineID || result.ParentEpoch != identity.Epoch {
 		return false
 	}
@@ -4162,8 +4174,14 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 
 type haPromotionJobResult struct {
 	SwitchLSN        uint64
+	ParentClusterID  uint64
+	ParentShardID    uint64
+	ParentTableID    uint64
 	ParentTimelineID uint64
 	ParentEpoch      uint64
+	NewClusterID     uint64
+	NewShardID       uint64
+	NewTableID       uint64
 	NewTimelineID    uint64
 	NewEpoch         uint64
 	RequiredLSN      uint64
@@ -4240,10 +4258,16 @@ type haPromotionAPIResult struct {
 	Promotion struct {
 		SwitchLSN   uint64 `json:"switch_lsn"`
 		OldIdentity struct {
+			ClusterID  uint64 `json:"cluster_id"`
+			ShardID    uint64 `json:"shard_id"`
+			TableID    uint64 `json:"table_id"`
 			TimelineID uint64 `json:"timeline_id"`
 			Epoch      uint64 `json:"epoch"`
 		} `json:"old_identity"`
 		NewIdentity struct {
+			ClusterID  uint64 `json:"cluster_id"`
+			ShardID    uint64 `json:"shard_id"`
+			TableID    uint64 `json:"table_id"`
 			TimelineID uint64 `json:"timeline_id"`
 			Epoch      uint64 `json:"epoch"`
 		} `json:"new_identity"`
@@ -4268,8 +4292,10 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		result = envelope.Result.Promote
 	}
 	if result == nil || result.Promotion.SwitchLSN == 0 ||
+		result.Promotion.OldIdentity.ClusterID == 0 ||
 		result.Promotion.OldIdentity.TimelineID == 0 ||
 		result.Promotion.OldIdentity.Epoch == 0 ||
+		result.Promotion.NewIdentity.ClusterID == 0 ||
 		result.Promotion.NewIdentity.TimelineID == 0 ||
 		result.Promotion.NewIdentity.Epoch == 0 ||
 		result.FenceGeneration == 0 ||
@@ -4289,8 +4315,14 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	}
 	return haPromotionJobResult{
 		SwitchLSN:        result.Promotion.SwitchLSN,
+		ParentClusterID:  result.Promotion.OldIdentity.ClusterID,
+		ParentShardID:    result.Promotion.OldIdentity.ShardID,
+		ParentTableID:    result.Promotion.OldIdentity.TableID,
 		ParentTimelineID: result.Promotion.OldIdentity.TimelineID,
 		ParentEpoch:      result.Promotion.OldIdentity.Epoch,
+		NewClusterID:     result.Promotion.NewIdentity.ClusterID,
+		NewShardID:       result.Promotion.NewIdentity.ShardID,
+		NewTableID:       result.Promotion.NewIdentity.TableID,
 		NewTimelineID:    result.Promotion.NewIdentity.TimelineID,
 		NewEpoch:         result.Promotion.NewIdentity.Epoch,
 		RequiredLSN:      requiredLSN,

@@ -598,7 +598,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -727,6 +727,9 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 	g := NewWithT(t)
 
 	identity := &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:  100,
+		ShardID:    10,
+		TableID:    20,
 		TimelineID: 4,
 		Epoch:      6,
 	}
@@ -738,8 +741,14 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 		SwitchLSN:        12,
 		RequiredLSN:      12,
 		ObservedLSN:      13,
+		ParentClusterID:  100,
+		ParentShardID:    10,
+		ParentTableID:    20,
 		ParentTimelineID: 4,
 		ParentEpoch:      6,
+		NewClusterID:     100,
+		NewShardID:       10,
+		NewTableID:       20,
 		NewTimelineID:    5,
 		NewEpoch:         7,
 		FenceGeneration:  3,
@@ -754,6 +763,10 @@ func TestHADirectPromotionResultMatchesPlannedBoundary(t *testing.T) {
 	mismatchedTimeline := result
 	mismatchedTimeline.NewTimelineID = 6
 	g.Expect(haDirectPromotionResultMatchesAction(mismatchedTimeline, identity, &action)).To(BeFalse())
+
+	mismatchedScope := result
+	mismatchedScope.NewTableID = 21
+	g.Expect(haDirectPromotionResultMatchesAction(mismatchedScope, identity, &action)).To(BeFalse())
 
 	unappliedBoundary := result
 	unappliedBoundary.ObservedLSN = 10
@@ -1877,19 +1890,28 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g := NewWithT(t)
 
-	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	openAPIResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(openAPIResult.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(openAPIResult.ParentClusterID).To(Equal(uint64(100)))
+	g.Expect(openAPIResult.ParentShardID).To(Equal(uint64(10)))
+	g.Expect(openAPIResult.ParentTableID).To(Equal(uint64(20)))
 	g.Expect(openAPIResult.ParentTimelineID).To(Equal(uint64(4)))
+	g.Expect(openAPIResult.NewClusterID).To(Equal(uint64(100)))
 	g.Expect(openAPIResult.NewEpoch).To(Equal(uint64(7)))
 	g.Expect(openAPIResult.RequiredLSN).To(Equal(uint64(12)))
 	g.Expect(openAPIResult.ObservedLSN).To(Equal(uint64(13)))
 	g.Expect(openAPIResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIResult.FenceToken).To(Equal("ha-fence-token"))
 
-	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15},"promotion":{"switch_lsn":14,"old_identity":{"timeline_id":5,"epoch":7},"new_identity":{"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11},"promotion":{"switch_lsn":12,"old_identity":{"timeline_id":4,"epoch":6},"new_identity":{"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	g.Expect(ok).To(BeFalse())
+
+	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15},"promotion":{"switch_lsn":14,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(legacyResult.SwitchLSN).To(Equal(uint64(14)))
+	g.Expect(legacyResult.ParentClusterID).To(Equal(uint64(100)))
+	g.Expect(legacyResult.ParentShardID).To(Equal(uint64(0)))
 	g.Expect(legacyResult.ParentTimelineID).To(Equal(uint64(5)))
 	g.Expect(legacyResult.NewEpoch).To(Equal(uint64(8)))
 	g.Expect(legacyResult.ObservedLSN).To(Equal(uint64(15)))
