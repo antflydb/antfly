@@ -767,7 +767,21 @@ func (im *IndexManager) Register(name string, rebuild bool, config indexes.Index
 		return fmt.Errorf("creating index %s: %w", name, err)
 	}
 	if _, loaded := im.indexes.LoadOrStore(name, index); loaded {
-		return fmt.Errorf("index %s already registered", name)
+		err := fmt.Errorf("index %s already registered", name)
+		if closeErr := index.Close(); closeErr != nil {
+			return errors.Join(err, fmt.Errorf("closing duplicate index %s: %w", name, closeErr))
+		}
+		return err
+	}
+
+	im.logger.Info("Opening index at registration", zap.String("name", name))
+	if err := index.Open(rebuild, im.schema, im.byteRange); err != nil {
+		im.indexes.Delete(name)
+		openErr := fmt.Errorf("opening index %s: %w", name, err)
+		if closeErr := index.Close(); closeErr != nil {
+			return errors.Join(openErr, fmt.Errorf("closing failed index %s: %w", name, closeErr))
+		}
+		return openErr
 	}
 	im.enricherMu.Lock()
 	if idx, ok := index.(EnrichableIndex); ok {
@@ -777,11 +791,6 @@ func (im *IndexManager) Register(name string, rebuild bool, config indexes.Index
 	}
 	im.enricherMu.Unlock()
 
-	im.logger.Info("Opening index at registration", zap.String("name", name))
-	if err := index.Open(rebuild, im.schema, im.byteRange); err != nil {
-		im.indexes.Delete(name)
-		return fmt.Errorf("opening index %s: %w", name, err)
-	}
 	im.logger.Info("Registered index", zap.String("name", name))
 	return nil
 }
@@ -998,12 +1007,27 @@ func (im *IndexManager) UnregisterMissing(name string, config indexes.IndexConfi
 	if err != nil {
 		return fmt.Errorf("constructing index %s for deletion: %w", name, err)
 	}
+	closed := false
+	defer func() {
+		if closed {
+			return
+		}
+		if err := index.Close(); err != nil {
+			im.logger.Warn("Failed to close missing index after deletion setup failed",
+				zap.String("name", name),
+				zap.Error(err))
+		}
+	}()
 	// Delete() bounds its enrichment-key scan by the index byte range, which is
 	// normally set during Open(). Supply the shard byte range explicitly so the
 	// cleanup covers the full range.
 	if err := index.UpdateRange(im.byteRange); err != nil {
 		return fmt.Errorf("setting byte range for index %s deletion: %w", name, err)
 	}
+	if err := index.Close(); err != nil {
+		return fmt.Errorf("closing index %s before deletion: %w", name, err)
+	}
+	closed = true
 	if err := index.Delete(); err != nil {
 		return fmt.Errorf("deleting index %s: %w", name, err)
 	}
