@@ -634,6 +634,74 @@ func TestValidateHAReplicationSlotActionResponse(t *testing.T) {
 	}
 }
 
+func TestValidateHASeedActionResponses(t *testing.T) {
+	t.Parallel()
+
+	begin := HABaseBackupBeginResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "base_backup_begin:manifest-a",
+			ActionKind: HAActionKindBaseBackupBegin,
+			Target:     "manifest-a",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		SlotName:       "standby-a",
+		ManifestId:     "manifest-a",
+		BackupLsn:      7,
+		StartRecordLsn: 8,
+	}
+	if err := ValidateHABaseBackupBeginResponse(begin); err != nil {
+		t.Fatalf("ValidateHABaseBackupBeginResponse returned error: %v", err)
+	}
+	begin.StartRecordLsn = 0
+	if err := ValidateHABaseBackupBeginResponse(begin); err == nil || !strings.Contains(err.Error(), "start_record_lsn") {
+		t.Fatalf("missing start_record_lsn error = %v, want start_record_lsn error", err)
+	}
+
+	finish := HABaseBackupFinishResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "base_backup_finish:manifest-a",
+			ActionKind: HAActionKindBaseBackupFinish,
+			Target:     "manifest-a",
+			State:      HAActionStateApplied,
+			NodeId:     "primary-a",
+		},
+		ManifestId:   "manifest-a",
+		BackupLsn:    7,
+		EndRecordLsn: 9,
+	}
+	if err := ValidateHABaseBackupFinishResponse(finish); err != nil {
+		t.Fatalf("ValidateHABaseBackupFinishResponse returned error: %v", err)
+	}
+	finish.EndRecordLsn = 0
+	if err := ValidateHABaseBackupFinishResponse(finish); err == nil || !strings.Contains(err.Error(), "end_record_lsn") {
+		t.Fatalf("missing end_record_lsn error = %v, want end_record_lsn error", err)
+	}
+
+	bootstrap := HAStandbyBootstrapResponse{
+		SchemaVersion: 1,
+		Action: HAActionReceipt{
+			ActionId:   "standby_bootstrap:manifest-a",
+			ActionKind: HAActionKindStandbyBootstrap,
+			Target:     "manifest-a",
+			State:      HAActionStateApplied,
+			NodeId:     "standby-a",
+		},
+		ManifestId:    "manifest-a",
+		BackupLsn:     7,
+		CheckpointLsn: 10,
+	}
+	if err := ValidateHAStandbyBootstrapResponse(bootstrap); err != nil {
+		t.Fatalf("ValidateHAStandbyBootstrapResponse returned error: %v", err)
+	}
+	bootstrap.CheckpointLsn = 0
+	if err := ValidateHAStandbyBootstrapResponse(bootstrap); err == nil || !strings.Contains(err.Error(), "checkpoint_lsn") {
+		t.Fatalf("missing checkpoint_lsn error = %v, want checkpoint_lsn error", err)
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

@@ -306,6 +306,66 @@ func ValidateHAReplicationSlotActionResponse(response HAReplicationSlotActionRes
 	return nil
 }
 
+func ValidateHABaseBackupBeginResponse(response HABaseBackupBeginResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing base backup begin schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing base backup begin action receipt")
+	}
+	if strings.TrimSpace(response.SlotName) == "" {
+		return fmt.Errorf("missing base backup begin slot_name")
+	}
+	if strings.TrimSpace(response.ManifestId) == "" {
+		return fmt.Errorf("missing base backup begin manifest_id")
+	}
+	if response.BackupLsn == 0 {
+		return fmt.Errorf("missing base backup begin backup_lsn")
+	}
+	if response.StartRecordLsn == 0 {
+		return fmt.Errorf("missing base backup begin start_record_lsn")
+	}
+	return nil
+}
+
+func ValidateHABaseBackupFinishResponse(response HABaseBackupFinishResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing base backup finish schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing base backup finish action receipt")
+	}
+	if strings.TrimSpace(response.ManifestId) == "" {
+		return fmt.Errorf("missing base backup finish manifest_id")
+	}
+	if response.BackupLsn == 0 {
+		return fmt.Errorf("missing base backup finish backup_lsn")
+	}
+	if response.EndRecordLsn == 0 {
+		return fmt.Errorf("missing base backup finish end_record_lsn")
+	}
+	return nil
+}
+
+func ValidateHAStandbyBootstrapResponse(response HAStandbyBootstrapResponse) error {
+	if response.SchemaVersion == 0 {
+		return fmt.Errorf("missing standby bootstrap schema_version")
+	}
+	if !HAActionReceiptPresent(response.Action) {
+		return fmt.Errorf("missing standby bootstrap action receipt")
+	}
+	if strings.TrimSpace(response.ManifestId) == "" {
+		return fmt.Errorf("missing standby bootstrap manifest_id")
+	}
+	if response.BackupLsn == 0 {
+		return fmt.Errorf("missing standby bootstrap backup_lsn")
+	}
+	if response.CheckpointLsn == 0 {
+		return fmt.Errorf("missing standby bootstrap checkpoint_lsn")
+	}
+	return nil
+}
+
 func HAActionReceiptPresent(receipt HAActionReceipt) bool {
 	return strings.TrimSpace(receipt.ActionId) != "" &&
 		strings.TrimSpace(string(receipt.ActionKind)) != "" &&
