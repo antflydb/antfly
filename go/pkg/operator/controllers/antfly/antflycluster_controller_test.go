@@ -1337,6 +1337,10 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 		},
 	}
 	failedPauseJob := buildHAAdminJob(cluster, admin, cluster.Status.HAStatus.PlannedActions[0])
+	failedPauseHash := haAdminActionHash(cluster.Status.HAStatus.PlannedActions[0])[:10]
+	g.Expect(failedPauseJob.Annotations).To(HaveKeyWithValue("antfly.io/ha-command-hash", haAdminActionHash(cluster.Status.HAStatus.PlannedActions[0])))
+	g.Expect(failedPauseJob.Labels).To(HaveKeyWithValue("antfly.io/ha-command-hash", failedPauseHash))
+	g.Expect(failedPauseJob.Spec.Template.Labels).To(HaveKeyWithValue("antfly.io/ha-command-hash", failedPauseHash))
 	failedPauseJob.Status.Conditions = []batchv1.JobCondition{{
 		Type:   batchv1.JobFailed,
 		Status: corev1.ConditionTrue,

@@ -5318,6 +5318,7 @@ func haAdminJobTTLSecondsAfterFinished(admin *antflyv1.HAAdminSpec) int32 {
 func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) map[string]string {
 	labels := podLabels(cluster, "ha-admin")
 	labels["antfly.io/ha-action-kind"] = strings.ToLower(action.Kind)
+	labels["antfly.io/ha-command-hash"] = haAdminActionHash(action)[:10]
 	if action.StandbyName != "" {
 		labels["antfly.io/ha-standby"] = action.StandbyName
 	}
