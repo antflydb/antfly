@@ -56,6 +56,48 @@ const v1_encoded = [_]u8{
     0x69, 0x78, 0x74, 0x75, 0x72, 0x65,
 };
 
+const v1_timeline_switch_payload =
+    \\{"old_timeline_id":4,"new_timeline_id":5,"switch_lsn":12}
+;
+
+const v1_timeline_switch_record = replication_record.Record{
+    .kind = .timeline_switch,
+    .payload_codec = .json,
+    .flags = 0x00000002,
+    .cluster_id = 100,
+    .shard_id = 10,
+    .table_id = 20,
+    .timeline_id = 5,
+    .epoch = 7,
+    .lsn = 12,
+    .previous_lsn = 11,
+    .commit_timestamp_ns = 1700000000123456789,
+    .payload = v1_timeline_switch_payload,
+};
+
+const v1_timeline_switch_encoded = [_]u8{
+    0x41, 0x46, 0x48, 0x41, 0x57, 0x41, 0x4c, 0x0a,
+    0x01, 0x00, 0x64, 0x00, 0x20, 0x00, 0x01, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x15, 0xcd, 0x85, 0x3d,
+    0xfe, 0x9c, 0x97, 0x17, 0x39, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xc8, 0x11, 0xac, 0xd4,
+    0x07, 0x58, 0x99, 0x71, 0x7b, 0x22, 0x6f, 0x6c,
+    0x64, 0x5f, 0x74, 0x69, 0x6d, 0x65, 0x6c, 0x69,
+    0x6e, 0x65, 0x5f, 0x69, 0x64, 0x22, 0x3a, 0x34,
+    0x2c, 0x22, 0x6e, 0x65, 0x77, 0x5f, 0x74, 0x69,
+    0x6d, 0x65, 0x6c, 0x69, 0x6e, 0x65, 0x5f, 0x69,
+    0x64, 0x22, 0x3a, 0x35, 0x2c, 0x22, 0x73, 0x77,
+    0x69, 0x74, 0x63, 0x68, 0x5f, 0x6c, 0x73, 0x6e,
+    0x22, 0x3a, 0x31, 0x32, 0x7d,
+};
+
 test "storage.ha compat decodes v1 replication record fixture" {
     const decoded = try replication_record.decode(&v1_encoded);
 
@@ -79,4 +121,32 @@ test "storage.ha compat keeps v1 replication record encoding stable" {
 
     try std.testing.expectEqual(@as(usize, replication_record.header_size + v1_payload.len), encoded.len);
     try std.testing.expectEqualSlices(u8, &v1_encoded, encoded);
+}
+
+test "storage.ha compat decodes v1 timeline switch record fixture" {
+    const decoded = try replication_record.decode(&v1_timeline_switch_encoded);
+
+    try std.testing.expectEqual(v1_timeline_switch_record.kind, decoded.kind);
+    try std.testing.expectEqual(v1_timeline_switch_record.payload_codec, decoded.payload_codec);
+    try std.testing.expectEqual(v1_timeline_switch_record.flags, decoded.flags);
+    try std.testing.expectEqual(v1_timeline_switch_record.cluster_id, decoded.cluster_id);
+    try std.testing.expectEqual(v1_timeline_switch_record.shard_id, decoded.shard_id);
+    try std.testing.expectEqual(v1_timeline_switch_record.table_id, decoded.table_id);
+    try std.testing.expectEqual(v1_timeline_switch_record.timeline_id, decoded.timeline_id);
+    try std.testing.expectEqual(v1_timeline_switch_record.epoch, decoded.epoch);
+    try std.testing.expectEqual(v1_timeline_switch_record.lsn, decoded.lsn);
+    try std.testing.expectEqual(v1_timeline_switch_record.previous_lsn, decoded.previous_lsn);
+    try std.testing.expectEqual(v1_timeline_switch_record.commit_timestamp_ns, decoded.commit_timestamp_ns);
+    try std.testing.expectEqualStrings(v1_timeline_switch_payload, decoded.payload);
+}
+
+test "storage.ha compat keeps v1 timeline switch encoding stable" {
+    const encoded = try replication_record.encodeAlloc(std.testing.allocator, v1_timeline_switch_record);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectEqual(
+        @as(usize, replication_record.header_size + v1_timeline_switch_payload.len),
+        encoded.len,
+    );
+    try std.testing.expectEqualSlices(u8, &v1_timeline_switch_encoded, encoded);
 }
