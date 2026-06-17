@@ -903,13 +903,14 @@ pub const UserManager = struct {
 
     pub fn enableSqlRowSecurity(self: *UserManager, table: []const u8) !void {
         if (table.len == 0) return error.InvalidRowFilter;
+        if (try self.sqlRowSecurityEnabled(table)) return;
         _ = try self.enforcer.addNamedPolicy("p4", &.{table});
     }
 
     pub fn disableSqlRowSecurity(self: *UserManager, table: []const u8) !void {
         if (table.len == 0) return error.InvalidRowFilter;
-        const removed = try self.enforcer.removeFilteredNamedPolicy("p4", 0, &.{table});
-        if (!removed) return error.RowSecurityNotEnabled;
+        if (!(try self.sqlRowSecurityEnabled(table))) return;
+        _ = try self.enforcer.removeFilteredNamedPolicy("p4", 0, &.{table});
     }
 
     pub fn sqlRowSecurityEnabled(self: *const UserManager, table: []const u8) !bool {

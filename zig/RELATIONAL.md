@@ -4475,11 +4475,13 @@ document query execution. Creating a policy stores policy metadata but does not
 make the filter active until `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` marks
 that table as RLS-enabled in the native auth policy store. `DROP POLICY` removes
 the hidden policy subject for that table, while `DROP POLICY IF EXISTS` is an
-idempotent no-op. Unsupported policy expressions, policy replacement, per-role
-`TO ...` policy targeting, and `DISABLE ROW LEVEL SECURITY` still fail closed
-until they have durable native policy state, request-context bindings, and
-planner/executor validation. Storage must not silently accept or ignore
-unsupported SQL RLS declarations.
+idempotent no-op. Unsupported policy expressions, policy replacement, and
+per-role `TO ...` policy targeting still fail closed until they have durable
+native policy state, request-context bindings, and planner/executor validation.
+`ALTER TABLE ... DISABLE ROW LEVEL SECURITY` clears the native table enable bit
+idempotently; stored policies remain catalog metadata but stop contributing
+effective row filters until the table is enabled again. Storage must not
+silently accept or ignore unsupported SQL RLS declarations.
 
 PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 `REVOKE`, and role lifecycle statements lower to typed authorization-catalog

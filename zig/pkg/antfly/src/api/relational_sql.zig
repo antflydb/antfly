@@ -48698,6 +48698,22 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:enable_row_security:table=usage_records", enable_row_security_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, enable_row_security));
 
+    var disable_row_security = try lowerDdlPlanAlloc(alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;");
+    defer disable_row_security.deinit(alloc);
+    const disable_row_security_plan = switch (disable_row_security) {
+        .row_security_catalog => |plan| switch (plan) {
+            .alter_table => |alter_plan| alter_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!disable_row_security_plan.enabled);
+    try std.testing.expectEqualStrings("usage_records", disable_row_security_plan.table_name);
+    const disable_row_security_fingerprint = try ddlFingerprintAlloc(alloc, disable_row_security);
+    defer alloc.free(disable_row_security_fingerprint);
+    try std.testing.expectEqualStrings("ddl:disable_row_security:table=usage_records", disable_row_security_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, disable_row_security));
+
     var create_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));");
     defer create_row_policy.deinit(alloc);
     const create_row_policy_plan = switch (create_row_policy) {
@@ -63413,6 +63429,7 @@ fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, 
         .detach_table_partition,
         => expected == 0,
         .enable_row_security,
+        .disable_row_security,
         .create_row_policy,
         .drop_row_policy,
         .create_update_policy,
@@ -63485,7 +63502,6 @@ fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, 
         .drop_sequence,
         .create_role,
         .drop_role,
-        .disable_row_security,
         .rename_collation,
         .drop_collation,
         => false,
@@ -67196,6 +67212,7 @@ const AppParityCorpusCoverage = struct {
     ddl_partition_attach: bool = false,
     ddl_partition_detach: bool = false,
     ddl_row_security_enable: bool = false,
+    ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
     ddl_row_security_drop_policy: bool = false,
     ddl_database_create: bool = false,
@@ -68490,7 +68507,7 @@ const AppParityCorpusCoverage = struct {
                 .attach_table_partition => self.ddl_partition_attach = true,
                 .detach_table_partition => self.ddl_partition_detach = true,
                 .enable_row_security => self.ddl_row_security_enable = true,
-                .disable_row_security => {},
+                .disable_row_security => self.ddl_row_security_disable = true,
                 .create_row_policy => self.ddl_row_security_create_policy = true,
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
                 .create_database => self.ddl_database_create = true,
@@ -69245,6 +69262,7 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_partition_attach);
         try std.testing.expect(self.ddl_partition_detach);
         try std.testing.expect(self.ddl_row_security_enable);
+        try std.testing.expect(self.ddl_row_security_disable);
         try std.testing.expect(self.ddl_row_security_create_policy);
         try std.testing.expect(self.ddl_row_security_drop_policy);
         try std.testing.expect(self.ddl_database_create);
@@ -75880,6 +75898,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .enable_row_security, .table_name = "usage_records", .operations = 1 },
             .plan = "ddl:enable_row_security:table=usage_records",
             .sql = "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY",
+        },
+        .{
+            .name = "row security disable catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .disable_row_security, .table_name = "usage_records", .operations = 1 },
+            .plan = "ddl:disable_row_security:table=usage_records",
+            .sql = "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY",
         },
         .{
             .name = "row security create policy catalog ddl",
@@ -85904,38 +85929,6 @@ test "postgres sql adapter lowers row_number window query plans" {
         schema,
         &.{},
     ));
-}
-
-test "postgres sql adapter lexer records source spans and dollar quoted literals" {
-    const alloc = std.testing.allocator;
-    const sql = "SELECT $$a $1 body$$ AS body, $tag$quoted 'text'$tag$ AS tagged FROM users WHERE id = $1";
-
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
-
-    try std.testing.expect(tokens.items.len > 0);
-    try std.testing.expectEqual(TokenKind.identifier, tokens.items[0].kind);
-    try std.testing.expectEqualStrings("SELECT", tokens.items[0].text);
-    try std.testing.expectEqualStrings("SELECT", sql[tokens.items[0].source_start..tokens.items[0].source_end]);
-
-    try std.testing.expectEqual(TokenKind.string, tokens.items[1].kind);
-    try std.testing.expectEqualStrings("a $1 body", tokens.items[1].text);
-    try std.testing.expectEqualStrings("$$a $1 body$$", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
-    try std.testing.expect(!tokens.items[1].owned);
-
-    try std.testing.expectEqual(TokenKind.string, tokens.items[5].kind);
-    try std.testing.expectEqualStrings("quoted 'text'", tokens.items[5].text);
-    try std.testing.expectEqualStrings("$tag$quoted 'text'$tag$", sql[tokens.items[5].source_start..tokens.items[5].source_end]);
-    try std.testing.expect(!tokens.items[5].owned);
-
-    try std.testing.expectEqual(TokenKind.placeholder, tokens.items[tokens.items.len - 1].kind);
-    try std.testing.expectEqualStrings("$1", tokens.items[tokens.items.len - 1].text);
-    try std.testing.expectEqualStrings("$1", sql[tokens.items[tokens.items.len - 1].source_start..tokens.items[tokens.items.len - 1].source_end]);
-}
-
-test "postgres sql adapter lexer rejects unterminated dollar quoted literals" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT $tag$unterminated"));
 }
 
 test "postgres sql adapter rejects unsupported application shapes explicitly" {

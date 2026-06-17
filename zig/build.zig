@@ -3752,6 +3752,7 @@ pub fn build(b: *std.Build) void {
             "sql auth adapter creates roles and applies table grants through user manager",
             "sql auth adapter grants directly to existing antfly users",
             "sql auth adapter applies row security policies through user manager",
+            "sql row security policies are inert until row security is enabled",
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "api http server serves mcp and a2a protocol surfaces",

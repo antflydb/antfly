@@ -401,3 +401,35 @@ fn sqlStringIsJsonNumber(alloc: std.mem.Allocator, text: []const u8) bool {
     defer parsed.deinit();
     return parsed.value == .integer or parsed.value == .float;
 }
+
+test "sql adapter lexer records source spans and dollar quoted literals" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT $$a $1 body$$ AS body, $tag$quoted 'text'$tag$ AS tagged FROM users WHERE id = $1";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expect(tokens.items.len > 0);
+    try std.testing.expectEqual(TokenKind.identifier, tokens.items[0].kind);
+    try std.testing.expectEqualStrings("SELECT", tokens.items[0].text);
+    try std.testing.expectEqualStrings("SELECT", sql[tokens.items[0].source_start..tokens.items[0].source_end]);
+
+    try std.testing.expectEqual(TokenKind.string, tokens.items[1].kind);
+    try std.testing.expectEqualStrings("a $1 body", tokens.items[1].text);
+    try std.testing.expectEqualStrings("$$a $1 body$$", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
+    try std.testing.expect(!tokens.items[1].owned);
+
+    try std.testing.expectEqual(TokenKind.string, tokens.items[5].kind);
+    try std.testing.expectEqualStrings("quoted 'text'", tokens.items[5].text);
+    try std.testing.expectEqualStrings("$tag$quoted 'text'$tag$", sql[tokens.items[5].source_start..tokens.items[5].source_end]);
+    try std.testing.expect(!tokens.items[5].owned);
+
+    try std.testing.expectEqual(TokenKind.placeholder, tokens.items[tokens.items.len - 1].kind);
+    try std.testing.expectEqualStrings("$1", tokens.items[tokens.items.len - 1].text);
+    try std.testing.expectEqualStrings("$1", sql[tokens.items[tokens.items.len - 1].source_start..tokens.items[tokens.items.len - 1].source_end]);
+}
+
+test "sql adapter lexer rejects unterminated dollar quoted literals" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT $tag$unterminated"));
+}

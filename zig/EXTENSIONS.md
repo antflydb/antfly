@@ -256,13 +256,16 @@ membership edits, and multi-extension drop lists should fail closed until they
 have native lifecycle semantics.
 
 Use the SQL extension name as the installed extension name. Resolve the package
-name separately. Resolution should first consult a compatibility alias map for
-PostgreSQL names that do not match Antfly package names; otherwise the package
-name defaults to the SQL extension name. SQL `VERSION` maps to
-`InstallExtensionRequest.version`, while omitted version means "latest package
-version already present in the package catalog". SQL should not accept an
-arbitrary package digest in v1. Digest trust comes from the pre-registered
-package manifest and hosted package store policy, not from user SQL text.
+name separately from the registered package catalog. Resolution first matches
+the package name, then manifest-declared `sql_names` aliases for PostgreSQL
+names that do not match Antfly package names, such as `"uuid-ossp"` resolving to
+package `uuid_ossp`. If more than one package name declares the same SQL alias,
+the SQL DDL fails as ambiguous. SQL `VERSION` maps to
+`InstallExtensionRequest.version`; when omitted, lifecycle resolution chooses
+the latest package version already present in the package catalog. SQL should
+not accept an arbitrary package digest in v1. Digest trust comes from the
+pre-registered package manifest and hosted package store policy, not from user
+SQL text.
 
 `IF EXISTS` and `IF NOT EXISTS` need strict, unsurprising semantics:
 

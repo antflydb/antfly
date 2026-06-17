@@ -275,6 +275,23 @@ test "sql extension adapter resolves package from manifest sql name" {
     try std.testing.expect(service.saw_uuid_ossp_package);
 }
 
+test "sql extension adapter rejects ambiguous manifest sql names" {
+    const alloc = std.testing.allocator;
+    const other_uuid_package = extension_domain.PackageManifest{
+        .name = "other_uuid",
+        .version = "1.0.0",
+        .digest = "sha256:other-uuid",
+        .sql_names = &.{"uuid-ossp"},
+        .install = .{ .scopes_supported = &.{.cluster} },
+    };
+    var service = TestService{ .packages = &.{ test_uuid_ossp_package, other_uuid_package } };
+
+    try std.testing.expectError(
+        error.AmbiguousExtensionSqlName,
+        executeRelationalSqlDdlOnService(&service, alloc, "CREATE EXTENSION \"uuid-ossp\" VERSION '1.0.0';"),
+    );
+}
+
 test "sql extension adapter treats matching create if not exists as no-op" {
     const alloc = std.testing.allocator;
     var service = TestService{

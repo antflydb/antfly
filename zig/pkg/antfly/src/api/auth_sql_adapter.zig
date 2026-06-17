@@ -139,8 +139,13 @@ fn executeAlterRowSecurity(
     alloc: std.mem.Allocator,
     plan: relational_sql.AlterRowSecurityPlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    if (!plan.enabled) return error.UnsupportedSqlShape;
-    try manager.enableSqlRowSecurity(plan.table_name);
+    if (plan.enabled) {
+        if (try manager.sqlRowSecurityEnabled(plan.table_name)) return try noopRecordAlloc(alloc);
+        try manager.enableSqlRowSecurity(plan.table_name);
+    } else {
+        if (!(try manager.sqlRowSecurityEnabled(plan.table_name))) return try noopRecordAlloc(alloc);
+        try manager.disableSqlRowSecurity(plan.table_name);
+    }
     return try changedRecordAlloc(alloc);
 }
 
@@ -511,7 +516,19 @@ test "sql auth adapter applies row security policies through user manager" {
     try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"$auth\":\"metadata.tenant_id\"") != null);
 
     try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;"));
+    var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
+    defer disabled.deinit(alloc);
+    try std.testing.expect(!disabled.noop);
+    try std.testing.expect(!(try manager.sqlRowSecurityEnabled("usage_records")));
+    const filters_after_disable = try manager.getRowFilters("alice");
+    defer {
+        for (filters_after_disable) |*entry| entry.deinit(alloc);
+        alloc.free(filters_after_disable);
+    }
+    try std.testing.expectEqual(@as(usize, 0), filters_after_disable.len);
+    var disabled_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
+    defer disabled_again.deinit(alloc);
+    try std.testing.expect(disabled_again.noop);
 
     var dropped = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;")).?;
     defer dropped.deinit(alloc);
@@ -548,8 +565,15 @@ test "sql row security policies are inert until row security is enabled" {
     }
     try std.testing.expectEqual(@as(usize, 0), filters_before_enable.len);
 
+    var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
+    defer disabled.deinit(alloc);
+    try std.testing.expect(!(try manager.sqlRowSecurityEnabled("usage_records")));
+
     var enabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
     defer enabled.deinit(alloc);
+    var enabled_again = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;")).?;
+    defer enabled_again.deinit(alloc);
+    try std.testing.expect(enabled_again.noop);
     const filters_after_enable = try manager.getRowFilters("alice");
     defer {
         for (filters_after_enable) |*entry| entry.deinit(alloc);
