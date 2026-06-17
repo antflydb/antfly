@@ -940,6 +940,14 @@ func (tx *Transaction) Read(ctx context.Context, table, key string) (map[string]
 // Returns a TransactionCommitResult with status "committed" or "aborted".
 // An error is returned only for transport/server failures, not for version conflicts.
 func (tx *Transaction) Commit(ctx context.Context, writes map[string]BatchRequest) (*TransactionCommitResult, error) {
+	return tx.CommitWithOptions(ctx, writes, WriteOptions{})
+}
+
+// CommitWithOptions submits the transaction's read set and writes with request
+// and response size bounds.
+func (tx *Transaction) CommitWithOptions(ctx context.Context, writes map[string]BatchRequest, opts WriteOptions) (*TransactionCommitResult, error) {
+	opts = normalizeWriteOptions(opts)
+
 	// Convert SDK BatchRequest to oapi types
 	oapiTables := make(map[string]oapi.BatchRequest, len(writes))
 	for tableName, br := range writes {
@@ -977,16 +985,23 @@ func (tx *Transaction) Commit(ctx context.Context, writes map[string]BatchReques
 		ReadSet: tx.readSet,
 		Tables:  oapiTables,
 	}
+	reqBodyReader, err := boundedJSONBody(reqBody, opts.MaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling commit transaction request: %w", err)
+	}
 
-	resp, err := tx.client.client.CommitTransaction(ctx, reqBody)
+	resp, err := tx.client.client.CommitTransactionWithBody(ctx, "application/json", reqBodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("commit transaction failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, truncated, err := readLimitedBody(resp.Body, opts.MaxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("commit transaction response exceeded %d bytes", opts.MaxResponseBytes)
 	}
 
 	// Both 200 (committed) and 409 (conflict/aborted) return TransactionCommitResponse

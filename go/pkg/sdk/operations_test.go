@@ -486,3 +486,34 @@ func TestLinearMergeRequestSizerMatchesEncodedSize(t *testing.T) {
 		t.Fatalf("estimated size = %d, want encoded size %d", got, want)
 	}
 }
+
+func TestTransactionCommitUsesWriteOptions(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"committed"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	tx := client.NewTransaction()
+	_, err = tx.CommitWithOptions(context.Background(), map[string]BatchRequest{
+		"files": {
+			Inserts: map[string]any{"doc-1": map[string]any{"title": strings.Repeat("x", 128)}},
+		},
+	}, WriteOptions{
+		MaxRequestBytes:  64,
+		MaxResponseBytes: 1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "encoded request exceeded 64 bytes") {
+		t.Fatalf("CommitWithOptions error = %v, want request limit error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want no request sent after local request limit failure", requests)
+	}
+}

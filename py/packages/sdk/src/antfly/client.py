@@ -9,9 +9,6 @@ from httpx import Timeout
 
 from antfly.client_generated import Client
 from antfly.client_generated.api.data_operations import (
-    batch_write as batch,
-)
-from antfly.client_generated.api.data_operations import (
     lookup_key,
 )
 from antfly.client_generated.client import AuthenticatedClient
@@ -128,15 +125,16 @@ class AntflyClient:
             return None
         return response.json()
 
-    def _check_write_request_size(self, operation: str, body: dict[str, Any]) -> None:
+    def _encode_write_request(self, operation: str, body: dict[str, Any]) -> bytes:
+        encoded = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         if self.max_write_request_bytes <= 0:
-            return
-        encoded = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+            return encoded
         if len(encoded) > self.max_write_request_bytes:
             raise AntflyException(
                 f"{operation} request encoded to {len(encoded)} bytes, exceeding max write request size "
                 f"{self.max_write_request_bytes}"
             )
+        return encoded
 
     # Table operations
 
@@ -261,15 +259,11 @@ class AntflyClient:
         """
         batch_inserts = BatchRequestInserts.from_dict(inserts) if inserts is not None else UNSET
         request = BatchRequest(inserts=batch_inserts, deletes=deletes or [])
-        self._check_write_request_size("Batch", request.to_dict())
+        encoded = self._encode_write_request("Batch", request.to_dict())
 
-        response = batch.sync(
-            table_name=table,
-            client=cast(AuthenticatedClient, self._client),
-            body=request,
+        self._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/batch",
+            content=encoded,
+            headers={"Content-Type": "application/json"},
         )
-
-        if isinstance(response, Error):
-            raise AntflyException(f"Batch operation failed for table '{table}': {response.error}")
-        if response is None:
-            raise AntflyException(f"Batch operation failed for table '{table}'")

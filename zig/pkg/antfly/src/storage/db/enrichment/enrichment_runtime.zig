@@ -2865,6 +2865,14 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 
     fn onBegin(_: *anyopaque, _: document_extraction_mod.StreamInfo) anyerror!void {}
 
+    fn accountWorkingSet(self: *@This(), unit_bytes: usize, generated_cache_bytes: usize) !void {
+        if (self.mode == .store_artifacts) {
+            try self.resource_tracker.updateWorkingSet(unit_bytes, generated_cache_bytes, self.writes.items, self.window);
+        } else {
+            self.resource_tracker.observeWorkingSet(unit_bytes, generated_cache_bytes, self.writes.items, self.window);
+        }
+    }
+
     fn onUnit(ptr: *anyopaque, unit: *document_extraction_mod.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (runtimeGeneratedTextNeeded(self.config, unit.*)) {
@@ -2873,11 +2881,7 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
         }
         const unit_working_bytes = runtimeDocumentExtractionUnitOwnedBytes(unit.*);
         const generated_cache_bytes = self.generated_units.bytes;
-        if (self.mode == .store_artifacts) {
-            try self.resource_tracker.updateWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
-        } else {
-            self.resource_tracker.observeWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
-        }
+        try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
         const unit_key = self.desired_unit_keys[self.unit_index];
         const unit_range_id = try documentExtractionRangeIdAlloc(self.runtime.alloc, documentExtractionUnitRangeIndexFromTextLengths(self.unit_text_lengths, self.unit_index));
@@ -2917,24 +2921,18 @@ const RuntimeDocumentExtractionMaterializeContext = struct {
 
         try appendRuntimeDocumentUnitChunkWrites(self.runtime, self.doc_key, self.artifact_name, unit_key, unit.*, self.desired_chunk_keys, self.chunk_range_base_index, self.previous_child_ranges, self.writes, self.window, self.mode);
         self.unit_index += 1;
-        if (self.mode == .store_artifacts) {
-            try self.resource_tracker.updateWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
-        } else {
-            self.resource_tracker.observeWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
-        }
+        try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
 
         if (self.mode == .store_artifacts and (self.writes.items.len >= runtime_document_extraction_flush_write_count or
             runtimeDocumentExtractionWriteBytes(self.writes.items) >= runtime_document_extraction_flush_write_bytes))
         {
             try flushRuntimeKVBatchAndClear(self.runtime, self.writes, self.deletes);
-            try self.resource_tracker.updateWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
+            try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
         }
         if (self.mode == .publish_replay) {
             try flushGeneratedReplayWindowIfNeeded(self.runtime, self.window, self.max_window_items);
-            self.resource_tracker.observeWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
-        } else {
-            try self.resource_tracker.updateWorkingSet(unit_working_bytes, generated_cache_bytes, self.writes.items, self.window);
         }
+        try self.accountWorkingSet(unit_working_bytes, generated_cache_bytes);
     }
 
     fn onEnd(_: *anyopaque) anyerror!void {}
