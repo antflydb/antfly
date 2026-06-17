@@ -4058,7 +4058,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 			g.Expect(query.Get("sync_required")).To(Equal("1"))
 			g.Expect(query["sync_standby"]).To(Equal([]string{"standby-a"}))
 			g.Expect(query.Get("sync_failure")).To(Equal("fail-closed"))
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply"}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"would_block","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":11,"missing_lsn_count":1,"satisfied_count":0,"required_count":1,"candidate_count":1}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -4101,6 +4101,13 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(standby.AppliedLSN).To(Equal(uint64(11)))
 	g.Expect(standby.ApplyLagLSN).To(Equal(uint64(1)))
 	g.Expect(standby.Status).To(Equal("healthy"))
+	g.Expect(cluster.Status.HAStatus.Sync.Mode).To(Equal(antflyv1.HADurabilityModeRemoteApply))
+	g.Expect(cluster.Status.HAStatus.Sync.Selection).To(Equal(antflyv1.HAStandbySelectionFirst))
+	g.Expect(cluster.Status.HAStatus.Sync.Required).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.Sync.Satisfied).To(Equal(int32(0)))
+	g.Expect(cluster.Status.HAStatus.Sync.Candidates).To(Equal(int32(1)))
+	g.Expect(cluster.Status.HAStatus.Sync.Degraded).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.Sync.Action).To(Equal("BlockWrites"))
 
 	reconciler.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("primary admin refused connection")

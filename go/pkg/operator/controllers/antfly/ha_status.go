@@ -1791,6 +1791,9 @@ func haEvaluateSyncPolicy(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HA
 	if evaluation.Required == 0 {
 		evaluation.Required = 1
 	}
+	if observed, ok := haObservedAdminSyncStatus(policy, status); ok {
+		return observed
+	}
 	if status == nil {
 		evaluation.Degraded = true
 		evaluation.Action = haSyncFailureAction(evaluation.FailurePolicy)
@@ -1847,6 +1850,51 @@ func haEvaluateSyncPolicy(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HA
 		evaluation.Action = haSyncFailureAction(evaluation.FailurePolicy)
 	}
 	return evaluation
+}
+
+func haObservedAdminSyncStatus(policy *antflyv1.HASyncPolicy, status *antflyv1.HAStatus) (haSyncEvaluation, bool) {
+	if policy == nil || status == nil || !status.PrimaryAdminReachable || status.Sync.Mode == "" {
+		return haSyncEvaluation{}, false
+	}
+	if status.Sync.Mode != policy.Mode {
+		return haSyncEvaluation{}, false
+	}
+	selection := policy.Selection
+	if selection == "" {
+		selection = antflyv1.HAStandbySelectionAny
+	}
+	if status.Sync.Selection != "" && status.Sync.Selection != selection {
+		return haSyncEvaluation{}, false
+	}
+	failurePolicy := policy.FailurePolicy
+	if failurePolicy == "" {
+		failurePolicy = antflyv1.HAFailurePolicyBlock
+	}
+	required := policy.Required
+	if required == 0 {
+		required = 1
+	}
+	if status.Sync.Required > 0 {
+		required = status.Sync.Required
+	}
+	action := status.Sync.Action
+	if action == "" {
+		if status.Sync.Degraded {
+			action = haSyncFailureAction(failurePolicy)
+		} else {
+			action = "Satisfied"
+		}
+	}
+	return haSyncEvaluation{
+		Mode:          status.Sync.Mode,
+		Selection:     selection,
+		Required:      required,
+		Satisfied:     status.Sync.Satisfied,
+		Candidates:    status.Sync.Candidates,
+		FailurePolicy: failurePolicy,
+		Degraded:      status.Sync.Degraded,
+		Action:        action,
+	}, true
 }
 
 func haSyncFailureAction(policy antflyv1.HAFailurePolicy) string {

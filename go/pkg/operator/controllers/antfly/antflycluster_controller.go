@@ -5410,6 +5410,11 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
 	cluster.Status.HAStatus.Retention = status.Retention
 	cluster.Status.HAStatus.Standbys = status.Standbys
+	if status.Sync != nil {
+		cluster.Status.HAStatus.Sync = *status.Sync
+	} else {
+		cluster.Status.HAStatus.Sync = antflyv1.HASyncStatus{}
+	}
 	return nil
 }
 
@@ -5609,6 +5614,7 @@ type haObservedPrimaryStatus struct {
 	PrimaryLSN uint64
 	Retention  antflyv1.HARetentionStatus
 	Standbys   []antflyv1.HAStandbyStatus
+	Sync       *antflyv1.HASyncStatus
 }
 
 type haAdminStatusJSON struct {
@@ -5634,7 +5640,8 @@ type haPrimaryStatusJSON struct {
 		ActiveSlots       int32  `json:"active_slots"`
 		ReseedRecommended int32  `json:"reseed_recommended"`
 	} `json:"retention"`
-	Slots []struct {
+	Durability *haDurabilityStatusJSON `json:"durability,omitempty"`
+	Slots      []struct {
 		Name            string `json:"name"`
 		TimelineID      uint64 `json:"timeline_id"`
 		Active          bool   `json:"active"`
@@ -5650,6 +5657,16 @@ type haPrimaryStatusJSON struct {
 		Status          string `json:"status"`
 		LastError       string `json:"last_error"`
 	} `json:"slots"`
+}
+
+type haDurabilityStatusJSON struct {
+	Status          string `json:"status"`
+	Mode            string `json:"mode"`
+	Selection       string `json:"selection"`
+	SatisfiedCount  int32  `json:"satisfied_count"`
+	RequiredCount   int32  `json:"required_count"`
+	CandidateCount  int32  `json:"candidate_count"`
+	MissingLSNCount uint64 `json:"missing_lsn_count"`
 }
 
 type haStandbyStatusJSON struct {
@@ -5717,7 +5734,72 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 			LastError:      strings.TrimSpace(slot.LastError),
 		})
 	}
+	if snapshot.Durability != nil {
+		status.Sync = haSyncStatusFromAdminDurability(*snapshot.Durability)
+	}
 	return status, nil
+}
+
+func haSyncStatusFromAdminDurability(durability haDurabilityStatusJSON) *antflyv1.HASyncStatus {
+	mode := haDurabilityModeFromAdmin(strings.TrimSpace(durability.Mode))
+	if mode == "" {
+		mode = antflyv1.HADurabilityModeAsync
+	}
+	selection := haStandbySelectionFromAdmin(strings.TrimSpace(durability.Selection))
+	if selection == "" {
+		selection = antflyv1.HAStandbySelectionAny
+	}
+	degraded, action := haSyncActionFromAdminDurabilityStatus(strings.TrimSpace(durability.Status))
+	return &antflyv1.HASyncStatus{
+		Mode:       mode,
+		Selection:  selection,
+		Required:   durability.RequiredCount,
+		Satisfied:  durability.SatisfiedCount,
+		Candidates: durability.CandidateCount,
+		Degraded:   degraded,
+		Action:     action,
+	}
+}
+
+func haDurabilityModeFromAdmin(raw string) antflyv1.HADurabilityMode {
+	switch raw {
+	case "remote_write", "remote-write":
+		return antflyv1.HADurabilityModeRemoteWrite
+	case "remote_apply", "remote-apply":
+		return antflyv1.HADurabilityModeRemoteApply
+	case "async":
+		return antflyv1.HADurabilityModeAsync
+	default:
+		return ""
+	}
+}
+
+func haStandbySelectionFromAdmin(raw string) antflyv1.HAStandbySelection {
+	switch raw {
+	case "first":
+		return antflyv1.HAStandbySelectionFirst
+	case "all":
+		return antflyv1.HAStandbySelectionAll
+	case "any":
+		return antflyv1.HAStandbySelectionAny
+	default:
+		return ""
+	}
+}
+
+func haSyncActionFromAdminDurabilityStatus(raw string) (bool, string) {
+	switch raw {
+	case "satisfied":
+		return false, "Satisfied"
+	case "degraded_to_async":
+		return true, "DegradeToAsync"
+	case "fail_closed":
+		return true, "RejectWrites"
+	case "would_block":
+		return true, "BlockWrites"
+	default:
+		return true, "Unknown"
+	}
 }
 
 func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {

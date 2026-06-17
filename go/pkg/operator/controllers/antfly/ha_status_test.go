@@ -1836,6 +1836,73 @@ func TestUpdateHAStatusRespectsSyncPolicySelectionSemantics(t *testing.T) {
 	}
 }
 
+func TestUpdateHAStatusPrefersReachableAdminDurabilityDecision(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
+		{Name: "standby-a"},
+	}
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:          antflyv1.HADurabilityModeRemoteApply,
+		Selection:     antflyv1.HAStandbySelectionFirst,
+		Required:      1,
+		StandbyNames:  []string{"standby-a"},
+		FailurePolicy: antflyv1.HAFailurePolicyFailClosed,
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN:            10,
+		PrimaryAdminReachable: true,
+		PrimaryAdminLastError: "",
+		Sync: antflyv1.HASyncStatus{
+			Mode:       antflyv1.HADurabilityModeRemoteApply,
+			Selection:  antflyv1.HAStandbySelectionFirst,
+			Required:   1,
+			Satisfied:  0,
+			Candidates: 1,
+			Degraded:   true,
+			Action:     "RejectWrites",
+		},
+		Standbys: []antflyv1.HAStandbyStatus{{
+			Name:              "standby-a",
+			SlotName:          "standby-a",
+			Active:            true,
+			ReceivedLSN:       10,
+			AppliedLSN:        10,
+			SafeReadLSN:       10,
+			ApplyLagLSN:       0,
+			SafeReadLagLSN:    0,
+			CanServeSafeReads: true,
+			Status:            "healthy",
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != antflyv1.ReasonHASyncPolicyUnsatisfied {
+		t.Fatalf("expected reachable primary admin durability to mark sync degraded, got %#v", degraded)
+	}
+	if cluster.Status.HAStatus.Sync.Mode != antflyv1.HADurabilityModeRemoteApply ||
+		cluster.Status.HAStatus.Sync.Selection != antflyv1.HAStandbySelectionFirst ||
+		cluster.Status.HAStatus.Sync.Required != 1 ||
+		cluster.Status.HAStatus.Sync.Satisfied != 0 ||
+		cluster.Status.HAStatus.Sync.Candidates != 1 ||
+		cluster.Status.HAStatus.Sync.FailurePolicy != antflyv1.HAFailurePolicyFailClosed ||
+		!cluster.Status.HAStatus.Sync.Degraded ||
+		cluster.Status.HAStatus.Sync.Action != "RejectWrites" {
+		t.Fatalf("unexpected admin-derived sync status: %#v", cluster.Status.HAStatus.Sync)
+	}
+
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "connection refused"
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Reason != antflyv1.ReasonHAPrimaryAdminUnavailable {
+		t.Fatalf("expected unreachable primary admin to stop trusting stale admin sync evidence, got %#v", degraded)
+	}
+}
+
 func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
