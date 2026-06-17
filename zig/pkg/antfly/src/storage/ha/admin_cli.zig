@@ -152,6 +152,8 @@ pub const Command = union(enum) {
     promote_current_fence,
     promote: admin.FencedPromotionRequest,
     rejoin_assess: RejoinAssessCommand,
+    rejoin_rewind: RejoinAssessCommand,
+    rejoin_reseed: RejoinAssessCommand,
     operator_plan: OperatorPlanCommand,
 };
 
@@ -275,7 +277,7 @@ pub fn parse(alloc: Allocator, argv: []const []const u8) !Plan {
         return plan;
     }
     if (std.mem.eql(u8, root, "rejoin")) {
-        plan.command = .{ .rejoin_assess = try parseRejoin(&cursor) };
+        plan.command = try parseRejoin(&cursor);
         try cursor.expectEnd();
         return plan;
     }
@@ -1080,9 +1082,16 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
     };
 }
 
-fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
+fn parseRejoin(cursor: *Cursor) !Command {
     const subcommand = cursor.next() orelse return error.RejoinSubcommandMissing;
-    if (!std.mem.eql(u8, subcommand, "assess")) return error.UnknownRejoinSubcommand;
+    const action: enum { assess, rewind, reseed } = if (std.mem.eql(u8, subcommand, "assess"))
+        .assess
+    else if (std.mem.eql(u8, subcommand, "rewind"))
+        .rewind
+    else if (std.mem.eql(u8, subcommand, "reseed"))
+        .reseed
+    else
+        return error.UnknownRejoinSubcommand;
 
     var identity = standby_mod.Identity{
         .cluster_id = 0,
@@ -1222,7 +1231,7 @@ fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
         .reason = fence_reason,
     } else null;
 
-    return .{
+    const command = RejoinAssessCommand{
         .former = .{
             .node_id = node_id orelse return error.NodeIdMissing,
             .identity = identity,
@@ -1230,6 +1239,12 @@ fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
         },
         .receipt = receipt,
         .policy = policy,
+    };
+
+    return switch (action) {
+        .assess => .{ .rejoin_assess = command },
+        .rewind => .{ .rejoin_rewind = command },
+        .reseed => .{ .rejoin_reseed = command },
     };
 }
 
@@ -1883,6 +1898,56 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
     try std.testing.expectEqual(@as(u64, 2), receipt.generation);
     try std.testing.expect(receipt.forced);
     try std.testing.expectEqualStrings("operator-approved", receipt.reason);
+
+    var rewind = try parse(alloc, &.{
+        "rejoin",                     "rewind",
+        "--node-id",                  "primary-a",
+        "--cluster-id",               "1",
+        "--shard-id",                 "0",
+        "--table-id",                 "0",
+        "--timeline-id",              "4",
+        "--epoch",                    "5",
+        "--last-lsn",                 "12",
+        "--retained-from-lsn",        "8",
+        "--fence-old-primary-id",     "primary-a",
+        "--fence-promoted-node-id",   "standby-b",
+        "--fence-parent-timeline-id", "4",
+        "--fence-parent-epoch",       "5",
+        "--fence-new-timeline-id",    "6",
+        "--fence-new-epoch",          "7",
+        "--fence-required-lsn",       "10",
+        "--fence-observed-lsn",       "10",
+        "--fence-generation",         "2",
+        "--fence-token",              "token",
+    });
+    defer rewind.deinit(alloc);
+    try std.testing.expectEqualStrings("primary-a", rewind.command.rejoin_rewind.former.node_id);
+    try std.testing.expectEqual(@as(u64, 8), rewind.command.rejoin_rewind.policy.retained_from_lsn);
+
+    var reseed = try parse(alloc, &.{
+        "rejoin",                     "reseed",
+        "--node-id",                  "primary-a",
+        "--cluster-id",               "1",
+        "--shard-id",                 "0",
+        "--table-id",                 "0",
+        "--timeline-id",              "4",
+        "--epoch",                    "5",
+        "--last-lsn",                 "12",
+        "--retained-from-lsn",        "11",
+        "--fence-old-primary-id",     "primary-a",
+        "--fence-promoted-node-id",   "standby-b",
+        "--fence-parent-timeline-id", "4",
+        "--fence-parent-epoch",       "5",
+        "--fence-new-timeline-id",    "6",
+        "--fence-new-epoch",          "7",
+        "--fence-required-lsn",       "10",
+        "--fence-observed-lsn",       "10",
+        "--fence-generation",         "2",
+        "--fence-token",              "token",
+    });
+    defer reseed.deinit(alloc);
+    try std.testing.expectEqualStrings("primary-a", reseed.command.rejoin_reseed.former.node_id);
+    try std.testing.expectEqual(@as(u64, 11), reseed.command.rejoin_reseed.policy.retained_from_lsn);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

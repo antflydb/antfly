@@ -28,6 +28,7 @@ const LocalOptions = struct {
     standby_log: ?[]const u8 = null,
     standby_progress: ?[]const u8 = null,
     fence_wal: ?[]const u8 = null,
+    former_primary_log: ?[]const u8 = null,
     identity: IdentityOptions = .{},
 
     fn wantsPrimary(self: LocalOptions) bool {
@@ -111,7 +112,9 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
     if (parsed.command_args.len == 0) return error.HaCommandMissing;
 
     if (parsed.options.remote_url) |remote_url| {
-        if (parsed.options.wantsPrimary() or parsed.options.wantsStandby() or parsed.options.fence_wal != null) {
+        if (parsed.options.wantsPrimary() or parsed.options.wantsStandby() or
+            parsed.options.fence_wal != null or parsed.options.former_primary_log != null)
+        {
             return error.HaRemoteCannotUseLocalHandles;
         }
         var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{});
@@ -131,6 +134,9 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
 
     var fence_store: ?ha.fencing.Store = null;
     defer if (fence_store) |*handle| handle.close();
+
+    var former_primary_log: ?ha.replication_log.ReplicationLog = null;
+    defer if (former_primary_log) |*handle| handle.close();
 
     if (parsed.options.wantsPrimary()) {
         const identity = try parsed.options.primaryIdentity();
@@ -165,11 +171,17 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
         defer alloc.free(fence_wal);
         fence_store = try ha.fencing.Store.open(alloc, fence_wal.ptr, .{});
     }
+    if (parsed.options.former_primary_log) |path| {
+        const former_log_path = try zPath(alloc, path);
+        defer alloc.free(former_log_path);
+        former_primary_log = try ha.replication_log.ReplicationLog.open(former_log_path.ptr, .{});
+    }
 
     var rendered = try ha.admin_exec.executeAndRenderAlloc(alloc, .{
         .primary = if (primary) |*handle| handle else null,
         .standby = if (standby) |*handle| handle else null,
         .fence_store = if (fence_store) |*handle| handle else null,
+        .former_primary_log = if (former_primary_log) |*handle| handle else null,
     }, plan);
     defer rendered.deinit(alloc);
 
@@ -383,14 +395,19 @@ fn executeTypedRemote(
             return true;
         },
         .rejoin_assess => |command| {
-            var out = try client.assessRejoin(remote_url, .{
-                .node_id = command.former.node_id,
-                .identity = try adminIdentity(command.former.identity),
-                .last_lsn = try i64FromU64(command.former.last_lsn),
-                .retained_from_lsn = try i64FromU64(command.policy.retained_from_lsn),
-                .allow_rewind_after_forced_promotion = command.policy.allow_rewind_after_forced_promotion,
-                .receipt = if (command.receipt) |receipt| try fenceReceiptOpenApi(receipt) else null,
-            });
+            var out = try client.assessRejoin(remote_url, try rejoinRequestOpenApi(command));
+            defer out.deinit(alloc);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            return true;
+        },
+        .rejoin_rewind => |command| {
+            var out = try client.rewindRejoin(remote_url, try rejoinRequestOpenApi(command));
+            defer out.deinit(alloc);
+            try writeTypedRemoteBody(alloc, io, plan.output, out.body);
+            return true;
+        },
+        .rejoin_reseed => |command| {
+            var out = try client.reseedRejoin(remote_url, try rejoinRequestOpenApi(command));
             defer out.deinit(alloc);
             try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             return true;
@@ -550,6 +567,17 @@ fn fenceReceiptOpenApi(receipt: ha.fencing.Receipt) !admin_api.openapi.HAFenceRe
     };
 }
 
+fn rejoinRequestOpenApi(command: ha.admin_cli.RejoinAssessCommand) !admin_api.openapi.RejoinAssessRequest {
+    return .{
+        .node_id = command.former.node_id,
+        .identity = try adminIdentity(command.former.identity),
+        .last_lsn = try i64FromU64(command.former.last_lsn),
+        .retained_from_lsn = try i64FromU64(command.policy.retained_from_lsn),
+        .allow_rewind_after_forced_promotion = command.policy.allow_rewind_after_forced_promotion,
+        .receipt = if (command.receipt) |receipt| try fenceReceiptOpenApi(receipt) else null,
+    };
+}
+
 fn recordKindName(kind: ha.replication_record.RecordKind) ![]const u8 {
     return switch (kind) {
         .batch_mutation => "batch_mutation",
@@ -610,6 +638,9 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
         } else if (std.mem.eql(u8, arg, "--fence-wal")) {
             command_start += 1;
             options.fence_wal = try value(argv, &command_start, "--fence-wal");
+        } else if (std.mem.eql(u8, arg, "--former-primary-log")) {
+            command_start += 1;
+            options.former_primary_log = try value(argv, &command_start, "--former-primary-log");
         } else if (std.mem.eql(u8, arg, "--ha-cluster-id")) {
             command_start += 1;
             options.identity.cluster_id = try parseU64(try value(argv, &command_start, "--ha-cluster-id"));
@@ -666,6 +697,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --standby-log PATH
         \\  --standby-progress PATH
         \\  --fence-wal PATH
+        \\  --former-primary-log PATH
         \\  --ha-cluster-id N
         \\  --ha-shard-id N
         \\  --ha-table-id N
@@ -856,6 +888,62 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_assess);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "rejoin",                     "rewind",
+        "--node-id",                  "primary-a",
+        "--cluster-id",               "10",
+        "--shard-id",                 "20",
+        "--table-id",                 "30",
+        "--timeline-id",              "1",
+        "--epoch",                    "2",
+        "--last-lsn",                 "12",
+        "--retained-from-lsn",        "8",
+        "--fence-old-primary-id",     "primary-a",
+        "--fence-promoted-node-id",   "standby-b",
+        "--fence-parent-timeline-id", "1",
+        "--fence-parent-epoch",       "2",
+        "--fence-new-timeline-id",    "2",
+        "--fence-new-epoch",          "3",
+        "--fence-required-lsn",       "10",
+        "--fence-observed-lsn",       "10",
+        "--fence-generation",         "1",
+        "--fence-token",              "token",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_rewind);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "slot",
+        "create",
+        "primary-a",
+        "--initial-lsn",
+        "0",
+    }, recorder.executor());
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "rejoin",                     "reseed",
+        "--node-id",                  "primary-a",
+        "--cluster-id",               "10",
+        "--shard-id",                 "20",
+        "--table-id",                 "30",
+        "--timeline-id",              "1",
+        "--epoch",                    "2",
+        "--last-lsn",                 "12",
+        "--retained-from-lsn",        "11",
+        "--fence-old-primary-id",     "primary-a",
+        "--fence-promoted-node-id",   "standby-b",
+        "--fence-parent-timeline-id", "1",
+        "--fence-parent-epoch",       "2",
+        "--fence-new-timeline-id",    "2",
+        "--fence-new-epoch",          "3",
+        "--fence-required-lsn",       "10",
+        "--fence-observed-lsn",       "10",
+        "--fence-generation",         "1",
+        "--fence-token",              "token",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
 }
 
 test "ha cmd renders typed JSON responses as dotted table fields" {

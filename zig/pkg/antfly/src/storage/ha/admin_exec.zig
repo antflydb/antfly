@@ -75,6 +75,16 @@ pub const SeedBootstrapResult = struct {
     }
 };
 
+pub const RejoinRewindResult = struct {
+    assessment: rejoin.Assessment,
+    rewind: rejoin.RewindResult,
+};
+
+pub const RejoinReseedResult = struct {
+    assessment: rejoin.Assessment,
+    reseed: rejoin.ReseedResult,
+};
+
 pub const Result = union(enum) {
     identify_system: replication_api.IdentifySystemResponse,
     slot: admin.SlotResult,
@@ -100,6 +110,8 @@ pub const Result = union(enum) {
     promote_current_fence: admin.FencedPromotionResult,
     promote: admin.FencedPromotionResult,
     rejoin_assess: rejoin.Assessment,
+    rejoin_rewind: RejoinRewindResult,
+    rejoin_reseed: RejoinReseedResult,
     operator_plan: operator.Plan,
 
     pub fn deinit(self: *Result, alloc: Allocator) void {
@@ -277,15 +289,28 @@ pub fn renderTableAlloc(alloc: Allocator, result: Result) ![]u8 {
             try appendPromotionResultLines(alloc, &out, promotion_result);
         },
         .rejoin_assess => |assessment| {
-            try appendLine(alloc, &out, "action", @tagName(assessment.action));
-            try appendLine(alloc, &out, "reason", @tagName(assessment.reason));
-            try appendLine(alloc, &out, "former_node_id", assessment.former_node_id);
-            try appendU64Line(alloc, &out, "target_timeline_id", assessment.target_timeline_id);
-            try appendU64Line(alloc, &out, "target_epoch", assessment.target_epoch);
-            try appendU64Line(alloc, &out, "fork_lsn", assessment.fork_lsn);
-            try appendU64Line(alloc, &out, "former_last_lsn", assessment.former_last_lsn);
-            try appendU64Line(alloc, &out, "retained_from_lsn", assessment.retained_from_lsn);
-            try appendBoolLine(alloc, &out, "data_loss_discarded", assessment.data_loss_discarded);
+            try appendRejoinAssessmentLines(alloc, &out, "", assessment);
+        },
+        .rejoin_rewind => |rewind_result| {
+            try appendRejoinAssessmentLines(alloc, &out, "assessment", rewind_result.assessment);
+            try appendU64Line(alloc, &out, "rewind.fork_lsn", rewind_result.rewind.fork_lsn);
+            try appendU64Line(alloc, &out, "rewind.previous_last_lsn", rewind_result.rewind.previous_last_lsn);
+            try appendU64Line(alloc, &out, "rewind.current_last_lsn", rewind_result.rewind.current_last_lsn);
+            try appendU64Line(alloc, &out, "rewind.next_lsn", rewind_result.rewind.next_lsn);
+            try appendU64Line(alloc, &out, "rewind.discarded_lsn_count", rewind_result.rewind.discarded_lsn_count);
+            try appendU64Line(alloc, &out, "rewind.target_timeline_id", rewind_result.rewind.target_timeline_id);
+            try appendU64Line(alloc, &out, "rewind.target_epoch", rewind_result.rewind.target_epoch);
+            try appendBoolLine(alloc, &out, "rewind.data_loss_discarded", rewind_result.rewind.data_loss_discarded);
+        },
+        .rejoin_reseed => |reseed_result| {
+            try appendRejoinAssessmentLines(alloc, &out, "assessment", reseed_result.assessment);
+            try appendLine(alloc, &out, "reseed.slot_name", reseed_result.reseed.slot_name);
+            try appendU64Line(alloc, &out, "reseed.target_timeline_id", reseed_result.reseed.target_timeline_id);
+            try appendU64Line(alloc, &out, "reseed.target_epoch", reseed_result.reseed.target_epoch);
+            try appendU64Line(alloc, &out, "reseed.fork_lsn", reseed_result.reseed.fork_lsn);
+            try appendU64Line(alloc, &out, "reseed.former_last_lsn", reseed_result.reseed.former_last_lsn);
+            try appendBoolLine(alloc, &out, "reseed.reseed_required", reseed_result.reseed.reseed_required);
+            try appendBoolLine(alloc, &out, "reseed.base_backup_required", reseed_result.reseed.base_backup_required);
         },
         .operator_plan => |operator_plan| {
             try appendBoolLine(alloc, &out, "automatic_promotion_allowed", operator_plan.automatic_promotion_allowed);
@@ -393,10 +418,28 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         .rejoin_assess => |command| .{
             .rejoin_assess = admin.assessFormerPrimaryRejoin(command.former, command.receipt, command.policy),
         },
+        .rejoin_rewind => |command| try executeRejoinRewind(alloc, ctx, command),
+        .rejoin_reseed => |command| try executeRejoinReseed(ctx, command),
         .operator_plan => |command| .{
             .operator_plan = try executeOperatorPlan(alloc, try requirePrimary(ctx), command),
         },
     };
+}
+
+fn executeRejoinRewind(alloc: Allocator, ctx: Context, command: admin_cli.RejoinAssessCommand) !Result {
+    const assessment = admin.assessFormerPrimaryRejoin(command.former, command.receipt, command.policy);
+    return .{ .rejoin_rewind = .{
+        .assessment = assessment,
+        .rewind = try admin.rewindFormerPrimaryReplicationLog(alloc, try requireFormerPrimaryLog(ctx), assessment),
+    } };
+}
+
+fn executeRejoinReseed(ctx: Context, command: admin_cli.RejoinAssessCommand) !Result {
+    const assessment = admin.assessFormerPrimaryRejoin(command.former, command.receipt, command.policy);
+    return .{ .rejoin_reseed = .{
+        .assessment = assessment,
+        .reseed = try admin.markFormerPrimaryForReseed(try requirePrimary(ctx), assessment),
+    } };
 }
 
 fn executeOperatorPlan(
@@ -625,6 +668,10 @@ fn requireFenceStore(ctx: Context) !*fencing.Store {
     return ctx.fence_store orelse error.FenceStoreUnavailable;
 }
 
+fn requireFormerPrimaryLog(ctx: Context) !*replication_log.ReplicationLog {
+    return ctx.former_primary_log orelse error.FormerPrimaryLogUnavailable;
+}
+
 fn resultName(result: Result) []const u8 {
     return switch (result) {
         .identify_system => "identify_system",
@@ -651,6 +698,8 @@ fn resultName(result: Result) []const u8 {
         .promote_current_fence => "promote_current_fence",
         .promote => "promote",
         .rejoin_assess => "rejoin_assess",
+        .rejoin_rewind => "rejoin_rewind",
+        .rejoin_reseed => "rejoin_reseed",
         .operator_plan => "operator_plan",
     };
 }
@@ -928,6 +977,23 @@ fn appendPromotionAssessmentLines(
     try appendPrefixedBoolLine(alloc, out, prefix, "can_promote", assessment.can_promote);
 }
 
+fn appendRejoinAssessmentLines(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    assessment: rejoin.Assessment,
+) !void {
+    try appendPrefixedLine(alloc, out, prefix, "action", @tagName(assessment.action));
+    try appendPrefixedLine(alloc, out, prefix, "reason", @tagName(assessment.reason));
+    try appendPrefixedLine(alloc, out, prefix, "former_node_id", assessment.former_node_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "target_timeline_id", assessment.target_timeline_id);
+    try appendPrefixedU64Line(alloc, out, prefix, "target_epoch", assessment.target_epoch);
+    try appendPrefixedU64Line(alloc, out, prefix, "fork_lsn", assessment.fork_lsn);
+    try appendPrefixedU64Line(alloc, out, prefix, "former_last_lsn", assessment.former_last_lsn);
+    try appendPrefixedU64Line(alloc, out, prefix, "retained_from_lsn", assessment.retained_from_lsn);
+    try appendPrefixedBoolLine(alloc, out, prefix, "data_loss_discarded", assessment.data_loss_discarded);
+}
+
 fn appendPromotionResultLines(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1041,6 +1107,23 @@ fn appendOptionalLine(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), key: [
     try appendLine(alloc, out, key, value orelse "-");
 }
 
+fn prefixedKeyAlloc(alloc: Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
+    if (prefix.len == 0) return try alloc.dupe(u8, suffix);
+    return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, suffix });
+}
+
+fn appendPrefixedLine(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    prefix: []const u8,
+    suffix: []const u8,
+    value: []const u8,
+) !void {
+    const key = try prefixedKeyAlloc(alloc, prefix, suffix);
+    defer alloc.free(key);
+    try appendLine(alloc, out, key, value);
+}
+
 fn appendPrefixedU64Line(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1048,7 +1131,7 @@ fn appendPrefixedU64Line(
     suffix: []const u8,
     value: u64,
 ) !void {
-    const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, suffix });
+    const key = try prefixedKeyAlloc(alloc, prefix, suffix);
     defer alloc.free(key);
     try appendU64Line(alloc, out, key, value);
 }
@@ -1060,7 +1143,7 @@ fn appendPrefixedBoolLine(
     suffix: []const u8,
     value: bool,
 ) !void {
-    const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ prefix, suffix });
+    const key = try prefixedKeyAlloc(alloc, prefix, suffix);
     defer alloc.free(key);
     try appendBoolLine(alloc, out, key, value);
 }
@@ -1471,6 +1554,145 @@ test "storage.ha admin exec operator plan assesses former primary rejoin" {
     try expectContains(table_body, "actions.0.kind=rewind_former_primary\n");
     try expectContains(table_body, "actions.0.phase=rejoin\n");
     try expectContains(table_body, "actions.0.target_lsn=10\n");
+}
+
+test "storage.ha admin exec executes former primary rejoin rewind and reseed commands" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-execute");
+    defer paths.deinit(alloc);
+
+    var former_identity = testIdentity();
+    former_identity.timeline_id = 1;
+    former_identity.epoch = 1;
+    {
+        var former_primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, former_identity, .{});
+        defer former_primary.close();
+        for (0..12) |idx| {
+            _ = try former_primary.append(.{ .payload = if (idx < 10) "parent" else "divergent" });
+        }
+    }
+
+    var former_log = try replication_log.ReplicationLog.open(paths.primary_log.ptr, .{});
+    defer former_log.close();
+
+    var promoted_identity = former_identity;
+    promoted_identity.timeline_id = 2;
+    promoted_identity.epoch = 2;
+    var promoted_primary = try primary_mod.Primary.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, promoted_identity, .{});
+    defer promoted_primary.close();
+    try promoted_primary.createSlot("primary-a", 0);
+
+    var rewind_plan = try admin_cli.parse(alloc, &.{
+        "--table",
+        "rejoin",
+        "rewind",
+        "--node-id",
+        "primary-a",
+        "--cluster-id",
+        "100",
+        "--shard-id",
+        "10",
+        "--table-id",
+        "20",
+        "--timeline-id",
+        "1",
+        "--epoch",
+        "1",
+        "--last-lsn",
+        "12",
+        "--retained-from-lsn",
+        "8",
+        "--fence-old-primary-id",
+        "primary-a",
+        "--fence-promoted-node-id",
+        "standby-a",
+        "--fence-parent-timeline-id",
+        "1",
+        "--fence-parent-epoch",
+        "1",
+        "--fence-new-timeline-id",
+        "2",
+        "--fence-new-epoch",
+        "2",
+        "--fence-required-lsn",
+        "10",
+        "--fence-observed-lsn",
+        "10",
+        "--fence-generation",
+        "3",
+        "--fence-token",
+        "token",
+    });
+    defer rewind_plan.deinit(alloc);
+
+    var rewind_result = try execute(alloc, .{ .former_primary_log = &former_log }, rewind_plan);
+    defer rewind_result.deinit(alloc);
+    try std.testing.expectEqual(rejoin.Action.rewind, rewind_result.rejoin_rewind.assessment.action);
+    try std.testing.expectEqual(@as(u64, 12), rewind_result.rejoin_rewind.rewind.previous_last_lsn);
+    try std.testing.expectEqual(@as(u64, 10), rewind_result.rejoin_rewind.rewind.current_last_lsn);
+    try std.testing.expectEqual(@as(u64, 2), rewind_result.rejoin_rewind.rewind.discarded_lsn_count);
+
+    const rewind_table = try renderTableAlloc(alloc, rewind_result);
+    defer alloc.free(rewind_table);
+    try expectContains(rewind_table, "result=rejoin_rewind\n");
+    try expectContains(rewind_table, "assessment.action=rewind\n");
+    try expectContains(rewind_table, "rewind.discarded_lsn_count=2\n");
+
+    var reseed_plan = try admin_cli.parse(alloc, &.{
+        "--table",
+        "rejoin",
+        "reseed",
+        "--node-id",
+        "primary-a",
+        "--cluster-id",
+        "100",
+        "--shard-id",
+        "10",
+        "--table-id",
+        "20",
+        "--timeline-id",
+        "1",
+        "--epoch",
+        "1",
+        "--last-lsn",
+        "12",
+        "--retained-from-lsn",
+        "11",
+        "--fence-old-primary-id",
+        "primary-a",
+        "--fence-promoted-node-id",
+        "standby-a",
+        "--fence-parent-timeline-id",
+        "1",
+        "--fence-parent-epoch",
+        "1",
+        "--fence-new-timeline-id",
+        "2",
+        "--fence-new-epoch",
+        "2",
+        "--fence-required-lsn",
+        "10",
+        "--fence-observed-lsn",
+        "10",
+        "--fence-generation",
+        "3",
+        "--fence-token",
+        "token",
+    });
+    defer reseed_plan.deinit(alloc);
+
+    var reseed_result = try execute(alloc, .{ .primary = &promoted_primary }, reseed_plan);
+    defer reseed_result.deinit(alloc);
+    try std.testing.expectEqual(rejoin.Action.reseed, reseed_result.rejoin_reseed.assessment.action);
+    try std.testing.expectEqualStrings("primary-a", reseed_result.rejoin_reseed.reseed.slot_name);
+    try std.testing.expect(reseed_result.rejoin_reseed.reseed.reseed_required);
+    try std.testing.expect(reseed_result.rejoin_reseed.reseed.base_backup_required);
+
+    const reseed_table = try renderTableAlloc(alloc, reseed_result);
+    defer alloc.free(reseed_table);
+    try expectContains(reseed_table, "result=rejoin_reseed\n");
+    try expectContains(reseed_table, "assessment.action=reseed\n");
+    try expectContains(reseed_table, "reseed.slot_name=primary-a\n");
 }
 
 test "storage.ha admin exec finishes and bootstraps seed manifests from files" {
