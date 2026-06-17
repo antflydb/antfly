@@ -737,8 +737,9 @@ be validated against that operator package.
   Secret read permissions just to make HA admin API calls.
 - Support runtime-side admin auth by passing `--ha-admin-token-env` from
   `spec.highAvailability.runtime.adminTokenEnvVar`. Antfly pods should receive
-  the same token through `spec.swarm.envFrom` or explicit env injection, and the
-  process should fail closed if the configured env var is missing or empty.
+  the same token through `spec.swarm.envFrom` or the explicit
+  `spec.highAvailability.runtime.adminTokenSecretRef` secret-key injection, and
+  the process should fail closed if the configured env var is missing or empty.
 - Publish each executable planned action with its typed admin HTTP method/path
   and target admin URL, while keeping CLI argv as a compatibility and
   break-glass execution hint.

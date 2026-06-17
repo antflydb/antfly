@@ -145,6 +145,23 @@ func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
 	}}
 }
 
+func haRuntimeAdminTokenEnv(ha *antflyv1.HighAvailabilitySpec) []corev1.EnvVar {
+	if ha == nil || ha.Runtime == nil || ha.Runtime.AdminTokenSecretRef == nil {
+		return nil
+	}
+	envVar := strings.TrimSpace(ha.Runtime.AdminTokenEnvVar)
+	if envVar == "" {
+		return nil
+	}
+	secretRef := ha.Runtime.AdminTokenSecretRef.DeepCopy()
+	return []corev1.EnvVar{{
+		Name: envVar,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: secretRef,
+		},
+	}}
+}
+
 func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 	if store == nil {
 		return ""
@@ -2408,7 +2425,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env:             secretStoreEnv(cluster.Spec.SecretStore),
+						Env:             append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",

@@ -3677,7 +3677,34 @@ spec:
                         description: |-
                           AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
                           When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
+                          Populate it with adminTokenSecretRef or spec.swarm.envFrom.
                         type: string
+                      adminTokenSecretRef:
+                        description: |-
+                          AdminTokenSecretRef optionally injects AdminTokenEnvVar from a Secret key into the Antfly runtime container.
+                          Use this when the token is not already provided by spec.swarm.envFrom.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
                       fencePath:
                         description: |-
                           FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.

@@ -1207,6 +1207,7 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 	}
 
 	errors = append(errors, validateHARuntime(ha)...)
+	errors = append(errors, r.validateHARuntimeAdminTokenSource(ha)...)
 
 	if identity := ha.Identity; identity != nil {
 		if identity.ClusterID == 0 {
@@ -1372,10 +1373,34 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	if envVar := strings.TrimSpace(runtime.AdminTokenEnvVar); envVar != "" && !envVarNamePattern.MatchString(envVar) {
 		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must be a valid environment variable name")
 	}
+	if ref := runtime.AdminTokenSecretRef; ref != nil {
+		if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar is required when adminTokenSecretRef is set")
+		}
+		if strings.TrimSpace(ref.Name) == "" {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.name is required")
+		}
+		if strings.TrimSpace(ref.Key) == "" {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.key is required")
+		}
+	}
 	if ha.Identity == nil {
 		errors = append(errors, "spec.highAvailability.runtime requires spec.highAvailability.identity")
 	}
 	return errors
+}
+
+func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {
+	if ha == nil || ha.Runtime == nil || strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == "" {
+		return nil
+	}
+	if ha.Runtime.AdminTokenSecretRef != nil {
+		return nil
+	}
+	if r.effectiveMode() == ClusterModeSwarm && r.Spec.Swarm != nil && len(r.Spec.Swarm.EnvFrom) > 0 {
+		return nil
+	}
+	return []string{"spec.highAvailability.runtime.adminTokenEnvVar requires spec.highAvailability.runtime.adminTokenSecretRef or spec.swarm.envFrom"}
 }
 
 func validateHARouteSelector(selector map[string]string, fieldPath string) []string {

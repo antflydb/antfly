@@ -1986,6 +1986,76 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidRuntimeAdminTokenEnvVar(t 
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRuntimeAdminTokenRequiresPodEnvSource(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:             HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected runtime admin token without pod env source to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenSecretRef or spec.swarm.envFrom") {
+		t.Fatalf("expected runtime admin token source validation error, got: %v", err)
+	}
+
+	cluster.Spec.Swarm.EnvFrom = []corev1.EnvFromSource{{
+		SecretRef: &corev1.SecretEnvSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+		},
+	}}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected runtime admin token to accept spec.swarm.envFrom token source, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRuntimeAdminTokenAcceptsSecretRef(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:             HARuntimeRolePrimary,
+			NodeID:           "primary-a",
+			AdminTokenEnvVar: "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+				Key:                  "token",
+			},
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected runtime admin token secret ref to be valid, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.AdminTokenEnvVar = ""
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected adminTokenSecretRef without adminTokenEnvVar to be rejected")
+	}
+	if !strings.Contains(err.Error(), "adminTokenEnvVar is required when adminTokenSecretRef is set") {
+		t.Fatalf("expected adminTokenEnvVar-required validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationSource(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

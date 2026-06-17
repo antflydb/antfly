@@ -670,8 +670,14 @@ type HARuntimeSpec struct {
 
 	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
 	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
+	// Populate it with adminTokenSecretRef or spec.swarm.envFrom.
 	// +optional
 	AdminTokenEnvVar string `json:"adminTokenEnvVar,omitempty"`
+
+	// AdminTokenSecretRef optionally injects AdminTokenEnvVar from a Secret key into the Antfly runtime container.
+	// Use this when the token is not already provided by spec.swarm.envFrom.
+	// +optional
+	AdminTokenSecretRef *corev1.SecretKeySelector `json:"adminTokenSecretRef,omitempty"`
 
 	// Primary configures primary-side durable HA state. Defaults are under /antflydb/ha.
 	// +optional

@@ -7772,6 +7772,10 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 			NodeID:               "primary-a",
 			FormerPrimaryLogPath: "/antflydb/ha/primary.wal",
 			AdminTokenEnvVar:     "ANTFLY_HA_ADMIN_TOKEN",
+			AdminTokenSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+				Key:                  "token",
+			},
 		},
 		SyncPolicy: &antflyv1.HASyncPolicy{
 			Mode:          antflyv1.HADurabilityModeRemoteApply,
@@ -7805,6 +7809,15 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-a"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-standby "standby-b"`))
 	g.Expect(primaryArgs).To(ContainSubstring(`--ha-sync-failure "fail-closed"`))
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+		Name: "ANTFLY_HA_ADMIN_TOKEN",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+				Key:                  "token",
+			},
+		},
+	}))
 
 	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{
 		Role:                 antflyv1.HARuntimeRoleStandby,
@@ -7812,6 +7825,10 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 		FencePath:            "/antflydb/custom/fence.wal",
 		FormerPrimaryLogPath: "/antflydb/custom/former-primary.wal",
 		AdminTokenEnvVar:     "CUSTOM_HA_ADMIN_TOKEN",
+		AdminTokenSecretRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "custom-ha-admin-token"},
+			Key:                  "custom-token",
+		},
 		Standby: &antflyv1.HAStandbyRuntimeSpec{
 			LogPath:      "/antflydb/custom/standby.wal",
 			ProgressPath: "/antflydb/custom/progress.wal",
@@ -7830,6 +7847,15 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-admin-token-env "CUSTOM_HA_ADMIN_TOKEN"`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-upstream-url "http://primary.default.svc:8080"`))
 	g.Expect(standbyArgs).To(ContainSubstring(`--ha-standby-slot "standby-a"`))
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+		Name: "CUSTOM_HA_ADMIN_TOKEN",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "custom-ha-admin-token"},
+				Key:                  "custom-token",
+			},
+		},
+	}))
 }
 
 func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
