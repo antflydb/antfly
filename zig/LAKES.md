@@ -39,6 +39,41 @@ These are related, but they are not one layer:
 Antfly should use Arrow-like batches internally where it helps execution, but
 the public contract should remain the existing typed relational plan surface.
 
+## Alignment With Lakehouse RT And LTAP
+
+The lakehouse industry is moving toward storage-layer unification: one governed
+copy of data in open table formats, with specialized engines for transactional
+writes, analytical scans, and low-latency serving. Databricks' Lakehouse//RT and
+LTAP framing is a useful reference point for Antfly's long-term direction:
+
+- Lakehouse//RT maps to Antfly's external relational row source: low-latency
+  query directly over governed lake tables without copying data into a separate
+  serving database as the source of truth.
+- LTAP maps to a later write-path direction: operational writes can eventually
+  land in open table formats instead of requiring ETL from an operational store
+  into a lake.
+- The shared idea is storage-layer unification, not one engine for every
+  workload. Different engines can remain best suited for row transactions,
+  vector/search serving, graph traversal, and analytical scans as long as they
+  share one authoritative table snapshot model.
+
+Antfly should not try to become a full lakehouse warehouse. Its center of
+gravity is serving-grade retrieval and agent context over live governed data:
+hybrid search, vector retrieval, sparse retrieval, graph traversal, JSON/document
+semantics, row-level authorization, and algebraic materialization. The right
+positioning is therefore:
+
+> Antfly is the serving, retrieval, indexing, and agent context layer over
+> native Antfly rows and open lake tables.
+
+The "one copy" claim needs precise language. Lake tables should have one
+authoritative base copy in Iceberg/Parquet/Lance or native Antfly relational
+storage. Antfly may still maintain derived sidecars: text indexes, vector
+indexes, graph indexes, aggregate materializations, decoded-page caches, and hot
+projection caches. Those are not source-of-truth copies when they are
+snapshot-keyed, freshness-checked, rebuildable, and garbage-collected with the
+same snapshot-retention rules as the base table.
+
 ## Fit With Relational Mode
 
 Lake query mode should be a row source for relational plans, not a separate
@@ -389,10 +424,16 @@ Future write modes can be explicit:
   overlay and query execution merges overlay rows with external snapshot rows.
 - `iceberg_writer`: Antfly commits new Parquet files and Iceberg metadata
   updates using optimistic table commits.
+- `lake_native_relational`: Antfly accepts relational writes through a hot
+  row/cache layer, then columnizes and commits those writes into Iceberg/Parquet
+  as the authoritative storage representation.
 
 The read-only path should land first. Overlay and Iceberg writer modes create
 transaction, conflict, compaction, and ownership questions that are separate
 from efficient querying.
+`lake_native_relational` is the LTAP-like end state and should stay behind the
+query/indexing work until Antfly has proven snapshot binding, sidecar freshness,
+cache isolation, and Iceberg commit correctness.
 
 ## MVP
 
