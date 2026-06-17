@@ -425,6 +425,9 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		if !ok {
 			plan.UnhealthyStandbyCount++
 			seedTargetLSN := initialStandbyLSN(standby, status.PrimaryLSN)
+			if seedTargetLSN == 0 {
+				continue
+			}
 			plan.Actions = append(plan.Actions, haPlannedAction{
 				Kind:        haActionCreateSlot,
 				StandbyName: standby.Name,
@@ -432,17 +435,15 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 				TargetLSN:   seedTargetLSN,
 				Reason:      "SlotMissing",
 			})
-			if seedTargetLSN > 0 {
-				plan.Actions = append(plan.Actions, haPlannedAction{
-					Kind:        haActionSeedStandby,
-					DependsOn:   haActionCreateSlot,
-					StandbyName: standby.Name,
-					SlotName:    slotName,
-					TargetLSN:   seedTargetLSN,
-					Reason:      "StandbyNeedsBaseBackup",
-				})
-				plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "StandbyNeedsBaseBackup", haActionSeedStandby)...)
-			}
+			plan.Actions = append(plan.Actions, haPlannedAction{
+				Kind:        haActionSeedStandby,
+				DependsOn:   haActionCreateSlot,
+				StandbyName: standby.Name,
+				SlotName:    slotName,
+				TargetLSN:   seedTargetLSN,
+				Reason:      "StandbyNeedsBaseBackup",
+			})
+			plan.Actions = append(plan.Actions, haSeedCompletionActions(standby, slotName, seedTargetLSN, "StandbyNeedsBaseBackup", haActionSeedStandby)...)
 			continue
 		}
 		if !observed.Active && !observed.ReseedRequired {
