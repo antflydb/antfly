@@ -1649,6 +1649,87 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceGeneration).To(Equal(uint64(0)))
 }
 
+func TestReconcileHAPrimaryRouteRequiresStandbyRouteSelector(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name: "standby-a",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode: antflyv1.HAModeHotStandby,
+				PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
+					CurrentTarget: "primary",
+					DesiredTarget: "standby-a",
+					Stale:         true,
+					Action:        string(haActionUpdatePrimaryRoute),
+				},
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionPromoteStandby),
+					StandbyName:   "standby-a",
+					AdminCommand:  []string{"promote", "--current-fence"},
+					AdminURL:      "http://standby-a-ha.default.svc:8081",
+					AdminJobName:  "promote-job",
+					AdminJobPhase: haAdminJobPhaseSucceeded,
+					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						FenceGeneration: 7,
+						FenceToken:      "ha-fence-token",
+					},
+				}, {
+					Kind:            string(haActionUpdatePrimaryRoute),
+					StandbyName:     "standby-a",
+					RouteFrom:       "primary",
+					RouteTo:         "standby-a",
+					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration: 7,
+				}},
+			},
+		},
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster-public-api",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: serviceSelectorLabels("test-cluster", "metadata"),
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, service).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
+
+	observed := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
+	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteSelectorAnnotation))
+	g.Expect(observed.Spec.Selector).To(Equal(serviceSelectorLabels("test-cluster", "metadata")))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.DesiredTarget).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Stale).To(BeTrue())
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Action).To(Equal(string(haActionUpdatePrimaryRoute)))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.Reason).To(Equal(antflyv1.ReasonHAPrimaryRouteSelectorMissing))
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAPrimaryRouteSelectorMissing))
+}
+
 func TestUpdateHAPrimaryRouteServiceClearsFenceAnnotationsWithoutFence(t *testing.T) {
 	g := NewWithT(t)
 

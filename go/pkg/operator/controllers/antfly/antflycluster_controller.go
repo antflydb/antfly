@@ -5132,6 +5132,21 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 		}
 		return err
 	}
+	selector, selectorOK := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeSwarm, action.RouteTo)
+	if !selectorOK {
+		cluster.Status.HAStatus.PrimaryRoute.DesiredTarget = action.RouteTo
+		cluster.Status.HAStatus.PrimaryRoute.Stale = true
+		cluster.Status.HAStatus.PrimaryRoute.Action = string(haActionUpdatePrimaryRoute)
+		cluster.Status.HAStatus.PrimaryRoute.Reason = antflyv1.ReasonHAPrimaryRouteSelectorMissing
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAPrimaryRouteSelectorMissing,
+			fmt.Sprintf("HA primary route target %s has no public-api Service selector", action.RouteTo),
+		)
+		return nil
+	}
 	patch := client.MergeFrom(service.DeepCopy())
 	if service.Annotations == nil {
 		service.Annotations = map[string]string{}
@@ -5147,12 +5162,8 @@ func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Contex
 	} else {
 		delete(service.Annotations, haPrimaryRouteFenceGenerationAnnotation)
 	}
-	if selector, ok := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeSwarm, action.RouteTo); ok {
-		service.Spec.Selector = selector
-		service.Annotations[haPrimaryRouteSelectorAnnotation] = "true"
-	} else {
-		service.Annotations[haPrimaryRouteSelectorAnnotation] = "false"
-	}
+	service.Spec.Selector = selector
+	service.Annotations[haPrimaryRouteSelectorAnnotation] = "true"
 	if err := r.Patch(ctx, service, patch); err != nil {
 		return err
 	}

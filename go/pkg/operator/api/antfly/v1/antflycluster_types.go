@@ -233,6 +233,9 @@ const (
 	// ReasonHAAdminResultMissing indicates a completed HA admin action lacks typed result evidence.
 	ReasonHAAdminResultMissing = "HAAdminResultMissing"
 
+	// ReasonHAPrimaryRouteSelectorMissing indicates the promoted standby lacks a public-api route selector.
+	ReasonHAPrimaryRouteSelectorMissing = "HAPrimaryRouteSelectorMissing"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 
