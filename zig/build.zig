@@ -2797,6 +2797,20 @@ pub fn build(b: *std.Build) void {
     const run_lib_lsm_backend_chaos_tests = b.addRunArtifact(lib_lsm_backend_chaos_tests);
     const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
     lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
+    const lib_ha_chaos_default_filters = [_][]const u8{
+        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
+        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
+        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
+        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
+        "storage.ha chaos network partition requires fence before standby promotion",
+    };
+    const lib_ha_chaos_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
+    });
+    const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
+    const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
+    lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
@@ -3886,6 +3900,7 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
