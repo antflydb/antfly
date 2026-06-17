@@ -294,9 +294,10 @@ pub const SearchScratch = struct {
 
     fn ensureQueryStorageCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.positions.len >= needed) return;
-        const replacement = try allocateQueryStorage(alloc, needed);
+        const capacity = nextScratchCapacity(self.positions.len, needed);
+        const replacement = try allocateQueryStorage(alloc, capacity);
         errdefer alloc.free(replacement);
-        const views = carveQueryStorage(replacement, needed);
+        const views = carveQueryStorage(replacement, capacity);
         copyQueryStorageViews(views, .{
             .positions = self.positions,
             .vector_ids = self.vector_ids,
@@ -324,11 +325,12 @@ pub const SearchScratch = struct {
         if (self.distances.len >= needed and self.error_bounds.len >= needed) return;
         const old_distance_len = self.distances.len;
         const old_error_bound_len = self.error_bounds.len;
-        const new_storage_len = try std.math.mul(usize, needed, 2);
+        const capacity = nextScratchCapacity(@min(self.distances.len, self.error_bounds.len), needed);
+        const new_storage_len = try std.math.mul(usize, capacity, 2);
         self.distance_storage = try alloc.realloc(self.distance_storage, new_storage_len);
         self.noteScratchAllocation(byteLen(self.distance_storage));
-        self.distances = self.distance_storage[0..needed];
-        self.error_bounds = self.distance_storage[needed .. 2 * needed];
+        self.distances = self.distance_storage[0..capacity];
+        self.error_bounds = self.distance_storage[capacity .. 2 * capacity];
         if (old_error_bound_len != 0) {
             std.mem.copyBackwards(f32, self.error_bounds[0..old_error_bound_len], self.distance_storage[old_distance_len .. old_distance_len + old_error_bound_len]);
         }
@@ -852,6 +854,24 @@ test "SearchScratch grows hot posting buffers geometrically" {
     try std.testing.expectEqual(@as(usize, 8), scratch.posting_delta_records.len);
     try scratch.ensureDeltaRecordCapacity(alloc, 9);
     try std.testing.expectEqual(@as(usize, 16), scratch.posting_delta_records.len);
+}
+
+test "SearchScratch grows query and distance slabs geometrically" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    try scratch.ensureDistanceCapacity(alloc, 3);
+    try std.testing.expectEqual(@as(usize, 8), scratch.positions.len);
+    try std.testing.expectEqual(@as(usize, 8), scratch.vector_ids.len);
+    try std.testing.expectEqual(@as(usize, 8), scratch.distances.len);
+    try std.testing.expectEqual(@as(usize, 8), scratch.error_bounds.len);
+
+    try scratch.ensureDistanceCapacity(alloc, 9);
+    try std.testing.expectEqual(@as(usize, 16), scratch.positions.len);
+    try std.testing.expectEqual(@as(usize, 16), scratch.vector_ids.len);
+    try std.testing.expectEqual(@as(usize, 16), scratch.distances.len);
+    try std.testing.expectEqual(@as(usize, 16), scratch.error_bounds.len);
 }
 
 test "SearchScratch reports allocation pressure and retained bytes" {
