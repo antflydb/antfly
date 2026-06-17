@@ -28,6 +28,25 @@ func TestClusterRoleAvoidsOptionalHighRiskPermissions(t *testing.T) {
 	}
 }
 
+func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
+	role := ClusterRole()
+	requiredVerbs := []string{"get", "list", "watch", "create", "update", "patch", "delete"}
+
+	for _, rule := range role.Rules {
+		if !containsString(rule.APIGroups, "coordination.k8s.io") || !containsString(rule.Resources, "leases") {
+			continue
+		}
+		for _, verb := range requiredVerbs {
+			if !containsString(rule.Verbs, verb) {
+				t.Fatalf("ClusterRole leases rule missing verb %q: %#v", verb, rule.Verbs)
+			}
+		}
+		return
+	}
+
+	t.Fatal("ClusterRole must grant coordination.k8s.io leases permissions for HA KubernetesLease fencing")
+}
+
 func TestStorageAutoGrowRBACGrantsNodeProxyOnly(t *testing.T) {
 	role := StorageAutoGrowClusterRole()
 	if role.Name != StorageAutoGrowClusterRoleName {
@@ -59,4 +78,13 @@ func TestStorageAutoGrowRBACGrantsNodeProxyOnly(t *testing.T) {
 	if subject.Kind != "ServiceAccount" || subject.Name != ServiceAccountName || subject.Namespace != OperatorNamespace {
 		t.Fatalf("StorageAutoGrowClusterRoleBinding subject = %#v", subject)
 	}
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
