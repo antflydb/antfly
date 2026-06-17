@@ -5311,23 +5311,25 @@ a dedicated source summary assertion path.
 
 Returning summaries are self-anchored to write fingerprints. Point writes must
 match `returning_rows`, source-query writes and merge mutations must match
-`returning`, and any explicit `returning_all` summary must match an explicit
-`returning_all` token. This keeps `RETURNING` coverage tied to the committed row
-image contract instead of allowing stale fixture metadata to claim result-shape
-coverage.
+`returning`, and any explicit `returning_all=true` summary must match
+`returning_all=1`. Explicit `returning_all=false` is also meaningful coverage:
+it requires the positive all-fields token to be absent or zero, so compact
+fingerprints can assert the negative case without carrying extra noise. This
+keeps `RETURNING` coverage tied to the committed row image contract instead of
+allowing stale fixture metadata to claim result-shape coverage.
 
-Write operation-count summaries are fingerprint anchored for non-DDL writes.
-Point inserts/updates and mutation-source updates must match `ops`,
-insert-source plans must match `assignments`, and merge mutations must match
-`matched_update`. DDL operation summaries remain tied to the DDL lowerer and
-applied-plan verifier because their meaning depends on the specific catalog
-operation family.
+Write operation-count summaries are fingerprint anchored by family. Point
+inserts/updates and mutation-source updates must match `ops`, insert-source
+plans must match `assignments`, and merge mutations must match `matched_update`.
+DDL operation summaries use the tag-local typed fingerprint rules described
+above, because each catalog operation family owns a different count token.
 
-Conflict guard summaries are also positive evidence. A fixture may carry
-`conflict_where` only for insert or insert-source plans whose fingerprint
-contains `conflict_where=1`; absence of the summary is the only representation
-for unguarded conflict actions. This keeps `ON CONFLICT ... WHERE` coverage tied
-to the typed proposed/existing-row predicate contract.
+Conflict guard summaries are boolean fingerprint evidence. A fixture may carry
+`conflict_where` only for insert or insert-source plans. `true` requires
+`conflict_where=1`; `false` requires that positive token to be absent or zero,
+which lets the corpus assert both guarded and unguarded conflict actions without
+making omitted metadata ambiguous. This keeps `ON CONFLICT ... WHERE` coverage
+tied to the typed proposed/existing-row predicate contract.
 
 Merge-arm summaries are anchored to the merge fingerprint. `matched_predicates`,
 `matched_delete`, `matched_do_nothing`, `not_matched_predicates`, and

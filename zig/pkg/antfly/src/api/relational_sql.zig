@@ -62340,7 +62340,8 @@ fn appParityFixtureReturningSummaryMatchesPlan(entry: AppParityCorpusEntry, expe
 }
 
 fn appParityFixtureReturningAllSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
-    return appParityPlanHasExactUsizeToken(entry.plan, ":returning_all=", @intFromBool(expected));
+    if (expected) return appParityPlanHasExactUsizeToken(entry.plan, ":returning_all=", 1);
+    return !appParityPlanHasExactUsizeToken(entry.plan, ":returning_all=", 1);
 }
 
 fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool {
@@ -62355,7 +62356,8 @@ fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool 
 }
 
 fn appParityFixtureConflictWhereSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
-    return expected and appParityPlanHasExactUsizeToken(entry.plan, ":conflict_where=", 1);
+    if (expected) return appParityPlanHasExactUsizeToken(entry.plan, ":conflict_where=", 1);
+    return !appParityPlanHasExactUsizeToken(entry.plan, ":conflict_where=", 1);
 }
 
 fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
@@ -63609,6 +63611,46 @@ test "app parity fixture metadata requires typed summary anchors" {
         .summary = .{ .table_name = "price_intervals", .operations = 2 },
         .plan = "query:table=price_intervals:pred=0:array_any=0:in=0:json_path_eq=0:json_contains=0:json_exists=0:array_contains=0:array_eq=0:text_patterns=0:expr_pred=0:expr_or=0:expr_not=0:select=0:order=0:limit=none",
     }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale returning all false summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') RETURNING *",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning_all = false },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid compact returning all false summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .returning_all = false },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc);
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale conflict where true summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .conflict_where = true },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "stale conflict where false summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) WHERE status = 'active' DO UPDATE SET status = excluded.status",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .conflict_where = false },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=1",
+    }, &seen, alloc));
+
+    try validateAppParityFixtureMetadata(.{
+        .name = "valid compact conflict where false summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records", .conflict_where = false },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0",
+    }, &seen, alloc);
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "point insert cte summary",
