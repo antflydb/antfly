@@ -857,6 +857,57 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_standby_status);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "commit",
+        "append",
+        "--payload",
+        "remote-cli-record",
+        "--sync-mode",
+        "async",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_commit_append);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "commit",
+        "check",
+        "--target-lsn",
+        "1",
+        "--sync-mode",
+        "async",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_commit_check);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "read",
+        "check",
+        "--at-least-lsn",
+        "0",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_read_check);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "write",
+        "check",
+        "--role",
+        "primary",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_write_check);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "owner-job",
+        "check",
+        "--role",
+        "primary",
+        "--kind",
+        "retention-advance",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_owner_job_check);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "fence",
         "acquire",
         "--cluster-id",
