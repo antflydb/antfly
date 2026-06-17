@@ -65097,6 +65097,13 @@ fn appParityPlanHasExactStringToken(plan: []const u8, token: []const u8, expecte
     };
 }
 
+fn appParityPlanHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_values: []const []const u8) bool {
+    for (expected_values) |expected| {
+        if (appParityPlanHasExactStringToken(plan, token, expected)) return true;
+    }
+    return false;
+}
+
 fn appParityPlanHasToken(plan: []const u8, token: []const u8) bool {
     return std.mem.indexOf(u8, plan, token) != null;
 }
@@ -65132,6 +65139,16 @@ test "app parity applied plan coverage tokens are exact" {
     try std.testing.expect(appParityAppliedPlanHasExactUsizeToken(plan, "unvalidated_unique=", 10));
     try std.testing.expect(!appParityAppliedPlanHasExactUsizeToken(plan, "unvalidated_unique=", 1));
     try std.testing.expect(!appParityAppliedPlanHasExactBoolToken("applied:rebuild=true:rewrite=false", "rebuild=", true));
+}
+
+test "app parity claim coverage tokens are exact" {
+    const no_key_nowait = "query:table=usage_records:claim=no_key_update_nowait:pred=0:select=1:order=0:limit=none";
+    try std.testing.expect(appParityPlanHasExactStringToken(no_key_nowait, ":claim=", "no_key_update_nowait"));
+    try std.testing.expect(!appParityPlanHasExactStringToken(no_key_nowait, ":claim=", "no_key_update"));
+    try std.testing.expect(appParityPlanHasAnyExactStringToken(no_key_nowait, ":claim=", &.{
+        "no_key_update",
+        "no_key_update_nowait",
+    }));
 }
 
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {
@@ -65719,9 +65736,12 @@ const AppParityCorpusCoverage = struct {
         self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null);
         self.point_update_patch_expression = self.point_update_patch_expression or
             (entry.family == .update and std.mem.eql(u8, entry.name, "point update expression assignment"));
-        self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and std.mem.indexOf(u8, entry.plan, ":claim=skip_locked:") != null);
-        self.update_source_claim_nowait = self.update_source_claim_nowait or (entry.family == .update_source and std.mem.indexOf(u8, entry.plan, ":claim=nowait:") != null);
-        self.update_source_claim_no_key_update = self.update_source_claim_no_key_update or (entry.family == .update_source and std.mem.indexOf(u8, entry.plan, ":claim=no_key_update") != null);
+        self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and
+            appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "skip_locked", "no_key_update_skip_locked" }));
+        self.update_source_claim_nowait = self.update_source_claim_nowait or (entry.family == .update_source and
+            appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "nowait", "no_key_update_nowait" }));
+        self.update_source_claim_no_key_update = self.update_source_claim_no_key_update or (entry.family == .update_source and
+            appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
         self.update_source_pagination = self.update_source_pagination or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":source_offset="));
         self.update_source_nullable_pagination = self.update_source_nullable_pagination or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
@@ -66660,9 +66680,11 @@ const AppParityCorpusCoverage = struct {
         self.query_access_not_predicates = self.query_access_not_predicates or
             entry.family == .query and appParityPlanHasNonZeroToken(entry.plan, ":access_not=");
         self.read_row_lock_nowait = self.read_row_lock_nowait or
-            (entry.family == .query and std.mem.indexOf(u8, entry.plan, ":claim=nowait") != null);
+            (entry.family == .query and
+                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "nowait", "no_key_update_nowait" }));
         self.query_row_lock_no_key_update = self.query_row_lock_no_key_update or
-            (entry.family == .query and std.mem.indexOf(u8, entry.plan, ":claim=no_key_update") != null);
+            (entry.family == .query and
+                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
         self.expression_predicate = self.expression_predicate or appParityPlanHasAnyNonZeroToken(entry.plan, &.{
             ":expr_pred=",
             "_expr_pred=",

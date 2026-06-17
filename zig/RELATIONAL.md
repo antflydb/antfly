@@ -5371,7 +5371,10 @@ plans reject it. The summary is fingerprint-anchored: `true` requires
 `claim=skip_locked` or `claim=no_key_update_skip_locked`, while `false` requires
 a present non-skip-locked claim such as `claim=locked`, `claim=nowait`, or
 the no-key-update `claim=no_key_update` / `claim=no_key_update_nowait` modes. A
-no-claim row stream cannot satisfy row-claim coverage.
+no-claim row stream cannot satisfy row-claim coverage. Coverage accounting reads
+the same exact `claim` token, so combined modes such as
+`claim=no_key_update_nowait` satisfy only coverage buckets that explicitly list
+that combined mode, not loose substrings such as plain `claim=no_key_update`.
 
 CTE summaries are self-anchored to the typed fingerprint. A fixture may carry
 `ctes` only when its golden plan includes an exact `ctes` token with the same
