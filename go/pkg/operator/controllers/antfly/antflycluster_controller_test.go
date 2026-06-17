@@ -1109,7 +1109,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":12,"fencing_confirmed":true,"can_promote":true}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`)),
 				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
@@ -1183,15 +1183,19 @@ func TestReconcileHAAdminJobsRejectsUnsafePromotionAssessment(t *testing.T) {
 	}{
 		{
 			name: "cannot promote",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"fencing_confirmed":true,"can_promote":false}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":false}}`,
 		},
 		{
 			name: "missing applied lsn",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"fencing_confirmed":true,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 		{
 			name: "missing fence confirmation",
-			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"can_promote":true}}`,
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
+		},
+		{
+			name: "missing force field",
+			body: `{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`,
 		},
 	}
 
@@ -1418,7 +1422,7 @@ func TestReconcileHAAdminJobsRejectsDirectPromotionMissingReceipt(t *testing.T) 
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"fencing_confirmed":true,"can_promote":false}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":false}}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)

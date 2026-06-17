@@ -3903,6 +3903,21 @@ type haAdminActionReceiptJSON struct {
 	NodeID     string `json:"node_id"`
 }
 
+type haPromotionAssessmentJSON struct {
+	RequiredLSN        *uint64 `json:"required_lsn"`
+	ReceivedLSN        *uint64 `json:"received_lsn"`
+	AppliedLSN         *uint64 `json:"applied_lsn"`
+	HasRequiredLSN     *bool   `json:"has_required_lsn"`
+	CaughtUpToReceived *bool   `json:"caught_up_to_received"`
+	FencingConfirmed   *bool   `json:"fencing_confirmed"`
+	Force              *bool   `json:"force"`
+	DataLossPossible   *bool   `json:"data_loss_possible"`
+	Safe               *bool   `json:"safe"`
+	RequiresFencing    *bool   `json:"requires_fencing"`
+	RequiresForce      *bool   `json:"requires_force"`
+	CanPromote         *bool   `json:"can_promote"`
+}
+
 type haDirectAdminActionResultJSON struct {
 	SchemaVersion uint32                   `json:"schema_version"`
 	Action        haAdminActionReceiptJSON `json:"action"`
@@ -3910,20 +3925,14 @@ type haDirectAdminActionResultJSON struct {
 	Slot          struct {
 		SlotName string `json:"slot_name"`
 	} `json:"slot"`
-	SlotName       string `json:"slot_name"`
-	ManifestID     string `json:"manifest_id"`
-	BackupLSN      uint64 `json:"backup_lsn"`
-	StartRecordLSN uint64 `json:"start_record_lsn"`
-	EndRecordLSN   uint64 `json:"end_record_lsn"`
-	CheckpointLSN  uint64 `json:"checkpoint_lsn"`
-	Assessment     struct {
-		RequiredLSN  uint64 `json:"required_lsn"`
-		ReceivedLSN  uint64 `json:"received_lsn"`
-		AppliedLSN   uint64 `json:"applied_lsn"`
-		CanPromote   bool   `json:"can_promote"`
-		FencingReady bool   `json:"fencing_confirmed"`
-	} `json:"assessment"`
-	Receipt struct {
+	SlotName       string                    `json:"slot_name"`
+	ManifestID     string                    `json:"manifest_id"`
+	BackupLSN      uint64                    `json:"backup_lsn"`
+	StartRecordLSN uint64                    `json:"start_record_lsn"`
+	EndRecordLSN   uint64                    `json:"end_record_lsn"`
+	CheckpointLSN  uint64                    `json:"checkpoint_lsn"`
+	Assessment     haPromotionAssessmentJSON `json:"assessment"`
+	Receipt        struct {
 		Identity struct {
 			ClusterID  uint64 `json:"cluster_id"`
 			ShardID    uint64 `json:"shard_id"`
@@ -4017,6 +4026,10 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 	if topLevel && !haAdminActionReceiptPresent(result.Action) {
 		return nil, false
 	}
+	if strings.TrimSpace(result.Action.ActionKind) == "promotion_assess" &&
+		!haPromotionAssessmentJSONComplete(result.Assessment) {
+		return nil, false
+	}
 	status := &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion:         result.SchemaVersion,
 		ActionID:              strings.TrimSpace(result.Action.ActionID),
@@ -4031,11 +4044,11 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		StartRecordLSN:        result.StartRecordLSN,
 		EndRecordLSN:          result.EndRecordLSN,
 		CheckpointLSN:         result.CheckpointLSN,
-		PromotionRequiredLSN:  result.Assessment.RequiredLSN,
-		PromotionReceivedLSN:  result.Assessment.ReceivedLSN,
-		PromotionAppliedLSN:   result.Assessment.AppliedLSN,
-		PromotionCanPromote:   result.Assessment.CanPromote,
-		PromotionFenced:       result.Assessment.FencingReady,
+		PromotionRequiredLSN:  haUint64JSONValue(result.Assessment.RequiredLSN),
+		PromotionReceivedLSN:  haUint64JSONValue(result.Assessment.ReceivedLSN),
+		PromotionAppliedLSN:   haUint64JSONValue(result.Assessment.AppliedLSN),
+		PromotionCanPromote:   haBoolJSONValue(result.Assessment.CanPromote),
+		PromotionFenced:       haBoolJSONValue(result.Assessment.FencingConfirmed),
 		FenceGeneration:       result.Receipt.Generation,
 		FenceToken:            strings.TrimSpace(result.Receipt.Token),
 		FenceClusterID:        result.Receipt.Identity.ClusterID,
@@ -4072,6 +4085,32 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		return nil, false
 	}
 	return status, true
+}
+
+func haPromotionAssessmentJSONComplete(assessment haPromotionAssessmentJSON) bool {
+	return assessment.RequiredLSN != nil &&
+		assessment.ReceivedLSN != nil &&
+		assessment.AppliedLSN != nil &&
+		assessment.HasRequiredLSN != nil &&
+		assessment.CaughtUpToReceived != nil &&
+		assessment.FencingConfirmed != nil &&
+		assessment.Force != nil &&
+		assessment.DataLossPossible != nil &&
+		assessment.Safe != nil &&
+		assessment.RequiresFencing != nil &&
+		assessment.RequiresForce != nil &&
+		assessment.CanPromote != nil
+}
+
+func haUint64JSONValue(value *uint64) uint64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func haBoolJSONValue(value *bool) bool {
+	return value != nil && *value
 }
 
 func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionResultJSON) bool {
