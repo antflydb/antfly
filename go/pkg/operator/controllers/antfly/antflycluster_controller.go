@@ -4093,6 +4093,13 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
 			continue
 		}
+		if action.AdminResult == nil {
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, &action)
+			cluster.Status.HAStatus.PlannedActions[i] = action
+		}
+		if !haAdminActionSucceededWithEvidence(action) {
+			return
+		}
 		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
 			if cluster.Status.HAStatus.LastPromotion.FenceAuthority == "" {
 				cluster.Status.HAStatus.LastPromotion.FenceAuthority = action.FenceAuthority
@@ -5540,15 +5547,33 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 			result.FenceToken != "" &&
 			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
 	case haActionPromoteStandby:
-		return result.FenceGeneration > 0 &&
-			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
-			result.FenceToken != "" &&
-			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
+		return haPromotionAdminResultHasEvidence(action, result)
 	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
 		return haRejoinResultMatchesRequiredAdminResult(action, result)
 	default:
 		return true
 	}
+}
+
+func haPromotionAdminResultHasEvidence(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil ||
+		result.FenceGeneration == 0 ||
+		(action.FenceGeneration != 0 && result.FenceGeneration != action.FenceGeneration) ||
+		strings.TrimSpace(result.FenceToken) == "" ||
+		strings.TrimSpace(result.FencePromotedNodeID) == "" ||
+		(action.StandbyName != "" && result.FencePromotedNodeID != action.StandbyName) ||
+		result.FenceParentTimelineID == 0 ||
+		result.FenceParentEpoch == 0 ||
+		result.FenceNewTimelineID == 0 ||
+		result.FenceNewEpoch == 0 ||
+		result.FenceRequiredLSN == 0 ||
+		result.FenceObservedLSN < result.FenceRequiredLSN {
+		return false
+	}
+	if action.TargetLSN != 0 && result.FenceRequiredLSN != action.TargetLSN {
+		return false
+	}
+	return true
 }
 
 func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {

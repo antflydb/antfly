@@ -67,6 +67,23 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 	return string(body)
 }
 
+func haPromotionAdminResult(generation uint64, token string, promotedNodeID string) *antflyv1.HAAdminActionResultStatus {
+	return &antflyv1.HAAdminActionResultStatus{
+		FenceGeneration:       generation,
+		FenceToken:            token,
+		FenceClusterID:        100,
+		FenceShardID:          10,
+		FenceTableID:          20,
+		FencePromotedNodeID:   promotedNodeID,
+		FenceParentTimelineID: 4,
+		FenceParentEpoch:      6,
+		FenceNewTimelineID:    5,
+		FenceNewEpoch:         7,
+		FenceRequiredLSN:      12,
+		FenceObservedLSN:      13,
+	}
+}
+
 func mergeStringMaps(base map[string]string, overlay map[string]string) map[string]string {
 	merged := maps.Clone(base)
 	maps.Copy(merged, overlay)
@@ -1574,11 +1591,7 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	}
 	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeFalse())
 
-	promotionActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration:     3,
-		FenceToken:          "ha-fence-token",
-		FencePromotedNodeID: "standby-a",
-	}
+	promotionActions[0].AdminResult = haPromotionAdminResult(3, "ha-fence-token", "standby-a")
 	g.Expect(haPlannedActionDependenciesSucceeded(promotionActions, 1)).To(BeTrue())
 
 	rejoinActions := []antflyv1.HAPlannedActionStatus{{
@@ -1818,11 +1831,7 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 	g.Expect(observed.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
 	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("primary"))
 
-	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration:     7,
-		FenceToken:          "ha-fence-token",
-		FencePromotedNodeID: "standby-a",
-	}
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
 	g.Expect(reconciler.reconcileHAPrimaryRoute(context.Background(), cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, observed)).To(Succeed())
 	g.Expect(observed.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
@@ -1881,11 +1890,7 @@ func TestReconcileHAPrimaryRouteRequiresStandbyRouteSelector(t *testing.T) {
 					AdminURL:      "http://standby-a-ha.default.svc:8081",
 					AdminJobName:  "promote-job",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
-					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration:     7,
-						FenceToken:          "ha-fence-token",
-						FencePromotedNodeID: "standby-a",
-					},
+					AdminResult:   haPromotionAdminResult(7, "ha-fence-token", "standby-a"),
 				}, {
 					Kind:            string(haActionUpdatePrimaryRoute),
 					StandbyName:     "standby-a",
@@ -2018,11 +2023,7 @@ func TestReconcileHAPrimaryRouteHonorsExplicitDependencyAfterUnrelatedFailure(t 
 					StandbyName:   "standby-a",
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
-					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration:     7,
-						FenceToken:          "ha-fence-token",
-						FencePromotedNodeID: "standby-a",
-					},
+					AdminResult:   haPromotionAdminResult(7, "ha-fence-token", "standby-a"),
 				}, {
 					Kind:            string(haActionUpdatePrimaryRoute),
 					DependsOn:       string(haActionPromoteStandby),
@@ -2083,10 +2084,7 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminJobName:    "promote-job",
 					AdminJobPhase:   haAdminJobPhaseSucceeded,
-					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration: 3,
-						FenceToken:      "ha-fence-token",
-					},
+					AdminResult:     haPromotionAdminResult(3, "ha-fence-token", "standby-a"),
 				}},
 			},
 		},
@@ -2227,6 +2225,10 @@ func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 		FencePromotedNodeID: "standby-a",
 	}
 	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
+
+	cluster.Status.HAStatus.PlannedActions[1].AdminResult = haPromotionAdminResult(3, "lease-token-3", "standby-a")
+	reconciler.updateHALastPromotionFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.LastPromotion).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.LastPromotion.PromotedStandbyID).To(Equal("standby-a"))
 }
@@ -2271,6 +2273,7 @@ func TestUpdateHALastPromotionHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					AdminCommand:    []string{"promote", "--current-fence"},
 					AdminJobName:    "promote-job",
 					AdminJobPhase:   haAdminJobPhaseSucceeded,
+					AdminResult:     haPromotionAdminResult(3, "lease-token-3", "standby-a"),
 				}},
 			},
 		},
@@ -2926,6 +2929,7 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
 
+	cluster.Status.HAStatus.PlannedActions[0].AdminResult = haPromotionAdminResult(3, "ha-fence-token", "standby-a")
 	cluster.Status.HAStatus.PlannedActions[1].AdminResult = &antflyv1.HAAdminActionResultStatus{
 		RejoinAction:     "reject_unfenced",
 		RejoinReason:     "no_fence",
@@ -2965,12 +2969,10 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					AdminJobPhase: haAdminJobPhaseFailed,
 				}, {
 					Kind:          string(haActionPromoteStandby),
+					StandbyName:   "standby-a",
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
-					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration: 3,
-						FenceToken:      "ha-fence-token",
-					},
+					AdminResult:   haPromotionAdminResult(3, "ha-fence-token", "standby-a"),
 				}, {
 					Kind:          string(haActionDemoteFormerPrimary),
 					DependsOn:     string(haActionPromoteStandby),
