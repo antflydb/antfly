@@ -2955,6 +2955,64 @@ func TestParseHARejoinAPIResultRecordsReseedExecution(t *testing.T) {
 	g.Expect(ok).To(BeFalse())
 }
 
+func TestHARejoinAssessAdminResultAcceptsDispositionActions(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionDemoteFormerPrimary),
+		StandbyName: "primary-a",
+		TargetLSN:   12,
+		ObservedLSN: 13,
+	}
+	for _, disposition := range []string{"reject_unfenced", "already_current", "rewind", "reseed"} {
+		result := &antflyv1.HAAdminActionResultStatus{
+			RejoinAction:     disposition,
+			FormerNodeID:     "primary-a",
+			TargetTimelineID: 5,
+			TargetEpoch:      7,
+			ForkLSN:          12,
+			FormerLastLSN:    13,
+		}
+		g.Expect(haActionHasRequiredAdminResult(antflyv1.HAPlannedActionStatus{
+			Kind:        action.Kind,
+			StandbyName: action.StandbyName,
+			TargetLSN:   action.TargetLSN,
+			ObservedLSN: action.ObservedLSN,
+			AdminResult: result,
+		})).To(BeTrue(), "disposition %s", disposition)
+	}
+
+	g.Expect(haActionHasRequiredAdminResult(antflyv1.HAPlannedActionStatus{
+		Kind:        action.Kind,
+		StandbyName: action.StandbyName,
+		TargetLSN:   action.TargetLSN,
+		ObservedLSN: action.ObservedLSN,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			RejoinAction:     "unknown",
+			FormerNodeID:     "primary-a",
+			TargetTimelineID: 5,
+			TargetEpoch:      7,
+			ForkLSN:          12,
+			FormerLastLSN:    13,
+		},
+	})).To(BeFalse())
+
+	g.Expect(haActionHasRequiredAdminResult(antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionRewindFormerPrimary),
+		StandbyName: "primary-a",
+		TargetLSN:   12,
+		ObservedLSN: 13,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			RejoinAction:     "rewind",
+			FormerNodeID:     "primary-a",
+			TargetTimelineID: 5,
+			TargetEpoch:      7,
+			ForkLSN:          12,
+			FormerLastLSN:    13,
+		},
+	})).To(BeFalse())
+}
+
 func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 	g := NewWithT(t)
 

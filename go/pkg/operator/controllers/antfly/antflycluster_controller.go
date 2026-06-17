@@ -5757,7 +5757,9 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 	}
 	switch haActionKind(action.Kind) {
 	case haActionDemoteFormerPrimary:
-		if result.RejoinAction != "reject_unfenced" {
+		switch result.RejoinAction {
+		case "reject_unfenced", "already_current", "rewind", "reseed":
+		default:
 			return false
 		}
 	case haActionRewindFormerPrimary:
