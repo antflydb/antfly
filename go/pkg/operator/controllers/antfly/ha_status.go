@@ -1891,6 +1891,9 @@ func haApplyFormerPrimaryAssessment(evaluation *haFormerPrimaryEvaluation, forme
 		former.NodeID != promotion.OldPrimaryID ||
 		former.TargetTimelineID != promotion.NewTimelineID ||
 		former.TargetEpoch != promotion.NewEpoch ||
+		former.FenceAuthority != promotion.FenceAuthority ||
+		former.FenceHolder != promotion.PromotedStandbyID ||
+		former.FenceGeneration != promotion.FenceGeneration ||
 		former.ForkLSN == 0 ||
 		former.AssessedAction == "" {
 		return false

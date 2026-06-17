@@ -1571,6 +1571,9 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	}
 	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
 		NodeID:            "old-primary",
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:       "standby-a",
+		FenceGeneration:   4,
 		TargetTimelineID:  2,
 		TargetEpoch:       2,
 		ForkLSN:           10,
@@ -1599,6 +1602,33 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		t.Fatalf("expected assessed rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
+	cluster.Status.HAStatus.FormerPrimary.FenceGeneration = 3
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former = cluster.Status.HAStatus.FormerPrimary
+	if former == nil ||
+		!former.ReseedRequired ||
+		!former.Diverged ||
+		former.RewindPossible ||
+		former.Action != string(haActionReseedFormerPrimary) ||
+		former.Reason != "FormerPrimaryRequiresReseed" {
+		t.Fatalf("expected stale assessed fence generation to be ignored, got %#v", former)
+	}
+
+	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
+		NodeID:            "old-primary",
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:       "standby-a",
+		FenceGeneration:   4,
+		TargetTimelineID:  2,
+		TargetEpoch:       2,
+		ForkLSN:           10,
+		FormerLastLSN:     11,
+		RetainedFromLSN:   8,
+		DataLossDiscarded: true,
+		AssessedAction:    "rewind",
+		AssessedReason:    "parent_timeline_retained",
+	}
 	cluster.Status.HAStatus.Standbys[0].TimelineID = 2
 	reconciler.updateHAStatusAndConditions(cluster)
 
