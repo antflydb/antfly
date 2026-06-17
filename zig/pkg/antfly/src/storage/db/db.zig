@@ -200,6 +200,11 @@ pub const OpenOptions = struct {
     /// that need remote-write or remote-apply durability must use the HA commit
     /// gate around the primary replication stream.
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    /// Optional async mirror for committed user batch mutations into the HA
+    /// replication stream. This emits versioned `batch_mutation` envelopes for
+    /// catch-up/read-replica apply. It is intentionally best-effort until the
+    /// DB write path is wired to the synchronous HA commit gate.
+    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     /// Optional HA write ownership gate. Client/API writes are allowed only
     /// when this DB is attached to the current HA primary. Standby apply paths
     /// must use replicated-apply entry points that explicitly bypass this
@@ -215,6 +220,8 @@ pub const HAAsyncEffectMirror = struct {
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
 };
+
+pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
 
 pub const HAWriteGate = union(enum) {
     primary: *ha_primary_mod.Primary,
@@ -778,6 +785,7 @@ const EnrichmentAppendContext = struct {
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_write_gate: ?HAWriteGate = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
@@ -799,6 +807,7 @@ const EnrichmentAppendContext = struct {
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_write_gate = self.ha_write_gate,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
@@ -838,6 +847,7 @@ const BatchExecutionContext = struct {
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_write_gate: ?HAWriteGate = null,
 };
 
@@ -2444,6 +2454,7 @@ pub const DB = struct {
     promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_write_gate: ?HAWriteGate = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
@@ -2504,6 +2515,7 @@ pub const DB = struct {
             .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_write_gate = self.ha_write_gate,
         };
     }
@@ -2515,6 +2527,11 @@ pub const DB = struct {
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
         var ctx = self.batchContext();
         mirrorHAReplayPayloadBestEffortContext(&ctx, payload);
+    }
+
+    fn mirrorHABatchMutationBestEffort(self: *DB, request: types.BatchRequest) void {
+        var ctx = self.batchContext();
+        mirrorHABatchMutationBestEffortContext(&ctx, request);
     }
 
     fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
@@ -2662,6 +2679,7 @@ pub const DB = struct {
                 .promotion_owner = opts.promotion_owner,
                 .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ha_async_effect_mirror = opts.ha_async_effect_mirror,
+                .ha_async_batch_mirror = opts.ha_async_batch_mirror,
                 .ha_write_gate = opts.ha_write_gate,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
@@ -2842,6 +2860,7 @@ pub const DB = struct {
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_write_gate = self.ha_write_gate,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -2887,6 +2906,7 @@ pub const DB = struct {
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_write_gate = self.ha_write_gate,
         };
 
@@ -2962,6 +2982,7 @@ pub const DB = struct {
                 .resolution_runtime = self.resolution_runtime,
                 .promotion_runtime = self.promotion_runtime,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
+                .ha_async_batch_mirror = self.ha_async_batch_mirror,
                 .ha_write_gate = self.ha_write_gate,
             },
             .grace_period_ns = cfg.grace_period_ns,
@@ -4594,7 +4615,10 @@ pub const DB = struct {
             },
             store_batch_options,
         );
-        self.mirrorHAReplayPayloadBestEffort(replay_payload);
+        if (!opts.bypass_ha_write_gate) {
+            self.mirrorHABatchMutationBestEffort(effective_req);
+            self.mirrorHAReplayPayloadBestEffort(replay_payload);
+        }
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
         }
@@ -18162,6 +18186,18 @@ fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, pay
     const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
         if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB derived effect into HA stream: {s}", .{@errorName(err)});
+        return;
+    };
+    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+}
+
+fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) void {
+    const mirror = ctx.ha_async_batch_mirror orelse return;
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
+        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        std.log.warn("failed to mirror DB batch mutation into HA stream: {s}", .{@errorName(err)});
         return;
     };
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
@@ -36643,6 +36679,104 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     try std.testing.expectEqual(@as(u64, 1), decoded.record.sequence);
     try std.testing.expectEqualStrings(artifact_key, decoded.record.changed_artifact_keys[0]);
     try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
+}
+
+test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 250,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
+        .cluster_id = 250,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    {
+        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .ha_async_batch_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .deletes = &.{"doc:old"},
+            .timestamp_ns = 123,
+            .sync_level = .write,
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .batch_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 250), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 4), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 10), entry.record.table_id);
+
+    var decoded = try ha_effects_mod.decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.writes.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.value.request.writes[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.value.request.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
+    try std.testing.expectEqualStrings("doc:old", decoded.value.request.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .failure_count = &failures,
+        },
+    });
+    defer standby_db.close();
+
+    try standby_db.batchReplicatedApply(decoded.value.request);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
 }
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {

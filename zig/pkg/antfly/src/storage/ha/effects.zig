@@ -21,6 +21,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("../db/derived/change_journal.zig");
+const db_types = @import("../db/types.zig");
 const primary_mod = @import("primary.zig");
 const replication_record = @import("replication_record.zig");
 
@@ -31,6 +32,60 @@ pub const AppendDerivedEffectOptions = struct {
     table_id: ?u64 = null,
     commit_timestamp_ns: i64 = 0,
 };
+
+pub const AppendBatchMutationOptions = struct {
+    shard_id: ?u64 = null,
+    table_id: ?u64 = null,
+    commit_timestamp_ns: i64 = 0,
+};
+
+pub const BatchMutationPayload = struct {
+    schema_version: u32 = 1,
+    request: db_types.BatchRequest,
+};
+
+pub fn encodeBatchMutationRequestAlloc(
+    alloc: Allocator,
+    request: db_types.BatchRequest,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
+        .request = request,
+    }, .{});
+}
+
+pub fn appendBatchMutationRequest(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    request: db_types.BatchRequest,
+    options: AppendBatchMutationOptions,
+) !u64 {
+    const payload = try encodeBatchMutationRequestAlloc(alloc, request);
+    defer alloc.free(payload);
+
+    return try primary.append(.{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .shard_id = options.shard_id,
+        .table_id = options.table_id,
+        .commit_timestamp_ns = options.commit_timestamp_ns,
+        .payload = payload,
+    });
+}
+
+pub fn decodeBatchMutationRequest(
+    alloc: Allocator,
+    record: replication_record.RecordView,
+) !std.json.Parsed(BatchMutationPayload) {
+    if (record.kind != .batch_mutation) return error.NotBatchMutationRecord;
+    if (record.payload_codec != .json) return error.UnsupportedBatchMutationCodec;
+    var parsed = try std.json.parseFromSlice(BatchMutationPayload, alloc, record.payload, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    errdefer parsed.deinit();
+    if (parsed.value.schema_version != 1) return error.UnsupportedBatchMutationPayloadVersion;
+    return parsed;
+}
 
 pub fn appendDerivedChangeRecord(
     alloc: Allocator,
@@ -129,6 +184,51 @@ test "storage.ha effects appends derived change journal payload as HA derived ef
     try std.testing.expectEqual(change_journal.TargetHint.graph, decoded.record.target_hints[1]);
 }
 
+test "storage.ha effects appends db batch mutation payload as HA batch mutation" {
+    const alloc = std.testing.allocator;
+    const log_path = try testPath(alloc, "batch-log");
+    defer alloc.free(log_path);
+    const slots_path = try testPath(alloc, "batch-slots");
+    defer alloc.free(slots_path);
+
+    var primary = try primary_mod.Primary.open(alloc, log_path.ptr, slots_path.ptr, .{
+        .cluster_id = 101,
+        .shard_id = 8,
+        .table_id = 12,
+        .timeline_id = 3,
+        .epoch = 4,
+    }, .{});
+    defer primary.close();
+
+    const lsn = try appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc-a", .value = "{\"title\":\"alpha\"}" }},
+        .deletes = &.{"doc-old"},
+        .timestamp_ns = 55,
+        .sync_level = .write,
+    }, .{ .commit_timestamp_ns = 5678 });
+    try std.testing.expectEqual(@as(u64, 1), lsn);
+
+    var entry = (try primary.log.entryAt(alloc, lsn)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(replication_record.RecordKind.batch_mutation, entry.record.kind);
+    try std.testing.expectEqual(replication_record.PayloadCodec.json, entry.record.payload_codec);
+    try std.testing.expectEqual(@as(u64, 101), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 8), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 12), entry.record.table_id);
+    try std.testing.expectEqual(@as(i64, 5678), entry.record.commit_timestamp_ns);
+
+    var decoded = try decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), decoded.value.schema_version);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.writes.len);
+    try std.testing.expectEqualStrings("doc-a", decoded.value.request.writes[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.value.request.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
+    try std.testing.expectEqualStrings("doc-old", decoded.value.request.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 55), decoded.value.request.timestamp_ns);
+    try std.testing.expectEqual(db_types.SyncLevel.write, decoded.value.request.sync_level);
+}
+
 test "storage.ha effects rejects non-derived HA records when decoding derived payloads" {
     const record = replication_record.Record{
         .kind = .batch_mutation,
@@ -143,6 +243,53 @@ test "storage.ha effects rejects non-derived HA records when decoding derived pa
     try std.testing.expectError(
         error.NotDerivedEffectRecord,
         decodeDerivedChangeRecord(std.testing.allocator, record),
+    );
+}
+
+test "storage.ha effects rejects unsupported batch mutation payloads" {
+    const derived = replication_record.Record{
+        .kind = .derived_effect,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "{}",
+    };
+    try std.testing.expectError(
+        error.NotBatchMutationRecord,
+        decodeBatchMutationRequest(std.testing.allocator, derived),
+    );
+
+    const binary = replication_record.Record{
+        .kind = .batch_mutation,
+        .payload_codec = .binary,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "",
+    };
+    try std.testing.expectError(
+        error.UnsupportedBatchMutationCodec,
+        decodeBatchMutationRequest(std.testing.allocator, binary),
+    );
+
+    const bad_version = replication_record.Record{
+        .kind = .batch_mutation,
+        .payload_codec = .json,
+        .cluster_id = 1,
+        .timeline_id = 1,
+        .epoch = 1,
+        .lsn = 1,
+        .previous_lsn = 0,
+        .payload = "{\"schema_version\":2,\"request\":{}}",
+    };
+    try std.testing.expectError(
+        error.UnsupportedBatchMutationPayloadVersion,
+        decodeBatchMutationRequest(std.testing.allocator, bad_version),
     );
 }
 
