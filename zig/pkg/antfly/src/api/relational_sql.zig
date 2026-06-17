@@ -10692,12 +10692,6 @@ const Parser = struct {
             .intersect, .except => {
                 if (!querySupportsSimpleIntersectExceptRewrite(lhs)) return error.UnsupportedSqlShape;
                 if (!querySupportsSimpleIntersectExceptRewrite(rhs)) return error.UnsupportedSqlShape;
-                if (op == .intersect and
-                    (lhs.expression_or_predicates.len > 0 or rhs.expression_or_predicates.len > 0) and
-                    (lhs.in_predicates.len > 0 or rhs.in_predicates.len > 0))
-                {
-                    return error.UnsupportedSqlShape;
-                }
             },
         }
     }
@@ -10969,35 +10963,34 @@ const Parser = struct {
         lhs: *LoweredSelect,
         rhs: db_mod.types.RelationalRowsQueryRequest,
     ) !void {
-        const lhs_branch_count = simpleExpressionSetQueryBranchCount(lhs.query);
-        const rhs_branch_count = simpleExpressionSetQueryBranchCount(rhs);
-        if (rhs_branch_count == 0) return;
-        if (lhs_branch_count == 0) {
-            const groups = try cloneSimpleExpressionSetQueryBranchesAlloc(self.alloc, rhs);
+        const rhs_groups = try expressionGroupsFromSimpleIntersectQueryAlloc(self.alloc, rhs);
+        defer {
+            freeExpressionPredicateGroups(self.alloc, rhs_groups);
+            if (rhs_groups.len > 0) self.alloc.free(rhs_groups);
+        }
+        if (rhs_groups.len == 0) return;
+
+        const lhs_groups = try expressionGroupsFromSimpleIntersectQueryAlloc(self.alloc, lhs.query);
+        defer {
+            freeExpressionPredicateGroups(self.alloc, lhs_groups);
+            if (lhs_groups.len > 0) self.alloc.free(lhs_groups);
+        }
+        if (lhs_groups.len == 0) {
+            const groups = try cloneExpressionPredicateGroupsAlloc(self.alloc, rhs_groups);
             self.replaceQueryWithExpressionOrBranches(lhs, groups);
             return;
         }
-        if (lhs_branch_count > max_scalar_or_expanded_branches / rhs_branch_count) return error.UnsupportedSqlShape;
+        if (lhs_groups.len > max_scalar_or_expanded_branches / rhs_groups.len) return error.UnsupportedSqlShape;
 
-        const groups = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, lhs_branch_count * rhs_branch_count);
+        const groups = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, lhs_groups.len * rhs_groups.len);
         var initialized: usize = 0;
         errdefer {
             for (groups[0..initialized]) |group| freeExpressionPredicateGroup(self.alloc, group);
             self.alloc.free(groups);
         }
-        for (0..lhs_branch_count) |left_index| {
-            const left = try expressionConditionsFromSimpleExpressionSetQueryBranchAlloc(self.alloc, lhs.query, left_index);
-            defer {
-                freeExpressionConditions(self.alloc, left);
-                if (left.len > 0) self.alloc.free(left);
-            }
-            for (0..rhs_branch_count) |right_index| {
-                const right = try expressionConditionsFromSimpleExpressionSetQueryBranchAlloc(self.alloc, rhs, right_index);
-                defer {
-                    freeExpressionConditions(self.alloc, right);
-                    if (right.len > 0) self.alloc.free(right);
-                }
-                groups[initialized] = .{ .conditions = try cloneExpressionConditionsConcatAlloc(self.alloc, left, right) };
+        for (lhs_groups) |left| {
+            for (rhs_groups) |right| {
+                groups[initialized] = .{ .conditions = try cloneExpressionConditionsConcatAlloc(self.alloc, left.conditions, right.conditions) };
                 initialized += 1;
             }
         }
@@ -43776,6 +43769,15 @@ fn cloneSimpleExpressionSetQueryBranchesAlloc(
     return groups;
 }
 
+fn expressionGroupsFromSimpleIntersectQueryAlloc(
+    alloc: std.mem.Allocator,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]db_mod.types.RelationalRowsExpressionPredicateGroup {
+    if (queryHasNoSimpleSetPredicates(query)) return &.{};
+    if (query.in_predicates.len > 0) return try expressionGroupsFromInSetQueryAlloc(alloc, query);
+    return try cloneSimpleExpressionSetQueryBranchesAlloc(alloc, query);
+}
+
 fn cloneSimpleAccessSetQueryBranchesInto(
     alloc: std.mem.Allocator,
     out: []db_mod.types.RelationalRowsAccessPredicateGroup,
@@ -74302,6 +74304,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
         },
         .{
+            .name = "query intersect scalar in expression or set operation",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 4, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=4:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending'",
+        },
+        .{
             .name = "query intersect scalar or set operation",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .select = 1 },
@@ -74664,6 +74673,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .predicates = 1, .in_predicates = 1, .expression_predicates = 1, .select = 1 },
             .plan = "read:query:query:table=usage_records:ctes=0:pred=1:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:in=1",
             .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        },
+        .{
+            .name = "read intersect scalar in expression or set operation",
+            .family = .read,
+            .summary = .{ .table_name = "usage_records", .expression_or_predicates = 4, .select = 1 },
+            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:array_any=0:expr_pred=0:expr_or=4:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending'",
         },
         .{
             .name = "read intersect scalar or set operation",
@@ -83049,6 +83065,23 @@ test "postgres sql adapter lowers direct select set operation query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_intersect.query.expression_predicates[0].lhs.kind);
     try std.testing.expectEqualStrings("\"open\"", in_expression_intersect.query.expression_predicates[0].rhs[0].value_json);
     try std.testing.expectEqualStrings("enabled", in_expression_intersect.query.predicates[0].field);
+
+    var in_expression_or_intersect = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending'",
+        schema,
+        &.{},
+    );
+    defer in_expression_or_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_intersect.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 4), in_expression_or_intersect.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_or_intersect.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", in_expression_or_intersect.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_or_intersect.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_or_intersect.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_or_intersect.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_or_intersect.query.expression_or_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", in_expression_or_intersect.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
 
     var or_intersect = try lowerSelectAlloc(
         alloc,
