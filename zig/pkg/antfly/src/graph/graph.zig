@@ -14508,6 +14508,9 @@ test "graph metric build page progress cursor survives renew and reopen" {
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.failed, failed_status.build_pages[0].state);
     try std.testing.expectEqualStrings("worker-a", failed_status.build_pages[0].worker_id);
     try std.testing.expectEqual(@as(u64, 1), failed_status.build_pages[0].attempt);
+    try std.testing.expectEqualStrings("edge-page:0001", failed_status.build_pages[0].cursor);
+    try std.testing.expectEqual(@as(u64, 1), failed_status.build_pages[0].completed_units);
+    try std.testing.expectEqual(@as(u64, 10), failed_status.build_pages[0].total_units);
     try std.testing.expectEqualStrings("simulated page failure", failed_status.build_pages[0].last_error);
 }
 
