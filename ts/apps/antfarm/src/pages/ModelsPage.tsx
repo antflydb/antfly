@@ -51,6 +51,7 @@ import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
+import { ConnectedProvidersSummary } from "@/components/ConnectedProvidersSummary";
 import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
@@ -58,13 +59,13 @@ import {
   getHardwareCapabilities,
   HARDWARE_INFO,
   type HardwareCapability,
+  type InferenceModel,
   MODEL_TYPE_DETAILS,
   MODEL_TYPE_PLAYGROUND,
   type ModelType,
   type QuantizationOption,
   type QuantizationType,
   type RecognizerCapability,
-  type InferenceModel,
   VARIANT_PRESETS,
   type VariantPreset,
 } from "@/data/inference-models";
@@ -1072,6 +1073,8 @@ const ModelsPage: React.FC = () => {
           </div>
         </DashboardPageActions>
       </DashboardPageHeader>
+
+      <ConnectedProvidersSummary />
 
       {/* Search and filters */}
       <DashboardToolbar className="md:flex-col md:items-stretch">

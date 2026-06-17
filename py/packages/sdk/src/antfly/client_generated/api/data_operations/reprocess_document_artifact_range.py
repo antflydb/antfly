@@ -22,7 +22,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/db/v1/tables/{table_name}/artifacts/{artifact_name}:reprocess".format(
+        "url": "/db/v1/tables/{table_name}/artifacts/{artifact_name}/reprocess".format(
             table_name=quote(str(table_name), safe=""),
             artifact_name=quote(str(artifact_name), safe=""),
         ),

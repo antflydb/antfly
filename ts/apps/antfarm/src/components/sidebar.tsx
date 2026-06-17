@@ -24,19 +24,19 @@ import {
 } from "@antfly/design-system";
 import {
   ArrowUpDown,
+  Bot,
   ClipboardCheck,
-  Database,
   FileInput,
-  FileText,
+  FileStack,
   KeyRound,
   Library,
-  MessageCircle,
-  MessageSquare,
   Mic,
   Network,
   PanelLeft,
+  Plug,
   Plus,
   Repeat2,
+  RotateCw,
   ScanLine,
   Scissors,
   Search,
@@ -49,9 +49,8 @@ import {
 } from "lucide-react";
 import * as React from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ProductSwitcher } from "@/components/product-switcher";
 import { SidebarUser } from "@/components/sidebar-user";
-import type { ProductId } from "@/config/products";
+import { isProductEnabled } from "@/config/products";
 import { useAuth } from "@/hooks/use-auth";
 import { useTable } from "@/hooks/use-table";
 import { cn } from "@/lib/utils";
@@ -60,23 +59,20 @@ import { isExternalAuthMode } from "@/runtime-config";
 interface AppSidebarProps extends React.ComponentProps<typeof Sidebar> {
   currentSection?: string;
   onSectionChange?: (section: string) => void;
-  currentProduct: ProductId;
-  onProductChange: (product: ProductId) => void;
 }
 
-export function AppSidebar({
-  currentSection,
-  onSectionChange,
-  currentProduct,
-  onProductChange,
-  ...props
-}: AppSidebarProps) {
+function tableRoute(table: string, section: string) {
+  return `/tables/${encodeURIComponent(table)}?section=${encodeURIComponent(section)}`;
+}
+
+export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSidebarProps) {
   const location = useLocation();
   const navigate = useNavigate();
   const { state: sidebarState, toggleSidebar, isMobile } = useSidebar();
   const { hasPermission } = useAuth();
-  const { tables, selectedTable, setSelectedTable } = useTable();
+  const { tables, selectedTable, setSelectedTable, graphIndexes, isLoadingIndexes } = useTable();
   const showLocalAdminRoutes = !isExternalAuthMode();
+  const showAdmin = showLocalAdminRoutes && hasPermission("*", "*", "admin");
 
   const [comboboxOpen, setComboboxOpen] = React.useState(false);
   const [tooltipOpen, setTooltipOpen] = React.useState(false);
@@ -86,19 +82,20 @@ export function AppSidebar({
     setIsMounted(true);
   }, []);
 
-  const handleSectionClick = (section: string) => {
+  const navigateTableSection = (section: string) => {
     if (!selectedTable) return;
+    onSectionChange?.(section);
+    navigate(tableRoute(selectedTable, section));
+  };
 
-    // Section-based items: navigate to table page if needed, then set section
-    if (!location.pathname.startsWith("/tables/")) {
-      navigate(`/tables/${selectedTable}`);
-    }
-    if (onSectionChange) {
-      onSectionChange(section);
-    }
+  const navigateSelectedTableRoute = (route: string) => {
+    const suffix = selectedTable ? `?table=${encodeURIComponent(selectedTable)}` : "";
+    navigate(`${route}${suffix}`);
   };
 
   const isOnTablePage = location.pathname.startsWith("/tables/");
+  const isTableSection = (section: string) => isOnTablePage && currentSection === section;
+  const isPath = (path: string) => location.pathname === path;
 
   return (
     <Sidebar collapsible="icon" {...props}>
@@ -136,10 +133,21 @@ export function AppSidebar({
                   </Tooltip>
                 </TooltipProvider>
               ) : (
-                <ProductSwitcher
-                  currentProduct={currentProduct}
-                  onProductChange={onProductChange}
-                />
+                <SidebarMenuButton size="lg" className="cursor-default">
+                  <div className="flex h-8 min-w-8 items-center justify-center">
+                    <Anty
+                      size={24}
+                      eyeStyle="original"
+                      float={false}
+                      showShadow={false}
+                      showGlow
+                      style={{ height: 24 }}
+                    />
+                  </div>
+                  <div className="flex min-w-0 flex-1 items-center text-left text-sm leading-tight">
+                    <span className="truncate font-semibold">Antfarm</span>
+                  </div>
+                </SidebarMenuButton>
               )}
               {isMounted && (isMobile || sidebarState !== "collapsed") && (
                 <TooltipProvider delayDuration={0}>
@@ -174,85 +182,371 @@ export function AppSidebar({
       </SidebarHeader>
 
       <SidebarContent className="border-r border-t-0 group-data-[collapsible=icon]:border-r-0">
-        {/* Antfly Management */}
-        {currentProduct === "antfly" && (
+        {isProductEnabled("antfly") && (
+          <>
+            <SidebarGroup>
+              <SidebarGroupLabel className="mono-label">Data</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={isPath("/") || isPath("/create") || isTableSection("overview")}
+                      tooltip="Tables"
+                    >
+                      <a
+                        href="/"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          onSectionChange?.("overview");
+                          navigate("/");
+                        }}
+                      >
+                        <TableIcon className="size-4" />
+                        <span>Tables</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+
+                <div className="px-2 pt-2 pb-1 group-data-[collapsible=icon]:hidden">
+                  <Switcher open={comboboxOpen} onOpenChange={setComboboxOpen}>
+                    <SwitcherTrigger disabled={tables.length === 0} placeholder="Select a table...">
+                      {selectedTable}
+                    </SwitcherTrigger>
+                    <SwitcherContent
+                      searchPlaceholder="Search tables..."
+                      emptyMessage="No table found."
+                      heading="Tables"
+                      footer={
+                        <SwitcherFooter onClick={() => navigate("/create")}>
+                          <Plus className="size-4" />
+                          <span>Create table</span>
+                        </SwitcherFooter>
+                      }
+                    >
+                      {tables.map((table) => (
+                        <SwitcherItem
+                          key={table.name}
+                          value={table.name}
+                          selected={selectedTable === table.name}
+                          onSelect={(value) => {
+                            setSelectedTable(value);
+                            onSectionChange?.("overview");
+                            navigate(tableRoute(value, "overview"));
+                          }}
+                        >
+                          {table.name}
+                        </SwitcherItem>
+                      ))}
+                    </SwitcherContent>
+                  </Switcher>
+                </div>
+              </SidebarGroupContent>
+            </SidebarGroup>
+
+            <SidebarGroup>
+              <SidebarGroupLabel className="mono-label">Retrieval</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("semantic")}
+                      tooltip="Search"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("semantic")}
+                    >
+                      <Search className="size-4" />
+                      <span>Search</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isPath("/data/playground/chat")}
+                      tooltip="Ask"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateSelectedTableRoute("/data/playground/chat")}
+                    >
+                      <Bot className="size-4" />
+                      <span>Ask</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isPath("/data/playground/evals")}
+                      tooltip="Evaluate"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateSelectedTableRoute("/data/playground/evals")}
+                    >
+                      <ClipboardCheck className="size-4" />
+                      <span>Evaluate</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("graph")}
+                      tooltip={graphIndexes.length > 0 ? "Graph" : "Create a graph index first"}
+                      disabled={!selectedTable || (!isLoadingIndexes && graphIndexes.length === 0)}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("graph")}
+                    >
+                      <Network className="size-4" />
+                      <span>Graph</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+
+            <SidebarGroup>
+              <SidebarGroupLabel className="mono-label">Ingest</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("bulk")}
+                      tooltip="Upload"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("bulk")}
+                    >
+                      <Upload className="size-4" />
+                      <span>Upload</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("document-builder")}
+                      tooltip="Manual Entry"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("document-builder")}
+                    >
+                      <FileInput className="size-4" />
+                      <span>Manual Entry</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("artifacts")}
+                      tooltip="Artifacts"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("artifacts")}
+                    >
+                      <FileStack className="size-4" />
+                      <span>Artifacts</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("reprocess")}
+                      tooltip="Reprocess"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("reprocess")}
+                    >
+                      <RotateCw className="size-4" />
+                      <span>Reprocess</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </>
+        )}
+
+        {isProductEnabled("inference") && (
           <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">Management</SidebarGroupLabel>
+            <SidebarGroupLabel className="mono-label">Models</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/" || location.pathname === "/create"}
-                    tooltip="Tables"
+                    isActive={isPath("/inference/models")}
+                    tooltip="Runtime"
                   >
                     <a
-                      href="/"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate("/");
+                      href="/inference/models"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/models");
                       }}
                     >
-                      <TableIcon className="size-4" />
-                      <span>Tables</span>
+                      <Library className="size-4" />
+                      <span>Runtime</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
 
-                {/* Users Link - only show if user has admin permission */}
-                {showLocalAdminRoutes && hasPermission("*", "*", "admin") && (
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/users"}
-                      tooltip="User Management"
-                    >
-                      <a
-                        href="/users"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/users");
-                        }}
-                      >
-                        <Shield className="size-4" />
-                        <span>Users</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                )}
-
-                {/* Secrets Link - only show if user has admin permission */}
-                {showLocalAdminRoutes && hasPermission("*", "*", "admin") && (
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/secrets"}
-                      tooltip="Secret Management"
-                    >
-                      <a
-                        href="/secrets"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/secrets");
-                        }}
-                      >
-                        <KeyRound className="size-4" />
-                        <span>Secrets</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                )}
+                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
+                  Tools
+                </div>
 
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/cluster"}
-                    tooltip="Cluster Overview"
+                    isActive={isPath("/inference/playground/chunk")}
+                    tooltip="Chunk Text"
                   >
                     <a
+                      href="/inference/playground/chunk"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/chunk");
+                      }}
+                    >
+                      <Scissors className="size-4" />
+                      <span>Chunk Text</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/extract")}
+                    tooltip="Extract"
+                  >
+                    <a
+                      href="/inference/playground/extract"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/extract");
+                      }}
+                    >
+                      <Tag className="size-4" />
+                      <span>Extract</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/rewrite")}
+                    tooltip="Rewrite"
+                  >
+                    <a
+                      href="/inference/playground/rewrite"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/rewrite");
+                      }}
+                    >
+                      <Repeat2 className="size-4" />
+                      <span>Rewrite</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/rerank")}
+                    tooltip="Rerank"
+                  >
+                    <a
+                      href="/inference/playground/rerank"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/rerank");
+                      }}
+                    >
+                      <ArrowUpDown className="size-4" />
+                      <span>Rerank</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/kg")}
+                    tooltip="Knowledge Graph"
+                  >
+                    <a
+                      href="/inference/playground/kg"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/kg");
+                      }}
+                    >
+                      <Network className="size-4" />
+                      <span>Knowledge Graph</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/embed")}
+                    tooltip="Embed"
+                  >
+                    <a
+                      href="/inference/playground/embed"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/embed");
+                      }}
+                    >
+                      <Waypoints className="size-4" />
+                      <span>Embed</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/read")}
+                    tooltip="Read Image"
+                  >
+                    <a
+                      href="/inference/playground/read"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/read");
+                      }}
+                    >
+                      <ScanLine className="size-4" />
+                      <span>Read Image</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPath("/inference/playground/transcribe")}
+                    tooltip="Transcribe"
+                  >
+                    <a
+                      href="/inference/playground/transcribe"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        navigate("/inference/playground/transcribe");
+                      }}
+                    >
+                      <Mic className="size-4" />
+                      <span>Transcribe</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
+
+        {isProductEnabled("antfly") && (
+          <SidebarGroup>
+            <SidebarGroupLabel className="mono-label">Operations</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                <SidebarMenuItem>
+                  <SidebarMenuButton asChild isActive={isPath("/cluster")} tooltip="Cluster">
+                    <a
                       href="/cluster"
-                      onClick={(e) => {
-                        e.preventDefault();
+                      onClick={(event) => {
+                        event.preventDefault();
                         navigate("/cluster");
                       }}
                     >
@@ -261,475 +555,61 @@ export function AppSidebar({
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
-        )}
 
-        {/* Antfly Table-Scoped Items - always visible */}
-        {currentProduct === "antfly" && (
-          <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">Table</SidebarGroupLabel>
-            <SidebarGroupContent>
-              {/* Table Selector */}
-              <div className="px-2 pb-2 group-data-[collapsible=icon]:hidden">
-                <Switcher open={comboboxOpen} onOpenChange={setComboboxOpen}>
-                  <SwitcherTrigger disabled={tables.length === 0} placeholder="Select a table...">
-                    {selectedTable}
-                  </SwitcherTrigger>
-                  <SwitcherContent
-                    searchPlaceholder="Search tables..."
-                    emptyMessage="No table found."
-                    heading="Tables"
-                    footer={
-                      <SwitcherFooter onClick={() => navigate("/create")}>
-                        <Plus className="size-4" />
-                        <span>Create table</span>
-                      </SwitcherFooter>
-                    }
-                  >
-                    {tables.map((table) => (
-                      <SwitcherItem
-                        key={table.name}
-                        value={table.name}
-                        selected={selectedTable === table.name}
-                        onSelect={(value) => setSelectedTable(value)}
-                      >
-                        {table.name}
-                      </SwitcherItem>
-                    ))}
-                  </SwitcherContent>
-                </Switcher>
-              </div>
-              <SidebarMenu>
-                {/* Configure subgroup */}
-                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
-                  Configure
-                </div>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "schema"}
-                    tooltip="Schema"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("schema")}
-                  >
-                    <FileText className="size-4" />
-                    <span>Schema</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "indexes"}
-                    tooltip="Indexes"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("indexes")}
-                  >
-                    <Database className="size-4" />
-                    <span>Indexes</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
+                {showAdmin && (
+                  <>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton asChild isActive={isPath("/users")} tooltip="Users">
+                        <a
+                          href="/users"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            navigate("/users");
+                          }}
+                        >
+                          <Shield className="size-4" />
+                          <span>Users</span>
+                        </a>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                    <SidebarMenuItem>
+                      <SidebarMenuButton asChild isActive={isPath("/secrets")} tooltip="Secrets">
+                        <a
+                          href="/secrets"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            navigate("/secrets");
+                          }}
+                        >
+                          <KeyRound className="size-4" />
+                          <span>Secrets</span>
+                        </a>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  </>
+                )}
 
-                {/* Ingest subgroup */}
-                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
-                  Ingest
-                </div>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "bulk"}
-                    tooltip="Upload"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("bulk")}
-                  >
-                    <Upload className="size-4" />
-                    <span>Upload</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "document-builder"}
-                    tooltip="Document Builder"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("document-builder")}
-                  >
-                    <FileInput className="size-4" />
-                    <span>Document Builder</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-
-                {/* Explore subgroup */}
-                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
-                  Explore
-                </div>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "semantic"}
-                    tooltip="Search"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("semantic")}
-                  >
-                    <Search className="size-4" />
-                    <span>Search</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "faceted"}
-                    tooltip="Component Builder"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("faceted")}
-                  >
-                    <FileText className="size-4" />
-                    <span>Component Builder</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    isActive={isOnTablePage && currentSection === "graph"}
-                    tooltip="Graph Explorer"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                    onClick={() => handleSectionClick("graph")}
-                  >
-                    <Network className="size-4" />
-                    <span>Graph Explorer</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location.pathname === "/data/playground/rag"}
-                    tooltip="RAG"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
+                    isActive={location.pathname === "/connections"}
+                    tooltip="Connected Providers & Stores"
                   >
                     <a
-                      href="/data/playground/rag"
+                      href="/connections"
                       onClick={(e) => {
                         e.preventDefault();
-                        navigate(
-                          selectedTable
-                            ? `/data/playground/rag?table=${encodeURIComponent(selectedTable)}`
-                            : "/data/playground/rag"
-                        );
+                        navigate("/connections");
                       }}
                     >
-                      <MessageSquare className="size-4" />
-                      <span>RAG</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={location.pathname === "/data/playground/chat"}
-                    tooltip="Chat"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                  >
-                    <a
-                      href="/data/playground/chat"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate(
-                          selectedTable
-                            ? `/data/playground/chat?table=${encodeURIComponent(selectedTable)}`
-                            : "/data/playground/chat"
-                        );
-                      }}
-                    >
-                      <MessageCircle className="size-4" />
-                      <span>Chat</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={location.pathname === "/data/playground/evals"}
-                    tooltip="Evals"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                  >
-                    <a
-                      href="/data/playground/evals"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate(
-                          selectedTable
-                            ? `/data/playground/evals?table=${encodeURIComponent(selectedTable)}`
-                            : "/data/playground/evals"
-                        );
-                      }}
-                    >
-                      <ClipboardCheck className="size-4" />
-                      <span>Evals</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={location.pathname === "/data/playground/embed"}
-                    tooltip="Embedding"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                  >
-                    <a
-                      href="/data/playground/embed"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate(
-                          selectedTable
-                            ? `/data/playground/embed?table=${encodeURIComponent(selectedTable)}`
-                            : "/data/playground/embed"
-                        );
-                      }}
-                    >
-                      <Waypoints className="size-4" />
-                      <span>Embedding</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={location.pathname === "/data/playground/rerank"}
-                    tooltip="Reranking"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                  >
-                    <a
-                      href="/data/playground/rerank"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate(
-                          selectedTable
-                            ? `/data/playground/rerank?table=${encodeURIComponent(selectedTable)}`
-                            : "/data/playground/rerank"
-                        );
-                      }}
-                    >
-                      <ArrowUpDown className="size-4" />
-                      <span>Reranking</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={location.pathname === "/data/playground/chunk"}
-                    tooltip="Chunking"
-                    disabled={!selectedTable}
-                    className="disabled:opacity-50"
-                  >
-                    <a
-                      href="/data/playground/chunk"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        navigate(
-                          selectedTable
-                            ? `/data/playground/chunk?table=${encodeURIComponent(selectedTable)}`
-                            : "/data/playground/chunk"
-                        );
-                      }}
-                    >
-                      <Scissors className="size-4" />
-                      <span>Chunking</span>
+                      <Plug className="size-4" />
+                      <span>Connections</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
-        )}
-
-        {/* Inference Management */}
-        {currentProduct === "inference" && (
-          <>
-            <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Management</SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/models"}
-                      tooltip="Models & Runtime"
-                    >
-                      <a
-                        href="/inference/models"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/models");
-                        }}
-                      >
-                        <Library className="size-4" />
-                        <span>Models & Runtime</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                </SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
-
-            <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Playgrounds</SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/chunk"}
-                      tooltip="Chunking"
-                    >
-                      <a
-                        href="/inference/playground/chunk"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/chunk");
-                        }}
-                      >
-                        <Scissors className="size-4" />
-                        <span>Chunking</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/extract"}
-                      tooltip="Extraction"
-                    >
-                      <a
-                        href="/inference/playground/extract"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/extract");
-                        }}
-                      >
-                        <Tag className="size-4" />
-                        <span>Extraction</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/rewrite"}
-                      tooltip="Rewriting"
-                    >
-                      <a
-                        href="/inference/playground/rewrite"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/rewrite");
-                        }}
-                      >
-                        <Repeat2 className="size-4" />
-                        <span>Rewriting</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/rerank"}
-                      tooltip="Reranking"
-                    >
-                      <a
-                        href="/inference/playground/rerank"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/rerank");
-                        }}
-                      >
-                        <ArrowUpDown className="size-4" />
-                        <span>Reranking</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/kg"}
-                      tooltip="Knowledge Graph"
-                    >
-                      <a
-                        href="/inference/playground/kg"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/kg");
-                        }}
-                      >
-                        <Network className="size-4" />
-                        <span>Knowledge Graph</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/embed"}
-                      tooltip="Embedding"
-                    >
-                      <a
-                        href="/inference/playground/embed"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/embed");
-                        }}
-                      >
-                        <Waypoints className="size-4" />
-                        <span>Embedding</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/read"}
-                      tooltip="Reader"
-                    >
-                      <a
-                        href="/inference/playground/read"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/read");
-                        }}
-                      >
-                        <ScanLine className="size-4" />
-                        <span>Reader</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={location.pathname === "/inference/playground/transcribe"}
-                      tooltip="Transcribe"
-                    >
-                      <a
-                        href="/inference/playground/transcribe"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          navigate("/inference/playground/transcribe");
-                        }}
-                      >
-                        <Mic className="size-4" />
-                        <span>Transcribe</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                </SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
-          </>
         )}
       </SidebarContent>
 

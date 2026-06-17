@@ -40,6 +40,8 @@ type (
 	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
 	DistanceMetric        = oapi.DistanceMetric
 	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
+	EnrichmentConfig      = oapi.EnrichmentConfig
+	EnrichmentKind        = oapi.EnrichmentKind
 	FullTextIndexConfig   = oapi.FullTextIndexConfig
 	FullTextIndexStats    = oapi.FullTextIndexStats
 
@@ -311,6 +313,11 @@ const (
 	IndexTypeEmbeddings = oapi.IndexTypeEmbeddings
 	IndexTypeFullText   = oapi.IndexTypeFullText
 	IndexTypeGraph      = oapi.IndexTypeGraph
+
+	// EnrichmentKind values
+	EnrichmentKindAsset     = oapi.EnrichmentKindAsset
+	EnrichmentKindChunk     = oapi.EnrichmentKindChunk
+	EnrichmentKindEmbedding = oapi.EnrichmentKindEmbedding
 
 	// DistanceMetric values
 	DistanceMetricCosine       = oapi.DistanceMetricCosine

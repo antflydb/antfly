@@ -15,11 +15,60 @@
 package modelregistry
 
 import (
+	"errors"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func TestIsTransientHuggingFaceError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "tls handshake timeout",
+			err:  errors.New(`failed request for metadata: Head "https://xet-bridge-us/...": net/http: TLS handshake timeout`),
+			want: true,
+		},
+		{
+			name: "rate limited",
+			err:  errors.New("huggingface returned status 429"),
+			want: true,
+		},
+		{
+			name: "bad gateway",
+			err:  errors.New("download failed: 502 Bad Gateway"),
+			want: true,
+		},
+		{
+			name: "missing model files",
+			err:  errors.New("no model files found in repo"),
+			want: false,
+		},
+		{
+			name: "invalid variant",
+			err:  errors.New(`invalid variant "unknown"`),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTransientHuggingFaceError(tt.err)
+			if got != tt.want {
+				t.Fatalf("isTransientHuggingFaceError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestOnnxVariantSuffix(t *testing.T) {
 	tests := []struct {

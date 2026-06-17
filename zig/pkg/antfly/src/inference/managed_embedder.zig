@@ -121,6 +121,11 @@ pub const AntflyProvider = struct {
         model: []const u8,
         request: extracting.Request,
     ) anyerror!extracting.Response = null,
+    /// Returns the task-keyed /ai/v1/models JSON body for the embedded node.
+    list_models_json: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+    ) anyerror![]u8 = null,
 };
 
 pub const InitOptions = struct {
@@ -742,6 +747,14 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         "body"
     else
         "embedding";
+    const artifact_embedding_name = if (root.get("embedding_name")) |json_value| blk: {
+        if (json_value != .string or json_value.string.len == 0) return error.InvalidCreateTableRequest;
+        break :blk json_value.string;
+    } else null;
+    const artifact_source_name = if (root.get("source_artifact_name")) |json_value| blk: {
+        if (json_value != .string or json_value.string.len == 0) return error.InvalidCreateTableRequest;
+        break :blk json_value.string;
+    } else null;
 
     const chunker_json = if (root.get("chunker")) |chunker_value| blk: {
         var chunker_cfg = try chunking_types.parseConfigFromValue(alloc, chunker_value);
@@ -825,6 +838,8 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try resolveEmbeddingDimensionsForManagedConfig(alloc, index_name, cfg, embedder, options)
     else
         try resolveDeclaredEmbeddingDimensionsRequired(cfg);
+    if (artifact_embedding_name != null and external) return error.InvalidCreateTableRequest;
+    if (artifact_source_name != null and artifact_embedding_name == null) return error.InvalidCreateTableRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -838,10 +853,12 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
-    try appendJsonString(alloc, &out, index_name);
+    try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
     try appendOptionalDenseStorageFormatFields(alloc, &out, root);
 
-    if (!external) {
+    if (artifact_embedding_name != null) {
+        if (chunker_json != null or template_value != null) return error.InvalidCreateTableRequest;
+    } else if (!external) {
         try out.appendSlice(alloc, ",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":");
         try appendJsonString(alloc, &out, source_field);
         if (template_value) |source_template| {
@@ -2263,6 +2280,27 @@ test "managed embedder treats dense storage version zero as unspecified" {
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"backend\":\"lsm\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"format\":\"base_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"version\"") == null);
+}
+
+pub fn testArtifactBackedEmbeddingTranslation() !void {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"embedding","embedding_name":"document_chunk_dense_v1","source_artifact_name":"document_chunks_v1","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "document_vectors", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"embedding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"document_chunk_dense_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedder\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\"") == null);
+}
+
+test "managed embedder translates artifact backed embeddings config without generator" {
+    try testArtifactBackedEmbeddingTranslation();
 }
 
 test "managed embedder translates managed embeddings config with probed dimension" {

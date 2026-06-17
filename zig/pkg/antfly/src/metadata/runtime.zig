@@ -18,11 +18,14 @@ const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
+const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const platform_time = @import("../platform/time.zig");
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
+const metadata_raft_retained_entries = 1024;
+const metadata_raft_compaction_min_interval_entries = 512;
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
@@ -34,6 +37,17 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
         .max_apply_tasks_per_round = 16,
+        .applied_log_retained_entries = metadata_raft_retained_entries,
+        .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
+        .applied_log_compaction_single_node_only = false,
+    };
+}
+
+fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
+    return .{
+        .compaction_retained_entries = metadata_raft_retained_entries,
+        .compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
+        .compaction_single_node_only = false,
     };
 }
 
@@ -53,6 +67,7 @@ const CliConfig = struct {
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
     help: bool = false,
 };
@@ -96,7 +111,7 @@ const Factory = struct {
                     .id = record.local_node_id,
                     .group_id = record.group_id,
                     .peers = peers,
-                    .election_tick = 5,
+                    .election_tick = 30,
                     .heartbeat_tick = 1,
                     .pre_vote = true,
                     .check_quorum = true,
@@ -118,11 +133,13 @@ const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
+    extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
+        alloc.free(self.extension_package_store_dir);
     }
 };
 
@@ -157,6 +174,8 @@ pub const HealthSource = struct {
         const svc = self.server.metadataHttpService();
         const host_metrics = svc.raft.host.http_host.metricsSnapshot();
         const svc_metrics = svc.metrics();
+        const memory = svc.memoryDiagnostics();
+        const raft_storage = self.server.metadataRaftStorageDiagnostics();
 
         const append = antfly.common.health_server.appendPromMetric;
 
@@ -193,6 +212,77 @@ pub const HealthSource = struct {
         try append(writer, "antfly_service_split_transitions_completed_total", "counter", "Completed split transitions", @intCast(svc_metrics.completed_split_transitions));
         try append(writer, "antfly_service_merge_transitions_queued", "gauge", "Queued merge transitions", @intCast(svc_metrics.queued_merge_transitions));
         try append(writer, "antfly_service_merge_transitions_completed_total", "counter", "Completed merge transitions", @intCast(svc_metrics.completed_merge_transitions));
+
+        try append(writer, "antfly_process_memory_available", "gauge", "Whether process memory metrics are available on this platform", if (memory.process.available) 1 else 0);
+        if (memory.process.available) {
+            try append(writer, "antfly_process_resident_bytes", "gauge", "Process resident bytes reported by the operating system", memory.process.resident_bytes);
+            try append(writer, "antfly_process_anonymous_bytes", "gauge", "Process anonymous resident bytes reported by the operating system", memory.process.anonymous_bytes);
+            try append(writer, "antfly_process_private_dirty_bytes", "gauge", "Process private dirty bytes reported by the operating system", memory.process.private_dirty_bytes);
+            try append(writer, "antfly_process_footprint_bytes", "gauge", "Process physical footprint bytes reported by the operating system", memory.process.footprint_bytes);
+            try append(writer, "antfly_process_wired_bytes", "gauge", "Process wired bytes reported by the operating system", memory.process.wired_bytes);
+            try append(writer, "antfly_process_pageins_total", "counter", "Process page-ins reported by the operating system", memory.process.pageins);
+            try append(writer, "antfly_process_malloc_available", "gauge", "Whether process malloc zone metrics are available on this platform", if (memory.process.malloc_available) 1 else 0);
+            if (memory.process.malloc_available) {
+                try append(writer, "antfly_process_malloc_allocated_bytes", "gauge", "Live bytes allocated across process malloc zones", memory.process.malloc_allocated_bytes);
+                try append(writer, "antfly_process_malloc_zone_bytes", "gauge", "Bytes reserved by process malloc zones", memory.process.malloc_zone_bytes);
+            }
+        }
+
+        try append(writer, "antfly_metadata_projected_core_snapshot_cached", "gauge", "Whether the metadata projected-core snapshot cache currently has a snapshot", if (memory.projected_core_snapshot.cached) 1 else 0);
+        try append(writer, "antfly_metadata_projected_core_snapshot_estimated_bytes", "gauge", "Approximate retained bytes in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.estimated_bytes));
+        try append(writer, "antfly_metadata_projected_core_snapshot_tables", "gauge", "Tables retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.tables));
+        try append(writer, "antfly_metadata_projected_core_snapshot_ranges", "gauge", "Ranges retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.ranges));
+        try append(writer, "antfly_metadata_projected_core_snapshot_stores", "gauge", "Stores retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.stores));
+        try append(writer, "antfly_metadata_projected_core_snapshot_store_group_statuses", "gauge", "Store group-status records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.store_group_statuses));
+        try append(writer, "antfly_metadata_projected_core_snapshot_store_runtime_statuses", "gauge", "Store runtime-status records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.store_runtime_statuses));
+        try append(writer, "antfly_metadata_projected_core_snapshot_placement_intents", "gauge", "Placement intents retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.placement_intents));
+        try append(writer, "antfly_metadata_projected_core_snapshot_schema_progresses", "gauge", "Schema-progress records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.schema_progresses));
+        try append(writer, "antfly_metadata_projected_core_snapshot_restore_progresses", "gauge", "Restore-progress records retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.restore_progresses));
+        try append(writer, "antfly_metadata_projected_core_snapshot_replication_source_statuses", "gauge", "Replication source statuses retained in the metadata projected-core snapshot cache", @intCast(memory.projected_core_snapshot.replication_source_statuses));
+
+        try append(writer, "antfly_metadata_raft_memory_storage_groups", "gauge", "Raft groups counted in metadata raft MemoryStorage diagnostics", @intCast(raft_storage.groups));
+        try append(writer, "antfly_metadata_raft_memory_storage_entries", "gauge", "Raft log entries retained by metadata raft MemoryStorage", @intCast(raft_storage.entries));
+        try append(writer, "antfly_metadata_raft_memory_storage_entry_capacity", "gauge", "Raft log entry capacity retained by metadata raft MemoryStorage", @intCast(raft_storage.entry_capacity));
+        try append(writer, "antfly_metadata_raft_memory_storage_entry_payload_bytes", "gauge", "Raft log entry payload bytes retained by metadata raft MemoryStorage", @intCast(raft_storage.entry_payload_bytes));
+        try append(writer, "antfly_metadata_raft_memory_storage_estimated_bytes", "gauge", "Approximate bytes retained by metadata raft MemoryStorage", @intCast(raft_storage.estimated_bytes));
+        try append(writer, "antfly_metadata_raft_memory_storage_max_entries_per_group", "gauge", "Maximum raft log entries retained by any metadata raft group MemoryStorage", @intCast(raft_storage.max_entries_per_group));
+        try append(writer, "antfly_metadata_raft_memory_storage_min_first_index", "gauge", "Minimum first raft log index retained by metadata raft MemoryStorage", raft_storage.min_first_index);
+        try append(writer, "antfly_metadata_raft_memory_storage_max_last_index", "gauge", "Maximum last raft log index retained by metadata raft MemoryStorage", raft_storage.max_last_index);
+        try append(writer, "antfly_metadata_raft_memory_storage_max_snapshot_index", "gauge", "Maximum snapshot index retained by metadata raft MemoryStorage", raft_storage.max_snapshot_index);
+        try append(writer, "antfly_metadata_raft_memory_storage_compactions_total", "counter", "Total metadata raft MemoryStorage compactions reported by the replica state provider", raft_storage.storage_compactions);
+
+        try append(writer, "antfly_metadata_json_response_calls_total", "counter", "Metadata JSON responses allocated by the metadata HTTP server", memory.json_response.calls);
+        try append(writer, "antfly_metadata_json_response_bytes_total", "counter", "Total JSON response body bytes allocated by the metadata HTTP server", memory.json_response.bytes_total);
+        try append(writer, "antfly_metadata_json_response_peak_bytes", "gauge", "Largest JSON response body allocated by the metadata HTTP server", memory.json_response.peak_bytes);
+
+        try append(writer, "antfly_metadata_projected_store_lsm_mutable_bytes", "gauge", "Mutable in-memory LSM bytes retained by the metadata projected store", memory.projected_store_lsm.mutable_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_immutable_bytes", "gauge", "Immutable in-memory LSM bytes retained by the metadata projected store", memory.projected_store_lsm.immutable_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_run_bytes", "gauge", "Table-run bytes retained by the metadata projected store LSM", memory.projected_store_lsm.total_run_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_wal_retained_bytes", "gauge", "WAL bytes retained by the metadata projected store LSM", memory.projected_store_lsm.wal_retained_bytes);
+        try append(writer, "antfly_metadata_projected_store_lsm_wal_retained_segments", "gauge", "WAL segments retained by the metadata projected store LSM", memory.projected_store_lsm.wal_retained_segments);
+        try append(writer, "antfly_metadata_projected_store_lsm_active_readers", "gauge", "Active readers pinning metadata projected store LSM state", memory.projected_store_lsm.active_readers);
+        try append(writer, "antfly_metadata_projected_store_lsm_obsolete_paths", "gauge", "Obsolete LSM paths retained by the metadata projected store", memory.projected_store_lsm.obsolete_paths);
+        try append(writer, "antfly_metadata_projected_store_lsm_bulk_clone_active_bytes", "gauge", "Bulk-ingest current-scan clone bytes retained by the metadata projected store LSM", memory.projected_store_lsm.bulk_ingest_current_scan_clone_active_bytes);
+
+        try append(writer, "antfly_metadata_hosted_write_cache_present", "gauge", "Whether a hosted metadata write DB cache exists for this replica root", if (memory.hosted_write_cache.present) 1 else 0);
+        try append(writer, "antfly_metadata_hosted_write_cache_roots", "gauge", "Hosted metadata write DB cache roots registered in this process", memory.hosted_write_cache.cached_roots);
+        try append(writer, "antfly_metadata_hosted_write_cache_entries", "gauge", "Live hosted metadata write DB cache entries", memory.hosted_write_cache.cached_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_retired_entries", "gauge", "Retired hosted metadata write DB cache entries waiting for leases to release", memory.hosted_write_cache.retired_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_table_metadata_entries", "gauge", "Table metadata entries retained by the hosted metadata write DB cache", memory.hosted_write_cache.table_metadata_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_active_leases", "gauge", "Active leases held on live hosted metadata write DB cache entries", memory.hosted_write_cache.active_leases);
+        try append(writer, "antfly_metadata_hosted_write_cache_retired_active_leases", "gauge", "Active leases keeping retired hosted metadata write DB cache entries alive", memory.hosted_write_cache.retired_active_leases);
+        try append(writer, "antfly_metadata_hosted_write_cache_active_bulk_sessions", "gauge", "Explicit bulk-ingest sessions retained by the hosted metadata write DB cache", memory.hosted_write_cache.active_bulk_sessions);
+        try append(writer, "antfly_metadata_hosted_write_cache_bulk_ingest_open_entries", "gauge", "Hosted metadata write DB cache entries with open bulk-ingest sessions", memory.hosted_write_cache.bulk_ingest_open_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_auto_bulk_open_entries", "gauge", "Hosted metadata write DB cache entries with open auto bulk-ingest sessions", memory.hosted_write_cache.auto_bulk_ingest_open_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_auto_bulk_finish_requested_entries", "gauge", "Hosted metadata write DB cache auto bulk-ingest entries that requested finish", memory.hosted_write_cache.auto_bulk_ingest_finish_requested_entries);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_mutable_bytes", "gauge", "Mutable in-memory LSM bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_mutable_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_immutable_bytes", "gauge", "Immutable in-memory LSM bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_immutable_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_run_bytes", "gauge", "Table-run bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_total_run_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes", "gauge", "WAL bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_wal_retained_bytes);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_wal_retained_segments", "gauge", "WAL segments retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_wal_retained_segments);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_active_readers", "gauge", "Active readers pinning hosted metadata write DB cache LSM state", memory.hosted_write_cache.lsm_active_readers);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_obsolete_paths", "gauge", "Obsolete LSM paths retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_obsolete_paths);
+        try append(writer, "antfly_metadata_hosted_write_cache_lsm_bulk_clone_active_bytes", "gauge", "Bulk-ingest current-scan clone bytes retained by hosted metadata write DB cache entries", memory.hosted_write_cache.lsm_bulk_ingest_current_scan_clone_active_bytes);
     }
 };
 
@@ -225,6 +315,60 @@ pub const ServerConfig = struct {
     secret_store: ?*antfly.common.secrets.FileStore = null,
 };
 
+const MetadataRaftStorageDiagnostics = struct {
+    groups: usize = 0,
+    entries: usize = 0,
+    entry_capacity: usize = 0,
+    entry_payload_bytes: usize = 0,
+    estimated_bytes: usize = 0,
+    max_entries_per_group: usize = 0,
+    min_first_index: raft_engine.core.types.Index = 0,
+    max_last_index: raft_engine.core.types.Index = 0,
+    max_snapshot_index: raft_engine.core.types.Index = 0,
+    storage_compactions: u64 = 0,
+};
+
+const MetadataRaftStorageDiagnosticsCache = struct {
+    groups: std.atomic.Value(usize) = .init(0),
+    entries: std.atomic.Value(usize) = .init(0),
+    entry_capacity: std.atomic.Value(usize) = .init(0),
+    entry_payload_bytes: std.atomic.Value(usize) = .init(0),
+    estimated_bytes: std.atomic.Value(usize) = .init(0),
+    max_entries_per_group: std.atomic.Value(usize) = .init(0),
+    min_first_index: std.atomic.Value(raft_engine.core.types.Index) = .init(0),
+    max_last_index: std.atomic.Value(raft_engine.core.types.Index) = .init(0),
+    max_snapshot_index: std.atomic.Value(raft_engine.core.types.Index) = .init(0),
+    storage_compactions: std.atomic.Value(u64) = .init(0),
+
+    fn store(self: *MetadataRaftStorageDiagnosticsCache, value: MetadataRaftStorageDiagnostics) void {
+        self.groups.store(value.groups, .monotonic);
+        self.entries.store(value.entries, .monotonic);
+        self.entry_capacity.store(value.entry_capacity, .monotonic);
+        self.entry_payload_bytes.store(value.entry_payload_bytes, .monotonic);
+        self.estimated_bytes.store(value.estimated_bytes, .monotonic);
+        self.max_entries_per_group.store(value.max_entries_per_group, .monotonic);
+        self.min_first_index.store(value.min_first_index, .monotonic);
+        self.max_last_index.store(value.max_last_index, .monotonic);
+        self.max_snapshot_index.store(value.max_snapshot_index, .monotonic);
+        self.storage_compactions.store(value.storage_compactions, .monotonic);
+    }
+
+    fn load(self: *const MetadataRaftStorageDiagnosticsCache) MetadataRaftStorageDiagnostics {
+        return .{
+            .groups = self.groups.load(.monotonic),
+            .entries = self.entries.load(.monotonic),
+            .entry_capacity = self.entry_capacity.load(.monotonic),
+            .entry_payload_bytes = self.entry_payload_bytes.load(.monotonic),
+            .estimated_bytes = self.estimated_bytes.load(.monotonic),
+            .max_entries_per_group = self.max_entries_per_group.load(.monotonic),
+            .min_first_index = self.min_first_index.load(.monotonic),
+            .max_last_index = self.max_last_index.load(.monotonic),
+            .max_snapshot_index = self.max_snapshot_index.load(.monotonic),
+            .storage_compactions = self.storage_compactions.load(.monotonic),
+        };
+    }
+};
+
 pub const Server = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
@@ -235,10 +379,12 @@ pub const Server = struct {
     snapshot_root_dir: []u8,
     bind_host: []u8,
     admin_bind_host: []u8,
+    raft_storage_diagnostics: MetadataRaftStorageDiagnosticsCache = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: ServerConfig) !Server {
         var result: Server = undefined;
         result.alloc = alloc;
+        result.raft_storage_diagnostics = .{};
         result.store = try alloc.create(raft_engine.core.MemoryStorage);
         errdefer alloc.destroy(result.store);
         result.store.* = raft_engine.core.MemoryStorage.init(alloc);
@@ -290,6 +436,7 @@ pub const Server = struct {
                         },
                     },
                 },
+                .wal_replica_state = metadataWalReplicaStateConfig(),
             },
             .admin_listener = .{
                 .bind_host = result.admin_bind_host,
@@ -411,6 +558,7 @@ pub const Server = struct {
         self.server.svc.observe_local_replica_root = false;
         defer self.server.svc.observe_local_replica_root = observe_local_replica_root;
         try self.server.runRound();
+        self.refreshMetadataRaftStorageDiagnostics();
         _ = try self.server.svc.ensureMetadataReplica(.{
             .group_id = metadata_group_id,
             .replica_id = 1,
@@ -421,6 +569,7 @@ pub const Server = struct {
 
     pub fn runRound(self: *Server) !void {
         try self.server.runRound();
+        self.refreshMetadataRaftStorageDiagnostics();
     }
 
     pub fn runCdcRound(self: *Server) !void {
@@ -445,6 +594,44 @@ pub const Server = struct {
 
     pub fn metadataHttpService(self: *Server) *antfly.metadata_service.MetadataHttpService {
         return self.server.svc;
+    }
+
+    pub fn metadataRaftStorageDiagnostics(self: *Server) MetadataRaftStorageDiagnostics {
+        return self.raft_storage_diagnostics.load();
+    }
+
+    fn refreshMetadataRaftStorageDiagnostics(self: *Server) void {
+        self.raft_storage_diagnostics.store(self.collectMetadataRaftStorageDiagnostics());
+    }
+
+    fn collectMetadataRaftStorageDiagnostics(self: *Server) MetadataRaftStorageDiagnostics {
+        if (self.server.svc.raft.host.owned_wal_replica_provider) |provider| {
+            const stats = provider.diagnostics();
+            return .{
+                .groups = stats.groups,
+                .entries = stats.entries,
+                .entry_capacity = stats.entry_capacity,
+                .entry_payload_bytes = stats.entry_payload_bytes,
+                .estimated_bytes = stats.estimated_bytes,
+                .max_entries_per_group = stats.max_entries_per_group,
+                .min_first_index = stats.min_first_index,
+                .max_last_index = stats.max_last_index,
+                .max_snapshot_index = stats.max_snapshot_index,
+                .storage_compactions = stats.storage_compactions,
+            };
+        }
+        const storage = self.store.diagnostics();
+        return .{
+            .groups = if (storage.entries > 0 or storage.snapshot_index > 0) 1 else 0,
+            .entries = storage.entries,
+            .entry_capacity = storage.entry_capacity,
+            .entry_payload_bytes = storage.entry_payload_bytes,
+            .estimated_bytes = storage.estimated_bytes,
+            .max_entries_per_group = storage.entries,
+            .min_first_index = storage.first_index,
+            .max_last_index = storage.last_index,
+            .max_snapshot_index = storage.snapshot_index,
+        };
     }
 
     pub fn baseUri(self: *Server, alloc: std.mem.Allocator) ![]u8 {
@@ -568,6 +755,10 @@ pub fn runFromIterator(
     defer server.deinit();
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
+    const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
+    if (synced_extension_packages > 0) {
+        std.log.info("metadata synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
+    }
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -592,7 +783,7 @@ pub fn runFromIterator(
     );
     defer if (health_server) |hs| hs.deinit();
 
-    const tick_ms = cli.tick_ms orelse 25;
+    const tick_ms = cli.tick_ms orelse 100;
     var req = std.posix.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
@@ -691,6 +882,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.snapshot_root_dir = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extension-package-store")) {
+            cfg.extension_package_store_dir = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
@@ -739,11 +934,20 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
+    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
+        try normalizeResolvedPathAlloc(alloc, path)
+    else blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(extension_package_store_dir);
 
     return .{
         .replica_root_dir = replica_root_dir,
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
+        .extension_package_store_dir = extension_package_store_dir,
     };
 }
 
@@ -999,6 +1203,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
         \\  --snapshot-root-dir <path>     Snapshot root directory
+        \\  --extension-package-store <path>
+        \\                                 Extension package store directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
         \\  -h, --help                     Show this help
         \\
@@ -1016,11 +1222,82 @@ test "metadata runtime module compiles" {
     _ = runFromIterator;
 }
 
-test "metadata runtime cli accepts secret store path" {
-    var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
+test "metadata runtime cli accepts secret and extension package store paths" {
+    var argv = [_][*:0]const u8{
+        "--secret-store-path",
+        "/run/antfly/secrets/secrets.json",
+        "--extension-package-store",
+        "/opt/antfly/extensions",
+    };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const cfg = try parseCli(&iter);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+    try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+fn expectMetricPresent(output: []const u8, name: []const u8) !void {
+    const help = try std.fmt.allocPrint(std.testing.allocator, "# HELP {s}", .{name});
+    defer std.testing.allocator.free(help);
+    try std.testing.expect(std.mem.indexOf(u8, output, help) != null);
+}
+
+fn metadataMemorySoakEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_METADATA_MEMORY_SOAK", false);
+}
+
+fn metadataMemorySoakEnvUsize(comptime name: [*:0]const u8, default: usize) usize {
+    return platform.env.getenvUsize(name) orelse default;
+}
+
+fn printMetadataMemorySoakSample(label: []const u8, round: usize, memory: anytype, raft_storage: anytype) void {
+    std.debug.print(
+        "metadata-memory-soak {s} round={} process_available={} rss={} anon={} private_dirty={} footprint={} malloc_available={} malloc_allocated={} malloc_zone={} projected_cached={} projected_bytes={} projected_tables={} projected_ranges={} projected_stores={} projected_runtime_statuses={} projected_replication_statuses={} raft_groups={} raft_entries={} raft_capacity={} raft_payload_bytes={} raft_estimated_bytes={} raft_max_entries_per_group={} raft_min_first_index={} raft_max_last_index={} raft_max_snapshot_index={} raft_compactions={} ",
+        .{
+            label,
+            round,
+            memory.process.available,
+            memory.process.resident_bytes,
+            memory.process.anonymous_bytes,
+            memory.process.private_dirty_bytes,
+            memory.process.footprint_bytes,
+            memory.process.malloc_available,
+            memory.process.malloc_allocated_bytes,
+            memory.process.malloc_zone_bytes,
+            memory.projected_core_snapshot.cached,
+            memory.projected_core_snapshot.estimated_bytes,
+            memory.projected_core_snapshot.tables,
+            memory.projected_core_snapshot.ranges,
+            memory.projected_core_snapshot.stores,
+            memory.projected_core_snapshot.store_runtime_statuses,
+            memory.projected_core_snapshot.replication_source_statuses,
+            raft_storage.groups,
+            raft_storage.entries,
+            raft_storage.entry_capacity,
+            raft_storage.entry_payload_bytes,
+            raft_storage.estimated_bytes,
+            raft_storage.max_entries_per_group,
+            raft_storage.min_first_index,
+            raft_storage.max_last_index,
+            raft_storage.max_snapshot_index,
+            raft_storage.storage_compactions,
+        },
+    );
+    std.debug.print(
+        "projected_lsm_mutable={} projected_lsm_immutable={} projected_lsm_runs={} projected_lsm_wal={} json_calls={} json_peak={} json_total={} hosted_cache_present={} hosted_cache_entries={} hosted_retired={} hosted_lsm_wal={}\n",
+        .{
+            memory.projected_store_lsm.mutable_bytes,
+            memory.projected_store_lsm.immutable_bytes,
+            memory.projected_store_lsm.total_run_bytes,
+            memory.projected_store_lsm.wal_retained_bytes,
+            memory.json_response.calls,
+            memory.json_response.peak_bytes,
+            memory.json_response.bytes_total,
+            memory.hosted_write_cache.present,
+            memory.hosted_write_cache.cached_entries,
+            memory.hosted_write_cache.retired_entries,
+            memory.hosted_write_cache.lsm_wal_retained_bytes,
+        },
+    );
 }
 
 test "metadata runtime server uses wal replica state backend by default" {
@@ -1043,6 +1320,191 @@ test "metadata runtime server uses wal replica state backend by default" {
 
     try std.testing.expect(server.server.svc.raft.host.owned_wal_replica_provider != null);
     try std.testing.expect(server.server.svc.raft.host.owned_file_replica_provider == null);
+}
+
+test "metadata runtime enables bounded raft storage compaction for multi-node groups" {
+    const runtime_cfg = metadataRaftRuntimeConfig();
+    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
+    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
+    try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
+
+    const wal_cfg = metadataWalReplicaStateConfig();
+    try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), wal_cfg.compaction_retained_entries);
+    try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), wal_cfg.compaction_min_interval_entries);
+    try std.testing.expect(!wal_cfg.compaction_single_node_only);
+}
+
+test "metadata runtime metrics expose memory ownership buckets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var server = try Server.init(std.testing.allocator, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
+
+    if (server.server.owned_admin_http_server) |admin| {
+        var resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
+        defer resp.deinit(std.testing.allocator);
+    }
+
+    var health = HealthSource{ .server = &server };
+    var buf: [128 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const output = writer.buffered();
+
+    try expectMetricPresent(output, "antfly_process_memory_available");
+    try expectMetricPresent(output, "antfly_metadata_projected_core_snapshot_estimated_bytes");
+    try expectMetricPresent(output, "antfly_metadata_projected_store_lsm_wal_retained_bytes");
+    try expectMetricPresent(output, "antfly_metadata_json_response_calls_total");
+    try expectMetricPresent(output, "antfly_metadata_raft_memory_storage_estimated_bytes");
+    try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_entries");
+    try expectMetricPresent(output, "antfly_metadata_hosted_write_cache_lsm_wal_retained_bytes");
+}
+
+test "metadata runtime memory soak diagnostic" {
+    if (!metadataMemorySoakEnabled()) return error.SkipZigTest;
+
+    const soak_alloc = std.heap.page_allocator;
+    const rounds = metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_ROUNDS", 2000);
+    const sample_every = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_SAMPLE_EVERY", 100));
+    const table_count = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_TABLES", 4));
+    const ranges_per_table = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_RANGES_PER_TABLE", 8));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/replicas", .{tmp.sub_path});
+    defer soak_alloc.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/catalog.txt", .{tmp.sub_path});
+    defer soak_alloc.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/snapshots", .{tmp.sub_path});
+    defer soak_alloc.free(snapshot_root);
+
+    var server = try Server.init(soak_alloc, .{
+        .local_node_id = 1,
+        .metadata_group_id = group_ids.main_metadata_group_id,
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+        .observe_local_replica_root = false,
+    });
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
+
+    const svc = server.metadataHttpService();
+    try svc.registerNode(.{ .node_id = 1, .role = "metadata" });
+    try svc.registerNode(.{ .node_id = 2, .role = "data" });
+    try svc.registerNode(.{ .node_id = 3, .role = "data" });
+    try svc.upsertStore(.{ .store_id = 31, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024 * 1024 * 1024, .available_bytes = 900 * 1024 * 1024 });
+    try svc.upsertStore(.{ .store_id = 32, .node_id = 2, .role = "data", .live = true, .capacity_bytes = 1024 * 1024 * 1024, .available_bytes = 850 * 1024 * 1024 });
+    try svc.upsertStore(.{ .store_id = 33, .node_id = 3, .role = "data", .live = true, .capacity_bytes = 1024 * 1024 * 1024, .available_bytes = 800 * 1024 * 1024 });
+
+    var table_idx: usize = 0;
+    while (table_idx < table_count) : (table_idx += 1) {
+        const table_id = 1000 + @as(u64, @intCast(table_idx));
+        const table_name = try std.fmt.allocPrint(soak_alloc, "docs_{}", .{table_idx});
+        defer soak_alloc.free(table_name);
+        try svc.upsertTable(.{
+            .table_id = table_id,
+            .name = table_name,
+            .desired_replica_count = 3,
+            .min_ranges = @intCast(ranges_per_table),
+        });
+        var range_idx: usize = 0;
+        while (range_idx < ranges_per_table) : (range_idx += 1) {
+            const start_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:a", .{range_idx});
+            defer soak_alloc.free(start_key);
+            const end_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:z", .{range_idx});
+            defer soak_alloc.free(end_key);
+            try svc.upsertRange(.{
+                .group_id = table_id * 1000 + @as(u64, @intCast(range_idx + 1)),
+                .range_id = @intCast(range_idx + 1),
+                .table_id = table_id,
+                .start_key = start_key,
+                .end_key = end_key,
+            });
+        }
+        try svc.upsertReplicationSourceStatus(.{
+            .table_id = table_id,
+            .source_ordinal = 0,
+            .source_kind = "postgres",
+            .external_table = table_name,
+            .cutover_mode = "exported_snapshot",
+            .slot_name = "antfly_metadata_memory_soak_slot",
+            .publication_name = "antfly_metadata_memory_soak_publication",
+            .phase = "streaming",
+            .checkpoint = "lsn:0/16B6B10",
+            .stream_checkpoint = "lsn:0/16B6B10",
+            .lag_records = @intCast(table_idx),
+            .updated_at_ms = 1000 + @as(u64, @intCast(table_idx)),
+        });
+    }
+    try server.runRound();
+
+    const admin = server.server.owned_admin_http_server orelse return error.MissingMetadataAdminServer;
+    printMetadataMemorySoakSample("baseline", 0, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        const round_u64: u64 = @intCast(round);
+        const available = (700 * 1024 * 1024) + ((round_u64 % 200) * 1024);
+        try svc.reportStoreStatus(.{
+            .store_id = 31,
+            .live = true,
+            .health_class = "healthy",
+            .capacity_bytes = 1024 * 1024 * 1024,
+            .available_bytes = available,
+            .lease_pressure = @intCast(round % 100),
+            .read_load = @intCast((round * 3) % 1000),
+            .write_load = @intCast((round * 7) % 1000),
+        });
+        try svc.upsertReplicationSourceStatus(.{
+            .table_id = 1000,
+            .source_ordinal = 0,
+            .source_kind = "postgres",
+            .external_table = "docs_0",
+            .cutover_mode = "exported_snapshot",
+            .slot_name = "antfly_metadata_memory_soak_slot",
+            .publication_name = "antfly_metadata_memory_soak_publication",
+            .phase = if (round % 17 == 0) "streaming_failed" else "streaming",
+            .checkpoint = "lsn:0/16B6B10",
+            .stream_checkpoint = "lsn:0/16B6B10",
+            .last_error = if (round % 17 == 0) "synthetic intermittent timeout" else "",
+            .failure_class = if (round % 17 == 0) "retryable" else "",
+            .lag_records = round_u64 % 1024,
+            .lag_millis = round_u64 % 4096,
+            .consecutive_failures = if (round % 17 == 0) 1 else 0,
+            .last_source_commit_at_ms = 2000 + round_u64,
+            .last_success_at_ms = 3000 + round_u64,
+            .last_change_applied_at_ms = 4000 + round_u64,
+            .updated_at_ms = 5000 + round_u64,
+        });
+        try server.runRound();
+
+        var status_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.status });
+        defer status_resp.deinit(server.alloc);
+        var snapshot_resp = try admin.handle(.{ .method = .GET, .uri = antfly.metadata.http_routes.Routes.admin_snapshot });
+        defer snapshot_resp.deinit(server.alloc);
+
+        if ((round + 1) % sample_every == 0) {
+            printMetadataMemorySoakSample("sample", round + 1, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
+        }
+    }
+    printMetadataMemorySoakSample("final", rounds, svc.memoryDiagnostics(), server.metadataRaftStorageDiagnostics());
 }
 
 test "metadata runtime prefers common config raft url for local id when cli bind is absent" {
@@ -1086,6 +1548,17 @@ test "metadata runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
+}
+
+test "metadata runtime resolves explicit extension package store path" {
+    const alloc = std.testing.allocator;
+    const resolved = try resolvePaths(alloc, .{
+        .data_dir = "/tmp/antflydb",
+        .extension_package_store_dir = "/opt/antfly/extension-store",
+    }, null);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqualStrings("/opt/antfly/extension-store", resolved.extension_package_store_dir);
 }
 
 test "metadata runtime derives reconciler config from common shard allocation settings" {

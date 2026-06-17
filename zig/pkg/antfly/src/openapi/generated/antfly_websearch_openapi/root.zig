@@ -5,12 +5,13 @@ pub const types = @import("types.zig");
 
 pub const WebSearchProvider = types.WebSearchProvider;
 pub const WebSearchConfig = types.WebSearchConfig;
-pub const GoogleSearchConfig = types.GoogleSearchConfig;
-pub const BingSearchConfig = types.BingSearchConfig;
+pub const ExaSearchConfig = types.ExaSearchConfig;
 pub const SerperSearchConfig = types.SerperSearchConfig;
 pub const TavilySearchConfig = types.TavilySearchConfig;
 pub const BraveSearchConfig = types.BraveSearchConfig;
-pub const DuckDuckGoSearchConfig = types.DuckDuckGoSearchConfig;
+pub const YouSearchConfig = types.YouSearchConfig;
+pub const LinkupSearchConfig = types.LinkupSearchConfig;
+pub const VertexSearchConfig = types.VertexSearchConfig;
 pub const WebSearchResult = types.WebSearchResult;
 pub const WebSearchResponse = types.WebSearchResponse;
 pub const FetchConfig = types.FetchConfig;

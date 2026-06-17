@@ -19,6 +19,7 @@ const group_ids = @import("../../common/group_ids.zig");
 const docstore = @import("../../storage/docstore.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const metadata = @import("../mod.zig");
+const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const raft_catalog = @import("../../raft/catalog.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
@@ -29,6 +30,28 @@ const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 pub const AppliedMetadataBatch = struct {
     commit_index: u64,
     entries_bytes: []const u8,
+};
+
+pub const ExtensionMemberKey = struct {
+    extension_name: []const u8,
+    object_kind: extension_domain.ExtensionObjectKind,
+    object_name: []const u8,
+};
+
+pub const ExtensionDependencyKey = struct {
+    extension_name: []const u8,
+    required_extension_name: []const u8,
+    package_name: []const u8,
+};
+
+pub const ExtensionLifecycleDelta = struct {
+    upsert_tables: []const metadata.TableRecord = &.{},
+    upsert_installed_extensions: []const extension_domain.InstalledExtension = &.{},
+    remove_installed_extensions: []const []const u8 = &.{},
+    upsert_extension_members: []const extension_domain.ExtensionMember = &.{},
+    remove_extension_members: []const ExtensionMemberKey = &.{},
+    upsert_extension_dependencies: []const extension_domain.ExtensionDependency = &.{},
+    remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
 pub const TransitionCommand = union(enum) {
@@ -96,6 +119,28 @@ pub const TransitionCommand = union(enum) {
     },
     upsert_reallocation_request: metadata.ReallocationRequestRecord,
     remove_reallocation_request: struct {},
+    upsert_extension_package: extension_domain.PackageManifest,
+    remove_extension_package: struct {
+        name: []const u8,
+        version: []const u8,
+    },
+    upsert_installed_extension: extension_domain.InstalledExtension,
+    remove_installed_extension: struct {
+        name: []const u8,
+    },
+    upsert_extension_member: extension_domain.ExtensionMember,
+    remove_extension_member: struct {
+        extension_name: []const u8,
+        object_kind: extension_domain.ExtensionObjectKind,
+        object_name: []const u8,
+    },
+    upsert_extension_dependency: extension_domain.ExtensionDependency,
+    remove_extension_dependency: struct {
+        extension_name: []const u8,
+        required_extension_name: []const u8,
+        package_name: []const u8,
+    },
+    apply_extension_lifecycle: ExtensionLifecycleDelta,
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -130,6 +175,27 @@ pub const TransitionCommand = union(enum) {
             .upsert_merge_transition => |*record| {
                 if (record.rollback_reason) |reason| alloc.free(reason);
             },
+            .upsert_extension_package => |*record| record.deinitOwned(alloc),
+            .remove_extension_package => |record| {
+                alloc.free(record.name);
+                alloc.free(record.version);
+            },
+            .upsert_installed_extension => |*record| record.deinitOwned(alloc),
+            .remove_installed_extension => |record| {
+                alloc.free(record.name);
+            },
+            .upsert_extension_member => |*record| record.deinitOwned(alloc),
+            .remove_extension_member => |record| {
+                alloc.free(record.extension_name);
+                alloc.free(record.object_name);
+            },
+            .upsert_extension_dependency => |*record| record.deinitOwned(alloc),
+            .remove_extension_dependency => |record| {
+                alloc.free(record.extension_name);
+                alloc.free(record.required_extension_name);
+                alloc.free(record.package_name);
+            },
+            .apply_extension_lifecycle => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
             else => {},
         }
         self.* = undefined;
@@ -329,6 +395,10 @@ pub const RaftApplyStore = struct {
 
     pub fn snapshotWriteStats(self: *const RaftApplyStore) lsm_backend.Backend.WriteStats {
         return self.backend.snapshotWriteStats();
+    }
+
+    pub fn snapshotMaintenanceStats(self: *const RaftApplyStore) lsm_backend.Backend.MaintenanceStats {
+        return self.backend.snapshotMaintenanceStats();
     }
 
     pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataBatch {
@@ -677,6 +747,102 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    pub fn listExtensionPackages(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.PackageManifest {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try extensionPackagePrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer freeKvs(alloc, kvs);
+
+        const out = try alloc.alloc(extension_domain.PackageManifest, kvs.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*record| record.deinitOwned(alloc);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeExtensionPackageRecord(alloc, kv.value);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    pub fn freeExtensionPackages(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []extension_domain.PackageManifest) void {
+        for (records) |*record| record.deinitOwned(alloc);
+        alloc.free(records);
+    }
+
+    pub fn listInstalledExtensions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.InstalledExtension {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try installedExtensionPrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer freeKvs(alloc, kvs);
+
+        const out = try alloc.alloc(extension_domain.InstalledExtension, kvs.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*record| record.deinitOwned(alloc);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeInstalledExtensionRecord(alloc, kv.value);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    pub fn freeInstalledExtensions(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []extension_domain.InstalledExtension) void {
+        for (records) |*record| record.deinitOwned(alloc);
+        alloc.free(records);
+    }
+
+    pub fn listExtensionMembers(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.ExtensionMember {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try extensionMemberPrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer freeKvs(alloc, kvs);
+
+        const out = try alloc.alloc(extension_domain.ExtensionMember, kvs.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*record| record.deinitOwned(alloc);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeExtensionMemberRecord(alloc, kv.value);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    pub fn freeExtensionMembers(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []extension_domain.ExtensionMember) void {
+        for (records) |*record| record.deinitOwned(alloc);
+        alloc.free(records);
+    }
+
+    pub fn listExtensionDependencies(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]extension_domain.ExtensionDependency {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try extensionDependencyPrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer freeKvs(alloc, kvs);
+
+        const out = try alloc.alloc(extension_domain.ExtensionDependency, kvs.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*record| record.deinitOwned(alloc);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeExtensionDependencyRecord(alloc, kv.value);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    pub fn freeExtensionDependencies(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []extension_domain.ExtensionDependency) void {
+        for (records) |*record| record.deinitOwned(alloc);
+        alloc.free(records);
+    }
+
     pub fn listShuffleJoinLeases(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.ShuffleJoinLeaseRecord {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try shuffleJoinLeasePrefixForGroup(&prefix_buf, group_id);
@@ -725,6 +891,14 @@ pub const RaftApplyStore = struct {
     pub fn freeRanges(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.RangeRecord) void {
         for (records) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(records);
+    }
+
+    fn freeKvs(alloc: std.mem.Allocator, kvs: anytype) void {
+        for (kvs) |kv| {
+            alloc.free(kv.key);
+            alloc.free(kv.value);
+        }
+        alloc.free(kvs);
     }
 
     pub fn freeSplitTransitions(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.SplitTransitionRecord) void {
@@ -1277,6 +1451,139 @@ pub const RaftApplyStore = struct {
                 };
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
+            .upsert_extension_package => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try extensionPackageKeyForGroup(&key_buf, group_id, record.name, record.version);
+                const value = try encodeExtensionPackageRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .remove_extension_package => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try extensionPackageKeyForGroup(&key_buf, group_id, record.name, record.version);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .upsert_installed_extension => |record| {
+                var key_buf: [192]u8 = undefined;
+                const key = try installedExtensionKeyForGroup(&key_buf, group_id, record.name);
+                const value = try encodeInstalledExtensionRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .remove_installed_extension => |record| {
+                var key_buf: [192]u8 = undefined;
+                const key = try installedExtensionKeyForGroup(&key_buf, group_id, record.name);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .upsert_extension_member => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+                const value = try encodeExtensionMemberRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .remove_extension_member => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .upsert_extension_dependency => |record| {
+                var key_buf: [320]u8 = undefined;
+                const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
+                const value = try encodeExtensionDependencyRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .remove_extension_dependency => |record| {
+                var key_buf: [320]u8 = undefined;
+                const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .apply_extension_lifecycle => |delta| {
+                try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
+            },
+        }
+    }
+
+    fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
+        for (delta.upsert_tables) |record| {
+            var key_buf: [160]u8 = undefined;
+            const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
+            const value = try encodeTableRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.remove_extension_dependencies) |record| {
+            var key_buf: [320]u8 = undefined;
+            const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.remove_extension_members) |record| {
+            var key_buf: [256]u8 = undefined;
+            const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.remove_installed_extensions) |name| {
+            var key_buf: [192]u8 = undefined;
+            const key = try installedExtensionKeyForGroup(&key_buf, group_id, name);
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.upsert_installed_extensions) |record| {
+            var key_buf: [192]u8 = undefined;
+            const key = try installedExtensionKeyForGroup(&key_buf, group_id, record.name);
+            const value = try encodeInstalledExtensionRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.upsert_extension_dependencies) |record| {
+            var key_buf: [320]u8 = undefined;
+            const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
+            const value = try encodeExtensionDependencyRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        }
+        for (delta.upsert_extension_members) |record| {
+            var key_buf: [256]u8 = undefined;
+            const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+            const value = try encodeExtensionMemberRecord(self.alloc, record);
+            defer self.alloc.free(value);
+            try txn.put(key, value);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         }
     }
 
@@ -1568,6 +1875,15 @@ const TransitionTag = enum(u8) {
     register_node = 29,
     register_store = 30,
     finalize_node_shutdown = 31,
+    upsert_extension_package = 32,
+    remove_extension_package = 33,
+    upsert_installed_extension = 34,
+    remove_installed_extension = 35,
+    upsert_extension_member = 36,
+    remove_extension_member = 37,
+    upsert_extension_dependency = 38,
+    remove_extension_dependency = 39,
+    apply_extension_lifecycle = 40,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -1703,6 +2019,47 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_reallocation_request => {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_reallocation_request));
         },
+        .upsert_extension_package => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_package));
+            try appendJsonRecord(alloc, &out, record);
+        },
+        .remove_extension_package => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_extension_package));
+            try appendRequiredString(alloc, &out, record.name);
+            try appendRequiredString(alloc, &out, record.version);
+        },
+        .upsert_installed_extension => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_installed_extension));
+            try appendJsonRecord(alloc, &out, record);
+        },
+        .remove_installed_extension => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_installed_extension));
+            try appendRequiredString(alloc, &out, record.name);
+        },
+        .upsert_extension_member => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_member));
+            try appendJsonRecord(alloc, &out, record);
+        },
+        .remove_extension_member => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_extension_member));
+            try appendRequiredString(alloc, &out, record.extension_name);
+            try appendRequiredString(alloc, &out, @tagName(record.object_kind));
+            try appendRequiredString(alloc, &out, record.object_name);
+        },
+        .upsert_extension_dependency => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_extension_dependency));
+            try appendJsonRecord(alloc, &out, record);
+        },
+        .remove_extension_dependency => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_extension_dependency));
+            try appendRequiredString(alloc, &out, record.extension_name);
+            try appendRequiredString(alloc, &out, record.required_extension_name);
+            try appendRequiredString(alloc, &out, record.package_name);
+        },
+        .apply_extension_lifecycle => |delta| {
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle));
+            try appendJsonRecord(alloc, &out, delta);
+        },
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -1824,6 +2181,54 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .remove_reallocation_request => .{
             .remove_reallocation_request = .{},
         },
+        .upsert_extension_package => .{
+            .upsert_extension_package = try readJsonRecord(extension_domain.PackageManifest, alloc, encoded, &pos),
+        },
+        .remove_extension_package => .{
+            .remove_extension_package = .{
+                .name = try readRequiredString(alloc, encoded, &pos),
+                .version = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .upsert_installed_extension => .{
+            .upsert_installed_extension = try readJsonRecord(extension_domain.InstalledExtension, alloc, encoded, &pos),
+        },
+        .remove_installed_extension => .{
+            .remove_installed_extension = .{
+                .name = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .upsert_extension_member => .{
+            .upsert_extension_member = try readJsonRecord(extension_domain.ExtensionMember, alloc, encoded, &pos),
+        },
+        .remove_extension_member => blk: {
+            const extension_name = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(extension_name);
+            const kind_name = try readRequiredString(alloc, encoded, &pos);
+            defer alloc.free(kind_name);
+            const object_kind = std.meta.stringToEnum(extension_domain.ExtensionObjectKind, kind_name) orelse return error.InvalidMetadataTransitionEncoding;
+            const object_name = try readRequiredString(alloc, encoded, &pos);
+            break :blk .{
+                .remove_extension_member = .{
+                    .extension_name = extension_name,
+                    .object_kind = object_kind,
+                    .object_name = object_name,
+                },
+            };
+        },
+        .upsert_extension_dependency => .{
+            .upsert_extension_dependency = try readJsonRecord(extension_domain.ExtensionDependency, alloc, encoded, &pos),
+        },
+        .remove_extension_dependency => .{
+            .remove_extension_dependency = .{
+                .extension_name = try readRequiredString(alloc, encoded, &pos),
+                .required_extension_name = try readRequiredString(alloc, encoded, &pos),
+                .package_name = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
+        .apply_extension_lifecycle => .{
+            .apply_extension_lifecycle = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
+        },
     };
 }
 
@@ -1904,6 +2309,22 @@ fn encodeReallocationRequestRecord(alloc: std.mem.Allocator, record: metadata.Re
     return try out.toOwnedSlice(alloc);
 }
 
+fn encodeExtensionPackageRecord(alloc: std.mem.Allocator, record: extension_domain.PackageManifest) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
+}
+
+fn encodeInstalledExtensionRecord(alloc: std.mem.Allocator, record: extension_domain.InstalledExtension) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
+}
+
+fn encodeExtensionMemberRecord(alloc: std.mem.Allocator, record: extension_domain.ExtensionMember) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
+}
+
+fn encodeExtensionDependencyRecord(alloc: std.mem.Allocator, record: extension_domain.ExtensionDependency) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
+}
+
 fn encodeSplitTransitionRecord(alloc: std.mem.Allocator, record: metadata.SplitTransitionRecord) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -1951,6 +2372,34 @@ fn decodeRestoreProgressRecord(alloc: std.mem.Allocator, encoded: []const u8) !m
 fn decodeReplicationSourceStatusRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.ReplicationSourceStatusRecord {
     var pos: usize = 0;
     return try readReplicationSourceStatusRecord(alloc, encoded, &pos);
+}
+
+fn decodeExtensionPackageRecord(alloc: std.mem.Allocator, encoded: []const u8) !extension_domain.PackageManifest {
+    var value = try std.json.parseFromSliceLeaky(extension_domain.PackageManifest, alloc, encoded, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer value.deinitOwned(alloc);
+    try value.validate();
+    return value;
+}
+
+fn decodeInstalledExtensionRecord(alloc: std.mem.Allocator, encoded: []const u8) !extension_domain.InstalledExtension {
+    var value = try std.json.parseFromSliceLeaky(extension_domain.InstalledExtension, alloc, encoded, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer value.deinitOwned(alloc);
+    try value.validate();
+    return value;
+}
+
+fn decodeExtensionMemberRecord(alloc: std.mem.Allocator, encoded: []const u8) !extension_domain.ExtensionMember {
+    var value = try std.json.parseFromSliceLeaky(extension_domain.ExtensionMember, alloc, encoded, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer value.deinitOwned(alloc);
+    try value.validate();
+    return value;
+}
+
+fn decodeExtensionDependencyRecord(alloc: std.mem.Allocator, encoded: []const u8) !extension_domain.ExtensionDependency {
+    var value = try std.json.parseFromSliceLeaky(extension_domain.ExtensionDependency, alloc, encoded, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer value.deinitOwned(alloc);
+    try value.validate();
+    return value;
 }
 
 fn decodePlacementIntent(alloc: std.mem.Allocator, encoded: []const u8) !raft_reconciler.PlacementIntent {
@@ -2943,6 +3392,15 @@ fn readRequiredString(
     return value;
 }
 
+fn readJsonRecord(comptime T: type, alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !T {
+    const json = try readRequiredString(alloc, encoded, pos);
+    defer alloc.free(json);
+    var value = try std.json.parseFromSliceLeaky(T, alloc, json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    errdefer deinitExtensionJsonRecord(T, alloc, &value);
+    if (@hasDecl(T, "validate")) try value.validate();
+    return value;
+}
+
 fn appendRequiredString(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2950,6 +3408,51 @@ fn appendRequiredString(
 ) !void {
     try appendInt(alloc, out, u32, @intCast(value.len));
     try out.appendSlice(alloc, value);
+}
+
+fn appendJsonRecord(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), record: anytype) !void {
+    const json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
+    defer alloc.free(json);
+    try appendRequiredString(alloc, out, json);
+}
+
+fn deinitExtensionJsonRecord(comptime T: type, alloc: std.mem.Allocator, value: *T) void {
+    if (@hasDecl(T, "deinitOwned")) {
+        value.deinitOwned(alloc);
+    }
+}
+
+fn freeExtensionLifecycleDelta(alloc: std.mem.Allocator, delta: ExtensionLifecycleDelta) void {
+    for (delta.upsert_tables) |record| metadata_table_manager.freeTable(alloc, record);
+    if (delta.upsert_tables.len > 0) alloc.free(@constCast(delta.upsert_tables));
+    for (delta.upsert_installed_extensions) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (delta.upsert_installed_extensions.len > 0) alloc.free(@constCast(delta.upsert_installed_extensions));
+    for (delta.remove_installed_extensions) |name| alloc.free(@constCast(name));
+    if (delta.remove_installed_extensions.len > 0) alloc.free(@constCast(delta.remove_installed_extensions));
+    for (delta.upsert_extension_members) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (delta.upsert_extension_members.len > 0) alloc.free(@constCast(delta.upsert_extension_members));
+    for (delta.remove_extension_members) |record| {
+        alloc.free(@constCast(record.extension_name));
+        alloc.free(@constCast(record.object_name));
+    }
+    if (delta.remove_extension_members.len > 0) alloc.free(@constCast(delta.remove_extension_members));
+    for (delta.upsert_extension_dependencies) |record| {
+        var owned = record;
+        owned.deinitOwned(alloc);
+    }
+    if (delta.upsert_extension_dependencies.len > 0) alloc.free(@constCast(delta.upsert_extension_dependencies));
+    for (delta.remove_extension_dependencies) |record| {
+        alloc.free(@constCast(record.extension_name));
+        alloc.free(@constCast(record.required_extension_name));
+        alloc.free(@constCast(record.package_name));
+    }
+    if (delta.remove_extension_dependencies.len > 0) alloc.free(@constCast(delta.remove_extension_dependencies));
 }
 
 fn readRangeRecord(
@@ -3335,6 +3838,22 @@ pub fn replicationSourceStatusPrefixForGroup(buf: []u8, group_id: u64) ![]const 
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_replication_source_status:{d}:", .{group_id});
 }
 
+pub fn extensionPackagePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_extension_package:{d}:", .{group_id});
+}
+
+pub fn installedExtensionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_installed_extension:{d}:", .{group_id});
+}
+
+pub fn extensionMemberPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_extension_member:{d}:", .{group_id});
+}
+
+pub fn extensionDependencyPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_extension_dependency:{d}:", .{group_id});
+}
+
 pub fn shuffleJoinLeasePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_shuffle_join_lease:{d}:", .{group_id});
 }
@@ -3381,6 +3900,22 @@ fn restoreProgressKeyForGroup(buf: []u8, group_id: u64, table_id: u64, node_id: 
 
 fn replicationSourceStatusKeyForGroup(buf: []u8, group_id: u64, table_id: u64, source_ordinal: u32) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_replication_source_status:{d}:{d}:{d}", .{ group_id, table_id, source_ordinal });
+}
+
+fn extensionPackageKeyForGroup(buf: []u8, group_id: u64, name: []const u8, version: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_extension_package:{d}:{s}:{s}", .{ group_id, name, version });
+}
+
+fn installedExtensionKeyForGroup(buf: []u8, group_id: u64, name: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_installed_extension:{d}:{s}", .{ group_id, name });
+}
+
+fn extensionMemberKeyForGroup(buf: []u8, group_id: u64, extension_name: []const u8, object_kind: extension_domain.ExtensionObjectKind, object_name: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_extension_member:{d}:{s}:{s}:{s}", .{ group_id, extension_name, @tagName(object_kind), object_name });
+}
+
+fn extensionDependencyKeyForGroup(buf: []u8, group_id: u64, extension_name: []const u8, required_extension_name: []const u8, package_name: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_extension_dependency:{d}:{s}:{s}:{s}", .{ group_id, extension_name, required_extension_name, package_name });
 }
 
 fn rangeKeyForGroup(buf: []u8, group_id: u64, range_group_id: u64) ![]const u8 {
@@ -4319,6 +4854,73 @@ test "metadata reallocation request transition command round-trips" {
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
+}
+
+test "metadata extension lifecycle transition command round-trips" {
+    const command: TransitionCommand = .{
+        .apply_extension_lifecycle = .{
+            .upsert_tables = &.{.{
+                .table_id = 7,
+                .name = "memories",
+                .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"}}",
+            }},
+            .upsert_installed_extensions = &.{.{
+                .name = "memoryaf",
+                .package_name = "memoryaf",
+                .package_version = "1.0.0",
+                .package_digest = "sha256:abc",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .status = .ready,
+            }},
+            .remove_installed_extensions = &.{"old_memoryaf"},
+            .upsert_extension_members = &.{.{
+                .extension_name = "memoryaf",
+                .scope = .{ .kind = .table, .table_name = "memories" },
+                .object_kind = .index,
+                .object_name = "memory_text",
+                .table_name = "memories",
+                .owner_metadata_json = "{\"type\":\"full_text\"}",
+            }},
+            .remove_extension_members = &.{.{
+                .extension_name = "memoryaf",
+                .object_kind = .mcp_tool,
+                .object_name = "old_recall",
+            }},
+            .upsert_extension_dependencies = &.{.{
+                .extension_name = "memoryaf",
+                .required_extension_name = "core",
+                .package_name = "antfly_core",
+            }},
+            .remove_extension_dependencies = &.{.{
+                .extension_name = "memoryaf",
+                .required_extension_name = "old_core",
+                .package_name = "old_core",
+            }},
+        },
+    };
+
+    const encoded = try encodeTransitionCommand(std.testing.allocator, command);
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decodeTransitionCommand(std.testing.allocator, encoded);
+    defer if (decoded) |*d| d.deinit(std.testing.allocator);
+
+    try std.testing.expect(decoded != null);
+    try std.testing.expect(decoded.? == .apply_extension_lifecycle);
+    const delta = decoded.?.apply_extension_lifecycle;
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_tables.len);
+    try std.testing.expectEqualStrings("memories", delta.upsert_tables[0].name);
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_installed_extensions.len);
+    try std.testing.expectEqualStrings("memoryaf", delta.upsert_installed_extensions[0].name);
+    try std.testing.expectEqual(@as(usize, 1), delta.remove_installed_extensions.len);
+    try std.testing.expectEqualStrings("old_memoryaf", delta.remove_installed_extensions[0]);
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_extension_members.len);
+    try std.testing.expectEqual(.index, delta.upsert_extension_members[0].object_kind);
+    try std.testing.expectEqual(@as(usize, 1), delta.remove_extension_members.len);
+    try std.testing.expectEqualStrings("old_recall", delta.remove_extension_members[0].object_name);
+    try std.testing.expectEqual(@as(usize, 1), delta.upsert_extension_dependencies.len);
+    try std.testing.expectEqualStrings("antfly_core", delta.upsert_extension_dependencies[0].package_name);
+    try std.testing.expectEqual(@as(usize, 1), delta.remove_extension_dependencies.len);
 }
 
 test "metadata raft apply store projects schema progress records from committed entries" {

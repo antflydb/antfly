@@ -360,7 +360,7 @@ pub fn trainEvalBoundaryHead(
 
     var session = switch (backend) {
         .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
+        .metal => try session_factory.createMetalSessionWithTaskOverride(allocator, model_dir, .generic),
         .auto => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
     };
     defer session.close();
@@ -472,7 +472,7 @@ pub fn trainEvalBoundaryTaskHead(
 
     var session = switch (backend) {
         .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
+        .metal => try session_factory.createMetalSessionWithTaskOverride(allocator, model_dir, .generic),
         .auto => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
     };
     defer session.close();
@@ -661,7 +661,7 @@ fn collectCalibrationBatch(
 
     var session = switch (backend) {
         .native => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
-        .mlx => try session_factory.createMlxSessionWithTaskOverride(allocator, model_dir, .generic),
+        .metal => try session_factory.createMetalSessionWithTaskOverride(allocator, model_dir, .generic),
         .auto => try session_factory.createNativeSessionWithTaskOverride(allocator, model_dir, .generic),
     };
     defer session.close();

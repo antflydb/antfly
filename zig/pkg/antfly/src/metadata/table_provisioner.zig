@@ -491,9 +491,10 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     var added: usize = 0;
     var it = object.iterator();
     while (it.next()) |entry| {
-        // `resolvers` is a reserved top-level section (entity-resolution config,
-        // handled by ensureResolvers), not an index.
-        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+        // Reserved top-level sections are handled by their own reconcilers, not
+        // by the index reconciler.
+        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         if (db.core.index_manager.has(entry.key_ptr.*)) continue;
 
@@ -549,8 +550,10 @@ fn collectDesiredEnrichments(
                             .allocate = .alloc_always,
                             .ignore_unknown_fields = true,
                         });
-                        errdefer parsed.deinit();
-                        try out.append(alloc, parsed.value);
+                        defer parsed.deinit();
+                        var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
+                        errdefer owned.deinit(alloc);
+                        try out.append(alloc, owned);
                     }
                 }
             }
@@ -962,6 +965,49 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
 }
 
+test "table provisioner registers top-level enrichments without creating enrichment index" {
+    const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const summary = try reconcileReplicaRoot(
+        std.testing.allocator,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}]}",
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 7,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.enrichments_added);
+
+    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
+    defer std.testing.allocator.free(db_path);
+    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.has("full_text_index_v0"));
+    try std.testing.expect(!db.core.index_manager.has("enrichments"));
+
+    const enrichments = try db.listEnrichments(std.testing.allocator);
+    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+    try std.testing.expectEqualStrings("memory_embed", enrichments[0].name);
+    try std.testing.expectEqual(db_mod.types.EnrichmentKind.embedding, enrichments[0].kind);
+    try std.testing.expectEqualStrings("body", enrichments[0].field);
+}
+
 test "table provisioner registers a resolver declared in the table index config" {
     const path = "/tmp/antfly-metadata-table-provisioner-resolver";
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -1114,6 +1160,57 @@ test "table provisioner registers a resolver declared in the table index config"
         std.testing.allocator.free(removed_resolvers);
     }
     try std.testing.expectEqual(@as(usize, 0), removed_resolvers.len);
+}
+
+test "table provisioner registers explicit document enrichments from index config" {
+    const alloc = std.heap.c_allocator;
+    const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const indexes_json =
+        \\{
+        \\  "document_text":{"type":"full_text","artifact_name":"document_chunks_v1","enrichments":[
+        \\    {"name":"document_units_v1","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},
+        \\    {"name":"document_chunks_v1","kind":"chunk","source_artifact_name":"document_units_v1","field":"text","chunk_size":512,"chunk_overlap":50}
+        \\  ]}
+        \\}
+    ;
+
+    const summary = try reconcileReplicaRoot(
+        alloc,
+        path,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 11,
+            .name = "docs",
+            .indexes_json = indexes_json,
+        }},
+        &.{.{
+            .group_id = 2001,
+            .table_id = 11,
+            .start_key = "doc:a",
+            .end_key = "doc:z",
+        }},
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
+    try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 2), summary.enrichments_added);
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expectEqualStrings("document_units_v1", enrichments[0].name);
+    try std.testing.expectEqual(.asset, enrichments[0].kind);
+    try std.testing.expectEqualStrings("document_chunks_v1", enrichments[1].name);
+    try std.testing.expectEqual(.chunk, enrichments[1].kind);
 }
 
 test "table provisioner restores local shard data from metadata restore intent" {

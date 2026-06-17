@@ -419,6 +419,33 @@ func TestShadowIndexManagerLifecycle(t *testing.T) {
 	})
 }
 
+func TestDBCloseClosesActiveShadowIndexManager(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	baseDir := t.TempDir()
+	dbDir := filepath.Join(baseDir, "db")
+	require.NoError(t, os.MkdirAll(dbDir, os.ModePerm))
+
+	testSchema := &schema.TableSchema{
+		DefaultType: "default",
+		DocumentSchemas: map[string]schema.DocumentSchema{
+			"default": {Schema: map[string]any{"type": "object"}},
+		},
+	}
+
+	testDB := &DBImpl{
+		logger:       logger,
+		antflyConfig: &common.Config{},
+		indexes:      make(map[string]indexes.IndexConfig),
+	}
+	require.NoError(t, testDB.Open(dbDir, false, testSchema, types.Range{[]byte("\x00"), []byte("\xFF")}))
+	require.NoError(t, testDB.CreateShadowIndexManager([]byte("m"), []byte("\xFF")))
+	require.NotNil(t, testDB.GetShadowIndexManager())
+
+	require.NoError(t, testDB.Close())
+	assert.Nil(t, testDB.GetShadowIndexManager())
+}
+
 // TestShadowIndexManagerDirectory tests that shadow creates its own directory structure.
 func TestShadowIndexManagerDirectory(t *testing.T) {
 	logger := zaptest.NewLogger(t)

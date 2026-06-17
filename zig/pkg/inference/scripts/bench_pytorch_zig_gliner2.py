@@ -248,7 +248,7 @@ def run_zig(
     out_dir: Path,
 ) -> dict[str, Any]:
     repo_root = Path(args.repo_root).resolve()
-    termite_dir = repo_root / "zig/pkg/termite"
+    inference_dir = repo_root / "zig/pkg/inference"
     cmd = [
         args.zig,
         "build",
@@ -256,7 +256,6 @@ def run_zig(
         args.zig_cache_dir,
         "--global-cache-dir",
         args.zig_global_cache_dir,
-        "-Dmlx=false",
         "-Donnx=false",
         "-Dmetal=true",
     ]
@@ -295,19 +294,19 @@ def run_zig(
 
     runner = f"zig_{backend}" + (f"_{graph_runtime}" if graph_runtime else "_eager")
     actual_cmd = cmd
-    cwd = termite_dir
+    cwd = inference_dir
     debug_out: Path | None = None
     if backend == "metal" and args.metal_debug:
         debug_out = out_dir / f"debug-{runner}-batch{batch_size}"
         actual_cmd = [
             "bash",
-            str(termite_dir / "scripts/debug_metal_command.sh"),
+            str(inference_dir / "scripts/debug_metal_command.sh"),
             "command",
             "--api-validate",
             "--timeout",
             str(args.metal_timeout),
             "--cwd",
-            str(termite_dir),
+            str(inference_dir),
             "--out-dir",
             str(debug_out),
             "--",

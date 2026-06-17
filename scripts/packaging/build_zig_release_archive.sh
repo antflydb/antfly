@@ -110,7 +110,6 @@ zig_build_args=(
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
-  -Dmlx=false
   -Dmetal="$metal"
   -Dsystem-blas="$system_blas"
   install

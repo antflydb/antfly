@@ -3,8 +3,8 @@ module github.com/antflydb/antfly/examples/docsaf
 go 1.26.0
 
 require (
-	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260207183149-045031239f8a
 	github.com/antflydb/antfly/go/pkg/docsaf v0.0.0-20260207183149-045031239f8a
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
 	github.com/mbleigh/raymond v0.0.0-20250414171441-6b3a58ab9e0a
 )
 
@@ -85,8 +85,6 @@ require (
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
@@ -107,7 +105,7 @@ require (
 )
 
 replace (
-	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 	github.com/antflydb/antfly/go/pkg/docsaf => ../../go/pkg/docsaf
 	github.com/antflydb/antfly/go/pkg/libaf => ../../go/pkg/libaf
+	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 )

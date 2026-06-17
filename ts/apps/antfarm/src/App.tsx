@@ -2,6 +2,7 @@ import { SidebarInset, SidebarProvider } from "@antfly/design-system";
 import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiConfigProvider } from "@/components/api-config-provider";
+import { AppHeader } from "@/components/app-header";
 import { AuthProvider } from "@/components/auth-provider";
 import { CommandPaletteProvider } from "@/components/command-palette-provider";
 import { ConnectionStatusBanner } from "@/components/connection-status-banner";
@@ -10,14 +11,8 @@ import { GeneratorPreferenceProvider } from "@/components/generator-preference-p
 import { PrivateRoute } from "@/components/private-route";
 import { AppSidebar } from "@/components/sidebar";
 import { TableProvider } from "@/components/table-provider";
-import { WorkspaceHeader } from "@/components/workspace-header";
-import {
-  defaultProduct,
-  getDefaultRoute,
-  isProductEnabled,
-  type ProductId,
-  productForPath,
-} from "@/config/products";
+import { getDefaultRoute, isProductEnabled } from "@/config/products";
+import { useTable } from "@/hooks/use-table";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { isExternalAuthMode } from "@/runtime-config";
 import AntflyChunkingPlaygroundPage from "./pages/AntflyChunkingPlaygroundPage";
@@ -26,6 +21,7 @@ import AntflyRerankingPlaygroundPage from "./pages/AntflyRerankingPlaygroundPage
 import ChatPlaygroundPage from "./pages/ChatPlaygroundPage";
 import ChunkingPlaygroundPage from "./pages/ChunkingPlaygroundPage";
 import ClusterPage from "./pages/ClusterPage";
+import ConnectionsPage from "./pages/ConnectionsPage";
 import CreateTablePage from "./pages/CreateTablePage";
 import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
 import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
@@ -43,20 +39,71 @@ import TablesListPage from "./pages/TablesListPage";
 import TranscribePlaygroundPage from "./pages/TranscribePlaygroundPage";
 import { UsersPage } from "./pages/UsersPage";
 
+const tableSections = new Set([
+  "overview",
+  "indexes",
+  "schema",
+  "semantic",
+  "graph",
+  "faceted",
+  "bulk",
+  "document-builder",
+  "artifacts",
+  "reprocess",
+]);
+
+function TableSectionRedirect({ section, fallback = "/" }: { section: string; fallback?: string }) {
+  const { selectedTable, tables, isLoadingTables } = useTable();
+  const tableName = selectedTable || tables[0]?.name;
+
+  if (tableName) {
+    return (
+      <Navigate
+        to={`/tables/${encodeURIComponent(tableName)}?section=${encodeURIComponent(section)}`}
+        replace
+      />
+    );
+  }
+
+  if (isLoadingTables) {
+    return <div className="py-10 text-sm text-muted-foreground">Loading tables...</div>;
+  }
+
+  if (!tableName) {
+    return <Navigate to={fallback} replace />;
+  }
+
+  return null;
+}
+
+function SelectedTableRoute({ route }: { route: string }) {
+  const { selectedTable, tables, isLoadingTables } = useTable();
+  const tableName = selectedTable || tables[0]?.name;
+
+  if (!tableName && isLoadingTables) {
+    return <div className="py-10 text-sm text-muted-foreground">Loading tables...</div>;
+  }
+
+  const suffix = tableName ? `?table=${encodeURIComponent(tableName)}` : "";
+  return <Navigate to={`${route}${suffix}`} replace />;
+}
+
 function AppContent() {
-  const [currentSection, setCurrentSection] = useState("indexes");
-  const [currentProduct, setCurrentProduct] = useState<ProductId>(defaultProduct);
+  const [currentSection, setCurrentSection] = useState("overview");
   const location = useLocation();
   const showLocalAdminRoutes = !isExternalAuthMode();
 
-  // Sync currentProduct with the current route so direct navigation
-  // (bookmarks, refresh, shared links) shows the correct sidebar.
   useEffect(() => {
-    const product = productForPath(location.pathname);
-    if (product && isProductEnabled(product)) {
-      setCurrentProduct(product);
+    const isTableRoute = location.pathname.startsWith("/tables/");
+    if (!isTableRoute) return;
+
+    const section = new URLSearchParams(location.search).get("section");
+    if (section && tableSections.has(section)) {
+      setCurrentSection(section);
+    } else {
+      setCurrentSection("overview");
     }
-  }, [location.pathname]);
+  }, [location.pathname, location.search]);
 
   return (
     <Routes>
@@ -66,16 +113,11 @@ function AppContent() {
         element={
           <PrivateRoute>
             <SidebarProvider className="af-dashboard">
-              <AppSidebar
-                currentSection={currentSection}
-                onSectionChange={setCurrentSection}
-                currentProduct={currentProduct}
-                onProductChange={setCurrentProduct}
-              />
+              <AppSidebar currentSection={currentSection} onSectionChange={setCurrentSection} />
               <SidebarInset>
-                <WorkspaceHeader />
+                <AppHeader />
                 <ConnectionStatusBanner />
-                <div className="af-workspace-content flex-1 px-6 pt-4 pb-6">
+                <div className="af-app-content flex-1 px-6 pt-4 pb-6">
                   <Routes>
                     {/* Antfly routes */}
                     {isProductEnabled("antfly") && (
@@ -86,11 +128,77 @@ function AppContent() {
                           path="/tables/:tableName"
                           element={<TableDetailsPage currentSection={currentSection} />}
                         />
-                        {showLocalAdminRoutes && <Route path="/users" element={<UsersPage />} />}
+                        <Route
+                          path="/retrieval"
+                          element={<TableSectionRedirect section="semantic" />}
+                        />
+                        <Route
+                          path="/retrieval/search"
+                          element={<TableSectionRedirect section="semantic" />}
+                        />
+                        <Route
+                          path="/retrieval/ask"
+                          element={<SelectedTableRoute route="/data/playground/chat" />}
+                        />
+                        <Route
+                          path="/retrieval/evaluate"
+                          element={<SelectedTableRoute route="/data/playground/evals" />}
+                        />
+                        <Route
+                          path="/retrieval/graph"
+                          element={<TableSectionRedirect section="graph" />}
+                        />
+                        <Route path="/ingest" element={<TableSectionRedirect section="bulk" />} />
+                        <Route
+                          path="/ingest/upload"
+                          element={<TableSectionRedirect section="bulk" />}
+                        />
+                        <Route
+                          path="/ingest/manual"
+                          element={<TableSectionRedirect section="document-builder" />}
+                        />
+                        <Route
+                          path="/ingest/artifacts"
+                          element={<TableSectionRedirect section="artifacts" />}
+                        />
+                        <Route
+                          path="/ingest/reprocess"
+                          element={<TableSectionRedirect section="reprocess" />}
+                        />
                         {showLocalAdminRoutes && (
-                          <Route path="/secrets" element={<SecretsPage />} />
+                          <Route
+                            path="/users"
+                            element={
+                              <PrivateRoute
+                                requiredPermission={{
+                                  resource: "*",
+                                  resourceType: "*",
+                                  permissionType: "admin",
+                                }}
+                              >
+                                <UsersPage />
+                              </PrivateRoute>
+                            }
+                          />
+                        )}
+                        {showLocalAdminRoutes && (
+                          <Route
+                            path="/secrets"
+                            element={
+                              <PrivateRoute
+                                requiredPermission={{
+                                  resource: "*",
+                                  resourceType: "*",
+                                  permissionType: "admin",
+                                }}
+                              >
+                                <SecretsPage />
+                              </PrivateRoute>
+                            }
+                          />
                         )}
                         <Route path="/cluster" element={<ClusterPage />} />
+                        <Route path="/connections" element={<ConnectionsPage />} />
                         <Route path="/data/playground/evals" element={<EvalsPlaygroundPage />} />
                         <Route path="/data/playground/rag" element={<RagPlaygroundPage />} />
                         <Route path="/data/playground/chat" element={<ChatPlaygroundPage />} />
@@ -168,11 +276,11 @@ function App() {
         <ApiConfigProvider>
           <AuthProvider>
             <GeneratorPreferenceProvider>
-              <CommandPaletteProvider>
-                <TableProvider>
+              <TableProvider>
+                <CommandPaletteProvider>
                   <AppContent />
-                </TableProvider>
-              </CommandPaletteProvider>
+                </CommandPaletteProvider>
+              </TableProvider>
             </GeneratorPreferenceProvider>
           </AuthProvider>
         </ApiConfigProvider>

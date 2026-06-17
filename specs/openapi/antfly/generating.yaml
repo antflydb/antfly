@@ -299,7 +299,7 @@ components:
         - add_filter: Add search filters (field constraints)
         - ask_clarification: Ask user for clarification
         - search: Execute semantic searches (legacy, use semantic_search for retrieval)
-        - websearch: Search the web (requires websearch_config)
+        - websearch: Search the web (requires websearch_connection or websearch_config)
         - fetch: Fetch URL content (subject to security controls)
         - semantic_search: Execute semantic/vector search against an index
         - full_text_search: Execute full-text BM25 search against an index
@@ -336,8 +336,16 @@ components:
         websearch_config:
           $ref: "websearch.yaml#/components/schemas/WebSearchConfig"
           description: |
-            Web search provider configuration. Required when websearch tool is enabled.
-            See specs/openapi/antfly/websearch.yaml for provider-specific options.
+            Inline web search provider configuration. Prefer websearch_connection for
+            configured production agents; inline config remains useful for CLI/dev
+            requests. See specs/openapi/antfly/websearch.yaml for provider-specific
+            options.
+        websearch_connection:
+          type: string
+          description: |
+            Name of a configured connections.<id> resource with kind web_search.
+            Request-level tool options may reduce scope, but cannot expand the
+            connection's configured capabilities or policy.
         fetch_config:
           $ref: "websearch.yaml#/components/schemas/FetchConfig"
           description: |

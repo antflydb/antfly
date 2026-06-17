@@ -11,7 +11,9 @@ import {
 } from "@antfly/design-system";
 import type { GeneratorConfig, GeneratorProvider } from "@antfly/sdk";
 import { generatorProviders } from "@antfly/sdk";
-import { useId } from "react";
+import { useId, useMemo } from "react";
+import { Combobox } from "@/components/Combobox";
+import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Record<GeneratorProvider, string> = {
@@ -125,6 +127,21 @@ export function GeneratorSelector({
   const defaultId = `${id}-generator-mode-default`;
   const customId = `${id}-generator-mode-custom`;
 
+  // Live model lists per configured provider from /db/v1/connections.
+  // Falls back to the static per-provider default when the provider is not
+  // configured/connected or the server predates the endpoint.
+  const { providers: connectedProviders } = useConnectedModels();
+  const liveGenerators = useMemo(
+    () => liveModelSuggestions(connectedProviders, "generator"),
+    [connectedProviders]
+  );
+  const modelOptions = useMemo(() => {
+    if (!value) return [];
+    const live = liveGenerators[value.provider] ?? [];
+    const names = live.length > 0 ? live : [GENERATOR_PROVIDER_DEFAULTS[value.provider]];
+    return names.filter(Boolean).map((name) => ({ value: name, label: name }));
+  }, [liveGenerators, value]);
+
   const handleModeChange = (nextMode: string) => {
     if (nextMode === "default") {
       onChange(null);
@@ -138,10 +155,11 @@ export function GeneratorSelector({
       return;
     }
     const nextProvider = provider as GeneratorProvider;
+    const liveDefault = liveGenerators[nextProvider]?.[0];
     onChange({
       ...value,
       provider: nextProvider,
-      model: GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
+      model: liveDefault || GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
     });
   };
 
@@ -200,10 +218,14 @@ export function GeneratorSelector({
           </div>
           <div className="space-y-2">
             <Label className="text-xs text-muted-foreground">Model</Label>
-            <Input
+            <Combobox
+              options={modelOptions}
               value={value.model}
-              onChange={(e) => onChange({ ...value, model: e.target.value })}
+              onChange={(model) => onChange({ ...value, model })}
               placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
+              searchPlaceholder="Search or type a model..."
+              emptyText="Type a model name."
+              allowCustomValue
             />
           </div>
           {showTemperature && (

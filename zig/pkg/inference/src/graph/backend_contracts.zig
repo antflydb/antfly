@@ -31,7 +31,6 @@ pub const CT = *anyopaque;
 pub const BackendKind = enum {
     native,
     metal,
-    mlx,
     onnx,
     pjrt,
     cuda,
@@ -47,7 +46,6 @@ pub const TensorStorageClass = enum {
     host_packed_quant,
     metal_buffer,
     webgpu_buffer,
-    mlx_array,
     onnx_tensor,
     pjrt_buffer,
     cuda_buffer,
@@ -64,7 +62,7 @@ pub const TensorStorageClass = enum {
 
     pub fn isDevice(self: TensorStorageClass) bool {
         return switch (self) {
-            .metal_buffer, .webgpu_buffer, .mlx_array, .onnx_tensor, .pjrt_buffer, .cuda_buffer => true,
+            .metal_buffer, .webgpu_buffer, .onnx_tensor, .pjrt_buffer, .cuda_buffer => true,
             else => false,
         };
     }

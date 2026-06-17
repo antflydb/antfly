@@ -1,0 +1,26 @@
+package antfly:extension@0.1.0;
+
+interface db {
+  query: func(table: string, query-json: string) -> result<string, string>;
+  write: func(table: string, writes-json: string) -> result<string, string>;
+}
+
+interface ai {
+  embed: func(model: string, text: string) -> result<list<f32>, string>;
+}
+
+interface mcp {
+  record tool-result {
+    content-json: string,
+  }
+}
+
+world extension {
+  use mcp.{tool-result};
+
+  import db;
+  import ai;
+
+  export init: func(config-json: string) -> result<_, string>;
+  export call-tool: func(name: string, request-json: string) -> result<tool-result, string>;
+}

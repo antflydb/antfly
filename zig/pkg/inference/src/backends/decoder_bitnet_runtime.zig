@@ -171,13 +171,13 @@ test "ReservedHiddenCarrier does not free carrier slots during replacement" {
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
-    const value = c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_BITNET_LAYERS") orelse return configured_layers;
+    const value = c_std.getenv("TERMITE_METAL_WHOLE_TOKEN_BITNET_LAYERS") orelse return configured_layers;
     const parsed = std.fmt.parseUnsigned(usize, std.mem.span(value), 10) catch return configured_layers;
     return @min(configured_layers, parsed);
 }
 
 pub fn overrideLevel() usize {
-    const value = c_std.getenv("TERMITE_MLX_RAW_METAL_WHOLE_TOKEN_BITNET_OVERRIDE_LEVEL") orelse return 4;
+    const value = c_std.getenv("TERMITE_METAL_WHOLE_TOKEN_BITNET_OVERRIDE_LEVEL") orelse return 4;
     return std.fmt.parseUnsigned(usize, std.mem.span(value), 10) catch 4;
 }
 

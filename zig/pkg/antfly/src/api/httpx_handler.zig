@@ -200,7 +200,7 @@ pub const AntflyApiHandler = struct {
         return respondApiResponseBody(ctx, resp.status, resp.body);
     }
 
-    fn httpRequestFromContext(ctx: *httpx.Context, body_data: []const u8) !http_common.HttpRequest {
+    pub fn httpRequestFromContext(ctx: *httpx.Context, body_data_opt: ?[]const u8) !http_common.HttpRequest {
         const method: http_common.Method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
@@ -210,15 +210,15 @@ pub const AntflyApiHandler = struct {
                 return error.UnsupportedMethod;
             },
         };
-        const trusted_principal_headers: []const http_common.RequestHeader = if (ctx.header(http_server_mod.trusted_principal_header)) |trusted_principal| blk: {
-            const headers = try ctx.allocator.alloc(http_common.RequestHeader, 1);
-            headers[0] = .{ .name = http_server_mod.trusted_principal_header, .value = trusted_principal };
-            break :blk headers;
-        } else &.{};
+        const headers = try ctx.allocator.alloc(http_common.RequestHeader, ctx.request.headers.entries.items.len);
+        for (ctx.request.headers.entries.items, 0..) |entry, i| {
+            headers[i] = .{ .name = entry.name, .value = entry.value };
+        }
+        const body_data = body_data_opt orelse (try ctx.body()) orelse "";
         return .{
             .method = method,
             .uri = ctx.request.uri.raw,
-            .headers = trusted_principal_headers,
+            .headers = headers,
             .authorization = ctx.header("authorization"),
             .content_type = ctx.header("content-type"),
             .body = body_data,
@@ -360,6 +360,17 @@ pub const AntflyApiHandler = struct {
         var topology = try cluster.topologyFromStatus(alloc, public_status);
         defer topology.deinit(alloc);
         return ctx.json(topology);
+    }
+
+    pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListConnectionsParams) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const alloc = ctx.allocator;
+        const body = try self.api_server.listConnectionsJsonAlloc(alloc, params.types, params.include, params.refresh);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(body);
+        return ctx.response.build();
     }
 
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3021,6 +3032,25 @@ const SchemaUpdateStatusSource = struct {
         _ = self.projection_wait_calls.fetchAdd(1, .monotonic);
     }
 };
+
+test "httpx internal request conversion preserves protocol headers" {
+    const alloc = std.testing.allocator;
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/mcp/v1/extensions/memoryaf");
+    defer request.deinit();
+    try request.setHeader("Content-Type", "application/json");
+    try request.setHeader("Mcp-Session-Id", "session-123");
+
+    var ctx = httpx.Context.init(alloc, undefined, &request);
+    defer ctx.deinit();
+
+    const converted = try AntflyApiHandler.httpRequestFromContext(&ctx, "{}");
+    defer alloc.free(converted.headers);
+
+    try std.testing.expectEqualStrings("session-123", converted.header("mcp-session-id") orelse return error.MissingHeader);
+    try std.testing.expectEqualStrings("application/json", converted.content_type orelse return error.MissingContentType);
+    try std.testing.expectEqualStrings("{}", converted.body);
+}
 
 test "httpx antfly routes require auth and enforce admin middleware" {
     const alloc = std.testing.allocator;

@@ -16,7 +16,7 @@
 //
 // Pure text decoder (no vision tower, no VL projection). Mirrors the shape
 // of `bert.zig` so that colqwen2 and other downstream pipelines can swap in
-// a native forward pass on top of any ComputeBackend (native, MLX, ...).
+// a native forward pass on top of any ComputeBackend (native, ...).
 //
 // Qwen2 architectural notes (applies to Qwen2-0.5B / 1.5B / 7B / Coder):
 //   - Pre-norm transformer decoder with `num_hidden_layers` blocks.

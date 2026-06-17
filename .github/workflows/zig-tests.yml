@@ -161,8 +161,13 @@ jobs:
           version: 0.16.0
           use-cache: false
 
-      - name: Prepare ARC cache dirs
-        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+      - name: Restore ARC Zig cache dirs
+        run: |
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
 
       - name: Verify Zig version
         run: zig version
@@ -200,9 +205,14 @@ jobs:
           version: 0.16.0
           use-cache: false
 
-      - name: Prepare ARC cache dirs
+      - name: Restore ARC Zig cache dirs
         if: needs.changes.outputs.trace_validate == 'true'
-        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+        run: |
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
@@ -273,8 +283,13 @@ jobs:
           version: 0.16.0
           use-cache: false
 
-      - name: Prepare ARC cache dirs
-        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+      - name: Restore ARC Zig cache dirs
+        run: |
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
 
       - name: Verify Zig version
         run: zig version
@@ -340,6 +355,8 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 45
     env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_CI_TRACE: "1"
@@ -357,9 +374,13 @@ jobs:
           version: 0.16.0
           use-cache: false
 
-      - name: Prepare ARC cache dirs
+      - name: Restore ARC cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
           mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
           rm -rf ~/.cache ~/.antfly
           ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
@@ -382,6 +403,8 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
     steps:
@@ -398,9 +421,13 @@ jobs:
           version: 0.16.0
           use-cache: false
 
-      - name: Prepare ARC cache dirs
+      - name: Restore ARC cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
           mkdir -p /mnt/cache/antfly/zig/home-cache /mnt/cache/antfly/zig/home-antfly
           rm -rf ~/.cache ~/.antfly
           ln -s /mnt/cache/antfly/zig/home-cache ~/.cache
@@ -409,8 +436,37 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
 
+      - name: Set up Rust WASI target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build MemoryAF extension package
+        run: cargo build --manifest-path extensions/memoryaf/0.0.1/Cargo.toml --release --target wasm32-wasip2
+
       - name: Build E2E binaries
         run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Install Wasmtime C API
+        env:
+          WASMTIME_VERSION: v45.0.2
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 ;;
+            aarch64|arm64) arch=aarch64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="wasmtime-${WASMTIME_VERSION}-${arch}-linux-c-api.tar.xz"
+          root="/tmp/wasmtime-c-api"
+          rm -rf "$root"
+          mkdir -p "$root"
+          curl -L "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${archive}" -o "/tmp/${archive}"
+          tar -xJf "/tmp/${archive}" -C "$root" --strip-components=1
+          lib="$(find "$root/lib" -maxdepth 1 -name 'libwasmtime.so*' | sort | head -n 1)"
+          test -n "$lib"
+          echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Run Antfly full E2E
         working-directory: zig

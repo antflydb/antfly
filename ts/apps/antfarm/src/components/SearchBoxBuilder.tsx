@@ -74,9 +74,7 @@ export default function SearchBoxBuilder({
   const [displayTextField, setDisplayTextField] = useState<string>("");
 
   // Get baseUrl from environment
-  const baseUrl =
-    getAntfarmRuntimeConfig().apiUrl ??
-    (import.meta.env.MODE === "development" ? "http://localhost:8080/db/v1" : "/db/v1");
+  const baseUrl = getAntfarmRuntimeConfig().apiUrl ?? "/db/v1";
   const antflyUrl = `${baseUrl}/tables/${tableName}`;
 
   // Derive effective pagination: pagination is disabled when semantic search is enabled

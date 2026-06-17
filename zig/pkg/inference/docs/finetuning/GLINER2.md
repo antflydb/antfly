@@ -165,7 +165,7 @@ File:
 
 Issue:
 - the merged tree had an outdated call to `recommendedMlxLazyQuantSharedCacheBudget(...)`
-- BLAS/MLX-capable build paths failed once exercised through GLiNER2 finetune commands
+- BLAS/Metal-capable build paths failed once exercised through GLiNER2 finetune commands
 
 Fix:
 - updated the callsite to match the new function signature

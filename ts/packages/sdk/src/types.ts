@@ -91,6 +91,24 @@ export type TableSchema = components["schemas"]["TableSchema"];
 export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 
+// Document artifact types
+export type DocumentArtifactChildRange = components["schemas"]["DocumentArtifactChildRange"];
+export type DocumentArtifactManifest = components["schemas"]["DocumentArtifactManifest"];
+export type DocumentArtifactManifestList = components["schemas"]["DocumentArtifactManifestList"];
+export type DocumentArtifactReprocessResponse =
+  components["schemas"]["DocumentArtifactReprocessResponse"];
+export type DocumentArtifactTableReprocessRequest =
+  components["schemas"]["DocumentArtifactTableReprocessRequest"];
+export type DocumentArtifactTableReprocessResponse =
+  components["schemas"]["DocumentArtifactTableReprocessResponse"];
+export type DocumentArtifactReprocessFailure =
+  components["schemas"]["DocumentArtifactReprocessFailure"];
+export type DocumentArtifactReprocessShardCursor =
+  components["schemas"]["DocumentArtifactReprocessShardCursor"];
+export type DocumentArtifactReprocessJobStartRequest =
+  components["schemas"]["DocumentArtifactReprocessJobStartRequest"];
+export type DocumentArtifactReprocessJob = components["schemas"]["DocumentArtifactReprocessJob"];
+
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];
 export type IndexType = components["schemas"]["IndexType"];
@@ -160,6 +178,19 @@ export type AggregationRange = components["schemas"]["AggregationRange"];
 export type AggregationDateRange = components["schemas"]["AggregationDateRange"];
 export type DistanceRange = components["schemas"]["DistanceRange"];
 export type AntflyType = components["schemas"]["AntflyType"];
+
+// Connection types
+export type ConnectionsResponse = components["schemas"]["ConnectionsResponse"];
+export type Connection = components["schemas"]["Connection"];
+export type ConnectionKind = components["schemas"]["ConnectionKind"];
+export type ConnectionStatus = components["schemas"]["ConnectionStatus"];
+export type InferenceProviderType = components["schemas"]["InferenceProviderType"];
+export type ConnectedModel = components["schemas"]["ConnectedModel"];
+export type ConnectedModelType = components["schemas"]["ConnectedModelType"];
+export type InferenceConnection = components["schemas"]["InferenceConnection"];
+export type ExternalIoProtocol = components["schemas"]["ExternalIoProtocol"];
+export type ExternalIoConnection = components["schemas"]["ExternalIoConnection"];
+export type CdcConnection = components["schemas"]["CdcConnection"];
 
 // Model and reranker types
 export type EmbedderConfig = components["schemas"]["EmbedderConfig"];

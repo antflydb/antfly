@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Antfly inference: ML service for embeddings, chunking, and reranking.
-// Zig implementation with ONNX Runtime, MLX, and native backends.
+// Zig implementation with ONNX Runtime, Metal, CUDA, WASM, and native backends.
 
 const build_options = @import("build_options");
 
@@ -66,13 +66,11 @@ pub const compare_generate = @import("cli/compare_generate.zig");
 pub const native_smoke = @import("native_smoke.zig");
 pub const cuda_info = @import("cuda_info.zig");
 pub const cuda_microbench = @import("bench/cuda_microbench.zig");
-pub const enable_mlx = build_options.enable_mlx;
 pub const metal_runtime = @import("backends/metal_runtime.zig");
 pub const native_compute = struct {
     pub const native = @import("ops/native_compute.zig");
     pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
     pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
-    pub const mlx = if (build_options.enable_mlx) @import("ops/mlx_compute.zig") else struct {};
     pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
     pub const wasm = if (build_options.enable_wasm) @import("ops/wasm_compute.zig") else struct {};
 };

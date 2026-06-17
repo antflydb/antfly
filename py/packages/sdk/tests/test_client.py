@@ -1,5 +1,6 @@
 """Tests for Antfly client."""
 
+import json
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -142,3 +143,40 @@ class TestAntflyClient:
             client.get(table="users", key="user:1")
 
         assert "Failed to get key 'user:1' from table 'users'" in str(exc_info.value)
+
+    @patch("antfly.client.Client")
+    def test_batch_rejects_oversized_request(self, mock_client_class: MagicMock) -> None:
+        """Test client-side write request size enforcement."""
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080", max_write_request_bytes=32)
+
+        with pytest.raises(AntflyException) as exc_info:
+            client.batch(table="users", inserts={"user:1": {"bio": "x" * 128}})
+
+        assert "exceeding max write request size 32" in str(exc_info.value)
+        mock_httpx.request.assert_not_called()
+
+    @patch("antfly.client.Client")
+    def test_batch_sends_exact_checked_bytes(self, mock_client_class: MagicMock) -> None:
+        """Test batch sends the same bytes used for request-size enforcement."""
+        expected_body = {"inserts": {"user:1": {"name": "Zoë"}}, "deletes": []}
+        expected_content = json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        mock_response = Mock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"inserted": 1}
+
+        mock_httpx = MagicMock()
+        mock_httpx.request.return_value = mock_response
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080", max_write_request_bytes=len(expected_content))
+        client.batch(table="users", inserts={"user:1": {"name": "Zoë"}})
+
+        mock_httpx.request.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/users/batch",
+            content=expected_content,
+            headers={"Content-Type": "application/json"},
+        )

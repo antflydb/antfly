@@ -15,7 +15,7 @@ export type RecognizerCapability = "labels" | "zeroshot" | "relations" | "answer
 
 export type QuantizationType = "f32" | "f16" | "i8" | "i8-st" | "i4" | "i4-cuda";
 
-export type Backend = "native" | "onnx" | "metal" | "mlx" | "cuda" | "xla" | "wasm";
+export type Backend = "native" | "onnx" | "metal" | "cuda" | "xla" | "wasm";
 
 // Hardware capabilities that models can run on
 export type HardwareCapability = "nvidia-gpu" | "apple-silicon" | "google-tpu" | "cpu";
@@ -60,7 +60,6 @@ export const BACKEND_TO_HARDWARE: Record<Backend, HardwareCapability[]> = {
   native: ["cpu"],
   onnx: ["nvidia-gpu", "apple-silicon", "cpu"],
   metal: ["apple-silicon"],
-  mlx: ["apple-silicon", "cpu"],
   cuda: ["nvidia-gpu"],
   xla: ["google-tpu", "nvidia-gpu", "cpu"],
   wasm: ["cpu"],

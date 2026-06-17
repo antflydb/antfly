@@ -1231,7 +1231,6 @@ fn runPjrtHloArtifactFull(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -2080,7 +2079,6 @@ fn materializePartitionInputs(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,
@@ -2461,7 +2459,6 @@ fn computeNativeLastLogitsForArtifact(
     const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
         .native => .native,
         .metal => .metal,
-        .mlx => .mlx,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
         .onnx => return error.UnexpectedOnnxBackend,

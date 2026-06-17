@@ -2190,7 +2190,7 @@ pub const WasmCompute = struct {
     fn runDenseDecoderBlockOp(ctx: *anyopaque, request: *const ops.RunDenseDecoderBlockRequest) anyerror!?CT {
         // The dense decoder block accepts either pre-projected q/k/v or a raw
         // attention_input that must be projected through fused_qkv_linear_slot.
-        // Mirror the MLX backend's contract — see ops/mlx_compute.zig
+        // Mirror the native backend contract.
         // runDenseDecoderBlockOp — so callers can use the same request shape.
         var q_tensor = request.q;
         var k_tensor = request.k;

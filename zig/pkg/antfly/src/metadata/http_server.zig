@@ -17,6 +17,7 @@ const common_secrets = @import("../common/secrets.zig");
 const group_ids = @import("../common/group_ids.zig");
 const metadata_api = @import("api.zig");
 const metadata_admin = @import("admin.zig");
+const extension_domain = @import("../extensions/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -73,6 +74,12 @@ pub const NodeShutdownStatus = struct {
     pending_groups: []const u64,
 };
 
+const RestoreExtensionsRequest = struct {
+    installed_extensions: []const extension_domain.InstalledExtension = &.{},
+    extension_members: []const extension_domain.ExtensionMember = &.{},
+    extension_dependencies: []const extension_domain.ExtensionDependency = &.{},
+};
+
 pub const ReseedExactCutoverResult = struct {
     slot_name: []u8,
     publication_name: []u8,
@@ -110,7 +117,15 @@ pub const AdminSource = struct {
         request_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: SplitRequest) anyerror!void = null,
         request_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) anyerror!void = null,
         reseed_replication_source_exact_cutover: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) anyerror!ReseedExactCutoverResult = null,
+        install_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        update_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        drop_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) anyerror!void = null,
+        enable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
+        disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
+        configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
+        restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
         forward_metadata_request: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse = null,
+        record_json_response_allocation: ?*const fn (ptr: *anyopaque, bytes: usize) void = null,
     };
 
     pub fn head(self: AdminSource) !metadata_api.MetadataHead {
@@ -219,9 +234,55 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, source_ordinal);
     }
 
+    pub fn installExtension(self: AdminSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.install_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn updateExtension(self: AdminSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.update_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn dropExtension(self: AdminSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
+        const fn_ptr = self.vtable.drop_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn enableExtension(self: AdminSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.enable_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name);
+    }
+
+    pub fn disableExtension(self: AdminSource, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.disable_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name);
+    }
+
+    pub fn configureExtension(self: AdminSource, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
+        const fn_ptr = self.vtable.configure_extension orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, name, req);
+    }
+
+    pub fn restoreExtensions(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        installed: []const extension_domain.InstalledExtension,
+        members: []const extension_domain.ExtensionMember,
+        dependencies: []const extension_domain.ExtensionDependency,
+    ) !void {
+        const fn_ptr = self.vtable.restore_extensions orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, installed, members, dependencies);
+    }
+
     pub fn forwardMetadataRequest(self: AdminSource, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const fn_ptr = self.vtable.forward_metadata_request orelse return null;
         return try fn_ptr(self.ptr, alloc, req);
+    }
+
+    pub fn recordJsonResponseAllocation(self: AdminSource, bytes: usize) void {
+        const fn_ptr = self.vtable.record_json_response_allocation orelse return;
+        fn_ptr(self.ptr, bytes);
     }
 
     pub fn fromMetadataService(svc: *service.MetadataService) AdminSource {
@@ -249,6 +310,14 @@ pub const AdminSource = struct {
                 .request_split = metadataServiceRequestSplit,
                 .request_merge = metadataServiceRequestMerge,
                 .reseed_replication_source_exact_cutover = metadataServiceReseedReplicationSourceExactCutover,
+                .install_extension = metadataServiceInstallExtension,
+                .update_extension = metadataServiceUpdateExtension,
+                .drop_extension = metadataServiceDropExtension,
+                .enable_extension = metadataServiceEnableExtension,
+                .disable_extension = metadataServiceDisableExtension,
+                .configure_extension = metadataServiceConfigureExtension,
+                .restore_extensions = metadataServiceRestoreExtensions,
+                .record_json_response_allocation = metadataServiceRecordJsonResponseAllocation,
             },
         };
     }
@@ -278,7 +347,15 @@ pub const AdminSource = struct {
                 .request_split = metadataHttpServiceRequestSplit,
                 .request_merge = metadataHttpServiceRequestMerge,
                 .reseed_replication_source_exact_cutover = metadataHttpServiceReseedReplicationSourceExactCutover,
+                .install_extension = metadataHttpServiceInstallExtension,
+                .update_extension = metadataHttpServiceUpdateExtension,
+                .drop_extension = metadataHttpServiceDropExtension,
+                .enable_extension = metadataHttpServiceEnableExtension,
+                .disable_extension = metadataHttpServiceDisableExtension,
+                .configure_extension = metadataHttpServiceConfigureExtension,
+                .restore_extensions = metadataHttpServiceRestoreExtensions,
                 .forward_metadata_request = metadataHttpServiceForwardMetadataRequest,
+                .record_json_response_allocation = metadataHttpServiceRecordJsonResponseAllocation,
             },
         };
     }
@@ -336,6 +413,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -348,6 +426,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
@@ -360,6 +439,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
@@ -373,6 +453,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
@@ -486,6 +567,69 @@ pub const AdminSource = struct {
         return try reseedReplicationSourceExactCutoverForService(service.MetadataService, svc, alloc, table_name, source_ordinal, flushMetadataServiceMutation);
     }
 
+    fn metadataServiceInstallExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.installOnService(svc, alloc, name, req);
+        errdefer installed.deinitOwned(alloc);
+        if (!req.dry_run) try flushMetadataServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataServiceUpdateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.updateOnService(svc, alloc, name, req);
+        errdefer installed.deinitOwned(alloc);
+        if (!req.dry_run) try flushMetadataServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataServiceDropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try extension_domain.lifecycle.dropOnService(svc, alloc, name, req);
+        if (!req.dry_run) try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceEnableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.enableOnService(svc, alloc, name);
+        errdefer installed.deinitOwned(alloc);
+        try flushMetadataServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataServiceDisableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.disableOnService(svc, alloc, name);
+        errdefer installed.deinitOwned(alloc);
+        try flushMetadataServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataServiceConfigureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.configureOnService(svc, alloc, name, req);
+        errdefer installed.deinitOwned(alloc);
+        try flushMetadataServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataServiceRestoreExtensions(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        installed: []const extension_domain.InstalledExtension,
+        members: []const extension_domain.ExtensionMember,
+        dependencies: []const extension_domain.ExtensionDependency,
+    ) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try extension_domain.lifecycle.restoreOnService(svc, installed, members, dependencies);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceRecordJsonResponseAllocation(ptr: *anyopaque, bytes: usize) void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        svc.recordJsonResponseAllocation(bytes);
+    }
+
     fn metadataHttpServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.status();
@@ -543,6 +687,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -555,6 +700,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
 
         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
@@ -567,6 +713,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
@@ -580,6 +727,7 @@ pub const AdminSource = struct {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (extensionOwnsIndex(&snapshot, table_name, index_name)) return error.ExtensionOwnedObject;
 
         const indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
         defer alloc.free(indexes_json);
@@ -692,6 +840,69 @@ pub const AdminSource = struct {
         defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataHttpService, svc, alloc, table_name, source_ordinal, flushMetadataHttpServiceMutation);
     }
+
+    fn metadataHttpServiceInstallExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.InstallExtensionRequest) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.installOnService(svc, alloc, name, req);
+        errdefer installed.deinitOwned(alloc);
+        if (!req.dry_run) try flushMetadataHttpServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataHttpServiceUpdateExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.UpdateExtensionRequest) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.updateOnService(svc, alloc, name, req);
+        errdefer installed.deinitOwned(alloc);
+        if (!req.dry_run) try flushMetadataHttpServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataHttpServiceDropExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.DropExtensionRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try extension_domain.lifecycle.dropOnService(svc, alloc, name, req);
+        if (!req.dry_run) try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceEnableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.enableOnService(svc, alloc, name);
+        errdefer installed.deinitOwned(alloc);
+        try flushMetadataHttpServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataHttpServiceDisableExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.disableOnService(svc, alloc, name);
+        errdefer installed.deinitOwned(alloc);
+        try flushMetadataHttpServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataHttpServiceConfigureExtension(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var installed = try extension_domain.lifecycle.configureOnService(svc, alloc, name, req);
+        errdefer installed.deinitOwned(alloc);
+        try flushMetadataHttpServiceMutation(svc);
+        return installed;
+    }
+
+    fn metadataHttpServiceRestoreExtensions(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        installed: []const extension_domain.InstalledExtension,
+        members: []const extension_domain.ExtensionMember,
+        dependencies: []const extension_domain.ExtensionDependency,
+    ) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try extension_domain.lifecycle.restoreOnService(svc, installed, members, dependencies);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceRecordJsonResponseAllocation(ptr: *anyopaque, bytes: usize) void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        svc.recordJsonResponseAllocation(bytes);
+    }
 };
 
 pub const MetadataHttpServer = struct {
@@ -730,21 +941,21 @@ pub const MetadataHttpServer = struct {
                     defer self.source.freeAdminSnapshot(&snapshot);
                     var status = try buildNodeShutdownStatus(self.alloc, &snapshot, node_id);
                     defer freeNodeShutdownStatus(self.alloc, &status);
-                    return try jsonResponse(self.alloc, status);
+                    return try jsonResponse(self.alloc, self.source, status);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.health)) {
                     return try textResponse(self.alloc, 200, "ok");
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.head)) {
-                    return try jsonResponse(self.alloc, try self.source.head());
+                    return try jsonResponse(self.alloc, self.source, try self.source.head());
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.status)) {
-                    return try jsonResponse(self.alloc, try self.source.status());
+                    return try jsonResponse(self.alloc, self.source, try self.source.status());
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.admin_snapshot)) {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    return try jsonResponse(self.alloc, snapshot);
+                    return try jsonResponse(self.alloc, self.source, snapshot);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.active_transitions)) {
                     var snapshot = try self.source.adminSnapshot();
@@ -761,7 +972,7 @@ pub const MetadataHttpServer = struct {
                     defer self.alloc.free(split);
                     const merge = try cloneValues(self.alloc, @TypeOf(snapshot.merge_transitions[0]), active.merge);
                     defer self.alloc.free(merge);
-                    return try jsonResponse(self.alloc, Response{
+                    return try jsonResponse(self.alloc, self.source, Response{
                         .split = split,
                         .merge = merge,
                     });
@@ -773,7 +984,7 @@ pub const MetadataHttpServer = struct {
                     defer metadata_admin.freeRangeRefs(self.alloc, refs);
                     const records = try cloneValues(self.alloc, @TypeOf(snapshot.ranges[0]), refs);
                     defer self.alloc.free(records);
-                    return try jsonResponse(self.alloc, records);
+                    return try jsonResponse(self.alloc, self.source, records);
                 }
                 if (routes.Routes.matchGroupPlacement(req.uri)) |group_id| {
                     var snapshot = try self.source.adminSnapshot();
@@ -782,7 +993,7 @@ pub const MetadataHttpServer = struct {
                     defer metadata_admin.freePlacementRefs(self.alloc, refs);
                     const records = try cloneValues(self.alloc, @TypeOf(snapshot.placement_intents[0]), refs);
                     defer self.alloc.free(records);
-                    return try jsonResponse(self.alloc, records);
+                    return try jsonResponse(self.alloc, self.source, records);
                 }
             },
             .POST => {
@@ -792,6 +1003,78 @@ pub const MetadataHttpServer = struct {
                         else => return err,
                     };
                     return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (std.mem.eql(u8, req.uri, routes.Routes.internal_extension_restore)) {
+                    var parsed = std.json.parseFromSlice(RestoreExtensionsRequest, self.alloc, req.body, .{
+                        .allocate = .alloc_always,
+                        .ignore_unknown_fields = true,
+                    }) catch return try textResponse(self.alloc, 400, "invalid extension restore request");
+                    defer parsed.deinit();
+                    self.source.restoreExtensions(
+                        self.alloc,
+                        parsed.value.installed_extensions,
+                        parsed.value.extension_members,
+                        parsed.value.extension_dependencies,
+                    ) catch |err| switch (err) {
+                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.UnsupportedManifestApiVersion,
+                        error.UnsupportedPackageKind,
+                        error.UnsupportedExtensionScope,
+                        error.UnsupportedObjectKindForV1,
+                        error.InvalidJsonObject,
+                        error.EmptyName,
+                        error.InvalidIdentifier,
+                        error.MemberTableOutsideScope,
+                        => return try textResponse(self.alloc, 400, "invalid extension restore request"),
+                        else => return err,
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalExtensionUpdate(req.uri)) |extension_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(self.alloc, 400, "invalid extension update request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.updateExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, self.source, installed);
+                }
+                if (routes.Routes.matchInternalExtensionDrop(req.uri)) |extension_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(self.alloc, 400, "invalid extension drop request");
+                    };
+                    defer parsed.deinit();
+                    self.source.dropExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    return try textResponse(self.alloc, 202, "accepted");
+                }
+                if (routes.Routes.matchInternalExtensionEnable(req.uri)) |extension_route| {
+                    var installed = self.source.enableExtension(self.alloc, extension_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, self.source, installed);
+                }
+                if (routes.Routes.matchInternalExtensionDisable(req.uri)) |extension_route| {
+                    var installed = self.source.disableExtension(self.alloc, extension_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, self.source, installed);
+                }
+                if (routes.Routes.matchInternalExtension(req.uri)) |extension_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(self.alloc, 400, "invalid extension install request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.installExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, self.source, installed);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_nodes)) {
                     var node = parseNodeRecord(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid node registration request");
@@ -915,6 +1198,17 @@ pub const MetadataHttpServer = struct {
                 }
             },
             .PUT => {
+                if (routes.Routes.matchInternalExtensionConfig(req.uri)) |extension_route| {
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(self.alloc, 400, "invalid extension config request");
+                    };
+                    defer parsed.deinit();
+                    var installed = self.source.configureExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    };
+                    defer installed.deinitOwned(self.alloc);
+                    return try jsonResponse(self.alloc, self.source, installed);
+                }
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
                     parseNodeShutdownRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid node shutdown request");
                     self.requestNodeShutdown(node_id) catch |err| switch (err) {
@@ -927,6 +1221,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableSchema(req.uri)) |table| {
                     self.source.updateSchema(self.alloc, table.table_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                         else => return err,
@@ -936,6 +1231,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.createIndex(self.alloc, table_index.table_name, table_index.index_name, req.body) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
                         else => return err,
@@ -962,6 +1258,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
                     self.source.dropTable(self.alloc, table.table_name) catch |err| switch (err) {
                         error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return err,
                     };
@@ -970,6 +1267,7 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
                     self.source.dropIndex(self.alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
                         error.TableNotFound, error.IndexNotFound => return try textResponse(self.alloc, 404, "index not found"),
+                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
                         else => return err,
                     };
@@ -2040,6 +2338,109 @@ fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []co
     return null;
 }
 
+fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
+    if (member.table_name.len != 0) return member.table_name;
+    if (member.scope.kind == .table) return member.scope.table_name;
+    return null;
+}
+
+fn extensionOwnsIndex(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8, index_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .index) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name) and std.mem.eql(u8, member.object_name, index_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableSchema(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .table_schema) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableDataShape(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        if (member.object_kind != .data_shape) continue;
+        const shape_kind = member.shape_kind orelse continue;
+        if (shape_kind != .document and shape_kind != .row) continue;
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+fn extensionOwnsTableShape(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    return extensionOwnsTableSchema(snapshot, table_name) or extensionOwnsTableDataShape(snapshot, table_name);
+}
+
+fn extensionOwnsTableScopedObject(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) bool {
+    for (snapshot.extension_members) |member| {
+        const member_table = extensionMemberTableName(member) orelse continue;
+        if (std.mem.eql(u8, member_table, table_name)) return true;
+    }
+    return false;
+}
+
+test "metadata http extension ownership helpers protect internal table mutations" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "memories",
+        .placement_role = "data",
+    }};
+    var members = [_]extension_domain.ExtensionMember{
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .table_schema,
+            .object_name = "memory_record",
+            .table_name = "memories",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = "memories",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memories" },
+            .object_kind = .enrichment,
+            .object_name = "memory_embed",
+        },
+        .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = "memory_events" },
+            .object_kind = .data_shape,
+            .object_name = "memory_event",
+            .shape_kind = .row,
+        },
+    };
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = tables[0..],
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .extension_members = members[0..],
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    try std.testing.expect(extensionOwnsTableScopedObject(&snapshot, "memories"));
+    try std.testing.expect(extensionOwnsTableSchema(&snapshot, "memories"));
+    try std.testing.expect(extensionOwnsIndex(&snapshot, "memories", "memory_text"));
+    try std.testing.expect(!extensionOwnsTableSchema(&snapshot, "memory_events"));
+    try std.testing.expect(extensionOwnsTableDataShape(&snapshot, "memory_events"));
+    try std.testing.expect(extensionOwnsTableShape(&snapshot, "memory_events"));
+    try std.testing.expect(!extensionOwnsIndex(&snapshot, "memories", "manual_text"));
+    try std.testing.expect(!extensionOwnsTableScopedObject(&snapshot, "sessions"));
+}
+
 fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, key: []const u8) ?u64 {
     for (ranges) |record| {
         if (record.table_id != table_id) continue;
@@ -2139,11 +2540,47 @@ fn deriveGroupId(table_name: []const u8, key: []const u8, seed: u64, reserved: u
     return id;
 }
 
-fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
+fn jsonResponse(alloc: std.mem.Allocator, source: AdminSource, value: anytype) !http_common.HttpResponse {
+    const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    errdefer alloc.free(body);
+    source.recordJsonResponseAllocation(body.len);
     return .{
         .status = 200,
         .content_type = try alloc.dupe(u8, "application/json"),
-        .body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}),
+        .body = body,
+    };
+}
+
+fn jsonBodyOrEmptyObject(body: []const u8) []const u8 {
+    return if (body.len == 0) "{}" else body;
+}
+
+fn extensionLifecycleErrorResponse(alloc: std.mem.Allocator, err: anyerror) !http_common.HttpResponse {
+    return switch (err) {
+        error.UnsupportedOperation => try textResponse(alloc, 405, "unsupported operation"),
+        error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try textResponse(alloc, 404, "not found"),
+        error.ExtensionAlreadyInstalled => try textResponse(alloc, 409, "extension already installed"),
+        error.DependentExtensionExists => try textResponse(alloc, 409, "dependent extension exists"),
+        error.RequiredExtensionNotInstalled => try textResponse(alloc, 409, "required extension not installed"),
+        error.UnsupportedManifestApiVersion,
+        error.UnsupportedPackageKind,
+        error.UnsupportedExtensionScope,
+        error.UnsupportedObjectKindForV1,
+        error.PackageVersionMismatch,
+        error.UpdatePathNotFound,
+        error.ExtensionDisabled,
+        error.ExtensionLifecycleBusy,
+        error.InvalidCreateTableRequest,
+        error.InvalidCreateIndexRequest,
+        error.InvalidTableIndexMetadata,
+        error.InvalidExtensionEnrichment,
+        error.UnrequestedCapabilityGrant,
+        error.InvalidJsonObject,
+        error.EmptyName,
+        error.InvalidIdentifier,
+        error.MemberTableOutsideScope,
+        => try textResponse(alloc, 400, "invalid extension lifecycle request"),
+        else => err,
     };
 }
 
@@ -2334,6 +2771,78 @@ test "metadata http server serves status and filtered admin routes" {
     defer active_resp.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body, "\"transition_id\":9001") != null);
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body, "\"transition_id\":9010") != null);
+}
+
+test "metadata http server maps extension-owned object mutations to method not allowed" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) AdminSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .drop_table = dropTable,
+                    .update_schema = updateSchema,
+                    .create_index = createIndex,
+                    .drop_index = dropIndex,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn dropTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+
+        fn updateSchema(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+
+        fn createIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+
+        fn dropIndex(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.ExtensionOwnedObject;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    var schema_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/tables/memories/schema", .body = "{}" });
+    defer schema_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), schema_resp.status);
+
+    var create_index_resp = try server.handle(.{ .method = .PUT, .uri = "/internal/v1/tables/memories/indexes/memory_text", .body = "{\"type\":\"full_text\"}" });
+    defer create_index_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), create_index_resp.status);
+
+    var drop_index_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories/indexes/memory_text" });
+    defer drop_index_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), drop_index_resp.status);
+
+    var drop_table_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/tables/memories" });
+    defer drop_table_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 405), drop_table_resp.status);
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {
