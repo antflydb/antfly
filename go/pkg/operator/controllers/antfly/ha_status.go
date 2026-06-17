@@ -1109,10 +1109,7 @@ func haAdminURL(action haPlannedAction, ha *antflyv1.HighAvailabilitySpec, statu
 	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot, haActionSeedStandby, haActionFinishStandbySeed, haActionMarkReseed:
 		return haCurrentPrimaryAdminURL(ha, status)
 	case haActionAcquireFence:
-		if url := haStandbyAdminURL(ha, action.StandbyName); url != "" {
-			return url
-		}
-		return haCurrentPrimaryAdminURL(ha, status)
+		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionBootstrapStandbySeed:
 		return haStandbyAdminURL(ha, action.StandbyName)
 	case haActionPromoteStandby:

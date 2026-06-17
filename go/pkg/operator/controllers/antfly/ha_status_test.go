@@ -812,6 +812,14 @@ func TestHAAdminURLTargetsNodeLocalAdminAPI(t *testing.T) {
 		action: haPlannedAction{Kind: haActionCreateSlot, StandbyName: "standby-a"},
 		want:   "http://primary-ha.default.svc:8081",
 	}, {
+		name:   "standby scoped fence acquire",
+		action: haPlannedAction{Kind: haActionAcquireFence, StandbyName: "standby-a"},
+		want:   "http://standby-a-ha.default.svc:8081",
+	}, {
+		name:   "standby scoped fence acquire without node url",
+		action: haPlannedAction{Kind: haActionAcquireFence, StandbyName: "missing-standby"},
+		want:   "",
+	}, {
 		name:   "standby scoped promotion",
 		action: haPlannedAction{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
 		want:   "http://standby-a-ha.default.svc:8081",
