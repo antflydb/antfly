@@ -324,8 +324,9 @@ pub const Server = struct {
         const gate = ha_admin.evaluateCommit(primary, target_lsn, policy) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        return try self.handleTypedJson(CommitCheckDocument{
-            .gate = commitGateDocument(gate),
+        return try self.handleTypedJson(admin_api.HACommitCheckResponse{
+            .schema_version = 1,
+            .gate = try adminCommitGate(gate),
         });
     }
 
@@ -347,9 +348,10 @@ pub const Server = struct {
         const result = commit_gate.appendAndEvaluate(primary, append, policy) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        return try self.handleTypedJson(CommitAppendDocument{
-            .lsn = result.lsn,
-            .gate = commitGateDocument(result.gate),
+        return try self.handleTypedJson(admin_api.HACommitAppendResponse{
+            .schema_version = 1,
+            .lsn = try adminI64(result.lsn),
+            .gate = try adminCommitGate(result.gate),
         });
     }
 
@@ -370,7 +372,10 @@ pub const Server = struct {
         const decision = ha_admin.evaluateStandbyRead(standby, request) catch |err| {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
-        return try self.handleTypedJson(ReadCheckDocument{ .decision = decision });
+        return try self.handleTypedJson(admin_api.HAReadCheckResponse{
+            .schema_version = 1,
+            .decision = try adminReadDecision(decision),
+        });
     }
 
     fn handleAdminWriteCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -397,7 +402,10 @@ pub const Server = struct {
                 };
             },
         };
-        return try self.handleTypedJson(WriteCheckDocument{ .decision = decision });
+        return try self.handleTypedJson(admin_api.HAWriteCheckResponse{
+            .schema_version = 1,
+            .decision = try adminWriteDecision(decision),
+        });
     }
 
     fn handleAdminOwnerJobCheck(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -424,7 +432,10 @@ pub const Server = struct {
                 };
             },
         };
-        return try self.handleTypedJson(OwnerJobCheckDocument{ .decision = decision });
+        return try self.handleTypedJson(admin_api.HAOwnerJobCheckResponse{
+            .schema_version = 1,
+            .decision = try adminOwnerJobDecision(decision),
+        });
     }
 
     fn handleAdminBeginBaseBackup(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -878,38 +889,6 @@ fn legacyCommandEndpointAllowed(command: admin_cli.Command, output: admin_cli.Ou
     };
 }
 
-const CommitCheckDocument = struct {
-    schema_version: u32 = 1,
-    gate: CommitGateDocument,
-};
-
-const CommitAppendDocument = struct {
-    schema_version: u32 = 1,
-    lsn: u64,
-    gate: CommitGateDocument,
-};
-
-const CommitGateDocument = struct {
-    target_lsn: u64,
-    action: commit_gate.Action,
-    durability: primary_mod.DurabilityDecision,
-};
-
-const ReadCheckDocument = struct {
-    schema_version: u32 = 1,
-    decision: read_gate.Decision,
-};
-
-const WriteCheckDocument = struct {
-    schema_version: u32 = 1,
-    decision: write_gate.Decision,
-};
-
-const OwnerJobCheckDocument = struct {
-    schema_version: u32 = 1,
-    decision: owner_job_gate.Decision,
-};
-
 const ActionReceiptDocument = struct {
     action_id: []const u8,
     action_kind: []const u8,
@@ -968,11 +947,72 @@ fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !
     };
 }
 
-fn commitGateDocument(gate: commit_gate.GateResult) CommitGateDocument {
+fn adminCommitGate(gate: commit_gate.GateResult) !admin_api.HACommitGate {
     return .{
-        .target_lsn = gate.target_lsn,
-        .action = gate.action,
-        .durability = gate.decision,
+        .target_lsn = try adminI64(gate.target_lsn),
+        .action = @tagName(gate.action),
+        .durability = try adminDurabilityDecision(gate.decision),
+    };
+}
+
+fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.HADurabilityDecision {
+    return .{
+        .status = @tagName(decision.status),
+        .mode = @tagName(decision.mode),
+        .selection = @tagName(decision.selection),
+        .target_lsn = try adminI64(decision.target_lsn),
+        .progress_lsn = try adminI64(decision.progress_lsn),
+        .missing_lsn_count = try adminI64(decision.missing_lsn_count),
+        .satisfied_count = try adminI64(decision.satisfied_count),
+        .required_count = try adminI64(decision.required_count),
+        .candidate_count = try adminI64(decision.candidate_count),
+    };
+}
+
+fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
+    return .{
+        .action = @tagName(decision.action),
+        .consistency = @tagName(decision.consistency),
+        .required_lsn = if (decision.required_lsn) |value| try adminI64(value) else null,
+        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| try adminI64(value) else null,
+        .received_lsn = try adminI64(decision.received_lsn),
+        .applied_lsn = try adminI64(decision.applied_lsn),
+        .safe_read_lsn = try adminI64(decision.safe_read_lsn),
+        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| try adminI64(value) else null,
+        .serve_lsn = if (decision.serve_lsn) |value| try adminI64(value) else null,
+        .missing_lsn_count = try adminI64(decision.missing_lsn_count),
+        .metadata_missing_lsn_count = try adminI64(decision.metadata_missing_lsn_count),
+    };
+}
+
+fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision {
+    return .{
+        .role = @tagName(decision.role),
+        .action = @tagName(decision.action),
+        .identity = try adminIdentity(decision.identity),
+        .durable_lsn = try adminI64(decision.durable_lsn),
+        .next_lsn = try adminI64(decision.next_lsn),
+        .promotion_handoff = if (decision.promotion_handoff) |handoff| try adminPromotionHandoff(handoff) else null,
+    };
+}
+
+fn adminOwnerJobDecision(decision: owner_job_gate.Decision) !admin_api.HAOwnerJobDecision {
+    return .{
+        .kind = @tagName(decision.kind),
+        .role = @tagName(decision.role),
+        .action = @tagName(decision.action),
+        .identity = try adminIdentity(decision.identity),
+        .durable_lsn = try adminI64(decision.durable_lsn),
+        .next_lsn = try adminI64(decision.next_lsn),
+        .promotion_handoff = if (decision.promotion_handoff) |handoff| try adminPromotionHandoff(handoff) else null,
+    };
+}
+
+fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPromotionHandoff {
+    return .{
+        .identity = try adminIdentity(handoff.identity),
+        .switch_lsn = try adminI64(handoff.switch_lsn),
+        .next_lsn = try adminI64(handoff.next_lsn),
     };
 }
 
