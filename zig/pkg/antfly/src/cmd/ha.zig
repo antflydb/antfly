@@ -663,8 +663,8 @@ fn durabilityStatusCodeFromAdmin(raw: []const u8) !ha.metrics.DurabilityStatusCo
     return error.InvalidHaCommand;
 }
 
-fn boolGauge(value: bool) u64 {
-    return if (value) 1 else 0;
+fn boolGauge(enabled: bool) u64 {
+    return if (enabled) 1 else 0;
 }
 
 fn u64FromI64(raw: i64) !u64 {
@@ -1040,6 +1040,30 @@ test "ha cmd remote commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_replication_slots);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "slot",
+        "pause",
+        "standby-table",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .PUT, admin_api.routes.ha_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.ha_replication_slot_pause_suffix);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "slot",
+        "resume",
+        "standby-table",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .PUT, admin_api.routes.ha_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.ha_replication_slot_resume_suffix);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "slot",
+        "drop",
+        "standby-table",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .DELETE, admin_api.routes.ha_replication_slot_prefix ++ "standby-table");
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "seed",
         "begin",
         "--slot",
@@ -1049,6 +1073,30 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_base_backups);
+
+    try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
+    const manifest_path = try writeSeedManifestFiles(alloc, paths.backup_root, testIdentity(), "base-standby-json-1", 1, 2);
+    defer alloc.free(manifest_path);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "seed",
+        "finish",
+        "--manifest",
+        manifest_path,
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_base_backups_finish);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "seed",
+        "bootstrap",
+        "--manifest",
+        manifest_path,
+        "--content-root",
+        paths.backup_root,
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_standby_bootstrap);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "status",
@@ -1157,7 +1205,7 @@ test "ha cmd remote commands prefer typed admin routes" {
         "--old-primary-id",
         "primary-a",
         "--promoted-node-id",
-        "standby-b",
+        "standby-a",
         "--new-timeline-id",
         "2",
         "--new-epoch",
@@ -1188,6 +1236,13 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_assess);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "promote",
+        "--current-fence",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_current_fence);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
@@ -1269,6 +1324,56 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
+}
+
+test "ha cmd remote direct promotion uses typed admin route" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "remote-direct-promote");
+    defer paths.deinit(alloc);
+
+    var standby = try ha.standby.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, testIdentity(), .{});
+    defer standby.close();
+    var fence_store = try ha.fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+
+    var server = ha.http_admin.Server.init(alloc, .{
+        .standby = &standby,
+        .standby_node_id = "standby-a",
+        .fence_store = &fence_store,
+    });
+    defer server.deinit();
+    var recorder = RecordingExecutor.init(alloc, server.executor());
+    defer recorder.deinit();
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "promote",
+        "--cluster-id",
+        "10",
+        "--shard-id",
+        "20",
+        "--table-id",
+        "30",
+        "--timeline-id",
+        "1",
+        "--epoch",
+        "2",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-a",
+        "--new-timeline-id",
+        "2",
+        "--new-epoch",
+        "3",
+        "--required-lsn",
+        "0",
+        "--observed-lsn",
+        "0",
+        "--reason",
+        "operator-approved",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion);
 }
 
 test "ha cmd remote rejects legacy command fallback for production admin operations" {
@@ -1425,6 +1530,7 @@ const TestPaths = struct {
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
     fence_wal: [:0]u8,
+    backup_root: [:0]u8,
 
     fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.primary_log);
@@ -1432,6 +1538,7 @@ const TestPaths = struct {
         alloc.free(self.standby_log);
         alloc.free(self.standby_progress);
         alloc.free(self.fence_wal);
+        alloc.free(self.backup_root);
     }
 };
 
@@ -1447,6 +1554,8 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     defer alloc.free(standby_progress);
     const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
     defer alloc.free(fence_wal);
+    const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
@@ -1455,6 +1564,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
         .primary_log = try alloc.dupeZ(u8, primary_log),
@@ -1462,6 +1572,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
         .standby_log = try alloc.dupeZ(u8, standby_log),
         .standby_progress = try alloc.dupeZ(u8, standby_progress),
         .fence_wal = try alloc.dupeZ(u8, fence_wal),
+        .backup_root = try alloc.dupeZ(u8, backup_root),
     };
 }
 
@@ -1481,6 +1592,54 @@ fn testIdentity() ha.standby.Identity {
         .timeline_id = 1,
         .epoch = 2,
     };
+}
+
+fn seedFiles() [2]ha.backup_manifest.FileEntry {
+    return .{
+        .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = ha.backup_manifest.crc32("manifest") },
+        .{ .path = "sst/0001", .kind = .sstable, .size_bytes = 7, .crc32 = ha.backup_manifest.crc32("sstable") },
+    };
+}
+
+fn writeSeedManifestFiles(
+    alloc: std.mem.Allocator,
+    backup_root: []const u8,
+    identity: ha.standby.Identity,
+    manifest_id: []const u8,
+    backup_lsn: u64,
+    checkpoint_lsn: u64,
+) ![]u8 {
+    const files = seedFiles();
+    const encoded_manifest = try ha.backup_manifest.encodeAlloc(alloc, .{
+        .identity = identity,
+        .manifest_id = manifest_id,
+        .backup_lsn = backup_lsn,
+        .checkpoint_lsn = checkpoint_lsn,
+        .files = &files,
+    });
+    defer alloc.free(encoded_manifest);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ backup_root, "backup.afha" });
+    errdefer alloc.free(manifest_path);
+    const manifest_file_path = try std.fs.path.join(alloc, &.{ backup_root, "manifest" });
+    defer alloc.free(manifest_file_path);
+    const sstable_path = try std.fs.path.join(alloc, &.{ backup_root, "sst/0001" });
+    defer alloc.free(sstable_path);
+
+    try writeTestFile(manifest_path, encoded_manifest);
+    try writeTestFile(manifest_file_path, "manifest");
+    try writeTestFile(sstable_path, "sstable");
+    return manifest_path;
+}
+
+fn writeTestFile(path: []const u8, bytes: []const u8) !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
+        .sub_path = path,
+        .data = bytes,
+    });
 }
 
 const RecordingExecutor = struct {
