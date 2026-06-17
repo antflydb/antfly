@@ -1610,7 +1610,7 @@ pub const PostingFormat = struct {
     ) ![]VectorId {
         var members: std.ArrayList(VectorId) = .empty;
         errdefer members.deinit(alloc);
-        try members.ensureTotalCapacity(alloc, base_members.len + records.len);
+        try members.ensureTotalCapacity(alloc, base_members.len + liveDeltaRecordCount(records));
         try members.appendSlice(alloc, base_members);
         for (records) |record| {
             switch (record.op) {
@@ -1632,7 +1632,7 @@ pub const PostingFormat = struct {
     ) ![]VectorId {
         var members: std.ArrayList(VectorId) = .empty;
         errdefer members.deinit(alloc);
-        try members.ensureTotalCapacity(alloc, base_members.len + records.len);
+        try members.ensureTotalCapacity(alloc, base_members.len + liveDeltaRecordCountAfterGeneration(records, base_generation));
         try members.appendSlice(alloc, base_members);
         for (records) |record| {
             if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
@@ -1651,6 +1651,29 @@ pub const PostingFormat = struct {
         var count: usize = 0;
         for (records) |record| {
             if (deltaSequenceGeneration(record.sequence) > base_generation) count += 1;
+        }
+        return count;
+    }
+
+    pub fn liveDeltaRecordCount(records: []const PostingDeltaRecord) usize {
+        var count: usize = 0;
+        for (records) |record| {
+            switch (record.op) {
+                .insert, .replace => count += 1,
+                .tombstone => {},
+            }
+        }
+        return count;
+    }
+
+    pub fn liveDeltaRecordCountAfterGeneration(records: []const PostingDeltaRecord, base_generation: u64) usize {
+        var count: usize = 0;
+        for (records) |record| {
+            if (deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            switch (record.op) {
+                .insert, .replace => count += 1,
+                .tombstone => {},
+            }
         }
         return count;
     }
@@ -3464,7 +3487,7 @@ pub const PostingStore = struct {
             const materialized_len = materialized: {
                 _ = try PostingFormat.decodeBaseIntoScratch(index.alloc, &scratch, base_data);
                 var materialized_len = base_header.member_count;
-                try scratch.ensureMemberIdCapacity(index.alloc, materialized_len + scratch.deltaRecordCount());
+                try scratch.ensureMemberIdCapacity(index.alloc, materialized_len + PostingFormat.liveDeltaRecordCount(scratch.deltaRecords()));
                 for (scratch.deltaRecords()) |record| {
                     PostingFormat.applyDeltaRecordToScratch(&scratch, &materialized_len, record);
                 }

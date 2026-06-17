@@ -103,6 +103,9 @@ Current status:
   restart on large cached tails. Sorted replay and compact base materialization
   size temporary output buffers from deduped live operations rather than raw
   tail length, so tombstone-heavy tails do not inflate scratch allocation.
+  Unsorted materialization and fold fallback paths likewise reserve member
+  output capacity from surviving insert/replace records rather than total delta
+  records.
 - Sorted canonical bases now expose `PostingFormat.baseContainsSortedMember`
   and a strict validating variant, giving delete/update and validation paths a
   streaming membership primitive that can stop before materializing the full
