@@ -329,6 +329,107 @@ func TestHAClientAcceptsAdminRootURL(t *testing.T) {
 	}
 }
 
+func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		got  HAOperation
+		want HAOperation
+	}{
+		{
+			name: "create replication slot",
+			got:  HACreateReplicationSlotOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/replication-slots"},
+		},
+		{
+			name: "begin base backup",
+			got:  HABeginBaseBackupOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/base-backups"},
+		},
+		{
+			name: "finish base backup",
+			got:  HAFinishBaseBackupOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/base-backups/finish"},
+		},
+		{
+			name: "bootstrap standby",
+			got:  HABootstrapStandbyOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/standby/bootstrap"},
+		},
+		{
+			name: "acquire fence",
+			got:  HAAcquireFenceOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/fence"},
+		},
+		{
+			name: "assess promotion",
+			got:  HAAssessPromotionOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion/assess"},
+		},
+		{
+			name: "promote with current fence",
+			got:  HAPromoteWithCurrentFenceOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion/current-fence"},
+		},
+		{
+			name: "assess rejoin",
+			got:  HAAssessRejoinOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/rejoin/assess"},
+		},
+		{
+			name: "rewind rejoin",
+			got:  HARewindRejoinOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/rejoin/rewind"},
+		},
+		{
+			name: "reseed rejoin",
+			got:  HAReseedRejoinOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/rejoin/reseed"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.got != tt.want {
+				t.Fatalf("operation = %#v, want %#v", tt.got, tt.want)
+			}
+		})
+	}
+
+	slotPath, ok := HAReplicationSlotPath("standby a/%")
+	if !ok {
+		t.Fatal("HAReplicationSlotPath returned ok=false for non-empty slot")
+	}
+	if slotPath != "/admin/v1/ha/replication-slots/standby%20a%2F%25" {
+		t.Fatalf("slot path = %q", slotPath)
+	}
+	if _, ok := HAReplicationSlotPath(" "); ok {
+		t.Fatal("HAReplicationSlotPath returned ok=true for empty slot")
+	}
+	resume, ok := HAResumeReplicationSlotOperation("standby a/%")
+	if !ok {
+		t.Fatal("HAResumeReplicationSlotOperation returned ok=false")
+	}
+	if want := (HAOperation{Method: http.MethodPut, Path: "/admin/v1/ha/replication-slots/standby%20a%2F%25/resume"}); resume != want {
+		t.Fatalf("resume operation = %#v, want %#v", resume, want)
+	}
+	pause, ok := HAPauseReplicationSlotOperation("standby a/%")
+	if !ok {
+		t.Fatal("HAPauseReplicationSlotOperation returned ok=false")
+	}
+	if want := (HAOperation{Method: http.MethodPut, Path: "/admin/v1/ha/replication-slots/standby%20a%2F%25/pause"}); pause != want {
+		t.Fatalf("pause operation = %#v, want %#v", pause, want)
+	}
+	drop, ok := HADropReplicationSlotOperation("standby a/%")
+	if !ok {
+		t.Fatal("HADropReplicationSlotOperation returned ok=false")
+	}
+	if want := (HAOperation{Method: http.MethodDelete, Path: "/admin/v1/ha/replication-slots/standby%20a%2F%25"}); drop != want {
+		t.Fatalf("drop operation = %#v, want %#v", drop, want)
+	}
+}
+
 func TestHAClientReturnsStatusError(t *testing.T) {
 	t.Parallel()
 

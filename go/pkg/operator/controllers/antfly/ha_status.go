@@ -3,13 +3,13 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
+	adminsdk "github.com/antflydb/antfly/go/pkg/sdk/admin"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -57,30 +57,30 @@ const (
 )
 
 const (
-	haAdminBasePath                        = "/admin/v1"
-	haAdminHAPath                          = haAdminBasePath + "/ha"
-	haAdminPrimaryStatusPath               = haAdminHAPath + "/primary/status"
-	haAdminStandbyStatusPath               = haAdminHAPath + "/standby/status"
-	haAdminCommitCheckPath                 = haAdminHAPath + "/commit/check"
-	haAdminCommitAppendPath                = haAdminHAPath + "/commit/append"
-	haAdminReadCheckPath                   = haAdminHAPath + "/read/check"
-	haAdminWriteCheckPath                  = haAdminHAPath + "/write/check"
-	haAdminOwnerJobCheckPath               = haAdminHAPath + "/owner-jobs/check"
-	haAdminReplicationSlotsPath            = haAdminHAPath + "/replication-slots"
-	haAdminReplicationSlotPathPrefix       = haAdminReplicationSlotsPath + "/"
-	haAdminReplicationSlotPausePathSuffix  = "/pause"
-	haAdminReplicationSlotResumePathSuffix = "/resume"
-	haAdminBaseBackupsPath                 = haAdminHAPath + "/base-backups"
-	haAdminBaseBackupsFinishPath           = haAdminBaseBackupsPath + "/finish"
-	haAdminStandbyBootstrapPath            = haAdminHAPath + "/standby/bootstrap"
-	haAdminFencePath                       = haAdminHAPath + "/fence"
-	haAdminFenceCurrentPath                = haAdminFencePath + "/current"
-	haAdminPromotionPath                   = haAdminHAPath + "/promotion"
-	haAdminPromotionAssessPath             = haAdminHAPath + "/promotion/assess"
-	haAdminPromotionCurrentFencePath       = haAdminHAPath + "/promotion/current-fence"
-	haAdminRejoinAssessPath                = haAdminHAPath + "/rejoin/assess"
-	haAdminRejoinRewindPath                = haAdminHAPath + "/rejoin/rewind"
-	haAdminRejoinReseedPath                = haAdminHAPath + "/rejoin/reseed"
+	haAdminBasePath                        = adminsdk.AdminV1Path
+	haAdminHAPath                          = adminsdk.HAPath
+	haAdminPrimaryStatusPath               = adminsdk.HAPrimaryStatusPath
+	haAdminStandbyStatusPath               = adminsdk.HAStandbyStatusPath
+	haAdminCommitCheckPath                 = adminsdk.HACommitCheckPath
+	haAdminCommitAppendPath                = adminsdk.HACommitAppendPath
+	haAdminReadCheckPath                   = adminsdk.HAReadCheckPath
+	haAdminWriteCheckPath                  = adminsdk.HAWriteCheckPath
+	haAdminOwnerJobCheckPath               = adminsdk.HAOwnerJobCheckPath
+	haAdminReplicationSlotsPath            = adminsdk.HAReplicationSlotsPath
+	haAdminReplicationSlotPathPrefix       = adminsdk.HAReplicationSlotPathPrefix
+	haAdminReplicationSlotPausePathSuffix  = adminsdk.HAReplicationSlotPausePathSuffix
+	haAdminReplicationSlotResumePathSuffix = adminsdk.HAReplicationSlotResumePathSuffix
+	haAdminBaseBackupsPath                 = adminsdk.HABaseBackupsPath
+	haAdminBaseBackupsFinishPath           = adminsdk.HABaseBackupsFinishPath
+	haAdminStandbyBootstrapPath            = adminsdk.HAStandbyBootstrapPath
+	haAdminFencePath                       = adminsdk.HAFencePath
+	haAdminFenceCurrentPath                = adminsdk.HAFenceCurrentPath
+	haAdminPromotionPath                   = adminsdk.HAPromotionPath
+	haAdminPromotionAssessPath             = adminsdk.HAPromotionAssessPath
+	haAdminPromotionCurrentFencePath       = adminsdk.HAPromotionCurrentFencePath
+	haAdminRejoinAssessPath                = adminsdk.HARejoinAssessPath
+	haAdminRejoinRewindPath                = adminsdk.HARejoinRewindPath
+	haAdminRejoinReseedPath                = adminsdk.HARejoinReseedPath
 )
 
 const haFencingLeaseDefaultDurationSeconds int32 = 30
@@ -1208,41 +1208,42 @@ func haPromotedPrimaryNodeID(status *antflyv1.HAStatus) string {
 }
 
 func haAdminOperation(action haPlannedAction) (string, string) {
+	operation := adminsdk.HAOperation{}
+	ok := true
 	switch action.Kind {
 	case haActionCreateSlot:
-		return "POST", haAdminReplicationSlotsPath
+		operation = adminsdk.HACreateReplicationSlotOperation()
 	case haActionResumeSlot:
-		if slotName := haPlannedActionSlotName(action); slotName != "" {
-			return "PUT", haAdminReplicationSlotPathPrefix + url.PathEscape(slotName) + haAdminReplicationSlotResumePathSuffix
-		}
+		operation, ok = adminsdk.HAResumeReplicationSlotOperation(haPlannedActionSlotName(action))
 	case haActionPauseSlot:
-		if slotName := haPlannedActionSlotName(action); slotName != "" {
-			return "PUT", haAdminReplicationSlotPathPrefix + url.PathEscape(slotName) + haAdminReplicationSlotPausePathSuffix
-		}
+		operation, ok = adminsdk.HAPauseReplicationSlotOperation(haPlannedActionSlotName(action))
 	case haActionDropSlot:
-		if slotName := haPlannedActionSlotName(action); slotName != "" {
-			return "DELETE", haAdminReplicationSlotPathPrefix + url.PathEscape(slotName)
-		}
+		operation, ok = adminsdk.HADropReplicationSlotOperation(haPlannedActionSlotName(action))
 	case haActionSeedStandby, haActionMarkReseed:
-		return "POST", haAdminBaseBackupsPath
+		operation = adminsdk.HABeginBaseBackupOperation()
 	case haActionFinishStandbySeed:
-		return "POST", haAdminBaseBackupsFinishPath
+		operation = adminsdk.HAFinishBaseBackupOperation()
 	case haActionBootstrapStandbySeed:
-		return "POST", haAdminStandbyBootstrapPath
+		operation = adminsdk.HABootstrapStandbyOperation()
 	case haActionAcquireFence:
-		return "POST", haAdminFencePath
+		operation = adminsdk.HAAcquireFenceOperation()
 	case haActionAssessPromotion:
-		return "POST", haAdminPromotionAssessPath
+		operation = adminsdk.HAAssessPromotionOperation()
 	case haActionPromoteStandby:
-		return "POST", haAdminPromotionCurrentFencePath
+		operation = adminsdk.HAPromoteWithCurrentFenceOperation()
 	case haActionDemoteFormerPrimary:
-		return "POST", haAdminRejoinAssessPath
+		operation = adminsdk.HAAssessRejoinOperation()
 	case haActionRewindFormerPrimary:
-		return "POST", haAdminRejoinRewindPath
+		operation = adminsdk.HARewindRejoinOperation()
 	case haActionReseedFormerPrimary:
-		return "POST", haAdminRejoinReseedPath
+		operation = adminsdk.HAReseedRejoinOperation()
+	default:
+		ok = false
 	}
-	return "", ""
+	if !ok {
+		return "", ""
+	}
+	return operation.Method, operation.Path
 }
 
 func haPlannedActionSlotName(action haPlannedAction) string {

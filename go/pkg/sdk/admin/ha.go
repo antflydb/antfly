@@ -4,12 +4,40 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
 )
 
-const adminV1Path = "/admin/v1"
+const (
+	AdminV1Path                       = "/admin/v1"
+	HAPath                            = AdminV1Path + "/ha"
+	HAPrimaryStatusPath               = HAPath + "/primary/status"
+	HAStandbyStatusPath               = HAPath + "/standby/status"
+	HACommitCheckPath                 = HAPath + "/commit/check"
+	HACommitAppendPath                = HAPath + "/commit/append"
+	HAReadCheckPath                   = HAPath + "/read/check"
+	HAWriteCheckPath                  = HAPath + "/write/check"
+	HAOwnerJobCheckPath               = HAPath + "/owner-jobs/check"
+	HAReplicationSlotsPath            = HAPath + "/replication-slots"
+	HAReplicationSlotPathPrefix       = HAReplicationSlotsPath + "/"
+	HAReplicationSlotPausePathSuffix  = "/pause"
+	HAReplicationSlotResumePathSuffix = "/resume"
+	HABaseBackupsPath                 = HAPath + "/base-backups"
+	HABaseBackupsFinishPath           = HABaseBackupsPath + "/finish"
+	HAStandbyBootstrapPath            = HAPath + "/standby/bootstrap"
+	HAFencePath                       = HAPath + "/fence"
+	HAFenceCurrentPath                = HAFencePath + "/current"
+	HAPromotionPath                   = HAPath + "/promotion"
+	HAPromotionAssessPath             = HAPath + "/promotion/assess"
+	HAPromotionCurrentFencePath       = HAPath + "/promotion/current-fence"
+	HARejoinAssessPath                = HAPath + "/rejoin/assess"
+	HARejoinRewindPath                = HAPath + "/rejoin/rewind"
+	HARejoinReseedPath                = HAPath + "/rejoin/reseed"
+)
+
+const adminV1Path = AdminV1Path
 
 type (
 	HAActionReceipt                    = oapi.HAActionReceipt
@@ -134,6 +162,90 @@ const (
 type HAClient struct {
 	client  *oapi.ClientWithResponses
 	editors []oapi.RequestEditorFn
+}
+
+// HAOperation identifies a stable /admin/v1/ha method and full admin path.
+// Operator status and automation should use these values rather than carrying a
+// separate route table outside the admin SDK wrapper.
+type HAOperation struct {
+	Method string
+	Path   string
+}
+
+func HAListReplicationSlotsOperation() HAOperation {
+	return HAOperation{Method: http.MethodGet, Path: HAReplicationSlotsPath}
+}
+
+func HACreateReplicationSlotOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAReplicationSlotsPath}
+}
+
+func HADropReplicationSlotOperation(slotName string) (HAOperation, bool) {
+	path, ok := HAReplicationSlotPath(slotName)
+	if !ok {
+		return HAOperation{}, false
+	}
+	return HAOperation{Method: http.MethodDelete, Path: path}, true
+}
+
+func HAPauseReplicationSlotOperation(slotName string) (HAOperation, bool) {
+	path, ok := HAReplicationSlotPath(slotName)
+	if !ok {
+		return HAOperation{}, false
+	}
+	return HAOperation{Method: http.MethodPut, Path: path + HAReplicationSlotPausePathSuffix}, true
+}
+
+func HAResumeReplicationSlotOperation(slotName string) (HAOperation, bool) {
+	path, ok := HAReplicationSlotPath(slotName)
+	if !ok {
+		return HAOperation{}, false
+	}
+	return HAOperation{Method: http.MethodPut, Path: path + HAReplicationSlotResumePathSuffix}, true
+}
+
+func HABeginBaseBackupOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HABaseBackupsPath}
+}
+
+func HAFinishBaseBackupOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HABaseBackupsFinishPath}
+}
+
+func HABootstrapStandbyOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAStandbyBootstrapPath}
+}
+
+func HAAcquireFenceOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAFencePath}
+}
+
+func HAAssessPromotionOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAPromotionAssessPath}
+}
+
+func HAPromoteWithCurrentFenceOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAPromotionCurrentFencePath}
+}
+
+func HAAssessRejoinOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HARejoinAssessPath}
+}
+
+func HARewindRejoinOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HARejoinRewindPath}
+}
+
+func HAReseedRejoinOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HARejoinReseedPath}
+}
+
+func HAReplicationSlotPath(slotName string) (string, bool) {
+	slotName = strings.TrimSpace(slotName)
+	if slotName == "" {
+		return "", false
+	}
+	return HAReplicationSlotPathPrefix + url.PathEscape(slotName), true
 }
 
 // HAResponse keeps the typed response and the original response body together.
