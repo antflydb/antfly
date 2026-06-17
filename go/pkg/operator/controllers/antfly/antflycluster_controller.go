@@ -5686,7 +5686,11 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return true
 	}
-	if action.AdminJobName == haAdminDirectAPIName && !haDirectAdminActionReceiptMatches(action) {
+	if action.AdminJobName == haAdminDirectAPIName {
+		if !haDirectAdminActionReceiptMatches(action) {
+			return false
+		}
+	} else if !haAdminActionReceiptMatches(action) {
 		return false
 	}
 	return haActionHasRequiredAdminResult(action)
@@ -5743,6 +5747,14 @@ func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool 
 func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
 	result := action.AdminResult
 	if result == nil || result.SchemaVersion == 0 {
+		return false
+	}
+	return haAdminActionReceiptMatches(action)
+}
+
+func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	result := action.AdminResult
+	if result == nil {
 		return false
 	}
 	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)

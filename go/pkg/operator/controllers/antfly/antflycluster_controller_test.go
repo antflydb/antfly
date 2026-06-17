@@ -75,6 +75,10 @@ func haFenceResponseJSON(oldPrimaryID, promotedNodeID string, generation uint64,
 
 func haPromotionAdminResult(generation uint64, token string, promotedNodeID string) *antflyv1.HAAdminActionResultStatus {
 	return &antflyv1.HAAdminActionResultStatus{
+		ActionID:              "promotion:" + promotedNodeID,
+		ActionKind:            "promotion",
+		ActionTarget:          promotedNodeID,
+		ActionState:           "applied",
 		FenceGeneration:       generation,
 		FenceToken:            token,
 		FenceClusterID:        100,
@@ -1560,11 +1564,16 @@ func TestHAPlannedActionDependenciesPreferExplicitDependsOn(t *testing.T) {
 		AdminJobPhase: haAdminJobPhaseFailed,
 	}, {
 		Kind:          string(haActionCreateSlot),
+		SlotName:      "standby-a",
 		AdminCommand:  []string{"slot", "create"},
 		AdminJobPhase: haAdminJobPhaseSucceeded,
 		AdminResult: &antflyv1.HAAdminActionResultStatus{
-			SlotAction: "create",
-			SlotName:   "standby-a",
+			ActionID:     "replication_slot_create:standby-a",
+			ActionKind:   "replication_slot_create",
+			ActionTarget: "standby-a",
+			ActionState:  "applied",
+			SlotAction:   "create",
+			SlotName:     "standby-a",
 		},
 	}, {
 		Kind:         string(haActionSeedStandby),
@@ -1642,6 +1651,12 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 		SlotAction: "create",
 		SlotName:   "standby-a",
 	}
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult.ActionID = "replication_slot_create:standby-a"
+	actions[0].AdminResult.ActionKind = "replication_slot_create"
+	actions[0].AdminResult.ActionTarget = "standby-a"
+	actions[0].AdminResult.ActionState = "applied"
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 
 	seedFileActions := []antflyv1.HAPlannedActionStatus{{
@@ -1668,6 +1683,10 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeFalse())
 
 	seedFileActions[0].AdminResult.ManifestID = "base-standby-a-5"
+	seedFileActions[0].AdminResult.ActionID = "base_backup_finish:base-standby-a-5"
+	seedFileActions[0].AdminResult.ActionKind = "base_backup_finish"
+	seedFileActions[0].AdminResult.ActionTarget = "base-standby-a-5"
+	seedFileActions[0].AdminResult.ActionState = "applied"
 	g.Expect(haPlannedActionDependenciesSucceeded(seedFileActions, 1)).To(BeTrue())
 
 	seedFileActions[1].AdminJobPhase = haAdminJobPhaseSucceeded
@@ -1682,6 +1701,10 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeFalse())
 
 	seedFileActions[1].AdminResult.ManifestID = "base-standby-a-5"
+	seedFileActions[1].AdminResult.ActionID = "standby_bootstrap:base-standby-a-5"
+	seedFileActions[1].AdminResult.ActionKind = "standby_bootstrap"
+	seedFileActions[1].AdminResult.ActionTarget = "base-standby-a-5"
+	seedFileActions[1].AdminResult.ActionState = "applied"
 	g.Expect(haAdminActionSucceededWithEvidence(seedFileActions[1])).To(BeTrue())
 
 	promotionActions := []antflyv1.HAPlannedActionStatus{{
@@ -1747,6 +1770,10 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	rejoinActions[0].AdminResult.RewindCurrentLastLSN = 12
 	rejoinActions[0].AdminResult.RewindNextLSN = 13
 	rejoinActions[0].AdminResult.RewindDiscardedLSNCount = 1
+	rejoinActions[0].AdminResult.ActionID = "rejoin_rewind:primary-a"
+	rejoinActions[0].AdminResult.ActionKind = "rejoin_rewind"
+	rejoinActions[0].AdminResult.ActionTarget = "primary-a"
+	rejoinActions[0].AdminResult.ActionState = "applied"
 	g.Expect(haPlannedActionDependenciesSucceeded(rejoinActions, 1)).To(BeTrue())
 
 	reseedActions := []antflyv1.HAPlannedActionStatus{{
@@ -1775,7 +1802,41 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 	reseedActions[0].AdminResult.ReseedSlotName = "primary-a"
 	reseedActions[0].AdminResult.ReseedRequired = true
 	reseedActions[0].AdminResult.ReseedBaseBackupRequired = true
+	reseedActions[0].AdminResult.ActionID = "rejoin_reseed:primary-a"
+	reseedActions[0].AdminResult.ActionKind = "rejoin_reseed"
+	reseedActions[0].AdminResult.ActionTarget = "primary-a"
+	reseedActions[0].AdminResult.ActionState = "applied"
 	g.Expect(haPlannedActionDependenciesSucceeded(reseedActions, 1)).To(BeTrue())
+}
+
+func TestHACLIActionDependenciesRequireMatchingActionReceipt(t *testing.T) {
+	g := NewWithT(t)
+
+	actions := []antflyv1.HAPlannedActionStatus{{
+		Kind:          string(haActionCreateSlot),
+		SlotName:      "standby-a",
+		AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
+		AdminJobPhase: haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SlotAction: "create",
+			SlotName:   "standby-a",
+		},
+	}, {
+		Kind:      string(haActionSeedStandby),
+		DependsOn: string(haActionCreateSlot),
+	}}
+
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult.ActionID = "replication_slot_create:standby-b"
+	actions[0].AdminResult.ActionKind = "replication_slot_create"
+	actions[0].AdminResult.ActionTarget = "standby-b"
+	actions[0].AdminResult.ActionState = "applied"
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult.ActionID = "replication_slot_create:standby-a"
+	actions[0].AdminResult.ActionTarget = "standby-a"
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeTrue())
 }
 
 func TestHADirectAdminActionDependenciesRequireVersionedActionReceipt(t *testing.T) {
@@ -2024,12 +2085,17 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 					AdminJobPhase: haAdminJobPhaseFailed,
 				}, {
 					Kind:          string(haActionCreateSlot),
+					SlotName:      "standby-a",
 					AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
 					AdminURL:      "http://primary-ha.default.svc:8081",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						SlotAction: "create",
-						SlotName:   "standby-a",
+						ActionID:     "replication_slot_create:standby-a",
+						ActionKind:   "replication_slot_create",
+						ActionTarget: "standby-a",
+						ActionState:  "applied",
+						SlotAction:   "create",
+						SlotName:     "standby-a",
 					},
 				}, {
 					Kind:         string(haActionSeedStandby),
@@ -2545,6 +2611,10 @@ func TestUpdateHALastPromotionRequiresPriorHAAdminActions(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.LastPromotion).To(BeNil())
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		ActionID:            "fence_acquire:standby-a",
+		ActionKind:          "fence_acquire",
+		ActionTarget:        "standby-a",
+		ActionState:         "applied",
 		FenceGeneration:     3,
 		FenceToken:          "lease-token-3",
 		FencePromotedNodeID: "standby-a",
@@ -2583,11 +2653,17 @@ func TestUpdateHALastPromotionHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					AdminJobPhase: haAdminJobPhaseFailed,
 				}, {
 					Kind:          string(haActionAcquireFence),
+					StandbyName:   "standby-a",
 					AdminCommand:  []string{"fence", "acquire"},
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult: &antflyv1.HAAdminActionResultStatus{
-						FenceGeneration: 3,
-						FenceToken:      "lease-token-3",
+						ActionID:            "fence_acquire:standby-a",
+						ActionKind:          "fence_acquire",
+						ActionTarget:        "standby-a",
+						ActionState:         "applied",
+						FenceGeneration:     3,
+						FenceToken:          "lease-token-3",
+						FencePromotedNodeID: "standby-a",
 					},
 				}, {
 					Kind:            string(haActionPromoteStandby),
@@ -3341,6 +3417,7 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 				},
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:          string(haActionPromoteStandby),
+					StandbyName:   "standby-a",
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminJobName:  "promote-job",
 					AdminJobPhase: haAdminJobPhasePending,
@@ -3368,14 +3445,23 @@ func TestUpdateHAFormerPrimaryRequiresPriorHAAdminActions(t *testing.T) {
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
-		FenceGeneration: 3,
-		FenceToken:      "ha-fence-token",
+		ActionID:            "fence_acquire:standby-a",
+		ActionKind:          "fence_acquire",
+		ActionTarget:        "standby-a",
+		ActionState:         "applied",
+		FenceGeneration:     3,
+		FenceToken:          "ha-fence-token",
+		FencePromotedNodeID: "standby-a",
 	}
 	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).To(BeNil())
 
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = haPromotionAdminResult(3, "ha-fence-token", "standby-a")
 	cluster.Status.HAStatus.PlannedActions[1].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		ActionID:         "rejoin_assess:primary-a",
+		ActionKind:       "rejoin_assess",
+		ActionTarget:     "primary-a",
+		ActionState:      "assessed",
 		RejoinAction:     "reject_unfenced",
 		RejoinReason:     "no_fence",
 		FormerNodeID:     "primary-a",
@@ -3426,6 +3512,10 @@ func TestUpdateHAFormerPrimaryHonorsExplicitDependencyAfterUnrelatedFailure(t *t
 					AdminJobName:  "demote-job",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult: &antflyv1.HAAdminActionResultStatus{
+						ActionID:         "rejoin_assess:primary-a",
+						ActionKind:       "rejoin_assess",
+						ActionTarget:     "primary-a",
+						ActionState:      "assessed",
 						RejoinAction:     "reject_unfenced",
 						RejoinReason:     "no_fence",
 						FormerNodeID:     "primary-a",
