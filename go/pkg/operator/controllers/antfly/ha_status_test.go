@@ -1014,6 +1014,42 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 	}
 }
 
+func TestHAFenceAdminCommandUsesFenceReasonFallback(t *testing.T) {
+	identity := &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		ShardID:          10,
+		TableID:          20,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
+	command := haAdminCommand(haPlannedAction{
+		Kind:            haActionAcquireFence,
+		StandbyName:     "standby-a",
+		TargetLSN:       12,
+		FenceGeneration: 3,
+		FenceReason:     "LeaseHeld",
+	}, identity, nil)
+
+	if !reflect.DeepEqual(command, []string{
+		"fence", "acquire",
+		"--cluster-id", "100",
+		"--shard-id", "10",
+		"--table-id", "20",
+		"--timeline-id", "4",
+		"--epoch", "6",
+		"--old-primary-id", "primary-a",
+		"--promoted-node-id", "standby-a",
+		"--new-timeline-id", "5",
+		"--new-epoch", "7",
+		"--required-lsn", "12",
+		"--observed-lsn", "12",
+		"--reason", "LeaseHeld",
+	}) {
+		t.Fatalf("expected fence reason fallback in admin command, got %#v", command)
+	}
+}
+
 func marshalJSONMap(t *testing.T, value any) map[string]any {
 	t.Helper()
 	raw, err := json.Marshal(value)

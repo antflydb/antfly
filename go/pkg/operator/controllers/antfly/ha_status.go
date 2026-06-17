@@ -978,6 +978,10 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 		if identity == nil || identity.CurrentPrimaryID == "" || action.StandbyName == "" {
 			return nil
 		}
+		reason := action.Reason
+		if strings.TrimSpace(reason) == "" {
+			reason = action.FenceReason
+		}
 		return []string{
 			"fence", "acquire",
 			"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
@@ -991,7 +995,7 @@ func haAdminCommand(action haPlannedAction, identity *antflyv1.HAReplicationIden
 			"--new-epoch", strconv.FormatUint(identity.Epoch+1, 10),
 			"--required-lsn", strconv.FormatUint(action.TargetLSN, 10),
 			"--observed-lsn", strconv.FormatUint(action.TargetLSN, 10),
-			"--reason", action.Reason,
+			"--reason", reason,
 		}
 	default:
 		return nil
