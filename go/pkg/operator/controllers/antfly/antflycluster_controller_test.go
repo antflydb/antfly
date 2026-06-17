@@ -112,10 +112,10 @@ func haPromotionResponseJSON() string {
 		},
 		"assessment": map[string]any{
 			"required_lsn":          12,
-			"received_lsn":          13,
-			"applied_lsn":           11,
+			"received_lsn":          12,
+			"applied_lsn":           12,
 			"has_required_lsn":      true,
-			"caught_up_to_received": false,
+			"caught_up_to_received": true,
 			"fencing_confirmed":     true,
 			"force":                 false,
 			"data_loss_possible":    false,
@@ -126,7 +126,7 @@ func haPromotionResponseJSON() string {
 		},
 		"promotion": map[string]any{
 			"node_id":    "standby-a",
-			"switch_lsn": 12,
+			"switch_lsn": 13,
 			"old_identity": map[string]any{
 				"cluster_id":  100,
 				"shard_id":    10,
@@ -224,7 +224,7 @@ func haPromotionAdminResult(generation uint64, token string, promotedNodeID stri
 		FenceNewTimelineID:    5,
 		FenceNewEpoch:         7,
 		FenceRequiredLSN:      12,
-		FenceObservedLSN:      13,
+		FenceObservedLSN:      12,
 	}
 }
 
@@ -1307,14 +1307,14 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`)),
 				}, nil
 			case "/admin/v1/ha/promotion/current-fence":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s", req.URL.Path)
@@ -1375,8 +1375,8 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	g.Expect(promotion.PromotedStandbyID).To(Equal("standby-a"))
 	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
-	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))
-	g.Expect(promotion.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(promotion.SwitchLSN).To(Equal(uint64(13)))
+	g.Expect(promotion.ObservedLSN).To(Equal(uint64(12)))
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(promotion.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
@@ -1677,9 +1677,9 @@ func TestHAPromotionResultMatchesPlannedBoundary(t *testing.T) {
 		ActionTarget:     "standby-a",
 		ActionState:      "applied",
 		PromotedNodeID:   "standby-a",
-		SwitchLSN:        12,
+		SwitchLSN:        13,
 		RequiredLSN:      12,
-		ObservedLSN:      13,
+		ObservedLSN:      12,
 		ParentClusterID:  100,
 		ParentShardID:    10,
 		ParentTableID:    20,
@@ -1696,7 +1696,7 @@ func TestHAPromotionResultMatchesPlannedBoundary(t *testing.T) {
 	g.Expect(haPromotionResultMatchesAction(result, identity, &action)).To(BeTrue())
 
 	mismatchedLSN := result
-	mismatchedLSN.SwitchLSN = 11
+	mismatchedLSN.SwitchLSN = 12
 	g.Expect(haPromotionResultMatchesAction(mismatchedLSN, identity, &action)).To(BeFalse())
 
 	mismatchedTimeline := result
@@ -3529,7 +3529,7 @@ func TestUpdateHALastPromotionFromSucceededPromoteJob(t *testing.T) {
 	g.Expect(promotion.TableID).To(Equal(uint64(20)))
 	g.Expect(promotion.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.NewTimelineID).To(Equal(uint64(5)))
-	g.Expect(promotion.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(promotion.SwitchLSN).To(Equal(uint64(13)))
 	g.Expect(promotion.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
 	g.Expect(promotion.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(promotion.FenceReason).To(Equal("LeaseAcquired"))
@@ -3733,10 +3733,10 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	result, ok := parseHAPromotionJobResult(strings.Join([]string{
 		"result=promote_current_fence",
 		"assessment.required_lsn=12",
-		"assessment.received_lsn=13",
+		"assessment.received_lsn=12",
 		"assessment.applied_lsn=11",
 		"promotion.node_id=standby-a",
-		"promotion.switch_lsn=12",
+		"promotion.switch_lsn=13",
 		"promotion.old_identity.cluster_id=100",
 		"promotion.old_identity.shard_id=10",
 		"promotion.old_identity.table_id=20",
@@ -3756,13 +3756,13 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 
 	g.Expect(ok).To(BeTrue())
 	g.Expect(result.PromotedNodeID).To(Equal("standby-a"))
-	g.Expect(result.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(result.SwitchLSN).To(Equal(uint64(13)))
 	g.Expect(result.ParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(result.ParentEpoch).To(Equal(uint64(6)))
 	g.Expect(result.NewTimelineID).To(Equal(uint64(5)))
 	g.Expect(result.NewEpoch).To(Equal(uint64(7)))
 	g.Expect(result.RequiredLSN).To(Equal(uint64(12)))
-	g.Expect(result.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(result.ObservedLSN).To(Equal(uint64(12)))
 	g.Expect(result.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(result.FenceToken).To(Equal("ha-fence-token"))
 	g.Expect(result.Forced).To(BeTrue())
@@ -3774,7 +3774,7 @@ func TestParseHAPromotionJobResult(t *testing.T) {
 	g.Expect(adminResult.FenceTableID).To(Equal(uint64(20)))
 	g.Expect(adminResult.FencePromotedNodeID).To(Equal("standby-a"))
 	g.Expect(adminResult.FenceRequiredLSN).To(Equal(uint64(12)))
-	g.Expect(adminResult.FenceObservedLSN).To(Equal(uint64(13)))
+	g.Expect(adminResult.FenceObservedLSN).To(Equal(uint64(12)))
 	g.Expect(adminResult.FenceForced).To(BeTrue())
 	g.Expect(adminResult.PromotionForce).To(BeTrue())
 	g.Expect(adminResult.PromotionDataLossPossible).To(BeTrue())
@@ -3832,7 +3832,7 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(openAPIResult.ActionTarget).To(Equal("standby-a"))
 	g.Expect(openAPIResult.ActionState).To(Equal("applied"))
 	g.Expect(openAPIResult.PromotedNodeID).To(Equal("standby-a"))
-	g.Expect(openAPIResult.SwitchLSN).To(Equal(uint64(12)))
+	g.Expect(openAPIResult.SwitchLSN).To(Equal(uint64(13)))
 	g.Expect(openAPIResult.ParentClusterID).To(Equal(uint64(100)))
 	g.Expect(openAPIResult.ParentShardID).To(Equal(uint64(10)))
 	g.Expect(openAPIResult.ParentTableID).To(Equal(uint64(20)))
@@ -3840,7 +3840,7 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	g.Expect(openAPIResult.NewClusterID).To(Equal(uint64(100)))
 	g.Expect(openAPIResult.NewEpoch).To(Equal(uint64(7)))
 	g.Expect(openAPIResult.RequiredLSN).To(Equal(uint64(12)))
-	g.Expect(openAPIResult.ObservedLSN).To(Equal(uint64(13)))
+	g.Expect(openAPIResult.ObservedLSN).To(Equal(uint64(12)))
 	g.Expect(openAPIResult.FenceGeneration).To(Equal(uint64(3)))
 	g.Expect(openAPIResult.FenceToken).To(Equal("ha-fence-token"))
 	openAPIStatus := haPromotionAdminActionResult(openAPIResult)
@@ -3865,25 +3865,28 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	_, ok = parseHAPromotionAPIResult([]byte(haPromotionResponseJSONWithoutPath("promotion", "new_identity", "table_id")))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":13,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":false,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":12,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":12,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
-	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":14,"received_lsn":14,"applied_lsn":15,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"data_loss_possible":true,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":14,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
+	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
+	g.Expect(ok).To(BeFalse())
+
+	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":15,"received_lsn":14,"applied_lsn":14,"has_required_lsn":false,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":15,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(legacyResult.SchemaVersion).To(Equal(uint32(1)))
 	g.Expect(legacyResult.PromotedNodeID).To(Equal("standby-a"))
-	g.Expect(legacyResult.SwitchLSN).To(Equal(uint64(14)))
+	g.Expect(legacyResult.SwitchLSN).To(Equal(uint64(15)))
 	g.Expect(legacyResult.ParentClusterID).To(Equal(uint64(100)))
 	g.Expect(legacyResult.ParentShardID).To(Equal(uint64(0)))
 	g.Expect(legacyResult.ParentTimelineID).To(Equal(uint64(5)))
 	g.Expect(legacyResult.NewEpoch).To(Equal(uint64(8)))
-	g.Expect(legacyResult.ObservedLSN).To(Equal(uint64(15)))
+	g.Expect(legacyResult.ObservedLSN).To(Equal(uint64(14)))
 	g.Expect(legacyResult.FenceGeneration).To(Equal(uint64(4)))
 	g.Expect(legacyResult.FenceToken).To(Equal("legacy-token"))
 	g.Expect(legacyResult.Forced).To(BeTrue())
@@ -4055,10 +4058,10 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 		"action.state=applied",
 		"action.node_id=standby-a",
 		"assessment.required_lsn=12",
-		"assessment.received_lsn=13",
+		"assessment.received_lsn=12",
 		"assessment.applied_lsn=12",
 		"promotion.node_id=standby-a",
-		"promotion.switch_lsn=12",
+		"promotion.switch_lsn=13",
 		"promotion.old_identity.timeline_id=4",
 		"promotion.old_identity.epoch=6",
 		"promotion.new_identity.timeline_id=5",
@@ -4081,7 +4084,7 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(promotion.FenceParentTimelineID).To(Equal(uint64(4)))
 	g.Expect(promotion.FenceNewTimelineID).To(Equal(uint64(5)))
 	g.Expect(promotion.FenceRequiredLSN).To(Equal(uint64(12)))
-	g.Expect(promotion.FenceObservedLSN).To(Equal(uint64(13)))
+	g.Expect(promotion.FenceObservedLSN).To(Equal(uint64(12)))
 	g.Expect(promotion.PromotionForce).To(BeFalse())
 	g.Expect(promotion.PromotionDataLossPossible).To(BeFalse())
 

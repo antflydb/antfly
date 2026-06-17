@@ -4531,13 +4531,16 @@ func haPromotionResultMatchesAction(result haPromotionJobResult, identity *antfl
 	if result.NewTimelineID != identity.TimelineID+1 || result.NewEpoch != identity.Epoch+1 {
 		return false
 	}
-	if action.TargetLSN > 0 && (result.SwitchLSN != action.TargetLSN || result.RequiredLSN != action.TargetLSN) {
+	if result.SwitchLSN == 0 || result.SwitchLSN != result.ObservedLSN+1 {
+		return false
+	}
+	if action.TargetLSN > 0 && result.RequiredLSN != action.TargetLSN {
 		return false
 	}
 	if strings.TrimSpace(action.StandbyName) != "" && result.PromotedNodeID != strings.TrimSpace(action.StandbyName) {
 		return false
 	}
-	if result.ObservedLSN < result.RequiredLSN {
+	if !result.Forced && result.ObservedLSN < result.RequiredLSN {
 		return false
 	}
 	if action.FenceGeneration > 0 && result.FenceGeneration != action.FenceGeneration {
@@ -4578,6 +4581,14 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			return
 		}
 		now := metav1.Now()
+		switchLSN := action.TargetLSN
+		observedLSN := action.TargetLSN
+		if action.AdminResult != nil && action.AdminResult.FenceObservedLSN > 0 {
+			observedLSN = action.AdminResult.FenceObservedLSN
+			switchLSN = action.AdminResult.FenceObservedLSN + 1
+		} else if action.TargetLSN > 0 {
+			switchLSN = action.TargetLSN + 1
+		}
 		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
 			ClusterID:         identity.ClusterID,
 			ShardID:           identity.ShardID,
@@ -4588,9 +4599,9 @@ func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context
 			ParentEpoch:       identity.Epoch,
 			NewTimelineID:     identity.TimelineID + 1,
 			NewEpoch:          identity.Epoch + 1,
-			SwitchLSN:         action.TargetLSN,
+			SwitchLSN:         switchLSN,
 			RequiredLSN:       action.TargetLSN,
-			ObservedLSN:       action.TargetLSN,
+			ObservedLSN:       observedLSN,
 			FenceGeneration:   action.FenceGeneration,
 			FenceAuthority:    action.FenceAuthority,
 			FenceReason:       haPromotionFenceReason(action),
@@ -4873,7 +4884,8 @@ func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antf
 		status.ParentEpoch == identity.Epoch &&
 		status.NewTimelineID == identity.TimelineID+1 &&
 		status.NewEpoch == identity.Epoch+1 &&
-		status.SwitchLSN == action.TargetLSN &&
+		(action.TargetLSN == 0 || haPromotionRequiredLSN(status) == action.TargetLSN) &&
+		(action.TargetLSN == 0 || haPromotionObservedLSN(status) >= action.TargetLSN) &&
 		(status.FenceAuthority == "" || status.FenceAuthority == action.FenceAuthority) &&
 		status.FenceGeneration == action.FenceGeneration
 }
@@ -4952,20 +4964,25 @@ func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
 		return haPromotionJobResult{}, false
 	}
 	result.RequiredLSN, _ = parseHAResultUint(lines, "assessment.required_lsn")
-	receivedLSN, _ := parseHAResultUint(lines, "assessment.received_lsn")
-	appliedLSN, _ := parseHAResultUint(lines, "assessment.applied_lsn")
-	result.ObservedLSN = receivedLSN
-	if appliedLSN > result.ObservedLSN {
-		result.ObservedLSN = appliedLSN
-	}
 	if result.RequiredLSN == 0 {
-		result.RequiredLSN = result.SwitchLSN
+		return haPromotionJobResult{}, false
 	}
-	if result.ObservedLSN == 0 {
-		result.ObservedLSN = result.RequiredLSN
+	receivedLSN, ok := parseHAResultUint(lines, "assessment.received_lsn")
+	if !ok {
+		return haPromotionJobResult{}, false
 	}
+	if _, ok := parseHAResultUint(lines, "assessment.applied_lsn"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.SwitchLSN != receivedLSN+1 {
+		return haPromotionJobResult{}, false
+	}
+	result.ObservedLSN = receivedLSN
 	result.Forced, _ = parseHAResultBool(lines, "promotion.forced")
 	result.DataLossPossible, _ = parseHAResultBool(lines, "promotion.data_loss_possible")
+	if !result.Forced && result.ObservedLSN < result.RequiredLSN {
+		return haPromotionJobResult{}, false
+	}
 	return result, true
 }
 
@@ -5013,6 +5030,7 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 	if result == nil ||
 		result.SchemaVersion == 0 ||
 		!haPromotionAssessmentJSONComplete(result.Assessment) ||
+		!haPromotionAssessmentJSONConsistent(result.Assessment) ||
 		!haPromotionResultJSONComplete(result) ||
 		result.FenceGeneration == 0 ||
 		strings.TrimSpace(result.FenceToken) == "" {
@@ -5022,16 +5040,20 @@ func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
 		return haPromotionJobResult{}, false
 	}
 	observedLSN := haUint64JSONValue(result.Assessment.ReceivedLSN)
-	appliedLSN := haUint64JSONValue(result.Assessment.AppliedLSN)
-	if appliedLSN > observedLSN {
-		observedLSN = appliedLSN
-	}
 	requiredLSN := haUint64JSONValue(result.Assessment.RequiredLSN)
-	if requiredLSN == 0 {
-		requiredLSN = haUint64JSONValue(result.Promotion.SwitchLSN)
-	}
-	if observedLSN == 0 {
-		observedLSN = requiredLSN
+	if requiredLSN == 0 ||
+		haUint64JSONValue(result.Promotion.SwitchLSN) != observedLSN+1 ||
+		!haBoolJSONValue(result.Assessment.FencingConfirmed) ||
+		!haBoolJSONValue(result.Assessment.CanPromote) ||
+		haBoolJSONValue(result.Forced) != haBoolJSONValue(result.Promotion.Forced) ||
+		haBoolJSONValue(result.Assessment.Force) != haBoolJSONValue(result.Forced) ||
+		haBoolJSONValue(result.Promotion.DataLossPossible) != haBoolJSONValue(result.Assessment.DataLossPossible) ||
+		haUint64JSONValue(result.Promotion.OldIdentity.ClusterID) != haUint64JSONValue(result.Promotion.NewIdentity.ClusterID) ||
+		haUint64JSONValue(result.Promotion.OldIdentity.ShardID) != haUint64JSONValue(result.Promotion.NewIdentity.ShardID) ||
+		haUint64JSONValue(result.Promotion.OldIdentity.TableID) != haUint64JSONValue(result.Promotion.NewIdentity.TableID) ||
+		haUint64JSONValue(result.Promotion.NewIdentity.TimelineID) <= haUint64JSONValue(result.Promotion.OldIdentity.TimelineID) ||
+		haUint64JSONValue(result.Promotion.NewIdentity.Epoch) <= haUint64JSONValue(result.Promotion.OldIdentity.Epoch) {
+		return haPromotionJobResult{}, false
 	}
 	return haPromotionJobResult{
 		SchemaVersion:    result.SchemaVersion,
@@ -5071,6 +5093,33 @@ func haPromotionResultJSONComplete(result *haPromotionAPIResult) bool {
 		result.Promotion.Forced != nil &&
 		result.Promotion.DataLossPossible != nil &&
 		result.Forced != nil
+}
+
+func haPromotionAssessmentJSONConsistent(assessment haPromotionAssessmentJSON) bool {
+	if !haPromotionAssessmentJSONComplete(assessment) {
+		return false
+	}
+	requiredLSN := haUint64JSONValue(assessment.RequiredLSN)
+	receivedLSN := haUint64JSONValue(assessment.ReceivedLSN)
+	appliedLSN := haUint64JSONValue(assessment.AppliedLSN)
+	if requiredLSN == 0 {
+		return false
+	}
+	hasRequiredLSN := receivedLSN >= requiredLSN
+	caughtUpToReceived := appliedLSN >= receivedLSN
+	dataLossPossible := !hasRequiredLSN || !caughtUpToReceived || appliedLSN < requiredLSN
+	fencingConfirmed := haBoolJSONValue(assessment.FencingConfirmed)
+	forced := haBoolJSONValue(assessment.Force)
+	requiresFencing := !fencingConfirmed && !forced
+	requiresForce := dataLossPossible && !forced
+	canPromote := !requiresFencing && (!requiresForce || forced)
+	return haBoolJSONValue(assessment.HasRequiredLSN) == hasRequiredLSN &&
+		haBoolJSONValue(assessment.CaughtUpToReceived) == caughtUpToReceived &&
+		haBoolJSONValue(assessment.DataLossPossible) == dataLossPossible &&
+		haBoolJSONValue(assessment.Safe) == (fencingConfirmed && !dataLossPossible) &&
+		haBoolJSONValue(assessment.RequiresFencing) == requiresFencing &&
+		haBoolJSONValue(assessment.RequiresForce) == requiresForce &&
+		haBoolJSONValue(assessment.CanPromote) == canPromote
 }
 
 func haAdminActionReceiptPresent(action haAdminActionReceiptJSON) bool {
