@@ -733,10 +733,34 @@ pub const UserManager = struct {
 
     pub fn dropRoleSubject(self: *UserManager, role_subject: []const u8) !void {
         if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        if (try self.roleSubjectHasDependencies(role_subject)) return error.RoleInUse;
+        _ = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{ sql_role_catalog_subject, role_subject });
+    }
+
+    pub fn dropRoleSubjectCascade(self: *UserManager, role_subject: []const u8) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
         _ = try self.enforcer.removeFilteredPolicy(0, &.{role_subject});
         _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 1, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{role_subject});
+    }
+
+    pub fn roleSubjectHasDependencies(self: *const UserManager, role_subject: []const u8) !bool {
+        if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("g", 0, role_subject)) return true;
+
+        const inbound_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "g", 1, &.{role_subject});
+        defer {
+            for (inbound_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(inbound_rules);
+        }
+        for (inbound_rules) |rule| {
+            if (rule.fields.len < 2) continue;
+            if (std.mem.eql(u8, rule.fields[0], sql_role_catalog_subject)) continue;
+            return true;
+        }
+        return false;
     }
 
     pub fn roleSubjectExists(self: *const UserManager, role_subject: []const u8) !bool {

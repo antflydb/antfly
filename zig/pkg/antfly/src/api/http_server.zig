@@ -12374,6 +12374,10 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer alloc.free(stored_policy);
     try std.testing.expect(std.mem.indexOf(u8, stored_policy, "\"$auth\":\"metadata.tenant_id\"") != null);
 
+    try std.testing.expectError(error.RoleInUse, server.applyRelationalSqlDdl("DROP ROLE app_writer;"));
+    var revoked = try server.applyRelationalSqlDdl("REVOKE SELECT ON TABLE usage_records FROM app_writer;");
+    defer revoked.deinit(alloc);
+    try auth.manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "usage_records", .read)));

@@ -4465,8 +4465,9 @@ intent that captures role names, privilege counts, object kind/name, principal
 identity, and role setting names, then fail closed when applied to table schema
 storage. Public API execution routes authorization-catalog SQL through the
 native user-management surface instead: `CREATE ROLE app_writer` creates the
-Antfly auth subject `role:app_writer`, `DROP ROLE` removes that subject's
-permissions, inheritance edges, assignments, and row filters, and table
+Antfly auth subject `role:app_writer`, `DROP ROLE` succeeds only after that
+subject has no remaining permissions, row filters, inheritance edges, or user
+assignments, and table
 `GRANT`/`REVOKE` statements map PostgreSQL privileges onto Antfly
 `read`/`write`/`admin` table permissions, with `ALL [PRIVILEGES]` expanded to
 all three native permission bits. A grant target that is already an Antfly user

@@ -320,6 +320,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
     defer revoked.deinit(alloc);
     try std.testing.expect(try manager.enforce("alice", .table, "usage_records", .read));
     try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .write)));
+    try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
 
     var all_granted = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;")).?;
     defer all_granted.deinit(alloc);
@@ -332,7 +333,9 @@ test "sql auth adapter creates roles and applies table grants through user manag
     try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .read)));
     try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .write)));
     try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .admin)));
+    try std.testing.expectError(error.RoleInUse, executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;"));
 
+    try manager.removeRoleFromUser("alice", "role:app_writer");
     var dropped = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "DROP ROLE app_writer;")).?;
     defer dropped.deinit(alloc);
     try std.testing.expect(!(try manager.enforce("alice", .table, "usage_records", .read)));
@@ -343,6 +346,7 @@ test "sql auth adapter creates roles and applies table grants through user manag
 
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT USAGE ON TABLE usage_records TO app_writer;"));
     try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT, USAGE ON TABLE usage_records TO app_writer;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER ROLE app_writer SET statement_timeout = '5s';"));
 }
 
 test "sql auth adapter grants directly to existing antfly users" {
