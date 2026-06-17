@@ -743,6 +743,8 @@ fn parseOperator(
         .timeline_id = 0,
         .epoch = 0,
     };
+    var former_has_shard_id = false;
+    var former_has_table_id = false;
     var former_node_id: ?[]const u8 = null;
     var former_last_lsn: ?u64 = null;
     var has_former_primary = false;
@@ -841,10 +843,12 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--former-shard-id")) {
             _ = cursor.next();
             has_former_primary = true;
+            former_has_shard_id = true;
             former_identity.shard_id = try parseU64(try cursor.value("--former-shard-id"));
         } else if (std.mem.eql(u8, arg, "--former-table-id")) {
             _ = cursor.next();
             has_former_primary = true;
+            former_has_table_id = true;
             former_identity.table_id = try parseU64(try cursor.value("--former-table-id"));
         } else if (std.mem.eql(u8, arg, "--former-timeline-id")) {
             _ = cursor.next();
@@ -921,8 +925,8 @@ fn parseOperator(
 
     if (has_former_primary) {
         if (former_identity.cluster_id == 0) return error.FormerClusterIdMissing;
-        if (former_identity.shard_id == 0) return error.FormerShardIdMissing;
-        if (former_identity.table_id == 0) return error.FormerTableIdMissing;
+        if (!former_has_shard_id) return error.FormerShardIdMissing;
+        if (!former_has_table_id) return error.FormerTableIdMissing;
         if (former_identity.timeline_id == 0) return error.FormerTimelineIdMissing;
         if (former_identity.epoch == 0) return error.FormerEpochMissing;
         command.former_primary = .{
@@ -995,6 +999,8 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
         .timeline_id = 0,
         .epoch = 0,
     };
+    var has_shard_id = false;
+    var has_table_id = false;
     var old_primary_id: ?[]const u8 = null;
     var promoted_node_id: ?[]const u8 = null;
     var new_timeline_id: ?u64 = null;
@@ -1010,9 +1016,11 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
             identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
         } else if (std.mem.eql(u8, arg, "--shard-id")) {
             _ = cursor.next();
+            has_shard_id = true;
             identity.shard_id = try parseU64(try cursor.value("--shard-id"));
         } else if (std.mem.eql(u8, arg, "--table-id")) {
             _ = cursor.next();
+            has_table_id = true;
             identity.table_id = try parseU64(try cursor.value("--table-id"));
         } else if (std.mem.eql(u8, arg, "--timeline-id")) {
             _ = cursor.next();
@@ -1050,8 +1058,8 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
     }
 
     if (identity.cluster_id == 0) return error.ClusterIdMissing;
-    if (identity.shard_id == 0) return error.ShardIdMissing;
-    if (identity.table_id == 0) return error.TableIdMissing;
+    if (!has_shard_id) return error.ShardIdMissing;
+    if (!has_table_id) return error.TableIdMissing;
     if (identity.timeline_id == 0) return error.TimelineIdMissing;
     if (identity.epoch == 0) return error.EpochMissing;
 
@@ -1079,6 +1087,8 @@ fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
         .timeline_id = 0,
         .epoch = 0,
     };
+    var has_shard_id = false;
+    var has_table_id = false;
     var node_id: ?[]const u8 = null;
     var last_lsn: ?u64 = null;
     var policy = rejoin.RejoinPolicy{ .retained_from_lsn = 0 };
@@ -1106,9 +1116,11 @@ fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
             identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
         } else if (std.mem.eql(u8, arg, "--shard-id")) {
             _ = cursor.next();
+            has_shard_id = true;
             identity.shard_id = try parseU64(try cursor.value("--shard-id"));
         } else if (std.mem.eql(u8, arg, "--table-id")) {
             _ = cursor.next();
+            has_table_id = true;
             identity.table_id = try parseU64(try cursor.value("--table-id"));
         } else if (std.mem.eql(u8, arg, "--timeline-id")) {
             _ = cursor.next();
@@ -1179,8 +1191,8 @@ fn parseRejoin(cursor: *Cursor) !RejoinAssessCommand {
     }
 
     if (identity.cluster_id == 0) return error.ClusterIdMissing;
-    if (identity.shard_id == 0) return error.ShardIdMissing;
-    if (identity.table_id == 0) return error.TableIdMissing;
+    if (!has_shard_id) return error.ShardIdMissing;
+    if (!has_table_id) return error.TableIdMissing;
     if (identity.timeline_id == 0) return error.TimelineIdMissing;
     if (identity.epoch == 0) return error.EpochMissing;
 
@@ -1505,8 +1517,8 @@ test "storage.ha admin cli parses operator plan command" {
         "--fence-reason",               "LeaseAcquired",
         "--former-primary-id",          "primary-a",
         "--former-cluster-id",          "100",
-        "--former-shard-id",            "10",
-        "--former-table-id",            "20",
+        "--former-shard-id",            "0",
+        "--former-table-id",            "0",
         "--former-timeline-id",         "1",
         "--former-epoch",               "1",
         "--former-last-lsn",            "12",
@@ -1552,6 +1564,8 @@ test "storage.ha admin cli parses operator plan command" {
     try std.testing.expectEqual(primary_mod.DurabilityMode.remote_apply, command.spec.sync_policy.?.mode);
     try std.testing.expectEqualStrings("standby-a", command.spec.sync_policy.?.standby_names[0]);
     try std.testing.expectEqualStrings("primary-a", command.former_primary.?.node_id);
+    try std.testing.expectEqual(@as(u64, 0), command.former_primary.?.identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), command.former_primary.?.identity.table_id);
     try std.testing.expectEqual(@as(u64, 1), command.former_primary.?.identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 12), command.former_primary.?.last_lsn);
     try std.testing.expectEqual(@as(u64, 8), command.rejoin_policy.retained_from_lsn);
@@ -1774,6 +1788,36 @@ test "storage.ha admin cli parses fenced promotion request" {
     try std.testing.expectEqual(@as(u64, 99), fence.observed_lsn);
     try std.testing.expect(fence.force);
     try std.testing.expectEqualStrings("operator-approved", fence.reason);
+
+    var whole_instance = try parse(alloc, &.{
+        "fence",
+        "acquire",
+        "--cluster-id",
+        "1",
+        "--shard-id",
+        "0",
+        "--table-id",
+        "0",
+        "--timeline-id",
+        "4",
+        "--epoch",
+        "5",
+        "--old-primary-id",
+        "primary-a",
+        "--promoted-node-id",
+        "standby-b",
+        "--new-timeline-id",
+        "6",
+        "--new-epoch",
+        "7",
+        "--required-lsn",
+        "100",
+        "--observed-lsn",
+        "99",
+    });
+    defer whole_instance.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), whole_instance.command.fence_acquire.identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), whole_instance.command.fence_acquire.identity.table_id);
 }
 
 test "storage.ha admin cli parses former primary rejoin assessment" {
@@ -1783,8 +1827,8 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
         "rejoin",              "assess",
         "--node-id",           "primary-a",
         "--cluster-id",        "1",
-        "--shard-id",          "2",
-        "--table-id",          "3",
+        "--shard-id",          "0",
+        "--table-id",          "0",
         "--timeline-id",       "4",
         "--epoch",             "5",
         "--last-lsn",          "12",
@@ -1792,6 +1836,8 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
     });
     defer no_fence.deinit(alloc);
     try std.testing.expectEqualStrings("primary-a", no_fence.command.rejoin_assess.former.node_id);
+    try std.testing.expectEqual(@as(u64, 0), no_fence.command.rejoin_assess.former.identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), no_fence.command.rejoin_assess.former.identity.table_id);
     try std.testing.expectEqual(@as(u64, 4), no_fence.command.rejoin_assess.former.identity.timeline_id);
     try std.testing.expectEqual(@as(u64, 12), no_fence.command.rejoin_assess.former.last_lsn);
     try std.testing.expectEqual(@as(u64, 8), no_fence.command.rejoin_assess.policy.retained_from_lsn);
