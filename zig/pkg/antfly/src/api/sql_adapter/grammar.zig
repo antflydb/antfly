@@ -30,6 +30,10 @@ pub const AdapterNoopTransactionBoundaryTail = struct {
     transaction: bool = false,
 };
 
+pub const SavepointNameSyntax = struct {
+    savepoint_name: []const u8,
+};
+
 pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAlterSyntax {
     const start = pos.*;
     var cursor = parser.Cursor.init(tokens, pos);
@@ -111,6 +115,23 @@ pub fn matchAdapterNoopTransactionBoundaryTail(
     return false;
 }
 
+pub fn parseSavepointTransactionTail(tokens: []const Token, pos: *usize) !SavepointNameSyntax {
+    return try parseSavepointNameTail(tokens, pos);
+}
+
+pub fn parseReleaseSavepointTail(tokens: []const Token, pos: *usize) !SavepointNameSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    _ = cursor.matchKeyword("savepoint");
+    return try parseSavepointNameTailFromCursor(cursor);
+}
+
+pub fn parseRollbackToSavepointTail(tokens: []const Token, pos: *usize) !SavepointNameSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("to");
+    _ = cursor.matchKeyword("savepoint");
+    return try parseSavepointNameTailFromCursor(cursor);
+}
+
 fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
@@ -136,6 +157,17 @@ fn matchAdapterNoopStatementEnd(cursor: parser.Cursor) !bool {
         return true;
     }
     return cursor.atEnd();
+}
+
+fn parseSavepointNameTail(tokens: []const Token, pos: *usize) !SavepointNameSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    return try parseSavepointNameTailFromCursor(cursor);
+}
+
+fn parseSavepointNameTailFromCursor(cursor: parser.Cursor) !SavepointNameSyntax {
+    const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{ .savepoint_name = name.text };
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -542,4 +574,48 @@ test "sql adapter grammar matches transaction boundary noops" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, matchAdapterNoopTransactionBoundaryTail(extra_tokens.items, &extra_pos, .{}));
+}
+
+test "sql adapter grammar parses savepoint transaction tails" {
+    const alloc = std.testing.allocator;
+
+    var savepoint_tokens = try lexer.tokenizeAlloc(alloc, "before_retry;");
+    defer lexer.freeTokens(alloc, &savepoint_tokens);
+    var savepoint_pos: usize = 0;
+    const savepoint = try parseSavepointTransactionTail(savepoint_tokens.items, &savepoint_pos);
+    try std.testing.expectEqualStrings("before_retry", savepoint.savepoint_name);
+    try std.testing.expectEqual(savepoint_tokens.items.len, savepoint_pos);
+
+    var release_tokens = try lexer.tokenizeAlloc(alloc, "SAVEPOINT before_retry;");
+    defer lexer.freeTokens(alloc, &release_tokens);
+    var release_pos: usize = 0;
+    const release = try parseReleaseSavepointTail(release_tokens.items, &release_pos);
+    try std.testing.expectEqualStrings("before_retry", release.savepoint_name);
+    try std.testing.expectEqual(release_tokens.items.len, release_pos);
+
+    var release_shorthand_tokens = try lexer.tokenizeAlloc(alloc, "before_retry;");
+    defer lexer.freeTokens(alloc, &release_shorthand_tokens);
+    var release_shorthand_pos: usize = 0;
+    const release_shorthand = try parseReleaseSavepointTail(release_shorthand_tokens.items, &release_shorthand_pos);
+    try std.testing.expectEqualStrings("before_retry", release_shorthand.savepoint_name);
+    try std.testing.expectEqual(release_shorthand_tokens.items.len, release_shorthand_pos);
+
+    var rollback_tokens = try lexer.tokenizeAlloc(alloc, "TO SAVEPOINT before_retry;");
+    defer lexer.freeTokens(alloc, &rollback_tokens);
+    var rollback_pos: usize = 0;
+    const rollback = try parseRollbackToSavepointTail(rollback_tokens.items, &rollback_pos);
+    try std.testing.expectEqualStrings("before_retry", rollback.savepoint_name);
+    try std.testing.expectEqual(rollback_tokens.items.len, rollback_pos);
+
+    var rollback_shorthand_tokens = try lexer.tokenizeAlloc(alloc, "TO before_retry;");
+    defer lexer.freeTokens(alloc, &rollback_shorthand_tokens);
+    var rollback_shorthand_pos: usize = 0;
+    const rollback_shorthand = try parseRollbackToSavepointTail(rollback_shorthand_tokens.items, &rollback_shorthand_pos);
+    try std.testing.expectEqualStrings("before_retry", rollback_shorthand.savepoint_name);
+    try std.testing.expectEqual(rollback_shorthand_tokens.items.len, rollback_shorthand_pos);
+
+    var extra_tokens = try lexer.tokenizeAlloc(alloc, "before_retry RELEASE;");
+    defer lexer.freeTokens(alloc, &extra_tokens);
+    var extra_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSavepointTransactionTail(extra_tokens.items, &extra_pos));
 }

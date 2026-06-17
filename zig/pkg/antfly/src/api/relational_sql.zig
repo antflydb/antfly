@@ -6154,28 +6154,22 @@ const Parser = struct {
     }
 
     fn parseSavepointTransactionDdl(self: *@This()) !SavepointNamePlan {
-        return try self.parseSavepointNameTailDdl();
+        const syntax = try sql_adapter.parseSavepointTransactionTail(self.tokens, &self.pos);
+        return try self.savepointNamePlanFromSyntax(syntax);
     }
 
     fn parseReleaseSavepointDdl(self: *@This()) !SavepointNamePlan {
-        _ = self.matchKeyword("savepoint");
-        return try self.parseSavepointNameTailDdl();
+        const syntax = try sql_adapter.parseReleaseSavepointTail(self.tokens, &self.pos);
+        return try self.savepointNamePlanFromSyntax(syntax);
     }
 
     fn parseRollbackToSavepointDdl(self: *@This()) !SavepointNamePlan {
-        try self.expectKeyword("to");
-        _ = self.matchKeyword("savepoint");
-        return try self.parseSavepointNameTailDdl();
+        const syntax = try sql_adapter.parseRollbackToSavepointTail(self.tokens, &self.pos);
+        return try self.savepointNamePlanFromSyntax(syntax);
     }
 
-    fn parseSavepointNameTailDdl(self: *@This()) !SavepointNamePlan {
-        const savepoint_name = try self.parseIdentifierOwned();
-        var name_transferred = false;
-        errdefer if (!name_transferred) self.alloc.free(savepoint_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        name_transferred = true;
-        return .{ .savepoint_name = savepoint_name };
+    fn savepointNamePlanFromSyntax(self: *@This(), syntax: sql_adapter.SavepointNameSyntax) !SavepointNamePlan {
+        return .{ .savepoint_name = try self.alloc.dupe(u8, syntax.savepoint_name) };
     }
 
     fn parseCommentMetadataDdl(self: *@This()) !CommentMetadataPlan {
@@ -49417,12 +49411,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:release_savepoint:name=before_retry", release_savepoint_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, release_savepoint));
 
+    var release_savepoint_shorthand = try lowerDdlPlanAlloc(alloc, "RELEASE before_retry;");
+    defer release_savepoint_shorthand.deinit(alloc);
+    const release_savepoint_shorthand_fingerprint = try ddlFingerprintAlloc(alloc, release_savepoint_shorthand);
+    defer alloc.free(release_savepoint_shorthand_fingerprint);
+    try std.testing.expectEqualStrings("ddl:release_savepoint:name=before_retry", release_savepoint_shorthand_fingerprint);
+
     var rollback_to_savepoint = try lowerDdlPlanAlloc(alloc, "ROLLBACK TO SAVEPOINT before_retry;");
     defer rollback_to_savepoint.deinit(alloc);
     const rollback_to_savepoint_fingerprint = try ddlFingerprintAlloc(alloc, rollback_to_savepoint);
     defer alloc.free(rollback_to_savepoint_fingerprint);
     try std.testing.expectEqualStrings("ddl:rollback_to_savepoint:name=before_retry", rollback_to_savepoint_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, rollback_to_savepoint));
+
+    var rollback_to_savepoint_shorthand = try lowerDdlPlanAlloc(alloc, "ROLLBACK TO before_retry;");
+    defer rollback_to_savepoint_shorthand.deinit(alloc);
+    const rollback_to_savepoint_shorthand_fingerprint = try ddlFingerprintAlloc(alloc, rollback_to_savepoint_shorthand);
+    defer alloc.free(rollback_to_savepoint_shorthand_fingerprint);
+    try std.testing.expectEqualStrings("ddl:rollback_to_savepoint:name=before_retry", rollback_to_savepoint_shorthand_fingerprint);
 
     var replace = try lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE TABLE users (id uuid PRIMARY KEY);");
     defer replace.deinit(alloc);

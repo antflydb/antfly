@@ -4177,13 +4177,13 @@ the golden corpus. The boundary tail matcher lives in
 `api/sql_adapter/grammar.zig`, including statement-end validation, `WORK` and
 `TRANSACTION` aliases, and fail-closed handling for prepared transactions or
 extra statements. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
-[SAVEPOINT]` lower to typed savepoint transaction-control intents that capture
-the savepoint name and fail closed at schema/storage application until native
-nested transaction rollback/release semantics exist. Prepared transaction
-commands are not boundary no-ops; they must fail closed until Antfly owns a
-durable prepared-transaction model. This keeps savepoint and
-prepared-transaction syntax out of storage while preserving a stable typed
-boundary for the future subtransaction model.
+[SAVEPOINT]` syntax is also parsed in `api/sql_adapter/grammar.zig` and lowers
+to typed savepoint transaction-control intents that capture the savepoint name
+and fail closed at schema/storage application until native nested transaction
+rollback/release semantics exist. Prepared transaction commands are not boundary
+no-ops; they must fail closed until Antfly owns a durable prepared-transaction
+model. This keeps savepoint and prepared-transaction syntax out of storage while
+preserving a stable typed boundary for the future subtransaction model.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
