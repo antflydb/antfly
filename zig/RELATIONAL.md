@@ -5294,8 +5294,9 @@ write plans, generic read fingerprints whose resolved inner plan is a row query,
 or `EXPLAIN` wrappers around those plans. Aggregate, join, lateral, window, and
 point-write families reject those fields because their runners do not read the
 full query-output contract. Query-output summaries must also match the typed
-fingerprint: `select_all=true` requires `select_all=1`, and `distinct_on` must
-match the exact `distinct_on` count.
+fingerprint: `select_all=true` requires `select_all=1`, `select_all=false`
+requires that positive token to be absent or zero, and `distinct_on` must match
+the exact `distinct_on` count.
 
 Pagination summaries are scoped to typed stages that actually order or trim a
 row stream. `order_by`, `limit`, and `offset` are valid on row-query, aggregate,
