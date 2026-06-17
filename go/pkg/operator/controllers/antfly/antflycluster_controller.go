@@ -5827,18 +5827,21 @@ type haObservedPrimaryStatus struct {
 }
 
 type haAdminStatusJSON struct {
-	Result struct {
+	SchemaVersion uint32 `json:"schema_version"`
+	Result        struct {
 		PrimaryStatus *haPrimaryStatusJSON `json:"primary_status,omitempty"`
 		StandbyStatus *haStandbyStatusJSON `json:"standby_status,omitempty"`
 	} `json:"result"`
 }
 
 type haPrimaryStatusEnvelopeJSON struct {
-	Snapshot *haPrimaryStatusJSON `json:"snapshot,omitempty"`
+	SchemaVersion uint32               `json:"schema_version"`
+	Snapshot      *haPrimaryStatusJSON `json:"snapshot,omitempty"`
 }
 
 type haStandbyStatusEnvelopeJSON struct {
-	Snapshot *haStandbyStatusJSON `json:"snapshot,omitempty"`
+	SchemaVersion uint32               `json:"schema_version"`
+	Snapshot      *haStandbyStatusJSON `json:"snapshot,omitempty"`
 }
 
 type haAdminIdentityJSON struct {
@@ -5916,12 +5919,17 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 		return haObservedPrimaryStatus{}, err
 	}
 	snapshot := direct.Snapshot
+	schemaVersion := direct.SchemaVersion
 	if snapshot == nil {
 		var doc haAdminStatusJSON
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return haObservedPrimaryStatus{}, err
 		}
 		snapshot = doc.Result.PrimaryStatus
+		schemaVersion = doc.SchemaVersion
+	}
+	if schemaVersion == 0 {
+		return haObservedPrimaryStatus{}, fmt.Errorf("missing primary status schema_version")
 	}
 	if snapshot == nil {
 		return haObservedPrimaryStatus{}, fmt.Errorf("missing primary status snapshot")
@@ -6052,12 +6060,17 @@ func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (
 		return antflyv1.HAStandbyStatus{}, err
 	}
 	snapshot := direct.Snapshot
+	schemaVersion := direct.SchemaVersion
 	if snapshot == nil {
 		var doc haAdminStatusJSON
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			return antflyv1.HAStandbyStatus{}, err
 		}
 		snapshot = doc.Result.StandbyStatus
+		schemaVersion = doc.SchemaVersion
+	}
+	if schemaVersion == 0 {
+		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status schema_version")
 	}
 	if snapshot == nil {
 		return antflyv1.HAStandbyStatus{}, fmt.Errorf("missing standby status snapshot")
