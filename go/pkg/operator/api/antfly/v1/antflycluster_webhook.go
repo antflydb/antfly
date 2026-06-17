@@ -1131,6 +1131,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 	var errors []string
 	names := map[string]struct{}{}
 	slotNames := map[string]int{}
+	desiredStandbys := 0
+	desiredStandbyWithRouteSelector := false
 	for i, standby := range ha.Standbys {
 		name := strings.TrimSpace(standby.Name)
 		if name == "" {
@@ -1167,6 +1169,12 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		if standby.DropSlotOnRemoval && standbyDesiredBySpec(standby) {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].dropSlotOnRemoval requires desired=false", i))
+		}
+		if standbyDesiredBySpec(standby) {
+			desiredStandbys++
+			if len(standby.RouteSelector) > 0 {
+				desiredStandbyWithRouteSelector = true
+			}
 		}
 	}
 
@@ -1243,6 +1251,12 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 	if failover := ha.AutomaticFailover; failover != nil && failover.Enabled {
 		if len(names) == 0 {
 			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one declared standby")
+		}
+		if len(names) > 0 && desiredStandbys == 0 {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one desired standby")
+		}
+		if !desiredStandbyWithRouteSelector {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one desired standby with routeSelector")
 		}
 		fencingAuthority := failover.fencingAuthorityOrDefault()
 		if fencingAuthority == HAFencingAuthorityNone {

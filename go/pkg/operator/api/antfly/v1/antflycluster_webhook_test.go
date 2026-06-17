@@ -1932,6 +1932,44 @@ func TestValidateCreate_HighAvailabilityRequiresFencingForAutomaticFailover(t *t
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutRouteSelector(t *testing.T) {
+	disabled := false
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+			{Name: "standby-b", Desired: &disabled, AdminURL: "http://standby-b-ha.default.svc:8081", RouteSelector: map[string]string{
+				"app.kubernetes.io/component": "standby-b",
+			}},
+		},
+		AutomaticFailover: &HAAutomaticFailoverPolicy{
+			Enabled:          true,
+			FencingAuthority: HAFencingAuthorityKubernetesLease,
+		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected automatic failover without a desired routable standby to be rejected")
+	}
+	if !strings.Contains(err.Error(), "automaticFailover requires at least one desired standby with routeSelector") {
+		t.Fatalf("expected automatic failover route selector validation error, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsAutomaticFailoverWithoutExecutionPrerequisites(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
