@@ -52536,6 +52536,23 @@ test "postgres sql adapter lowers text pattern predicates" {
     try std.testing.expectEqualStrings("\"Grace%\"", pattern_any.query.expression_predicates[0].lhs.operands[1].operands[1].value_json);
     try std.testing.expectEqualStrings("true", pattern_any.query.expression_predicates[0].rhs[0].value_json);
 
+    var pattern_all = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE name ILIKE ALL($1::text[]) ORDER BY id",
+        schema,
+        &.{.{ .json = "[\"A%\",\"%a\"]" }},
+    );
+    defer pattern_all.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pattern_all.query.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), pattern_all.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, pattern_all.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), pattern_all.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ilike, pattern_all.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("name", pattern_all.query.expression_predicates[0].lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"A%\"", pattern_all.query.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("\"%a\"", pattern_all.query.expression_predicates[0].lhs.operands[1].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", pattern_all.query.expression_predicates[0].rhs[0].value_json);
+
     var not_pattern_all = try lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE name NOT LIKE ALL(ARRAY['bot%', 'sys%']) ORDER BY id",
@@ -52568,6 +52585,25 @@ test "postgres sql adapter lowers text pattern predicates" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_pattern_any.query.expression_predicates[0].lhs.operands[1].kind);
     try std.testing.expectEqualStrings("\"grace%\"", computed_pattern_any.query.expression_predicates[0].lhs.operands[1].operands[1].value_json);
     try std.testing.expectEqualStrings("true", computed_pattern_any.query.expression_predicates[0].rhs[0].value_json);
+
+    var computed_not_pattern_all = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(name) NOT ILIKE ALL(ARRAY['bot%', 'sys%']) ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer computed_not_pattern_all.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_not_pattern_all.query.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_not_pattern_all.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, computed_not_pattern_all.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_not_pattern_all.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_not, computed_not_pattern_all.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ilike, computed_not_pattern_all.query.expression_predicates[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_not_pattern_all.query.expression_predicates[0].lhs.operands[0].operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("name", computed_not_pattern_all.query.expression_predicates[0].lhs.operands[0].operands[0].operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"bot%\"", computed_not_pattern_all.query.expression_predicates[0].lhs.operands[0].operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("\"sys%\"", computed_not_pattern_all.query.expression_predicates[0].lhs.operands[1].operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_not_pattern_all.query.expression_predicates[0].rhs[0].value_json);
 
     var pattern_any_or = try lowerSelectAlloc(
         alloc,
@@ -71234,6 +71270,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .params = &.{.{ .json = "[\"op%\",\"ready%\"]" }},
         },
         .{
+            .name = "single table text pattern all query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE status ILIKE ALL($1::text[]) ORDER BY id ASC LIMIT 5",
+            .params = &.{.{ .json = "[\"op%\",\"%en\"]" }},
+        },
+        .{
             .name = "single table regexp match predicate query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .expression_predicates = 2, .select = 1, .order_by = 1, .limit = 5 },
@@ -71286,6 +71330,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
             .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
             .sql = "SELECT id FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%']) ORDER BY id ASC LIMIT 5",
+        },
+        .{
+            .name = "single table computed pattern all query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .expression_predicates = 1, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+            .sql = "SELECT id FROM usage_records WHERE lower(status) NOT ILIKE ALL(ARRAY['blocked%', 'archived%']) ORDER BY id ASC LIMIT 5",
         },
         .{
             .name = "single table boolean is predicate query",
