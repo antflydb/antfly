@@ -36853,16 +36853,20 @@ const Parser = struct {
         return self.params[index - 1];
     }
 
+    fn cursor(self: *@This()) sql_adapter.Cursor {
+        return sql_adapter.Cursor.init(self.tokens, &self.pos);
+    }
+
     fn expectKeyword(self: *@This(), keyword: []const u8) !void {
-        try sql_adapter.expectKeyword(self.tokens, &self.pos, keyword);
+        try self.cursor().expectKeyword(keyword);
     }
 
     fn expect(self: *@This(), kind: TokenKind) !void {
-        try sql_adapter.expectToken(self.tokens, &self.pos, kind);
+        try self.cursor().expectToken(kind);
     }
 
     fn matchKeyword(self: *@This(), keyword: []const u8) bool {
-        return sql_adapter.matchKeyword(self.tokens, &self.pos, keyword);
+        return self.cursor().matchKeyword(keyword);
     }
 
     fn matchAnyOrSomeKeyword(self: *@This()) bool {
@@ -37153,7 +37157,7 @@ const Parser = struct {
     }
 
     fn peekKeyword(self: *@This(), keyword: []const u8) bool {
-        return sql_adapter.peekKeyword(self.tokens, self.pos, keyword);
+        return self.cursor().peekKeyword(keyword);
     }
 
     fn peekTextLengthFunctionKeyword(self: *@This()) bool {
@@ -37393,15 +37397,15 @@ const Parser = struct {
     }
 
     fn match(self: *@This(), kind: TokenKind) ?Token {
-        return sql_adapter.matchToken(self.tokens, &self.pos, kind);
+        return self.cursor().matchToken(kind);
     }
 
     fn peekKind(self: *@This(), kind: TokenKind) bool {
-        return sql_adapter.peekKind(self.tokens, self.pos, kind);
+        return self.cursor().peekKind(kind);
     }
 
     fn atEnd(self: *@This()) bool {
-        return sql_adapter.atEnd(self.tokens, self.pos);
+        return self.cursor().atEnd();
     }
 
     fn nextIsUnsupportedQueryKeyword(self: *@This()) bool {

@@ -36,6 +36,7 @@ pub const SqlValue = value.SqlValue;
 pub const SqlWriteStatementKind = classifier.SqlWriteStatementKind;
 pub const Token = token.Token;
 pub const TokenKind = token.TokenKind;
+pub const Cursor = parser.Cursor;
 pub const UnsupportedPlanFamily = corpus.UnsupportedPlanFamily;
 pub const adapterNoopFingerprintAlloc = corpus.adapterNoopFingerprintAlloc;
 pub const adapterNoopPlanMatchesReason = corpus.adapterNoopPlanMatchesReason;

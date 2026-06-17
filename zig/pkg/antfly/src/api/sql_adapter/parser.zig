@@ -19,6 +19,67 @@ const token_mod = @import("token.zig");
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 
+pub const Cursor = struct {
+    tokens: []const Token,
+    pos: *usize,
+
+    pub fn init(tokens: []const Token, pos: *usize) Cursor {
+        return .{ .tokens = tokens, .pos = pos };
+    }
+
+    pub fn checkpoint(self: Cursor) usize {
+        return self.pos.*;
+    }
+
+    pub fn restore(self: Cursor, value: usize) void {
+        self.pos.* = value;
+    }
+
+    pub fn advance(self: Cursor, count: usize) !void {
+        if (count > self.tokens.len -| self.pos.*) return error.UnsupportedSqlShape;
+        self.pos.* += count;
+    }
+
+    pub fn expectKeyword(self: Cursor, keyword: []const u8) !void {
+        if (!self.matchKeyword(keyword)) return error.UnsupportedSqlShape;
+    }
+
+    pub fn expectToken(self: Cursor, kind: TokenKind) !void {
+        if (self.matchToken(kind) == null) return error.UnsupportedSqlShape;
+    }
+
+    pub fn matchKeyword(self: Cursor, keyword: []const u8) bool {
+        if (self.pos.* >= self.tokens.len) return false;
+        const token = self.tokens[self.pos.*];
+        if (token.kind != .identifier) return false;
+        if (!std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
+        self.pos.* += 1;
+        return true;
+    }
+
+    pub fn matchToken(self: Cursor, kind: TokenKind) ?Token {
+        if (self.pos.* >= self.tokens.len) return null;
+        const token = self.tokens[self.pos.*];
+        if (token.kind != kind) return null;
+        self.pos.* += 1;
+        return token;
+    }
+
+    pub fn peekKeyword(self: Cursor, keyword: []const u8) bool {
+        if (self.pos.* >= self.tokens.len) return false;
+        const token = self.tokens[self.pos.*];
+        return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, keyword);
+    }
+
+    pub fn peekKind(self: Cursor, kind: TokenKind) bool {
+        return self.pos.* < self.tokens.len and self.tokens[self.pos.*].kind == kind;
+    }
+
+    pub fn atEnd(self: Cursor) bool {
+        return self.pos.* >= self.tokens.len;
+    }
+};
+
 pub fn expectKeyword(tokens: []const Token, pos: *usize, keyword: []const u8) !void {
     if (!matchKeyword(tokens, pos, keyword)) return error.UnsupportedSqlShape;
 }
@@ -90,4 +151,24 @@ pub fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usiz
         }
     }
     return null;
+}
+
+test "sql adapter parser cursor tracks shared token position" {
+    var pos: usize = 0;
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .text = "select", .source_start = 0, .source_end = 6 },
+        .{ .kind = .star, .text = "*", .source_start = 7, .source_end = 8 },
+        .{ .kind = .identifier, .text = "from", .source_start = 9, .source_end = 13 },
+    };
+    const cursor = Cursor.init(tokens[0..], &pos);
+
+    try cursor.expectKeyword("select");
+    try std.testing.expectEqual(@as(usize, 1), pos);
+    const checkpoint = cursor.checkpoint();
+    try std.testing.expect(cursor.matchToken(.star) != null);
+    try std.testing.expect(cursor.peekKeyword("from"));
+    cursor.restore(checkpoint);
+    try std.testing.expect(cursor.peekKind(.star));
+    try cursor.advance(2);
+    try std.testing.expect(cursor.atEnd());
 }
