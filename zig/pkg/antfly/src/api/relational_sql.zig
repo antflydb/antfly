@@ -53990,6 +53990,22 @@ test "postgres sql adapter lowers filtered aggregate predicates" {
     try std.testing.expectEqualStrings("\"op%\"", computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
     try std.testing.expectEqualStrings("true", computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].rhs[0].value_json);
 
+    var computed_pattern_some_filter = try lowerAggregateAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) AS computed_pattern_set_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_some_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_some_filter.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"op%\"", computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].rhs[0].value_json);
+
     var constructor_arrays = try lowerAggregateAlloc(
         alloc,
         "SELECT customer, COUNT(*) FILTER (WHERE tags @> ARRAY['hot']) AS hot_count, COUNT(*) FILTER (WHERE tags = ARRAY['hot','new']::text[]) AS exact_tags_count FROM usage_records GROUP BY customer ORDER BY hot_count DESC LIMIT 10",
@@ -72142,6 +72158,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT organization_id, COUNT(*) FILTER (WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])) AS openish_count FROM usage_records GROUP BY organization_id ORDER BY openish_count DESC LIMIT 5",
         },
         .{
+            .name = "grouped aggregate computed pattern some filter",
+            .family = .aggregate,
+            .summary = .{ .table_name = "usage_records", .group_by = 1, .aggregations = 1, .order_by = 1, .limit = 5 },
+            .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=1:having=0:order=1:limit=5",
+            .sql = "SELECT organization_id, COUNT(*) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) AS openish_count FROM usage_records GROUP BY organization_id ORDER BY openish_count DESC LIMIT 5",
+        },
+        .{
             .name = "grouped aggregate alias qualified source",
             .family = .aggregate,
             .summary = .{ .table_name = "usage_records", .predicates = 1, .group_by = 1, .aggregations = 2, .filter_groups = 0, .having = 1, .order_by = 1, .limit = 10 },
@@ -72765,6 +72788,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .ctes = 0, .predicates = 1, .select = 2, .windows = 1, .order_by = 1, .limit = 5 },
             .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=1:window_expr=1:window_default=0:window_frame_sig=0:select=2:order=1:limit=5:window_filter_expr=1",
             .sql = "SELECT organization_id, id, sum(amount) FILTER (WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])) OVER (PARTITION BY organization_id ORDER BY amount DESC) AS open_amount FROM usage_records WHERE metric_type = $1 ORDER BY open_amount DESC LIMIT 5",
+            .params = &.{.{ .string = "tokens" }},
+        },
+        .{
+            .name = "window computed pattern some filter",
+            .family = .window,
+            .summary = .{ .table_name = "usage_records", .ctes = 0, .predicates = 1, .select = 2, .windows = 1, .order_by = 1, .limit = 5 },
+            .plan = "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=1:window_expr=1:window_default=0:window_frame_sig=0:select=2:order=1:limit=5:window_filter_expr=1",
+            .sql = "SELECT organization_id, id, sum(amount) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) OVER (PARTITION BY organization_id ORDER BY amount DESC) AS open_amount FROM usage_records WHERE metric_type = $1 ORDER BY open_amount DESC LIMIT 5",
             .params = &.{.{ .string = "tokens" }},
         },
         .{
@@ -84845,6 +84876,22 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
     try std.testing.expectEqualStrings("\"op%\"", pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
     try std.testing.expectEqualStrings("true", pattern_set_window.plan.window.windows[0].filter_expressions[0].rhs[0].value_json);
+
+    var pattern_some_window = try lowerWindowPlanAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) OVER (PARTITION BY tenant ORDER BY amount DESC) AS open_amount FROM usage_records WHERE status = 'open' ORDER BY open_amount DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer pattern_some_window.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pattern_some_window.plan.window.windows.len);
+    try std.testing.expectEqual(@as(usize, 1), pattern_some_window.plan.window.windows[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"op%\"", pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", pattern_some_window.plan.window.windows[0].filter_expressions[0].rhs[0].value_json);
 
     var cte = try lowerWindowPlanAlloc(
         alloc,
