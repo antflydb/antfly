@@ -489,6 +489,27 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 		notPreserved.AdminResult != nil {
 		t.Fatalf("expected stale promotion token evidence to be dropped, got %#v", notPreserved)
 	}
+
+	status.LastPromotion.FenceToken = "ha-fence-token"
+	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
+	previous.AdminResult.FenceOldPrimaryID = "different-primary"
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+	notPreserved = haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected promotion evidence with mismatched old primary to be dropped, got %#v", notPreserved)
+	}
+
+	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
+	previous.AdminResult.FenceClusterID = 0
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+	notPreserved = haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected promotion evidence without cluster identity to be dropped, got %#v", notPreserved)
+	}
 }
 
 func TestHAPromotionReceiptRequiresConcreteFenceAuthority(t *testing.T) {

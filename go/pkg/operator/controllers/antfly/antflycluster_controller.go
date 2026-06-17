@@ -6618,8 +6618,10 @@ func haPromotionActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, act
 	return result != nil &&
 		!promotion.Forced &&
 		!promotion.DataLossPossible &&
+		strings.TrimSpace(promotion.OldPrimaryID) == strings.TrimSpace(result.FenceOldPrimaryID) &&
 		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(action.StandbyName) &&
 		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(result.FencePromotedNodeID) &&
+		result.FenceClusterID != 0 &&
 		(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
 		(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
 		promotion.FenceGeneration == result.FenceGeneration &&
