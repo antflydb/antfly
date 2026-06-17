@@ -157,7 +157,7 @@ pub const Client = struct {
         const requested_lsn = standby.nextReceiveLsn();
         var response = try self.startReplication(base_uri, slot_name, requested_lsn, options);
         defer response.deinit();
-        try verifyStartReplicationResponse(response.parsed.value, standby.identity);
+        try verifyStartReplicationResponse(response.parsed.value, slot_name, standby.identity);
 
         const current_lsn = try uint64FromJson(response.parsed.value.current_lsn);
         const last_sent_lsn = try uint64FromJson(response.parsed.value.last_sent_lsn);
@@ -517,7 +517,8 @@ fn verifyIdentity(actual: anytype, expected: standby_mod.Identity) !void {
     if (try positiveUint64FromJson(actual.epoch) != expected.epoch) return error.WrongEpoch;
 }
 
-fn verifyStartReplicationResponse(response: anytype, expected: standby_mod.Identity) !void {
+fn verifyStartReplicationResponse(response: anytype, expected_slot_name: []const u8, expected: standby_mod.Identity) !void {
+    if (!std.mem.eql(u8, response.slot_name, expected_slot_name)) return error.ReplicationSlotMismatch;
     try verifyIdentity(response.identity, expected);
     const format_version = try positiveUint64FromJson(response.record_format_version);
     if (format_version != replication_record.format_version) return error.UnsupportedReplicationFormat;
@@ -699,7 +700,7 @@ const CorruptFrameExecutor = struct {
 };
 
 const WrongIdentityBatchExecutor = struct {
-    const Mismatch = enum { epoch, previous_lsn };
+    const Mismatch = enum { epoch, previous_lsn, slot };
 
     identity: standby_mod.Identity,
     mismatch: Mismatch = .epoch,
@@ -780,7 +781,7 @@ const WrongIdentityBatchExecutor = struct {
         };
 
         return try jsonTestResponse(alloc, .{
-            .slot_name = "standby-a",
+            .slot_name = if (self.mismatch == .slot) "standby-other" else "standby-a",
             .identity = self.identity,
             .record_format_version = replication_record.format_version,
             .timeline_id = self.identity.timeline_id,
@@ -999,6 +1000,36 @@ test "storage.ha http replication client rejects previous lsn mismatch before pa
     defer capture.deinit();
     try std.testing.expectError(
         error.UnexpectedPreviousLsn,
+        client.replicateAvailable(
+            "http://primary.internal.test",
+            "standby-a",
+            &standby,
+            &capture,
+            ApplyCapture.apply,
+            .{ .verify_upstream = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().applied_lsn);
+    try std.testing.expectEqual(@as(usize, 0), capture.payloads.items.len);
+}
+
+test "storage.ha http replication client rejects slot mismatch before receive" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "stream-slot-mismatch");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+
+    var executor = WrongIdentityBatchExecutor{ .identity = identity, .mismatch = .slot };
+    var client = Client.init(alloc, executor.executor());
+
+    var capture = ApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(
+        error.ReplicationSlotMismatch,
         client.replicateAvailable(
             "http://primary.internal.test",
             "standby-a",
