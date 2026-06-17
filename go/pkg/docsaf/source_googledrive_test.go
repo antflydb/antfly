@@ -1,7 +1,16 @@
 package docsaf
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"golang.org/x/time/rate"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
 )
 
 func TestGoogleDriveSource_Type(t *testing.T) {
@@ -298,6 +307,74 @@ func TestGoogleDriveSource_WorkspaceExportFormats(t *testing.T) {
 		if !workspaceSkipTypes[mimeType] {
 			t.Errorf("Expected %s to be in workspaceSkipTypes", mimeType)
 		}
+	}
+}
+
+func TestReadLimitedDriveContentRejectsOversize(t *testing.T) {
+	data, err := readLimitedDriveContent(strings.NewReader("12345"), 5)
+	if err != nil {
+		t.Fatalf("readLimitedDriveContent exact limit: %v", err)
+	}
+	if string(data) != "12345" {
+		t.Fatalf("data = %q, want 12345", data)
+	}
+
+	_, err = readLimitedDriveContent(strings.NewReader("123456"), 5)
+	if err == nil || !strings.Contains(err.Error(), "exceeds download limit of 5 bytes") {
+		t.Fatalf("readLimitedDriveContent oversize error = %v, want limit error", err)
+	}
+}
+
+func TestGoogleDriveSourceTraversePropagatesDownloadErrors(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/files" && r.URL.Query().Get("alt") != "media":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{
+						"id":           "file-id",
+						"name":         "huge.txt",
+						"mimeType":     "text/plain",
+						"size":         "12",
+						"modifiedTime": "2026-01-02T03:04:05.000Z",
+						"md5Checksum":  "checksum",
+						"webViewLink":  "https://drive.google.com/file/d/file-id/view",
+					},
+				},
+			}); err != nil {
+				t.Fatalf("encode list response: %v", err)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/files/file-id" && r.URL.Query().Get("alt") == "media":
+			http.Error(w, "download failed", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected Drive API request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer server.Close()
+
+	service, err := drive.NewService(ctx, option.WithEndpoint(server.URL+"/"), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("new Drive service: %v", err)
+	}
+	source := &GoogleDriveSource{
+		config:    GoogleDriveSourceConfig{FolderID: "folder-id"},
+		service:   service,
+		semaphore: make(chan struct{}, 1),
+		limiter:   rate.NewLimiter(rate.Inf, 1),
+	}
+
+	items, errs := source.Traverse(ctx)
+	for item := range items {
+		t.Fatalf("unexpected item emitted after failed download: %#v", item)
+	}
+	var gotErr error
+	for err := range errs {
+		gotErr = err
+	}
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "failed to download huge.txt") {
+		t.Fatalf("Traverse error = %v, want download failure", gotErr)
 	}
 }
 
