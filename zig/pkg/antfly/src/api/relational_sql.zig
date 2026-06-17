@@ -65297,6 +65297,40 @@ test "app parity count coverage tokens are exact" {
     try std.testing.expect(coverage.ddl_temporal_fk_delete_cascade_action);
 }
 
+test "app parity table coverage tokens are exact" {
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+        .plan = "insert:table=products_extra:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+        .apply_setup_sql = &.{"CREATE TABLE products (id text PRIMARY KEY)"},
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert_source,
+        .source_schema_json = "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}",
+        .plan = "insert_source:table=usage_records:source_table=archived_records_extra:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(!coverage.schema_temporal_open_daterange_insert);
+    try std.testing.expect(!coverage.insert_source_cross_table_source_schema);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert,
+        .sql = "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+        .plan = "insert:table=products:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+        .apply_setup_sql = &.{"CREATE TABLE products (id text PRIMARY KEY)"},
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .insert_source,
+        .source_schema_json = "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}",
+        .plan = "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(coverage.schema_temporal_open_daterange_insert);
+    try std.testing.expect(coverage.insert_source_cross_table_source_schema);
+}
+
 test "app parity explain coverage tokens are exact" {
     const write_suffix = AppParityCorpusEntry{
         .family = .explain,
@@ -65921,90 +65955,90 @@ const AppParityCorpusCoverage = struct {
         self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
         self.schema_temporal_numrange_insert = self.schema_temporal_numrange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::numrange") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=price_intervals") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_daterange_insert = self.schema_temporal_daterange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             std.mem.indexOf(u8, entry.sql, ",)'") == null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_open_daterange_insert = self.schema_temporal_open_daterange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             std.mem.indexOf(u8, entry.sql, ",)'") != null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_open_daterange_insert = self.schema_temporal_lower_open_daterange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             std.mem.indexOf(u8, entry.sql, "'(,") != null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_numrange_constructor_insert = self.schema_temporal_numrange_constructor_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "numrange(") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=price_intervals") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_daterange_constructor_insert = self.schema_temporal_daterange_constructor_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "daterange(") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_constructor_insert = self.schema_temporal_inclusive_daterange_constructor_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "daterange(") != null and
             std.mem.indexOf(u8, entry.sql, "'[]'") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_literal_insert = self.schema_temporal_inclusive_daterange_literal_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::daterange") != null and
             std.mem.indexOf(u8, entry.sql, "2025-02-01]'") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_constructor_insert = self.schema_temporal_lower_exclusive_daterange_constructor_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "daterange(") != null and
             std.mem.indexOf(u8, entry.sql, "'(]'") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_literal_insert = self.schema_temporal_lower_exclusive_daterange_literal_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::daterange") != null and
             std.mem.indexOf(u8, entry.sql, "(2025-01-01,") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_insert = self.schema_temporal_tsrange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::tsrange") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=local_prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_constructor_insert = self.schema_temporal_tsrange_constructor_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "tsrange(") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=local_prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_insert = self.schema_temporal_tstzrange_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "::tstzrange") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=published_prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_constructor_insert = self.schema_temporal_tstzrange_constructor_insert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "tstzrange(") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=published_prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_bound_query = self.schema_temporal_range_bound_query or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, "lower(") != null and
             std.mem.indexOf(u8, entry.sql, "upper(") != null and
-            std.mem.indexOf(u8, entry.plan, "query:table=price_intervals") != null and
+            appParityPlanHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
             appParityPlanHasNonZeroToken(entry.plan, ":expr_pred="));
         self.schema_temporal_range_contains_query = self.schema_temporal_range_contains_query or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, " @> ") != null and
-            std.mem.indexOf(u8, entry.plan, "query:table=price_intervals") != null and
+            appParityPlanHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             appParityPlanHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_range_overlap_query = self.schema_temporal_range_overlap_query or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, " && ") != null and
-            std.mem.indexOf(u8, entry.plan, "query:table=price_intervals") != null and
+            appParityPlanHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             appParityPlanHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_inclusive_daterange_overlap_query = self.schema_temporal_inclusive_daterange_overlap_query or (entry.family == .query and
             std.mem.indexOf(u8, entry.sql, " && ") != null and
             std.mem.indexOf(u8, entry.sql, "daterange(") != null and
             std.mem.indexOf(u8, entry.sql, "'[]'") != null and
-            std.mem.indexOf(u8, entry.plan, "query:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "query:table=", "products") and
             appParityPlanHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_unique_conflict_upsert = self.schema_temporal_unique_conflict_upsert or (entry.family == .insert and
             std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT prices_sku_time_key") != null and
-            std.mem.indexOf(u8, entry.plan, "insert:table=prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "prices") and
             std.mem.indexOf(u8, entry.plan, "transforms=1") != null and
             entry.apply_setup_sql.len > 0 and
             entry.resolver_row_json.len > 0);
@@ -66058,22 +66092,22 @@ const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "FOREIGN KEY") != null);
         self.schema_temporal_portion_update = self.schema_temporal_portion_update or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
-            std.mem.indexOf(u8, entry.plan, "update_source:table=prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "update_source:table=", "prices") and
             appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_portion_delete = self.schema_temporal_portion_delete or (entry.family == .delete_source and
             std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
-            std.mem.indexOf(u8, entry.plan, "delete_source:table=prices") != null and
+            appParityPlanHasExactStringToken(entry.plan, "delete_source:table=", "prices") and
             appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_column_portion_update = self.schema_temporal_range_column_portion_update or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "FOR PORTION OF valid_at") != null and
-            std.mem.indexOf(u8, entry.plan, "update_source:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "update_source:table=", "products") and
             appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_column_portion_delete = self.schema_temporal_range_column_portion_delete or (entry.family == .delete_source and
             std.mem.indexOf(u8, entry.sql, "FOR PORTION OF valid_at") != null and
-            std.mem.indexOf(u8, entry.plan, "delete_source:table=products") != null and
+            appParityPlanHasExactStringToken(entry.plan, "delete_source:table=", "products") and
             appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.update_source_row_assignment = self.update_source_row_assignment or (entry.family == .update_source and
@@ -67261,7 +67295,7 @@ const AppParityCorpusCoverage = struct {
         self.insert_source_cross_table_source_schema = self.insert_source_cross_table_source_schema or
             (entry.family == .insert_source and
                 entry.source_schema_json.len > 0 and
-                std.mem.indexOf(u8, entry.plan, "source_table=archived_records") != null);
+                appParityPlanHasExactStringToken(entry.plan, ":source_table=", "archived_records"));
         self.insert_source_expression_assignment = self.insert_source_expression_assignment or
             (entry.family == .insert_source and
                 std.mem.indexOf(u8, entry.plan, ":assignment_expr=") != null);
