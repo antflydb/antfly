@@ -2046,7 +2046,9 @@ pub const PostingStore = struct {
         }
 
         pub fn ensureMemberIdCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
-            if (self.member_ids.len < needed) self.member_ids = try alloc.realloc(self.member_ids, needed);
+            if (self.member_ids.len < needed) {
+                self.member_ids = try alloc.realloc(self.member_ids, PostingFormat.nextScratchCapacity(self.member_ids.len, needed));
+            }
         }
 
         pub fn ensureAppendCapacity(self: *FoldScratch, alloc: std.mem.Allocator, needed: usize) !void {
@@ -6698,7 +6700,7 @@ test "posting compact base materialization sizes output scratch by deduped live 
 
     const expected = [_]VectorId{ 10, 30, 40 };
     try std.testing.expectEqual(@as(usize, expected.len), out_count);
-    try std.testing.expectEqual(@as(usize, base_members.len), scratch.member_ids.len);
+    try std.testing.expect(scratch.member_ids.len >= base_members.len);
     try std.testing.expectEqualSlices(VectorId, expected[0..], scratch.member_ids[0..out_count]);
 }
 
