@@ -8412,6 +8412,7 @@ const Parser = struct {
             try self.expectKeyword("key");
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
+            if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
             try self.consumeOptionalDdlImmediateConstraintTiming();
             const primary_key = try self.makeDdlPrimaryKey(constraint_name, columns.columns, columns.without_overlaps_period);
             if (constraint_name) |name| self.alloc.free(name);
@@ -8423,8 +8424,10 @@ const Parser = struct {
             try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
+            const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
+            defer freeStringSlice(self.alloc, include_columns);
             try self.consumeOptionalDdlImmediateConstraintTiming();
-            var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, columns.without_overlaps_period);
+            var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
             if (constraint_name) |name| self.alloc.free(name);
             constraint_name_transferred = true;
             constraint.validation_state = .unvalidated;
@@ -8489,8 +8492,10 @@ const Parser = struct {
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
             if (self.matchKeyword("unique")) {
                 try self.consumeOptionalDdlUniqueNullsDistinct();
+                const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
+                defer freeStringSlice(self.alloc, include_columns);
                 try self.consumeOptionalDdlImmediateConstraintTiming();
-                var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, null);
+                var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, include_columns, null);
                 constraint.validation_state = .unvalidated;
                 try unique_constraints.append(self.alloc, constraint);
             } else if (self.matchKeyword("check")) {
@@ -8509,8 +8514,10 @@ const Parser = struct {
                 errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
                 if (self.matchKeyword("unique")) {
                     try self.consumeOptionalDdlUniqueNullsDistinct();
+                    const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
+                    defer freeStringSlice(self.alloc, include_columns);
                     try self.consumeOptionalDdlImmediateConstraintTiming();
-                    var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, null);
+                    var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                     constraint.validation_state = .unvalidated;
@@ -9230,12 +9237,15 @@ const Parser = struct {
             } else if (self.matchKeyword("primary")) {
                 try self.expectKeyword("key");
                 column.nullable = false;
+                if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
                 try self.consumeOptionalDdlImmediateConstraintTiming();
                 try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, null);
             } else if (self.matchKeyword("unique")) {
                 try self.consumeOptionalDdlUniqueNullsDistinct();
+                const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
+                defer freeStringSlice(self.alloc, include_columns);
                 try self.consumeOptionalDdlImmediateConstraintTiming();
-                try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, null);
+                try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, include_columns, null);
             } else if (self.matchKeyword("check")) {
                 const check = try self.parseDdlCheckConstraint(null);
                 var check_transferred = false;
@@ -9255,14 +9265,17 @@ const Parser = struct {
                 if (self.matchKeyword("primary")) {
                     try self.expectKeyword("key");
                     column.nullable = false;
+                    if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
                     try self.consumeOptionalDdlImmediateConstraintTiming();
                     try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("unique")) {
                     try self.consumeOptionalDdlUniqueNullsDistinct();
+                    const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
+                    defer freeStringSlice(self.alloc, include_columns);
                     try self.consumeOptionalDdlImmediateConstraintTiming();
-                    try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, null);
+                    try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, include_columns, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("check")) {
@@ -9547,14 +9560,17 @@ const Parser = struct {
             try self.expectKeyword("key");
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
+            if (self.peekKeyword("include")) return error.UnsupportedSqlShape;
             try self.consumeOptionalDdlImmediateConstraintTiming();
             try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("unique")) {
             try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
+            const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
+            defer freeStringSlice(self.alloc, include_columns);
             try self.consumeOptionalDdlImmediateConstraintTiming();
-            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, columns.without_overlaps_period);
+            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("foreign")) {
             const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
             var transferred = false;
@@ -10323,6 +10339,14 @@ const Parser = struct {
         return try columns.toOwnedSlice(self.alloc);
     }
 
+    fn parseOptionalDdlConstraintIncludeAlloc(self: *@This(), key_columns: []const []const u8) ![]const []const u8 {
+        if (!self.matchKeyword("include")) return &.{};
+        const include_columns = try self.parseDdlColumnListAlloc();
+        errdefer freeStringSlice(self.alloc, include_columns);
+        try validateSqlIdentifierListsDisjoint(key_columns, include_columns);
+        return include_columns;
+    }
+
     const DdlTemporalColumnList = struct {
         columns: []const []const u8,
         without_overlaps_period: ?[]const u8 = null,
@@ -10503,9 +10527,10 @@ const Parser = struct {
         unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
         constraint_name: ?[]const u8,
         columns: []const []const u8,
+        include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
     ) !void {
-        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns, without_overlaps_period);
+        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns, include_columns, without_overlaps_period);
         var transferred = false;
         errdefer if (!transferred) freeDdlUniqueConstraint(self.alloc, constraint);
         try unique_constraints.append(self.alloc, constraint);
@@ -10516,24 +10541,34 @@ const Parser = struct {
         self: *@This(),
         constraint_name: ?[]const u8,
         columns: []const []const u8,
+        include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
     ) !runtime_schema.UniqueConstraint {
         const owned_columns = try cloneStringSlice(self.alloc, columns);
         var columns_transferred = false;
         errdefer if (!columns_transferred) freeStringSlice(self.alloc, owned_columns);
+        const owned_include_columns = try cloneStringSlice(self.alloc, include_columns);
+        var include_columns_transferred = false;
+        errdefer if (!include_columns_transferred) freeStringSlice(self.alloc, owned_include_columns);
         const name = if (constraint_name) |existing|
             try self.alloc.dupe(u8, existing)
         else
             try self.defaultUniqueConstraintNameAlloc(columns);
         var name_transferred = false;
         errdefer if (!name_transferred) self.alloc.free(name);
-        columns_transferred = true;
-        name_transferred = true;
         const owned_period = if (without_overlaps_period) |period| try self.alloc.dupe(u8, period) else null;
         var period_transferred = false;
         errdefer if (!period_transferred) if (owned_period) |period| self.alloc.free(period);
+        columns_transferred = true;
+        name_transferred = true;
         period_transferred = true;
-        return .{ .name = name, .columns = owned_columns, .without_overlaps_period = owned_period };
+        include_columns_transferred = true;
+        return .{
+            .name = name,
+            .columns = owned_columns,
+            .include_columns = owned_include_columns,
+            .without_overlaps_period = owned_period,
+        };
     }
 
     fn defaultUniqueConstraintNameAlloc(self: *@This(), columns: []const []const u8) ![]const u8 {
@@ -45613,6 +45648,42 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
+    var covering_unique_constraints = try lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE covering_unique_constraints (
+        \\  id uuid PRIMARY KEY,
+        \\  tenant_id text,
+        \\  status text,
+        \\  email text UNIQUE INCLUDE (tenant_id),
+        \\  CONSTRAINT covering_unique_constraints_status_key UNIQUE (status) INCLUDE (tenant_id, email) NOT DEFERRABLE INITIALLY IMMEDIATE
+        \\);
+        ,
+    );
+    defer covering_unique_constraints.deinit(alloc);
+    switch (covering_unique_constraints) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("covering_unique_constraints", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints[0].include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[0].include_columns[0]);
+            try std.testing.expectEqualStrings("covering_unique_constraints_status_key", plan.unique_constraints[1].name);
+            try std.testing.expectEqualStrings("status", plan.unique_constraints[1].columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints[1].include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[1].include_columns[0]);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[1].include_columns[1]);
+
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+            try std.testing.expectEqual(@as(usize, 2), applied.unique_constraints.len);
+            try std.testing.expectEqual(@as(usize, 2), applied.unique_constraints[1].include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", applied.unique_constraints[1].include_columns[0]);
+            try std.testing.expectEqualStrings("email", applied.unique_constraints[1].include_columns[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE ONLY usage_records (id uuid PRIMARY KEY);",
@@ -45640,6 +45711,18 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_deferred_table_primary (tenant_id text NOT NULL, id uuid NOT NULL, CONSTRAINT bad_deferred_table_primary_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY DEFERRED);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_primary_include (id uuid PRIMARY KEY INCLUDE (tenant_id), tenant_id text);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_table_primary_include (tenant_id text, id uuid, status text, PRIMARY KEY (tenant_id, id) INCLUDE (status));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_unique_include_overlap (id uuid PRIMARY KEY, email text UNIQUE INCLUDE (email));",
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
@@ -47329,6 +47412,39 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;",
+    ));
+
+    var explicit_covering_unique = try lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (tenant_id, status) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+    );
+    defer explicit_covering_unique.deinit(alloc);
+    switch (explicit_covering_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_cover_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 1), constraint.columns.len);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expectEqual(@as(usize, 2), constraint.include_columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", constraint.include_columns[0]);
+                    try std.testing.expectEqualStrings("status", constraint.include_columns[1]);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (email);",
     ));
 
     var explicit_primary_key_timing = try lowerDdlPlanAlloc(
@@ -70962,6 +71078,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE;",
         },
         .{
+            .name = "unsupported primary key include columns",
+            .family = .unsupported_ddl,
+            .plan = "unsupported:ddl:requires=primary_key_include_columns",
+            .classification_reason = "primary_key_include_columns",
+            .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status);",
+        },
+        .{
             .name = "schema replace table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 1 },
@@ -71205,6 +71328,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_nulls_distinct_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+        },
+        .{
+            .name = "schema additive covering unique validation work",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (tenant_id, status);",
         },
         .{
             .name = "schema validate unique constraint",
