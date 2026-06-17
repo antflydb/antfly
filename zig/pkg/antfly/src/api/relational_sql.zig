@@ -8419,6 +8419,7 @@ const Parser = struct {
             return;
         }
         if (self.matchKeyword("unique")) {
+            try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, columns.without_overlaps_period);
@@ -8485,6 +8486,7 @@ const Parser = struct {
 
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
             if (self.matchKeyword("unique")) {
+                try self.consumeOptionalDdlUniqueNullsDistinct();
                 var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, null);
                 constraint.validation_state = .unvalidated;
                 try unique_constraints.append(self.alloc, constraint);
@@ -8503,6 +8505,7 @@ const Parser = struct {
                 var constraint_name_transferred = false;
                 errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
                 if (self.matchKeyword("unique")) {
+                    try self.consumeOptionalDdlUniqueNullsDistinct();
                     var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
@@ -9225,6 +9228,7 @@ const Parser = struct {
                 column.nullable = false;
                 try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, null);
             } else if (self.matchKeyword("unique")) {
+                try self.consumeOptionalDdlUniqueNullsDistinct();
                 try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, null);
             } else if (self.matchKeyword("check")) {
                 const check = try self.parseDdlCheckConstraint(null);
@@ -9249,6 +9253,7 @@ const Parser = struct {
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("unique")) {
+                    try self.consumeOptionalDdlUniqueNullsDistinct();
                     try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, null);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
@@ -9536,6 +9541,7 @@ const Parser = struct {
             defer columns.deinit(self.alloc);
             try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("unique")) {
+            try self.consumeOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, columns.without_overlaps_period);
@@ -10238,6 +10244,12 @@ const Parser = struct {
         if (!self.peekDdlNotValid()) return false;
         self.pos += 2;
         return true;
+    }
+
+    fn consumeOptionalDdlUniqueNullsDistinct(self: *@This()) !void {
+        if (!self.matchKeyword("nulls")) return;
+        if (self.matchKeyword("not")) return error.UnsupportedSqlShape;
+        try self.expectKeyword("distinct");
     }
 
     fn peekDdlNotValid(self: *@This()) bool {
@@ -45490,9 +45502,44 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
+    var unique_nulls_distinct = try lowerDdlPlanAlloc(
+        alloc,
+        \\CREATE TABLE unique_nulls_distinct (
+        \\  id uuid PRIMARY KEY,
+        \\  email text UNIQUE NULLS DISTINCT,
+        \\  tenant_id text CONSTRAINT unique_nulls_distinct_tenant_key UNIQUE NULLS DISTINCT,
+        \\  CONSTRAINT unique_nulls_distinct_tenant_email_key UNIQUE NULLS DISTINCT (tenant_id, email)
+        \\);
+        ,
+    );
+    defer unique_nulls_distinct.deinit(alloc);
+    switch (unique_nulls_distinct) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("unique_nulls_distinct", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 3), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqualStrings("unique_nulls_distinct_tenant_key", plan.unique_constraints[1].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[1].columns[0]);
+            try std.testing.expectEqualStrings("unique_nulls_distinct_tenant_email_key", plan.unique_constraints[2].name);
+            try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints[2].columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[2].columns[0]);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[2].columns[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE ONLY usage_records (id uuid PRIMARY KEY);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_unique_nulls (id uuid PRIMARY KEY, email text UNIQUE NULLS NOT DISTINCT);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE TABLE bad_table_unique_nulls (id uuid PRIMARY KEY, email text, CONSTRAINT bad_table_unique_nulls_email_key UNIQUE NULLS NOT DISTINCT (email));",
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
@@ -47153,6 +47200,32 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
+
+    var explicit_nulls_distinct_unique = try lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS DISTINCT (email);",
+    );
+    defer explicit_nulls_distinct_unique.deinit(alloc);
+    switch (explicit_nulls_distinct_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 1), constraint.columns.len);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS NOT DISTINCT (email);",
+    ));
 
     var drop_column = try lowerDdlPlanAlloc(
         alloc,
@@ -70969,6 +71042,14 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
             .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
             .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);",
+        },
+        .{
+            .name = "schema additive explicit nulls distinct unique validation work",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .alter_table, .table_name = "usage_records", .operations = 1 },
+            .plan = "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_nulls_distinct_key UNIQUE NULLS DISTINCT (email);",
         },
         .{
             .name = "schema validate unique constraint",
