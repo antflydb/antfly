@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: antfly-ha-admin-token
-  namespace: default
+  namespace: antfly-operator-namespace
 type: Opaque
 stringData:
   token: replace-with-a-random-admin-token
