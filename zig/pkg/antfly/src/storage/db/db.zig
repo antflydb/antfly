@@ -1043,7 +1043,28 @@ const BatchExecutionOptions = struct {
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     bypass_ha_write_gate: bool = false,
+    ha_applied_lsn_marker: ?u64 = null,
 };
+
+const ha_applied_lsn_value_len: usize = @sizeOf(u64);
+
+fn haAppliedReplicationLsnWrite(lsn: u64, value_buf: *[ha_applied_lsn_value_len]u8) docstore_mod.KVPair {
+    std.mem.writeInt(u64, value_buf, lsn, .little);
+    return .{
+        .key = internal_keys.ha_applied_lsn_key[0..],
+        .value = value_buf[0..],
+    };
+}
+
+fn readHAAppliedReplicationLsn(alloc: Allocator, store: *docstore_mod.DocStore) !u64 {
+    const raw = store.get(alloc, internal_keys.ha_applied_lsn_key[0..]) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != ha_applied_lsn_value_len) return error.CorruptHAAppliedReplicationLsn;
+    return std.mem.readInt(u64, raw[0..ha_applied_lsn_value_len], .little);
+}
 
 pub const OpenProfile = struct {
     primary_store_ns: u64 = 0,
@@ -3914,31 +3935,39 @@ pub const DB = struct {
     }
 
     pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
+        try self.batchReplicatedApplyWithMarker(req, null);
+    }
+
+    fn batchReplicatedApplyWithMarker(self: *DB, req: types.BatchRequest, applied_lsn_marker: ?u64) anyerror!void {
         var apply_req = req;
         apply_req.sync_level = .write;
         try self.batchInternal(apply_req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = true,
+            .ha_applied_lsn_marker = applied_lsn_marker,
         });
     }
 
     pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
+        if (try self.haReplicationRecordAlreadyApplied(record)) return;
+
         switch (record.kind) {
             .batch_mutation => {
                 var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
                 defer decoded.deinit();
-                try self.batchReplicatedApply(decoded.value.request);
+                try self.batchReplicatedApplyWithMarker(decoded.value.request, record.lsn);
             },
             .derived_effect => {
                 _ = try self.applyHADerivedEffectRecord(record);
+                try self.markHAReplicationRecordApplied(record.lsn);
             },
             .backup_start,
             .backup_end,
             .checkpoint,
             .manifest,
             .truncate,
-            => {},
+            => try self.markHAReplicationRecordApplied(record.lsn),
             .metadata_mutation,
             .timeline_switch,
             => return error.HAReplicationRecordApplyUnsupported,
@@ -3949,6 +3978,24 @@ pub const DB = struct {
     pub fn applyHADerivedEffectRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!u64 {
         var ctx = self.batchContext();
         return try appendReplicatedHADerivedEffectContext(&ctx, record);
+    }
+
+    pub fn haAppliedReplicationLsn(self: *DB) anyerror!u64 {
+        return try readHAAppliedReplicationLsn(self.alloc, self.core.store);
+    }
+
+    fn haReplicationRecordAlreadyApplied(self: *DB, record: ha_replication_record_mod.RecordView) !bool {
+        if (record.lsn == 0) return false;
+        return (try self.haAppliedReplicationLsn()) >= record.lsn;
+    }
+
+    fn markHAReplicationRecordApplied(self: *DB, lsn: u64) !void {
+        if (lsn == 0) return;
+        const current = try self.haAppliedReplicationLsn();
+        if (current >= lsn) return;
+        var value_buf: [ha_applied_lsn_value_len]u8 = undefined;
+        const marker = haAppliedReplicationLsnWrite(lsn, &value_buf);
+        try self.core.store.putBatch(&.{marker}, &.{});
     }
 
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: ha_replication_record_mod.RecordView) anyerror!void {
@@ -4640,6 +4687,12 @@ pub const DB = struct {
             .{ .mode = .bulk_ingest }
         else
             .{};
+        var ha_applied_lsn_value_buf: [ha_applied_lsn_value_len]u8 = undefined;
+        if (opts.ha_applied_lsn_marker) |lsn| {
+            if (lsn != 0) {
+                try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
+            }
+        }
         try self.core.store.putBatchWithReplayWithOptions(
             self.backend_runtime.io(),
             store_writes.items,
@@ -36897,6 +36950,7 @@ test "storage.ha db applies batch mutation records through replication session c
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 3), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 3), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 3), try standby_db.haAppliedReplicationLsn());
 
     var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
@@ -36922,6 +36976,72 @@ test "storage.ha db applies batch mutation records through replication session c
     try std.testing.expectEqualStrings("doc:a", replicated_effect_record.record.changed_doc_keys[0]);
     try std.testing.expectEqual(@as(usize, 1), replicated_effect_record.record.target_hints.len);
     try std.testing.expectEqual(change_journal_mod.TargetHint.full_text, replicated_effect_record.record.target_hints[0]);
+
+    var duplicate_batch = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer duplicate_batch.deinit(alloc);
+    try standby_db.applyHAReplicationRecord(duplicate_batch.record);
+    var duplicate_derived = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
+    defer duplicate_derived.deinit(alloc);
+    try standby_db.applyHAReplicationRecord(duplicate_derived.record);
+    try std.testing.expectEqual(@as(u64, 3), try standby_db.haAppliedReplicationLsn());
+
+    const replay_after_duplicates = try replay_stream_mod.iterateFrom(alloc, standby_db.core.store, 1);
+    defer {
+        for (replay_after_duplicates) |*entry| entry.deinit(alloc);
+        alloc.free(replay_after_duplicates);
+    }
+    try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
+}
+
+test "storage.ha db persists applied replication marker across reopen" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var primary_log_path_buf: [256]u8 = undefined;
+    const primary_log_path = tempPath(&primary_log_path_buf);
+    defer cleanupTempDir(primary_log_path);
+    var primary_slots_path_buf: [256]u8 = undefined;
+    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    defer cleanupTempDir(primary_slots_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 252,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
+    defer primary.close();
+
+    _ = try ha_effects_mod.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:persisted-marker", .value = "{\"title\":\"persisted\"}" }},
+        .sync_level = .write,
+    }, .{});
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.applyHAReplicationRecord(entry.record);
+        try std.testing.expectEqual(@as(u64, 1), try db.haAppliedReplicationLsn());
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
+    try reopened.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
+
+    const replay_entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
+    defer {
+        for (replay_entries) |*replay_entry| replay_entry.deinit(alloc);
+        alloc.free(replay_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
 }
 
 test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
