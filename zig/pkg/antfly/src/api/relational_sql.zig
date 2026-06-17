@@ -63755,6 +63755,14 @@ test "app parity fixture metadata requires typed summary anchors" {
         .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1x:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
     }, &seen, alloc));
 
+    try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
+        .name = "duplicate query select summary",
+        .sql = "SELECT id FROM usage_records",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .select = 1 },
+        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=2:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none",
+    }, &seen, alloc));
+
     try validateAppParityFixtureMetadata(.{
         .name = "valid query select summary",
         .sql = "SELECT id FROM usage_records",
@@ -64845,46 +64853,52 @@ fn appParityPlanParseDelimitedUsizeToken(plan: []const u8, value_start: usize) ?
     return value;
 }
 
-fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
+const AppParityPlanUsizeTokenScan = union(enum) {
+    absent,
+    value: usize,
+    invalid,
+};
+
+fn appParityPlanScanUsizeToken(plan: []const u8, token: []const u8) AppParityPlanUsizeTokenScan {
     var start: usize = 0;
+    var found: ?usize = null;
     while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse {
-            start = index + token.len;
-            continue;
-        };
-        return parsed;
+        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse return .invalid;
+        if (found != null) return .invalid;
+        found = parsed;
+        start = index + token.len;
     }
-    return null;
+    if (found) |value| return .{ .value = value };
+    return .absent;
+}
+
+fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
+    return switch (appParityPlanScanUsizeToken(plan, token)) {
+        .value => |value| value,
+        .absent, .invalid => null,
+    };
 }
 
 fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse {
-            start = index + token.len;
-            continue;
-        };
-        if (parsed > 0) return true;
-        start = index + token.len;
-    }
-    return false;
+    return switch (appParityPlanScanUsizeToken(plan, token)) {
+        .value => |value| value > 0,
+        .absent, .invalid => false,
+    };
 }
 
 fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const parsed = appParityPlanParseDelimitedUsizeToken(plan, index + token.len) orelse {
-            start = index + token.len;
-            continue;
-        };
-        if (parsed == expected) return true;
-        start = index + token.len;
-    }
-    return false;
+    return switch (appParityPlanScanUsizeToken(plan, token)) {
+        .value => |value| value == expected,
+        .absent, .invalid => false,
+    };
 }
 
-fn appParityPlanUsizeOptionalTokenValue(plan: []const u8, token: []const u8) usize {
-    return appParityPlanUsizeTokenValue(plan, token) orelse 0;
+fn appParityPlanUsizeOptionalTokenValue(plan: []const u8, token: []const u8) ?usize {
+    return switch (appParityPlanScanUsizeToken(plan, token)) {
+        .value => |value| value,
+        .absent => 0,
+        .invalid => null,
+    };
 }
 
 fn appParityPlanUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
@@ -64899,7 +64913,7 @@ fn appParityPlanUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u
 fn appParityPlanUsizeOptionalTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
     var sum: usize = 0;
     for (tokens) |token| {
-        sum += appParityPlanUsizeOptionalTokenValue(plan, token);
+        sum += appParityPlanUsizeOptionalTokenValue(plan, token) orelse return false;
     }
     return sum == expected;
 }
