@@ -856,11 +856,11 @@ func TestUpdateHAStatusReportsUnhealthyAndLaggingStandbys(t *testing.T) {
 		t.Fatalf("expected one lagging standby, got %d", cluster.Status.HAStatus.LaggingStandbyCount)
 	}
 	unhealthy := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAUnhealthy)
-	if unhealthy == nil || unhealthy.Status != metav1.ConditionTrue || unhealthy.Reason != "HAStandbyUnhealthy" {
+	if unhealthy == nil || unhealthy.Status != metav1.ConditionTrue || unhealthy.Reason != antflyv1.ReasonHAStandbyUnhealthy {
 		t.Fatalf("expected unhealthy condition, got %#v", unhealthy)
 	}
 	lagging := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHALagging)
-	if lagging == nil || lagging.Status != metav1.ConditionTrue || lagging.Reason != "HAStandbyLagging" {
+	if lagging == nil || lagging.Status != metav1.ConditionTrue || lagging.Reason != antflyv1.ReasonHAStandbyLagging {
 		t.Fatalf("expected lagging condition, got %#v", lagging)
 	}
 }
@@ -940,7 +940,7 @@ func TestUpdateHAStatusReportsPrimaryAdminUnavailable(t *testing.T) {
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	degraded = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
-	if degraded == nil || degraded.Status != metav1.ConditionFalse || degraded.Reason != "HASyncPolicySatisfied" {
+	if degraded == nil || degraded.Status != metav1.ConditionFalse || degraded.Reason != antflyv1.ReasonHASyncPolicySatisfied {
 		t.Fatalf("expected primary admin degraded condition to clear, got %#v", degraded)
 	}
 }
@@ -1069,7 +1069,7 @@ func TestUpdateHAStatusAllowsAutomaticPromotionOnlyWithFenceAndCaughtUpStandby(t
 		t.Fatal("expected automatic promotion to be allowed with ready fencing, primary failure, and caught-up standby")
 	}
 	failover = meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHAAutomaticFailoverReady)
-	if failover == nil || failover.Status != metav1.ConditionTrue || failover.Reason != "HAFencedPromotionReady" {
+	if failover == nil || failover.Status != metav1.ConditionTrue || failover.Reason != antflyv1.ReasonHAFencedPromotionReady {
 		t.Fatalf("expected failover-ready condition, got %#v", failover)
 	}
 	plan := planHA(cluster)

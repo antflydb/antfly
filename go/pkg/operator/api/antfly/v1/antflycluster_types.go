@@ -212,8 +212,47 @@ const (
 	// ReasonHASyncPolicyUnsatisfied indicates synchronous HA durability is not satisfied.
 	ReasonHASyncPolicyUnsatisfied = "HASyncPolicyUnsatisfied"
 
+	// ReasonHASyncPolicySatisfied indicates synchronous HA durability is satisfied or not configured.
+	ReasonHASyncPolicySatisfied = "HASyncPolicySatisfied"
+
 	// ReasonHAPrimaryAdminUnavailable indicates the primary HA admin endpoint could not be observed.
 	ReasonHAPrimaryAdminUnavailable = "HAPrimaryAdminUnavailable"
+
+	// ReasonHAAdminStatusUnavailable indicates one or more HA admin status endpoints could not be observed.
+	ReasonHAAdminStatusUnavailable = "HAAdminStatusUnavailable"
+
+	// ReasonHAAdminJobFailed indicates an HA admin execution failed.
+	ReasonHAAdminJobFailed = "HAAdminJobFailed"
+
+	// ReasonHAStandbyUnhealthy indicates at least one desired standby is unhealthy.
+	ReasonHAStandbyUnhealthy = "HAStandbyUnhealthy"
+
+	// ReasonHAStandbysHealthy indicates desired standbys are healthy.
+	ReasonHAStandbysHealthy = "HAStandbysHealthy"
+
+	// ReasonHAStandbyLagging indicates at least one desired standby has replication lag.
+	ReasonHAStandbyLagging = "HAStandbyLagging"
+
+	// ReasonHANoLaggingStandbys indicates no desired standby has replication lag.
+	ReasonHANoLaggingStandbys = "HANoLaggingStandbys"
+
+	// ReasonHARetentionCapExceeded indicates HA WAL retention exceeds policy.
+	ReasonHARetentionCapExceeded = "HARetentionCapExceeded"
+
+	// ReasonHARetentionWithinPolicy indicates HA WAL retention is within policy.
+	ReasonHARetentionWithinPolicy = "HARetentionWithinPolicy"
+
+	// ReasonHAStandbyRequiresReseed indicates at least one desired standby requires reseed.
+	ReasonHAStandbyRequiresReseed = "HAStandbyRequiresReseed"
+
+	// ReasonHANoReseedRequired indicates no desired standby requires reseed.
+	ReasonHANoReseedRequired = "HANoReseedRequired"
+
+	// ReasonHAFencedPromotionReady indicates automatic failover can perform a fenced promotion.
+	ReasonHAFencedPromotionReady = "HAFencedPromotionReady"
+
+	// ReasonHAAutomaticFailoverDisabled indicates automatic failover is disabled.
+	ReasonHAAutomaticFailoverDisabled = "HAAutomaticFailoverDisabled"
 
 	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
 	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"

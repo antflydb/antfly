@@ -3188,7 +3188,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 				cluster,
 				antflyv1.TypeHADegraded,
 				metav1.ConditionTrue,
-				"HAAdminStatusUnavailable",
+				antflyv1.ReasonHAAdminStatusUnavailable,
 				fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 			)
 		}
@@ -3283,7 +3283,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
-			"HAAdminStatusUnavailable",
+			antflyv1.ReasonHAAdminStatusUnavailable,
 			fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
 		)
 	}
@@ -5927,7 +5927,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
-			"HAAdminJobFailed",
+			antflyv1.ReasonHAAdminJobFailed,
 			message,
 		)
 		return

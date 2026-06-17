@@ -444,7 +444,7 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
 	g.Expect(degraded).NotTo(BeNil())
 	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
-	g.Expect(degraded.Reason).To(Equal("HAAdminJobFailed"))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminJobFailed))
 	g.Expect(degraded.Message).To(ContainSubstring(haAdminDirectAPIName))
 	g.Expect(degraded.Message).To(ContainSubstring("status 409"))
 }

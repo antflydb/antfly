@@ -1389,32 +1389,32 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 			fmt.Sprintf("Primary HA admin endpoint is unreachable: %s", strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError)),
 		)
 	} else {
-		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionFalse, "HASyncPolicySatisfied", "Synchronous HA policy is satisfied or not configured")
+		setHACondition(cluster, antflyv1.TypeHADegraded, metav1.ConditionFalse, antflyv1.ReasonHASyncPolicySatisfied, "Synchronous HA policy is satisfied or not configured")
 	}
 
 	if plan.UnhealthyStandbyCount > 0 {
-		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionTrue, "HAStandbyUnhealthy", fmt.Sprintf("%d desired standby is missing, inactive, or reporting replication errors", plan.UnhealthyStandbyCount))
+		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionTrue, antflyv1.ReasonHAStandbyUnhealthy, fmt.Sprintf("%d desired standby is missing, inactive, or reporting replication errors", plan.UnhealthyStandbyCount))
 	} else {
-		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionFalse, "HAStandbysHealthy", "No desired standby is missing, inactive, or reporting replication errors")
+		setHACondition(cluster, antflyv1.TypeHAUnhealthy, metav1.ConditionFalse, antflyv1.ReasonHAStandbysHealthy, "No desired standby is missing, inactive, or reporting replication errors")
 	}
 
 	if plan.LaggingStandbyCount > 0 {
-		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionTrue, "HAStandbyLagging", fmt.Sprintf("%d desired standby has replication lag", plan.LaggingStandbyCount))
+		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionTrue, antflyv1.ReasonHAStandbyLagging, fmt.Sprintf("%d desired standby has replication lag", plan.LaggingStandbyCount))
 	} else {
-		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionFalse, "HANoLaggingStandbys", "No desired standby has replication lag")
+		setHACondition(cluster, antflyv1.TypeHALagging, metav1.ConditionFalse, antflyv1.ReasonHANoLaggingStandbys, "No desired standby has replication lag")
 	}
 
 	retentionPressure := cluster.Status.HAStatus != nil && cluster.Status.HAStatus.Retention.ReseedRecommended > 0
 	if retentionPressure {
-		setHACondition(cluster, antflyv1.TypeHARetentionPressure, metav1.ConditionTrue, "HARetentionCapExceeded", "One or more slots are forcing WAL retention beyond policy")
+		setHACondition(cluster, antflyv1.TypeHARetentionPressure, metav1.ConditionTrue, antflyv1.ReasonHARetentionCapExceeded, "One or more slots are forcing WAL retention beyond policy")
 	} else {
-		setHACondition(cluster, antflyv1.TypeHARetentionPressure, metav1.ConditionFalse, "HARetentionWithinPolicy", "WAL retention is within configured policy")
+		setHACondition(cluster, antflyv1.TypeHARetentionPressure, metav1.ConditionFalse, antflyv1.ReasonHARetentionWithinPolicy, "WAL retention is within configured policy")
 	}
 
 	if plan.ReseedRequiredCount > 0 {
-		setHACondition(cluster, antflyv1.TypeHAReseedRequired, metav1.ConditionTrue, "HAStandbyRequiresReseed", fmt.Sprintf("%d desired standby requires reseed", plan.ReseedRequiredCount))
+		setHACondition(cluster, antflyv1.TypeHAReseedRequired, metav1.ConditionTrue, antflyv1.ReasonHAStandbyRequiresReseed, fmt.Sprintf("%d desired standby requires reseed", plan.ReseedRequiredCount))
 	} else {
-		setHACondition(cluster, antflyv1.TypeHAReseedRequired, metav1.ConditionFalse, "HANoReseedRequired", "No desired standby requires reseed")
+		setHACondition(cluster, antflyv1.TypeHAReseedRequired, metav1.ConditionFalse, antflyv1.ReasonHANoReseedRequired, "No desired standby requires reseed")
 	}
 
 	reason := haAutomaticFailoverReason(ha, plan)
@@ -1597,10 +1597,10 @@ func haStandbyRouteSelectorConfigured(ha *antflyv1.HighAvailabilitySpec, standby
 
 func haAutomaticFailoverReason(ha *antflyv1.HighAvailabilitySpec, plan haPlan) string {
 	if plan.AutomaticPromotionAllowed {
-		return "HAFencedPromotionReady"
+		return antflyv1.ReasonHAFencedPromotionReady
 	}
 	if ha == nil || ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled {
-		return "HAAutomaticFailoverDisabled"
+		return antflyv1.ReasonHAAutomaticFailoverDisabled
 	}
 	if ha.AutomaticFailover.FencingAuthority == "" || ha.AutomaticFailover.FencingAuthority == antflyv1.HAFencingAuthorityNone {
 		return antflyv1.ReasonHAFencingAuthorityMissing
