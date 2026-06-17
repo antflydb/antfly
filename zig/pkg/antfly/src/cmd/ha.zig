@@ -797,7 +797,9 @@ test "ha cmd remote JSON commands prefer typed admin routes" {
 
     var server = ha.http_admin.Server.init(alloc, .{
         .primary = &primary,
+        .primary_node_id = "primary-a",
         .standby = &standby,
+        .standby_node_id = "standby-a",
         .fence_store = &fence_store,
     });
     defer server.deinit();
