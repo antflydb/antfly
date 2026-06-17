@@ -82,6 +82,7 @@ const (
 	haAdminTokenDefaultEnvVar               = "ANTFLY_HA_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
 	defaultHAPrimaryLogPath                 = "/antflydb/ha/primary.wal"
 	defaultHAPrimarySlotsPath               = "/antflydb/ha/slots"
+	defaultHAFencePath                      = "/antflydb/ha/fence.wal"
 	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
 	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
 
@@ -158,6 +159,10 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	runtime := ha.Runtime
 	identity := ha.Identity
 	var args strings.Builder
+	fencePath := defaultHAFencePath
+	if value := strings.TrimSpace(runtime.FencePath); value != "" {
+		fencePath = value
+	}
 	appendHAArg := func(name, value string) {
 		args.WriteString(" \\\n  ")
 		args.WriteString(name)
@@ -187,6 +192,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-primary-log", logPath)
 		appendHAArg("--ha-primary-slots", slotsPath)
 		appendHAArg("--ha-primary-node-id", runtime.NodeID)
+		appendHAArg("--ha-fence-wal", fencePath)
 		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
@@ -203,6 +209,7 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		appendHAArg("--ha-standby-log", logPath)
 		appendHAArg("--ha-standby-progress", progressPath)
 		appendHAArg("--ha-standby-node-id", runtime.NodeID)
+		appendHAArg("--ha-fence-wal", fencePath)
 		if standby != nil && strings.TrimSpace(standby.UpstreamURL) != "" && strings.TrimSpace(standby.SlotName) != "" {
 			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)
 			appendHAArg("--ha-standby-slot", standby.SlotName)

@@ -3672,6 +3672,11 @@ spec:
                     description: Runtime configures the local Zig antfly swarm HA
                       runtime role and durable WAL paths.
                     properties:
+                      fencePath:
+                        description: |-
+                          FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.
+                          Defaults to /antflydb/ha/fence.wal.
+                        type: string
                       nodeID:
                         description: NodeID is the logical HA node id used in typed
                           admin receipts and fencing.

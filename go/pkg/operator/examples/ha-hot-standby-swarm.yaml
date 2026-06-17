@@ -66,6 +66,7 @@ spec:
     runtime:
       role: Primary
       nodeID: primary-a
+      fencePath: /antflydb/ha/fence.wal
       primary:
         logPath: /antflydb/ha/primary.wal
         slotsPath: /antflydb/ha/slots
@@ -160,6 +161,7 @@ spec:
     runtime:
       role: Standby
       nodeID: standby-a
+      fencePath: /antflydb/ha/fence.wal
       standby:
         logPath: /antflydb/ha/standby.wal
         progressPath: /antflydb/ha/standby-progress.wal

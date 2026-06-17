@@ -653,20 +653,21 @@ and either rewind or reseed.
 - Keep CLI table and JSON output aligned with admin API response schemas so
   humans, tests, and the operator observe the same fields.
 - Wire the supported Zig `antfly swarm` runtime so a primary can be started with
-  durable HA replication log, slot store, node id, and identity flags. That
-  runtime path should attach the same `/admin/v1/ha` executor and
-  `/internal/v1/ha/replication` executor used by tests and the CLI, rather than
-  requiring a bespoke harness to expose primary-side HA operations.
+  durable HA replication log, slot store, promotion fence WAL, node id, and
+  identity flags. That runtime path should attach the same `/admin/v1/ha`
+  executor, durable fence store, and `/internal/v1/ha/replication` executor used
+  by tests and the CLI, rather than requiring a bespoke harness to expose
+  primary-side HA operations.
 - Wire the supported Zig `antfly swarm` runtime so a standby can also be started
-  with a durable received-WAL log, progress WAL, node id, and identity flags.
-  The standby runtime path should expose `/admin/v1/ha` status, read/write
-  gate, bootstrap, and promotion operations against the real standby handle.
-  Continuous pull/apply should then plug into the DataServer-managed standby DB
-  open path so applied LSN only advances after replicated records are applied to
-  storage. Every provisioned writer DB opened by that DataServer path must carry
-  the same HA write gate as the node's admin role, so standby processes reject
-  client/local-owner writes and suppress primary-only background mutation loops
-  while still permitting replicated apply.
+  with a durable received-WAL log, progress WAL, promotion fence WAL, node id,
+  and identity flags. The standby runtime path should expose `/admin/v1/ha`
+  status, read/write gate, bootstrap, and promotion operations against the real
+  standby handle. Continuous pull/apply should then plug into the
+  DataServer-managed standby DB open path so applied LSN only advances after
+  replicated records are applied to storage. Every provisioned writer DB opened
+  by that DataServer path must carry the same HA write gate as the node's admin
+  role, so standby processes reject client/local-owner writes and suppress
+  primary-only background mutation loops while still permitting replicated apply.
 - Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
   `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
   operations following the style of the other SDK APIs.
@@ -688,7 +689,8 @@ conditions, admin-job targeting, service updates, and promotion automation must
 be validated against that operator package.
 
 - Add CRD fields for HA mode, standby topology, sync policy, failure policy,
-  retention caps, and automatic-failover policy.
+  retention caps, durable runtime WAL/fence paths, and automatic-failover
+  policy.
 - Bootstrap standby pods from base backup and attach them to replication slots.
 - Manage slot lifecycle and WAL retention pressure.
 - Prefer typed `/admin/v1/ha` calls for idempotent operator actions.

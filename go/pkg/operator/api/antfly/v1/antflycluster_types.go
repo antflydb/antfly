@@ -657,6 +657,11 @@ type HARuntimeSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	NodeID string `json:"nodeID"`
 
+	// FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.
+	// Defaults to /antflydb/ha/fence.wal.
+	// +optional
+	FencePath string `json:"fencePath,omitempty"`
+
 	// Primary configures primary-side durable HA state. Defaults are under /antflydb/ha.
 	// +optional
 	Primary *HAPrimaryRuntimeSpec `json:"primary,omitempty"`
