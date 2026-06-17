@@ -1369,8 +1369,10 @@ fn validateConstraintCatalogTransition(current_runtime: runtime_schema_mod.Table
 fn primaryKeysEqual(a: ?runtime_schema_mod.PrimaryKey, b: ?runtime_schema_mod.PrimaryKey) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
-    return stringSlicesEqual(a.?.columns, b.?.columns) and
-        stringSlicesEqual(a.?.include_columns, b.?.include_columns);
+    return optionalStringsEqual(a.?.name, b.?.name) and
+        stringSlicesEqual(a.?.columns, b.?.columns) and
+        stringSlicesEqual(a.?.include_columns, b.?.include_columns) and
+        optionalStringsEqual(a.?.without_overlaps_period, b.?.without_overlaps_period);
 }
 
 fn findUniqueConstraintByName(unique_constraints: []const runtime_schema_mod.UniqueConstraint, name: []const u8) ?runtime_schema_mod.UniqueConstraint {
@@ -1390,14 +1392,20 @@ fn findForeignKeyByName(foreign_keys: []const runtime_schema_mod.ForeignKey, nam
 fn uniqueConstraintsEqual(a: runtime_schema_mod.UniqueConstraint, b: runtime_schema_mod.UniqueConstraint) bool {
     return std.mem.eql(u8, a.name, b.name) and
         stringSlicesEqual(a.columns, b.columns) and
-        stringSlicesEqual(a.include_columns, b.include_columns);
+        uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
+        stringSlicesEqual(a.include_columns, b.include_columns) and
+        optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
+        uniquePredicateSlicesEqual(a.where, b.where) and
+        relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }
 
 fn foreignKeysSameDefinition(a: runtime_schema_mod.ForeignKey, b: runtime_schema_mod.ForeignKey) bool {
     return std.mem.eql(u8, a.name, b.name) and
         stringSlicesEqual(a.child_columns, b.child_columns) and
+        optionalStringsEqual(a.child_period, b.child_period) and
         std.mem.eql(u8, a.parent_table, b.parent_table) and
         stringSlicesEqual(a.parent_columns, b.parent_columns) and
+        optionalStringsEqual(a.parent_period, b.parent_period) and
         a.on_delete == b.on_delete and
         a.on_update == b.on_update and
         a.timing == b.timing and
@@ -1587,6 +1595,84 @@ fn schemaPropertyForSecondaryIndex(properties: *std.json.Value, index_name: []co
         if (declared == .string and std.mem.eql(u8, declared.string, index_name)) return entry.value_ptr;
     }
     return properties.object.getPtr(index_name);
+}
+
+fn relationalRowsExpressionConditionSlicesEqual(
+    a: []const runtime_schema_mod.RelationalRowsExpressionCondition,
+    b: []const runtime_schema_mod.RelationalRowsExpressionCondition,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!relationalRowsExpressionConditionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionsEqual(
+    a: runtime_schema_mod.RelationalRowsExpressionCondition,
+    b: runtime_schema_mod.RelationalRowsExpressionCondition,
+) bool {
+    if (a.op != b.op or a.rhs.len != b.rhs.len) return false;
+    if (!relationalRowsExpressionsEqual(a.lhs, b.lhs)) return false;
+    for (a.rhs, b.rhs) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionsEqual(
+    a: runtime_schema_mod.RelationalRowsExpression,
+    b: runtime_schema_mod.RelationalRowsExpression,
+) bool {
+    if (a.kind != b.kind or
+        !std.mem.eql(u8, a.field, b.field) or
+        a.field_source != b.field_source or
+        !std.mem.eql(u8, a.value_json, b.value_json) or
+        !std.mem.eql(u8, a.json_path, b.json_path) or
+        a.json_as_text != b.json_as_text or
+        a.cast_type != b.cast_type or
+        a.operands.len != b.operands.len or
+        a.case_branches.len != b.case_branches.len or
+        a.case_else.len != b.case_else.len)
+    {
+        return false;
+    }
+    for (a.operands, b.operands) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    for (a.case_branches, b.case_branches) |left, right| {
+        if (!relationalRowsExpressionConditionsEqual(left.when, right.when)) return false;
+        if (!relationalRowsExpressionsEqual(left.then, right.then)) return false;
+    }
+    for (a.case_else, b.case_else) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn uniqueExpressionSlicesEqual(a: []const runtime_schema_mod.UniqueExpression, b: []const runtime_schema_mod.UniqueExpression) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+    }
+    return true;
+}
+
+fn uniquePredicateSlicesEqual(a: []const runtime_schema_mod.UniquePredicate, b: []const runtime_schema_mod.UniquePredicate) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!optionalStringsEqual(left.value_json, right.value_json)) return false;
+    }
+    return true;
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -3886,6 +3972,78 @@ test "metadata.schema update rejects relational storage mode and base column cha
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"cascade\"}]}",
         ),
     );
+}
+
+test "metadata.schema update rejects relational constraint definition drift" {
+    const alloc = std.testing.allocator;
+    const indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}";
+    const replication_sources_json = "[]";
+
+    const pk_table: metadata_table_manager.TableRecord = .{
+        .table_id = 12,
+        .name = "orders",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["id"],"include_columns":["status"]}}
+        ,
+        .indexes_json = indexes_json,
+        .replication_sources_json = replication_sources_json,
+        .placement_role = "data",
+    };
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &pk_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"name":"orders_id_pkey","columns":["id"],"include_columns":["status"]}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &pk_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["id"],"include_columns":["email"]}}
+    ));
+
+    const unique_table: metadata_table_manager.TableRecord = .{
+        .table_id = 13,
+        .name = "users",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_lower_key","expressions":[{"op":"lower","field":"email"}],"validation_state":"unvalidated"},{"name":"users_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_status_email_key","columns":["email"],"where_expressions":[{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}}]}]}
+        ,
+        .indexes_json = indexes_json,
+        .replication_sources_json = replication_sources_json,
+        .placement_role = "data",
+    };
+
+    const promoted_unique = try applySchemaUpdateRecord(alloc, &unique_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_lower_key","expressions":[{"op":"lower","field":"email"}],"validation_state":"enforced"},{"name":"users_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_status_email_key","columns":["email"],"where_expressions":[{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}}]}]}
+    );
+    defer metadata_table_manager.freeTable(alloc, promoted_unique);
+    try std.testing.expect(std.mem.indexOf(u8, promoted_unique.schema_json, "\"validation_state\":\"enforced\"") != null);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &unique_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_lower_key","expressions":[{"op":"upper","field":"email"}],"validation_state":"unvalidated"},{"name":"users_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_status_email_key","columns":["email"],"where_expressions":[{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}}]}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &unique_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_lower_key","expressions":[{"op":"lower","field":"email"}],"validation_state":"unvalidated"},{"name":"users_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"pending"}]}},{"name":"users_status_email_key","columns":["email"],"where_expressions":[{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}}]}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &unique_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_lower_key","expressions":[{"op":"lower","field":"email"}],"validation_state":"unvalidated"},{"name":"users_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_status_email_key","columns":["email"],"where_expressions":[{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"pending"}}]}]}
+    ));
+
+    const period_table: metadata_table_manager.TableRecord = .{
+        .table_id = 14,
+        .name = "prices",
+        .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"},"other_from":{"type":"datetime"},"other_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to","other_from","other_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"},{"name":"other_time","start_column":"other_from","end_column":"other_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"prices_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_delete":"restrict"}]}
+        ,
+        .indexes_json = indexes_json,
+        .replication_sources_json = replication_sources_json,
+        .placement_role = "data",
+    };
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &period_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"},"other_from":{"type":"datetime"},"other_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to","other_from","other_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"},{"name":"other_time","start_column":"other_from","end_column":"other_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"other_time"},"foreign_keys":[{"name":"prices_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_delete":"restrict"}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &period_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"},"other_from":{"type":"datetime"},"other_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to","other_from","other_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"},{"name":"other_time","start_column":"other_from","end_column":"other_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"prices_parent_time_fkey","columns":["tenant_id","sku"],"period":"other_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_delete":"restrict"}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applySchemaUpdateRecord(alloc, &period_table,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"},"other_from":{"type":"datetime"},"other_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to","other_from","other_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"},{"name":"other_time","start_column":"other_from","end_column":"other_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"prices_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"other_time"},"on_delete":"restrict"}]}
+    ));
 }
 
 test "metadata.schema update cascade drop cleanup removes child foreign keys by parent table" {
