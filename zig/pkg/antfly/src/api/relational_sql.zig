@@ -65444,6 +65444,65 @@ test "app parity CTE chain coverage count tokens are exact" {
     try std.testing.expect(coverage.query_cte_chain);
 }
 
+test "app parity cross-table source schema table tokens are exact" {
+    const source_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var coverage = AppParityCorpusCoverage{};
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .update_joined_source,
+        .source_schema_json = source_schema,
+        .plan = "update_joined_source:target=usage_records:source=source_records_extra:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .join,
+        .source_schema_json = source_schema,
+        .plan = "join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .lateral,
+        .source_schema_json = source_schema,
+        .plan = "lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .merge_mutation,
+        .source_schema_json = source_schema,
+        .plan = "merge_mutation:target=usage_records:source=archived_records_extra:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(!coverage.joined_source_cross_table_source_schema);
+    try std.testing.expect(!coverage.read_join_cross_table_source_schema);
+    try std.testing.expect(!coverage.read_lateral_cross_table_source_schema);
+    try std.testing.expect(!coverage.merge_cross_table_source_schema);
+
+    try coverage.observe(std.testing.allocator, .{
+        .family = .update_joined_source,
+        .source_schema_json = source_schema,
+        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .join,
+        .source_schema_json = source_schema,
+        .plan = "join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .lateral,
+        .source_schema_json = source_schema,
+        .plan = "lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+    });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .merge_mutation,
+        .source_schema_json = source_schema,
+        .plan = "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+    });
+
+    try std.testing.expect(coverage.joined_source_cross_table_source_schema);
+    try std.testing.expect(coverage.read_join_cross_table_source_schema);
+    try std.testing.expect(coverage.read_lateral_cross_table_source_schema);
+    try std.testing.expect(coverage.merge_cross_table_source_schema);
+}
+
 test "app parity conflict write count coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -67530,19 +67589,19 @@ const AppParityCorpusCoverage = struct {
         self.joined_source_cross_table_source_schema = self.joined_source_cross_table_source_schema or
             ((entry.family == .update_joined_source or entry.family == .delete_joined_source) and
                 entry.source_schema_json.len > 0 and
-                std.mem.indexOf(u8, entry.plan, "source=source_records") != null);
+                appParityPlanHasExactStringToken(entry.plan, ":source=", "source_records"));
         self.read_join_cross_table_source_schema = self.read_join_cross_table_source_schema or
             (entry.family == .join and
                 entry.source_schema_json.len > 0 and
-                std.mem.indexOf(u8, entry.plan, "right=customer_records") != null);
+                appParityPlanHasExactStringToken(entry.plan, ":right=", "customer_records"));
         self.read_lateral_cross_table_source_schema = self.read_lateral_cross_table_source_schema or
             (entry.family == .lateral and
                 entry.source_schema_json.len > 0 and
-                std.mem.indexOf(u8, entry.plan, "right=balance_records") != null);
+                appParityPlanHasExactStringToken(entry.plan, ":right=", "balance_records"));
         self.merge_cross_table_source_schema = self.merge_cross_table_source_schema or
             (entry.family == .merge_mutation and
                 entry.source_schema_json.len > 0 and
-                std.mem.indexOf(u8, entry.plan, "source=archived_records") != null);
+                appParityPlanHasExactStringToken(entry.plan, ":source=", "archived_records"));
     }
 
     fn expectComplete(self: @This()) !void {
