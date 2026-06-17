@@ -47456,6 +47456,16 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     );
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, temporary_table));
 
+    var temporary_table_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE TEMPORARY TABLE IF NOT EXISTS users_session (id uuid PRIMARY KEY, status text);");
+    defer temporary_table_if_not_exists.deinit(alloc);
+    const temporary_if_not_exists_fingerprint = try ddlFingerprintAlloc(alloc, temporary_table_if_not_exists);
+    defer alloc.free(temporary_if_not_exists_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:relation_lifetime:kind=temporary:table=users_session:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+        temporary_if_not_exists_fingerprint,
+    );
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, temporary_table_if_not_exists));
+
     var unlogged_table = try lowerDdlPlanAlloc(alloc, "CREATE UNLOGGED TABLE users_ingest (id uuid PRIMARY KEY, payload jsonb);");
     defer unlogged_table.deinit(alloc);
     const unlogged_fingerprint = try ddlFingerprintAlloc(alloc, unlogged_table);
@@ -47465,6 +47475,16 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         unlogged_fingerprint,
     );
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, unlogged_table));
+
+    var unlogged_table_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS users_ingest (id uuid PRIMARY KEY, payload jsonb);");
+    defer unlogged_table_if_not_exists.deinit(alloc);
+    const unlogged_if_not_exists_fingerprint = try ddlFingerprintAlloc(alloc, unlogged_table_if_not_exists);
+    defer alloc.free(unlogged_if_not_exists_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:relation_lifetime:kind=unlogged:table=users_ingest:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+        unlogged_if_not_exists_fingerprint,
+    );
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, unlogged_table_if_not_exists));
 
     var create_enum_type = try lowerDdlPlanAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done');");
     defer create_enum_type.deinit(alloc);
@@ -73780,11 +73800,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)",
         },
         .{
+            .name = "temporary table if not exists lifetime ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .relation_lifetime, .table_name = "usage_session_records", .select = 2 },
+            .plan = "ddl:relation_lifetime:kind=temporary:table=usage_session_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+            .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_records (id uuid PRIMARY KEY, status text)",
+        },
+        .{
             .name = "unlogged table lifetime ddl",
             .family = .ddl,
             .summary = .{ .ddl_tag = .relation_lifetime, .table_name = "usage_ingest_records", .select = 2 },
             .plan = "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
             .sql = "CREATE UNLOGGED TABLE usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)",
+        },
+        .{
+            .name = "unlogged table if not exists lifetime ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .relation_lifetime, .table_name = "usage_ingest_records", .select = 2 },
+            .plan = "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+            .sql = "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)",
         },
         .{
             .name = "create table as select relation population plan",

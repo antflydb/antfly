@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 752,
-  "entry_count": 752,
+  "source_entry_count": 754,
+  "entry_count": 754,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -7725,6 +7725,17 @@
       "sql": "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)"
     },
     {
+      "name": "temporary table if not exists lifetime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "relation_lifetime",
+        "table_name": "usage_session_records",
+        "select": 2
+      },
+      "plan": "ddl:relation_lifetime:kind=temporary:table=usage_session_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_records (id uuid PRIMARY KEY, status text)"
+    },
+    {
       "name": "unlogged table lifetime ddl",
       "family": "ddl",
       "summary": {
@@ -7734,6 +7745,17 @@
       },
       "plan": "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
       "sql": "CREATE UNLOGGED TABLE usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)"
+    },
+    {
+      "name": "unlogged table if not exists lifetime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "relation_lifetime",
+        "table_name": "usage_ingest_records",
+        "select": 2
+      },
+      "plan": "ddl:relation_lifetime:kind=unlogged:table=usage_ingest_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+      "sql": "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)"
     },
     {
       "name": "create table as select relation population plan",

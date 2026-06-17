@@ -4184,14 +4184,14 @@ contracts by recording an opaque SQL definition.
 
 Temporary and unlogged relation DDL lowers to a native `relation_lifetime`
 intent instead of normal durable `CREATE TABLE` storage. `CREATE TEMP TABLE`,
-`CREATE TEMPORARY TABLE`, and `CREATE UNLOGGED TABLE` reuse the typed
-`CreateTablePlan` column, primary-key, constraint, period, and check metadata,
-then attach an explicit lifetime kind. The remaining production shape is the
-executor for that intent: session-scoped or unlogged durability policy,
-dependency cleanup, transaction visibility, crash/replay semantics,
-replication behavior, and range/index ownership rules. Until those policies
-exist as native REST/SDK contracts, these SQL forms must not lower to ordinary
-durable relational tables.
+`CREATE TEMPORARY TABLE`, `CREATE UNLOGGED TABLE`, and their `IF NOT EXISTS`
+forms reuse the typed `CreateTablePlan` column, primary-key, constraint, period,
+check, and idempotent-creation metadata, then attach an explicit lifetime kind.
+The remaining production shape is the executor for that intent: session-scoped
+or unlogged durability policy, dependency cleanup, transaction visibility,
+crash/replay semantics, replication behavior, and range/index ownership rules.
+Until those policies exist as native REST/SDK contracts, these SQL forms must
+not lower to ordinary durable relational tables.
 
 Table-population syntax lowers to a native population intent before execution.
 `CREATE TABLE ... AS SELECT ...` and read-path `SELECT ... INTO new_table ...`
