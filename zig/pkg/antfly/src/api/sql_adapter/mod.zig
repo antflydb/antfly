@@ -13,9 +13,19 @@
 // limitations.
 
 pub const lexer = @import("lexer.zig");
+pub const parser = @import("parser.zig");
 pub const token = @import("token.zig");
 
 pub const Token = token.Token;
 pub const TokenKind = token.TokenKind;
+pub const atEnd = parser.atEnd;
+pub const expectKeyword = parser.expectKeyword;
+pub const expectToken = parser.expectToken;
+pub const findMatchingRParenIndex = parser.findMatchingRParenIndex;
+pub const findTopLevelKeyword = parser.findTopLevelKeyword;
 pub const freeTokens = lexer.freeTokens;
+pub const matchKeyword = parser.matchKeyword;
+pub const matchToken = parser.matchToken;
+pub const peekKeyword = parser.peekKeyword;
+pub const peekKind = parser.peekKind;
 pub const tokenizeAlloc = lexer.tokenizeAlloc;

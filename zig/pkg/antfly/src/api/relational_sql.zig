@@ -2989,7 +2989,7 @@ fn parseCreateTableAsPopulationSqlAlloc(
 }
 
 fn expectTokenKeyword(tokens: []const Token, index: *usize, keyword: []const u8) !void {
-    if (!consumeKeyword(tokens, index, keyword)) return error.UnsupportedSqlShape;
+    try sql_adapter.expectKeyword(tokens, index, keyword);
 }
 
 fn tokenStartOffset(sql: []const u8, token: Token) !usize {
@@ -5325,11 +5325,7 @@ fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?ReadSo
 }
 
 fn consumeKeyword(tokens: []const Token, index: *usize, keyword: []const u8) bool {
-    if (index.* >= tokens.len) return false;
-    const token = tokens[index.*];
-    if (token.kind != .identifier or !std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
-    index.* += 1;
-    return true;
+    return sql_adapter.matchKeyword(tokens, index, keyword);
 }
 
 fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) !void {
@@ -5340,37 +5336,11 @@ fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) !void {
 }
 
 fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
-    var depth: usize = 0;
-    for (tokens, 0..) |token, i| {
-        switch (token.kind) {
-            .lparen => depth += 1,
-            .rparen => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            .semicolon => if (depth == 0) return null,
-            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, keyword)) return i,
-            else => {},
-        }
-    }
-    return null;
+    return sql_adapter.findTopLevelKeyword(tokens, keyword);
 }
 
 fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usize {
-    if (lparen_index >= tokens.len or tokens[lparen_index].kind != .lparen) return null;
-    var depth: usize = 1;
-    var index = lparen_index + 1;
-    while (index < tokens.len) : (index += 1) {
-        switch (tokens[index].kind) {
-            .lparen => depth += 1,
-            .rparen => {
-                depth -= 1;
-                if (depth == 0) return index;
-            },
-            else => {},
-        }
-    }
-    return null;
+    return sql_adapter.findMatchingRParenIndex(tokens, lparen_index);
 }
 
 fn catalogRuntimeSchemaAlloc(
@@ -37352,20 +37322,15 @@ const Parser = struct {
     }
 
     fn expectKeyword(self: *@This(), keyword: []const u8) !void {
-        if (!self.matchKeyword(keyword)) return error.UnsupportedSqlShape;
+        try sql_adapter.expectKeyword(self.tokens, &self.pos, keyword);
     }
 
     fn expect(self: *@This(), kind: TokenKind) !void {
-        if (self.match(kind) == null) return error.UnsupportedSqlShape;
+        try sql_adapter.expectToken(self.tokens, &self.pos, kind);
     }
 
     fn matchKeyword(self: *@This(), keyword: []const u8) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        if (token.kind != .identifier) return false;
-        if (!std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
-        self.pos += 1;
-        return true;
+        return sql_adapter.matchKeyword(self.tokens, &self.pos, keyword);
     }
 
     fn matchAnyOrSomeKeyword(self: *@This()) bool {
@@ -37656,9 +37621,7 @@ const Parser = struct {
     }
 
     fn peekKeyword(self: *@This(), keyword: []const u8) bool {
-        if (self.pos >= self.tokens.len) return false;
-        const token = self.tokens[self.pos];
-        return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, keyword);
+        return sql_adapter.peekKeyword(self.tokens, self.pos, keyword);
     }
 
     fn peekTextLengthFunctionKeyword(self: *@This()) bool {
@@ -37898,19 +37861,15 @@ const Parser = struct {
     }
 
     fn match(self: *@This(), kind: TokenKind) ?Token {
-        if (self.pos >= self.tokens.len) return null;
-        const token = self.tokens[self.pos];
-        if (token.kind != kind) return null;
-        self.pos += 1;
-        return token;
+        return sql_adapter.matchToken(self.tokens, &self.pos, kind);
     }
 
     fn peekKind(self: *@This(), kind: TokenKind) bool {
-        return self.pos < self.tokens.len and self.tokens[self.pos].kind == kind;
+        return sql_adapter.peekKind(self.tokens, self.pos, kind);
     }
 
     fn atEnd(self: *@This()) bool {
-        return self.pos >= self.tokens.len;
+        return sql_adapter.atEnd(self.tokens, self.pos);
     }
 
     fn nextIsUnsupportedQueryKeyword(self: *@This()) bool {
