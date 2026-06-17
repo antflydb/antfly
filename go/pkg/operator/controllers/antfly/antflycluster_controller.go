@@ -3599,12 +3599,13 @@ type haDirectAdminActionResultEnvelope struct {
 }
 
 func requireHADirectAdminActionResult(action *antflyv1.HAPlannedActionStatus, raw []byte) error {
-	if applyHADirectAdminActionResult(action, raw) {
-		return nil
-	}
 	if action == nil || !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return nil
 	}
+	if applyHADirectAdminActionResult(action, raw) && haActionHasRequiredAdminResult(*action) {
+		return nil
+	}
+	action.AdminResult = nil
 	return fmt.Errorf("HA admin action %s succeeded without typed result evidence", action.Kind)
 }
 
@@ -4852,7 +4853,7 @@ func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) b
 	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
 		return true
 	}
-	return action.AdminResult != nil
+	return haActionHasRequiredAdminResult(action)
 }
 
 func haActionRequiresAdminResult(kind haActionKind) bool {
@@ -4869,6 +4870,40 @@ func haActionRequiresAdminResult(kind haActionKind) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool {
+	result := action.AdminResult
+	if result == nil {
+		return false
+	}
+	switch haActionKind(action.Kind) {
+	case haActionCreateSlot:
+		return result.SlotAction == "create" && result.SlotName != ""
+	case haActionResumeSlot:
+		return result.SlotAction == "resume" && result.SlotName != ""
+	case haActionPauseSlot:
+		return result.SlotAction == "pause" && result.SlotName != ""
+	case haActionDropSlot:
+		return result.SlotAction == "drop" && result.SlotName != ""
+	case haActionSeedStandby, haActionMarkReseed:
+		return result.SlotName != "" &&
+			result.ManifestID != "" &&
+			result.BackupLSN > 0 &&
+			result.StartRecordLSN > 0
+	case haActionFinishStandbySeed:
+		return result.ManifestID != "" &&
+			result.BackupLSN > 0 &&
+			result.EndRecordLSN > 0
+	case haActionBootstrapStandbySeed:
+		return result.ManifestID != "" &&
+			result.BackupLSN > 0 &&
+			result.CheckpointLSN > 0
+	case haActionAcquireFence:
+		return result.FenceGeneration > 0 && result.FenceToken != ""
+	default:
+		return true
 	}
 }
 
@@ -4896,7 +4931,7 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
-			action.AdminResult != nil {
+			haActionHasRequiredAdminResult(action) {
 			continue
 		}
 		jobName := action.AdminJobName

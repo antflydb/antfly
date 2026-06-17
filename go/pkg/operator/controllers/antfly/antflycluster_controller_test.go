@@ -219,20 +219,26 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["slot_name"]).To(Equal("standby-a"))
 				g.Expect(payload["initial_lsn"]).To(Equal(float64(5)))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_action":"create","slot":{"slot_name":"standby-a"}}`)),
+				}, nil
 			case "/admin/v1/ha/base-backups":
 				g.Expect(req.Method).To(Equal(http.MethodPost))
 				var payload map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["slot_name"]).To(Equal("standby-a"))
 				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-5"))
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
+				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
+				return nil, nil
 			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot_name":"standby-a","manifest_id":"operator-base-standby-a-7","backup_lsn":7,"start_record_lsn":7}`)),
-			}, nil
 		})},
 	}
 	reconciler.updateHAStatusAndConditions(cluster)
@@ -358,7 +364,7 @@ func TestReconcileHAAdminJobsRejectsDirectAPIMissingTypedResult(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"slot":{"slot_name":"standby-a"}}`)),
 			}, nil
 		})},
 	}
@@ -790,6 +796,7 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(reconciler.Status().Update(context.Background(), finishJob)).To(Succeed())
 	cluster.Status.HAStatus.PlannedActions[2].AdminResult = &antflyv1.HAAdminActionResultStatus{
 		ManifestID:   "base-standby-a-5",
+		BackupLSN:    5,
 		EndRecordLSN: 5,
 	}
 
@@ -894,6 +901,11 @@ func TestHAPlannedActionDependenciesRequireAdminResultEvidence(t *testing.T) {
 		AdminCommand: []string{"seed", "begin", "--slot", "standby-a"},
 	}}
 
+	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
+
+	actions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
+		SlotName: "standby-a",
+	}
 	g.Expect(haPlannedActionDependenciesSucceeded(actions, 1)).To(BeFalse())
 
 	actions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
