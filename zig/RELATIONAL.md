@@ -949,6 +949,32 @@ The long-term layering is:
    PostgreSQL syntax is one frontend dialect, not the durable representation of
    relational behavior.
 
+The PostgreSQL-facing adapter should grow into a real compiler front-end rather
+than continuing to accumulate statement-specific token scans. The lexer is the
+first boundary: it owns PostgreSQL comments, quoted identifiers, string
+literals, dollar-quoted literals, bind placeholders, casts, operators,
+keywords, and source spans. The parser should consume those tokens into a
+bounded adapter AST for supported statement families plus explicit unsupported
+nodes for recognized-but-unimplemented shapes. That adapter AST is not durable
+state and is not an execution model; it exists only to resolve syntax, names,
+parameters, and error classification before lowering into Antfly-native typed
+plans.
+
+Grammar coverage should land incrementally and remain fail-closed. Statement
+families can move from the current handwritten lowerers into the grammar one at
+a time: DDL and catalog operations, row queries, row-batch mutations, claimed
+mutation sources, joins, CTEs, lateral plans, aggregates, windows, and
+insert-source flows. Each migration step keeps the existing typed lowerer and
+SQL/API parity corpus as the acceptance gate. A supported SQL form must lower to
+a REST/SDK-visible plan or catalog operation; an adapter-only no-op must be
+named; an unsupported form must carry a stable required-feature reason. No
+grammar rule may route raw SQL into storage.
+
+If parser code is generated from a grammar, the checked-in grammar is the source
+of truth and generated parser artifacts are updated only through the repository
+generation target and checked by CI. Hand edits belong in the grammar, lexer
+helpers, semantic binding, or typed-plan lowerers, not in generated files.
+
 The model-level contracts for a PostgreSQL-shaped SQL surface are below. They are
 implemented as explicit API/runtime contracts first, then mapped from SQL syntax
 by an adapter.
