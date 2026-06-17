@@ -2,7 +2,10 @@ package controllers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 )
 
 func TestUpdateHAStatusDisabledClearsStatusAndPublishesConditions(t *testing.T) {
@@ -401,6 +405,144 @@ func TestPlanHAEscapesSlotNamesInAdminPaths(t *testing.T) {
 		actions[0].AdminPath != "/admin/v1/ha/replication-slots/standby%2Fa%20b%25/resume" {
 		t.Fatalf("unexpected escaped slot action: %#v", actions[0])
 	}
+}
+
+func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
+	operations := loadAdminOpenAPIOperations(t)
+	slotAction := func(kind haActionKind) haPlannedAction {
+		return haPlannedAction{Kind: kind, StandbyName: "standby-a", SlotName: "standby-a"}
+	}
+	tests := []struct {
+		name        string
+		action      haPlannedAction
+		openAPIPath string
+		operationID string
+	}{
+		{
+			name:        "create slot",
+			action:      slotAction(haActionCreateSlot),
+			openAPIPath: "/ha/replication-slots",
+			operationID: "createHAReplicationSlot",
+		},
+		{
+			name:        "resume slot",
+			action:      slotAction(haActionResumeSlot),
+			openAPIPath: "/ha/replication-slots/{slot_name}/resume",
+			operationID: "resumeHAReplicationSlot",
+		},
+		{
+			name:        "pause slot",
+			action:      slotAction(haActionPauseSlot),
+			openAPIPath: "/ha/replication-slots/{slot_name}/pause",
+			operationID: "pauseHAReplicationSlot",
+		},
+		{
+			name:        "drop slot",
+			action:      slotAction(haActionDropSlot),
+			openAPIPath: "/ha/replication-slots/{slot_name}",
+			operationID: "dropHAReplicationSlot",
+		},
+		{
+			name:        "seed standby",
+			action:      haPlannedAction{Kind: haActionSeedStandby, StandbyName: "standby-a", SlotName: "standby-a"},
+			openAPIPath: "/ha/base-backups",
+			operationID: "beginHABaseBackup",
+		},
+		{
+			name:        "mark reseed",
+			action:      haPlannedAction{Kind: haActionMarkReseed, StandbyName: "standby-a", SlotName: "standby-a"},
+			openAPIPath: "/ha/base-backups",
+			operationID: "beginHABaseBackup",
+		},
+		{
+			name:        "finish standby seed",
+			action:      haPlannedAction{Kind: haActionFinishStandbySeed, StandbyName: "standby-a"},
+			openAPIPath: "/ha/base-backups/finish",
+			operationID: "finishHABaseBackup",
+		},
+		{
+			name:        "bootstrap standby seed",
+			action:      haPlannedAction{Kind: haActionBootstrapStandbySeed, StandbyName: "standby-a"},
+			openAPIPath: "/ha/standby/bootstrap",
+			operationID: "bootstrapHAStandby",
+		},
+		{
+			name:        "acquire fence",
+			action:      haPlannedAction{Kind: haActionAcquireFence, StandbyName: "standby-a"},
+			openAPIPath: "/ha/fence",
+			operationID: "acquireHAFence",
+		},
+		{
+			name:        "promote standby",
+			action:      haPlannedAction{Kind: haActionPromoteStandby, StandbyName: "standby-a"},
+			openAPIPath: "/ha/promotion/current-fence",
+			operationID: "promoteHAWithCurrentFence",
+		},
+		{
+			name:        "demote former primary",
+			action:      haPlannedAction{Kind: haActionDemoteFormerPrimary, StandbyName: "primary-a"},
+			openAPIPath: "/ha/rejoin/assess",
+			operationID: "assessHARejoin",
+		},
+		{
+			name:        "rewind former primary",
+			action:      haPlannedAction{Kind: haActionRewindFormerPrimary, StandbyName: "primary-a"},
+			openAPIPath: "/ha/rejoin/assess",
+			operationID: "assessHARejoin",
+		},
+		{
+			name:        "reseed former primary",
+			action:      haPlannedAction{Kind: haActionReseedFormerPrimary, StandbyName: "primary-a"},
+			openAPIPath: "/ha/rejoin/assess",
+			operationID: "assessHARejoin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			method, path := haAdminOperation(tt.action)
+			if method == "" || path == "" {
+				t.Fatalf("expected typed admin operation for %s", tt.name)
+			}
+			path = strings.Replace(path, "/standby-a", "/{slot_name}", 1)
+			path = strings.TrimPrefix(path, "/admin/v1")
+			if path != tt.openAPIPath {
+				t.Fatalf("expected OpenAPI path %s, got %s", tt.openAPIPath, path)
+			}
+			key := method + " " + path
+			if operations[key] != tt.operationID {
+				t.Fatalf("expected %s to resolve to operationId %s, got %q", key, tt.operationID, operations[key])
+			}
+		})
+	}
+}
+
+func loadAdminOpenAPIOperations(t *testing.T) map[string]string {
+	t.Helper()
+	_, file, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test file path")
+	}
+	specPath := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "..", "..", "..", "specs", "openapi", "antfly", "admin.yaml"))
+	raw, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatalf("read admin OpenAPI spec %s: %v", specPath, err)
+	}
+	var spec struct {
+		Paths map[string]map[string]struct {
+			OperationID string `json:"operationId"`
+		} `json:"paths"`
+	}
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("parse admin OpenAPI spec %s: %v", specPath, err)
+	}
+	operations := map[string]string{}
+	for path, methods := range spec.Paths {
+		for method, operation := range methods {
+			operations[strings.ToUpper(method)+" "+path] = operation.OperationID
+		}
+	}
+	return operations
 }
 
 func TestPlanHALeavesUndesiredSlotPausedUnlessDropIsExplicit(t *testing.T) {
