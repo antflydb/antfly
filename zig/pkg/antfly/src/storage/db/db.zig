@@ -228,12 +228,21 @@ pub const HAAsyncEffectMirror = struct {
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
     sync_policy: ha_primary_mod.SyncPolicy = .{},
+    sync_wait_ctx: ?*anyopaque = null,
+    sync_wait_fn: ?HASyncWaitFn = null,
     last_gate_lsn: ?*std.atomic.Value(u64) = null,
     last_gate_action: ?*std.atomic.Value(u8) = null,
     sync_reject_count: ?*std.atomic.Value(u64) = null,
     sync_wait_count: ?*std.atomic.Value(u64) = null,
     sync_degraded_count: ?*std.atomic.Value(u64) = null,
 };
+
+pub const HASyncWaitFn = *const fn (
+    ctx: *anyopaque,
+    primary: *ha_primary_mod.Primary,
+    target_lsn: u64,
+    policy: ha_primary_mod.SyncPolicy,
+) anyerror!void;
 
 pub const HAAsyncBatchMirror = HAAsyncEffectMirror;
 pub const HAAsyncMetadataMirror = HAAsyncEffectMirror;
@@ -18373,14 +18382,17 @@ fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, pay
 
 fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload: []const u8) !void {
     const mirror = ctx.ha_async_effect_mirror orelse return;
-    lockAtomic(ctx.log_mutex);
-    defer ctx.log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
-        noteHAMirrorFailure(mirror, "derived effect", err);
-        if (haMirrorSyncEnabled(mirror)) return err;
-        return;
+    const lsn = blk: {
+        lockAtomic(ctx.log_mutex);
+        defer ctx.log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
+            noteHAMirrorFailure(mirror, "derived effect", err);
+            if (haMirrorSyncEnabled(mirror)) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
     try evaluateHAMirrorCommitGate(mirror, lsn);
 }
 
@@ -18398,14 +18410,17 @@ fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, req
 
 fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request: types.BatchRequest) !void {
     const mirror = ctx.ha_async_batch_mirror orelse return;
-    lockAtomic(ctx.log_mutex);
-    defer ctx.log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
-        noteHAMirrorFailure(mirror, "batch mutation", err);
-        if (haMirrorSyncEnabled(mirror)) return err;
-        return;
+    const lsn = blk: {
+        lockAtomic(ctx.log_mutex);
+        defer ctx.log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
+            noteHAMirrorFailure(mirror, "batch mutation", err);
+            if (haMirrorSyncEnabled(mirror)) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
     try evaluateHAMirrorCommitGate(mirror, lsn);
 }
 
@@ -18423,14 +18438,17 @@ fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, ta
 
 fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) !void {
     const mirror = ctx.ha_async_metadata_mirror orelse return;
-    lockAtomic(ctx.log_mutex);
-    defer ctx.log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{}) catch |err| {
-        noteHAMirrorFailure(mirror, "metadata mutation", err);
-        if (haMirrorSyncEnabled(mirror)) return err;
-        return;
+    const lsn = blk: {
+        lockAtomic(ctx.log_mutex);
+        defer ctx.log_mutex.*.unlock();
+        const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{}) catch |err| {
+            noteHAMirrorFailure(mirror, "metadata mutation", err);
+            if (haMirrorSyncEnabled(mirror)) return err;
+            return;
+        };
+        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        break :blk lsn;
     };
-    if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
     try evaluateHAMirrorCommitGate(mirror, lsn);
 }
 
@@ -18453,13 +18471,25 @@ fn preflightHAMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror:
 
 fn evaluateHAMirrorCommitGate(mirror: HAAsyncEffectMirror, lsn: u64) !void {
     if (mirror.sync_policy.mode == .async) return;
-    const gate = try ha_commit_gate_mod.evaluate(mirror.primary, lsn, mirror.sync_policy);
+    var gate = try ha_commit_gate_mod.evaluate(mirror.primary, lsn, mirror.sync_policy);
     recordHAMirrorGate(mirror, gate);
     switch (gate.action) {
         .acknowledge => return,
         .acknowledge_degraded => return,
         .reject => return error.SyncPolicyUnsatisfied,
-        .wait_for_standby => return error.HASyncCommitWouldBlock,
+        .wait_for_standby => {
+            const wait_fn = mirror.sync_wait_fn orelse return error.HASyncCommitWouldBlock;
+            const wait_ctx = mirror.sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext;
+            try wait_fn(wait_ctx, mirror.primary, lsn, mirror.sync_policy);
+            gate = try ha_commit_gate_mod.evaluate(mirror.primary, lsn, mirror.sync_policy);
+            recordHAMirrorGate(mirror, gate);
+            switch (gate.action) {
+                .acknowledge => return,
+                .acknowledge_degraded => return,
+                .reject => return error.SyncPolicyUnsatisfied,
+                .wait_for_standby => return error.HASyncCommitWouldBlock,
+            }
+        },
     }
 }
 
@@ -37135,6 +37165,146 @@ test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
     try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
+}
+
+test "storage.ha db block sync policy waits for standby acknowledgement" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 255,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const SyncWait = struct {
+        calls: u64 = 0,
+
+        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_write, policy.mode);
+            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, 0);
+        }
+    };
+
+    var wait_state = SyncWait{};
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:block", .value = "{\"title\":\"block\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    var found = (try db.lookup(alloc, "doc:block", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
+}
+
+test "storage.ha db block sync policy surfaces wait provider errors" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 256,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const SyncWait = struct {
+        calls: u64 = 0,
+
+        fn timeout(ctx: *anyopaque, _: *ha_primary_mod.Primary, _: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.HASyncCommitWaitTimeout;
+        }
+    };
+
+    var wait_state = SyncWait{};
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.timeout,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.HASyncCommitWaitTimeout, db.batch(.{
+        .writes = &.{.{ .key = "doc:timeout", .value = "{\"title\":\"timeout\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 }
 
 test "storage.ha db fail-closed sync policy rejects before local batch commit" {
