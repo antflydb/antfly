@@ -4541,7 +4541,9 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		Mode: antflyv1.HAModeHotStandby,
 		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
-			CurrentTarget: "standby-a",
+			CurrentTarget:   "standby-a",
+			FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration: 7,
 		},
 	}
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
@@ -4552,6 +4554,57 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	publicSvc := &corev1.Service{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
 	g.Expect(publicSvc.Spec.Selector).To(Equal(cluster.Spec.HighAvailability.Standbys[0].RouteSelector))
+	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteTargetAnnotation, "standby-a"))
+	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceAuthorityAnnotation, string(antflyv1.HAFencingAuthorityKubernetesLease)))
+	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteFenceGenerationAnnotation, "7"))
+	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue(haPrimaryRouteSelectorAnnotation, "true"))
+
+	cluster.Status.HAStatus.PrimaryRoute = antflyv1.HAPrimaryRouteStatus{}
+	g.Expect(reconciler.observeHAPrimaryRouteStatus(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.CurrentTarget).To(Equal("standby-a"))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceAuthority).To(Equal(antflyv1.HAFencingAuthorityKubernetesLease))
+	g.Expect(cluster.Status.HAStatus.PrimaryRoute.FenceGeneration).To(Equal(uint64(7)))
+}
+
+func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagementDisabled(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := baseSwarmControllerCluster()
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-swarm-public-api",
+			Namespace: "default",
+			Annotations: map[string]string{
+				haPrimaryRouteTargetAnnotation:          "standby-a",
+				haPrimaryRouteFenceAuthorityAnnotation:  string(antflyv1.HAFencingAuthorityKubernetesLease),
+				haPrimaryRouteFenceGenerationAnnotation: "7",
+				haPrimaryRouteSelectorAnnotation:        "true",
+				"antfly.io/custom":                      "preserve",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				"app.kubernetes.io/component": "standby-a",
+			},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, service).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
+
+	publicSvc := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-swarm-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
+	g.Expect(publicSvc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "swarm"))
+	g.Expect(publicSvc.Annotations).To(HaveKeyWithValue("antfly.io/custom", "preserve"))
+	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteTargetAnnotation))
+	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteFenceAuthorityAnnotation))
+	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteFenceGenerationAnnotation))
+	g.Expect(publicSvc.Annotations).NotTo(HaveKey(haPrimaryRouteSelectorAnnotation))
 }
 
 func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
