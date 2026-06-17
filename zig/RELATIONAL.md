@@ -5410,7 +5410,9 @@ Coverage accounting for DDL sub-modes such as relation lifetime `kind`,
 identity allocator `kind`, comment `kind`, transaction `starter`, advisory-lock
 `action`, and relation-population `mode` likewise reads exact string tokens, so
 suffix-like values such as `kind=table_extra` cannot satisfy a `kind=table`
-coverage requirement.
+coverage requirement. DDL family coverage that is already represented by the
+typed `ddl_tag`, such as `table_clone`, is satisfied from that tag rather than a
+second string search over the fingerprint.
 `EXPLAIN` fixture metadata and coverage use the same exact-token rule for
 `explain:kind`, `analyze`, and option tokens such as `format`, `verbose`, and
 `costs`; malformed option values or suffix-like `kind=write_extra` values cannot

@@ -65115,10 +65115,6 @@ fn appParityExplainPlanHasKind(plan: []const u8, expected: []const u8) bool {
     return appParityPlanHasExactStringToken(plan, "explain:kind=", expected);
 }
 
-fn appParityPlanHasToken(plan: []const u8, token: []const u8) bool {
-    return std.mem.indexOf(u8, plan, token) != null;
-}
-
 fn appParityAppliedPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
     return appParityAppliedPlanIsStructured(plan) and
         appParityPlanHasExactBoolToken(plan, token, expected);
@@ -66083,8 +66079,6 @@ const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
             std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
             appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
-        self.ddl_table_clone = self.ddl_table_clone or (entry.family == .ddl and
-            appParityPlanHasToken(entry.plan, "ddl:table_clone:"));
         self.update_joined_source_row_value_semijoin = self.update_joined_source_row_value_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
             std.mem.indexOf(u8, entry.plan, ":right_pred=0:on=2:") != null);
