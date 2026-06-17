@@ -197,11 +197,11 @@ fn currentSettingRowFilterJsonAlloc(
 ) ![]u8 {
     const auth_metadata_key = authMetadataKeyForSqlSetting(predicate.setting_name);
     if (auth_metadata_key.len == 0) return error.UnsupportedSqlShape;
-    const field_json = try std.json.stringifyAlloc(alloc, predicate.field, .{});
+    const field_json = try std.json.Stringify.valueAlloc(alloc, predicate.field, .{});
     defer alloc.free(field_json);
     const auth_path = try std.fmt.allocPrint(alloc, "metadata.{s}", .{auth_metadata_key});
     defer alloc.free(auth_path);
-    const auth_path_json = try std.json.stringifyAlloc(alloc, auth_path, .{});
+    const auth_path_json = try std.json.Stringify.valueAlloc(alloc, auth_path, .{});
     defer alloc.free(auth_path_json);
     return try std.fmt.allocPrint(alloc, "{{\"term\":{{{s}:{{\"$auth\":{s}}}}}}}", .{ field_json, auth_path_json });
 }
