@@ -9486,6 +9486,8 @@ fn parseRowsQueryRowClaimAlloc(
         if (mode_value != .string) return error.InvalidRowsRequest;
         if (std.mem.eql(u8, mode_value.string, "for_update")) break :blk db_mod.types.RowClaimMode.for_update;
         if (std.mem.eql(u8, mode_value.string, "for_no_key_update")) break :blk db_mod.types.RowClaimMode.for_no_key_update;
+        if (std.mem.eql(u8, mode_value.string, "for_share")) break :blk db_mod.types.RowClaimMode.for_share;
+        if (std.mem.eql(u8, mode_value.string, "for_key_share")) break :blk db_mod.types.RowClaimMode.for_key_share;
         return error.InvalidRowsRequest;
     } else db_mod.types.RowClaimMode.for_update;
 
@@ -21374,6 +21376,26 @@ test "relational rows api query contract parses typed row claim request" {
     try std.testing.expectEqual(db_mod.types.RowClaimMode.for_no_key_update, no_key_update_request.row_claim.?.mode);
     try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, no_key_update_request.row_claim.?.wait_policy);
     try std.testing.expect(no_key_update_request.row_claim.?.effectiveSkipLocked());
+
+    var share_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"row_claim\":{\"mode\":\"for_share\",\"wait_policy\":\"wait\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        schema,
+    );
+    defer share_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_share, share_request.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, share_request.row_claim.?.wait_policy);
+    try std.testing.expect(!share_request.row_claim.?.effectiveSkipLocked());
+
+    var key_share_request = try parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"row_claim\":{\"mode\":\"for_key_share\",\"wait_policy\":\"nowait\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        schema,
+    );
+    defer key_share_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_key_share, key_share_request.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, key_share_request.row_claim.?.wait_policy);
+    try std.testing.expect(!key_share_request.row_claim.?.effectiveSkipLocked());
 
     var nowait_request = try parseRowsQueryRequest(
         std.testing.allocator,

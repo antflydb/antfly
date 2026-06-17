@@ -7066,7 +7066,7 @@ pub const DB = struct {
         row_keys: []const []const u8,
         claim: types.RowClaimRequest,
     ) !void {
-        if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+        if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
         if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
         if (row_keys.len == 0) return;
 
@@ -18991,7 +18991,7 @@ pub const DB = struct {
         if (relationalRowsQueryHasDistinctOn(req) and req.row_claim != null) return error.UnsupportedQueryRequest;
         if (req.row_claim) |claim| {
             if (claim.txn_id == null) return error.InvalidQueryRequest;
-            if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+            if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
         }
         try validateRelationalRowsQueryProjectionOutputs(req);
     }
@@ -21432,7 +21432,7 @@ pub const DB = struct {
         limit: ?u32,
     ) !u32 {
         const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-        if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+        if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
 
         if (!claim.effectiveSkipLocked()) {
             var row_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -26994,7 +26994,7 @@ pub const DB = struct {
     ) anyerror!types.SearchResult {
         const claim = req.row_claim orelse return error.InvalidQueryRequest;
         const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-        if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+        if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
         if (req.count_only) return error.UnsupportedQueryRequest;
         if (req.return_mode != .parent) return error.UnsupportedQueryRequest;
         if (req.graph_queries.len > 0) return error.UnsupportedQueryRequest;
@@ -30543,6 +30543,8 @@ fn rowClaimIntentValueAlloc(
         .mode = switch (claim.mode) {
             .for_update => "for_update",
             .for_no_key_update => "for_no_key_update",
+            .for_share => "for_share",
+            .for_key_share => "for_key_share",
         },
         .wait_policy = switch (claim.effectiveWaitPolicy()) {
             .wait => "wait",

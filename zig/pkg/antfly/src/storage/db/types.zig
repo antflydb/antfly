@@ -2535,10 +2535,23 @@ pub const ReturnMode = enum {
 pub const RowClaimMode = enum {
     for_update,
     for_no_key_update,
+    for_share,
+    for_key_share,
 
     pub fn isExclusiveWriteClaim(self: @This()) bool {
         return switch (self) {
             .for_update, .for_no_key_update => true,
+            .for_share, .for_key_share => false,
+        };
+    }
+
+    pub fn usesDurableIntent(self: @This()) bool {
+        return switch (self) {
+            .for_update,
+            .for_no_key_update,
+            .for_share,
+            .for_key_share,
+            => true,
         };
     }
 };

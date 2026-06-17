@@ -14316,7 +14316,7 @@ const Parser = struct {
         while (!self.atEnd()) {
             if (self.matchKeyword("for")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
-                setSqlRowClaimClause(&target_query.row_claim.?, try self.parseForRowClaimClause(&target_qualifiers));
+                setSqlRowClaimClause(&target_query.row_claim.?, try self.parseExclusiveForRowClaimClause(&target_qualifiers));
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
@@ -14475,7 +14475,7 @@ const Parser = struct {
         while (!self.atEnd()) {
             if (self.matchKeyword("for")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
-                setSqlRowClaimClause(&target_query.row_claim.?, try self.parseForRowClaimClause(&target_qualifiers));
+                setSqlRowClaimClause(&target_query.row_claim.?, try self.parseExclusiveForRowClaimClause(&target_qualifiers));
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
@@ -14614,7 +14614,7 @@ const Parser = struct {
         while (!self.atEnd()) {
             if (self.matchKeyword("for")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
-                setSqlRowClaimClause(&target_query.row_claim.?, try self.parseForRowClaimClause(&target_qualifiers));
+                setSqlRowClaimClause(&target_query.row_claim.?, try self.parseExclusiveForRowClaimClause(&target_qualifiers));
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
@@ -15423,7 +15423,7 @@ const Parser = struct {
                 limit = try self.parseFetchLimitValue();
             } else if (self.matchKeyword("for")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
-                setSqlRowClaimClause(&row_claim, try self.parseForRowClaimClause(returning_qualifiers));
+                setSqlRowClaimClause(&row_claim, try self.parseExclusiveForRowClaimClause(returning_qualifiers));
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
@@ -15689,7 +15689,7 @@ const Parser = struct {
                 limit = try self.parseFetchLimitValue();
             } else if (self.matchKeyword("for")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
-                setSqlRowClaimClause(&row_claim, try self.parseForRowClaimClause(returning_qualifiers));
+                setSqlRowClaimClause(&row_claim, try self.parseExclusiveForRowClaimClause(returning_qualifiers));
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
@@ -31690,6 +31690,11 @@ const Parser = struct {
             try self.expectKeyword("key");
             try self.expectKeyword("update");
             break :blk .for_no_key_update;
+        } else if (self.matchKeyword("key")) blk: {
+            try self.expectKeyword("share");
+            break :blk .for_key_share;
+        } else if (self.matchKeyword("share")) blk: {
+            break :blk .for_share;
         } else blk: {
             try self.expectKeyword("update");
             break :blk .for_update;
@@ -31710,6 +31715,12 @@ const Parser = struct {
             return .{ .mode = mode, .wait_policy = .nowait };
         }
         return .{ .mode = mode, .wait_policy = .wait };
+    }
+
+    fn parseExclusiveForRowClaimClause(self: *@This(), allowed_targets: []const []const u8) !SqlRowClaimClause {
+        const clause = try self.parseForRowClaimClause(allowed_targets);
+        if (!clause.mode.isExclusiveWriteClaim()) return error.UnsupportedSqlShape;
+        return clause;
     }
 
     fn rowClaimTargetAllowed(self: *@This(), target: []const u8, allowed_targets: []const []const u8) bool {
@@ -49492,6 +49503,32 @@ test "postgres sql adapter lowers application queue select into row claim query"
     try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, no_key_update_claim.query.row_claim.?.effectiveWaitPolicy());
     try std.testing.expect(no_key_update_claim.query.row_claim.?.skip_locked);
 
+    var share_claim = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records AS u WHERE status = 'queued' FOR SHARE OF u NOWAIT",
+        schema,
+        &.{},
+    );
+    defer share_claim.deinit(alloc);
+    try std.testing.expect(share_claim.query.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_share, share_claim.query.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, share_claim.query.row_claim.?.wait_policy);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, share_claim.query.row_claim.?.effectiveWaitPolicy());
+    try std.testing.expect(!share_claim.query.row_claim.?.skip_locked);
+
+    var key_share_claim = try lowerSelectAlloc(
+        alloc,
+        "SELECT id FROM usage_records AS u WHERE status = 'queued' FOR KEY SHARE OF u SKIP LOCKED",
+        schema,
+        &.{},
+    );
+    defer key_share_claim.deinit(alloc);
+    try std.testing.expect(key_share_claim.query.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_key_share, key_share_claim.query.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, key_share_claim.query.row_claim.?.wait_policy);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, key_share_claim.query.row_claim.?.effectiveWaitPolicy());
+    try std.testing.expect(key_share_claim.query.row_claim.?.skip_locked);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
         alloc,
         "SELECT id FROM usage_records AS u WHERE status = 'queued' FOR UPDATE OF archived_records",
@@ -58021,6 +58058,8 @@ fn sqlRowClaimModeName(mode: db_mod.types.RowClaimMode) []const u8 {
     return switch (mode) {
         .for_update => "for_update",
         .for_no_key_update => "for_no_key_update",
+        .for_share => "for_share",
+        .for_key_share => "for_key_share",
     };
 }
 
@@ -58043,6 +58082,16 @@ fn sqlRowClaimFingerprintName(claim: db_mod.types.RowClaimRequest) []const u8 {
             .wait => "no_key_update",
             .nowait => "no_key_update_nowait",
             .skip_locked => "no_key_update_skip_locked",
+        },
+        .for_share => switch (claim.effectiveWaitPolicy()) {
+            .wait => "share",
+            .nowait => "share_nowait",
+            .skip_locked => "share_skip_locked",
+        },
+        .for_key_share => switch (claim.effectiveWaitPolicy()) {
+            .wait => "key_share",
+            .nowait => "key_share_nowait",
+            .skip_locked => "key_share_skip_locked",
         },
     };
 }
@@ -65987,8 +66036,8 @@ const AppParityCorpusCoverage = struct {
     unsupported_read_set_operation_intersect: bool = false,
     unsupported_read_set_operation_except: bool = false,
     read_row_lock_nowait: bool = false,
-    unsupported_read_row_lock_share: bool = false,
-    unsupported_read_row_lock_key_share: bool = false,
+    read_row_lock_share: bool = false,
+    read_row_lock_key_share: bool = false,
     query_row_lock_no_key_update: bool = false,
     merge_mutation_typed_plan: bool = false,
     merge_mutation_default_expressions: bool = false,
@@ -67042,12 +67091,6 @@ const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_except = self.unsupported_read_set_operation_except or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
                     std.mem.indexOf(u8, entry.sql, " EXCEPT ") != null);
-            self.unsupported_read_row_lock_share = self.unsupported_read_row_lock_share or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR SHARE") != null);
-            self.unsupported_read_row_lock_key_share = self.unsupported_read_row_lock_key_share or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR KEY SHARE") != null);
             self.unsupported_read_row_lock_target = self.unsupported_read_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
@@ -67350,7 +67393,13 @@ const AppParityCorpusCoverage = struct {
             entry.family == .query and appParityPlanHasNonZeroToken(entry.plan, ":access_not=");
         self.read_row_lock_nowait = self.read_row_lock_nowait or
             (entry.family == .query and
-                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "nowait", "no_key_update_nowait" }));
+                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "nowait", "no_key_update_nowait", "share_nowait", "key_share_nowait" }));
+        self.read_row_lock_share = self.read_row_lock_share or
+            (entry.family == .query and
+                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "share", "share_nowait", "share_skip_locked" }));
+        self.read_row_lock_key_share = self.read_row_lock_key_share or
+            (entry.family == .query and
+                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "key_share", "key_share_nowait", "key_share_skip_locked" }));
         self.query_row_lock_no_key_update = self.query_row_lock_no_key_update or
             (entry.family == .query and
                 appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
@@ -67982,8 +68031,8 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
         try std.testing.expect(self.read_row_lock_nowait);
-        try std.testing.expect(self.unsupported_read_row_lock_share);
-        try std.testing.expect(self.unsupported_read_row_lock_key_share);
+        try std.testing.expect(self.read_row_lock_share);
+        try std.testing.expect(self.read_row_lock_key_share);
         try std.testing.expect(self.query_row_lock_no_key_update);
         try std.testing.expect(self.merge_mutation_typed_plan);
         try std.testing.expect(self.merge_mutation_default_expressions);
@@ -73476,17 +73525,17 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SELECT id FROM usage_records WHERE status = 'queued' FOR UPDATE NOWAIT",
         },
         .{
-            .name = "unsupported read share row lock mode",
-            .family = .unsupported_read,
-            .plan = "unsupported:read:requires=row_lock_mode_plan",
-            .classification_reason = "row_lock_mode_plan",
+            .name = "read share row lock query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=share",
             .sql = "SELECT id FROM usage_records WHERE status = 'queued' FOR SHARE",
         },
         .{
-            .name = "unsupported read key share row lock mode",
-            .family = .unsupported_read,
-            .plan = "unsupported:read:requires=row_lock_mode_plan",
-            .classification_reason = "row_lock_mode_plan",
+            .name = "read key share row lock query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
+            .plan = "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=key_share",
             .sql = "SELECT id FROM usage_records WHERE status = 'queued' FOR KEY SHARE",
         },
         .{

@@ -1764,6 +1764,10 @@ fn parseRowClaimRequestAlloc(
         .for_update
     else if (std.mem.eql(u8, mode_value.string, "for_no_key_update"))
         .for_no_key_update
+    else if (std.mem.eql(u8, mode_value.string, "for_share"))
+        .for_share
+    else if (std.mem.eql(u8, mode_value.string, "for_key_share"))
+        .for_key_share
     else
         return error.InvalidQueryRequest;
 
@@ -7031,6 +7035,24 @@ test "api query contract parses typed row claim request" {
     const wait_policy_claim = wait_policy_skip_locked.req.row_claim orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.skip_locked, wait_policy_claim.wait_policy);
     try std.testing.expect(wait_policy_claim.skip_locked);
+
+    var share_claim_request = try parseQueryRequest(alloc, null, "jobs",
+        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_share","wait_policy":"wait","lease_ms":30000,"owner_id":"session:4","transaction_id":"00112233445566778899aabbccddeeff"},"limit":5}
+    );
+    defer share_claim_request.deinit(alloc);
+    const share_claim = share_claim_request.req.row_claim orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_share, share_claim.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, share_claim.wait_policy);
+    try std.testing.expect(!share_claim.skip_locked);
+
+    var key_share_claim_request = try parseQueryRequest(alloc, null, "jobs",
+        \\{"full_text_search":{"match_all":{}},"claim":{"mode":"for_key_share","wait_policy":"nowait","lease_ms":30000,"owner_id":"session:5","transaction_id":"00112233445566778899aabbccddeeff"},"limit":5}
+    );
+    defer key_share_claim_request.deinit(alloc);
+    const key_share_claim = key_share_claim_request.req.row_claim orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_key_share, key_share_claim.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, key_share_claim.wait_policy);
+    try std.testing.expect(!key_share_claim.skip_locked);
 
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "jobs",
         \\{"claim":{"mode":"for_update","owner_id":"","transaction_id":"00112233445566778899aabbccddeeff"}}
