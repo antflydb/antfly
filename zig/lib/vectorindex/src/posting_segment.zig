@@ -1868,13 +1868,12 @@ pub fn readSegmentDeltaRecordsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
     var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
     errdefer records.deinit(alloc);
 
-    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-    while (index < entry.meta.entry_count) : (index += 1) {
-        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
-        if (found.posting_id != posting_id or found.kind != .delta) break;
+    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data, posting_id)) orelse return try records.toOwnedSlice(alloc);
+    defer range.deinit(alloc);
 
-        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
-        defer alloc.free(value);
+    var index = range.first_index;
+    while (index < range.past_index) : (index += 1) {
+        const value = try deltaValueFromRange(index_data, range, index);
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         if (min_generation) |generation| {
             while (try iterator.next()) |record| {
@@ -1903,14 +1902,13 @@ pub fn readSegmentDeltaRecordsWithStatsAlloc(
     const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
     defer alloc.free(index_data);
 
-    const base_generation = min_generation orelse 0;
-    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-    while (index < entry.meta.entry_count) : (index += 1) {
-        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
-        if (found.posting_id != posting_id or found.kind != .delta) break;
+    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data, posting_id)) orelse return;
+    defer range.deinit(alloc);
 
-        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
-        defer alloc.free(value);
+    const base_generation = min_generation orelse 0;
+    var index = range.first_index;
+    while (index < range.past_index) : (index += 1) {
+        const value = try deltaValueFromRange(index_data, range, index);
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         stats.records += iterator.recordCount();
         stats.encoded_value_bytes += value.len;
@@ -1937,13 +1935,12 @@ pub fn readSegmentDeltaRecordsIntoScratchWithStatsAlloc(
     const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
     defer alloc.free(index_data);
 
-    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-    while (index < entry.meta.entry_count) : (index += 1) {
-        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
-        if (found.posting_id != posting_id or found.kind != .delta) break;
+    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data, posting_id)) orelse return;
+    defer range.deinit(alloc);
 
-        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
-        defer alloc.free(value);
+    var index = range.first_index;
+    while (index < range.past_index) : (index += 1) {
+        const value = try deltaValueFromRange(index_data, range, index);
         var iterator = try posting.PostingFormat.DeltaTailIterator.init(value);
         stats.records += iterator.recordCount();
         stats.encoded_value_bytes += value.len;
@@ -1962,13 +1959,12 @@ pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.
     defer alloc.free(index_data);
 
     var out = posting.PostingDeltaTailStats{};
-    var index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
-    while (index < entry.meta.entry_count) : (index += 1) {
-        const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
-        if (found.posting_id != posting_id or found.kind != .delta) break;
+    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data, posting_id)) orelse return out;
+    defer range.deinit(alloc);
 
-        const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
-        defer alloc.free(value);
+    var index = range.first_index;
+    while (index < range.past_index) : (index += 1) {
+        const value = try deltaValueFromRange(index_data, range, index);
         const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(value, base_generation);
         out.records += stats.records;
         out.records_after_generation += stats.records_after_generation;
@@ -2269,6 +2265,17 @@ const IndexEntry = struct {
 
     fn value(self: IndexEntry, data: []const u8) ![]const u8 {
         return try self.location().value(data);
+    }
+};
+
+const OwnedDeltaValueRange = struct {
+    data: []u8,
+    base_offset: usize,
+    first_index: usize,
+    past_index: usize,
+
+    fn deinit(self: OwnedDeltaValueRange, alloc: Allocator) void {
+        alloc.free(self.data);
     }
 };
 
@@ -3165,6 +3172,54 @@ fn readSegmentEntryValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, ent
 
     const value = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(found.offset), found.len);
     errdefer alloc.free(value);
+    try found.location().verifyValue(value);
+    return value;
+}
+
+fn readSegmentDeltaValueRangeAlloc(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    entry: ManifestEntry,
+    index_data: []const u8,
+    posting_id: PostingId,
+) !?OwnedDeltaValueRange {
+    const first_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, .delta, 0);
+    if (first_index >= entry.meta.entry_count) return null;
+
+    const first_entry = try indexEntryFromBytes(index_data[first_index * index_entry_size ..][0..index_entry_size]);
+    if (first_entry.posting_id != posting_id or first_entry.kind != .delta) return null;
+
+    var range_offset = first_entry.offset;
+    var range_end = std.math.add(usize, first_entry.offset, first_entry.len) catch return error.CorruptedPostingSegment;
+    if (first_entry.offset > entry.meta.index_offset or range_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+
+    var past_index = first_index + 1;
+    while (past_index < entry.meta.entry_count) : (past_index += 1) {
+        const found = try indexEntryFromBytes(index_data[past_index * index_entry_size ..][0..index_entry_size]);
+        if (found.posting_id != posting_id or found.kind != .delta) break;
+        const value_end = std.math.add(usize, found.offset, found.len) catch return error.CorruptedPostingSegment;
+        if (found.offset > entry.meta.index_offset or value_end > entry.meta.index_offset) return error.CorruptedPostingSegment;
+        range_offset = @min(range_offset, found.offset);
+        range_end = @max(range_end, value_end);
+    }
+
+    const range_len = range_end - range_offset;
+    const data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(range_offset), range_len);
+    return .{
+        .data = data,
+        .base_offset = range_offset,
+        .first_index = first_index,
+        .past_index = past_index,
+    };
+}
+
+fn deltaValueFromRange(index_data: []const u8, range: OwnedDeltaValueRange, index: usize) ![]const u8 {
+    const found = try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+    const relative_offset = std.math.sub(usize, found.offset, range.base_offset) catch return error.CorruptedPostingSegment;
+    const relative_end = std.math.add(usize, relative_offset, found.len) catch return error.CorruptedPostingSegment;
+    if (relative_end > range.data.len) return error.CorruptedPostingSegment;
+    const value = range.data[relative_offset..relative_end];
     try found.location().verifyValue(value);
     return value;
 }
