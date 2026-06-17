@@ -65235,11 +65235,17 @@ test "app parity ddl boolean coverage tokens are exact" {
         .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=10",
         .sql = "TRUNCATE usage_records RESTART IDENTITY",
     });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records_extra:source_pred=0:source_order=0:source_limit=-1:claim=locked",
+        .sql = "TRUNCATE usage_records CONTINUE IDENTITY",
+    });
 
     try std.testing.expect(!coverage.ddl_replace_table);
     try std.testing.expect(!coverage.ddl_function_replace);
     try std.testing.expect(!coverage.ddl_drop_table_cascade);
     try std.testing.expect(!coverage.truncate_restart_identity);
+    try std.testing.expect(!coverage.truncate_continue_identity);
 
     try coverage.observe(std.testing.allocator, .{
         .family = .ddl,
@@ -65261,11 +65267,17 @@ test "app parity ddl boolean coverage tokens are exact" {
         .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=1",
         .sql = "TRUNCATE usage_records RESTART IDENTITY",
     });
+    try coverage.observe(std.testing.allocator, .{
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked",
+        .sql = "TRUNCATE usage_records CONTINUE IDENTITY",
+    });
 
     try std.testing.expect(coverage.ddl_replace_table);
     try std.testing.expect(coverage.ddl_function_replace);
     try std.testing.expect(coverage.ddl_drop_table_cascade);
     try std.testing.expect(coverage.truncate_restart_identity);
+    try std.testing.expect(coverage.truncate_continue_identity);
 }
 
 test "app parity count coverage tokens are exact" {
@@ -66884,7 +66896,7 @@ const AppParityCorpusCoverage = struct {
         } else if (entry.family == .truncate_source) {
             self.truncate_continue_identity = self.truncate_continue_identity or
                 (std.mem.indexOf(u8, entry.sql, "CONTINUE IDENTITY") != null and
-                    std.mem.indexOf(u8, entry.plan, "truncate_source:table=usage_records") != null);
+                    appParityPlanHasExactStringToken(entry.plan, "truncate_source:table=", "usage_records"));
             self.truncate_restart_identity = self.truncate_restart_identity or
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
                     appParityPlanHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
