@@ -61752,7 +61752,11 @@ fn appParityFixtureJsonAlloc(
     var entries_out: std.Io.Writer.Allocating = .init(alloc);
     errdefer entries_out.deinit();
     const entries_writer = &entries_out.writer;
+    var skipped_out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer skipped_out.deinit();
+    const skipped_writer = &skipped_out.writer;
     var written_entries: usize = 0;
+    var skipped_entries: usize = 0;
     for (corpus) |entry| {
         var derived_applied_plan: ?[]u8 = null;
         defer if (derived_applied_plan) |applied_plan| alloc.free(applied_plan);
@@ -61760,7 +61764,13 @@ fn appParityFixtureJsonAlloc(
             entry.applied_plan
         else if (try appParityDdlFixtureRequiresAppliedPlan(entry)) applied: {
             derived_applied_plan = appParityAppliedDdlPlanAlloc(alloc, schema_json, entry) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => continue,
+                error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
+                    if (skipped_entries > 0) try skipped_writer.writeByte(',');
+                    skipped_entries += 1;
+                    try skipped_writer.writeAll("\n    ");
+                    try skipped_writer.print("{f}", .{std.json.fmt(entry.name, .{})});
+                    continue;
+                },
                 else => return err,
             };
             break :applied derived_applied_plan.?;
@@ -61788,13 +61798,20 @@ fn appParityFixtureJsonAlloc(
     }
     const entries_json = try entries_out.toOwnedSlice();
     defer alloc.free(entries_json);
+    const skipped_json = try skipped_out.toOwnedSlice();
+    defer alloc.free(skipped_json);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.print(
-        "{{\n  \"fixture_format\": {},\n  \"entry_count\": {},\n  \"schema_json\": {f},\n  \"entries\": [",
-        .{ app_parity_fixture_format, written_entries, std.json.fmt(schema_json, .{}) },
+        "{{\n  \"fixture_format\": {},\n  \"source_entry_count\": {},\n  \"entry_count\": {},\n  \"skipped_entries\": [",
+        .{ app_parity_fixture_format, corpus.len, written_entries },
+    );
+    try writer.writeAll(skipped_json);
+    try writer.print(
+        "\n  ],\n  \"schema_json\": {f},\n  \"entries\": [",
+        .{std.json.fmt(schema_json, .{})},
     );
     try writer.writeAll(entries_json);
     try writer.writeAll("\n  ]\n}\n");
@@ -74618,10 +74635,13 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     defer parsed_fixture.deinit();
 
     const root = try appParityJsonObject(parsed_fixture.value);
-    try appParityRequireOnlyKeys(root, &.{ "fixture_format", "entry_count", "schema_json", "entries" });
+    try appParityRequireOnlyKeys(root, &.{ "fixture_format", "source_entry_count", "entry_count", "skipped_entries", "schema_json", "entries" });
     const fixture_format = try appParityJsonOptionalU64(root, "fixture_format", 0);
     if (fixture_format != app_parity_fixture_format) return error.TestUnexpectedResult;
+    const source_entry_count = try appParityJsonOptionalUsize(root, "source_entry_count") orelse return error.TestUnexpectedResult;
     const expected_entry_count = try appParityJsonOptionalUsize(root, "entry_count") orelse return error.TestUnexpectedResult;
+    const skipped_entries = try parseAppParityFixtureStringListAlloc(alloc, root, "skipped_entries");
+    defer alloc.free(skipped_entries);
     const schema_json = try appParityJsonString(root.get("schema_json") orelse return error.TestUnexpectedResult);
     const entries_value = root.get("entries") orelse return error.TestUnexpectedResult;
     const entries = switch (entries_value) {
@@ -74630,6 +74650,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     };
     try std.testing.expect(entries.items.len > 0);
     try std.testing.expectEqual(expected_entry_count, entries.items.len);
+    try std.testing.expectEqual(source_entry_count, entries.items.len + skipped_entries.len);
 
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -74648,12 +74669,19 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     };
     var seen_names = std.StringHashMapUnmanaged(void){};
     defer seen_names.deinit(alloc);
+    var seen_skipped_names = std.StringHashMapUnmanaged(void){};
+    defer seen_skipped_names.deinit(alloc);
+    for (skipped_entries) |name| {
+        if (name.len == 0 or seen_skipped_names.contains(name)) return error.TestUnexpectedResult;
+        try seen_skipped_names.put(alloc, name, {});
+    }
     var coverage = AppParityCorpusCoverage{};
 
     for (entries.items) |entry_value| {
         const entry = try parseAppParityFixtureEntryAlloc(alloc, entry_value);
         defer freeAppParityFixtureEntry(alloc, entry);
         errdefer std.debug.print("fixture parity corpus entry failed: {s}\n", .{entry.name});
+        if (seen_skipped_names.contains(entry.name)) return error.TestUnexpectedResult;
         try validateAppParityFixtureMetadataWithBaseSchema(entry, schema_json, &seen_names, alloc);
         try coverage.observe(alloc, entry);
         try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
