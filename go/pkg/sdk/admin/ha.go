@@ -565,6 +565,12 @@ func ValidateHAFenceResponse(response HAFenceResponse) error {
 	if !HAFenceReceiptComplete(response.Receipt) {
 		return fmt.Errorf("missing fence response receipt fields")
 	}
+	if err := validateHAFenceReceiptConsistency(response.Receipt); err != nil {
+		return err
+	}
+	if err := validateHAFenceActionCorrelation(response.Action, response.Receipt); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -587,10 +593,43 @@ func ValidateHACurrentFenceResponse(response HACurrentFenceResponse) error {
 		if !HAFenceReceiptComplete(response.Receipt) {
 			return fmt.Errorf("missing current fence receipt fields")
 		}
+		if err := validateHAFenceReceiptConsistency(response.Receipt); err != nil {
+			return err
+		}
 		return nil
 	}
 	if !HAFenceReceiptEmpty(response.Receipt) {
 		return fmt.Errorf("current fence response has receipt while not held")
+	}
+	return nil
+}
+
+func validateHAFenceActionCorrelation(action HAActionReceipt, receipt HAFenceReceipt) error {
+	promoted := strings.TrimSpace(receipt.PromotedNodeId)
+	if action.ActionKind != HAActionKindFenceAcquire {
+		return fmt.Errorf("fence response action kind mismatch")
+	}
+	if action.State != HAActionStateApplied && action.State != HAActionStateAlreadyApplied {
+		return fmt.Errorf("fence response action state mismatch")
+	}
+	if strings.TrimSpace(action.Target) != promoted || strings.TrimSpace(action.NodeId) != promoted {
+		return fmt.Errorf("fence response action node mismatch")
+	}
+	if strings.TrimSpace(action.ActionId) != strings.TrimSpace(string(action.ActionKind))+":"+promoted {
+		return fmt.Errorf("fence response action id does not match action kind and target")
+	}
+	return nil
+}
+
+func validateHAFenceReceiptConsistency(receipt HAFenceReceipt) error {
+	if receipt.Identity.TimelineId != receipt.NewTimelineId || receipt.Identity.Epoch != receipt.NewEpoch {
+		return fmt.Errorf("fence receipt identity does not match promoted timeline")
+	}
+	if receipt.NewTimelineId <= receipt.ParentTimelineId || receipt.NewEpoch <= receipt.ParentEpoch {
+		return fmt.Errorf("fence receipt new identity does not advance")
+	}
+	if receipt.ObservedLsn < receipt.RequiredLsn {
+		return fmt.Errorf("fence receipt observed_lsn is below required_lsn")
 	}
 	return nil
 }

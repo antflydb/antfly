@@ -769,8 +769,8 @@ func TestValidateHAFenceResponse(t *testing.T) {
 			ClusterId:  1,
 			ShardId:    2,
 			TableId:    3,
-			TimelineId: 4,
-			Epoch:      5,
+			TimelineId: 6,
+			Epoch:      7,
 		},
 		OldPrimaryId:     "primary-a",
 		PromotedNodeId:   "standby-a",
@@ -799,6 +799,21 @@ func TestValidateHAFenceResponse(t *testing.T) {
 	if err := ValidateHAFenceResponse(response); err != nil {
 		t.Fatalf("ValidateHAFenceResponse returned error: %v", err)
 	}
+	wrongActionNode := response
+	wrongActionNode.Action.NodeId = "standby-b"
+	if err := ValidateHAFenceResponse(wrongActionNode); err == nil || !strings.Contains(err.Error(), "action node mismatch") {
+		t.Fatalf("wrong fence action node error = %v, want action node mismatch", err)
+	}
+	wrongIdentity := response
+	wrongIdentity.Receipt.Identity.TimelineId = 5
+	if err := ValidateHAFenceResponse(wrongIdentity); err == nil || !strings.Contains(err.Error(), "promoted timeline") {
+		t.Fatalf("wrong fence identity error = %v, want promoted timeline mismatch", err)
+	}
+	staleObserved := response
+	staleObserved.Receipt.ObservedLsn = 7
+	if err := ValidateHAFenceResponse(staleObserved); err == nil || !strings.Contains(err.Error(), "observed_lsn") {
+		t.Fatalf("stale fence observed_lsn error = %v, want observed_lsn mismatch", err)
+	}
 	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
 		SchemaVersion: 1,
 		Held:          false,
@@ -824,6 +839,16 @@ func TestValidateHAFenceResponse(t *testing.T) {
 		Receipt:       receipt,
 	}); err == nil || !strings.Contains(err.Error(), "not held") {
 		t.Fatalf("unexpected current fence receipt error = %v, want not held error", err)
+	}
+	currentWithBadReceipt := receipt
+	currentWithBadReceipt.NewEpoch = currentWithBadReceipt.ParentEpoch
+	currentWithBadReceipt.Identity.Epoch = currentWithBadReceipt.NewEpoch
+	if err := ValidateHACurrentFenceResponse(HACurrentFenceResponse{
+		SchemaVersion: 1,
+		Held:          true,
+		Receipt:       currentWithBadReceipt,
+	}); err == nil || !strings.Contains(err.Error(), "does not advance") {
+		t.Fatalf("bad current fence receipt error = %v, want advance error", err)
 	}
 	response.Receipt.Token = ""
 	if err := ValidateHAFenceResponse(response); err == nil || !strings.Contains(err.Error(), "receipt fields") {
