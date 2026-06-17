@@ -2469,28 +2469,28 @@ pub const Writer = struct {
         var out = std.ArrayListUnmanaged(u8).empty;
         errdefer out.deinit(self.alloc);
         try out.ensureTotalCapacity(self.alloc, try encodedSegmentSizeForPendingEntries(self.entries.items));
-        var index_entries = try std.ArrayListUnmanaged(IndexEntry).initCapacity(self.alloc, self.entries.items.len);
-        defer index_entries.deinit(self.alloc);
 
         for (self.entries.items) |entry| {
-            const offset = out.items.len;
             try out.appendSlice(self.alloc, entry.value);
-            index_entries.appendAssumeCapacity(.{
-                .posting_id = entry.posting_id,
-                .kind = entry.kind,
-                .sequence = entry.sequence,
-                .offset = offset,
-                .len = entry.value.len,
-                .value_checksum = valueChecksum(entry.value),
-            });
         }
 
         const index_offset = out.items.len;
-        for (index_entries.items) |entry| try appendIndexEntry(self.alloc, &out, entry);
+        var value_offset: usize = 0;
+        for (self.entries.items) |entry| {
+            try appendIndexEntry(self.alloc, &out, .{
+                .posting_id = entry.posting_id,
+                .kind = entry.kind,
+                .sequence = entry.sequence,
+                .offset = value_offset,
+                .len = entry.value.len,
+                .value_checksum = valueChecksum(entry.value),
+            });
+            value_offset += entry.value.len;
+        }
         const index_end = out.items.len;
         const stored_index_checksum = indexChecksum(out.items[index_offset..index_end]);
         try appendU64(self.alloc, &out, @intCast(index_offset));
-        try appendU64(self.alloc, &out, @intCast(index_entries.items.len));
+        try appendU64(self.alloc, &out, @intCast(self.entries.items.len));
         try appendU32(self.alloc, &out, stored_index_checksum);
         try appendU32(self.alloc, &out, segmentChecksum(out.items));
         try appendU16(self.alloc, &out, version);
