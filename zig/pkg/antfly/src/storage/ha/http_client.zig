@@ -1026,6 +1026,17 @@ fn validateRejoinResponse(
     if (!std.mem.eql(u8, response.action.state, expected_state)) {
         return error.AdminRejoinResponseMismatch;
     }
+    if (response.action.node_id.len == 0) {
+        return error.AdminRejoinResponseMismatch;
+    }
+    switch (expected) {
+        .assess, .rewind => {
+            if (!std.mem.eql(u8, response.action.node_id, request.node_id)) {
+                return error.AdminRejoinResponseMismatch;
+            }
+        },
+        .reseed => {},
+    }
 
     const assessment = response.assessment;
     if (!std.mem.eql(u8, assessment.former_node_id, request.node_id)) {
@@ -1822,21 +1833,59 @@ test "storage.ha http client round trips typed safety operations" {
 
 test "storage.ha http client rejects mismatched rejoin admin responses" {
     const alloc = std.testing.allocator;
-    var executor = StaticJsonExecutor{
-        .body =
-        \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":99,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true}}
-        ,
-    };
-    var client = Client.init(alloc, executor.executor());
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-a"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":99,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
 
-    try std.testing.expectError(error.AdminRejoinResponseMismatch, client.assessRejoin("http://ha-admin.test", .{
-        .node_id = "primary-a",
-        .identity = testAdminIdentity(),
-        .last_lsn = 2,
-        .retained_from_lsn = 0,
-        .allow_rewind_after_forced_promotion = false,
-        .receipt = testFenceReceipt(),
-    }));
+        try std.testing.expectError(error.AdminRejoinResponseMismatch, client.assessRejoin("http://ha-admin.test", .{
+            .node_id = "primary-a",
+            .identity = testAdminIdentity(),
+            .last_lsn = 2,
+            .retained_from_lsn = 0,
+            .allow_rewind_after_forced_promotion = false,
+            .receipt = testFenceReceipt(),
+        }));
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"rejoin_assess:primary-a","action_kind":"rejoin_assess","target":"primary-a","state":"assessed","node_id":"primary-b"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":1,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+
+        try std.testing.expectError(error.AdminRejoinResponseMismatch, client.assessRejoin("http://ha-admin.test", .{
+            .node_id = "primary-a",
+            .identity = testAdminIdentity(),
+            .last_lsn = 2,
+            .retained_from_lsn = 0,
+            .allow_rewind_after_forced_promotion = false,
+            .receipt = testFenceReceipt(),
+        }));
+    }
+
+    {
+        var executor = StaticJsonExecutor{
+            .body =
+            \\{"schema_version":1,"action":{"action_id":"rejoin_rewind:primary-a","action_kind":"rejoin_rewind","target":"primary-a","state":"applied","node_id":"primary-b"},"assessment":{"action":"rewind","reason":"parent_timeline_retained","former_node_id":"primary-a","target_timeline_id":2,"target_epoch":2,"parent_cluster_id":100,"parent_shard_id":10,"parent_table_id":20,"parent_timeline_id":1,"parent_epoch":1,"fork_lsn":1,"former_last_lsn":2,"retained_from_lsn":0,"data_loss_discarded":true},"rewind":{"node_id":"primary-a","fork_lsn":1,"previous_last_lsn":2,"current_last_lsn":1,"next_lsn":2,"discarded_lsn_count":1,"target_timeline_id":2,"target_epoch":2,"data_loss_discarded":true}}
+            ,
+        };
+        var client = Client.init(alloc, executor.executor());
+
+        try std.testing.expectError(error.AdminRejoinResponseMismatch, client.rewindRejoin("http://ha-admin.test", .{
+            .node_id = "primary-a",
+            .identity = testAdminIdentity(),
+            .last_lsn = 2,
+            .retained_from_lsn = 0,
+            .allow_rewind_after_forced_promotion = false,
+            .receipt = testFenceReceipt(),
+        }));
+    }
 }
 
 test "storage.ha http client rejects mismatched promotion admin responses" {
