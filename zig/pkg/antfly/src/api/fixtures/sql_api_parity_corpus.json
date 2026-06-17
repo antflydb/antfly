@@ -1,7 +1,7 @@
 {
   "fixture_format": 1,
-  "source_entry_count": 836,
-  "entry_count": 836,
+  "source_entry_count": 839,
+  "entry_count": 839,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4085,6 +4085,21 @@
       "sql": "WITH open_usage AS NOT MATERIALIZED (SELECT tenant_id, amount, status, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(amount) AS total FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' GROUP BY tenant_id ORDER BY total DESC LIMIT 5"
     },
     {
+      "name": "cte column alias aggregate",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "predicates": 0,
+        "order_by": 1,
+        "limit": 5,
+        "group_by": 1,
+        "aggregations": 1
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5:ctes=1:cte0_alias=3",
+      "sql": "WITH open_usage(tenant, usage_amount, row_status) AS (SELECT tenant_id, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(usage_amount) AS total FROM open_usage GROUP BY tenant ORDER BY total DESC LIMIT 5"
+    },
+    {
       "name": "chained cte query",
       "family": "query",
       "summary": {
@@ -4097,6 +4112,20 @@
       },
       "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
       "sql": "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2"
+    },
+    {
+      "name": "cte column alias query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "predicates": 0,
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:cte0_alias=3",
+      "sql": "WITH open_usage(usage_id, row_status, created_time) AS (SELECT id, status, created_at FROM usage_records WHERE status = 'open') SELECT usage_id FROM open_usage ORDER BY created_time DESC LIMIT 5"
     },
     {
       "name": "chained cte query materialization hints",
@@ -4974,6 +5003,21 @@
       },
       "plan": "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=2:window_expr=2:window_default=1:window_frame_sig=0:select=2:order=1:limit=2",
       "sql": "WITH open_usage AS MATERIALIZED (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2"
+    },
+    {
+      "name": "cte column alias window",
+      "family": "window",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "predicates": 0,
+        "select": 2,
+        "order_by": 0,
+        "limit": 2,
+        "windows": 1
+      },
+      "plan": "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=2:order=0:limit=2:cte0_alias=5",
+      "sql": "WITH open_usage(tenant, usage_id, row_status, usage_amount, created_time) AS (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant, usage_id, row_number() OVER (PARTITION BY tenant ORDER BY created_time ASC) AS rn FROM open_usage LIMIT 2"
     },
     {
       "name": "cte producer expression window",

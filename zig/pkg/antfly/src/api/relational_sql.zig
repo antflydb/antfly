@@ -10476,6 +10476,8 @@ const Parser = struct {
             var cte_name_transferred = false;
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
+            const cte_column_aliases = try self.parseOptionalCteColumnAliasesAlloc();
+            defer freeStringSlice(self.alloc, cte_column_aliases);
             try self.expectKeyword("as");
             try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
@@ -10491,6 +10493,7 @@ const Parser = struct {
             var lowered = try sub.parseSelect();
             errdefer lowered.deinit(self.alloc);
             self.pos = close_index + 1;
+            try self.applyCteColumnAliases(&lowered, cte_column_aliases);
             try self.resolveSelectSourceForPlan(&lowered, ctes.items, base_table_name);
             try ctes.append(self.alloc, .{
                 .name = cte_name,
@@ -10512,6 +10515,125 @@ const Parser = struct {
         if (self.matchKeyword("not")) {
             try self.expectKeyword("materialized");
         }
+    }
+
+    fn parseOptionalCteColumnAliasesAlloc(self: *@This()) ![]const []const u8 {
+        if (self.match(.lparen) == null) return &.{};
+        var aliases = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (aliases.items) |alias| self.alloc.free(alias);
+            aliases.deinit(self.alloc);
+        }
+        while (true) {
+            const alias = try self.parseIdentifierOwned();
+            var alias_transferred = false;
+            errdefer if (!alias_transferred) self.alloc.free(alias);
+            for (aliases.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing, alias)) return error.UnsupportedSqlShape;
+            }
+            try aliases.append(self.alloc, alias);
+            alias_transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        try self.expect(.rparen);
+        return try aliases.toOwnedSlice(self.alloc);
+    }
+
+    fn applyCteColumnAliases(
+        self: *@This(),
+        lowered: *LoweredSelect,
+        aliases: []const []const u8,
+    ) !void {
+        if (aliases.len == 0) return;
+        if (lowered.query.select_all) return error.UnsupportedSqlShape;
+        if (aliases.len != lowered.select_outputs.len) return error.UnsupportedSqlShape;
+
+        var direct_field_outputs: usize = 0;
+        for (lowered.select_outputs) |output| {
+            if (output.kind == .field) direct_field_outputs += 1;
+        }
+        if (direct_field_outputs != lowered.query.select.len) return error.UnsupportedSqlShape;
+
+        for (lowered.select_outputs, aliases) |output, alias| {
+            if (alias.len == 0) return error.UnsupportedSqlShape;
+            try self.renameCteSelectOutput(lowered, output, alias);
+        }
+
+        if (direct_field_outputs == 0) return;
+
+        const old_field_aliases = lowered.query.field_aliases;
+        const new_field_aliases = try self.alloc.alloc(db_mod.types.RelationalRowsFieldAliasProjection, old_field_aliases.len + direct_field_outputs);
+        var initialized: usize = old_field_aliases.len;
+        errdefer {
+            for (new_field_aliases[old_field_aliases.len..initialized]) |projection| {
+                self.alloc.free(projection.output);
+                self.alloc.free(projection.field);
+            }
+            self.alloc.free(new_field_aliases);
+        }
+        for (old_field_aliases, 0..) |projection, i| new_field_aliases[i] = projection;
+
+        for (lowered.select_outputs, aliases) |output, alias| {
+            if (output.kind != .field) continue;
+            if (output.index >= lowered.query.select.len) return error.UnsupportedSqlShape;
+            const projection = db_mod.types.RelationalRowsFieldAliasProjection{
+                .output = try self.alloc.dupe(u8, alias),
+                .field = try self.alloc.dupe(u8, lowered.query.select[output.index]),
+            };
+            new_field_aliases[initialized] = projection;
+            initialized += 1;
+        }
+
+        if (old_field_aliases.len > 0) self.alloc.free(old_field_aliases);
+        freeStringSlice(self.alloc, lowered.query.select);
+        lowered.query.select = &.{};
+        lowered.query.field_aliases = new_field_aliases;
+    }
+
+    fn renameCteSelectOutput(
+        self: *@This(),
+        lowered: *LoweredSelect,
+        output: SelectOutputRef,
+        alias: []const u8,
+    ) !void {
+        switch (output.kind) {
+            .field => {},
+            .json_extract => {
+                if (output.index >= lowered.query.json_extract.len) return error.UnsupportedSqlShape;
+                try self.replaceOwnedString(&lowered.query.json_extract[output.index].output, alias);
+            },
+            .array_length => {
+                if (output.index >= lowered.query.array_length.len) return error.UnsupportedSqlShape;
+                try self.replaceOwnedString(&lowered.query.array_length[output.index].output, alias);
+            },
+            .coalesce => {
+                if (output.index >= lowered.query.coalesce.len) return error.UnsupportedSqlShape;
+                const old_output = lowered.query.coalesce[output.index].output;
+                try self.replaceOwnedString(&lowered.query.coalesce[output.index].output, alias);
+                for (lowered.query.expressions) |*projection_const| {
+                    const projection = @constCast(projection_const);
+                    if (projection.expression.kind != .coalesce) continue;
+                    if (!std.mem.eql(u8, projection.output, old_output)) continue;
+                    try self.replaceOwnedString(&projection.output, alias);
+                    break;
+                }
+            },
+            .field_alias => {
+                if (output.index >= lowered.query.field_aliases.len) return error.UnsupportedSqlShape;
+                try self.replaceOwnedString(&lowered.query.field_aliases[output.index].output, alias);
+            },
+            .expression => {
+                if (output.index >= lowered.query.expressions.len) return error.UnsupportedSqlShape;
+                try self.replaceOwnedString(&lowered.query.expressions[output.index].output, alias);
+            },
+        }
+    }
+
+    fn replaceOwnedString(self: *@This(), target_const: *const []const u8, replacement: []const u8) !void {
+        const target = @constCast(target_const);
+        const next = try self.alloc.dupe(u8, replacement);
+        self.alloc.free(target.*);
+        target.* = next;
     }
 
     fn parseQueryPlan(self: *@This()) !LoweredQueryPlan {
@@ -10552,6 +10674,8 @@ const Parser = struct {
             var cte_name_transferred = false;
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
+            const cte_column_aliases = try self.parseOptionalCteColumnAliasesAlloc();
+            defer freeStringSlice(self.alloc, cte_column_aliases);
             try self.expectKeyword("as");
             try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
@@ -10567,6 +10691,7 @@ const Parser = struct {
             var lowered = try sub.parseSelect();
             errdefer lowered.deinit(self.alloc);
             self.pos = close_index + 1;
+            try self.applyCteColumnAliases(&lowered, cte_column_aliases);
             try self.resolveSelectSourceForPlan(&lowered, ctes.items, &base_table_name);
             try ctes.append(self.alloc, .{
                 .name = cte_name,
@@ -11160,6 +11285,8 @@ const Parser = struct {
             var cte_name_transferred = false;
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
+            const cte_column_aliases = try self.parseOptionalCteColumnAliasesAlloc();
+            defer freeStringSlice(self.alloc, cte_column_aliases);
             try self.expectKeyword("as");
             try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
@@ -11170,10 +11297,12 @@ const Parser = struct {
                 .schema = self.schema,
                 .params = self.params,
                 .unique_resolver = self.unique_resolver,
+                .available_ctes = ctes.items,
             };
             var lowered = try sub.parseSelect();
             errdefer lowered.deinit(self.alloc);
             self.pos = close_index + 1;
+            try self.applyCteColumnAliases(&lowered, cte_column_aliases);
             try self.resolveSelectSourceForPlan(&lowered, ctes.items, &base_table_name);
             try ctes.append(self.alloc, .{
                 .name = cte_name,
@@ -11186,6 +11315,10 @@ const Parser = struct {
             cte_name_transferred = true;
             if (self.match(.comma) == null) break;
         }
+
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes.items;
+        defer self.available_ctes = previous_available_ctes;
 
         var final = try self.parseWindowSelect();
         errdefer final.deinit(self.alloc);
@@ -11232,6 +11365,8 @@ const Parser = struct {
             var cte_name_transferred = false;
             errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
             if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
+            const cte_column_aliases = try self.parseOptionalCteColumnAliasesAlloc();
+            defer freeStringSlice(self.alloc, cte_column_aliases);
             try self.expectKeyword("as");
             try self.parseOptionalCteMaterializationHint();
             try self.expect(.lparen);
@@ -11242,10 +11377,12 @@ const Parser = struct {
                 .schema = self.schema,
                 .params = self.params,
                 .unique_resolver = self.unique_resolver,
+                .available_ctes = ctes.items,
             };
             var lowered = try sub.parseSelect();
             errdefer lowered.deinit(self.alloc);
             self.pos = close_index + 1;
+            try self.applyCteColumnAliases(&lowered, cte_column_aliases);
             try self.resolveSelectSourceForPlan(&lowered, ctes.items, &base_table_name);
             try ctes.append(self.alloc, .{
                 .name = cte_name,
@@ -11258,6 +11395,10 @@ const Parser = struct {
             cte_name_transferred = true;
             if (self.match(.comma) == null) break;
         }
+
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes.items;
+        defer self.available_ctes = previous_available_ctes;
 
         var final = try self.parseAggregate();
         errdefer final.deinit(self.alloc);
@@ -11462,6 +11603,16 @@ const Parser = struct {
             self.field_expression_qualifiers = inferred_qualifiers[0..];
         }
         defer self.field_expression_qualifiers = previous_field_expression_qualifiers;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const previous_schema = self.schema;
+        defer self.schema = previous_schema;
+        if (inferred_table_ref) |value| {
+            if (findCteByName(self.available_ctes, value.name) != null) {
+                planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, previous_schema, self.available_ctes);
+                self.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            }
+        }
 
         const distinct_on = try self.parseOptionalDistinctOnAlloc();
         errdefer freeExpressionSlice(self.alloc, distinct_on);
@@ -11731,6 +11882,16 @@ const Parser = struct {
             self.field_expression_qualifiers = inferred_qualifiers[0..];
         }
         defer self.field_expression_qualifiers = previous_field_expression_qualifiers;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const previous_schema = self.schema;
+        defer self.schema = previous_schema;
+        if (inferred_table_ref) |value| {
+            if (findCteByName(self.available_ctes, value.name) != null) {
+                planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, previous_schema, self.available_ctes);
+                self.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            }
+        }
 
         const parsed_named_windows = try self.parseTopLevelNamedWindowSpecsAlloc();
         defer freeNamedWindowSpecs(self.alloc, parsed_named_windows);
@@ -11933,6 +12094,16 @@ const Parser = struct {
             self.field_expression_qualifiers = inferred_qualifiers[0..];
         }
         defer self.field_expression_qualifiers = previous_field_expression_qualifiers;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const previous_schema = self.schema;
+        defer self.schema = previous_schema;
+        if (inferred_table_ref) |value| {
+            if (findCteByName(self.available_ctes, value.name) != null) {
+                planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, previous_schema, self.available_ctes);
+                self.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            }
+        }
 
         const select_distinct = self.matchKeyword("distinct");
         if (select_distinct and self.peekKeyword("on")) return error.UnsupportedSqlShape;
@@ -59742,6 +59913,7 @@ fn appendCteAccessPathFingerprintAlloc(
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_or", cte.query.expression_or_predicates.len);
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_not", cte.query.expression_not_predicates.len);
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_array", cte.query.expression_array_contains.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "alias", cte.query.field_aliases.len);
     }
     return fingerprint;
 }
@@ -72554,11 +72726,25 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "WITH open_usage AS NOT MATERIALIZED (SELECT tenant_id, amount, status, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(amount) AS total FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' GROUP BY tenant_id ORDER BY total DESC LIMIT 5",
         },
         .{
+            .name = "cte column alias aggregate",
+            .family = .aggregate,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .group_by = 1, .aggregations = 1, .order_by = 1, .limit = 5 },
+            .plan = "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=5:ctes=1:cte0_alias=3",
+            .sql = "WITH open_usage(tenant, usage_amount, row_status) AS (SELECT tenant_id, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(usage_amount) AS total FROM open_usage GROUP BY tenant ORDER BY total DESC LIMIT 5",
+        },
+        .{
             .name = "chained cte query",
             .family = .query,
             .summary = .{ .table_name = "usage_records", .ctes = 2, .predicates = 0, .select = 1, .order_by = 1, .limit = 2 },
             .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=2:claim=none",
             .sql = "WITH open_usage AS (SELECT id, status, amount, created_at FROM usage_records WHERE status = 'open'), expensive_open_usage AS (SELECT id, amount, created_at FROM open_usage WHERE amount > 10) SELECT id FROM expensive_open_usage ORDER BY created_at DESC LIMIT 2",
+        },
+        .{
+            .name = "cte column alias query",
+            .family = .query,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .select = 1, .order_by = 1, .limit = 5 },
+            .plan = "query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none:cte0_alias=3",
+            .sql = "WITH open_usage(usage_id, row_status, created_time) AS (SELECT id, status, created_at FROM usage_records WHERE status = 'open') SELECT usage_id FROM open_usage ORDER BY created_time DESC LIMIT 5",
         },
         .{
             .name = "chained cte query materialization hints",
@@ -73009,6 +73195,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .select = 2, .windows = 2, .order_by = 1, .limit = 2 },
             .plan = "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=2:window_expr=2:window_default=1:window_frame_sig=0:select=2:order=1:limit=2",
             .sql = "WITH open_usage AS MATERIALIZED (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, id, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY created_at ASC) AS next_status FROM open_usage ORDER BY prev_amount ASC LIMIT 2",
+        },
+        .{
+            .name = "cte column alias window",
+            .family = .window,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .predicates = 0, .select = 2, .windows = 1, .order_by = 0, .limit = 2 },
+            .plan = "window:table=usage_records:ctes=1:source_cte=1:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=2:order=0:limit=2:cte0_alias=5",
+            .sql = "WITH open_usage(tenant, usage_id, row_status, usage_amount, created_time) AS (SELECT tenant_id, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant, usage_id, row_number() OVER (PARTITION BY tenant ORDER BY created_time ASC) AS rn FROM open_usage LIMIT 2",
         },
         .{
             .name = "cte producer expression window",
@@ -83473,6 +83666,47 @@ test "postgres sql adapter lowers non recursive cte query plans" {
     try std.testing.expectEqualStrings("created_at", direct_select.query.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 5), direct_select.query.limit.?);
 
+    var column_alias_list = try lowerSelectAlloc(
+        alloc,
+        "WITH open_orders(order_id, order_status, order_created_at) AS (SELECT id, status, created_at FROM orders WHERE status = 'open') SELECT order_id FROM open_orders ORDER BY order_created_at DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer column_alias_list.deinit(alloc);
+    try std.testing.expectEqualStrings("orders", column_alias_list.table_name);
+    try std.testing.expectEqual(@as(usize, 1), column_alias_list.ctes.len);
+    try std.testing.expectEqualStrings("open_orders", column_alias_list.ctes[0].name);
+    try std.testing.expectEqual(@as(usize, 0), column_alias_list.ctes[0].query.select.len);
+    try std.testing.expectEqual(@as(usize, 3), column_alias_list.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqualStrings("order_id", column_alias_list.ctes[0].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", column_alias_list.ctes[0].query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("order_status", column_alias_list.ctes[0].query.field_aliases[1].output);
+    try std.testing.expectEqualStrings("status", column_alias_list.ctes[0].query.field_aliases[1].field);
+    try std.testing.expectEqualStrings("order_created_at", column_alias_list.ctes[0].query.field_aliases[2].output);
+    try std.testing.expectEqualStrings("created_at", column_alias_list.ctes[0].query.field_aliases[2].field);
+    try std.testing.expectEqualStrings("open_orders", column_alias_list.query.source_cte);
+    try std.testing.expectEqualStrings("order_id", column_alias_list.query.select[0]);
+    try std.testing.expectEqualStrings("order_created_at", column_alias_list.query.order_by[0].field);
+
+    var expression_alias_list = try lowerQueryPlanAlloc(
+        alloc,
+        "WITH normalized_orders(order_id, status_key) AS (SELECT id, lower(status) FROM orders WHERE amount > 0) SELECT order_id FROM normalized_orders WHERE status_key = 'open'",
+        schema,
+        &.{},
+    );
+    defer expression_alias_list.deinit(alloc);
+    try std.testing.expectEqualStrings("orders", expression_alias_list.table_name);
+    try std.testing.expectEqual(@as(usize, 1), expression_alias_list.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_alias_list.plan.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqualStrings("order_id", expression_alias_list.plan.ctes[0].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", expression_alias_list.plan.ctes[0].query.field_aliases[0].field);
+    try std.testing.expectEqual(@as(usize, 1), expression_alias_list.plan.ctes[0].query.expressions.len);
+    try std.testing.expectEqualStrings("status_key", expression_alias_list.plan.ctes[0].query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_alias_list.plan.ctes[0].query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("normalized_orders", expression_alias_list.plan.query.source_cte);
+    try std.testing.expectEqualStrings("order_id", expression_alias_list.plan.query.select[0]);
+    try std.testing.expectEqualStrings("status_key", expression_alias_list.plan.query.predicates[0].field);
+
     var hinted = try lowerQueryPlanAlloc(
         alloc,
         "WITH open_orders AS MATERIALIZED (SELECT id, status, created_at FROM orders WHERE status = 'open'), ordered_orders AS NOT MATERIALIZED (SELECT id, created_at FROM open_orders WHERE created_at > 0) SELECT id FROM ordered_orders ORDER BY created_at DESC LIMIT 3",
@@ -83502,6 +83736,24 @@ test "postgres sql adapter lowers non recursive cte query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanAlloc(
         alloc,
         "WITH early AS (SELECT id FROM later), later AS (SELECT id FROM orders) SELECT id FROM early",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanAlloc(
+        alloc,
+        "WITH open_orders(order_id) AS (SELECT id, status FROM orders) SELECT order_id FROM open_orders",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanAlloc(
+        alloc,
+        "WITH open_orders(order_id, order_id) AS (SELECT id, status FROM orders) SELECT order_id FROM open_orders",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanAlloc(
+        alloc,
+        "WITH open_orders(order_id) AS (SELECT * FROM orders) SELECT order_id FROM open_orders",
         schema,
         &.{},
     ));
@@ -84068,6 +84320,21 @@ test "postgres sql adapter lowers non recursive cte aggregate plans" {
     try std.testing.expectEqual(@as(usize, 1), hinted.plan.ctes.len);
     try std.testing.expectEqualStrings("open_usage", hinted.plan.ctes[0].name);
     try std.testing.expectEqualStrings("open_usage", hinted.plan.aggregate.source.source_cte);
+
+    var column_alias_list = try lowerAggregatePlanAlloc(
+        alloc,
+        "WITH open_usage(tenant_id, usage_amount, row_status) AS (SELECT tenant, amount, status FROM usage_records WHERE status = 'open') SELECT tenant_id, SUM(usage_amount) AS total_amount FROM open_usage GROUP BY tenant_id ORDER BY total_amount DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer column_alias_list.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", column_alias_list.table_name);
+    try std.testing.expectEqual(@as(usize, 1), column_alias_list.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 3), column_alias_list.plan.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqualStrings("tenant_id", column_alias_list.plan.ctes[0].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("tenant", column_alias_list.plan.ctes[0].query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("open_usage", column_alias_list.plan.aggregate.source.source_cte);
+    try std.testing.expectEqualStrings("tenant_id", column_alias_list.plan.aggregate.group_by[0]);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregatePlanAlloc(
         alloc,
@@ -85250,6 +85517,22 @@ test "postgres sql adapter lowers row_number window query plans" {
     try std.testing.expectEqual(@as(usize, 1), hinted_cte.plan.ctes.len);
     try std.testing.expectEqualStrings("open_usage", hinted_cte.plan.window.source.source_cte);
     try std.testing.expectEqualStrings("rn", hinted_cte.plan.window.windows[0].output);
+
+    var column_alias_list = try lowerWindowPlanAlloc(
+        alloc,
+        "WITH open_usage(tenant_id, row_id, row_status, usage_amount, created_time) AS (SELECT tenant, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, row_id, row_number() OVER (PARTITION BY tenant_id ORDER BY created_time ASC) AS rn FROM open_usage LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer column_alias_list.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", column_alias_list.table_name);
+    try std.testing.expectEqual(@as(usize, 1), column_alias_list.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 5), column_alias_list.plan.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqualStrings("tenant_id", column_alias_list.plan.ctes[0].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("tenant", column_alias_list.plan.ctes[0].query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("open_usage", column_alias_list.plan.window.source.source_cte);
+    try std.testing.expectEqualStrings("tenant_id", column_alias_list.plan.window.windows[0].partition_by[0]);
+    try std.testing.expectEqualStrings("created_time", column_alias_list.plan.window.windows[0].order_by[0].field);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanAlloc(
         alloc,
