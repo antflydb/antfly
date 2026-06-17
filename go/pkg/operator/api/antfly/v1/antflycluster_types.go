@@ -588,6 +588,7 @@ type HighAvailabilitySpec struct {
 	Admin *HAAdminSpec `json:"admin,omitempty"`
 
 	// Runtime configures the local Zig antfly swarm HA runtime role and durable WAL paths.
+	// Supported only when spec.mode=Swarm; split metadata/data topology HA process wiring is not yet modeled here.
 	// +optional
 	Runtime *HARuntimeSpec `json:"runtime,omitempty"`
 
@@ -648,6 +649,7 @@ type HAStandbySpec struct {
 }
 
 // HARuntimeSpec configures how the operator starts this Antfly process in the HA runtime.
+// It is only supported when spec.mode=Swarm because those flags are currently wired through the Swarm StatefulSet.
 type HARuntimeSpec struct {
 	// Role selects whether this process opens primary or standby HA runtime state.
 	// +kubebuilder:validation:Enum=Primary;Standby

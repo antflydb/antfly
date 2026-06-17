@@ -3670,8 +3670,9 @@ spec:
                         type: integer
                     type: object
                   runtime:
-                    description: Runtime configures the local Zig antfly swarm HA
-                      runtime role and durable WAL paths.
+                    description: |-
+                      Runtime configures the local Zig antfly swarm HA runtime role and durable WAL paths.
+                      Supported only when spec.mode=Swarm; split metadata/data topology HA process wiring is not yet modeled here.
                     properties:
                       adminTokenEnvVar:
                         description: |-
