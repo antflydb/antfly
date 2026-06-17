@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +64,19 @@ func TestBuildSourceDocumentsRequiresURL(t *testing.T) {
 	_, err := BuildSourceDocuments(context.Background(), source, SourceDocumentOptions{})
 	if err == nil {
 		t.Fatal("expected missing source URL error")
+	}
+}
+
+func TestSourceDocumentInlineContentLimit(t *testing.T) {
+	_, err := SourceDocumentFromContentItem(ContentItem{
+		Path:    "large.pdf",
+		Content: []byte(strings.Repeat("x", 8)),
+	}, SourceDocumentOptions{
+		InlineContent:  true,
+		MaxInlineBytes: 4,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeding inline content limit 4 bytes") {
+		t.Fatalf("SourceDocumentFromContentItem error = %v, want inline limit error", err)
 	}
 }
 

@@ -37,7 +37,7 @@ are derived from those units.
 From the repository root:
 
 ```bash
-go build -o docsaf ./examples/docsaf
+(cd go/pkg/docsaf && go build -o ../../../examples/docsaf/docsaf ./cmd/docsaf)
 ```
 
 ## Commands
@@ -99,6 +99,9 @@ Load/sync flags:
 - `--create-table`: create the table with derived hierarchy indexes.
 - `--num-shards`: number of shards for a new table.
 - `--batch-size`: linear merge batch size.
+- `--max-request-bytes`: maximum encoded linear merge request bytes.
+- `--token`: bearer token for Antfly Cloud auth; also reads `ANTFLY_TOKEN`
+  or `ANTFLY_AUTH_TOKEN`.
 - `--chunk-size`: target size for unit-derived chunks.
 - `--chunk-overlap`: overlap for unit-derived chunks.
 - `--embedding-model`: Ollama embedding model for managed vector search.
