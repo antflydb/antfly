@@ -82,7 +82,7 @@ func (f sourceFlags) validate(ctx context.Context) error {
 		if f.googleDriveAuthConfigured(ctx) {
 			return nil
 		}
-		return fmt.Errorf("google-drive source requires --drive-credentials, --drive-access-token, GOOGLE_DRIVE_ACCESS_TOKEN, or a token file from `docsaf auth google-drive`")
+		return missingGoogleDriveAuthError()
 	default:
 		return fmt.Errorf("unknown --source %q; expected filesystem or google-drive", *f.sourceType)
 	}
@@ -117,10 +117,7 @@ func (f sourceFlags) googleDriveAuthConfigured(ctx context.Context) bool {
 	if strings.TrimSpace(*f.driveCredentials) != "" || strings.TrimSpace(*f.driveAccessToken) != "" || strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_ACCESS_TOKEN")) != "" {
 		return true
 	}
-	if strings.TrimSpace(*f.driveTokenFile) == "" {
-		return false
-	}
-	_, err := loadGoogleDriveTokenSource(ctx, *f.driveTokenFile)
+	_, err := resolveGoogleDriveTokenSource(ctx, *f.driveTokenFile)
 	return err == nil
 }
 
@@ -149,7 +146,7 @@ func (f sourceFlags) source(ctx context.Context) (docsaf.ContentSource, error) {
 		} else if token := strings.TrimSpace(os.Getenv("GOOGLE_DRIVE_ACCESS_TOKEN")); token != "" {
 			config.AccessToken = token
 		} else {
-			tokenSource, err := loadGoogleDriveTokenSource(ctx, *f.driveTokenFile)
+			tokenSource, err := resolveGoogleDriveTokenSource(ctx, *f.driveTokenFile)
 			if err != nil {
 				return nil, err
 			}

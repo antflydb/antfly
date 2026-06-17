@@ -351,6 +351,14 @@ docsaf auth google-drive --client-secret ./client_secret.json
 docsaf sync --source google-drive --drive-folder <folder-url> --inline-content --table docs
 ```
 
+It also supports Google Application Default Credentials for users who already
+have the Google Cloud CLI:
+
+```bash
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/drive.readonly
+docsaf sync --source google-drive --drive-folder <folder-url> --inline-content --table docs
+```
+
 For private Drive folders, `--inline-content` is usually required unless Antfly
 can fetch the emitted Drive links directly.
 

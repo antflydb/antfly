@@ -98,6 +98,20 @@ Then sync a Drive folder:
   --create-table
 ```
 
+Developers with the Google Cloud CLI can also use Application Default
+Credentials:
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/drive.readonly
+
+./docsaf sync \
+  --source google-drive \
+  --drive-folder "https://drive.google.com/drive/folders/..." \
+  --inline-content \
+  --table docs
+```
+
 Service accounts are also supported for shared folders:
 
 ```bash
@@ -132,6 +146,9 @@ Google Drive source flags:
   `GOOGLE_DRIVE_ACCESS_TOKEN`.
 - `--drive-concurrency`: parallel Drive downloads.
 - `--drive-include-shared-drives`: include shared/team drives.
+
+If no explicit Drive credentials or docsaf token cache are configured, docsaf
+falls back to Google Application Default Credentials.
 
 Auth flags:
 

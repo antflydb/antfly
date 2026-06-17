@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -63,14 +64,25 @@ func TestSourceFlagsGoogleDriveRequiresFolder(t *testing.T) {
 
 func TestSourceFlagsGoogleDriveRequiresAuth(t *testing.T) {
 	t.Setenv("GOOGLE_DRIVE_ACCESS_TOKEN", "")
+	originalADC := googleDriveADCTokenSource
+	googleDriveADCTokenSource = func(context.Context) (oauth2.TokenSource, error) {
+		return nil, fmt.Errorf("adc unavailable")
+	}
+	t.Cleanup(func() { googleDriveADCTokenSource = originalADC })
+
 	flags := parseSourceFlagsForTest(t,
 		"--source", "google-drive",
 		"--drive-folder", "folder-id",
 		"--drive-token-file", filepath.Join(t.TempDir(), "missing-token.json"),
 	)
 	err := flags.validate(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "google-drive source requires") {
-		t.Fatalf("validate error = %v, want missing auth", err)
+	if err == nil {
+		t.Fatalf("validate error = nil, want missing auth")
+	}
+	for _, want := range []string{"no Google Drive auth found", "docsaf auth google-drive", "gcloud auth application-default login"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("validate error = %v, want %q", err, want)
+		}
 	}
 }
 

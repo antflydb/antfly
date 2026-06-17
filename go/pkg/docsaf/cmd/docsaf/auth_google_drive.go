@@ -22,6 +22,8 @@ import (
 
 const googleDriveAuthTimeout = 5 * time.Minute
 
+var googleDriveADCTokenSource = loadGoogleDriveADCTokenSource
+
 type googleDriveTokenCache struct {
 	ClientID     string          `json:"client_id"`
 	ClientSecret string          `json:"client_secret"`
@@ -230,4 +232,33 @@ func loadGoogleDriveTokenSource(ctx context.Context, path string) (oauth2.TokenS
 		Scopes:       scopes,
 	}
 	return config.TokenSource(ctx, cache.Token), nil
+}
+
+func resolveGoogleDriveTokenSource(ctx context.Context, tokenFile string) (oauth2.TokenSource, error) {
+	if strings.TrimSpace(tokenFile) != "" {
+		if tokenSource, err := loadGoogleDriveTokenSource(ctx, tokenFile); err == nil {
+			return tokenSource, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	if tokenSource, err := googleDriveADCTokenSource(ctx); err == nil {
+		return tokenSource, nil
+	}
+	return nil, missingGoogleDriveAuthError()
+}
+
+func loadGoogleDriveADCTokenSource(ctx context.Context) (oauth2.TokenSource, error) {
+	credentials, err := google.FindDefaultCredentials(ctx, drive.DriveReadonlyScope)
+	if err != nil {
+		return nil, err
+	}
+	if credentials.TokenSource == nil {
+		return nil, fmt.Errorf("application default credentials did not include a token source")
+	}
+	return credentials.TokenSource, nil
+}
+
+func missingGoogleDriveAuthError() error {
+	return fmt.Errorf("no Google Drive auth found\n\nRun one of:\n  docsaf auth google-drive --client-secret ./client_secret.json\n  gcloud auth application-default login --scopes=%s\n\nThen retry with:\n  docsaf sync --source google-drive --drive-folder <folder-url>", drive.DriveReadonlyScope)
 }
