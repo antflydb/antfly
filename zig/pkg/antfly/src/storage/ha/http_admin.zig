@@ -1127,8 +1127,8 @@ fn appendOptionsFromOpenApi(request: admin_api.CommitAppendRequest) !primary_mod
     return .{
         .kind = if (request.kind) |raw| try parseRecordKind(raw) else .batch_mutation,
         .payload_codec = if (request.payload_codec) |raw| try parsePayloadCodec(raw) else .raw,
-        .shard_id = if (request.shard_id) |value| try uint64FromJson(value) else 0,
-        .table_id = if (request.table_id) |value| try uint64FromJson(value) else 0,
+        .shard_id = if (request.shard_id) |value| try uint64FromJson(value) else null,
+        .table_id = if (request.table_id) |value| try uint64FromJson(value) else null,
         .commit_timestamp_ns = request.commit_timestamp_ns orelse 0,
         .payload = request.payload,
     };
@@ -2254,6 +2254,24 @@ test "storage.ha http admin decodes sync policy query values" {
         error.InvalidAdminRequest,
         buildSyncPolicyFromQuery(alloc, "sync_mode=remote-write&sync_standby=standby%XX"),
     );
+}
+
+test "storage.ha http admin preserves omitted commit append shard and table defaults" {
+    const implicit = try appendOptionsFromOpenApi(.{
+        .payload = "implicit",
+        .sync_policy = .{ .mode = "async" },
+    });
+    try std.testing.expect(implicit.shard_id == null);
+    try std.testing.expect(implicit.table_id == null);
+
+    const explicit = try appendOptionsFromOpenApi(.{
+        .payload = "explicit",
+        .shard_id = 0,
+        .table_id = 20,
+        .sync_policy = .{ .mode = "async" },
+    });
+    try std.testing.expectEqual(@as(?u64, 0), explicit.shard_id);
+    try std.testing.expectEqual(@as(?u64, 20), explicit.table_id);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
