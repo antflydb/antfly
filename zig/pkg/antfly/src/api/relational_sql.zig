@@ -47300,6 +47300,25 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     );
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_or_replace_view));
 
+    var create_or_replace_view_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id, email FROM users;");
+    defer create_or_replace_view_if_not_exists.deinit(alloc);
+    const create_or_replace_view_if_not_exists_plan = switch (create_or_replace_view_if_not_exists) {
+        .view_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(create_or_replace_view_if_not_exists_plan.replace_existing);
+    try std.testing.expect(create_or_replace_view_if_not_exists_plan.if_not_exists);
+    const create_or_replace_view_if_not_exists_fingerprint = try ddlFingerprintAlloc(alloc, create_or_replace_view_if_not_exists);
+    defer alloc.free(create_or_replace_view_if_not_exists_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:create_view:view=users_v:source=users:source_fields=2:fields=2:replace=true:if_not_exists=true",
+        create_or_replace_view_if_not_exists_fingerprint,
+    );
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_or_replace_view_if_not_exists));
+
     var rename_view = try lowerDdlPlanAlloc(alloc, "ALTER VIEW users_v RENAME TO active_users_v;");
     defer rename_view.deinit(alloc);
     const rename_view_fingerprint = try ddlFingerprintAlloc(alloc, rename_view);
@@ -73682,6 +73701,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .summary = .{ .ddl_tag = .create_view, .table_name = "usage_records_v", .select = 1 },
             .plan = "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=true:if_not_exists=false",
             .sql = "CREATE OR REPLACE VIEW usage_records_v AS SELECT id FROM usage_records",
+        },
+        .{
+            .name = "create or replace view if not exists catalog ddl",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_view, .table_name = "usage_records_v", .select = 1 },
+            .plan = "ddl:create_view:view=usage_records_v:source=usage_records:source_fields=1:fields=1:replace=true:if_not_exists=true",
+            .sql = "CREATE OR REPLACE VIEW IF NOT EXISTS usage_records_v AS SELECT id FROM usage_records",
         },
         .{
             .name = "rename view catalog ddl",

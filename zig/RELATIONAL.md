@@ -4137,16 +4137,21 @@ dependency cleanup on durable catalog objects, and REST/SDK read APIs; comments
 should not be stored as opaque SQL text.
 
 PostgreSQL view DDL is schema-bearing and lowers to a native `view_catalog`
-intent instead of storing opaque SQL text. `CREATE VIEW` and
-`CREATE OR REPLACE VIEW` record the view name, replacement intent, source table,
-and declared output fields for conservative one-table projections. PostgreSQL
-view column lists such as `CREATE VIEW v(alias) AS SELECT field ...` supply the
-catalog output-field names after the adapter verifies that the declared aliases
-match the selected-field arity; selected source fields remain separate typed
-metadata so aliases do not erase the view's source-to-output mapping. Simple
-select-list aliases such as `SELECT field AS alias` and `SELECT field alias`
-use the same mapping: the selected source field remains durable metadata and
-the alias becomes the exposed output field;
+intent instead of storing opaque SQL text. `CREATE VIEW`,
+`CREATE VIEW IF NOT EXISTS`, `CREATE OR REPLACE VIEW`, and
+`CREATE OR REPLACE VIEW IF NOT EXISTS` record the view name, replacement intent,
+idempotent creation intent, source table, and declared output fields for
+conservative one-table projections. The combined replace/idempotent form has
+the same migration-equivalence contract as tables and materialized views:
+create the view if it is absent, otherwise replace the existing typed catalog
+definition. PostgreSQL view column lists such as
+`CREATE VIEW v(alias) AS SELECT field ...` supply the catalog output-field names
+after the adapter verifies that the declared aliases match the selected-field
+arity; selected source fields remain separate typed metadata so aliases do not
+erase the view's source-to-output mapping. Simple select-list aliases such as
+`SELECT field AS alias` and `SELECT field alias` use the same mapping: the
+selected source field remains durable metadata and the alias becomes the exposed
+output field;
 `ALTER VIEW ... RENAME TO ...` and `DROP VIEW ...` record typed catalog rename
 and removal intents. The remaining production shape is the durable view catalog
 executor: full stored queries over the same Antfly row-query, join, lateral,
