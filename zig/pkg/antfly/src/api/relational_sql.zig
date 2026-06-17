@@ -493,10 +493,7 @@ pub const LoweredExplainSubject = union(enum) {
     }
 };
 
-pub const ExplainFormat = enum {
-    text,
-    json,
-};
+pub const ExplainFormat = sql_adapter.SqlExplainFormat;
 
 pub const LoweredRelationPopulationPlan = struct {
     mode: RelationPopulationMode,
@@ -2578,7 +2575,7 @@ fn lowerExplainPlanWithOptionsAndCatalogAlloc(
     options: LowerWritePlanOptions,
     catalog: ?table_catalog.CatalogSource,
 ) !LoweredExplainPlan {
-    const parsed = try parseExplainPrefix(sql);
+    const parsed = try sql_adapter.parseExplainPrefix(sql);
     var read_err: ?anyerror = null;
     if (catalog) |source_catalog| {
         if (lowerReadPlanWithCatalogAlloc(alloc, parsed.inner_sql, schema, params, source_catalog)) |read| {
@@ -2768,118 +2765,6 @@ fn tokenStartOffset(sql: []const u8, token: Token) !usize {
     const token_start = @intFromPtr(token.text.ptr);
     if (token_start < sql_start or token_start > sql_end) return error.UnsupportedSqlShape;
     return token_start - sql_start;
-}
-
-const ExplainPrefix = struct {
-    analyze: bool = false,
-    format: ExplainFormat = .text,
-    verbose: bool = false,
-    costs: bool = true,
-    inner_sql: []const u8,
-};
-
-fn parseExplainPrefix(sql: []const u8) !ExplainPrefix {
-    var index = skipSqlWhitespace(sql, 0);
-    if (!consumeSqlKeyword(sql, &index, "explain")) return error.UnsupportedSqlShape;
-    index = skipSqlWhitespace(sql, index);
-    if (index >= sql.len) return error.UnsupportedSqlShape;
-
-    var prefix = ExplainPrefix{ .inner_sql = "" };
-    if (sql[index] == '(') {
-        try parseExplainOptions(sql, &index, &prefix);
-        index = skipSqlWhitespace(sql, index);
-        if (index >= sql.len) return error.UnsupportedSqlShape;
-    }
-
-    if (consumeSqlKeyword(sql, &index, "analyze")) {
-        prefix.analyze = true;
-        index = skipSqlWhitespace(sql, index);
-        if (index >= sql.len) return error.UnsupportedSqlShape;
-    }
-
-    const inner = std.mem.trim(u8, sql[index..], " \t\r\n;");
-    if (inner.len == 0) return error.UnsupportedSqlShape;
-    prefix.inner_sql = inner;
-    return prefix;
-}
-
-fn parseExplainOptions(sql: []const u8, index: *usize, prefix: *ExplainPrefix) !void {
-    if (index.* >= sql.len or sql[index.*] != '(') return error.UnsupportedSqlShape;
-    index.* += 1;
-    while (true) {
-        index.* = skipSqlWhitespace(sql, index.*);
-        if (index.* >= sql.len) return error.UnsupportedSqlShape;
-        if (consumeSqlKeyword(sql, index, "format")) {
-            index.* = skipSqlWhitespace(sql, index.*);
-            if (consumeSqlKeyword(sql, index, "json")) {
-                prefix.format = .json;
-            } else if (consumeSqlKeyword(sql, index, "text")) {
-                prefix.format = .text;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        } else if (consumeSqlKeyword(sql, index, "verbose")) {
-            prefix.verbose = try parseOptionalExplainBool(sql, index, true);
-        } else if (consumeSqlKeyword(sql, index, "costs")) {
-            prefix.costs = try parseOptionalExplainBool(sql, index, true);
-        } else if (consumeSqlKeyword(sql, index, "analyze")) {
-            prefix.analyze = try parseOptionalExplainBool(sql, index, true);
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-
-        index.* = skipSqlWhitespace(sql, index.*);
-        if (index.* >= sql.len) return error.UnsupportedSqlShape;
-        if (sql[index.*] == ',') {
-            index.* += 1;
-            continue;
-        }
-        if (sql[index.*] == ')') {
-            index.* += 1;
-            return;
-        }
-        return error.UnsupportedSqlShape;
-    }
-}
-
-fn parseOptionalExplainBool(sql: []const u8, index: *usize, default_value: bool) !bool {
-    const before = index.*;
-    index.* = skipSqlWhitespace(sql, index.*);
-    if (consumeSqlKeyword(sql, index, "true") or
-        consumeSqlKeyword(sql, index, "on") or
-        consumeSqlKeyword(sql, index, "yes"))
-    {
-        return true;
-    }
-    if (consumeSqlKeyword(sql, index, "false") or
-        consumeSqlKeyword(sql, index, "off") or
-        consumeSqlKeyword(sql, index, "no"))
-    {
-        return false;
-    }
-    index.* = before;
-    return default_value;
-}
-
-fn skipSqlWhitespace(sql: []const u8, start: usize) usize {
-    var index = start;
-    while (index < sql.len and std.ascii.isWhitespace(sql[index])) : (index += 1) {}
-    return index;
-}
-
-fn consumeSqlKeyword(sql: []const u8, index: *usize, keyword: []const u8) bool {
-    const start = index.*;
-    const end = start + keyword.len;
-    if (end > sql.len) return false;
-    if (!std.ascii.eqlIgnoreCase(sql[start..end], keyword)) return false;
-    if (end < sql.len and isSqlIdentifierByte(sql[end])) return false;
-    if (start > 0 and isSqlIdentifierByte(sql[start - 1])) return false;
-    index.* = end;
-    return true;
-}
-
-fn isSqlIdentifierByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
 pub fn lowerWindowPlanAlloc(

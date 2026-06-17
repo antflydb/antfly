@@ -1025,9 +1025,11 @@ expect, match, peek, identifier-predicate matching, function-call detection,
 balanced-paren normalization, wrapped identifier operands, top-level boolean
 operator scans bounded by tail clauses, top-level tail-clause index scans, and
 end-of-input behavior are adapter-owned before statement-specific grammar moves
-out of the large lowerer file. Next extract the shared expression grammar, because
-expressions are reused by SELECT, DML, DDL checks, partial indexes, defaults,
-generated columns, conflict actions, and RETURNING. The binder boundary should
+out of the large lowerer file. Adapter-only control syntax such as `EXPLAIN`
+prefix and option parsing also belongs there so lowerers receive typed wrapper
+intent instead of scanning raw SQL. Next extract the shared expression grammar,
+because expressions are reused by SELECT, DML, DDL checks, partial indexes,
+defaults, generated columns, conflict actions, and RETURNING. The binder boundary should
 own catalog source lookup, cross-table source-name pre-scans for read,
 insert-source, and joined-write statements, cross-table source schema
 derivation, identifier normalization, and scope resolution so statement lowerers

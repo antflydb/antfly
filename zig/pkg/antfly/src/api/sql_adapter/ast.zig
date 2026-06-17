@@ -35,6 +35,19 @@ pub const SelectSetOperation = enum {
     except,
 };
 
+pub const SqlExplainFormat = enum {
+    text,
+    json,
+};
+
+pub const SqlExplainPrefix = struct {
+    analyze: bool = false,
+    format: SqlExplainFormat = .text,
+    verbose: bool = false,
+    costs: bool = true,
+    inner_sql: []const u8,
+};
+
 pub const SqlPatternQuantifier = enum {
     any,
     all,
