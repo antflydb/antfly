@@ -1311,6 +1311,16 @@ fn generatedRouteSupportsMethod(generated_path: []const u8, method: []const u8) 
     return false;
 }
 
+fn implementedAdminRouteDocumented(full_path: []const u8, method: []const u8) bool {
+    if (!std.mem.startsWith(u8, full_path, admin_api.routes.base)) return false;
+    const spec_path = full_path[admin_api.routes.base.len..];
+    for (admin_api.openapi.server.routes) |route| {
+        if (!std.mem.eql(u8, route.path, spec_path)) continue;
+        if (std.mem.eql(u8, route.method, method)) return true;
+    }
+    return false;
+}
+
 fn methodFromText(method: []const u8) !http_common.Method {
     if (std.mem.eql(u8, method, "GET")) return .GET;
     if (std.mem.eql(u8, method, "POST")) return .POST;
@@ -2700,6 +2710,76 @@ test "storage.ha http admin handles every generated admin route method" {
                 .{ route.method, route.path, route.operation_id },
             );
             return error.TestExpectedGeneratedRouteDispatched;
+        }
+    }
+}
+
+test "storage.ha http admin implemented admin routes are documented" {
+    const alloc = std.testing.allocator;
+    const ImplementedRoute = struct {
+        method: []const u8,
+        path: []const u8,
+    };
+    const static_routes = [_]ImplementedRoute{
+        .{ .method = "GET", .path = admin_api.routes.ha_primary_status },
+        .{ .method = "GET", .path = admin_api.routes.ha_standby_status },
+        .{ .method = "GET", .path = admin_api.routes.ha_replication_slots },
+        .{ .method = "GET", .path = admin_api.routes.ha_fence_current },
+        .{ .method = "POST", .path = admin_api.routes.ha_replication_slots },
+        .{ .method = "POST", .path = admin_api.routes.ha_commit_check },
+        .{ .method = "POST", .path = admin_api.routes.ha_commit_append },
+        .{ .method = "POST", .path = admin_api.routes.ha_read_check },
+        .{ .method = "POST", .path = admin_api.routes.ha_write_check },
+        .{ .method = "POST", .path = admin_api.routes.ha_owner_job_check },
+        .{ .method = "POST", .path = admin_api.routes.ha_base_backups },
+        .{ .method = "POST", .path = admin_api.routes.ha_base_backups_finish },
+        .{ .method = "POST", .path = admin_api.routes.ha_standby_bootstrap },
+        .{ .method = "POST", .path = admin_api.routes.ha_fence },
+        .{ .method = "POST", .path = admin_api.routes.ha_promotion_assess },
+        .{ .method = "POST", .path = admin_api.routes.ha_promotion_current_fence },
+        .{ .method = "POST", .path = admin_api.routes.ha_promotion },
+        .{ .method = "POST", .path = admin_api.routes.ha_rejoin_assess },
+        .{ .method = "POST", .path = admin_api.routes.ha_rejoin_rewind },
+        .{ .method = "POST", .path = admin_api.routes.ha_rejoin_reseed },
+    };
+
+    for (static_routes) |route| {
+        try std.testing.expect(knownRoute(route.path));
+        if (!implementedAdminRouteDocumented(route.path, route.method)) {
+            std.debug.print(
+                "implemented HA admin route {s} {s} is missing from generated admin OpenAPI routes\n",
+                .{ route.method, route.path },
+            );
+            return error.TestExpectedImplementedAdminRouteDocumented;
+        }
+    }
+
+    const slot_path = try admin_api.routes.replicationSlotPathAlloc(alloc, "standby-a");
+    defer alloc.free(slot_path);
+    const pause_path = try admin_api.routes.replicationSlotPausePathAlloc(alloc, "standby-a");
+    defer alloc.free(pause_path);
+    const resume_path = try admin_api.routes.replicationSlotResumePathAlloc(alloc, "standby-a");
+    defer alloc.free(resume_path);
+
+    const dynamic_routes = [_]ImplementedRoute{
+        .{ .method = "DELETE", .path = slot_path },
+        .{ .method = "PUT", .path = pause_path },
+        .{ .method = "PUT", .path = resume_path },
+    };
+    const documented_dynamic_routes = [_]ImplementedRoute{
+        .{ .method = "DELETE", .path = admin_api.routes.ha_replication_slot_prefix ++ "{slot_name}" },
+        .{ .method = "PUT", .path = admin_api.routes.ha_replication_slot_prefix ++ "{slot_name}" ++ admin_api.routes.ha_replication_slot_pause_suffix },
+        .{ .method = "PUT", .path = admin_api.routes.ha_replication_slot_prefix ++ "{slot_name}" ++ admin_api.routes.ha_replication_slot_resume_suffix },
+    };
+
+    for (dynamic_routes, documented_dynamic_routes) |route, documented| {
+        try std.testing.expect(knownRoute(route.path));
+        if (!implementedAdminRouteDocumented(documented.path, documented.method)) {
+            std.debug.print(
+                "implemented HA admin dynamic route {s} {s} is missing from generated admin OpenAPI routes\n",
+                .{ route.method, route.path },
+            );
+            return error.TestExpectedImplementedAdminRouteDocumented;
         }
     }
 }
