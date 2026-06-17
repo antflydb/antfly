@@ -654,32 +654,32 @@ pub const Server = struct {
             }
 
             if (expected == .rewind) {
-                if (self.ctx.former_primary_log) |log| {
-                    const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
-                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
-                    };
-                    var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_rewind", assessment.former_node_id, "applied");
-                    defer action_receipt.deinit(self.alloc);
-                    return try self.handleTypedJson(RejoinRewindDocument{
-                        .action = action_receipt,
-                        .assessment = assessment,
-                        .rewind = rewind,
-                    });
-                }
+                const log = self.ctx.former_primary_log orelse
+                    return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
+                const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_rewind", assessment.former_node_id, "applied");
+                defer action_receipt.deinit(self.alloc);
+                return try self.handleTypedJson(RejoinRewindDocument{
+                    .action = action_receipt,
+                    .assessment = assessment,
+                    .rewind = rewind,
+                });
             }
             if (expected == .reseed) {
-                if (self.ctx.primary) |primary| {
-                    const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
-                        return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
-                    };
-                    var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied");
-                    defer action_receipt.deinit(self.alloc);
-                    return try self.handleTypedJson(RejoinReseedDocument{
-                        .action = action_receipt,
-                        .assessment = assessment,
-                        .reseed = reseed,
-                    });
-                }
+                const primary = self.ctx.primary orelse
+                    return try textResponse(self.alloc, 409, "PrimaryUnavailable");
+                const reseed = ha_admin.markFormerPrimaryForReseed(primary, assessment) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+                var action_receipt = try actionReceiptAlloc(self.alloc, "rejoin_reseed", assessment.former_node_id, "applied");
+                defer action_receipt.deinit(self.alloc);
+                return try self.handleTypedJson(RejoinReseedDocument{
+                    .action = action_receipt,
+                    .assessment = assessment,
+                    .reseed = reseed,
+                });
             }
         }
 
@@ -1597,6 +1597,22 @@ test "storage.ha http admin executes typed former primary log rewind when config
     try expectContains(stale.body, "RejoinAssessmentStale");
 }
 
+test "storage.ha http admin rejects typed former primary rewind on node without local log" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_rewind,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try expectContains(response.body, "FormerPrimaryLogUnavailable");
+}
+
 test "storage.ha http admin marks former primary slot for typed reseed" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "rejoin-reseed");
@@ -1631,6 +1647,22 @@ test "storage.ha http admin marks former primary slot for typed reseed" {
 
     const slot = primary.slot("primary-a") orelse return error.TestExpectedEqual;
     try std.testing.expect(slot.reseed_required);
+}
+
+test "storage.ha http admin rejects typed former primary reseed on node without primary context" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_reseed,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":3,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try expectContains(response.body, "PrimaryUnavailable");
 }
 
 test "storage.ha http admin serves health and command endpoint" {
@@ -1967,10 +1999,8 @@ test "storage.ha http admin serves health and command endpoint" {
         .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
     });
     defer typed_rejoin_rewind.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_rewind.status);
-    try std.testing.expectEqualStrings("application/json", typed_rejoin_rewind.content_type.?);
-    try expectContains(typed_rejoin_rewind.body, "\"action\":\"rewind\"");
-    try std.testing.expect(std.mem.indexOf(u8, typed_rejoin_rewind.body, "\"rewind\":") == null);
+    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_rewind.status);
+    try expectContains(typed_rejoin_rewind.body, "FormerPrimaryLogUnavailable");
 
     var typed_rejoin_reseed_mismatch = try server.handle(.{
         .method = .POST,
