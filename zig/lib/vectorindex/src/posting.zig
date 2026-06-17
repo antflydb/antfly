@@ -2703,9 +2703,9 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
-            const decoded = try PostingFormat.decodeDeltaTail(index.alloc, entry.value);
-            defer index.alloc.free(decoded);
-            try out.appendSlice(index.alloc, decoded);
+            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            try out.ensureUnusedCapacity(index.alloc, iterator.recordCount());
+            while (try iterator.next()) |record| out.appendAssumeCapacity(record);
             maybe_entry = try cursor.next();
         }
         return try out.toOwnedSlice(index.alloc);
@@ -5419,9 +5419,9 @@ const PostingPersistenceTestIndex = struct {
         errdefer out.deinit(self.alloc);
         for (self.delta_entries.items) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
-            const decoded = try PostingFormat.decodeDeltaTail(self.alloc, entry.value);
-            defer self.alloc.free(decoded);
-            try out.appendSlice(self.alloc, decoded);
+            var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
+            try out.ensureUnusedCapacity(self.alloc, iterator.recordCount());
+            while (try iterator.next()) |record| out.appendAssumeCapacity(record);
         }
         return try out.toOwnedSlice(self.alloc);
     }
