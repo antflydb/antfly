@@ -122,6 +122,40 @@ func TestSourceFlagsGoogleDriveInlineDefaultIsLargeEnoughForDocuments(t *testing
 	}
 }
 
+func TestSourceFlagsGoogleDriveInlineMaxInlineBytesCanBeExplicitlySmall(t *testing.T) {
+	flags := parseSourceFlagsForTest(t,
+		"--source", "google-drive",
+		"--drive-folder", "folder-id",
+		"--drive-access-token", "token",
+		"--inline-content",
+		"--max-inline-bytes", fmt.Sprint(defaultDocsafMaxInlineContentBytes),
+	)
+	flags.normalizeForSource()
+	if got := *flags.maxInlineBytes; got != defaultDocsafMaxInlineContentBytes {
+		t.Fatalf("maxInlineBytes = %d, want explicit %d", got, defaultDocsafMaxInlineContentBytes)
+	}
+}
+
+func TestSourceFlagsInlineMaxInlineBytesCanDisableGuard(t *testing.T) {
+	flags := parseSourceFlagsForTest(t,
+		"--source", "google-drive",
+		"--drive-folder", "folder-id",
+		"--drive-access-token", "token",
+		"--inline-content",
+		"--max-inline-bytes", "0",
+	)
+	flags.normalizeForSource()
+	if err := flags.validate(context.Background()); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if got := *flags.maxInlineBytes; got != 0 {
+		t.Fatalf("maxInlineBytes = %d, want disabled guard", got)
+	}
+	if got := flags.options().MaxInlineBytes; got != 0 {
+		t.Fatalf("options().MaxInlineBytes = %d, want disabled guard", got)
+	}
+}
+
 func TestGoogleDriveTokenCacheLoadTokenSource(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "google-drive-token.json")
 	cache := googleDriveTokenCache{

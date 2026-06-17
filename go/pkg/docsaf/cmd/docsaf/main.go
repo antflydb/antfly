@@ -36,6 +36,7 @@ func (s *StringSliceFlag) Set(value string) error {
 }
 
 type sourceFlags struct {
+	fs                *flag.FlagSet
 	sourceType        *string
 	dirPath           *string
 	baseURL           *string
@@ -54,6 +55,7 @@ type sourceFlags struct {
 
 func registerSourceFlags(fs *flag.FlagSet) sourceFlags {
 	flags := sourceFlags{
+		fs:                fs,
 		sourceType:        fs.String("source", "filesystem", "Source type: filesystem or google-drive"),
 		dirPath:           fs.String("dir", "", "Path to directory containing source documents (required for filesystem source)"),
 		baseURL:           fs.String("base-url", "", "Fetchable URL prefix for source documents"),
@@ -73,9 +75,6 @@ func registerSourceFlags(fs *flag.FlagSet) sourceFlags {
 }
 
 func (f sourceFlags) validate(ctx context.Context) error {
-	if err := f.validateInlineOptions(); err != nil {
-		return err
-	}
 	switch f.normalizedSourceType() {
 	case "filesystem":
 		return f.validateFilesystem()
@@ -92,17 +91,23 @@ func (f sourceFlags) validate(ctx context.Context) error {
 	}
 }
 
-func (f sourceFlags) validateInlineOptions() error {
-	if *f.inlineContent && *f.maxInlineBytes <= 0 {
-		return fmt.Errorf("--max-inline-bytes must be positive when --inline-content is set")
-	}
-	return nil
-}
-
 func (f sourceFlags) normalizeForSource() {
-	if f.normalizedSourceType() == "google-drive" && *f.inlineContent && *f.maxInlineBytes == defaultDocsafMaxInlineContentBytes {
+	if f.normalizedSourceType() == "google-drive" && *f.inlineContent && !f.flagSet("max-inline-bytes") {
 		*f.maxInlineBytes = defaultDriveMaxInlineContentBytes
 	}
+}
+
+func (f sourceFlags) flagSet(name string) bool {
+	if f.fs == nil {
+		return false
+	}
+	set := false
+	f.fs.Visit(func(flag *flag.Flag) {
+		if flag.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func (f sourceFlags) validateFilesystem() error {
