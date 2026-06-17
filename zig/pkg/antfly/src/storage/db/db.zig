@@ -46,6 +46,8 @@ const apply_state = @import("derived/apply_state.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
+const ha_standby_mod = @import("../ha/standby.zig");
+const ha_write_gate_mod = @import("../ha/write_gate.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_worker = @import("derived/derived_worker.zig");
@@ -198,6 +200,11 @@ pub const OpenOptions = struct {
     /// that need remote-write or remote-apply durability must use the HA commit
     /// gate around the primary replication stream.
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    /// Optional HA write ownership gate. Client/API writes are allowed only
+    /// when this DB is attached to the current HA primary. Standby apply paths
+    /// must use replicated-apply entry points that explicitly bypass this
+    /// client-write guard.
+    ha_write_gate: ?HAWriteGate = null,
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -206,6 +213,11 @@ pub const HAAsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
     last_lsn: ?*std.atomic.Value(u64) = null,
     failure_count: ?*std.atomic.Value(u64) = null,
+};
+
+pub const HAWriteGate = union(enum) {
+    primary: *ha_primary_mod.Primary,
+    standby: *ha_standby_mod.Standby,
 };
 
 pub const ReplayProgress = struct {
@@ -757,6 +769,7 @@ const EnrichmentAppendContext = struct {
     async_context: ?*AsyncContext,
     log_mutex: *std.atomic.Mutex,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    ha_write_gate: ?HAWriteGate = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -777,6 +790,7 @@ const EnrichmentAppendContext = struct {
             .io = if (self.async_context) |ctx| ctx.io else null,
             .async_context = self.async_context,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_write_gate = self.ha_write_gate,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -815,6 +829,7 @@ const BatchExecutionContext = struct {
     async_context: ?*AsyncContext = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    ha_write_gate: ?HAWriteGate = null,
 };
 
 const ReplayApplyContext = struct {
@@ -1006,6 +1021,7 @@ const BatchExecutionOptions = struct {
     wait_for_sync_level: bool = true,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
+    bypass_ha_write_gate: bool = false,
 };
 
 pub const OpenProfile = struct {
@@ -2419,6 +2435,7 @@ pub const DB = struct {
     promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
+    ha_write_gate: ?HAWriteGate = null,
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -2478,7 +2495,12 @@ pub const DB = struct {
             .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_write_gate = self.ha_write_gate,
         };
+    }
+
+    fn enforceHAWriteGate(self: *DB) !void {
+        try enforceHAWriteGateOptional(self.ha_write_gate);
     }
 
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
@@ -2629,6 +2651,7 @@ pub const DB = struct {
                 .promotion_owner = opts.promotion_owner,
                 .entity_sink_missing_policy = opts.entity_sink_missing_policy,
                 .ha_async_effect_mirror = opts.ha_async_effect_mirror,
+                .ha_write_gate = opts.ha_write_gate,
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
@@ -2808,6 +2831,7 @@ pub const DB = struct {
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_write_gate = self.ha_write_gate,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
         };
@@ -2852,6 +2876,7 @@ pub const DB = struct {
             .async_context = self.async_context,
             .log_mutex = resources.log_mutex,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
+            .ha_write_gate = self.ha_write_gate,
         };
 
         const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
@@ -2926,6 +2951,7 @@ pub const DB = struct {
                 .resolution_runtime = self.resolution_runtime,
                 .promotion_runtime = self.promotion_runtime,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
+                .ha_write_gate = self.ha_write_gate,
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
@@ -3806,6 +3832,7 @@ pub const DB = struct {
         limit: usize,
     ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
 
         const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
         defer self.alloc.free(prefix);
@@ -3841,6 +3868,7 @@ pub const DB = struct {
     }
 
     fn deleteDocumentArtifactChildRangeOutboxEntry(self: *DB, key: []const u8) !void {
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         const deletes = [_][]const u8{key};
@@ -3857,11 +3885,13 @@ pub const DB = struct {
         try self.batchInternal(apply_req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
         });
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
         if (child_batch.artifact_writes.len == 0 and
             child_batch.artifact_delete_keys.len == 0 and
             child_batch.documents.len == 0 and
@@ -4009,6 +4039,7 @@ pub const DB = struct {
 
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (!opts.bypass_ha_write_gate) try self.enforceHAWriteGate();
         const total_start_ns = monotonicTimeNs();
         defer {
             if (profile) |active_profile| {
@@ -5286,6 +5317,7 @@ pub const DB = struct {
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
         lockApply(self);
@@ -6820,6 +6852,7 @@ pub const DB = struct {
         key: []const u8,
     ) !u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
         lockApply(self);
@@ -17934,6 +17967,7 @@ fn collectGraphArtifactsForDocIndex(
 
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
     if (keys.len == 0) return;
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
@@ -18081,6 +18115,7 @@ fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
 }
 
 fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch) !u64 {
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
@@ -18094,6 +18129,19 @@ fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_t
     var record = try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
     defer change_journal_mod.deinitRecord(ctx.alloc, &record);
     return try change_journal_mod.encodeRecord(ctx.alloc, record);
+}
+
+fn enforceHAWriteGateOptional(gate: ?HAWriteGate) !void {
+    const configured = gate orelse return;
+    const decision = switch (configured) {
+        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
+    };
+    switch (decision.action) {
+        .allow_write => return,
+        .reject_read_only_standby => return error.HAReadOnlyStandby,
+        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+    }
 }
 
 fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, payload: []const u8) void {
@@ -36584,6 +36632,46 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     try std.testing.expectEqual(@as(u64, 1), decoded.record.sequence);
     try std.testing.expectEqualStrings(artifact_key, decoded.record.changed_artifact_keys[0]);
     try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
+}
+
+test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
+        .cluster_id = 300,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"client\"}" }},
+    }));
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated\"}" }},
+    });
+    var found = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
 }
 
 test "db reopen replays pending derived embeddings with durable lsm primary backend" {
