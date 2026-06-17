@@ -51,7 +51,9 @@ pub const ReadCheckRequest = struct {
 
 pub const HAIdentity = struct {
     cluster_id: i64,
+    /// Shard identity. Use 0 for whole-instance HA scope.
     shard_id: i64,
+    /// Table identity. Use 0 for whole-instance HA scope.
     table_id: i64,
     timeline_id: i64,
     epoch: i64,
