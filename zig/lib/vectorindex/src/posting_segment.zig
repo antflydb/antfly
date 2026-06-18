@@ -982,13 +982,13 @@ pub const LazyDirectorySnapshot = struct {
             const index_data = try readSegmentIndexAlloc(alloc, self.io, self.dir, manifest_entry);
             defer alloc.free(index_data);
 
-            const range = (try readSegmentDeltaValueRangeAlloc(alloc, self.io, self.dir, manifest_entry, index_data, posting_id)) orelse continue;
-            defer range.deinit(alloc);
-
+            const range = (try deltaIndexRange(index_data, entry.meta.entry_count, posting_id)) orelse continue;
             var delta_index = range.past_index;
             while (delta_index > range.first_index) {
                 delta_index -= 1;
-                const value = try deltaValueFromRange(index_data, range, delta_index);
+                const found = try deltaIndexEntryFromIndexData(index_data, delta_index);
+                const value = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
+                defer alloc.free(value);
                 try latestDeltaValueRecordAfterGenerationForMember(value, vector_id, base_generation, &best_sequence, &best_record);
             }
         }
@@ -2543,6 +2543,11 @@ const OwnedDeltaValueRange = struct {
     }
 };
 
+const DeltaIndexRange = struct {
+    first_index: usize,
+    past_index: usize,
+};
+
 pub const ValueLocation = struct {
     offset: usize,
     len: usize,
@@ -3677,7 +3682,33 @@ fn deltaValueFromRange(index_data: []const u8, range: OwnedDeltaValueRange, inde
 
 fn deltaIndexEntryFromRange(index_data: []const u8, range: OwnedDeltaValueRange, index: usize) !IndexEntry {
     if (index < range.first_index or index >= range.past_index) return error.CorruptedPostingSegment;
-    return try indexEntryFromBytes(index_data[index * index_entry_size ..][0..index_entry_size]);
+    return try deltaIndexEntryFromIndexData(index_data, index);
+}
+
+fn deltaIndexRange(index_data: []const u8, entry_count: usize, posting_id: PostingId) !?DeltaIndexRange {
+    const first_index = lowerBoundIndexData(index_data, entry_count, posting_id, .delta, 0);
+    if (first_index >= entry_count) return null;
+
+    const first_entry = try deltaIndexEntryFromIndexData(index_data, first_index);
+    if (first_entry.posting_id != posting_id or first_entry.kind != .delta) return null;
+
+    var past_index = first_index + 1;
+    while (past_index < entry_count) : (past_index += 1) {
+        const found = try deltaIndexEntryFromIndexData(index_data, past_index);
+        if (found.posting_id != posting_id or found.kind != .delta) break;
+    }
+
+    return .{
+        .first_index = first_index,
+        .past_index = past_index,
+    };
+}
+
+fn deltaIndexEntryFromIndexData(index_data: []const u8, index: usize) !IndexEntry {
+    const index_offset = std.math.mul(usize, index, index_entry_size) catch return error.CorruptedPostingSegment;
+    const index_end = std.math.add(usize, index_offset, index_entry_size) catch return error.CorruptedPostingSegment;
+    if (index_end > index_data.len) return error.CorruptedPostingSegment;
+    return try indexEntryFromBytes(index_data[index_offset..index_end]);
 }
 
 fn deltaValueFromEntryRange(range: OwnedDeltaValueRange, found: IndexEntry) ![]const u8 {
