@@ -215,6 +215,65 @@ func TestHAClientPromoteWithCurrentFenceUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientAssessPromotionUsesAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodPost)
+		}
+		if r.URL.Path != HAPromotionAssessPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPromotionAssessPath)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		got := string(body)
+		if !strings.Contains(got, `"required_lsn":12`) ||
+			!strings.Contains(got, `"fencing_confirmed":true`) ||
+			!strings.Contains(got, `"force":false`) ||
+			!strings.Contains(got, `"use_current_fence":true`) {
+			t.Fatalf("promotion assess body = %s, want required LSN and fence mode fields", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haPromotionAssessResponseJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	resp, err := client.WithToken("test-token").AssessPromotion(context.Background(), PromotionAssessRequest{
+		RequiredLsn:      12,
+		FencingConfirmed: true,
+		Force:            false,
+		UseCurrentFence:  true,
+	})
+	if err != nil {
+		t.Fatalf("AssessPromotion returned error: %v", err)
+	}
+	if resp.Action.ActionKind != HAActionKindPromotionAssess || resp.Action.State != HAActionStateAssessed {
+		t.Fatalf("promotion assess action = %#v, want assessed promotion receipt", resp.Action)
+	}
+	if !resp.Assessment.CanPromote || !resp.Assessment.Safe || resp.Assessment.Mode != HAPromotionModeSafe {
+		t.Fatalf("promotion assessment = %#v, want safe promotable assessment", resp.Assessment)
+	}
+	if resp.Assessment.RequiredLsn != 12 || resp.Assessment.ReceivedLsn != 12 || resp.Assessment.AppliedLsn != 12 {
+		t.Fatalf("promotion assessment LSNs = %#v, want all at 12", resp.Assessment)
+	}
+}
+
 func TestHAClientRewindRejoinUsesAdminAPI(t *testing.T) {
 	t.Parallel()
 
@@ -2106,6 +2165,34 @@ func haPromotionResponseJSON() string {
 		"fence_generation":3,
 		"fence_token":"ha-fence-token",
 		"forced":false
+	}`
+}
+
+func haPromotionAssessResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"action":{
+			"action_id":"promotion_assess:standby-a",
+			"action_kind":"promotion_assess",
+			"target":"standby-a",
+			"state":"assessed",
+			"node_id":"standby-a"
+		},
+		"assessment":{
+			"required_lsn":12,
+			"received_lsn":12,
+			"applied_lsn":12,
+			"has_required_lsn":true,
+			"caught_up_to_received":true,
+			"fencing_confirmed":true,
+			"force":false,
+			"mode":"safe",
+			"data_loss_possible":false,
+			"safe":true,
+			"requires_fencing":false,
+			"requires_force":false,
+			"can_promote":true
+		}
 	}`
 }
 
