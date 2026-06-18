@@ -1072,7 +1072,7 @@ aggregate, join, lateral, window, CTE, insert, update/delete, insert-source,
 mutation-source, joined-mutation-source, and merge mutation plans while
 preserving the existing public entrypoints through facade aliases;
 `api/sql_adapter/ddl_plan.zig` owns the adapter-noop DDL, enum-type catalog,
-domain catalog,
+domain catalog, identity-allocator catalog,
 schema-namespace catalog, extension catalog, function/routine catalog, and
 authorization catalog, sequence catalog, database catalog, tablespace catalog,
 notification channel, logical replication, type-system catalog, maintenance

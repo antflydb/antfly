@@ -589,6 +589,10 @@ pub const Routes = struct {
         return matchTableRowsAction(path, rows_mutation_source_suffix);
     }
 
+    pub fn matchTableRowsSource(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_source_suffix);
+    }
+
     pub fn matchDatabasePath(path: []const u8) ?DatabasePath {
         if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
         const database_name = path[databases_prefix.len..];

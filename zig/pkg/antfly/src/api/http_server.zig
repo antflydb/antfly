@@ -4836,6 +4836,11 @@ pub const ApiHttpServer = struct {
                 return try self.handlePublicTableRowsMutationSource(rows_route.table_name, req.body, authenticated_identity);
             }
         }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableRowsSource(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsSource(rows_route.table_name);
+            }
+        }
         if (req.method == .POST) {
             if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
                 return try self.handlePublicTableBatch(batch_route.table_name, req.body);
@@ -7365,6 +7370,67 @@ pub const ApiHttpServer = struct {
             .join => try self.handlePublicTableRowsJoin(table_name, body, authenticated_identity),
             .lateral => try self.handlePublicTableRowsLateral(table_name, body, authenticated_identity),
         };
+    }
+
+    pub fn handlePublicTableRowsSource(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+    ) !http_common.HttpResponse {
+        const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        const external_base_source = schema.external_base_source orelse return try textResponse(self.alloc, 404, "not found");
+        const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
+        const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
+        const opened_store = resolver.openParquetPrefixAlloc(self.alloc, binding, .{}) catch |err| switch (err) {
+            error.UnsupportedRowsQuery, error.UnsupportedExternalLakeCredentialRef => return try textResponse(self.alloc, 501, "rows source unavailable"),
+            error.ExternalLakeCredentialRefNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ExternalLakeCredentialScopeMismatch => return try textResponse(self.alloc, 403, "forbidden"),
+            else => return err,
+        };
+        var lake_source = table_reads.OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+            self.alloc,
+            schema,
+            opened_store,
+            .{},
+        ) catch |err| switch (err) {
+            error.EmptyExternalSourceSnapshot, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows source unavailable"),
+            error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
+            else => return err,
+        };
+        defer lake_source.deinit();
+
+        const state = lake_source.pinnedState();
+        const Source = struct {
+            kind: []const u8 = "external_lake",
+            format: []const u8,
+            source_uri: []const u8,
+            snapshot_id: []const u8,
+            schema_fingerprint: []const u8,
+            file_count: usize,
+            row_group_count: usize,
+            row_count: u64,
+            byte_len: u64,
+        };
+        const Response = struct {
+            source: Source,
+        };
+        return try jsonResponse(self.alloc, Response{ .source = .{
+            .format = @tagName(state.format),
+            .source_uri = state.source_uri,
+            .snapshot_id = state.snapshot_id,
+            .schema_fingerprint = state.schema_fingerprint,
+            .file_count = state.file_count,
+            .row_group_count = state.row_group_count,
+            .row_count = state.row_count,
+            .byte_len = state.byte_len,
+        } });
     }
 
     pub fn handlePublicTableRowsQuery(
@@ -17369,6 +17435,28 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
     try std.testing.expectEqual(@as(i64, 30), rows[1].object.get("amount").?.integer);
     try std.testing.expect(rows[0].object.get("tenant") == null);
+
+    var source_response = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/events/rows:source",
+    });
+    defer source_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), source_response.status);
+    try std.testing.expectEqual(@as(u32, 2), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed_source = try std.json.parseFromSlice(std.json.Value, alloc, source_response.body, .{ .allocate = .alloc_always });
+    defer parsed_source.deinit();
+    const source_state = parsed_source.value.object.get("source").?.object;
+    try std.testing.expectEqualStrings("external_lake", source_state.get("kind").?.string);
+    try std.testing.expectEqualStrings("parquet", source_state.get("format").?.string);
+    try std.testing.expectEqualStrings("s3://bucket/events", source_state.get("source_uri").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, source_state.get("snapshot_id").?.string, "sha256:"));
+    try std.testing.expectEqualStrings("schema-v1", source_state.get("schema_fingerprint").?.string);
+    try std.testing.expectEqual(@as(i64, 1), source_state.get("file_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), source_state.get("row_group_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), source_state.get("row_count").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(parquet_object.len)), source_state.get("byte_len").?.integer);
 }
 
 test "api http server resolves credentialed external lake rows from node config" {

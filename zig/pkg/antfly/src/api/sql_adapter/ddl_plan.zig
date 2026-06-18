@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const db_mod = @import("../../storage/db/mod.zig");
 const plan_mod = @import("plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 
@@ -149,6 +150,41 @@ pub const DropDomainPlan = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.domain_name);
+        self.* = undefined;
+    }
+};
+
+pub const IdentityAllocatorPlan = struct {
+    table_name: []const u8,
+    column: runtime_schema.RelationalColumn,
+    kind: IdentityAllocatorKind,
+    options: SequenceOptions = .{},
+    primary_key: bool = false,
+    additional_columns: []const runtime_schema.RelationalColumn = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        freeDdlRelationalColumn(alloc, self.column);
+        self.options.deinit(alloc);
+        clearDdlRelationalColumns(alloc, self.additional_columns);
+        if (self.additional_columns.len > 0) alloc.free(self.additional_columns);
+        self.* = undefined;
+    }
+};
+
+pub const IdentityAllocatorKind = enum {
+    serial,
+    bigserial,
+    generated_by_default,
+    generated_always,
+};
+
+pub const IdentityAllocatorSpec = struct {
+    kind: IdentityAllocatorKind,
+    options: SequenceOptions = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.options.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1543,6 +1579,42 @@ fn freeDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_sch
     if (checks.len > 0) alloc.free(checks);
 }
 
+fn freeDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) void {
+    alloc.free(column.name);
+    alloc.free(column.path);
+    if (column.collation) |collation| alloc.free(collation);
+    if (column.index_name) |index_name| alloc.free(index_name);
+    freeStringSlice(alloc, column.index_include_columns);
+    if (column.default_value) |value| alloc.free(value.value_json);
+    if (column.on_update_value) |value| alloc.free(value.value_json);
+    if (column.generated) |generated| freeDdlGeneratedValue(alloc, generated);
+    freeDdlUniquePredicates(alloc, column.index_where);
+    freeExpressionConditions(alloc, column.index_where_expressions);
+    if (column.index_where_expressions.len > 0) alloc.free(column.index_where_expressions);
+}
+
+fn clearDdlRelationalColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
+    for (columns) |column| freeDdlRelationalColumn(alloc, column);
+}
+
+fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) void {
+    if (generated.field) |field| alloc.free(field);
+    freeStringSlice(alloc, generated.fields);
+    if (generated.separator.len > 0) alloc.free(generated.separator);
+}
+
+fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
+    for (predicates) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value| alloc.free(value);
+    }
+    if (predicates.len > 0) alloc.free(predicates);
+}
+
+fn freeExpressionConditions(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionCondition) void {
+    for (values) |value| plan_mod.freeExpressionCondition(alloc, value);
+}
+
 fn freeDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
     for (operations) |operation_const| {
         var operation = operation_const;
@@ -1626,6 +1698,89 @@ test "SQL adapter DDL domain plans own nested defaults and checks" {
         .cascade = true,
     } };
     drop.deinit(alloc);
+}
+
+test "SQL adapter DDL identity allocator plans own column metadata" {
+    const alloc = std.testing.allocator;
+
+    var include_columns = try alloc.alloc([]const u8, 1);
+    include_columns[0] = try alloc.dupe(u8, "tenant_id");
+
+    var generated_fields = try alloc.alloc([]const u8, 2);
+    generated_fields[0] = try alloc.dupe(u8, "tenant_id");
+    generated_fields[1] = try alloc.dupe(u8, "id");
+
+    var index_where = try alloc.alloc(runtime_schema.UniquePredicate, 1);
+    index_where[0] = .{
+        .field = try alloc.dupe(u8, "tenant_id"),
+        .op = .eq,
+        .value_json = try alloc.dupe(u8, "\"tenant-a\""),
+    };
+
+    var index_where_expressions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
+    index_where_expressions[0] = .{
+        .lhs = .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, "tenant_id"),
+        },
+        .op = .eq,
+        .rhs = &.{},
+    };
+
+    var additional = try alloc.alloc(runtime_schema.RelationalColumn, 1);
+    additional[0] = .{
+        .name = try alloc.dupe(u8, "tenant_id"),
+        .path = try alloc.dupe(u8, "tenant_id"),
+        .field_type = .keyword,
+        .index_name = try alloc.dupe(u8, "usage_records_tenant_idx"),
+    };
+
+    var plan = IdentityAllocatorPlan{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .column = .{
+            .name = try alloc.dupe(u8, "id"),
+            .path = try alloc.dupe(u8, "id"),
+            .field_type = .numeric,
+            .collation = try alloc.dupe(u8, "C"),
+            .index_name = try alloc.dupe(u8, "usage_records_id_idx"),
+            .index_include_columns = include_columns,
+            .default_value = .{
+                .kind = .literal,
+                .value_json = try alloc.dupe(u8, "1"),
+            },
+            .on_update_value = .{
+                .kind = .now_ns,
+                .value_json = try alloc.dupe(u8, "{\"now_ns\":true}"),
+            },
+            .generated = .{
+                .op = .concat_ws,
+                .fields = generated_fields,
+                .separator = try alloc.dupe(u8, ":"),
+            },
+            .index_where = index_where,
+            .index_where_expressions = index_where_expressions,
+        },
+        .kind = .generated_always,
+        .options = .{
+            .start_with = 100,
+            .increment_by = 10,
+            .owned_by = .{
+                .table_name = try alloc.dupe(u8, "usage_records"),
+                .column_name = try alloc.dupe(u8, "id"),
+            },
+        },
+        .primary_key = true,
+        .additional_columns = additional,
+    };
+    plan.deinit(alloc);
+
+    var spec = IdentityAllocatorSpec{
+        .kind = .generated_by_default,
+        .options = .{
+            .as_type = try alloc.dupe(u8, "bigint"),
+        },
+    };
+    spec.deinit(alloc);
 }
 
 test "SQL adapter DDL namespace and extension plans own strings" {

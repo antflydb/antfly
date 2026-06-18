@@ -273,6 +273,9 @@ pub const CreateDomainPlan = sql_adapter.CreateDomainPlan;
 pub const AlterDomainPlan = sql_adapter.AlterDomainPlan;
 pub const DomainAlterOperation = sql_adapter.DomainAlterOperation;
 pub const DropDomainPlan = sql_adapter.DropDomainPlan;
+pub const IdentityAllocatorPlan = sql_adapter.IdentityAllocatorPlan;
+pub const IdentityAllocatorKind = sql_adapter.IdentityAllocatorKind;
+pub const IdentityAllocatorSpec = sql_adapter.IdentityAllocatorSpec;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -360,41 +363,6 @@ pub const RelationLifetimePlan = struct {
 };
 
 pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
-
-pub const IdentityAllocatorPlan = struct {
-    table_name: []const u8,
-    column: runtime_schema.RelationalColumn,
-    kind: IdentityAllocatorKind,
-    options: SequenceOptions = .{},
-    primary_key: bool = false,
-    additional_columns: []const runtime_schema.RelationalColumn = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        freeDdlRelationalColumn(alloc, self.column);
-        self.options.deinit(alloc);
-        clearDdlRelationalColumns(alloc, self.additional_columns);
-        alloc.free(self.additional_columns);
-        self.* = undefined;
-    }
-};
-
-pub const IdentityAllocatorKind = enum {
-    serial,
-    bigserial,
-    generated_by_default,
-    generated_always,
-};
-
-pub const IdentityAllocatorSpec = struct {
-    kind: IdentityAllocatorKind,
-    options: SequenceOptions = .{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.options.deinit(alloc);
-        self.* = undefined;
-    }
-};
 
 const PrivilegeChangeAction = enum {
     grant,
