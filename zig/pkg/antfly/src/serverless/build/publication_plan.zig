@@ -24,6 +24,53 @@ const external_binding = @import("../external_source/catalog_binding.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
 const manifest_base_source = @import("../manifest/base_source.zig");
 
+pub const OwnedExternalTableBinding = struct {
+    binding: external_binding.Binding,
+    table_id: []u8,
+    source_uri: []u8,
+    credential_ref_id: ?[]u8 = null,
+    credential_scope: ?[]u8 = null,
+    snapshot_value: ?[]u8 = null,
+    schema_fingerprint: []u8,
+
+    pub fn deinit(self: *OwnedExternalTableBinding, alloc: Allocator) void {
+        alloc.free(self.table_id);
+        alloc.free(self.source_uri);
+        if (self.credential_ref_id) |value| alloc.free(value);
+        if (self.credential_scope) |value| alloc.free(value);
+        if (self.snapshot_value) |value| alloc.free(value);
+        alloc.free(self.schema_fingerprint);
+        self.* = undefined;
+    }
+};
+
+pub const ExternalSourcePlanResolveRequest = struct {
+    namespace: []const u8,
+    table_name: []const u8,
+    binding: external_binding.Binding,
+};
+
+pub const ExternalSourcePlanResolver = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        resolve: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            request: ExternalSourcePlanResolveRequest,
+        ) anyerror!?external_source_manifest.Plan,
+    };
+
+    pub fn resolveAlloc(
+        self: ExternalSourcePlanResolver,
+        alloc: Allocator,
+        request: ExternalSourcePlanResolveRequest,
+    ) !?external_source_manifest.Plan {
+        return try self.vtable.resolve(self.ptr, alloc, request);
+    }
+};
+
 pub const ArtifactAction = enum {
     reuse,
     rebuild,
@@ -214,6 +261,19 @@ pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
     alloc: Allocator,
     schema_json: []const u8,
 ) !?manifest_base_source.BaseSourceDescriptor {
+    var owned_binding = (try externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return null;
+    defer owned_binding.deinit(alloc);
+    const binding = owned_binding.binding;
+    try binding.validateReadOnlyMvp();
+    const pinned_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() orelse return null;
+    const descriptor = try binding.toManifestBaseSource(pinned_snapshot_id, null);
+    return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);
+}
+
+pub fn externalBindingFromSchemaJsonAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+) !?OwnedExternalTableBinding {
     if (schema_json.len == 0) return null;
 
     var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
@@ -223,11 +283,51 @@ pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
     defer storage_schema.freeSchema(alloc, runtime_schema);
 
     const source = runtime_schema.external_base_source orelse return null;
-    const binding = external_binding.bindingFromRuntimeExternalBaseSource(source);
+    const table_id = try alloc.dupe(u8, source.table_id);
+    errdefer alloc.free(table_id);
+    const source_uri = try alloc.dupe(u8, source.source_uri);
+    errdefer alloc.free(source_uri);
+    const credential_ref_id = if (source.credential_ref) |credential| try alloc.dupe(u8, credential.ref_id) else null;
+    errdefer if (credential_ref_id) |value| alloc.free(value);
+    const credential_scope = if (source.credential_ref) |credential| try alloc.dupe(u8, credential.scope) else null;
+    errdefer if (credential_scope) |value| alloc.free(value);
+    const snapshot_value = switch (source.snapshot_mode) {
+        .current => null,
+        .snapshot_id => |snapshot_id| try alloc.dupe(u8, snapshot_id),
+        .object_version_digest => |digest| try alloc.dupe(u8, digest),
+    };
+    errdefer if (snapshot_value) |value| alloc.free(value);
+    const schema_fingerprint = try alloc.dupe(u8, source.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+
+    const borrowed_binding = external_binding.bindingFromRuntimeExternalBaseSource(source);
+    const binding = external_binding.Binding{
+        .table_id = table_id,
+        .format = borrowed_binding.format,
+        .source_uri = source_uri,
+        .credential_ref = if (credential_ref_id) |ref_id| .{
+            .ref_id = ref_id,
+            .scope = credential_scope orelse &.{},
+        } else null,
+        .snapshot_mode = switch (source.snapshot_mode) {
+            .current => .current,
+            .snapshot_id => .{ .snapshot_id = snapshot_value.? },
+            .object_version_digest => .{ .object_version_digest = snapshot_value.? },
+        },
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = borrowed_binding.write_policy,
+    };
     try binding.validateReadOnlyMvp();
-    const pinned_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() orelse return null;
-    const descriptor = try binding.toManifestBaseSource(pinned_snapshot_id, null);
-    return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);
+
+    return .{
+        .binding = binding,
+        .table_id = table_id,
+        .source_uri = source_uri,
+        .credential_ref_id = credential_ref_id,
+        .credential_scope = credential_scope,
+        .snapshot_value = snapshot_value,
+        .schema_fingerprint = schema_fingerprint,
+    };
 }
 
 test "metadata republish reasons report when any flag is set" {
