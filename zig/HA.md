@@ -488,14 +488,17 @@ Recommended split:
   offline helpers where useful. CLI output should be derived from the same typed
   responses the admin API returns.
 - Go SDK: generated client/types under `go/pkg/sdk/admin/oapi`, with a
-  hand-written `go/pkg/sdk/admin` wrapper that normalizes the admin base URL,
-  installs auth/request editors, exposes stable HA methods, returns typed
-  responses plus raw response bodies where receipts must be audited, and maps
-  non-2xx responses into operation-aware errors. The Kubernetes operator should
-  import this wrapper for executable admin operations instead of duplicating an
-  HTTP client, hard-coding paths, importing generated `oapi` internals directly,
-  or parsing CLI output. The wrapper is the compatibility boundary for Go
-  control-plane code; generated `oapi` symbols are a transport detail.
+  hand-written `go/pkg/sdk/admin` wrapper that follows the style of the other
+  Go SDK APIs: it normalizes the admin base URL, installs auth/request editors,
+  exposes stable HA methods, returns typed responses plus raw response bodies
+  where receipts must be audited, and maps non-2xx responses into
+  operation-aware errors. This should be the only generated Go client for the
+  admin spec; do not generate a separate operator-local client. The Kubernetes
+  operator should import this wrapper for executable admin operations instead
+  of duplicating an HTTP client, hard-coding paths, importing generated `oapi`
+  internals directly, or parsing CLI output. The wrapper is the compatibility
+  boundary for Go control-plane code; generated `oapi` symbols are a transport
+  detail hidden inside the SDK package.
 
 Admin authentication should be explicit but operationally simple. The Antfly
 runtime may be started with `--ha-admin-token-env <name>`; when set, the Zig
@@ -700,7 +703,9 @@ and either rewind or reseed.
   primary-only background mutation loops while still permitting replicated apply.
 - Generate Go admin client/types from `specs/openapi/antfly/admin.yaml` into
   `go/pkg/sdk/admin/oapi`, and keep a small `go/pkg/sdk/admin` wrapper for HA
-  operations following the style of the other SDK APIs.
+  operations following the style of the other SDK APIs. This SDK package is the
+  single Go generation target for the admin contract; operator code must not
+  own another generated admin client.
 - Make `go/pkg/operator` consume the `go/pkg/sdk/admin` HA wrapper for remote
   admin operations. The operator should not import generated `oapi` internals
   directly except in wrapper tests, and it should not maintain separate method
@@ -731,8 +736,10 @@ be validated against that operator package.
   `go/pkg/sdk/admin/oapi`, wrap them in `go/pkg/sdk/admin`, and have
   `go/pkg/operator` import that wrapper for executable `/admin/v1/ha` calls.
   The operator may keep path constants only for status display and plan
-  summaries; live calls and request/response decoding should go through the
-  SDK wrapper.
+  summaries; live calls, auth header installation, retry/error classification,
+  and request/response decoding should go through the SDK wrapper. This keeps
+  the operator on the same API compatibility path as other Go consumers and
+  avoids drift between operator automation and the public Go SDK.
 - Support authenticated admin endpoints by letting the operator read a bearer
   token from a configured process environment variable, defaulting to
   `ANTFLY_HA_ADMIN_TOKEN`. Kubernetes should inject that variable into the
