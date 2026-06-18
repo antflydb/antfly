@@ -1229,35 +1229,50 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 	}
 
-	if sync := ha.SyncPolicy; sync != nil && sync.modeOrDefault() != HADurabilityModeAsync {
+	if sync := ha.SyncPolicy; sync != nil {
 		if sync.Required < 0 {
 			errors = append(errors, "spec.highAvailability.syncPolicy.required must not be negative")
 		}
-		if sync.requiredOrDefault() == 0 {
-			errors = append(errors, "spec.highAvailability.syncPolicy.required must be at least 1 for synchronous modes")
-		}
-		if len(sync.StandbyNames) == 0 {
-			errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames is required for synchronous modes")
-		}
-		required := sync.requiredOrDefault()
-		selection := sync.selectionOrDefault()
-		if selection != HAStandbySelectionAll && required > int32(len(sync.StandbyNames)) {
-			errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.required (%d) cannot exceed standbyNames length (%d) for %s selection", required, len(sync.StandbyNames), selection))
-		}
-		seenSyncNames := map[string]int{}
-		for i, name := range sync.StandbyNames {
-			if strings.TrimSpace(name) == "" {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] is empty", i))
-				continue
+		if sync.modeOrDefault() == HADurabilityModeAsync {
+			if sync.Required != 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.required must be omitted when mode is Async")
 			}
-			if first, exists := seenSyncNames[name]; exists {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, name, first))
+			if len(sync.StandbyNames) > 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames must be omitted when mode is Async")
 			}
-			seenSyncNames[name] = i
-			if _, ok := names[name]; !ok {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
-			} else if _, desired := desiredNames[name]; !desired {
-				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q must reference a desired standby", i, name))
+			if sync.Selection != "" && sync.Selection != HAStandbySelectionAny {
+				errors = append(errors, "spec.highAvailability.syncPolicy.selection must be Any or omitted when mode is Async")
+			}
+			if sync.FailurePolicy != "" && sync.FailurePolicy != HAFailurePolicyBlock {
+				errors = append(errors, "spec.highAvailability.syncPolicy.failurePolicy must be Block or omitted when mode is Async")
+			}
+		} else {
+			if sync.requiredOrDefault() == 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.required must be at least 1 for synchronous modes")
+			}
+			if len(sync.StandbyNames) == 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames is required for synchronous modes")
+			}
+			required := sync.requiredOrDefault()
+			selection := sync.selectionOrDefault()
+			if selection != HAStandbySelectionAll && required > int32(len(sync.StandbyNames)) {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.required (%d) cannot exceed standbyNames length (%d) for %s selection", required, len(sync.StandbyNames), selection))
+			}
+			seenSyncNames := map[string]int{}
+			for i, name := range sync.StandbyNames {
+				if strings.TrimSpace(name) == "" {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] is empty", i))
+					continue
+				}
+				if first, exists := seenSyncNames[name]; exists {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, name, first))
+				}
+				seenSyncNames[name] = i
+				if _, ok := names[name]; !ok {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
+				} else if _, desired := desiredNames[name]; !desired {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q must reference a desired standby", i, name))
+				}
 			}
 		}
 	}

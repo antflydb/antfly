@@ -2344,6 +2344,57 @@ func TestValidateCreate_HighAvailabilityRejectsUnsupportedAutomaticFencingAuthor
 	}
 }
 
+func TestValidateCreate_HighAvailabilityAllowsDefaultAsyncSyncPolicy(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeAsync,
+			Selection:     HAStandbySelectionAny,
+			FailurePolicy: HAFailurePolicyBlock,
+		},
+	}
+
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected explicit default async sync policy to be accepted, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAsyncSyncOnlyFields(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a"},
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:          HADurabilityModeAsync,
+			Selection:     HAStandbySelectionFirst,
+			Required:      1,
+			StandbyNames:  []string{"standby-a"},
+			FailurePolicy: HAFailurePolicyDegradeToAsync,
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected async sync policy with synchronous-only fields to be rejected")
+	}
+	for _, want := range []string{
+		"syncPolicy.required must be omitted when mode is Async",
+		"syncPolicy.standbyNames must be omitted when mode is Async",
+		"syncPolicy.selection must be Any or omitted when mode is Async",
+		"syncPolicy.failurePolicy must be Block or omitted when mode is Async",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected async sync policy error %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilitySyncStandbysMustBeDeclared(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
