@@ -2800,6 +2800,7 @@ pub fn build(b: *std.Build) void {
     const lib_ha_chaos_default_filters = [_][]const u8{
         "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
         "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
+        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
         "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
         "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
         "storage.ha chaos network partition requires fence before standby promotion",
@@ -4092,6 +4093,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
             "swarm HA standby replication flags require upstream and slot",
+            "swarm HA string classifier distinguishes missing padded and valid values",
             "swarm HA runtime rejects ambiguous role flags",
             "antfly config uses cli override before common config",
             "swarm public api caps keep alive request reuse",

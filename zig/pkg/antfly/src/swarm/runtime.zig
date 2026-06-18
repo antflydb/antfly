@@ -2199,15 +2199,20 @@ fn validateHARole(cli: CliConfig) !void {
     if (cli.ha_fence_wal != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
-    if (paddedHAString(cli.ha_fence_wal)) return error.HAFenceWalInvalid;
-    if (paddedHAString(cli.ha_former_primary_log)) return error.HAFormerPrimaryLogInvalid;
-    if (cli.ha_admin_token_env) |env_var| {
-        const trimmed = std.mem.trim(u8, env_var, " \t\r\n");
-        if (trimmed.len == 0) return error.HAAdminTokenEnvMissing;
-        if (trimmed.len != env_var.len) return error.HAAdminTokenEnvInvalid;
-        if (!isHAAdminTokenEnvName(trimmed)) return error.HAAdminTokenEnvInvalid;
+    if (cli.ha_former_primary_log != null) {
+        _ = try requireHAString(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
-    if ((primary_requested or standby_requested) and cli.ha_fence_wal == null) return error.HAFenceWalMissing;
+    if (cli.ha_admin_token_env) |env_var| {
+        switch (classifyHAString(env_var)) {
+            .ok => {},
+            .missing => return error.HAAdminTokenEnvMissing,
+            .padded => return error.HAAdminTokenEnvInvalid,
+        }
+        if (!isHAAdminTokenEnvName(env_var)) return error.HAAdminTokenEnvInvalid;
+    }
+    if (primary_requested or standby_requested) {
+        _ = try requireHAString(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
+    }
     if (primary_requested or standby_requested) try validateHAIdentity(cli);
     if (primary_requested) try validateHAPrimaryRoleComplete(cli);
     if (standby_requested) try validateHAStandbyRoleComplete(cli);
@@ -2221,49 +2226,54 @@ fn validateHAIdentity(cli: CliConfig) !void {
     if (cli.ha_epoch == null) return error.HAEpochMissing;
 }
 
-fn missingHAString(value: ?[]const u8) bool {
-    const raw = value orelse return true;
-    return std.mem.trim(u8, raw, " \t\r\n").len == 0;
+const HAStringValidation = enum {
+    ok,
+    missing,
+    padded,
+};
+
+fn classifyHAString(value: ?[]const u8) HAStringValidation {
+    const raw = value orelse return .missing;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return .missing;
+    if (trimmed.len != raw.len) return .padded;
+    return .ok;
 }
 
-fn paddedHAString(value: ?[]const u8) bool {
-    const raw = value orelse return false;
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    return trimmed.len > 0 and trimmed.len != raw.len;
+fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime padded_err: anyerror) ![]const u8 {
+    switch (classifyHAString(value)) {
+        .ok => return value.?,
+        .missing => return missing_err,
+        .padded => return padded_err,
+    }
 }
 
 fn validateHAPrimaryRoleComplete(cli: CliConfig) !void {
-    if (missingHAString(cli.ha_primary_log)) return error.HAPrimaryLogMissing;
-    if (missingHAString(cli.ha_primary_slots)) return error.HAPrimarySlotsMissing;
-    if (missingHAString(cli.ha_primary_node_id)) return error.HAPrimaryNodeIdMissing;
-    if (paddedHAString(cli.ha_primary_log)) return error.HAPrimaryLogInvalid;
-    if (paddedHAString(cli.ha_primary_slots)) return error.HAPrimarySlotsInvalid;
-    if (paddedHAString(cli.ha_primary_node_id)) return error.HAPrimaryNodeIdInvalid;
+    _ = try requireHAString(cli.ha_primary_log, error.HAPrimaryLogMissing, error.HAPrimaryLogInvalid);
+    _ = try requireHAString(cli.ha_primary_slots, error.HAPrimarySlotsMissing, error.HAPrimarySlotsInvalid);
+    _ = try requireHAString(cli.ha_primary_node_id, error.HAPrimaryNodeIdMissing, error.HAPrimaryNodeIdInvalid);
 }
 
 fn validateHAStandbyRoleComplete(cli: CliConfig) !void {
-    if (missingHAString(cli.ha_standby_log)) return error.HAStandbyLogMissing;
-    if (missingHAString(cli.ha_standby_progress)) return error.HAStandbyProgressMissing;
-    if (missingHAString(cli.ha_standby_node_id)) return error.HAStandbyNodeIdMissing;
-    if (paddedHAString(cli.ha_standby_log)) return error.HAStandbyLogInvalid;
-    if (paddedHAString(cli.ha_standby_progress)) return error.HAStandbyProgressInvalid;
-    if (paddedHAString(cli.ha_standby_node_id)) return error.HAStandbyNodeIdInvalid;
+    _ = try requireHAString(cli.ha_standby_log, error.HAStandbyLogMissing, error.HAStandbyLogInvalid);
+    _ = try requireHAString(cli.ha_standby_progress, error.HAStandbyProgressMissing, error.HAStandbyProgressInvalid);
+    _ = try requireHAString(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid);
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
-    const raw_upstream = cli.ha_standby_upstream_url orelse return error.HAStandbyUpstreamUrlMissing;
-    const raw_slot = cli.ha_standby_slot orelse return error.HAStandbySlotMissing;
-    const upstream = std.mem.trim(u8, raw_upstream, " \t\r\n");
-    const slot = std.mem.trim(u8, raw_slot, " \t\r\n");
-    if (upstream.len == 0) return error.HAStandbyUpstreamUrlMissing;
-    if (slot.len == 0) return error.HAStandbySlotMissing;
-    if (upstream.len != raw_upstream.len) return error.HAStandbyUpstreamUrlInvalid;
-    if (slot.len != raw_slot.len) return error.HAStandbySlotInvalid;
+    const upstream = try requireHAString(cli.ha_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
+    const slot = try requireHAString(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
+    const parsed = std.Uri.parse(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
+    if (!isHAReplicationUpstreamScheme(parsed)) return error.HAStandbyUpstreamUrlInvalid;
     return .{
         .upstream_base_uri = upstream,
         .slot_name = slot,
     };
+}
+
+fn isHAReplicationUpstreamScheme(parsed: std.Uri) bool {
+    return std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https");
 }
 
 const OwnedHASyncPolicy = struct {
@@ -3091,6 +3101,14 @@ test "swarm HA standby replication flags require upstream and slot" {
         .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
         .ha_standby_slot = " standby-a\t",
     }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "primary.antfly.svc:8080",
+        .ha_standby_slot = "standby-a",
+    }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "file:///tmp/primary",
+        .ha_standby_slot = "standby-a",
+    }));
 
     const replication_cfg = (try haStandbyReplicationConfigFromCli(.{
         .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
@@ -3098,6 +3116,20 @@ test "swarm HA standby replication flags require upstream and slot" {
     })) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("http://primary.antfly.svc:8080", replication_cfg.upstream_base_uri);
     try std.testing.expectEqualStrings("standby-a", replication_cfg.slot_name);
+}
+
+test "swarm HA string classifier distinguishes missing padded and valid values" {
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
+    try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(" \t\r\n"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString(" standby-a"));
+    try std.testing.expectEqual(HAStringValidation.padded, classifyHAString("standby-a\n"));
+    try std.testing.expectEqual(HAStringValidation.ok, classifyHAString("standby-a"));
+
+    try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(null, error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
+    try std.testing.expectError(error.HAStandbySlotMissing, requireHAString(" \t", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
+    try std.testing.expectError(error.HAStandbySlotInvalid, requireHAString(" standby-a ", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
+    try std.testing.expectEqualStrings("standby-a", try requireHAString("standby-a", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
 }
 
 test "swarm HA primary identity defaults shard and table to whole instance" {
@@ -3167,6 +3199,15 @@ test "swarm HA runtime rejects ambiguous role flags" {
     }));
     try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
+    }));
+    try std.testing.expectError(error.HAFenceWalMissing, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = " \t ",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
     }));
     try std.testing.expectError(error.HAFenceWalInvalid, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",

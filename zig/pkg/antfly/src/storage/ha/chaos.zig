@@ -110,6 +110,21 @@ fn baseRecord(identity: standby_mod.Identity, lsn: u64, payload: []const u8) rep
     };
 }
 
+fn timelineSwitchRecord(identity: standby_mod.Identity, lsn: u64, previous_lsn: u64) replication_record.Record {
+    return .{
+        .kind = .timeline_switch,
+        .payload_codec = .raw,
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
+        .lsn = lsn,
+        .previous_lsn = previous_lsn,
+        .payload = "timeline-switch",
+    };
+}
+
 fn testFiles() [2]backup_manifest.FileEntry {
     return .{
         .{ .path = "manifest", .kind = .manifest, .size_bytes = 8, .crc32 = backup_manifest.crc32("manifest") },
@@ -227,6 +242,58 @@ test "storage.ha chaos crash after receive replays durable WAL before streaming 
         try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&capture, ApplyCapture.apply));
         try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
         try std.testing.expectEqual(@as(u64, 2), standby.nextReceiveLsn());
+    }
+}
+
+test "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "ordering-timeline");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    const promoted_identity = standby_mod.Identity{
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = 2,
+        .epoch = 2,
+    };
+
+    {
+        var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+        defer standby.close();
+        try std.testing.expectEqual(@as(u64, 1), try standby.receive(baseRecord(identity, 1, "one")));
+        try std.testing.expectError(error.RecordAlreadyReceived, standby.receive(baseRecord(identity, 1, "duplicate")));
+        try std.testing.expectError(error.UnexpectedRecordLsn, standby.receive(baseRecord(identity, 3, "gap")));
+
+        var wrong_previous = baseRecord(identity, 2, "wrong-previous");
+        wrong_previous.previous_lsn = 0;
+        try std.testing.expectError(error.UnexpectedPreviousLsn, standby.receive(wrong_previous));
+
+        var future_timeline = baseRecord(promoted_identity, 2, "future-timeline-data");
+        future_timeline.previous_lsn = 1;
+        try std.testing.expectError(error.WrongTimeline, standby.receive(future_timeline));
+
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&capture, ApplyCapture.apply));
+        try std.testing.expectEqualStrings("one", capture.payloads.items[0]);
+
+        try std.testing.expectEqual(@as(u64, 2), try standby.receive(timelineSwitchRecord(promoted_identity, 2, 1)));
+        try std.testing.expectEqual(@as(u64, 2), standby.identity.timeline_id);
+    }
+
+    {
+        var reopened = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 2), reopened.identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), reopened.currentProgress().applied_lsn);
+        try std.testing.expectError(error.WrongTimeline, reopened.receive(baseRecord(identity, 3, "old-timeline")));
+
+        try std.testing.expectEqual(@as(u64, 3), try reopened.receive(baseRecord(promoted_identity, 3, "new-timeline")));
+        var capture = ApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try reopened.applyAvailable(&capture, ApplyCapture.apply));
+        try std.testing.expectEqualStrings("new-timeline", capture.payloads.items[0]);
     }
 }
 
