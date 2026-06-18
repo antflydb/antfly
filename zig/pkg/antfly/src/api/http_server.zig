@@ -442,6 +442,7 @@ pub const StatusSource = struct {
         drop_catalog_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         create_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
         drop_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -524,6 +525,11 @@ pub const StatusSource = struct {
     pub fn applyRelationalSqlDdl(self: StatusSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, sql);
+    }
+
+    pub fn applyDatabaseCatalogPlan(self: StatusSource, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) !tables_api.AppliedRelationalSqlDdlRecord {
+        const fn_ptr = self.vtable.apply_database_catalog_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, plan);
     }
 
     pub fn createNamespace(self: StatusSource, database_name: []const u8, namespace_name: []const u8) !void {
@@ -672,6 +678,10 @@ pub const StatusSource = struct {
                 return try applyRelationalSqlDdlOnService(cast(ptr), alloc, sql);
             }
 
+            fn applyDatabaseCatalogPlan(ptr: *anyopaque, alloc: std.mem.Allocator, plan: relational_sql.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
+                return try applyDatabaseCatalogPlanOnService(cast(ptr), alloc, plan);
+            }
+
             fn createNamespace(ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void {
                 return try createNamespaceOnService(cast(ptr), database_name, namespace_name);
             }
@@ -765,6 +775,7 @@ pub const StatusSource = struct {
             .drop_catalog_table = Gen.dropCatalogTable,
             .update_schema = Gen.updateSchema,
             .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
+            .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
             .create_namespace = Gen.createNamespace,
             .drop_namespace = Gen.dropNamespace,
             .create_index = Gen.createIndex,
@@ -1011,6 +1022,19 @@ fn applyRelationalSqlDdlOnService(
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
+    try svc.runRound();
+    return applied;
+}
+
+fn applyDatabaseCatalogPlanOnService(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    plan: relational_sql.DatabaseCatalogPlan,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    var applied = try tables_api.applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, &snapshot, plan);
+    errdefer applied.deinit(alloc);
     try svc.runRound();
     return applied;
 }
@@ -3828,9 +3852,7 @@ pub const ApiHttpServer = struct {
 
     fn handlePublicCreateDatabase(self: *ApiHttpServer, database_name: []const u8) !http_common.HttpResponse {
         if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
-        const sql = try std.fmt.allocPrint(self.alloc, "CREATE DATABASE {s};", .{database_name});
-        defer self.alloc.free(sql);
-        var applied = self.applyRelationalSqlDdl(sql) catch |err| switch (err) {
+        var applied = self.source.applyDatabaseCatalogPlan(self.alloc, .{ .create = .{ .database_name = database_name } }) catch |err| switch (err) {
             error.DatabaseAlreadyExists => return try textResponse(self.alloc, 409, "database already exists"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
             else => return err,
@@ -3844,9 +3866,7 @@ pub const ApiHttpServer = struct {
 
     fn handlePublicDropDatabase(self: *ApiHttpServer, database_name: []const u8) !http_common.HttpResponse {
         if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
-        const sql = try std.fmt.allocPrint(self.alloc, "DROP DATABASE {s};", .{database_name});
-        defer self.alloc.free(sql);
-        var applied = self.applyRelationalSqlDdl(sql) catch |err| switch (err) {
+        var applied = self.source.applyDatabaseCatalogPlan(self.alloc, .{ .drop = .{ .database_name = database_name } }) catch |err| switch (err) {
             error.DatabaseNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.DatabaseNotEmpty => return try textResponse(self.alloc, 409, "database not empty"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
@@ -4003,6 +4023,84 @@ pub const ApiHttpServer = struct {
         return catalog_resources.isDefaultPublicNamespace(database_name, namespace_name);
     }
 
+    const CatalogTableSubroute = struct {
+        table_name: []const u8,
+        suffix: ?[]const u8 = null,
+    };
+
+    fn catalogTableSubroute(table_path: []const u8) CatalogTableSubroute {
+        if (std.mem.indexOfScalar(u8, table_path, '/')) |slash| {
+            return .{
+                .table_name = table_path[0..slash],
+                .suffix = table_path[slash + 1 ..],
+            };
+        }
+        return .{ .table_name = table_path };
+    }
+
+    fn storageTableNameForCatalogTargetAlloc(self: *ApiHttpServer, target: catalog_resources.TableTarget) ![]u8 {
+        var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+        for (snapshot.tables) |candidate| {
+            if (candidate.table_id == table.table_id) continue;
+            if (!std.mem.eql(u8, candidate.name, table.name)) continue;
+            return error.CatalogTableStorageAliasAmbiguous;
+        }
+        return try self.alloc.dupe(u8, table.name);
+    }
+
+    fn handlePublicCatalogTableSubroute(
+        self: *ApiHttpServer,
+        req: http_common.HttpRequest,
+        uri_parts: UriParts,
+        authenticated_identity: ?AuthenticatedIdentity,
+        target: catalog_resources.TableTarget,
+        suffix: []const u8,
+    ) !http_common.HttpResponse {
+        const storage_table_name = self.storageTableNameForCatalogTargetAlloc(target) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.CatalogTableStorageAliasAmbiguous => return try textResponse(self.alloc, 501, "catalog table storage name is ambiguous until table I/O APIs are catalog-aware"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        defer self.alloc.free(storage_table_name);
+
+        if (std.mem.eql(u8, suffix, "query")) {
+            if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handlePublicTableQuery(storage_table_name, req.body, authenticated_identity);
+        }
+        if (std.mem.eql(u8, suffix, "batch")) {
+            if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handlePublicTableBatch(storage_table_name, req.body);
+        }
+        if (std.mem.eql(u8, suffix, "rows:batch")) {
+            if (req.method != .POST) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handlePublicTableRowsBatch(storage_table_name, req.body);
+        }
+        if (std.mem.eql(u8, suffix, "indexes")) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            return try self.handlePublicTableListIndexes(storage_table_name);
+        }
+        if (std.mem.startsWith(u8, suffix, "indexes/")) {
+            const index_name = suffix["indexes/".len..];
+            if (index_name.len == 0 or std.mem.indexOfScalar(u8, index_name, '/') != null) return try textResponse(self.alloc, 404, "not found");
+            return switch (req.method) {
+                .GET => try self.handlePublicTableGetIndex(storage_table_name, index_name),
+                .POST => try self.handlePublicTableCreateIndex(storage_table_name, index_name, req.body),
+                .DELETE => try self.handlePublicTableDeleteIndex(storage_table_name, index_name),
+                else => try textResponse(self.alloc, 405, "method not allowed"),
+            };
+        }
+        if (std.mem.startsWith(u8, suffix, "documents/")) {
+            if (req.method != .GET) return try textResponse(self.alloc, 405, "method not allowed");
+            const key = suffix["documents/".len..];
+            if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return try textResponse(self.alloc, 404, "not found");
+            return try self.handlePublicTableDocumentLookup(storage_table_name, key, uri_parts.query, authenticated_identity);
+        }
+        return try textResponse(self.alloc, 404, "not found");
+    }
+
     fn handlePublicGetCatalogTable(self: *ApiHttpServer, target: catalog_resources.TableTarget) !http_common.HttpResponse {
         if (!catalogApiIdentifierValid(target.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
         if (!catalogApiIdentifierValid(target.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
@@ -4152,6 +4250,54 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn handlePublicTableDocumentLookup(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        encoded_key: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !http_common.HttpResponse {
+        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_key);
+        defer self.alloc.free(decoded_key);
+        var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, query);
+        defer lookup_opts.deinit(self.alloc);
+
+        var result = (try source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
+            return try textResponse(self.alloc, 404, "not found");
+        };
+        defer result.deinit(self.alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+        if (row_filter_json) |value| {
+            if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
+                return try textResponse(self.alloc, 404, "not found");
+            }
+        }
+        return try http_route_helpers.jsonWithHeadersResponse(self.alloc, 200, result.json, &.{
+            .{
+                .name = "X-Antfly-Version",
+                .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
+            },
+        });
+    }
+
+    const TableDocumentLookupPath = struct {
+        table_name: []const u8,
+        key: []const u8,
+    };
+
+    fn matchPublicTableDocumentLookup(path: []const u8) ?TableDocumentLookupPath {
+        if (!std.mem.startsWith(u8, path, routes.Routes.tables_prefix)) return null;
+        const rest = path[routes.Routes.tables_prefix.len..];
+        const marker_index = std.mem.indexOf(u8, rest, routes.Routes.documents_marker) orelse return null;
+        if (marker_index == 0) return null;
+        const table_name = rest[0..marker_index];
+        const key = rest[marker_index + routes.Routes.documents_marker.len ..];
+        if (key.len == 0 or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+        return .{ .table_name = table_name, .key = key };
+    }
+
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
@@ -4188,11 +4334,12 @@ pub const ApiHttpServer = struct {
         if (routes.Routes.matchDatabaseNamespaceTablePath(uri_parts.path)) |table_path| {
             if (!catalogApiIdentifierValid(table_path.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
             if (!catalogApiIdentifierValid(table_path.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
-            if (std.mem.indexOfScalar(u8, table_path.table_path, '/') != null) {
-                return try textResponse(self.alloc, 501, "explicit catalog table subroutes are not supported until table storage APIs are catalog-aware");
+            const subroute = catalogTableSubroute(table_path.table_path);
+            if (!catalogApiIdentifierValid(subroute.table_name)) return try textResponse(self.alloc, 400, "invalid table name");
+            const target = try catalog_resources.tableTargetFromOptional(table_path.database_name, table_path.namespace_name, subroute.table_name);
+            if (subroute.suffix) |suffix| {
+                return try self.handlePublicCatalogTableSubroute(req, uri_parts, authenticated_identity, target, suffix);
             }
-            if (!catalogApiIdentifierValid(table_path.table_path)) return try textResponse(self.alloc, 400, "invalid table name");
-            const target = try catalog_resources.tableTargetFromOptional(table_path.database_name, table_path.namespace_name, table_path.table_path);
             return switch (req.method) {
                 .GET => try self.handlePublicGetCatalogTable(target),
                 .POST => try self.handlePublicCreateCatalogTable(target, req.body),
@@ -4479,30 +4626,13 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (matchPublicTableDocumentLookup(uri_parts.path)) |document| {
+                return try self.handlePublicTableDocumentLookup(document.table_name, document.key, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
             if (routes.Routes.matchTableLookup(uri_parts.path)) |lookup| {
-                const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, lookup.key);
-                defer self.alloc.free(decoded_key);
-                var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
-                defer lookup_opts.deinit(self.alloc);
-
-                var result = (try source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
-                    return try textResponse(self.alloc, 404, "not found");
-                };
-                defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, lookup.table_name);
-                defer if (row_filter_json) |value| self.alloc.free(value);
-                if (row_filter_json) |value| {
-                    if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
-                        return try textResponse(self.alloc, 404, "not found");
-                    }
-                }
-                return try http_route_helpers.jsonWithHeadersResponse(self.alloc, 200, result.json, &.{
-                    .{
-                        .name = "X-Antfly-Version",
-                        .value = try std.fmt.allocPrint(self.alloc, "{d}", .{result.version}),
-                    },
-                });
+                return try self.handlePublicTableDocumentLookup(lookup.table_name, lookup.key, uri_parts.query, authenticated_identity);
             }
         }
         if (req.method == .GET) {
@@ -9575,20 +9705,15 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .namespace_name = tables_path.namespace_name,
     };
     if (routes.Routes.matchDatabaseNamespaceTablePath(path)) |table_path| {
-        const table_name = if (std.mem.indexOfScalar(u8, table_path.table_path, '/')) |slash|
-            table_path.table_path[0..slash]
-        else
-            table_path.table_path;
+        const table_subroute = explicitCatalogPermissionSubroute(table_path.table_path);
+        const permission_type = explicitCatalogTablePermissionType(method, table_subroute.suffix) orelse return null;
         return .{
             .resource_type = .table,
-            .resource = table_name,
-            .permission_type = switch (method) {
-                .GET => .read,
-                .POST, .PUT, .DELETE => .admin,
-            },
+            .resource = table_subroute.table_name,
+            .permission_type = permission_type,
             .database_name = table_path.database_name,
             .namespace_name = table_path.namespace_name,
-            .table_name = table_name,
+            .table_name = table_subroute.table_name,
         };
     }
     if (routes.Routes.matchDatabaseNamespaces(path)) |database_path| return .{
@@ -9624,6 +9749,11 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
             .permission_type = .read,
         },
         .POST, .PUT, .DELETE => null,
+    };
+    if (matchTableDocumentLookupForPermission(path)) |document| return .{
+        .resource_type = .table,
+        .resource = document.table_name,
+        .permission_type = .read,
     };
     if (routes.Routes.matchTableLookup(path)) |lookup| return .{
         .resource_type = .table,
@@ -9742,6 +9872,47 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
     return null;
 }
 
+const ExplicitCatalogPermissionSubroute = struct {
+    table_name: []const u8,
+    suffix: ?[]const u8 = null,
+};
+
+fn matchTableDocumentLookupForPermission(path: []const u8) ?struct { table_name: []const u8 } {
+    if (!std.mem.startsWith(u8, path, routes.Routes.tables_prefix)) return null;
+    const rest = path[routes.Routes.tables_prefix.len..];
+    const marker_index = std.mem.indexOf(u8, rest, routes.Routes.documents_marker) orelse return null;
+    if (marker_index == 0) return null;
+    const table_name = rest[0..marker_index];
+    const key = rest[marker_index + routes.Routes.documents_marker.len ..];
+    if (table_name.len == 0 or key.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, table_name, '/') != null or std.mem.indexOfScalar(u8, key, '/') != null) return null;
+    return .{ .table_name = table_name };
+}
+
+fn explicitCatalogPermissionSubroute(table_path: []const u8) ExplicitCatalogPermissionSubroute {
+    if (std.mem.indexOfScalar(u8, table_path, '/')) |slash| {
+        return .{ .table_name = table_path[0..slash], .suffix = table_path[slash + 1 ..] };
+    }
+    return .{ .table_name = table_path };
+}
+
+fn explicitCatalogTablePermissionType(method: http_common.Method, suffix: ?[]const u8) ?usermgr.PermissionType {
+    const value = suffix orelse return switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => .admin,
+    };
+    if (std.mem.eql(u8, value, "query")) return if (method == .POST) .read else null;
+    if (std.mem.eql(u8, value, "batch") or std.mem.eql(u8, value, "rows:batch")) return if (method == .POST) .write else null;
+    if (std.mem.eql(u8, value, "indexes")) return if (method == .GET) .read else null;
+    if (std.mem.startsWith(u8, value, "indexes/")) return switch (method) {
+        .GET => .read,
+        .POST, .DELETE => .admin,
+        else => null,
+    };
+    if (std.mem.startsWith(u8, value, "documents/")) return if (method == .GET) .read else null;
+    return null;
+}
+
 fn tableNameForGraphPath(path: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, path, routes.Routes.tables_prefix)) return null;
     const rest = path[routes.Routes.tables_prefix.len..];
@@ -9812,9 +9983,47 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         defer alloc.free(resource);
         try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
     }
+    {
+        const required = requiredPermissionForRequest(.POST, "/databases/tenant_ops/namespaces/analytics/tables/events/query").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
+    }
+    {
+        const required = requiredPermissionForRequest(.POST, "/databases/tenant_ops/namespaces/analytics/tables/events/batch").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.write, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables/events/documents/doc%2Fa").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
+    }
+    {
+        const required = requiredPermissionForRequest(.DELETE, "/databases/tenant_ops/namespaces/analytics/tables/events/indexes/search_idx").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
+    }
 }
 
 test "document artifact routes declare read and admin permissions" {
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
     {
         const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts").?;
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
@@ -20429,7 +20638,7 @@ test "api http server serves database and namespace catalog routes" {
         .uri = "/databases/tenant_ops/namespaces/analytics/tables/events/indexes",
     });
     defer non_default_table_subroute.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 501), non_default_table_subroute.status);
+    try std.testing.expectEqual(@as(u16, 200), non_default_table_subroute.status);
 
     var create_non_default_table = try server.handle(.{
         .method = .POST,

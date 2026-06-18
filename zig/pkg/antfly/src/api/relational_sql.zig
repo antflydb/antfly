@@ -161,6 +161,13 @@ pub const ExtensionCatalogPlan = sql_adapter.ExtensionCatalogPlan;
 pub const CreateExtensionPlan = sql_adapter.CreateExtensionPlan;
 pub const UpdateExtensionPlan = sql_adapter.UpdateExtensionPlan;
 pub const DropExtensionPlan = sql_adapter.DropExtensionPlan;
+pub const SequenceCatalogPlan = sql_adapter.SequenceCatalogPlan;
+pub const CreateSequencePlan = sql_adapter.CreateSequencePlan;
+pub const AlterSequencePlan = sql_adapter.AlterSequencePlan;
+pub const DropSequencePlan = sql_adapter.DropSequencePlan;
+pub const SequenceOptions = sql_adapter.SequenceOptions;
+pub const SequenceOwnedBy = sql_adapter.SequenceOwnedBy;
+pub const SequenceAlterOperation = sql_adapter.SequenceAlterOperation;
 pub const FunctionCatalogPlan = sql_adapter.FunctionCatalogPlan;
 pub const CreateRoutinePlan = sql_adapter.CreateRoutinePlan;
 pub const DropRoutinePlan = sql_adapter.DropRoutinePlan;
@@ -350,99 +357,6 @@ pub const DropDomainPlan = struct {
         alloc.free(self.domain_name);
         self.* = undefined;
     }
-};
-
-pub const SequenceCatalogPlan = union(enum) {
-    create: CreateSequencePlan,
-    alter: AlterSequencePlan,
-    drop: DropSequencePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .alter => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateSequencePlan = struct {
-    sequence_name: []const u8,
-    if_not_exists: bool = false,
-    options: SequenceOptions = .{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.sequence_name);
-        self.options.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const AlterSequencePlan = struct {
-    sequence_name: []const u8,
-    if_exists: bool = false,
-    operations: []const SequenceAlterOperation = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.sequence_name);
-        freeSequenceAlterOperations(alloc, self.operations);
-        if (self.operations.len > 0) alloc.free(self.operations);
-        self.* = undefined;
-    }
-};
-
-pub const DropSequencePlan = struct {
-    sequence_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.sequence_name);
-        self.* = undefined;
-    }
-};
-
-pub const SequenceOptions = struct {
-    as_type: ?[]const u8 = null,
-    start_with: ?i64 = null,
-    increment_by: ?i64 = null,
-    min_value_specified: bool = false,
-    min_value: ?i64 = null,
-    max_value_specified: bool = false,
-    max_value: ?i64 = null,
-    cache: ?i64 = null,
-    cycle: ?bool = null,
-    owned_by: ?SequenceOwnedBy = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.as_type) |as_type| alloc.free(as_type);
-        if (self.owned_by) |*owned_by| owned_by.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const SequenceOwnedBy = struct {
-    table_name: []const u8 = "",
-    column_name: []const u8 = "",
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.table_name.len > 0) alloc.free(self.table_name);
-        if (self.column_name.len > 0) alloc.free(self.column_name);
-        self.* = undefined;
-    }
-};
-
-pub const SequenceAlterOperation = union(enum) {
-    set_type: []const u8,
-    restart: ?i64,
-    set_start: i64,
-    set_increment: i64,
-    set_min: ?i64,
-    set_max: ?i64,
-    set_cache: i64,
-    set_cycle: bool,
-    set_owned_by: SequenceOwnedBy,
 };
 
 pub const IdentityAllocatorPlan = struct {

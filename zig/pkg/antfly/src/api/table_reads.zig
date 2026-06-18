@@ -51,6 +51,7 @@ const relational_rows_api = @import("relational_rows.zig");
 const relational_sql_api = @import("relational_sql.zig");
 const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../serverless/external_source/mod.zig");
+const object_store_support = @import("../serverless/object_store_support.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
 const object_storage_api = @import("../storage/object_storage.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -4838,6 +4839,7 @@ pub const PinnedExternalObjectStorageLakeRowsSource = struct {
 pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
+    file_bucket: []const u8 = "external-lake",
 };
 
 pub const OwnedExternalObjectStorageLakeRowsSource = struct {
@@ -4885,6 +4887,64 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
 
     pub fn deinit(self: *@This()) void {
         self.inventory.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+pub const OpenedExternalObjectStorageLakeRowsSource = struct {
+    opened_store: object_store_support.OpenedObjectStore,
+    owned_source: OwnedExternalObjectStorageLakeRowsSource,
+
+    pub fn initRemoteUriAlloc(
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !OpenedExternalObjectStorageLakeRowsSource {
+        if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+
+        const opened_store = try object_store_support.OpenedObjectStore.initRemoteUri(
+            alloc,
+            binding.source_uri,
+            options.file_bucket,
+        );
+        return try initWithOpenedStoreAlloc(alloc, runtime_schema, opened_store, options);
+    }
+
+    pub fn initWithOpenedStoreAlloc(
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        opened_store: object_store_support.OpenedObjectStore,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !OpenedExternalObjectStorageLakeRowsSource {
+        var store = opened_store;
+        errdefer store.deinit();
+
+        var owned_source = try OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
+            alloc,
+            runtime_schema,
+            store.client,
+            store.bucket,
+            store.prefix,
+            options,
+        );
+        errdefer owned_source.deinit();
+
+        return .{
+            .opened_store = store,
+            .owned_source = owned_source,
+        };
+    }
+
+    pub fn source(self: *@This()) TableReadSource {
+        return self.owned_source.source();
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.owned_source.deinit();
+        self.opened_store.deinit();
         self.* = undefined;
     }
 };
@@ -16652,6 +16712,55 @@ test "owned object storage lake source discovers and pins parquet prefix invento
             .{},
         ),
     );
+}
+
+test "opened object storage lake source owns store and pins parquet prefix inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put_a = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put_a.deinit(alloc);
+    var put_b = try client.putObject("bucket", "events/part-b.parquet", "not-a-real-parquet-file", .{});
+    defer put_b.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{},
+    );
+    defer opened_source.deinit();
+
+    try std.testing.expectEqualStrings("bucket", opened_source.opened_store.bucket);
+    try std.testing.expectEqualStrings("events", opened_source.opened_store.prefix);
+    try std.testing.expectEqualStrings("events", opened_source.owned_source.inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", opened_source.owned_source.inventory.source_uri);
+    try std.testing.expect(std.mem.startsWith(u8, opened_source.owned_source.inventory.snapshot_id, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
+    _ = opened_source.source();
 }
 
 test "lowered sql cross-table read plans execute through routed scans" {

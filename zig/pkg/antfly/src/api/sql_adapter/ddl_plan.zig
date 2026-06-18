@@ -535,6 +535,99 @@ pub const TransactionAccessMode = enum {
     read_write,
 };
 
+pub const SequenceCatalogPlan = union(enum) {
+    create: CreateSequencePlan,
+    alter: AlterSequencePlan,
+    drop: DropSequencePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .alter => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateSequencePlan = struct {
+    sequence_name: []const u8,
+    if_not_exists: bool = false,
+    options: SequenceOptions = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.sequence_name);
+        self.options.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const AlterSequencePlan = struct {
+    sequence_name: []const u8,
+    if_exists: bool = false,
+    operations: []const SequenceAlterOperation = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.sequence_name);
+        freeSequenceAlterOperations(alloc, self.operations);
+        if (self.operations.len > 0) alloc.free(self.operations);
+        self.* = undefined;
+    }
+};
+
+pub const DropSequencePlan = struct {
+    sequence_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.sequence_name);
+        self.* = undefined;
+    }
+};
+
+pub const SequenceOptions = struct {
+    as_type: ?[]const u8 = null,
+    start_with: ?i64 = null,
+    increment_by: ?i64 = null,
+    min_value_specified: bool = false,
+    min_value: ?i64 = null,
+    max_value_specified: bool = false,
+    max_value: ?i64 = null,
+    cache: ?i64 = null,
+    cycle: ?bool = null,
+    owned_by: ?SequenceOwnedBy = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.as_type) |as_type| alloc.free(as_type);
+        if (self.owned_by) |*owned_by| owned_by.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const SequenceOwnedBy = struct {
+    table_name: []const u8 = "",
+    column_name: []const u8 = "",
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.table_name.len > 0) alloc.free(self.table_name);
+        if (self.column_name.len > 0) alloc.free(self.column_name);
+        self.* = undefined;
+    }
+};
+
+pub const SequenceAlterOperation = union(enum) {
+    set_type: []const u8,
+    restart: ?i64,
+    set_start: i64,
+    set_increment: i64,
+    set_min: ?i64,
+    set_max: ?i64,
+    set_cache: i64,
+    set_cycle: bool,
+    set_owned_by: SequenceOwnedBy,
+};
+
 pub const AdvisoryLockPlan = struct {
     action: AdvisoryLockAction,
     key1: i64,
@@ -549,6 +642,21 @@ pub const AdvisoryLockAction = enum {
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
+}
+
+fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: SequenceAlterOperation) void {
+    switch (operation) {
+        .set_type => |type_name| alloc.free(type_name),
+        .set_owned_by => |owned_by| {
+            var owned = owned_by;
+            owned.deinit(alloc);
+        },
+        else => {},
+    }
+}
+
+fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const SequenceAlterOperation) void {
+    for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
 }
 
 test "SQL adapter DDL enum plans own nested values" {
@@ -745,4 +853,43 @@ test "SQL adapter DDL transaction-control plans own strings" {
         .key2 = 7,
     } };
     advisory_lock.deinit(alloc);
+}
+
+test "SQL adapter DDL sequence plans own options and operations" {
+    const alloc = std.testing.allocator;
+
+    var create: SequenceCatalogPlan = .{ .create = .{
+        .sequence_name = try alloc.dupe(u8, "usage_records_id_seq"),
+        .if_not_exists = true,
+        .options = .{
+            .as_type = try alloc.dupe(u8, "bigint"),
+            .start_with = 100,
+            .increment_by = 5,
+            .owned_by = .{
+                .table_name = try alloc.dupe(u8, "usage_records"),
+                .column_name = try alloc.dupe(u8, "id"),
+            },
+        },
+    } };
+    create.deinit(alloc);
+
+    var operations = try alloc.alloc(SequenceAlterOperation, 3);
+    operations[0] = .{ .set_type = try alloc.dupe(u8, "bigint") };
+    operations[1] = .{ .restart = 42 };
+    operations[2] = .{ .set_owned_by = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .column_name = try alloc.dupe(u8, "id"),
+    } };
+    var alter: SequenceCatalogPlan = .{ .alter = .{
+        .sequence_name = try alloc.dupe(u8, "usage_records_id_seq"),
+        .operations = operations,
+    } };
+    alter.deinit(alloc);
+
+    var drop: SequenceCatalogPlan = .{ .drop = .{
+        .sequence_name = try alloc.dupe(u8, "usage_records_id_seq"),
+        .if_exists = true,
+        .cascade = true,
+    } };
+    drop.deinit(alloc);
 }

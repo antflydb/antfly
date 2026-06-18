@@ -320,7 +320,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "name", .{ .string = index_name });
@@ -334,25 +334,29 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             if (jsonStringArg(args, "summarizer")) |summarizer_json| {
                 if (summarizer_json.len != 0) try body.put(alloc, "summarizer", std.json.parseFromSliceLeaky(std.json.Value, alloc, summarizer_json, .{}) catch return mcpError(alloc, "invalid summarizer JSON"));
             }
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ table_uri, index_name });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ routes.Routes.tables, table_name });
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/indexes", .{table_uri});
             return try ctx.simpleRoute(alloc, .GET, uri, "");
         }
 
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
 
             var uri = std.ArrayListUnmanaged(u8).empty;
             errdefer uri.deinit(alloc);
-            try uri.appendSlice(alloc, routes.Routes.tables);
-            try uri.append(alloc, '/');
-            try uri.appendSlice(alloc, table_name);
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            try uri.appendSlice(alloc, table_uri);
             try uri.appendSlice(alloc, routes.Routes.documents_marker);
             try appendUriPathSegment(alloc, &uri, key);
 
@@ -372,14 +376,16 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ table_uri, index_name });
             return try ctx.simpleRoute(alloc, method, uri, body);
         }
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             if (jsonStringArg(args, "fullTextSearch")) |full_text| {
                 if (full_text.len != 0) {
@@ -394,7 +400,9 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             if (jsonValueArg(args, "indexes")) |indexes| try body.put(alloc, "indexes", indexes);
             if (jsonStringArg(args, "filterPrefix")) |prefix| if (prefix.len != 0) try body.put(alloc, "filter_prefix", .{ .string = prefix });
             try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/query", .{table_uri});
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
@@ -410,11 +418,13 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             if (jsonValueArg(args, "writes")) |writes| try body.put(alloc, "inserts", writes);
             if (jsonValueArg(args, "deletes")) |deletes| try body.put(alloc, "deletes", deletes);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/batch", .{ routes.Routes.tables, table_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/batch", .{table_uri});
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
@@ -667,7 +677,7 @@ fn ensureDefaultCatalogQueryTargets(args: std.json.Value) CatalogToolArgError!vo
 fn catalogTableArgError(alloc: std.mem.Allocator, err: CatalogToolArgError) !mcp.CallToolResult {
     return switch (err) {
         error.MissingTableName => mcpError(alloc, "missing tableName"),
-        error.ExplicitCatalogTableRouteUnsupported => mcpError(alloc, "explicit database/namespace table storage subroutes are not supported until table I/O APIs are catalog-aware"),
+        error.ExplicitCatalogTableRouteUnsupported => mcpError(alloc, "invalid explicit database/namespace table target"),
     };
 }
 
@@ -1568,7 +1578,9 @@ test "mcp table tools expose catalog fields and route supported catalog lifecycl
     defer alloc.free(list_route);
     try std.testing.expectEqualStrings("/databases/tenant_ops/namespaces/analytics/tables", list_route);
 
-    try std.testing.expectError(error.ExplicitCatalogTableRouteUnsupported, catalogTableNameArg(non_default_args.value));
+    const non_default_query_route = try catalogTableRouteAlloc(alloc, non_default_target.database_name, non_default_target.namespace_name, non_default_target.table_name);
+    defer alloc.free(non_default_query_route);
+    try std.testing.expectEqualStrings("/databases/tenant_ops/namespaces/analytics/tables/docs", non_default_query_route);
 
     var namespace_read = try usermgr.Permission.initOwned(alloc, .namespace, "tenant_ops.analytics", .read);
     defer namespace_read.deinit(alloc);

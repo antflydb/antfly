@@ -3177,7 +3177,7 @@ pub fn applyRelationalCatalogDdlOnServiceAlloc(
     }
 }
 
-fn applyDatabaseCatalogPlanOnServiceAlloc(
+pub fn applyDatabaseCatalogPlanOnServiceAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
