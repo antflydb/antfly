@@ -34,6 +34,7 @@ type haAdminIdentityJSON struct {
 
 type haPrimaryStatusJSON struct {
 	Role       string                  `json:"role"`
+	NodeID     string                  `json:"node_id"`
 	Identity   haAdminIdentityJSON     `json:"identity"`
 	CurrentLSN *uint64                 `json:"current_lsn"`
 	Retention  *haRetentionStatusJSON  `json:"retention"`
@@ -82,6 +83,7 @@ type haDurabilityStatusJSON struct {
 
 type haStandbyStatusJSON struct {
 	Role               string              `json:"role"`
+	NodeID             string              `json:"node_id"`
 	Identity           haAdminIdentityJSON `json:"identity"`
 	ReceivedLSN        *uint64             `json:"received_lsn"`
 	AppliedLSN         *uint64             `json:"applied_lsn"`
@@ -129,6 +131,10 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 	if strings.TrimSpace(snapshot.Role) != string(HAPrimarySnapshotRolePrimary) {
 		return nil, fmt.Errorf("invalid primary status role")
 	}
+	nodeID := strings.TrimSpace(snapshot.NodeID)
+	if nodeID == "" {
+		return nil, fmt.Errorf("missing primary status node_id")
+	}
 	if !haAdminIdentityJSONComplete(snapshot.Identity) {
 		return nil, fmt.Errorf("missing primary status identity")
 	}
@@ -151,6 +157,7 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 			Snapshot: HAPrimarySnapshot{
 				CurrentLsn: *snapshot.CurrentLSN,
 				Identity:   haIdentityFromStatusJSON(snapshot.Identity),
+				NodeId:     nodeID,
 				Retention: HARetentionSnapshot{
 					PrimaryLsn:        haUint64StatusValue(snapshot.Retention.PrimaryLSN),
 					OldestRestartLsn:  haUint64StatusValue(snapshot.Retention.OldestRestartLSN),
@@ -241,6 +248,10 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 	if strings.TrimSpace(snapshot.Role) != string(HAStandbySnapshotRoleStandby) {
 		return nil, fmt.Errorf("invalid standby status role")
 	}
+	nodeID := strings.TrimSpace(snapshot.NodeID)
+	if nodeID == "" {
+		return nil, fmt.Errorf("missing standby status node_id")
+	}
 	if !haAdminIdentityJSONComplete(snapshot.Identity) {
 		return nil, fmt.Errorf("missing standby status identity")
 	}
@@ -254,6 +265,7 @@ func ParseHAStandbyStatus(raw []byte) (*ParsedHAStandbyStatus, error) {
 		SchemaVersion: schemaVersion,
 		Snapshot: HAStandbySnapshot{
 			Role:               HAStandbySnapshotRoleStandby,
+			NodeId:             nodeID,
 			Identity:           haIdentityFromStatusJSON(snapshot.Identity),
 			ReceivedLsn:        haUint64StatusValue(snapshot.ReceivedLSN),
 			AppliedLsn:         haUint64StatusValue(snapshot.AppliedLSN),

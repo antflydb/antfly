@@ -6285,6 +6285,9 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 	if err := haValidateObservedStatusIdentity(status.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
+	if err := haValidateObservedPrimaryNodeID(status.NodeID, ha, cluster.Status.HAStatus); err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
 	return status, nil
 }
 
@@ -6299,6 +6302,9 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 	}
 	observed := haObservedStandbyStatusFromAdminSDK(*response.Value, standbyName, slotName)
 	if err := haValidateObservedStatusIdentity(observed.Identity, ha, cluster.Status.HAStatus); err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	if err := haValidateObservedNodeID(observed.NodeID, standbyName, "standby"); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
 	return observed.Status, nil
@@ -6380,6 +6386,7 @@ func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimary
 }
 
 type haObservedPrimaryStatus struct {
+	NodeID     string
 	PrimaryLSN uint64
 	Retention  antflyv1.HARetentionStatus
 	Standbys   []antflyv1.HAStandbyStatus
@@ -6388,6 +6395,7 @@ type haObservedPrimaryStatus struct {
 }
 
 type haObservedStandbyStatus struct {
+	NodeID   string
 	Status   antflyv1.HAStandbyStatus
 	Identity haObservedIdentity
 }
@@ -6419,6 +6427,7 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) haObservedPrimaryStatus {
 	snapshot := parsed.Response.Snapshot
 	status := haObservedPrimaryStatus{
+		NodeID:     strings.TrimSpace(snapshot.NodeId),
 		Identity:   haObservedIdentityFromAdminSDK(snapshot.Identity),
 		PrimaryLSN: snapshot.CurrentLsn,
 		Retention: antflyv1.HARetentionStatus{
@@ -6556,6 +6565,7 @@ func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusRespon
 		status.Status = "healthy"
 	}
 	return haObservedStandbyStatus{
+		NodeID:   strings.TrimSpace(snapshot.NodeId),
 		Status:   status,
 		Identity: haObservedIdentityFromAdminSDK(snapshot.Identity),
 	}
@@ -6603,6 +6613,32 @@ func haValidateObservedStatusIdentity(observed haObservedIdentity, ha *antflyv1.
 			expectedTimelineID,
 			expectedEpoch,
 		)
+	}
+	return nil
+}
+
+func haValidateObservedPrimaryNodeID(observed string, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) error {
+	expected := haCurrentPrimaryNodeID(ha, status)
+	if strings.TrimSpace(expected) == "" {
+		if strings.TrimSpace(observed) == "" {
+			return fmt.Errorf("observed HA admin primary node_id is missing")
+		}
+		return nil
+	}
+	return haValidateObservedNodeID(observed, expected, "primary")
+}
+
+func haValidateObservedNodeID(observed string, expected string, label string) error {
+	observed = strings.TrimSpace(observed)
+	expected = strings.TrimSpace(expected)
+	if observed == "" {
+		return fmt.Errorf("observed HA admin %s node_id is missing", label)
+	}
+	if expected == "" {
+		return fmt.Errorf("expected HA admin %s node_id is missing", label)
+	}
+	if observed != expected {
+		return fmt.Errorf("observed HA admin %s node_id mismatch: got %q, expected %q", label, observed, expected)
 	}
 	return nil
 }

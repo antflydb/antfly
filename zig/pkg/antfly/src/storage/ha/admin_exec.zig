@@ -183,8 +183,16 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
             if (standbyActionNodeID(maybe_ctx)) |node_id| return try renderSeedBootstrapJsonAlloc(alloc, node_id, response);
             return try renderJsonAlloc(alloc, result);
         },
-        .primary_status => |snapshot| try renderPrimaryStatusJsonAlloc(alloc, snapshot),
-        .standby_status => |snapshot| try renderStandbyStatusJsonAlloc(alloc, snapshot),
+        .primary_status => |snapshot| blk: {
+            const node_id = primaryActionNodeID(maybe_ctx) orelse return error.PrimaryNodeIDUnavailable;
+            if (std.mem.trim(u8, node_id, " \t\r\n").len == 0) return error.PrimaryNodeIDUnavailable;
+            break :blk try renderPrimaryStatusJsonAlloc(alloc, node_id, snapshot);
+        },
+        .standby_status => |snapshot| blk: {
+            const node_id = standbyActionNodeID(maybe_ctx) orelse return error.StandbyNodeIDUnavailable;
+            if (std.mem.trim(u8, node_id, " \t\r\n").len == 0) return error.StandbyNodeIDUnavailable;
+            break :blk try renderStandbyStatusJsonAlloc(alloc, node_id, snapshot);
+        },
         .commit_check => |gate| try renderCommitCheckJsonAlloc(alloc, gate),
         .commit_append => |append_result| try renderCommitAppendJsonAlloc(alloc, append_result),
         .read_check => |decision| try renderReadCheckJsonAlloc(alloc, decision),
@@ -292,19 +300,19 @@ fn renderSeedBootstrapJsonAlloc(alloc: Allocator, node_id: []const u8, response:
     }, .{});
 }
 
-fn renderPrimaryStatusJsonAlloc(alloc: Allocator, snapshot: status.PrimarySnapshot) ![]u8 {
+fn renderPrimaryStatusJsonAlloc(alloc: Allocator, node_id: []const u8, snapshot: status.PrimarySnapshot) ![]u8 {
     const response = admin_api.HAPrimaryStatusResponse{
         .schema_version = 1,
-        .snapshot = try adminPrimarySnapshot(alloc, snapshot),
+        .snapshot = try adminPrimarySnapshot(alloc, snapshot, node_id),
     };
     defer alloc.free(response.snapshot.slots);
     return try std.json.Stringify.valueAlloc(alloc, response, .{});
 }
 
-fn renderStandbyStatusJsonAlloc(alloc: Allocator, snapshot: status.StandbySnapshot) ![]u8 {
+fn renderStandbyStatusJsonAlloc(alloc: Allocator, node_id: []const u8, snapshot: status.StandbySnapshot) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HAStandbyStatusResponse{
         .schema_version = 1,
-        .snapshot = try adminStandbySnapshot(snapshot),
+        .snapshot = try adminStandbySnapshot(snapshot, node_id),
     }, .{});
 }
 
@@ -520,9 +528,10 @@ fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
     };
 }
 
-fn adminPrimarySnapshot(alloc: Allocator, snapshot: status.PrimarySnapshot) !admin_api.HAPrimarySnapshot {
+fn adminPrimarySnapshot(alloc: Allocator, snapshot: status.PrimarySnapshot, node_id: []const u8) !admin_api.HAPrimarySnapshot {
     return .{
         .role = @tagName(snapshot.role),
+        .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .current_lsn = try adminI64(snapshot.current_lsn),
         .slots = try adminSlotSnapshots(alloc, snapshot.slots),
@@ -531,9 +540,10 @@ fn adminPrimarySnapshot(alloc: Allocator, snapshot: status.PrimarySnapshot) !adm
     };
 }
 
-fn adminStandbySnapshot(snapshot: status.StandbySnapshot) !admin_api.HAStandbySnapshot {
+fn adminStandbySnapshot(snapshot: status.StandbySnapshot, node_id: []const u8) !admin_api.HAStandbySnapshot {
     return .{
         .role = @tagName(snapshot.role),
+        .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .received_lsn = try adminI64(snapshot.received_lsn),
         .applied_lsn = try adminI64(snapshot.applied_lsn),
@@ -2055,11 +2065,12 @@ test "storage.ha admin exec runs slot lifecycle and status commands" {
     try expectContains(status_table, "durability.missing_lsn_count=1\n");
     try expectContains(status_table, "slots.0.last_error=IntentionalApplyFailure\n");
 
-    var status_json = try executeAndRenderAlloc(alloc, .{ .primary = &primary }, primary_status_plan);
+    var status_json = try executeAndRenderAlloc(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" }, primary_status_plan);
     defer status_json.deinit(alloc);
     try std.testing.expectEqualStrings("application/json", status_json.content_type);
     try expectContains(status_json.body, "\"schema_version\":1");
     try expectContains(status_json.body, "\"snapshot\"");
+    try expectContains(status_json.body, "\"node_id\":\"primary-a\"");
     try expectContains(status_json.body, "\"durability\"");
     try expectContains(status_json.body, "\"last_error\":\"IntentionalApplyFailure\"");
 

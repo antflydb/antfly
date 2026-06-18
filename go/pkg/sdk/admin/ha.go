@@ -550,6 +550,9 @@ func ValidateHAPrimaryStatusResponse(response HAPrimaryStatusResponse) error {
 	if snapshot.Role != HAPrimarySnapshotRolePrimary {
 		return fmt.Errorf("invalid primary status role %q", snapshot.Role)
 	}
+	if strings.TrimSpace(snapshot.NodeId) == "" {
+		return fmt.Errorf("missing primary status node_id")
+	}
 	if !HAIdentityComplete(snapshot.Identity) {
 		return fmt.Errorf("missing primary status identity fields")
 	}
@@ -576,6 +579,9 @@ func ValidateHAStandbyStatusResponse(response HAStandbyStatusResponse) error {
 	snapshot := response.Snapshot
 	if snapshot.Role != HAStandbySnapshotRoleStandby {
 		return fmt.Errorf("invalid standby status role %q", snapshot.Role)
+	}
+	if strings.TrimSpace(snapshot.NodeId) == "" {
+		return fmt.Errorf("missing standby status node_id")
 	}
 	if !HAIdentityComplete(snapshot.Identity) {
 		return fmt.Errorf("missing standby status identity fields")

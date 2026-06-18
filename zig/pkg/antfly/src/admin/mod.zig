@@ -365,6 +365,7 @@ const ha_standby_status_response_fields = [_][]const u8{
 
 const ha_primary_snapshot_fields = [_][]const u8{
     "role",
+    "node_id",
     "identity",
     "current_lsn",
     "slots",
@@ -374,6 +375,7 @@ const ha_primary_snapshot_fields = [_][]const u8{
 
 const ha_standby_snapshot_fields = [_][]const u8{
     "role",
+    "node_id",
     "identity",
     "received_lsn",
     "applied_lsn",

@@ -277,6 +277,8 @@ pub const HAPromotionResult = struct {
 
 pub const HAStandbySnapshot = struct {
     role: []const u8,
+    /// Node id for the node-local admin endpoint that produced this status snapshot.
+    node_id: []const u8,
     identity: HAIdentity,
     received_lsn: i64,
     applied_lsn: i64,
@@ -345,6 +347,8 @@ pub const HARejoinAssessResponse = struct {
 
 pub const HAPrimarySnapshot = struct {
     role: []const u8,
+    /// Node id for the node-local admin endpoint that produced this status snapshot.
+    node_id: []const u8,
     identity: HAIdentity,
     current_lsn: i64,
     slots: []const HASlotSnapshot,

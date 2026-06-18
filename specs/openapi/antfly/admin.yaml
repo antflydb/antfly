@@ -1564,12 +1564,16 @@ components:
           type: boolean
     HAPrimarySnapshot:
       type: object
-      required: [role, identity, current_lsn, slots, retention]
+      required: [role, node_id, identity, current_lsn, slots, retention]
       additionalProperties: false
       properties:
         role:
           type: string
           enum: [primary]
+        node_id:
+          type: string
+          minLength: 1
+          description: Node id for the node-local admin endpoint that produced this status snapshot.
         identity:
           $ref: "#/components/schemas/HAIdentity"
         current_lsn:
@@ -1589,6 +1593,7 @@ components:
       type: object
       required:
         - role
+        - node_id
         - identity
         - received_lsn
         - applied_lsn
@@ -1601,6 +1606,10 @@ components:
         role:
           type: string
           enum: [standby]
+        node_id:
+          type: string
+          minLength: 1
+          description: Node id for the node-local admin endpoint that produced this status snapshot.
         identity:
           $ref: "#/components/schemas/HAIdentity"
         received_lsn:

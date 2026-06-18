@@ -240,9 +240,10 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         defer snapshot.deinit(self.alloc);
+        const node_id = self.primaryNodeID() orelse return try textResponse(self.alloc, 409, "PrimaryNodeIDUnavailable");
         const response = admin_api.HAPrimaryStatusResponse{
             .schema_version = 1,
-            .snapshot = try adminPrimarySnapshot(self.alloc, snapshot),
+            .snapshot = try adminPrimarySnapshot(self.alloc, snapshot, node_id),
         };
         defer self.alloc.free(response.snapshot.slots);
         return try self.handleTypedJson(response);
@@ -250,6 +251,7 @@ pub const Server = struct {
 
     fn handleAdminStandbyStatus(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const standby = self.ctx.standby orelse return try textResponse(self.alloc, 409, "StandbyUnavailable");
+        const node_id = self.standbyNodeID() orelse return try textResponse(self.alloc, 409, "StandbyNodeIDUnavailable");
         const query = requestQuery(req.uri);
         const upstream_lsn = if (queryValue(query, "upstream_lsn")) |raw|
             uint64Text(raw) catch return try textResponse(self.alloc, 400, "invalid HA standby status request")
@@ -258,7 +260,7 @@ pub const Server = struct {
 
         return try self.handleTypedJson(admin_api.HAStandbyStatusResponse{
             .schema_version = 1,
-            .snapshot = try adminStandbySnapshot(ha_admin.standbyStatus(standby, upstream_lsn)),
+            .snapshot = try adminStandbySnapshot(ha_admin.standbyStatus(standby, upstream_lsn), node_id),
         });
     }
 
@@ -1086,9 +1088,10 @@ fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPro
     };
 }
 
-fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) !admin_api.HAPrimarySnapshot {
+fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot, node_id: []const u8) !admin_api.HAPrimarySnapshot {
     return .{
         .role = @tagName(snapshot.role),
+        .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .current_lsn = try adminI64(snapshot.current_lsn),
         .slots = try adminSlotSnapshots(alloc, snapshot.slots),
@@ -1097,9 +1100,10 @@ fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) 
     };
 }
 
-fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot) !admin_api.HAStandbySnapshot {
+fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot, node_id: []const u8) !admin_api.HAStandbySnapshot {
     return .{
         .role = @tagName(snapshot.role),
+        .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .received_lsn = try adminI64(snapshot.received_lsn),
         .applied_lsn = try adminI64(snapshot.applied_lsn),

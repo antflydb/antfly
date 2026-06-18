@@ -337,6 +337,7 @@ func haGeneratedPrimaryStatusJSON() string {
 		"schema_version":1,
 		"snapshot":{
 			"role":"primary",
+			"node_id":"primary-a",
 			"identity":{
 				"cluster_id":11,
 				"shard_id":22,
@@ -390,6 +391,7 @@ func haGeneratedStandbyStatusJSON() string {
 		"schema_version":1,
 		"snapshot":{
 			"role":"standby",
+			"node_id":"standby-a",
 			"identity":{
 				"cluster_id":11,
 				"shard_id":22,
@@ -417,6 +419,7 @@ func haLegacyPrimaryStatusJSON() string {
 		"result":{
 			"primary_status":{
 				"role":"primary",
+				"node_id":"primary-a",
 				"identity":{
 					"cluster_id":11,
 					"shard_id":22,
@@ -471,6 +474,7 @@ func haLegacyStandbyStatusJSON() string {
 		"result":{
 			"standby_status":{
 				"role":"standby",
+				"node_id":"standby-a",
 				"identity":{
 					"cluster_id":11,
 					"shard_id":22,
