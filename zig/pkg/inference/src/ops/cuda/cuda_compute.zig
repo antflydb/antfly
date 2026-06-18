@@ -18,6 +18,8 @@ const tensor_mod = @import("../../backends/tensor.zig");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const dense_lt_mod = @import("dense_lt.zig");
+const driver_mod = @import("driver.zig");
+const graph_mod = @import("graph.zig");
 const kernels_mod = @import("kernels.zig");
 const libraries_mod = @import("libraries.zig");
 const scratch_mod = @import("scratch.zig");
@@ -28,6 +30,9 @@ const platform = @import("antfly_platform");
 
 const CT = ops.CT;
 
+pub const DeviceBuffer = buffer_mod.DeviceBuffer;
+pub const HostBuffer = buffer_mod.HostBuffer;
+
 pub const CudaTensor = struct {
     buffer: buffer_mod.DeviceBuffer,
     dtype: tensor_mod.DType,
@@ -37,6 +42,73 @@ pub const CudaTensor = struct {
     owns_buffer: bool = true,
     owns_shape: bool = true,
     owned_by_tensor: bool = true,
+};
+
+pub const GraphUploadKind = enum {
+    static,
+    input_ids_i64,
+    attention_mask_i64,
+    attention_mask_f32,
+};
+
+pub const GraphUploadSlot = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    host: buffer_mod.HostBuffer = .{},
+    bytes: usize,
+    kind: GraphUploadKind,
+
+    pub fn deinit(self: *GraphUploadSlot, ctx: *context_mod.CudaContext) void {
+        self.buffer.free(ctx);
+        self.host.free(ctx);
+        self.* = undefined;
+    }
+
+    pub fn ownedBytes(self: GraphUploadSlot) usize {
+        return self.buffer.len + self.host.len;
+    }
+
+    pub fn isDynamic(self: GraphUploadSlot) bool {
+        return self.kind != .static;
+    }
+};
+
+pub const GraphCaptureMode = enum {
+    record,
+    capture,
+};
+
+pub const GraphCaptureFrame = struct {
+    mode: GraphCaptureMode,
+    slots: *std.ArrayListUnmanaged(GraphUploadSlot),
+    upload_index: usize = 0,
+    input_ids: []const i64 = &.{},
+    attention_mask: []const i64 = &.{},
+    attention_mask_f32_len: usize = 0,
+    used_buffers: ?*std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = null,
+};
+
+pub const GraphDeviceTensor = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    elem_count: usize,
+};
+
+pub const GraphStats = struct {
+    captures: u64 = 0,
+    replays: u64 = 0,
+    fallbacks: u64 = 0,
+    capture_failures: u64 = 0,
+    dynamic_copy_bytes: u64 = 0,
+    last_fallback_reason: GraphFallbackReason = .none,
+};
+
+pub const GraphFallbackReason = enum {
+    none,
+    unavailable,
+    capture_failed,
+    capture_needs_warmup,
+    unsupported_host_transfer,
+    upload_mismatch,
+    driver_error,
 };
 
 pub const CapabilityProfile = enum {
@@ -54,6 +126,8 @@ pub const CudaCompute = struct {
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
     temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     temp_ids_masks: scratch_mod.DeviceScratch = .{},
+    graph_frame: ?*GraphCaptureFrame = null,
+    graph_stats: GraphStats = .{},
     owned_by_backend: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !CudaCompute {
@@ -127,6 +201,120 @@ pub const CudaCompute = struct {
 
     pub fn hasDenseLibraryAcceleration(self: *const CudaCompute) bool {
         return self.dense_lt.enabled();
+    }
+
+    pub fn cudaGraphAvailable(self: *const CudaCompute) bool {
+        return graph_mod.available(&self.ctx);
+    }
+
+    pub fn graphStats(self: *const CudaCompute) GraphStats {
+        return self.graph_stats;
+    }
+
+    pub fn noteGraphCapture(self: *CudaCompute) void {
+        self.graph_stats.captures += 1;
+    }
+
+    pub fn noteGraphReplay(self: *CudaCompute, dynamic_copy_bytes: usize) void {
+        self.graph_stats.replays += 1;
+        self.graph_stats.dynamic_copy_bytes += @intCast(dynamic_copy_bytes);
+    }
+
+    pub fn noteGraphFallback(self: *CudaCompute, reason: GraphFallbackReason) void {
+        self.graph_stats.fallbacks += 1;
+        self.graph_stats.last_fallback_reason = reason;
+    }
+
+    pub fn noteGraphCaptureFailure(self: *CudaCompute) void {
+        self.graph_stats.capture_failures += 1;
+    }
+
+    pub fn beginGraphFrame(self: *CudaCompute, frame: *GraphCaptureFrame) void {
+        frame.upload_index = 0;
+        self.graph_frame = frame;
+    }
+
+    pub fn endGraphFrame(self: *CudaCompute) void {
+        self.graph_frame = null;
+    }
+
+    pub fn beginCudaGraphCapture(self: *CudaCompute) !void {
+        try graph_mod.beginCapture(&self.ctx);
+    }
+
+    pub fn endCudaGraphCapture(self: *CudaCompute) !graph_mod.CapturedGraph {
+        return graph_mod.endCapture(&self.ctx);
+    }
+
+    pub fn launchCudaGraph(self: *CudaCompute, graph: *const graph_mod.CapturedGraph) !void {
+        try graph.launch(&self.ctx);
+    }
+
+    pub fn refreshGraphDynamicUploads(
+        self: *CudaCompute,
+        slots: []const GraphUploadSlot,
+        input_ids: []const i64,
+        attention_mask: []const i64,
+        attention_mask_f32: []const f32,
+    ) !void {
+        for (slots) |slot| {
+            switch (slot.kind) {
+                .static => {},
+                .input_ids_i64 => {
+                    const bytes = std.mem.sliceAsBytes(input_ids);
+                    if (bytes.len != slot.bytes) return error.InvalidShape;
+                    try copyGraphStagingBytes(slot, bytes);
+                },
+                .attention_mask_i64 => {
+                    const bytes = std.mem.sliceAsBytes(attention_mask);
+                    if (bytes.len != slot.bytes) return error.InvalidShape;
+                    try copyGraphStagingBytes(slot, bytes);
+                },
+                .attention_mask_f32 => {
+                    const bytes = std.mem.sliceAsBytes(attention_mask_f32);
+                    if (bytes.len != slot.bytes) return error.InvalidShape;
+                    try copyGraphStagingBytes(slot, bytes);
+                },
+            }
+        }
+        _ = self;
+    }
+
+    pub fn retainGraphTempBuffers(
+        self: *CudaCompute,
+        used_buffers: []const buffer_mod.DeviceBuffer,
+        keepalive: *std.ArrayListUnmanaged(buffer_mod.DeviceBuffer),
+    ) !void {
+        var i: usize = 0;
+        while (i < self.temp_buffers.items.len) {
+            const candidate = self.temp_buffers.items[i];
+            if (graphBufferWasUsed(used_buffers, candidate.ptr)) {
+                const buffer = self.temp_buffers.swapRemove(i);
+                if (!graphBufferWasUsed(keepalive.items, buffer.ptr)) {
+                    try keepalive.append(self.allocator, buffer);
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    pub fn graphDeviceTensor(self: *CudaCompute, tensor: CT) !GraphDeviceTensor {
+        _ = self;
+        const cuda_tensor = tensorFromCt(tensor);
+        try ensureF32(cuda_tensor);
+        return .{ .buffer = cuda_tensor.buffer, .elem_count = cuda_tensor.elem_count };
+    }
+
+    pub fn copyGraphDeviceTensorToHostAsync(self: *CudaCompute, device_tensor: GraphDeviceTensor, out: []f32) !void {
+        if (out.len != device_tensor.elem_count) return error.InvalidShape;
+        try device_tensor.buffer.copyToHost(&self.ctx, std.mem.sliceAsBytes(out));
+    }
+
+    pub fn copyGraphDeviceTensorToHostBufferAsync(self: *CudaCompute, device_tensor: GraphDeviceTensor, out: buffer_mod.HostBuffer) !void {
+        const bytes = out.bytes();
+        if (bytes.len != device_tensor.elem_count * @sizeOf(f32)) return error.InvalidShape;
+        try device_tensor.buffer.copyToHost(&self.ctx, bytes);
     }
 
     pub fn denseLtStats(self: *const CudaCompute) dense_lt_mod.Stats {
@@ -253,6 +441,7 @@ fn isGlinerSpanWeightName(name: []const u8) bool {
 
 fn cudaDequantizeQuantWeightOnUpload(name: []const u8) bool {
     if (cudaDequantizeQuantWeightsOnUpload()) return true;
+    if (std.mem.endsWith(u8, name, "encoder.rel_embeddings.weight")) return true;
     if (!isGlinerSpanWeightName(name)) return false;
     if (platform.env.getenvBool("TERMITE_CUDA_DISABLE_GLINER_SPAN_F32_UPLOAD")) return false;
     return !cudaGlinerSpanQ4KernelsEnabled();
@@ -268,6 +457,7 @@ fn isDense16DType(dtype: tensor_mod.DType) bool {
 
 fn shouldPreserveDense16Weight(name: []const u8, tensor: *const tensor_mod.Tensor) bool {
     if (!cudaDense16WeightsEnabled()) return false;
+    if (std.mem.endsWith(u8, name, "encoder.rel_embeddings.weight")) return false;
     if (!isDense16DType(tensor.dtype)) return false;
     if (!std.mem.endsWith(u8, name, ".weight")) return false;
     if (tensor.shape.len != 2) return false;
@@ -280,6 +470,78 @@ fn shouldPreserveDense16Weight(name: []const u8, tensor: *const tensor_mod.Tenso
 fn cudaGlinerSpanQ4KernelsEnabled() bool {
     if (platform.env.getenvBool("TERMITE_CUDA_DISABLE_GLINER_SPAN_Q4_KERNELS")) return false;
     return platform.env.getenvBoolDefault("TERMITE_CUDA_ENABLE_GLINER_SPAN_Q4_KERNELS", true);
+}
+
+fn cudaQ8TiledKernelsEnabled() bool {
+    return !platform.env.getenvBool("ANTFLY_CUDA_DISABLE_Q8_TILED");
+}
+
+fn cudaQ4FusionKernelsEnabled() bool {
+    if (platform.env.getenvBool("ANTFLY_CUDA_DISABLE_Q4_FUSIONS")) return false;
+    return platform.env.getenvBool("ANTFLY_CUDA_ENABLE_Q4_FUSIONS");
+}
+
+const QMatmulVariantChoice = enum {
+    auto,
+    legacy,
+    fast_r2c4,
+    fast_r2c8,
+    fast_r4c4,
+};
+
+fn cudaQMatmulVariantChoice() QMatmulVariantChoice {
+    const raw = platform.env.getenv("ANTFLY_CUDA_QMATMUL_VARIANT") orelse return .auto;
+    if (std.ascii.eqlIgnoreCase(raw, "legacy")) return .legacy;
+    if (std.ascii.eqlIgnoreCase(raw, "fast_r2c4")) return .fast_r2c4;
+    if (std.ascii.eqlIgnoreCase(raw, "r2c4")) return .fast_r2c4;
+    if (std.ascii.eqlIgnoreCase(raw, "fast_r2c8")) return .fast_r2c8;
+    if (std.ascii.eqlIgnoreCase(raw, "r2c8")) return .fast_r2c8;
+    if (std.ascii.eqlIgnoreCase(raw, "fast_r4c4")) return .fast_r4c4;
+    if (std.ascii.eqlIgnoreCase(raw, "r4c4")) return .fast_r4c4;
+    return .auto;
+}
+
+fn cudaQMatmulKernelVariant() ?kernels_mod.QMatmulVariant {
+    return switch (cudaQMatmulVariantChoice()) {
+        .legacy => null,
+        .auto => .fast_r4c4,
+        .fast_r2c4 => .fast_r2c4,
+        .fast_r2c8 => .fast_r2c8,
+        .fast_r4c4 => .fast_r4c4,
+    };
+}
+
+fn isMxbaiDebertaLinearShape(in_dim: usize, out_dim: usize) bool {
+    if (in_dim == 768 and out_dim == 768) return true;
+    if (in_dim == 768 and out_dim == 3072) return true;
+    if (in_dim == 3072 and out_dim == 768) return true;
+    if (in_dim == 768 and out_dim == 1) return true;
+    return false;
+}
+
+fn useMxbaiQ8TiledKernel(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return cudaQ8TiledKernelsEnabled() and rows > 0 and in_dim % 256 == 0 and isMxbaiDebertaLinearShape(in_dim, out_dim);
+}
+
+fn mxbaiQ8Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
+    if (!useMxbaiQ8TiledKernel(rows, in_dim, out_dim)) return null;
+    const variant = cudaQMatmulKernelVariant() orelse return null;
+    if (variant == .fast_r2c8) return null;
+    return variant;
+}
+
+fn useMxbaiQ4FusionKernel(rows: usize, in_dim: usize, out_dim: usize) bool {
+    return cudaQ4FusionKernelsEnabled() and rows >= 2 and isMxbaiDebertaLinearShape(in_dim, out_dim);
+}
+
+fn mxbaiQ4Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
+    if (!useMxbaiQ4FusionKernel(rows, in_dim, out_dim)) return null;
+    return cudaQMatmulKernelVariant();
+}
+
+fn mxbaiQ4TiledVariant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
+    if (rows < 2 or !isMxbaiDebertaLinearShape(in_dim, out_dim)) return null;
+    return cudaQMatmulKernelVariant();
 }
 
 fn isGlinerSpanQ4Shape(rows: usize, in_dim: usize, out_dim: usize) bool {
@@ -419,6 +681,112 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
 
 const max_temp_buffers = 256;
 
+fn graphBufferWasUsed(buffers: []const buffer_mod.DeviceBuffer, ptr: driver_mod.CUdeviceptr) bool {
+    if (ptr == 0) return false;
+    for (buffers) |buffer| {
+        if (buffer.ptr == ptr) return true;
+    }
+    return false;
+}
+
+fn graphI64UploadKind(self: *CudaCompute, data: []const i64) GraphUploadKind {
+    const frame = self.graph_frame orelse return .static;
+    if (data.len == frame.input_ids.len and data.ptr == frame.input_ids.ptr) return .input_ids_i64;
+    if (data.len == frame.attention_mask.len and data.ptr == frame.attention_mask.ptr) return .attention_mask_i64;
+    return .static;
+}
+
+fn graphNextUploadSlot(self: *CudaCompute, bytes_len: usize, kind: GraphUploadKind) !GraphUploadSlot {
+    const frame = self.graph_frame orelse return error.InvalidCudaState;
+    if (frame.upload_index >= frame.slots.items.len) return error.CudaGraphUploadMismatch;
+    const slot = frame.slots.items[frame.upload_index];
+    frame.upload_index += 1;
+    if (slot.bytes != bytes_len or slot.kind != kind) return error.CudaGraphUploadMismatch;
+    return slot;
+}
+
+fn copyGraphStagingBytes(slot: GraphUploadSlot, bytes: []const u8) !void {
+    if (!slot.isDynamic()) return;
+    if (slot.host.len != bytes.len) return error.CudaGraphUploadMismatch;
+    @memcpy(slot.host.bytes(), bytes);
+}
+
+fn graphUploadBytes(self: *CudaCompute, bytes: []const u8, kind: GraphUploadKind) !buffer_mod.DeviceBuffer {
+    const frame = self.graph_frame orelse return error.InvalidCudaState;
+    switch (frame.mode) {
+        .record => {
+            var device = try buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes.len);
+            errdefer device.free(&self.ctx);
+            var host: buffer_mod.HostBuffer = .{};
+            errdefer host.free(&self.ctx);
+            if (kind != .static) {
+                host = try buffer_mod.HostBuffer.alloc(&self.ctx, bytes.len);
+                try copyGraphStagingBytes(.{
+                    .buffer = device,
+                    .host = host,
+                    .bytes = bytes.len,
+                    .kind = kind,
+                }, bytes);
+            }
+            try device.copyFromHost(&self.ctx, bytes);
+            try frame.slots.append(self.allocator, .{
+                .buffer = device,
+                .host = host,
+                .bytes = bytes.len,
+                .kind = kind,
+            });
+            host = .{};
+            return device;
+        },
+        .capture => {
+            const slot = try graphNextUploadSlot(self, bytes.len, kind);
+            if (slot.isDynamic()) {
+                if (slot.host.len != bytes.len) return error.CudaGraphUploadMismatch;
+                try slot.buffer.copyFromHost(&self.ctx, slot.host.constBytes());
+            }
+            return slot.buffer;
+        },
+    }
+}
+
+fn graphUploadU32Pair(self: *CudaCompute, first: []const u32, second: []const u32) !TempBufferPair {
+    const first_bytes = try checkedMul(first.len, @sizeOf(u32));
+    const second_bytes = try checkedMul(second.len, @sizeOf(u32));
+    const total_bytes = try checkedAdd(first_bytes, second_bytes);
+    const frame = self.graph_frame orelse return error.InvalidCudaState;
+    switch (frame.mode) {
+        .record => {
+            var device = try buffer_mod.DeviceBuffer.alloc(&self.ctx, total_bytes);
+            errdefer device.free(&self.ctx);
+            const first_device: buffer_mod.DeviceBuffer = .{ .ptr = device.ptr, .len = first_bytes };
+            const second_device: buffer_mod.DeviceBuffer = .{ .ptr = device.ptr + first_bytes, .len = second_bytes };
+            try first_device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(first));
+            try second_device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(second));
+            try frame.slots.append(self.allocator, .{
+                .buffer = device,
+                .bytes = total_bytes,
+                .kind = .static,
+            });
+            return .{ .first = first_device, .second = second_device };
+        },
+        .capture => {
+            const slot = try graphNextUploadSlot(self, total_bytes, .static);
+            return .{
+                .first = .{ .ptr = slot.buffer.ptr, .len = first_bytes },
+                .second = .{ .ptr = slot.buffer.ptr + first_bytes, .len = second_bytes },
+            };
+        },
+    }
+}
+
+fn trackGraphBufferUse(self: *CudaCompute, buffer: buffer_mod.DeviceBuffer) !void {
+    const frame = self.graph_frame orelse return;
+    if (frame.mode != .capture) return;
+    const used_buffers = frame.used_buffers orelse return;
+    if (graphBufferWasUsed(used_buffers.items, buffer.ptr)) return;
+    try used_buffers.append(self.allocator, buffer);
+}
+
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
     var best_index: ?usize = null;
@@ -431,7 +799,11 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     }
     if (best_index) |i| {
         const buffer = self.temp_buffers.swapRemove(i);
+        try trackGraphBufferUse(self, buffer);
         return buffer;
+    }
+    if (self.graph_frame) |frame| {
+        if (frame.mode == .capture) return error.CudaGraphCaptureNeedsWarmup;
     }
     return buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
 }
@@ -483,6 +855,20 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     errdefer self.allocator.free(shape_i64);
     for (shape, 0..) |dim, i| shape_i64[i] = dim;
 
+    if (self.graph_frame) |frame| {
+        const kind: GraphUploadKind = if (data.len == frame.attention_mask_f32_len) .attention_mask_f32 else .static;
+        const device = try graphUploadBytes(self, std.mem.sliceAsBytes(data), kind);
+        const tensor = try self.allocator.create(CudaTensor);
+        tensor.* = .{
+            .buffer = device,
+            .dtype = .f32,
+            .shape = shape_i64,
+            .elem_count = elem_count,
+            .owns_buffer = false,
+        };
+        return tensor;
+    }
+
     var device = try allocDeviceBuffer(self, data.len * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
@@ -500,6 +886,9 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
 
 fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.graph_frame) |frame| {
+        if (frame.mode == .capture) return error.CudaGraphUnsupportedHostTransfer;
+    }
     const cuda_tensor = tensorFromCt(tensor);
     if (cuda_tensor.quant_type) |quant_type| {
         const dims = try allocator.alloc(u64, cuda_tensor.shape.len);
@@ -550,6 +939,9 @@ fn tensorShapeOp(_: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
 
 fn evalTensorOp(ctx: *anyopaque, _: CT) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.graph_frame) |frame| {
+        if (frame.mode == .capture) return error.CudaGraphUnsupportedHostTransfer;
+    }
     try self.ctx.synchronize();
 }
 
@@ -675,12 +1067,18 @@ fn sameShape(a: []const i64, b: []const i64) bool {
 }
 
 fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
+    if (self.graph_frame) |_| {
+        return try graphUploadBytes(self, std.mem.sliceAsBytes(data), graphI64UploadKind(self, data));
+    }
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len * @sizeOf(i64));
     try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
     return device;
 }
 
 fn uploadTempU32(self: *CudaCompute, data: []const u32) !buffer_mod.DeviceBuffer {
+    if (self.graph_frame) |_| {
+        return try graphUploadBytes(self, std.mem.sliceAsBytes(data), .static);
+    }
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len * @sizeOf(u32));
     try device.copyFromHost(&self.ctx, std.mem.sliceAsBytes(data));
     return device;
@@ -695,6 +1093,9 @@ fn uploadTempU32Pair(self: *CudaCompute, first: []const u32, second: []const u32
     const first_bytes = try checkedMul(first.len, @sizeOf(u32));
     const second_bytes = try checkedMul(second.len, @sizeOf(u32));
     const total_bytes = try checkedAdd(first_bytes, second_bytes);
+    if (self.graph_frame) |_| {
+        return try graphUploadU32Pair(self, first, second);
+    }
     const device = try self.temp_ids_masks.acquire(&self.ctx, total_bytes);
     const first_device: buffer_mod.DeviceBuffer = .{ .ptr = device.ptr, .len = first_bytes };
     const second_device: buffer_mod.DeviceBuffer = .{ .ptr = device.ptr + first_bytes, .len = second_bytes };
@@ -931,8 +1332,19 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {
+                .Q8_0 => if (mxbaiQ8Variant(rows, in_dim, out_dim)) |variant| {
+                    if (variant == .fast_r2c4)
+                        try self.kernels.launchLinearQ8_0BiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
+                    else
+                        try self.kernels.launchLinearQ8_0BiasVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+                } else {
+                    try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                    try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
+                },
                 .Q4_K => if (useGlinerSpanQ4Kernel(self, rows, in_dim, out_dim))
                     try self.kernels.launchLinearQ4KSpanBiasTile4Rows8F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
+                else if (mxbaiQ4TiledVariant(rows, in_dim, out_dim)) |variant|
+                    try self.kernels.launchLinearQ4KBiasVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
                 else if (rows >= 2)
                     try self.kernels.launchLinearQ4KBiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
                 else
@@ -1022,11 +1434,13 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
     const bias_tensor = tensorFromCt(bias);
-    if (weight_tensor.quant_type != null or weight_tensor.dtype != .f32) return null;
-    if (rows < 2 or in_dim < 256 or out_dim < 4) return null;
+    const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
+    const q4_variant = if (isKnownQuant(weight_tensor, .Q4_K)) mxbaiQ4Variant(rows, in_dim, out_dim) else null;
+    const use_dense = weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and rows >= 2 and in_dim >= 256 and out_dim >= 4;
+    if (q8_variant == null and q4_variant == null and !use_dense) return null;
     try ensureF32(input_tensor);
-    try ensureF32(weight_tensor);
     try ensureF32(bias_tensor);
+    if (use_dense) try ensureF32(weight_tensor);
     try ensureCount(input_tensor, try checkedMul(rows, in_dim));
     try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
     try ensureCount(bias_tensor, out_dim);
@@ -1036,7 +1450,16 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchLinearBiasGeluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+    if (q8_variant) |variant| {
+        if (variant == .fast_r2c4)
+            try self.kernels.launchLinearQ8_0BiasGeluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
+        else
+            try self.kernels.launchLinearQ8_0BiasGeluVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+    } else if (q4_variant) |variant| {
+        try self.kernels.launchLinearQ4KBiasGeluVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+    } else {
+        try self.kernels.launchLinearBiasGeluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+    }
     return try createTensor(self, device, shape, out_count);
 }
 
@@ -1049,9 +1472,10 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     try ensureF32(input_tensor);
     try ensureF32(bias_tensor);
     try ensureF32(residual_tensor);
-    const use_q4 = isKnownQuant(weight_tensor, .Q4_K);
+    const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
+    const q4_variant = if (isKnownQuant(weight_tensor, .Q4_K)) mxbaiQ4Variant(rows, in_dim, out_dim) else null;
     const use_dense = weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and rows >= 2 and in_dim >= 256 and out_dim >= 4;
-    if (!use_q4 and !use_dense) return null;
+    if (q8_variant == null and q4_variant == null and !use_dense) return null;
     if (use_dense) try ensureF32(weight_tensor);
     try ensureCount(input_tensor, try checkedMul(rows, in_dim));
     try ensureCount(weight_tensor, try checkedMul(out_dim, in_dim));
@@ -1063,8 +1487,13 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    if (use_q4) {
-        try self.kernels.launchLinearQ4KBiasAddTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
+    if (q8_variant) |variant| {
+        if (variant == .fast_r2c4)
+            try self.kernels.launchLinearQ8_0BiasAddTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim)
+        else
+            try self.kernels.launchLinearQ8_0BiasAddVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
+    } else if (q4_variant) |variant| {
+        try self.kernels.launchLinearQ4KBiasAddVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
     } else {
         try self.kernels.launchLinearBiasAddTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
     }
@@ -1088,7 +1517,12 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
     if (weight_tensor.quant_type) |quant_type| {
         switch (quant_type) {
             .known => |known| switch (known) {
-                .Q8_0 => try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                .Q8_0 => if (mxbaiQ8Variant(rows, in_dim, out_dim)) |variant| {
+                    if (variant == .fast_r2c4)
+                        try self.kernels.launchLinearQ8_0Tile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)
+                    else
+                        try self.kernels.launchLinearQ8_0VariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                } else try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 .Q4_0 => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 .Q4_K => try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 else => return error.UnsupportedTensorType,

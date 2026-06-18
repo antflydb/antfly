@@ -25,6 +25,7 @@ command_timeout="${ANTFLY_MXBAI_RERANK_COMMAND_TIMEOUT:-900}"
 verify_server="${ANTFLY_MXBAI_RERANK_VERIFY_SERVER:-0}"
 server_port="${ANTFLY_MXBAI_RERANK_SERVER_PORT:-8097}"
 include_slow_cases="${ANTFLY_MXBAI_RERANK_INCLUDE_SLOW_CASES:-0}"
+verify_graphs="${ANTFLY_MXBAI_RERANK_VERIFY_GRAPHS:-1}"
 cuda_artifacts="${ANTFLY_CUDA_ARTIFACTS:-fatbin}"
 cuda_libraries="${ANTFLY_CUDA_LIBS:-auto}"
 optimize="${ANTFLY_CUDA_VERIFY_OPTIMIZE:-ReleaseFast}"
@@ -47,8 +48,8 @@ if [[ -z "$model_dir" ]]; then
   echo "set ANTFLY_MXBAI_RERANK_MODEL_DIR, or set ANTFLY_INFERENCE_MODELS_DIR/HOME for the default model location" >&2
   exit 1
 fi
-if [[ ! -f "$model_dir/model.safetensors" ]]; then
-  echo "missing model weights at $model_dir/model.safetensors" >&2
+if [[ ! -f "$model_dir/model.safetensors" && ! -f "$model_dir/model.gguf" && -z "$(find "$model_dir" -maxdepth 1 -type f -name '*.gguf' -print -quit 2>/dev/null)" ]]; then
+  echo "missing model weights in $model_dir; expected model.safetensors, model.gguf, or a GGUF file" >&2
   exit 1
 fi
 if [[ ! -f "$model_dir/tokenizer.json" ]]; then
@@ -61,13 +62,14 @@ zig_bin="$(resolve_zig)"
 
 bin="./zig-out/bin/antfly-inference"
 
-python3 - "$bin" "$model_dir" "$tolerance" "$command_timeout" "$include_slow_cases" <<'PY'
+python3 - "$bin" "$model_dir" "$tolerance" "$command_timeout" "$include_slow_cases" "$verify_graphs" <<'PY'
 import json
 import math
+import os
 import subprocess
 import sys
 
-bin_path, model_dir, tolerance_raw, timeout_raw, include_slow_cases = sys.argv[1:6]
+bin_path, model_dir, tolerance_raw, timeout_raw, include_slow_cases, verify_graphs = sys.argv[1:7]
 tolerance = float(tolerance_raw)
 timeout = float(timeout_raw)
 
@@ -139,18 +141,18 @@ def print_subprocess_output(exc):
     if not output.endswith("\n"):
         sys.stderr.write("\n")
 
-def checked_output(cmd):
+def checked_output(cmd, env=None):
     try:
-        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout, env=env)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print_subprocess_output(exc)
         raise
 
-def run_cli(backend, case):
+def run_cli(backend, case, env=None):
     cmd = [bin_path, "rerank", model_dir, "--query", case["query"], "--backend", backend]
     for doc in case["docs"]:
         cmd.extend(["--doc", doc])
-    raw = checked_output(cmd)
+    raw = checked_output(cmd, env=env)
     payload = parse_cli_json(raw)
     scores = [entry["score"] for entry in payload["scores"]]
     if len(scores) != len(case["docs"]):
@@ -168,6 +170,15 @@ for case in cases:
         raise SystemExit(f"{case['name']}: native/cuda max diff {max_diff:.8f} exceeds tolerance {tolerance:.8f}")
     if case.get("expect_order") and not (cuda[0] > cuda[1]):
         raise SystemExit(f"{case['name']}: expected first CUDA score to exceed second score, got {cuda}")
+    if verify_graphs == "1":
+        graph_env = dict(os.environ)
+        graph_env["ANTFLY_CUDA_ENABLE_DEBERTA_GRAPHS"] = "1"
+        graph_env["ANTFLY_CUDA_REQUIRE_DEBERTA_GRAPHS"] = "1"
+        cuda_graph = run_cli("cuda", case, env=graph_env)
+        graph_max_diff = max((abs(a - b) for a, b in zip(cuda, cuda_graph)), default=0.0)
+        print(f"case={case['name']} graph_required_max_abs_diff={graph_max_diff:.8f}", flush=True)
+        if graph_max_diff > tolerance:
+            raise SystemExit(f"{case['name']}: cuda/cuda_graph max diff {graph_max_diff:.8f} exceeds tolerance {tolerance:.8f}")
 
 print("mxbai CLI native/cuda parity completed", flush=True)
 PY
