@@ -11,6 +11,8 @@ info:
 servers:
   - url: /admin/v1
     description: Node-local admin API
+security:
+  - BearerAuth: []
 tags:
   - name: ha
     x-displayName: High Availability
@@ -526,6 +528,14 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
 components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Optional node-local HA admin bearer token. When an Antfly process is
+        started with `--ha-admin-token-env`, typed `/admin/v1/ha` routes require
+        `Authorization: Bearer <token>`.
   parameters:
     SlotName:
       name: slot_name
@@ -545,6 +555,12 @@ components:
             type: string
     Conflict:
       description: HA operation cannot be completed in the current state.
+      content:
+        text/plain:
+          schema:
+            type: string
+    Unauthorized:
+      description: HA admin bearer token is missing or invalid.
       content:
         text/plain:
           schema:

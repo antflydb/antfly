@@ -1071,6 +1071,36 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 	}
 }
 
+func TestAdminOpenAPISpecDocumentsBearerAuth(t *testing.T) {
+	raw, specPath := readAdminOpenAPISpec(t)
+	var spec struct {
+		Security   []map[string][]string `json:"security"`
+		Components struct {
+			SecuritySchemes map[string]struct {
+				Type   string `json:"type"`
+				Scheme string `json:"scheme"`
+			} `json:"securitySchemes"`
+		} `json:"components"`
+	}
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("parse admin OpenAPI spec %s: %v", specPath, err)
+	}
+
+	bearer, ok := spec.Components.SecuritySchemes["BearerAuth"]
+	if !ok {
+		t.Fatalf("admin OpenAPI spec must define components.securitySchemes.BearerAuth")
+	}
+	if bearer.Type != "http" || bearer.Scheme != "bearer" {
+		t.Fatalf("BearerAuth scheme = %#v, want http bearer", bearer)
+	}
+	for _, requirement := range spec.Security {
+		if _, ok := requirement["BearerAuth"]; ok {
+			return
+		}
+	}
+	t.Fatalf("admin OpenAPI spec must apply BearerAuth at the top level")
+}
+
 func TestOperatorUsesAdminSDKWrapperOnly(t *testing.T) {
 	_, file, _, ok := goruntime.Caller(0)
 	if !ok {
@@ -1533,15 +1563,7 @@ func TestHASeedAdminCommandRequiresTargetLSN(t *testing.T) {
 
 func loadAdminOpenAPIOperations(t *testing.T) map[string]string {
 	t.Helper()
-	_, file, _, ok := goruntime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test file path")
-	}
-	specPath := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "..", "..", "..", "specs", "openapi", "antfly", "admin.yaml"))
-	raw, err := os.ReadFile(specPath)
-	if err != nil {
-		t.Fatalf("read admin OpenAPI spec %s: %v", specPath, err)
-	}
+	raw, specPath := readAdminOpenAPISpec(t)
 	var spec struct {
 		Paths map[string]map[string]struct {
 			OperationID string `json:"operationId"`
@@ -1557,6 +1579,20 @@ func loadAdminOpenAPIOperations(t *testing.T) map[string]string {
 		}
 	}
 	return operations
+}
+
+func readAdminOpenAPISpec(t *testing.T) ([]byte, string) {
+	t.Helper()
+	_, file, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test file path")
+	}
+	specPath := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "..", "..", "..", "specs", "openapi", "antfly", "admin.yaml"))
+	raw, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatalf("read admin OpenAPI spec %s: %v", specPath, err)
+	}
+	return raw, specPath
 }
 
 func TestPlanHALeavesUndesiredSlotPausedUnlessDropIsExplicit(t *testing.T) {
