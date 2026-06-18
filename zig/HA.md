@@ -611,6 +611,29 @@ Treat these review points as acceptance gates, not follow-up polish:
 - Production readiness requires the failure cases to be first-class before
   automatic promotion or synchronous commit is advertised as supported.
 
+The concrete follow-up decisions are:
+
+- Replace `paddedHAString` with a small shared `HAStringValidation` classifier
+  rather than a catch-all `validateHAString`. Keep durable HA string handling
+  generic only for `ok`, `missing`, and `padded`, then have each caller map that
+  result to field-specific errors and type-specific validation.
+- Add `test_standby.py` as a real-process e2e, not just a CLI or validation
+  test. It should cover primary startup, slot creation, standby seed, standby
+  startup, primary writes, standby catch-up, read-only standby behavior,
+  standby restart/replay, and later fenced promotion plus old-primary write
+  rejection.
+- Integrate HA with Zig simulation tests before treating the mode as safe.
+  Sim coverage should exercise receive/apply crashes, primary crash before and
+  after sync ack, duplicate/gap/out-of-order WAL, promotion with and without
+  fences, old-primary rejoin, rewind, reseed, retained-WAL expiry, and timeline
+  switch propagation.
+- Do not advertise production-grade Postgres-style HA parity until the runtime
+  wiring, generated `/admin/v1/ha` Zig and Go clients, `go/pkg/operator`
+  integration, real base backup, synchronous commit, fencing, promotion
+  receipts, standby freshness, retention/reseed handling, auth, audit, metrics,
+  runbooks, compatibility tests, crash/e2e/operator coverage, and former-primary
+  repair paths are all implemented and tested.
+
 ## Test Strategy
 
 HA needs both black-box e2e coverage and deterministic simulation coverage. The
