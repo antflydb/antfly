@@ -748,6 +748,41 @@ pub const Catalog = struct {
         }
     }
 
+    pub fn appendDeltaRecordsIntoScratch(
+        self: Catalog,
+        alloc: Allocator,
+        posting_id: PostingId,
+        min_generation: ?u64,
+        scratch: anytype,
+    ) !void {
+        for (self.segments) |segment| {
+            if (!segment.meta.mayContainPosting(posting_id)) continue;
+            if (min_generation) |generation| {
+                if (segment.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(segment.meta.max_delta_sequence) <= generation) continue;
+            }
+
+            var reader = try Reader.init(segment.data);
+            var iter = reader.deltas(posting_id);
+            while (try iter.next()) |delta_value| {
+                var delta_iter = try posting.PostingFormat.DeltaTailIterator.init(delta_value.value);
+                if (min_generation) |generation| {
+                    var reserved = false;
+                    while (try delta_iter.next()) |record| {
+                        if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
+                        if (!reserved) {
+                            try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount() - delta_iter.index + 1);
+                            reserved = true;
+                        }
+                        scratch.appendDeltaRecordAssumeCapacity(record);
+                    }
+                } else {
+                    try ensureDeltaRecordAppendCapacity(alloc, scratch, delta_iter.recordCount());
+                    while (try delta_iter.next()) |record| scratch.appendDeltaRecordAssumeCapacity(record);
+                }
+            }
+        }
+    }
+
     fn getLatestExact(self: Catalog, posting_id: PostingId, kind: EntryKind) !?[]const u8 {
         var best_segment_id: u64 = 0;
         var best: ?[]const u8 = null;
@@ -1189,11 +1224,30 @@ pub const Snapshot = struct {
     }
 
     pub fn materializeMembers(self: Snapshot, alloc: Allocator, posting_id: PostingId) !?[]posting.VectorId {
-        var base = (try self.loadBase(alloc, posting_id)) orelse return null;
-        defer base.deinit(alloc);
-        const records = try self.loadDeltaTailAfterGeneration(alloc, posting_id, base.generation);
-        defer alloc.free(records);
-        return try posting.PostingFormat.materializeMembersAfterGeneration(alloc, base.members, records, base.generation);
+        const base_data = (try self.getBaseBytes(posting_id)) orelse return null;
+        var scratch = posting.PostingStore.FoldScratch{};
+        defer scratch.deinit(alloc);
+
+        scratch.resetDeltaRecords();
+        var base_iter = try posting.PostingFormat.BaseMemberIterator.init(base_data);
+        const base_member_count = base_iter.memberCount();
+        try scratch.ensureMemberIdCapacity(alloc, base_member_count);
+        var member_count: usize = 0;
+        while (try base_iter.next()) |member| {
+            scratch.member_ids[member_count] = member;
+            member_count += 1;
+        }
+        try base_iter.finish();
+
+        try self.catalog.appendDeltaRecordsIntoScratch(alloc, posting_id, base_iter.header.generation, &scratch);
+        const records = scratch.deltaRecordsMut();
+        sortPostingDeltaRecordsIfNeeded(records);
+
+        try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
+        for (records) |record| {
+            posting.PostingFormat.applyDeltaRecordToScratch(&scratch, &member_count, record);
+        }
+        return try alloc.dupe(posting.VectorId, scratch.member_ids[0..member_count]);
     }
 };
 
