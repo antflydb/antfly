@@ -4183,7 +4183,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_rows_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
             "relational rows unique selector",
             "relational rows conflict target upsert",
             "relational rows batch returning",
@@ -4220,7 +4220,7 @@ pub fn build(b: *std.Build) void {
             "db row claim lease expiry aborts stale owner and lets next claimer proceed",
             "db row claim lease expiry lets direct mutation reclaim stale owner",
             "catalog source resolves groups by key and span",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
