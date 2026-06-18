@@ -3520,6 +3520,11 @@ fn validateLakeRowsAggregateRequestSupported(
             else => {},
         }
     }
+    for (request.group_expressions) |projection| {
+        if (projection.output.len == 0) return error.InvalidRowsRequest;
+        const output_type = try rowsExpressionOutputType(alloc, schema, projection.expression);
+        if (output_type == .embedding) return error.UnsupportedRowsQuery;
+    }
     for (request.aggregations) |aggregation| {
         switch (aggregation.op) {
             .count => {
@@ -3615,8 +3620,7 @@ fn validateLakeRowsAggregateRequestSupported(
 
 fn validateLakeRowsAggregateShapeSupported(request: OwnedRowsAggregateRequest) !void {
     try validateLakeRowsAggregateSourceSupported(request.source);
-    if (request.group_expressions.len != 0) return error.UnsupportedRowsQuery;
-    if (request.aggregations.len == 0 and request.group_by.len == 0) return error.InvalidRowsRequest;
+    if (request.aggregations.len == 0 and request.group_by.len == 0 and request.group_expressions.len == 0) return error.InvalidRowsRequest;
     for (request.aggregations) |aggregation| {
         if (aggregation.name.len == 0) return error.InvalidRowsRequest;
         if (aggregation.distinct) return error.UnsupportedRowsQuery;
@@ -3658,6 +3662,9 @@ fn lakeRowsAggregateProjectedColumnsAlloc(
 
     for (request.group_by) |field| {
         try appendLakeProjectedColumnAlloc(alloc, &columns, field);
+    }
+    for (request.group_expressions) |projection| {
+        try appendLakeRowsExpressionProjectedColumnsAlloc(alloc, &columns, projection.expression);
     }
     for (request.aggregations) |aggregation| {
         if (aggregation.field) |field| try appendLakeProjectedColumnAlloc(alloc, &columns, field);
@@ -3995,12 +4002,13 @@ fn lakeRowsAggregateGroupsAlloc(
     var groups = std.ArrayListUnmanaged(LakeAggregateGroup).empty;
     errdefer freeLakeRowsAggregateGroupList(alloc, &groups, request.aggregations.len);
 
-    if (request.group_by.len == 0) {
+    const grouped = request.group_by.len != 0 or request.group_expressions.len != 0;
+    if (!grouped) {
         try appendLakeRowsAggregateGroupAlloc(alloc, request, &groups, null);
     }
 
     for (rows) |row| {
-        const group_index = if (request.group_by.len == 0)
+        const group_index = if (!grouped)
             @as(usize, 0)
         else
             try findOrAppendLakeRowsAggregateGroupAlloc(alloc, request, &groups, row);
@@ -4016,7 +4024,7 @@ fn findOrAppendLakeRowsAggregateGroupAlloc(
     groups: *std.ArrayListUnmanaged(LakeAggregateGroup),
     row: lake_rows.ProjectedRow,
 ) !usize {
-    const key_json = try lakeRowsGroupKeyJsonAlloc(alloc, request.group_by, row);
+    const key_json = try lakeRowsGroupKeyJsonAlloc(alloc, request, row);
     errdefer alloc.free(key_json);
     for (groups.items, 0..) |group, i| {
         if (std.mem.eql(u8, group.key_json, key_json)) {
@@ -4024,7 +4032,7 @@ fn findOrAppendLakeRowsAggregateGroupAlloc(
             return i;
         }
     }
-    const fields_json = try lakeRowsGroupFieldsJsonAlloc(alloc, request.group_by, row);
+    const fields_json = try lakeRowsGroupFieldsJsonAlloc(alloc, request, row);
     errdefer alloc.free(fields_json);
     const folds = try alloc.alloc(LakeAggregateFold, request.aggregations.len);
     @memset(folds, .{});
@@ -4044,12 +4052,12 @@ fn appendLakeRowsAggregateGroupAlloc(
     maybe_row: ?lake_rows.ProjectedRow,
 ) !void {
     const key_json = if (maybe_row) |row|
-        try lakeRowsGroupKeyJsonAlloc(alloc, request.group_by, row)
+        try lakeRowsGroupKeyJsonAlloc(alloc, request, row)
     else
         try alloc.dupe(u8, "[]");
     errdefer alloc.free(key_json);
     const fields_json = if (maybe_row) |row|
-        try lakeRowsGroupFieldsJsonAlloc(alloc, request.group_by, row)
+        try lakeRowsGroupFieldsJsonAlloc(alloc, request, row)
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(fields_json);
@@ -4107,6 +4115,11 @@ fn lakeRowsAggregateExpressionNonNullAlloc(
     row: lake_rows.ProjectedRow,
     expression: db_mod.types.RelationalRowsExpression,
 ) !bool {
+    switch (try lakeRowsTypedNumericExpressionAlloc(alloc, row, expression)) {
+        .unsupported => {},
+        .null => return false,
+        .i64, .f64 => return true,
+    }
     const value_json = try lakeRowsAggregateExpressionJsonAlloc(alloc, row, expression);
     defer alloc.free(value_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
@@ -4120,6 +4133,18 @@ fn addLakeRowsAggregateExpressionNumericAlloc(
     row: lake_rows.ProjectedRow,
     expression: db_mod.types.RelationalRowsExpression,
 ) !void {
+    switch (try lakeRowsTypedNumericExpressionAlloc(alloc, row, expression)) {
+        .unsupported => {},
+        .null => return,
+        .i64 => |number| {
+            try fold.addI64(number);
+            return;
+        },
+        .f64 => |number| {
+            fold.addF64(number);
+            return;
+        },
+    }
     const value_json = try lakeRowsAggregateExpressionJsonAlloc(alloc, row, expression);
     defer alloc.free(value_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
@@ -4137,6 +4162,167 @@ fn addLakeRowsAggregateExpressionNumericAlloc(
         },
         else => return error.UnsupportedRowsQuery,
     }
+}
+
+const LakeTypedNumericExpression = union(enum) {
+    unsupported,
+    null,
+    i64: i64,
+    f64: f64,
+
+    fn asF64(self: @This()) f64 {
+        return switch (self) {
+            .i64 => |number| @floatFromInt(number),
+            .f64 => |number| number,
+            else => unreachable,
+        };
+    }
+};
+
+fn lakeRowsTypedNumericExpressionAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    expression: db_mod.types.RelationalRowsExpression,
+) anyerror!LakeTypedNumericExpression {
+    return switch (expression.kind) {
+        .field => blk: {
+            switch (expression.field_source) {
+                .row, .existing, .source => {},
+                .proposed => break :blk .unsupported,
+            }
+            const cell = row.find(expression.field) orelse return error.RowSourceColumnNotFound;
+            const value = cell.value orelse break :blk .null;
+            break :blk switch (value) {
+                .i64 => |number| .{ .i64 = number },
+                .f64 => |number| .{ .f64 = number },
+                else => .unsupported,
+            };
+        },
+        .value => try lakeRowsTypedNumericValueJsonAlloc(alloc, expression.value_json),
+        .add, .sub, .mul, .div, .mod, .power => try lakeRowsTypedNumericArithmeticAlloc(alloc, row, expression),
+        .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign => try lakeRowsTypedNumericUnaryAlloc(alloc, row, expression),
+        else => .unsupported,
+    };
+}
+
+fn lakeRowsTypedNumericValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) anyerror!LakeTypedNumericExpression {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return switch (parsed.value) {
+        .null => .null,
+        .integer => |number| .{ .i64 = number },
+        .float => |number| .{ .f64 = number },
+        .number_string => |text| blk: {
+            if (std.fmt.parseInt(i64, text, 10)) |number| {
+                break :blk .{ .i64 = number };
+            } else |_| {
+                break :blk .{ .f64 = std.fmt.parseFloat(f64, text) catch return error.InvalidRowsRequest };
+            }
+        },
+        else => .unsupported,
+    };
+}
+
+fn lakeRowsTypedNumericArithmeticAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    expression: db_mod.types.RelationalRowsExpression,
+) anyerror!LakeTypedNumericExpression {
+    if ((expression.kind == .add or expression.kind == .mul) and expression.operands.len < 2) return error.InvalidRowsRequest;
+    if ((expression.kind == .sub or expression.kind == .div or expression.kind == .mod or expression.kind == .power) and expression.operands.len != 2) return error.InvalidRowsRequest;
+    if ((expression.kind == .add or expression.kind == .sub) and expression.operands.len == 2 and rowsExpressionHasDirectCalendarIntervalOperand(expression)) return .unsupported;
+
+    var result = try lakeRowsTypedNumericExpressionAlloc(alloc, row, expression.operands[0]);
+    switch (result) {
+        .unsupported, .null => return result,
+        .i64, .f64 => {},
+    }
+    for (expression.operands[1..]) |operand| {
+        const rhs = try lakeRowsTypedNumericExpressionAlloc(alloc, row, operand);
+        switch (rhs) {
+            .unsupported => return .unsupported,
+            .null => return .null,
+            .i64, .f64 => {},
+        }
+        result = try lakeRowsTypedNumericApplyArithmetic(expression.kind, result, rhs);
+    }
+    return result;
+}
+
+fn lakeRowsTypedNumericApplyArithmetic(
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    lhs: LakeTypedNumericExpression,
+    rhs: LakeTypedNumericExpression,
+) anyerror!LakeTypedNumericExpression {
+    if (kind == .add or kind == .sub or kind == .mul) {
+        switch (lhs) {
+            .i64 => |lhs_i64| switch (rhs) {
+                .i64 => |rhs_i64| {
+                    const maybe_i64 = switch (kind) {
+                        .add => std.math.add(i64, lhs_i64, rhs_i64),
+                        .sub => std.math.sub(i64, lhs_i64, rhs_i64),
+                        .mul => std.math.mul(i64, lhs_i64, rhs_i64),
+                        else => unreachable,
+                    };
+                    if (maybe_i64) |number| return .{ .i64 = number } else |_| {}
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    const lhs_f64 = lhs.asF64();
+    const rhs_f64 = rhs.asF64();
+    const result = switch (kind) {
+        .add => lhs_f64 + rhs_f64,
+        .sub => lhs_f64 - rhs_f64,
+        .mul => lhs_f64 * rhs_f64,
+        .div => if (rhs_f64 == 0) return error.InvalidRowsRequest else lhs_f64 / rhs_f64,
+        .mod => if (rhs_f64 == 0) return error.InvalidRowsRequest else lhs_f64 - @trunc(lhs_f64 / rhs_f64) * rhs_f64,
+        .power => std.math.pow(f64, lhs_f64, rhs_f64),
+        else => return error.InvalidRowsRequest,
+    };
+    if (!std.math.isFinite(result)) return error.InvalidRowsRequest;
+    return .{ .f64 = result };
+}
+
+fn lakeRowsTypedNumericUnaryAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    expression: db_mod.types.RelationalRowsExpression,
+) anyerror!LakeTypedNumericExpression {
+    if (expression.operands.len != 1) return error.InvalidRowsRequest;
+    const value = try lakeRowsTypedNumericExpressionAlloc(alloc, row, expression.operands[0]);
+    switch (value) {
+        .unsupported, .null => return value,
+        .i64, .f64 => {},
+    }
+    if (expression.kind == .abs) {
+        switch (value) {
+            .i64 => |number| {
+                if (number >= 0) return .{ .i64 = number };
+                return .{ .i64 = std.math.negate(number) catch return .{ .f64 = -value.asF64() } };
+            },
+            else => {},
+        }
+    }
+    const number = value.asF64();
+    const result = switch (expression.kind) {
+        .abs => if (number < 0) -number else number,
+        .round => @round(number),
+        .trunc => @trunc(number),
+        .floor => @floor(number),
+        .ceil => @ceil(number),
+        .sqrt => if (number < 0) return error.InvalidRowsRequest else @sqrt(number),
+        .sign => if (number < 0) @as(f64, -1) else if (number > 0) @as(f64, 1) else @as(f64, 0),
+        else => return error.InvalidRowsRequest,
+    };
+    if (!std.math.isFinite(result)) return error.InvalidRowsRequest;
+    return .{ .f64 = result };
 }
 
 fn lakeRowsAggregateExpressionJsonAlloc(
@@ -4543,16 +4729,31 @@ fn writeLakeAggregateFoldValueJson(
 
 fn lakeRowsGroupKeyJsonAlloc(
     alloc: std.mem.Allocator,
-    group_by: []const []const u8,
+    request: OwnedRowsAggregateRequest,
     row: lake_rows.ProjectedRow,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeByte('[');
-    for (group_by, 0..) |field, i| {
-        if (i != 0) try writer.writeByte(',');
+    var first = true;
+    for (request.group_by) |field| {
+        if (!first) try writer.writeByte(',');
+        first = false;
         try writeLakeRowsCellJson(writer, (row.find(field) orelse return error.RowSourceColumnNotFound).value);
+    }
+    if (request.group_expressions.len != 0) {
+        const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+        defer alloc.free(row_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        for (request.group_expressions) |projection| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            const value_json = try expressionValueJsonAlloc(alloc, parsed.value, projection.expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
+        }
     }
     try writer.writeByte(']');
     return try out.toOwnedSlice();
@@ -4560,16 +4761,32 @@ fn lakeRowsGroupKeyJsonAlloc(
 
 fn lakeRowsGroupFieldsJsonAlloc(
     alloc: std.mem.Allocator,
-    group_by: []const []const u8,
+    request: OwnedRowsAggregateRequest,
     row: lake_rows.ProjectedRow,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    for (group_by, 0..) |field, i| {
-        if (i != 0) try writer.writeByte(',');
+    var first = true;
+    for (request.group_by) |field| {
+        if (!first) try writer.writeByte(',');
+        first = false;
         try writer.print("{f}:", .{std.json.fmt(field, .{})});
         try writeLakeRowsCellJson(writer, (row.find(field) orelse return error.RowSourceColumnNotFound).value);
+    }
+    if (request.group_expressions.len != 0) {
+        const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+        defer alloc.free(row_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        for (request.group_expressions) |projection| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
+            const value_json = try expressionValueJsonAlloc(alloc, parsed.value, projection.expression);
+            defer alloc.free(value_json);
+            try writer.writeAll(value_json);
+        }
     }
     return try out.toOwnedSlice();
 }
@@ -18696,6 +18913,64 @@ test "relational rows lake bridge folds projected rows as grouped aggregate resu
     try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"amount_sum\":50}", result.rows[1]);
 }
 
+test "relational rows lake bridge folds expression grouped aggregate result" {
+    const alloc = std.testing.allocator;
+    const status_name_0 = @constCast("status"[0..]);
+    const status_value_0 = @constCast("Open"[0..]);
+    const amount_name_0 = @constCast("amount"[0..]);
+    const status_name_1 = @constCast("status"[0..]);
+    const status_value_1 = @constCast("open"[0..]);
+    const amount_name_1 = @constCast("amount"[0..]);
+    const status_name_2 = @constCast("status"[0..]);
+    const status_value_2 = @constCast("Closed"[0..]);
+    const amount_name_2 = @constCast("amount"[0..]);
+    var cells_0 = [_]lake_rows.ProjectedCell{
+        .{ .name = status_name_0, .value = .{ .bytes = status_value_0 } },
+        .{ .name = amount_name_0, .value = .{ .i64 = 10 } },
+    };
+    var cells_1 = [_]lake_rows.ProjectedCell{
+        .{ .name = status_name_1, .value = .{ .bytes = status_value_1 } },
+        .{ .name = amount_name_1, .value = .{ .i64 = 20 } },
+    };
+    var cells_2 = [_]lake_rows.ProjectedCell{
+        .{ .name = status_name_2, .value = .{ .bytes = status_value_2 } },
+        .{ .name = amount_name_2, .value = .{ .i64 = 5 } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .relational_key = "row:1" }, .cells = &cells_0 },
+        .{ .row_ref = .{ .relational_key = "row:2" }, .cells = &cells_1 },
+        .{ .row_ref = .{ .relational_key = "row:3" }, .cells = &cells_2 },
+    };
+    const status_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+        .field_source = .row,
+    }};
+    const group_expressions = [_]db_mod.types.RelationalRowsExpressionProjection{.{
+        .output = "status_key",
+        .expression = .{ .kind = .lower, .operands = &status_operands },
+    }};
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    const request = OwnedRowsAggregateRequest{
+        .group_expressions = &group_expressions,
+        .aggregations = &aggregations,
+    };
+
+    var result = try buildRowsAggregateResultFromLakeRowsAlloc(alloc, request, .{
+        .rows = &projected,
+        .total = 3,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"status_key\":\"closed\",\"row_count\":1,\"amount_sum\":5}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"status_key\":\"open\",\"row_count\":2,\"amount_sum\":30}", result.rows[1]);
+}
+
 test "relational rows lake bridge applies aggregate output filters order and limit" {
     const alloc = std.testing.allocator;
     const tenant_name_0 = @constCast("tenant"[0..]);
@@ -19037,6 +19312,9 @@ test "relational rows lake bridge folds expression aggregates" {
     const tenant_name_2 = @constCast("tenant"[0..]);
     const amount_name_2 = @constCast("amount"[0..]);
     const discount_name_2 = @constCast("discount"[0..]);
+    const tenant_name_3 = @constCast("tenant"[0..]);
+    const amount_name_3 = @constCast("amount"[0..]);
+    const discount_name_3 = @constCast("discount"[0..]);
     var cells_0 = [_]lake_rows.ProjectedCell{
         .{ .name = tenant_name_0, .value = .{ .i64 = 7 } },
         .{ .name = amount_name_0, .value = .{ .i64 = 10 } },
@@ -19052,10 +19330,16 @@ test "relational rows lake bridge folds expression aggregates" {
         .{ .name = amount_name_2, .value = .{ .i64 = 30 } },
         .{ .name = discount_name_2, .value = .{ .i64 = 4 } },
     };
+    var cells_3 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_3, .value = .{ .i64 = 8 } },
+        .{ .name = amount_name_3, .value = .{ .i64 = 50 } },
+        .{ .name = discount_name_3, .value = null },
+    };
     var projected = [_]lake_rows.ProjectedRow{
         .{ .row_ref = .{ .relational_key = "row:1" }, .cells = &cells_0 },
         .{ .row_ref = .{ .relational_key = "row:2" }, .cells = &cells_1 },
         .{ .row_ref = .{ .relational_key = "row:3" }, .cells = &cells_2 },
+        .{ .row_ref = .{ .relational_key = "row:4" }, .cells = &cells_3 },
     };
     const group_by = [_][]const u8{"tenant"};
     const net_amount_operands = [_]db_mod.types.RelationalRowsExpression{
@@ -19068,6 +19352,7 @@ test "relational rows lake bridge folds expression aggregates" {
     };
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "row_count", .op = .count },
+        .{ .name = "net_amount_count", .op = .count, .expression = net_amount_expression },
         .{ .name = "net_amount_sum", .op = .sum, .expression = net_amount_expression },
     };
     const request = OwnedRowsAggregateRequest{
@@ -19077,14 +19362,14 @@ test "relational rows lake bridge folds expression aggregates" {
 
     var result = try buildRowsAggregateResultFromLakeRowsAlloc(alloc, request, .{
         .rows = &projected,
-        .total = 3,
+        .total = 4,
     });
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"net_amount_sum\":9}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"net_amount_sum\":43}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"net_amount_count\":1,\"net_amount_sum\":9}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":3,\"net_amount_count\":2,\"net_amount_sum\":43}", result.rows[1]);
 }
 
 test "relational rows batch derives deterministic physical primary keys" {
