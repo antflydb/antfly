@@ -1029,7 +1029,10 @@ implementations cleanly:
     replay all append segment delta records directly into retained scratch;
     folds collect tail stats in that same pass. This removes the duplicate
     stats-then-replay scans, delta-location lists, and owned delta slices that
-    existed before. Fold scratch release now resets transient replay state and
+    existed before. Segment delta-tail stats also read a posting's contiguous
+    delta-value range once per segment instead of issuing one range read per
+    delta value while still verifying each value checksum. Fold scratch release
+    now resets transient replay state and
     trims retained buffers under the configured byte budget before caching the
     scratch for reuse, so exact-size fold encoders do not still pin a previous
     worst-case posting's memory. The HBC

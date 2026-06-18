@@ -2114,26 +2114,24 @@ pub fn readSegmentDeltaTailStatsAlloc(alloc: Allocator, io: std.Io, dir: std.Io.
     defer alloc.free(index_data);
 
     var out = posting.PostingDeltaTailStats{};
-    const range = (try deltaIndexRange(index_data, entry.meta.entry_count, posting_id)) orelse return out;
+    const range = (try readSegmentDeltaValueRangeAlloc(alloc, io, dir, entry, index_data, posting_id)) orelse return out;
+    defer range.deinit(alloc);
 
     var index = range.first_index;
     while (index < range.past_index) : (index += 1) {
-        const found = try deltaIndexEntryFromIndexData(index_data, index);
-        {
-            const value = try readSegmentEntryValueAlloc(alloc, io, dir, entry, found);
-            defer alloc.free(value);
-            if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
-                try accumulateDeltaValueAllRecordsStats(value, &out);
-                continue;
-            }
-
-            const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(value, base_generation);
-            out.records += stats.records;
-            out.records_after_generation += stats.records_after_generation;
-            out.tombstones_after_generation += stats.tombstones_after_generation;
-            out.encoded_value_bytes += stats.encoded_value_bytes;
-            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
+        const found = try deltaIndexEntryFromRange(index_data, range, index);
+        const value = try deltaValueFromEntryRange(range, found);
+        if (posting.PostingFormat.deltaSequenceGeneration(found.sequence) > base_generation) {
+            try accumulateDeltaValueAllRecordsStats(value, &out);
+            continue;
         }
+
+        const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(value, base_generation);
+        out.records += stats.records;
+        out.records_after_generation += stats.records_after_generation;
+        out.tombstones_after_generation += stats.tombstones_after_generation;
+        out.encoded_value_bytes += stats.encoded_value_bytes;
+        out.max_sequence_after_generation = @max(out.max_sequence_after_generation, stats.max_sequence_after_generation);
     }
     return out;
 }
