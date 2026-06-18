@@ -33,6 +33,7 @@ pub const external_source = @import("serverless/external_source/mod.zig");
 pub const lake_rows_query = @import("serverless/query/lake_rows.zig");
 pub const lake_explain_query = @import("serverless/query/lake_explain.zig");
 pub const lake_cache_query = @import("serverless/query/lake_cache.zig");
+pub const lake_range_io = @import("serverless/query/lake_range_io.zig");
 pub const sidecar_source_binding = @import("serverless/segment/source_binding.zig");
 pub const sidecar_manifest = @import("serverless/segment/sidecar_manifest.zig");
 pub const manifest_artifact_ref = @import("serverless/manifest/artifact_ref.zig");
@@ -59,6 +60,7 @@ test {
     _ = lake_rows_query;
     _ = lake_explain_query;
     _ = lake_cache_query;
+    _ = lake_range_io;
     _ = sidecar_source_binding;
     _ = sidecar_manifest;
     _ = manifest_artifact_ref;

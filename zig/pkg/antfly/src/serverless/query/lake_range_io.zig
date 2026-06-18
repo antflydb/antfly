@@ -1,0 +1,306 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Object-storage range planning for lake scans.
+//!
+//! Parquet and Iceberg readers should not assemble ad hoc object-store reads.
+//! This module provides the stable physical read contract: tail footer ranges,
+//! coalesced byte ranges, version-aware cache keys, and cache lanes that keep
+//! broad scans from evicting serving-critical sidecars.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const CacheLane = enum {
+    metadata,
+    compressed_range,
+    decoded_column,
+    projected_batch,
+    serving_sidecar,
+    broad_scan_scratch,
+};
+
+pub const RangePurpose = enum {
+    parquet_footer,
+    parquet_column_chunk,
+    parquet_page_index,
+    iceberg_metadata,
+    iceberg_delete_metadata,
+    decoded_column_page,
+    projected_row_batch,
+    sidecar_payload,
+    broad_scan_scratch,
+
+    pub fn cacheLane(self: RangePurpose) CacheLane {
+        return switch (self) {
+            .parquet_footer, .parquet_page_index, .iceberg_metadata, .iceberg_delete_metadata => .metadata,
+            .parquet_column_chunk => .compressed_range,
+            .decoded_column_page => .decoded_column,
+            .projected_row_batch => .projected_batch,
+            .sidecar_payload => .serving_sidecar,
+            .broad_scan_scratch => .broad_scan_scratch,
+        };
+    }
+};
+
+pub const ObjectVersion = struct {
+    etag: []const u8 = &.{},
+    version_id: []const u8 = &.{},
+
+    pub fn validate(self: ObjectVersion) !void {
+        if (self.etag.len == 0 and self.version_id.len == 0) return error.InvalidLakeRangeRead;
+    }
+};
+
+pub const ObjectRef = struct {
+    bucket: []const u8,
+    key: []const u8,
+    byte_len: u64,
+    version: ObjectVersion,
+
+    pub fn validate(self: ObjectRef) !void {
+        if (self.bucket.len == 0) return error.InvalidLakeRangeRead;
+        if (self.key.len == 0) return error.InvalidLakeRangeRead;
+        if (self.byte_len == 0) return error.InvalidLakeRangeRead;
+        try self.version.validate();
+    }
+};
+
+pub const ByteRange = struct {
+    offset: u64,
+    len: u64,
+
+    pub fn end(self: ByteRange) u64 {
+        return self.offset + self.len;
+    }
+
+    pub fn validate(self: ByteRange, object_len: u64) !void {
+        if (self.len == 0) return error.InvalidLakeRangeRead;
+        if (self.offset > object_len) return error.InvalidLakeRangeRead;
+        if (self.len > object_len - self.offset) return error.InvalidLakeRangeRead;
+    }
+};
+
+pub const RangeRead = struct {
+    object: ObjectRef,
+    range: ByteRange,
+    purpose: RangePurpose,
+    compression_codec: []const u8 = &.{},
+    decoded_column_id: []const u8 = &.{},
+
+    pub fn validate(self: RangeRead) !void {
+        try self.object.validate();
+        try self.range.validate(self.object.byte_len);
+        switch (self.purpose) {
+            .decoded_column_page, .projected_row_batch => {
+                if (self.decoded_column_id.len == 0) return error.InvalidLakeRangeRead;
+            },
+            else => {},
+        }
+    }
+
+    pub fn cacheLane(self: RangeRead) CacheLane {
+        return self.purpose.cacheLane();
+    }
+
+    pub fn cacheKeyAlloc(self: RangeRead, alloc: Allocator) ![]u8 {
+        try self.validate();
+        return std.fmt.allocPrint(
+            alloc,
+            "lake-range:v1:{s}/{s}:etag={s}:version={s}:offset={d}:len={d}:purpose={s}:codec={s}:column={s}",
+            .{
+                self.object.bucket,
+                self.object.key,
+                self.object.version.etag,
+                self.object.version.version_id,
+                self.range.offset,
+                self.range.len,
+                @tagName(self.purpose),
+                self.compression_codec,
+                self.decoded_column_id,
+            },
+        );
+    }
+};
+
+pub const CoalesceOptions = struct {
+    max_gap_bytes: u64 = 0,
+};
+
+pub fn planParquetFooterRead(object: ObjectRef, max_probe_bytes: u64) !RangeRead {
+    try object.validate();
+    if (max_probe_bytes == 0) return error.InvalidLakeRangeRead;
+    const read_len = @min(object.byte_len, max_probe_bytes);
+    return .{
+        .object = object,
+        .range = .{ .offset = object.byte_len - read_len, .len = read_len },
+        .purpose = .parquet_footer,
+    };
+}
+
+pub fn coalescePhysicalReadsAlloc(
+    alloc: Allocator,
+    reads: []const RangeRead,
+    options: CoalesceOptions,
+) ![]RangeRead {
+    if (reads.len == 0) return try alloc.alloc(RangeRead, 0);
+
+    var sorted = try alloc.dupe(RangeRead, reads);
+    errdefer alloc.free(sorted);
+    for (sorted) |read| try read.validate();
+    std.mem.sort(RangeRead, sorted, {}, lessThanRangeRead);
+
+    var out = std.ArrayListUnmanaged(RangeRead).empty;
+    errdefer out.deinit(alloc);
+
+    var current = sorted[0];
+    for (sorted[1..]) |next| {
+        if (canCoalesce(current, next, options.max_gap_bytes)) {
+            const new_end = @max(current.range.end(), next.range.end());
+            current.range.len = new_end - current.range.offset;
+            if (!std.mem.eql(u8, current.decoded_column_id, next.decoded_column_id)) {
+                current.decoded_column_id = &.{};
+            }
+        } else {
+            try out.append(alloc, current);
+            current = next;
+        }
+    }
+    try out.append(alloc, current);
+    alloc.free(sorted);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn canCoalesce(a: RangeRead, b: RangeRead, max_gap_bytes: u64) bool {
+    if (!sameObjectVersion(a.object, b.object)) return false;
+    if (a.purpose != b.purpose) return false;
+    if (!std.mem.eql(u8, a.compression_codec, b.compression_codec)) return false;
+    if (b.range.offset < a.range.offset) return false;
+    const a_end = a.range.end();
+    if (b.range.offset <= a_end) return true;
+    return b.range.offset - a_end <= max_gap_bytes;
+}
+
+fn sameObjectVersion(a: ObjectRef, b: ObjectRef) bool {
+    return std.mem.eql(u8, a.bucket, b.bucket) and
+        std.mem.eql(u8, a.key, b.key) and
+        a.byte_len == b.byte_len and
+        std.mem.eql(u8, a.version.etag, b.version.etag) and
+        std.mem.eql(u8, a.version.version_id, b.version.version_id);
+}
+
+fn lessThanRangeRead(_: void, a: RangeRead, b: RangeRead) bool {
+    const bucket_order = std.mem.order(u8, a.object.bucket, b.object.bucket);
+    if (bucket_order != .eq) return bucket_order == .lt;
+    const key_order = std.mem.order(u8, a.object.key, b.object.key);
+    if (key_order != .eq) return key_order == .lt;
+    if (a.range.offset != b.range.offset) return a.range.offset < b.range.offset;
+    return a.range.len < b.range.len;
+}
+
+test "lake range planner creates tail footer reads with versioned cache keys" {
+    const alloc = std.testing.allocator;
+    const object = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/date=2026-06-18/part-0.parquet",
+        .byte_len = 1_048_576,
+        .version = .{ .etag = "etag-1" },
+    };
+    const read = try planParquetFooterRead(object, 64 * 1024);
+    try std.testing.expectEqual(@as(u64, 983_040), read.range.offset);
+    try std.testing.expectEqual(@as(u64, 65_536), read.range.len);
+    try std.testing.expectEqual(CacheLane.metadata, read.cacheLane());
+
+    const key = try read.cacheKeyAlloc(alloc);
+    defer alloc.free(key);
+    try std.testing.expect(std.mem.indexOf(u8, key, "etag=etag-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "offset=983040") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "purpose=parquet_footer") != null);
+}
+
+test "lake range planner coalesces adjacent column chunks by object version" {
+    const alloc = std.testing.allocator;
+    const object = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/part-0.parquet",
+        .byte_len = 10_000,
+        .version = .{ .etag = "etag-1", .version_id = "v1" },
+    };
+    const changed_version = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/part-0.parquet",
+        .byte_len = 10_000,
+        .version = .{ .etag = "etag-2", .version_id = "v2" },
+    };
+    const reads = [_]RangeRead{
+        .{
+            .object = object,
+            .range = .{ .offset = 200, .len = 50 },
+            .purpose = .parquet_column_chunk,
+            .compression_codec = "zstd",
+            .decoded_column_id = "amount",
+        },
+        .{
+            .object = object,
+            .range = .{ .offset = 100, .len = 80 },
+            .purpose = .parquet_column_chunk,
+            .compression_codec = "zstd",
+            .decoded_column_id = "tenant_id",
+        },
+        .{
+            .object = changed_version,
+            .range = .{ .offset = 260, .len = 20 },
+            .purpose = .parquet_column_chunk,
+            .compression_codec = "zstd",
+            .decoded_column_id = "amount",
+        },
+    };
+
+    const coalesced = try coalescePhysicalReadsAlloc(alloc, &reads, .{ .max_gap_bytes = 32 });
+    defer alloc.free(coalesced);
+    try std.testing.expectEqual(@as(usize, 2), coalesced.len);
+    try std.testing.expectEqual(@as(u64, 100), coalesced[0].range.offset);
+    try std.testing.expectEqual(@as(u64, 150), coalesced[0].range.len);
+    try std.testing.expectEqualStrings("", coalesced[0].decoded_column_id);
+    try std.testing.expectEqualStrings("etag-2", coalesced[1].object.version.etag);
+}
+
+test "lake range planner validates cache lanes and decoded column keys" {
+    const alloc = std.testing.allocator;
+    const object = ObjectRef{
+        .bucket = "warehouse",
+        .key = "events/part-0.parquet",
+        .byte_len = 4096,
+        .version = .{ .version_id = "v1" },
+    };
+    const decoded = RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = 1024 },
+        .purpose = .decoded_column_page,
+        .compression_codec = "plain",
+        .decoded_column_id = "amount",
+    };
+    try std.testing.expectEqual(CacheLane.decoded_column, decoded.cacheLane());
+    const key = try decoded.cacheKeyAlloc(alloc);
+    defer alloc.free(key);
+    try std.testing.expect(std.mem.indexOf(u8, key, "version=v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "column=amount") != null);
+
+    const invalid = RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = 1024 },
+        .purpose = .decoded_column_page,
+    };
+    try std.testing.expectError(error.InvalidLakeRangeRead, invalid.validate());
+}
