@@ -994,6 +994,15 @@ pub fn planSupportedI64ObjectRangeRowGroupsAlloc(
     return try planObjectRangeRowGroupsAlloc(alloc, inventory, projected_columns, .supported_i64);
 }
 
+fn planSupportedI64ObjectRangeRowGroupsForQueryAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+    predicate: ?lake_rows.Predicate,
+) !ObjectRangeRowGroupPlan {
+    return try planObjectRangeRowGroupsForPredicateAlloc(alloc, inventory, projected_columns, .supported_i64, predicate);
+}
+
 pub fn querySupportedI64ObjectRangeRowsAlloc(
     alloc: Allocator,
     request: ObjectRangeRowsQueryRequest,
@@ -1008,8 +1017,15 @@ pub fn querySupportedI64ObjectRangeRowsAlloc(
     const scan_columns = try rowsQueryScanColumnsAlloc(alloc, request.projected_columns, request.predicate);
     defer alloc.free(scan_columns);
 
-    var row_group_plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, request.inventory, scan_columns);
+    var row_group_plan = try planSupportedI64ObjectRangeRowGroupsForQueryAlloc(alloc, request.inventory, scan_columns, request.predicate);
     defer row_group_plan.deinit(alloc);
+
+    if (row_group_plan.row_groups.len == 0) {
+        return .{
+            .rows = try alloc.alloc(lake_rows.ProjectedRow, 0),
+            .total = 0,
+        };
+    }
 
     var source = if (request.cache) |cache|
         try ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
@@ -1189,6 +1205,16 @@ fn planObjectRangeRowGroupsAlloc(
     projected_columns: []const []const u8,
     validation: RowGroupPlanValidation,
 ) !ObjectRangeRowGroupPlan {
+    return try planObjectRangeRowGroupsForPredicateAlloc(alloc, inventory, projected_columns, validation, null);
+}
+
+fn planObjectRangeRowGroupsForPredicateAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+    validation: RowGroupPlanValidation,
+    predicate: ?lake_rows.Predicate,
+) !ObjectRangeRowGroupPlan {
     try inventory.validate();
     if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
     if (projected_columns.len == 0) return error.InvalidParquetRowGroupBatch;
@@ -1203,16 +1229,18 @@ fn planObjectRangeRowGroupsAlloc(
                 const chunk = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
                 try validatePlannedChunk(chunk, validation);
             }
+            if (!rowGroupMayMatchPredicate(row_group, predicate)) continue;
             total_row_groups += 1;
         }
     }
-    if (total_row_groups == 0) return error.InvalidParquetRowGroupBatch;
+    if (total_row_groups == 0 and predicate == null) return error.InvalidParquetRowGroupBatch;
 
     const row_groups = try alloc.alloc(ObjectRangeRowGroupInput, total_row_groups);
     errdefer alloc.free(row_groups);
     var out_idx: usize = 0;
     for (inventory.files) |file| {
         for (file.row_groups) |row_group| {
+            if (!rowGroupMayMatchPredicate(row_group, predicate)) continue;
             row_groups[out_idx] = .{
                 .file_id = file.file_id,
                 .row_group_ordinal = row_group.ordinal,
@@ -1223,6 +1251,15 @@ fn planObjectRangeRowGroupsAlloc(
     }
 
     return .{ .row_groups = row_groups };
+}
+
+fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?lake_rows.Predicate) bool {
+    const pred = predicate orelse return true;
+    if (pred.op != .eq_i64) return true;
+    const chunk = findColumnChunk(row_group, pred.column) orelse return true;
+    const min = chunk.stats_min_i64 orelse return true;
+    const max = chunk.stats_max_i64 orelse return true;
+    return pred.i64_value >= min and pred.i64_value <= max;
 }
 
 fn validatePlannedChunk(chunk: external_source.ColumnChunk, validation: RowGroupPlanValidation) !void {

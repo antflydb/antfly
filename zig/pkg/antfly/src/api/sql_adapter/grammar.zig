@@ -411,6 +411,17 @@ pub const DropEnumTypeSyntax = struct {
     }
 };
 
+pub const DropDomainSyntax = struct {
+    domain_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.domain_name));
+        self.* = undefined;
+    }
+};
+
 pub const CommentMetadataSyntax = struct {
     target: ddl_plan.CommentMetadataTarget,
     object_name: []const u8,
@@ -1957,6 +1968,29 @@ pub fn parseDropEnumTypeCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     type_transferred = true;
     return .{ .type_name = type_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseDropDomainCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropDomainSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("domain");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const domain_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var domain_transferred = false;
+    errdefer if (!domain_transferred) alloc.free(domain_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    domain_transferred = true;
+    return .{ .domain_name = domain_name, .if_exists = if_exists, .cascade = cascade };
 }
 
 pub fn parseCommentMetadataCatalogTailAlloc(
@@ -3898,6 +3932,25 @@ test "sql adapter grammar parses enum type catalog tails" {
     defer lexer.freeTokens(alloc, &duplicate_tokens);
     var duplicate_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateEnumTypeCatalogTailAlloc(alloc, duplicate_tokens.items, &duplicate_pos));
+}
+
+test "sql adapter grammar parses domain catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var drop_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN IF EXISTS public.positive_amount CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_tokens);
+    var drop_pos: usize = 0;
+    var drop = try parseDropDomainCatalogTailAlloc(alloc, drop_tokens.items, &drop_pos);
+    defer drop.deinit(alloc);
+    try std.testing.expectEqual(drop_tokens.items.len, drop_pos);
+    try std.testing.expectEqualStrings("positive_amount", drop.domain_name);
+    try std.testing.expect(drop.if_exists);
+    try std.testing.expect(drop.cascade);
+
+    var multi_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN amount_domain, other_domain;");
+    defer lexer.freeTokens(alloc, &multi_tokens);
+    var multi_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDropDomainCatalogTailAlloc(alloc, multi_tokens.items, &multi_pos));
 }
 
 test "sql adapter grammar parses comment metadata catalog tails" {

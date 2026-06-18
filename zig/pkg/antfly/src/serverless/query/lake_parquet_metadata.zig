@@ -304,6 +304,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .logical_type = logical_type,
         .decimal_precision = chunk.decimal_precision,
         .decimal_scale = chunk.decimal_scale,
+        .stats_min_i64 = chunk.stats_min_i64,
+        .stats_max_i64 = chunk.stats_max_i64,
         .nullable = chunk.nullable,
     };
 }
@@ -679,6 +681,8 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .compression_codec = meta.compression_codec,
         .encoding = meta.encoding,
         .physical_type = meta.physical_type,
+        .stats_min_i64 = meta.stats_min_i64,
+        .stats_max_i64 = meta.stats_max_i64,
         .nullable = false,
     };
     chunk.validate(file_len) catch return error.InvalidParquetMetadata;
@@ -695,6 +699,8 @@ const ColumnMetadata = struct {
     total_uncompressed_size: u64,
     data_page_offset: ?u64 = null,
     dictionary_page_offset: ?u64 = null,
+    stats_min_i64: ?i64 = null,
+    stats_max_i64: ?i64 = null,
 
     fn deinit(self: *ColumnMetadata, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
@@ -722,6 +728,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
     var total_uncompressed_size: ?u64 = null;
     var data_page_offset: ?u64 = null;
     var dictionary_page_offset: ?u64 = null;
+    var raw_statistics: RawColumnStatistics = .{};
+    defer raw_statistics.deinit(alloc);
     errdefer if (column_id) |value| alloc.free(value);
     errdefer if (compression_codec) |value| alloc.free(value);
     errdefer if (encoding.len > 0) alloc.free(encoding);
@@ -737,20 +745,87 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
             7 => total_compressed_size = try reader.readRequiredU64(field.type),
             9 => data_page_offset = try reader.readRequiredU64(field.type),
             11 => dictionary_page_offset = try reader.readRequiredU64(field.type),
+            12 => raw_statistics = try parseColumnStatisticsAlloc(alloc, reader, field.type),
             else => try reader.skip(field.type),
         }
     }
+
+    const got_physical_type = physical_type orelse try alloc.dupe(u8, "unknown");
+    physical_type = null;
+    errdefer alloc.free(got_physical_type);
+    const stats = try decodeNumericStats(raw_statistics, got_physical_type);
 
     return .{
         .column_id = column_id orelse return error.InvalidParquetMetadata,
         .compression_codec = compression_codec orelse try alloc.dupe(u8, "unknown"),
         .encoding = encoding,
-        .physical_type = physical_type orelse try alloc.dupe(u8, "unknown"),
+        .physical_type = got_physical_type,
         .total_compressed_size = total_compressed_size orelse return error.InvalidParquetMetadata,
         .total_uncompressed_size = total_uncompressed_size orelse 0,
         .data_page_offset = data_page_offset,
         .dictionary_page_offset = dictionary_page_offset,
+        .stats_min_i64 = stats.min_i64,
+        .stats_max_i64 = stats.max_i64,
     };
+}
+
+const RawColumnStatistics = struct {
+    min: ?[]u8 = null,
+    max: ?[]u8 = null,
+
+    fn deinit(self: *RawColumnStatistics, alloc: Allocator) void {
+        if (self.min) |value| alloc.free(value);
+        if (self.max) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+const NumericStats = struct {
+    min_i64: ?i64 = null,
+    max_i64: ?i64 = null,
+};
+
+fn parseColumnStatisticsAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) !RawColumnStatistics {
+    if (field_type != .struct_) return error.InvalidParquetMetadata;
+    var previous_field_id: i16 = 0;
+    var stats = RawColumnStatistics{};
+    errdefer stats.deinit(alloc);
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        switch (field.id) {
+            1, 5 => {
+                if (field.type != .binary) return error.InvalidParquetMetadata;
+                if (stats.max) |value| alloc.free(value);
+                stats.max = try reader.readBinaryAlloc(alloc);
+            },
+            2, 6 => {
+                if (field.type != .binary) return error.InvalidParquetMetadata;
+                if (stats.min) |value| alloc.free(value);
+                stats.min = try reader.readBinaryAlloc(alloc);
+            },
+            else => try reader.skip(field.type),
+        }
+    }
+    return stats;
+}
+
+fn decodeNumericStats(raw: RawColumnStatistics, physical_type: []const u8) !NumericStats {
+    const min = raw.min orelse return .{};
+    const max = raw.max orelse return .{};
+    if (std.ascii.eqlIgnoreCase(physical_type, "int64")) {
+        if (min.len != 8 or max.len != 8) return error.InvalidParquetMetadata;
+        const min_i64 = std.mem.readInt(i64, min[0..8], .little);
+        const max_i64 = std.mem.readInt(i64, max[0..8], .little);
+        if (min_i64 > max_i64) return error.InvalidParquetMetadata;
+        return .{ .min_i64 = min_i64, .max_i64 = max_i64 };
+    }
+    if (std.ascii.eqlIgnoreCase(physical_type, "int32")) {
+        if (min.len != 4 or max.len != 4) return error.InvalidParquetMetadata;
+        const min_i64: i64 = std.mem.readInt(i32, min[0..4], .little);
+        const max_i64: i64 = std.mem.readInt(i32, max[0..4], .little);
+        if (min_i64 > max_i64) return error.InvalidParquetMetadata;
+        return .{ .min_i64 = min_i64, .max_i64 = max_i64 };
+    }
+    return .{};
 }
 
 fn parsePathInSchemaAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {

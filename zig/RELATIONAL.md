@@ -1097,6 +1097,7 @@ sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`,
 enum-type catalog grammar for `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD
 VALUE`, and `DROP TYPE`,
+domain catalog grammar for `DROP DOMAIN`,
 comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
 `COMMENT ON INDEX`, and `COMMENT ON CONSTRAINT`,
 drop-catalog grammar for `DROP TABLE`, `DROP TABLE IF EXISTS`, `DROP INDEX`,

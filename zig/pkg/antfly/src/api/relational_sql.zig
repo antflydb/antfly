@@ -3806,22 +3806,15 @@ const Parser = struct {
     }
 
     fn parseDropDomainDdl(self: *@This()) !DropDomainPlan {
-        try self.expectKeyword("domain");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const domain_name = try self.parseSqlObjectIdentifierOwned();
-        var domain_transferred = false;
-        errdefer if (!domain_transferred) self.alloc.free(domain_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        domain_transferred = true;
-        return .{ .domain_name = domain_name, .if_exists = if_exists, .cascade = cascade };
+        var syntax = try sql_adapter.parseDropDomainCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .domain_name = syntax.domain_name,
+            .if_exists = syntax.if_exists,
+            .cascade = syntax.cascade,
+        };
     }
 
     fn parseCreateSequenceDdl(self: *@This()) !CreateSequencePlan {

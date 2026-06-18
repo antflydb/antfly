@@ -36,6 +36,8 @@ pub const ColumnChunk = struct {
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
+    stats_min_i64: ?i64 = null,
+    stats_max_i64: ?i64 = null,
     nullable: bool = false,
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
@@ -52,6 +54,7 @@ pub const ColumnChunk = struct {
         if (self.compressed_len == 0) return error.InvalidExternalSourceInventory;
         if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
         if (self.compressed_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
+        if (self.stats_min_i64 != null and self.stats_max_i64 != null and self.stats_min_i64.? > self.stats_max_i64.?) return error.InvalidExternalSourceInventory;
     }
 };
 
