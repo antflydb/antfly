@@ -974,6 +974,9 @@ moves behind a `api/sql_adapter/` package:
   deinit helpers.
 - `plan.zig`: adapter public plan structs, fingerprints, and ownership helpers
   that callers already consume.
+- `ddl_plan.zig`: adapter public DDL/catalog plan containers and ownership
+  helpers, split from read/write execution plans so catalog evolution can move
+  behind the adapter facade without growing the main lowerer file.
 - `token.zig`: token kinds, token source spans, keyword helpers, and simple
   token predicates.
 - `lexer.zig`: PostgreSQL lexical handling for whitespace, comments, quoted
@@ -1058,6 +1061,9 @@ and relation-population containers that wrap Antfly-native typed query,
 aggregate, join, lateral, window, CTE, insert, update/delete, insert-source,
 mutation-source, joined-mutation-source, and merge mutation plans while
 preserving the existing public entrypoints through facade aliases;
+`api/sql_adapter/ddl_plan.zig` owns the adapter-noop DDL and enum-type catalog
+plan containers, with the remaining DDL families scheduled to move through the
+same facade as their lowerers are extracted;
 `api/sql_adapter/lower_expr.zig` owns the expression keyword, function-name, and
 tail-boundary predicates that the shared expression lowerer uses;
 `api/relational_sql.zig` keeps the public lowering entrypoints and maps adapter

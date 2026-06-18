@@ -145,6 +145,14 @@ pub const ExplainFormat = sql_adapter.ExplainFormat;
 pub const LoweredRelationPopulationPlan = sql_adapter.LoweredRelationPopulationPlan;
 pub const RelationPopulationMode = sql_adapter.RelationPopulationMode;
 
+pub const AdapterNoopDdlReason = sql_adapter.AdapterNoopDdlReason;
+pub const AdapterNoopDdlPlan = sql_adapter.AdapterNoopDdlPlan;
+pub const EnumTypeCatalogPlan = sql_adapter.EnumTypeCatalogPlan;
+pub const CreateEnumTypePlan = sql_adapter.CreateEnumTypePlan;
+pub const AddEnumValuePlan = sql_adapter.AddEnumValuePlan;
+pub const EnumValuePosition = sql_adapter.EnumValuePosition;
+pub const DropEnumTypePlan = sql_adapter.DropEnumTypePlan;
+
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
     create_table: CreateTablePlan,
@@ -220,17 +228,6 @@ pub const LoweredDdlPlan = union(enum) {
     }
 };
 
-pub const AdapterNoopDdlReason = enum {
-    schema_namespace,
-    extension,
-    transaction_control,
-    session_setting,
-};
-
-pub const AdapterNoopDdlPlan = struct {
-    reason: AdapterNoopDdlReason,
-};
-
 pub const RelationLifetimePlan = struct {
     kind: RelationLifetimeKind,
     create_table: CreateTablePlan,
@@ -242,64 +239,6 @@ pub const RelationLifetimePlan = struct {
 };
 
 pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
-
-pub const EnumTypeCatalogPlan = union(enum) {
-    create: CreateEnumTypePlan,
-    add_value: AddEnumValuePlan,
-    drop: DropEnumTypePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .add_value => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateEnumTypePlan = struct {
-    type_name: []const u8,
-    values: []const []const u8 = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.type_name);
-        freeStringSlice(alloc, self.values);
-        self.* = undefined;
-    }
-};
-
-pub const AddEnumValuePlan = struct {
-    type_name: []const u8,
-    value: []const u8,
-    if_not_exists: bool = false,
-    position: EnumValuePosition = .none,
-    neighbor_value: ?[]const u8 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.type_name);
-        alloc.free(self.value);
-        if (self.neighbor_value) |value| alloc.free(value);
-        self.* = undefined;
-    }
-};
-
-pub const EnumValuePosition = enum {
-    none,
-    before,
-    after,
-};
-
-pub const DropEnumTypePlan = struct {
-    type_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.type_name);
-        self.* = undefined;
-    }
-};
 
 pub const DomainCatalogPlan = union(enum) {
     create: CreateDomainPlan,
