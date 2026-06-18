@@ -2661,6 +2661,51 @@ func TestUpdateHAStatusPrefersReachableAdminDurabilityDecision(t *testing.T) {
 	}
 }
 
+func TestUpdateHAStatusNormalizesAdminAllSyncRequiredCount(t *testing.T) {
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
+		{Name: "standby-a"},
+		{Name: "standby-b"},
+	}
+	cluster.Spec.HighAvailability.SyncPolicy = &antflyv1.HASyncPolicy{
+		Mode:          antflyv1.HADurabilityModeRemoteApply,
+		Selection:     antflyv1.HAStandbySelectionAll,
+		StandbyNames:  []string{"standby-a", "standby-b"},
+		FailurePolicy: antflyv1.HAFailurePolicyDegradeToAsync,
+	}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN:            10,
+		PrimaryAdminReachable: true,
+		PrimaryAdminLastError: "",
+		Sync: antflyv1.HASyncStatus{
+			Mode:       antflyv1.HADurabilityModeRemoteApply,
+			Selection:  antflyv1.HAStandbySelectionAll,
+			Satisfied:  1,
+			Candidates: 2,
+			Degraded:   true,
+			Action:     "DegradeToAsync",
+		},
+		Standbys: []antflyv1.HAStandbyStatus{
+			{Name: "standby-a", SlotName: "standby-a", Active: true, ReceivedLSN: 10, AppliedLSN: 10, SafeReadLSN: 10, CanServeSafeReads: true},
+			{Name: "standby-b", SlotName: "standby-b", Active: true, ReceivedLSN: 10, AppliedLSN: 9, ApplyLagLSN: 1, SafeReadLSN: 9},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != antflyv1.ReasonHASyncPolicyUnsatisfied {
+		t.Fatalf("expected reachable admin ALL sync evidence to keep sync degraded, got %#v", degraded)
+	}
+	if cluster.Status.HAStatus.Sync.Required != 2 ||
+		cluster.Status.HAStatus.Sync.Satisfied != 1 ||
+		cluster.Status.HAStatus.Sync.Candidates != 2 ||
+		cluster.Status.HAStatus.Sync.Action != "DegradeToAsync" {
+		t.Fatalf("expected ALL sync required count to match named standbys, got %#v", cluster.Status.HAStatus.Sync)
+	}
+}
+
 func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{
