@@ -97,6 +97,7 @@ const PostingBaseHeaderCacheEntry = struct {
 const PostingDeltaTailCacheEntry = struct {
     posting_id: u64 = 0,
     valid: bool = false,
+    sequence_id_storage: []u64 = &.{},
     sequences: []u64 = &.{},
     ids: []u64 = &.{},
     ops: []u8 = &.{},
@@ -114,8 +115,21 @@ const PostingDeltaTailCacheEntry = struct {
             const current_capacity = @min(self.sequences.len, @min(self.ids.len, self.ops.len));
             const doubled = current_capacity *| 2;
             const capacity = @max(needed, @max(doubled, @as(usize, 8)));
-            self.sequences = try alloc.realloc(self.sequences, capacity);
-            self.ids = try alloc.realloc(self.ids, capacity);
+            if (self.sequences.len < capacity or self.ids.len < capacity) {
+                const old_capacity = self.sequences.len;
+                const old_count = self.count;
+                const storage_len = try std.math.mul(usize, capacity, 2);
+                self.sequence_id_storage = try alloc.realloc(self.sequence_id_storage, storage_len);
+                if (old_count != 0 and old_capacity != capacity) {
+                    std.mem.copyBackwards(
+                        u64,
+                        self.sequence_id_storage[capacity .. capacity + old_count],
+                        self.sequence_id_storage[old_capacity .. old_capacity + old_count],
+                    );
+                }
+                self.sequences = self.sequence_id_storage[0..capacity];
+                self.ids = self.sequence_id_storage[capacity..storage_len];
+            }
             self.ops = try alloc.realloc(self.ops, capacity);
         }
         self.sequences[self.count] = sequence;
@@ -133,12 +147,11 @@ const PostingDeltaTailCacheEntry = struct {
     }
 
     fn bytes(self: *const PostingDeltaTailCacheEntry) u64 {
-        return byteLen(self.sequences) + byteLen(self.ids) + byteLen(self.ops);
+        return byteLen(self.sequence_id_storage) + byteLen(self.ops);
     }
 
     fn deinit(self: *PostingDeltaTailCacheEntry, alloc: Allocator) void {
-        alloc.free(self.sequences);
-        alloc.free(self.ids);
+        alloc.free(self.sequence_id_storage);
         alloc.free(self.ops);
         self.* = .{};
     }
@@ -981,9 +994,14 @@ test "SearchScratch posting delta tail cache grows geometrically" {
     try std.testing.expectEqual(@as(usize, 9), view.sequences.len);
     try std.testing.expectEqual(@as(usize, 16), entry.sequences.len);
     try std.testing.expectEqual(entry.sequences.len, entry.ids.len);
+    try std.testing.expectEqual(@as(usize, 32), entry.sequence_id_storage.len);
+    try std.testing.expectEqual(entry.sequence_id_storage[0..16].ptr, entry.sequences.ptr);
+    try std.testing.expectEqual(entry.sequence_id_storage[16..32].ptr, entry.ids.ptr);
     try std.testing.expectEqual(entry.sequences.len, entry.ops.len);
     try std.testing.expectEqual(@as(u64, 1), view.sequences[0]);
     try std.testing.expectEqual(@as(u64, 9), view.sequences[8]);
+    try std.testing.expectEqual(@as(u64, 100), view.ids[0]);
+    try std.testing.expectEqual(@as(u64, 108), view.ids[8]);
 }
 
 test "SearchScratch grows posting overlay append buffers geometrically" {
