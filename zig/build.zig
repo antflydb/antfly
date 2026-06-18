@@ -3647,7 +3647,7 @@ pub fn build(b: *std.Build) void {
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
         "public api routes compile",
-        "mcp table tools expose catalog fields and reject non-default table targets",
+        "mcp table tools expose catalog fields and route supported catalog lifecycle targets",
         "internal group write routes expose unique integrity",
         "internal group write routes expose foreign key action job requeue",
         "batch parser accepts Go transform op spelling",
