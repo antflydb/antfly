@@ -312,6 +312,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .stats_max_i64 = chunk.stats_max_i64,
         .stats_min_bytes = stats_min_bytes,
         .stats_max_bytes = stats_max_bytes,
+        .stats_min_bool = chunk.stats_min_bool,
+        .stats_max_bool = chunk.stats_max_bool,
         .nullable = chunk.nullable,
     };
 }
@@ -691,6 +693,8 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .stats_max_i64 = meta.stats_max_i64,
         .stats_min_bytes = meta.stats_min_bytes,
         .stats_max_bytes = meta.stats_max_bytes,
+        .stats_min_bool = meta.stats_min_bool,
+        .stats_max_bool = meta.stats_max_bool,
         .nullable = false,
     };
     chunk.validate(file_len) catch return error.InvalidParquetMetadata;
@@ -711,6 +715,8 @@ const ColumnMetadata = struct {
     stats_max_i64: ?i64 = null,
     stats_min_bytes: ?[]u8 = null,
     stats_max_bytes: ?[]u8 = null,
+    stats_min_bool: ?bool = null,
+    stats_max_bool: ?bool = null,
 
     fn deinit(self: *ColumnMetadata, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
@@ -784,6 +790,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
         .stats_max_i64 = stats.max_i64,
         .stats_min_bytes = stats.min_bytes,
         .stats_max_bytes = stats.max_bytes,
+        .stats_min_bool = stats.min_bool,
+        .stats_max_bool = stats.max_bool,
     };
 }
 
@@ -803,6 +811,8 @@ const NumericStats = struct {
     max_i64: ?i64 = null,
     min_bytes: ?[]u8 = null,
     max_bytes: ?[]u8 = null,
+    min_bool: ?bool = null,
+    max_bool: ?bool = null,
 };
 
 fn parseColumnStatisticsAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) !RawColumnStatistics {
@@ -853,6 +863,15 @@ fn decodeColumnStatsAlloc(alloc: Allocator, raw: RawColumnStatistics, physical_t
         return .{
             .min_bytes = min_bytes,
             .max_bytes = max_bytes,
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(physical_type, "boolean")) {
+        if (min.len != 1 or max.len != 1) return error.InvalidParquetMetadata;
+        if (min[0] > 1 or max[0] > 1) return error.InvalidParquetMetadata;
+        if (min[0] > max[0]) return error.InvalidParquetMetadata;
+        return .{
+            .min_bool = min[0] != 0,
+            .max_bool = max[0] != 0,
         };
     }
     return .{};
