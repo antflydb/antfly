@@ -251,6 +251,7 @@ pub const ApiHttpServerConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
+    extension_package_store_dir: ?[]const u8 = null,
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,
@@ -10130,6 +10131,144 @@ test "api http server scopes mcp endpoint to one extension" {
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"recall\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"other_tool\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"create_table\"") == null);
+}
+
+test "api http server filters extension mcp tools by trusted principal table permissions" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_installed_extensions = 2, .projected_extension_members = 3 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{
+                    .{
+                        .name = "docsaf",
+                        .package_name = "docsaf",
+                        .package_version = "1.0.0",
+                        .package_digest = "sha256:docs",
+                        .scope = .{ .kind = .table, .table_name = "docs" },
+                        .granted_capabilities = &.{
+                            .{ .name = "db:read", .scope = "docsaf" },
+                            .{ .name = "db:write", .scope = "docsaf" },
+                        },
+                        .status = .ready,
+                    },
+                    .{
+                        .name = "memoryaf",
+                        .package_name = "memoryaf",
+                        .package_version = "1.0.0",
+                        .package_digest = "sha256:memories",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .granted_capabilities = &.{.{ .name = "db:read", .scope = "memoryaf" }},
+                        .status = .ready,
+                    },
+                })[0..]),
+                .extension_members = @constCast((&[_]extension_domain.ExtensionMember{
+                    .{
+                        .extension_name = "docsaf",
+                        .scope = .{ .kind = .table, .table_name = "docs" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "search_docs",
+                        .table_name = "docs",
+                        .owner_metadata_json = "{\"description\":\"Search docs\",\"input_schema\":{\"type\":\"object\"},\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"docsaf\"}]}",
+                    },
+                    .{
+                        .extension_name = "docsaf",
+                        .scope = .{ .kind = .table, .table_name = "docs" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "store_doc",
+                        .table_name = "docs",
+                        .owner_metadata_json = "{\"description\":\"Store docs\",\"input_schema\":{\"type\":\"object\"},\"required_capabilities\":[{\"name\":\"db:write\",\"scope\":\"docsaf\"}]}",
+                    },
+                    .{
+                        .extension_name = "memoryaf",
+                        .scope = .{ .kind = .table, .table_name = "memories" },
+                        .object_kind = .mcp_tool,
+                        .object_name = "search_memories",
+                        .table_name = "memories",
+                        .owner_metadata_json = "{\"description\":\"Search memories\",\"input_schema\":{\"type\":\"object\"},\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}]}",
+                    },
+                })[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const secret = "extension-mcp-tools-trusted-principal-secret";
+    const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"iss":"trusted-upstream","sub":"user:alice","tenant":"tenant-1","tables":["docs"],"operations":["read"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now, now + 60 },
+    );
+    defer std.testing.allocator.free(payload);
+    const token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, payload);
+    defer std.testing.allocator.free(token);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        std.testing.allocator,
+        .{
+            .auth_enabled = true,
+            .trusted_principal_secret = secret,
+            .trusted_principal_issuer = "trusted-upstream",
+        },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    const trusted_principal_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = token },
+    };
+    var init_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &trusted_principal_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    });
+    defer init_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), init_resp.status);
+
+    const mcp_session_headers = [_]http_common.RequestHeader{
+        .{ .name = mcp.session_id_header, .value = init_resp.headers[0].value },
+        .{ .name = trusted_principal_header, .value = token },
+    };
+    var tools_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.mcp_v1,
+        .headers = &mcp_session_headers,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+    });
+    defer tools_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), tools_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"store_doc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_resp.body, "\"name\":\"search_memories\"") == null);
 }
 
 test "api http server authenticates trusted principal" {

@@ -2798,6 +2798,7 @@ pub fn build(b: *std.Build) void {
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime local merge fallback derives receiver identity namespace from catalog",
+        "data runtime resolves extension package store env before local default",
         "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
@@ -3312,6 +3313,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "api http server serves mcp and a2a protocol surfaces",
+            "api http server filters extension mcp tools by trusted principal table permissions",
             "auth row filter resolver expands username references",
             "auth row filter resolver expands metadata references",
             "auth row filter validator accepts username references",
@@ -3995,6 +3997,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts inference budget overrides",
             "inference config falls back to common config",
             "swarm runtime resolves paths from common storage base dir",
+            "swarm runtime resolves extension package store env before local default",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
