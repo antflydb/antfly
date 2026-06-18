@@ -3164,6 +3164,12 @@ func TestReconcileHAFencingLeaseCreatesReadyLeaseForCaughtUpStandby(t *testing.T
 	if lease.Labels["antfly.io/ha-fence"] != "kubernetes-lease" {
 		t.Fatalf("expected HA fence label, got %#v", lease.Labels)
 	}
+	if lease.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "primary-a" ||
+		lease.Annotations[haFencingLeaseAnnotationTimelineID] != "4" ||
+		lease.Annotations[haFencingLeaseAnnotationEpoch] != "6" ||
+		lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "12" {
+		t.Fatalf("expected HA fence scope annotations, got %#v", lease.Annotations)
+	}
 	if len(lease.OwnerReferences) != 1 || lease.OwnerReferences[0].Name != cluster.Name {
 		t.Fatalf("expected cluster owner reference, got %#v", lease.OwnerReferences)
 	}
@@ -3395,6 +3401,52 @@ func TestObserveHAFencingStatusAllowsPromotionWithReadyKubernetesLease(t *testin
 	}
 }
 
+func TestObserveHAFencingStatusRejectsStaleTimelineLeaseScope(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	lease := haFenceLease(cluster, time.Now(), 30, 3, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTimelineID] = "3"
+	reconciler := testHAReconciler(t, lease)
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	fencing := cluster.Status.HAStatus.Fencing
+	if fencing.Ready || fencing.Reason != "LeaseScopeMismatch" {
+		t.Fatalf("expected stale timeline lease scope to be rejected, got %#v", fencing)
+	}
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected stale timeline lease scope to block automatic promotion")
+	}
+}
+
+func TestObserveHAFencingStatusRejectsStalePromotionBoundaryLeaseScope(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	lease := haFenceLease(cluster, time.Now(), 30, 3, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "11"
+	reconciler := testHAReconciler(t, lease)
+
+	if err := reconciler.observeHAFencingStatus(context.Background(), cluster); err != nil {
+		t.Fatalf("observe fencing status: %v", err)
+	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	fencing := cluster.Status.HAStatus.Fencing
+	if fencing.Ready || fencing.Reason != "LeaseScopeMismatch" {
+		t.Fatalf("expected stale promotion-boundary lease scope to be rejected, got %#v", fencing)
+	}
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected stale promotion-boundary lease scope to block automatic promotion")
+	}
+}
+
 func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 
@@ -3460,6 +3512,12 @@ func haCluster() *antflyv1.AntflyCluster {
 
 func haClusterWithAutomaticKubernetesLeaseFailover() *antflyv1.AntflyCluster {
 	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID:        100,
+		TimelineID:       4,
+		Epoch:            6,
+		CurrentPrimaryID: "primary-a",
+	}
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
 		PrimaryURL:            "http://primary-ha.default.svc:8081",
 		ExecutePlannedActions: true,
@@ -3530,10 +3588,15 @@ func haPlannedActionByKind(actions []antflyv1.HAPlannedActionStatus, kind haActi
 
 func haFenceLease(cluster *antflyv1.AntflyCluster, renewTime time.Time, durationSeconds int32, transitions int32, holder string) *coordinationv1.Lease {
 	renew := metav1.NewMicroTime(renewTime)
+	annotations := map[string]string{}
+	if scope, ok := haCurrentFencingLeaseScope(cluster); ok {
+		annotations = scope.annotations()
+	}
 	return &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      haFencingLeaseName(cluster),
-			Namespace: cluster.Namespace,
+			Name:        haFencingLeaseName(cluster),
+			Namespace:   cluster.Namespace,
+			Annotations: annotations,
 		},
 		Spec: coordinationv1.LeaseSpec{
 			HolderIdentity:       &holder,

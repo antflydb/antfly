@@ -773,6 +773,13 @@ be validated against that operator package.
 - Publish lag, degraded, unhealthy, and reseed-required conditions.
 - Coordinate fenced failover through Kubernetes Lease, storage fencing, or
   another configured ownership authority.
+- When Kubernetes Lease fencing is used, scope the Lease to the exact HA
+  identity and promotion boundary it protects. The operator should write and
+  validate machine-readable Lease annotations for `cluster_id`, `shard_id`,
+  `table_id`, current primary id, timeline, epoch, and primary LSN before
+  treating the Lease as a ready fence. A stale Lease from an older timeline,
+  epoch, primary, or observed LSN must block automatic promotion even if its
+  holder and renewal timestamp are otherwise valid.
 - Update Services, routes, and client-facing primary endpoints after promotion.
 - Automate former-primary demotion, rewind, or reseed after failover.
 - Keep automatic promotion disabled unless Phase 7 fencing requirements are

@@ -85,6 +85,16 @@ const (
 
 const haFencingLeaseDefaultDurationSeconds int32 = 30
 
+const (
+	haFencingLeaseAnnotationClusterID        = "antfly.io/ha-fence-cluster-id"
+	haFencingLeaseAnnotationShardID          = "antfly.io/ha-fence-shard-id"
+	haFencingLeaseAnnotationTableID          = "antfly.io/ha-fence-table-id"
+	haFencingLeaseAnnotationTimelineID       = "antfly.io/ha-fence-timeline-id"
+	haFencingLeaseAnnotationEpoch            = "antfly.io/ha-fence-epoch"
+	haFencingLeaseAnnotationCurrentPrimaryID = "antfly.io/ha-fence-current-primary-id"
+	haFencingLeaseAnnotationPrimaryLSN       = "antfly.io/ha-fence-primary-lsn"
+)
+
 func haFencingLeaseRenewalRequeueAfter() time.Duration {
 	return time.Duration(haFencingLeaseDefaultDurationSeconds) * time.Second / 3
 }
@@ -216,6 +226,10 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	if holder == "" {
 		return nil
 	}
+	scope, ok := haCurrentFencingLeaseScope(cluster)
+	if !ok {
+		return nil
+	}
 
 	now := metav1.NowMicro()
 	lease := &coordinationv1.Lease{}
@@ -228,9 +242,10 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		durationSeconds := haFencingLeaseDefaultDurationSeconds
 		lease = &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      haFencingLeaseName(cluster),
-				Namespace: cluster.Namespace,
-				Labels:    haFencingLeaseLabels(cluster),
+				Name:        haFencingLeaseName(cluster),
+				Namespace:   cluster.Namespace,
+				Labels:      haFencingLeaseLabels(cluster),
+				Annotations: scope.annotations(),
 			},
 			Spec: coordinationv1.LeaseSpec{
 				HolderIdentity:       &holder,
@@ -284,6 +299,12 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	for key, value := range haFencingLeaseLabels(cluster) {
 		lease.Labels[key] = value
 	}
+	if lease.Annotations == nil {
+		lease.Annotations = map[string]string{}
+	}
+	for key, value := range scope.annotations() {
+		lease.Annotations[key] = value
+	}
 	if r.Scheme != nil {
 		if err := controllerutil.SetControllerReference(cluster, lease, r.Scheme); err != nil {
 			return err
@@ -327,6 +348,16 @@ func (r *AntflyClusterReconciler) observeHAFencingStatus(ctx context.Context, cl
 		holder = *lease.Spec.HolderIdentity
 	}
 	ready, reason := haLeaseFenceReady(lease, generation, time.Now())
+	if ready {
+		scope, ok := haCurrentFencingLeaseScope(cluster)
+		if !ok {
+			ready = false
+			reason = "LeaseScopeMissing"
+		} else if !haLeaseFenceScopeMatches(lease, scope) {
+			ready = false
+			reason = "LeaseScopeMismatch"
+		}
+	}
 	cluster.Status.HAStatus.Fencing = antflyv1.HAFencingStatus{
 		Authority:  antflyv1.HAFencingAuthorityKubernetesLease,
 		Ready:      ready,
@@ -348,6 +379,63 @@ func haFencingLeaseLabels(cluster *antflyv1.AntflyCluster) map[string]string {
 		"app.kubernetes.io/managed-by": "antfly-operator",
 		"antfly.io/ha-fence":           "kubernetes-lease",
 	}
+}
+
+type haFencingLeaseScope struct {
+	clusterID        uint64
+	shardID          uint64
+	tableID          uint64
+	timelineID       uint64
+	epoch            uint64
+	currentPrimaryID string
+	primaryLSN       uint64
+}
+
+func haCurrentFencingLeaseScope(cluster *antflyv1.AntflyCluster) (haFencingLeaseScope, bool) {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return haFencingLeaseScope{}, false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || cluster.Status.HAStatus.PrimaryLSN == 0 {
+		return haFencingLeaseScope{}, false
+	}
+	return haFencingLeaseScope{
+		clusterID:        identity.ClusterID,
+		shardID:          identity.ShardID,
+		tableID:          identity.TableID,
+		timelineID:       identity.TimelineID,
+		epoch:            identity.Epoch,
+		currentPrimaryID: identity.CurrentPrimaryID,
+		primaryLSN:       cluster.Status.HAStatus.PrimaryLSN,
+	}, true
+}
+
+func (scope haFencingLeaseScope) annotations() map[string]string {
+	return map[string]string{
+		haFencingLeaseAnnotationClusterID:        strconv.FormatUint(scope.clusterID, 10),
+		haFencingLeaseAnnotationShardID:          strconv.FormatUint(scope.shardID, 10),
+		haFencingLeaseAnnotationTableID:          strconv.FormatUint(scope.tableID, 10),
+		haFencingLeaseAnnotationTimelineID:       strconv.FormatUint(scope.timelineID, 10),
+		haFencingLeaseAnnotationEpoch:            strconv.FormatUint(scope.epoch, 10),
+		haFencingLeaseAnnotationCurrentPrimaryID: scope.currentPrimaryID,
+		haFencingLeaseAnnotationPrimaryLSN:       strconv.FormatUint(scope.primaryLSN, 10),
+	}
+}
+
+func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseScope) bool {
+	if lease == nil {
+		return false
+	}
+	annotations := lease.Annotations
+	if annotations == nil {
+		return false
+	}
+	for key, value := range scope.annotations() {
+		if annotations[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func haLeaseFenceReady(lease *coordinationv1.Lease, generation uint64, now time.Time) (bool, string) {
