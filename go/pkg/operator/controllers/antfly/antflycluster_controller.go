@@ -3646,7 +3646,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	}
 	switch action.Kind {
 	case string(haActionCreateSlot):
-		slotName := haActionSlotName(*action)
+		slotName := haActionRequestSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
@@ -3667,7 +3667,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		return true, err
 	case string(haActionPauseSlot):
-		slotName := haActionSlotName(*action)
+		slotName := haActionRequestSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
@@ -3684,7 +3684,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		return true, err
 	case string(haActionResumeSlot):
-		slotName := haActionSlotName(*action)
+		slotName := haActionRequestSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
@@ -3701,7 +3701,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		return true, err
 	case string(haActionDropSlot):
-		slotName := haActionSlotName(*action)
+		slotName := haActionRequestSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
@@ -3718,7 +3718,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		}
 		return true, err
 	case string(haActionSeedStandby), string(haActionMarkReseed):
-		slotName := haActionSlotName(*action)
+		slotName := haActionRequestSlotName(*action)
 		if slotName == "" {
 			return false, nil
 		}
@@ -3752,7 +3752,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		body := adminsdk.BaseBackupManifestPathRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
+		body := adminsdk.BaseBackupManifestPathRequest{ManifestPath: action.SeedManifestPath}
 		result, err := adminClient.FinishBaseBackupResponse(ctx, body)
 		value, err := haAdminSDKResponseValue(result, err)
 		if err == nil {
@@ -3769,9 +3769,9 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
 			return true, err
 		}
-		body := adminsdk.StandbyBootstrapRequest{ManifestPath: strings.TrimSpace(action.SeedManifestPath)}
+		body := adminsdk.StandbyBootstrapRequest{ManifestPath: action.SeedManifestPath}
 		if strings.TrimSpace(action.SeedContentRoot) != "" {
-			body.ContentRoot = strings.TrimSpace(action.SeedContentRoot)
+			body.ContentRoot = action.SeedContentRoot
 		}
 		result, err := adminClient.BootstrapStandbyResponse(ctx, body)
 		value, err := haAdminSDKResponseValue(result, err)
@@ -4131,7 +4131,7 @@ func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 	return adminsdk.FenceAcquireRequest{
 		Identity:       haAdminIdentityRequestFromSpec(identity),
 		OldPrimaryId:   identity.CurrentPrimaryID,
-		PromotedNodeId: strings.TrimSpace(action.StandbyName),
+		PromotedNodeId: action.StandbyName,
 		NewTimelineId:  identity.TimelineID + 1,
 		NewEpoch:       identity.Epoch + 1,
 		RequiredLsn:    action.TargetLSN,
@@ -4154,8 +4154,7 @@ func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 		return adminsdk.RejoinAssessRequest{}, false
 	}
 	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
-	nodeID := strings.TrimSpace(action.StandbyName)
-	if identity == nil || nodeID == "" {
+	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
 		return adminsdk.RejoinAssessRequest{}, false
 	}
 	lastLSN := action.ObservedLSN
@@ -4163,7 +4162,7 @@ func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 		lastLSN = action.TargetLSN
 	}
 	body := adminsdk.RejoinAssessRequest{
-		NodeId:                          nodeID,
+		NodeId:                          action.StandbyName,
 		Identity:                        haAdminIdentityRequestFromSpec(identity),
 		LastLsn:                         lastLSN,
 		RetainedFromLsn:                 action.RetainedFromLSN,
@@ -4209,6 +4208,13 @@ func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplic
 		Token:            strings.TrimSpace(promotion.FenceToken),
 		Reason:           promotion.FenceReason,
 	}, true
+}
+
+func haActionRequestSlotName(action antflyv1.HAPlannedActionStatus) string {
+	if action.SlotName != "" {
+		return action.SlotName
+	}
+	return action.StandbyName
 }
 
 func haActionSlotName(action antflyv1.HAPlannedActionStatus) string {

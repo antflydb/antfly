@@ -815,7 +815,7 @@ func TestPlanHAPlansPauseAndResumeSlotLifecycle(t *testing.T) {
 	}
 }
 
-func TestPlanHAEscapesSlotNamesInAdminPaths(t *testing.T) {
+func TestPlanHADoesNotPublishTypedAdminPathForInvalidSlotNames(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"}
 	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{
@@ -839,10 +839,14 @@ func TestPlanHAEscapesSlotNamesInAdminPaths(t *testing.T) {
 		t.Fatalf("expected one resume action, got %#v", actions)
 	}
 	if actions[0].Kind != string(haActionResumeSlot) ||
-		!reflect.DeepEqual(actions[0].AdminCommand, []string{"slot", "resume", "--slot", "standby/a b%"}) ||
-		actions[0].AdminMethod != "PUT" ||
-		actions[0].AdminPath != "/admin/v1/ha/replication-slots/standby%2Fa%20b%25/resume" {
-		t.Fatalf("unexpected escaped slot action: %#v", actions[0])
+		!reflect.DeepEqual(actions[0].AdminCommand, []string{"slot", "resume", "--slot", "standby/a b%"}) {
+		t.Fatalf("unexpected invalid slot action: %#v", actions[0])
+	}
+	if actions[0].AdminMethod != "" || actions[0].AdminPath != "" {
+		t.Fatalf("invalid slot name should not publish typed admin operation, got method=%q path=%q", actions[0].AdminMethod, actions[0].AdminPath)
+	}
+	if haPlannedActionUsesTypedAdminAPI(actions[0]) {
+		t.Fatalf("invalid slot action should not use typed admin API: %#v", actions[0])
 	}
 }
 
@@ -1720,6 +1724,102 @@ func TestExecuteHAPlannedActionTypedUsesAdminSDKForReplicationSlotCreate(t *test
 		action.AdminResult.SlotName != "standby-a" ||
 		action.AdminResult.SlotAction != "create" {
 		t.Fatalf("unexpected admin result: %#v", action.AdminResult)
+	}
+}
+
+func TestExecuteHAPlannedActionTypedRejectsInvalidInputsBeforeHTTP(t *testing.T) {
+	t.Setenv(haAdminTokenDefaultEnvVar, "operator-token")
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	base := func(kind haActionKind) antflyv1.HAPlannedActionStatus {
+		method, path := haAdminOperation(haPlannedAction{
+			Kind:             kind,
+			StandbyName:      "standby-a",
+			SlotName:         "standby-a",
+			SeedManifestPath: "/backup/base-standby-a-5.afha",
+		})
+		return antflyv1.HAPlannedActionStatus{
+			Kind:             string(kind),
+			Executor:         string(haActionExecutorAdminAPI),
+			StandbyName:      "standby-a",
+			SlotName:         "standby-a",
+			SeedManifestPath: "/backup/base-standby-a-5.afha",
+			SeedContentRoot:  "/backup/base-standby-a-5",
+			TargetLSN:        5,
+			ObservedLSN:      5,
+			RetainedFromLSN:  1,
+			AdminURL:         server.URL,
+			AdminNodeID:      "primary-a",
+			AdminMethod:      method,
+			AdminPath:        path,
+		}
+	}
+
+	tests := []struct {
+		name   string
+		action antflyv1.HAPlannedActionStatus
+	}{{
+		name: "create slot padded slot name",
+		action: func() antflyv1.HAPlannedActionStatus {
+			action := base(haActionCreateSlot)
+			action.SlotName = " standby-a"
+			return action
+		}(),
+	}, {
+		name: "finish seed padded manifest path",
+		action: func() antflyv1.HAPlannedActionStatus {
+			action := base(haActionFinishStandbySeed)
+			action.SeedManifestPath = " /backup/base-standby-a-5.afha"
+			return action
+		}(),
+	}, {
+		name: "bootstrap seed padded content root",
+		action: func() antflyv1.HAPlannedActionStatus {
+			action := base(haActionBootstrapStandbySeed)
+			action.SeedContentRoot = "/backup/base-standby-a-5 "
+			return action
+		}(),
+	}, {
+		name: "acquire fence padded promoted standby",
+		action: func() antflyv1.HAPlannedActionStatus {
+			action := base(haActionAcquireFence)
+			action.StandbyName = "standby-a "
+			action.AdminNodeID = "primary-a"
+			return action
+		}(),
+	}, {
+		name: "rejoin padded former primary",
+		action: func() antflyv1.HAPlannedActionStatus {
+			action := base(haActionDemoteFormerPrimary)
+			action.StandbyName = "primary-a "
+			action.AdminNodeID = "primary-a"
+			return action
+		}(),
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action := tt.action
+			handled, err := (&AntflyClusterReconciler{}).executeHAPlannedActionTyped(context.Background(), haClusterWithAutomaticKubernetesLeaseFailover(), &action)
+			if !handled {
+				t.Fatal("expected typed admin action to be handled")
+			}
+			if err == nil || !strings.Contains(err.Error(), "invalid HA") {
+				t.Fatalf("executeHAPlannedActionTyped error = %v, want local invalid HA input error", err)
+			}
+			if action.AdminResult != nil {
+				t.Fatalf("unexpected admin result for invalid input: %#v", action.AdminResult)
+			}
+		})
+	}
+	if requests != 0 {
+		t.Fatalf("server received %d requests for invalid typed HA inputs", requests)
 	}
 }
 

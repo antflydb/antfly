@@ -645,6 +645,33 @@ The concrete follow-up decisions are:
   runbooks, compatibility tests, crash/e2e/operator coverage, and former-primary
   repair paths are all implemented and tested.
 
+#### Acceptance Checklist
+
+Before the hot-standby design is treated as more than an experimental async
+replication path, the implementation should satisfy this checklist:
+
+- shared HA string handling uses `classifyHAString` for missing/padded
+  detection, while every caller preserves field-specific errors and applies
+  type-specific validation for paths, node ids, slot names, token env vars, and
+  URLs;
+- `test_standby.py` exists as a real-process Zig e2e covering primary startup,
+  slot creation, standby seeding, standby startup, primary writes, standby
+  catch-up, read-only standby behavior, standby restart, and replay resume;
+- Zig simulation tests cover receive/apply crash points, primary crash before
+  and after synchronous acknowledgement, duplicate/gap/out-of-order WAL,
+  promotion with and without fence evidence, old-primary rejoin, rewind, reseed,
+  WAL-retention expiry, and timeline switch propagation;
+- production-grade scope includes the generated `/admin/v1/ha` Zig and Go
+  clients, `go/pkg/operator` integration through the Go SDK wrapper, real
+  base-backup/reseed workflows, synchronous commit modes, fencing, promotion
+  receipts, former-primary repair, standby freshness controls, WAL retention
+  policy, auth, auditability, metrics, runbooks, compatibility tests, crash
+  tests, black-box e2e, and operator e2e;
+- bulk Postgres-style parity is not claimed until the former-primary repair,
+  synchronous commit, observability, operator workflow, and optional
+  WAL-archive/PITR or relay-replica gaps are explicit product decisions rather
+  than implicit omissions.
+
 #### Open Review Question Answers
 
 The direct answers to the HA review questions are:
