@@ -423,6 +423,35 @@ func TestHAClientStandbyStatusParsedResponseValidatesRawBody(t *testing.T) {
 	}
 }
 
+func TestHAClientStandbyStatusParsedResponseSanitizesGeneratedQuery(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAStandbyStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
+		}
+		query := r.URL.Query()
+		if _, ok := query["upstream_lsn"]; ok {
+			t.Fatalf("query includes upstream_lsn = %q, want omitted zero value", query["upstream_lsn"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, haLegacyStandbyStatusJSON())
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.StandbyStatusParsedResponse(context.Background(), &HAStandbyStatusParams{})
+	if err != nil {
+		t.Fatalf("StandbyStatusParsedResponse returned error: %v", err)
+	}
+}
+
 func TestHAClientStandbyStatusParsedResponseRejectsInvalidRawBody(t *testing.T) {
 	t.Parallel()
 

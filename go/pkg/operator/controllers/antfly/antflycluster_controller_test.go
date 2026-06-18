@@ -5912,6 +5912,47 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g.Expect(standby.Status).To(Equal("unhealthy"))
 }
 
+func TestObserveHAStandbyAdminStatusesOmitsZeroUpstreamLSN(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			g.Expect(req.URL.Query()).NotTo(HaveKey("upstream_lsn"))
+			body := `{"schema_version":1,"snapshot":{"role":"standby","node_id":"standby-a","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":12,"safe_read_lsn":12,"write_lag_lsn":0,"receive_lag_lsn":0,"apply_lag_lsn":0,"unapplied_lsn_count":0,"caught_up_to_received":true,"can_serve_safe_reads":true}}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					SlotName: "slot-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode:       antflyv1.HAModeHotStandby,
+				PrimaryLSN: 0,
+			},
+		},
+	}
+
+	g.Expect(reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	g.Expect(cluster.Status.HAStatus.Standbys[0].UpstreamLSN).To(BeZero())
+	g.Expect(cluster.Status.HAStatus.Standbys[0].Status).To(Equal("healthy"))
+}
+
 func TestObserveHAStandbyAdminStatusesRejectsMissingSDKFieldEvidence(t *testing.T) {
 	g := NewWithT(t)
 

@@ -2230,7 +2230,7 @@ func removeZeroQueryParam(query url.Values, key string) {
 }
 
 func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[HAStandbyStatusResponse], error) {
-	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, c.editors...)
+	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, appendHARequestEditors(c.editors, haStandbyStatusQueryEditor(params))...)
 	if resp == nil {
 		return nil, err
 	}
@@ -2242,7 +2242,7 @@ func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusPar
 }
 
 func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HAStandbyStatusParams) (*HAResponse[ParsedHAStandbyStatus], error) {
-	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, c.editors...)
+	resp, err := c.client.GetHAStandbyStatusWithResponse(ctx, params, appendHARequestEditors(c.editors, haStandbyStatusQueryEditor(params))...)
 	if resp == nil {
 		return nil, err
 	}
@@ -2265,6 +2265,18 @@ func (c *HAClient) StandbyStatusParsedResponse(ctx context.Context, params *HASt
 
 func (c *HAClient) StandbyStatusParsed(ctx context.Context, params *HAStandbyStatusParams) (*ParsedHAStandbyStatus, error) {
 	return haResponseValue(c.StandbyStatusParsedResponse(ctx, params))
+}
+
+func haStandbyStatusQueryEditor(params *HAStandbyStatusParams) oapi.RequestEditorFn {
+	return func(_ context.Context, req *http.Request) error {
+		if params == nil || req == nil || req.URL == nil {
+			return nil
+		}
+		query := req.URL.Query()
+		removeZeroQueryParam(query, "upstream_lsn")
+		req.URL.RawQuery = query.Encode()
+		return nil
+	}
 }
 
 func (c *HAClient) AppendCommitResponse(ctx context.Context, body CommitAppendRequest) (*HAResponse[HACommitAppendResponse], error) {
