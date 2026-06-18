@@ -4929,7 +4929,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     inventory: external_source_api.Inventory,
     pinned_source: PinnedExternalObjectStorageLakeRowsSource,
 
-    pub fn initParquetPrefixAlloc(
+    pub fn initExternalLakeAlloc(
         alloc: std.mem.Allocator,
         runtime_schema: storage_schema.TableSchema,
         client: object_storage_api.ObjectStorage,
@@ -4940,17 +4940,29 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
         const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
         const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
-        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
 
-        var inventory = try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
-            .client = client,
-            .bucket = bucket,
-            .prefix = prefix,
-            .source_id = binding.table_id,
-            .source_uri = binding.source_uri,
-            .object_uri_base = options.object_uri_base,
-            .schema_fingerprint = binding.schema_fingerprint,
-        });
+        var inventory = switch (binding.format) {
+            .parquet => try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
+                .client = client,
+                .bucket = bucket,
+                .prefix = prefix,
+                .source_id = binding.table_id,
+                .source_uri = binding.source_uri,
+                .object_uri_base = options.object_uri_base,
+                .schema_fingerprint = binding.schema_fingerprint,
+            }),
+            .iceberg => blk: {
+                const metadata_uri = try icebergMetadataUriForOpenedStoreAlloc(alloc, client, bucket, prefix, binding.source_uri, options.object_uri_base);
+                defer alloc.free(metadata_uri);
+                break :blk try serverless_query.readLakeIcebergSnapshotInventoryAlloc(alloc, .{
+                    .client = client,
+                    .source_id = binding.table_id,
+                    .metadata_uri = metadata_uri,
+                    .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
+                });
+            },
+            .lance => return error.UnsupportedRowsQuery,
+        };
         errdefer inventory.deinit(alloc);
         try serverless_query.validateLakeBindingInventory(binding, inventory);
 
@@ -4964,6 +4976,21 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         };
     }
 
+    pub fn initParquetPrefixAlloc(
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        client: object_storage_api.ObjectStorage,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ExternalObjectStorageLakeRowsSourceOptions,
+    ) !OwnedExternalObjectStorageLakeRowsSource {
+        if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        return try initExternalLakeAlloc(alloc, runtime_schema, client, bucket, prefix, options);
+    }
+
     pub fn source(self: *@This()) TableReadSource {
         return self.pinned_source.source();
     }
@@ -4975,6 +5002,114 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     pub fn deinit(self: *@This()) void {
         self.inventory.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    fn icebergMetadataUriForOpenedStoreAlloc(
+        alloc: std.mem.Allocator,
+        client: object_storage_api.ObjectStorage,
+        bucket: []const u8,
+        prefix: []const u8,
+        source_uri: []const u8,
+        object_uri_base: ?[]const u8,
+    ) ![]u8 {
+        if (std.mem.endsWith(u8, source_uri, ".metadata.json")) return try alloc.dupe(u8, source_uri);
+
+        const metadata_prefix = try icebergMetadataListPrefixAlloc(alloc, prefix);
+        defer alloc.free(metadata_prefix);
+        var storage_client = client;
+        storage_client.allocator = alloc;
+
+        if (try icebergMetadataUriFromVersionHintAlloc(alloc, &storage_client, bucket, prefix, metadata_prefix, source_uri, object_uri_base)) |metadata_uri| {
+            return metadata_uri;
+        }
+
+        var best_key: ?[]u8 = null;
+        defer if (best_key) |key| alloc.free(key);
+        var next_token: ?[]u8 = null;
+        defer if (next_token) |token| alloc.free(token);
+        while (true) {
+            var page = try storage_client.listObjects(bucket, .{
+                .prefix = metadata_prefix,
+                .recursive = true,
+                .continuation_token = next_token,
+                .max_keys = 1000,
+            });
+            defer page.deinit(alloc);
+
+            for (page.entries) |entry| {
+                if (!std.mem.endsWith(u8, entry.key, ".metadata.json")) continue;
+                if (best_key == null or std.mem.order(u8, best_key.?, entry.key) == .lt) {
+                    const next_best = try alloc.dupe(u8, entry.key);
+                    if (best_key) |old| alloc.free(old);
+                    best_key = next_best;
+                }
+            }
+
+            if (page.next_continuation_token) |token| {
+                const owned_next = try alloc.dupe(u8, token);
+                if (next_token) |old| alloc.free(old);
+                next_token = owned_next;
+            } else break;
+        }
+
+        const key = best_key orelse return error.ExternalLakeSnapshotMismatch;
+        const relative_key = relativeObjectKeyForPrefix(prefix, key);
+        const base_uri = object_uri_base orelse source_uri;
+        return try objectUriForRelativeKeyAlloc(alloc, base_uri, relative_key);
+    }
+
+    fn icebergMetadataUriFromVersionHintAlloc(
+        alloc: std.mem.Allocator,
+        client: *object_storage_api.ObjectStorage,
+        bucket: []const u8,
+        prefix: []const u8,
+        metadata_prefix: []const u8,
+        source_uri: []const u8,
+        object_uri_base: ?[]const u8,
+    ) !?[]u8 {
+        const hint_key = try std.fmt.allocPrint(alloc, "{s}version-hint.text", .{metadata_prefix});
+        defer alloc.free(hint_key);
+        var hint = client.getObject(bucket, hint_key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer hint.deinit(alloc);
+
+        const trimmed = std.mem.trim(u8, hint.body, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        const version = std.fmt.parseUnsigned(u64, trimmed, 10) catch return null;
+        const metadata_key = try std.fmt.allocPrint(alloc, "{s}v{d}.metadata.json", .{ metadata_prefix, version });
+        defer alloc.free(metadata_key);
+        var metadata_stat = client.statObject(bucket, metadata_key) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer metadata_stat.deinit(alloc);
+
+        const relative_key = relativeObjectKeyForPrefix(prefix, metadata_key);
+        const base_uri = object_uri_base orelse source_uri;
+        return try objectUriForRelativeKeyAlloc(alloc, base_uri, relative_key);
+    }
+
+    fn icebergMetadataListPrefixAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+        if (prefix.len == 0) return try alloc.dupe(u8, "metadata/");
+        if (std.mem.endsWith(u8, prefix, "/")) return try std.fmt.allocPrint(alloc, "{s}metadata/", .{prefix});
+        return try std.fmt.allocPrint(alloc, "{s}/metadata/", .{prefix});
+    }
+
+    fn relativeObjectKeyForPrefix(prefix: []const u8, key: []const u8) []const u8 {
+        if (prefix.len == 0) return key;
+        if (std.mem.startsWith(u8, key, prefix)) {
+            var rest = key[prefix.len..];
+            if (std.mem.startsWith(u8, rest, "/")) rest = rest[1..];
+            return rest;
+        }
+        return key;
+    }
+
+    fn objectUriForRelativeKeyAlloc(alloc: std.mem.Allocator, base_uri: []const u8, relative_key: []const u8) ![]u8 {
+        if (std.mem.endsWith(u8, base_uri, "/")) return try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, relative_key });
+        return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base_uri, relative_key });
     }
 };
 
@@ -4990,7 +5125,7 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
         if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
         const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
         const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
-        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
 
         const opened_store = try object_store_support.OpenedObjectStore.initRemoteUri(
             alloc,
@@ -5017,7 +5152,7 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
             source_options.object_uri_base = owned_object_uri_base.?;
         }
 
-        var owned_source = try OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
+        var owned_source = try OwnedExternalObjectStorageLakeRowsSource.initExternalLakeAlloc(
             alloc,
             runtime_schema,
             store.client,
@@ -5092,7 +5227,7 @@ pub const RemoteUriExternalLakeObjectStoreResolver = struct {
         binding: external_binding_api.Binding,
         options: ExternalObjectStorageLakeRowsSourceOptions,
     ) !object_store_support.OpenedObjectStore {
-        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
         if (binding.credential_ref != null) return error.UnsupportedExternalLakeCredentialRef;
         return try object_store_support.OpenedObjectStore.initRemoteUri(
             alloc,
@@ -5131,7 +5266,7 @@ pub const ConfiguredExternalLakeObjectStoreResolver = struct {
         if (binding.credential_ref == null) {
             return try self.fallback.resolver().openParquetPrefixAlloc(alloc, binding, options);
         }
-        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
         return try self.openCredentialedParquetPrefix(alloc, binding, options);
     }
 
@@ -5301,7 +5436,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         if (runtime_schema.storage_mode != .relational) return error.InvalidRowsRequest;
         const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
         const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
-        if (binding.format != .parquet) return error.UnsupportedRowsQuery;
+        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
         const opened_store = try self.resolver.openParquetPrefixAlloc(alloc, binding, self.options);
         return try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
             alloc,
@@ -17338,6 +17473,66 @@ test "opened object storage lake source owns store and pins parquet prefix inven
     _ = opened_source.source();
 }
 
+test "opened object storage lake source resolves iceberg table root inventory" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "iceberg-schema:7",
+        },
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var version_hint = try client.putObject("bucket", "events/metadata/version-hint.text", "1\n", .{});
+    defer version_hint.deinit(alloc);
+    var metadata_file = try client.putObject("bucket", "events/metadata/v1.metadata.json", icebergRoutingMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var manifest_list = try buildIcebergRoutingManifestListFixture(alloc);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "events/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest = try buildIcebergRoutingDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "events/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+
+    const opened_store = try object_store_support.OpenedObjectStore.initWithClient(
+        alloc,
+        client,
+        "bucket",
+        "events",
+    );
+    var opened_source = try OpenedExternalObjectStorageLakeRowsSource.initWithOpenedStoreAlloc(
+        alloc,
+        schema,
+        opened_store,
+        .{},
+    );
+    defer opened_source.deinit();
+
+    try std.testing.expectEqual(external_source_api.Format.iceberg, opened_source.owned_source.inventory.format);
+    try std.testing.expectEqualStrings("events", opened_source.owned_source.inventory.source_id);
+    try std.testing.expectEqualStrings("s3://bucket/events", opened_source.owned_source.inventory.source_uri);
+    try std.testing.expectEqualStrings("12", opened_source.owned_source.inventory.snapshot_id);
+    try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
+    try std.testing.expectEqualStrings("s3://bucket/events/data/a.parquet", opened_source.owned_source.inventory.files[0].object_uri);
+    const pinned_state = opened_source.pinnedState();
+    try std.testing.expectEqual(external_source_api.Format.iceberg, pinned_state.format);
+    try std.testing.expectEqual(@as(usize, 2), pinned_state.file_count);
+    try std.testing.expectEqual(@as(u64, 6144), pinned_state.byte_len);
+}
+
 test "external lake routing source resolves object store for external row plans" {
     const alloc = std.testing.allocator;
     var columns = [_]storage_schema.RelationalColumn{
@@ -17451,6 +17646,171 @@ test "external lake routing source resolves object store for external row plans"
     try std.testing.expectError(error.BaseRowsQueryReached, source.rowsQueryPlan(alloc, "events", local_schema, plan, .read_index));
     try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 1), base.rows_query_count);
+}
+
+fn icebergRoutingMetadataJson() []const u8 {
+    return
+    \\{
+    \\  "format-version": 2,
+    \\  "table-uuid": "uuid-events",
+    \\  "location": "s3://bucket/events",
+    \\  "current-schema-id": 7,
+    \\  "current-snapshot-id": 12,
+    \\  "snapshots": [
+    \\    {
+    \\      "snapshot-id": 12,
+    \\      "sequence-number": 42,
+    \\      "timestamp-ms": 1700000000000,
+    \\      "manifest-list": "s3://bucket/events/metadata/snap-12.avro"
+    \\    }
+    \\  ]
+    \\}
+    ;
+}
+
+fn buildIcebergRoutingManifestListFixture(alloc: std.mem.Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingManifestListSchema(), "0123456789abcdef");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingString(alloc, &block, "s3://bucket/events/metadata/m-a.avro");
+    try appendIcebergRoutingLong(alloc, &block, 512);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 42);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+    try appendIcebergRoutingLong(alloc, &block, 0);
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 1, "0123456789abcdef");
+    return out;
+}
+
+fn buildIcebergRoutingDataManifestFixture(alloc: std.mem.Allocator) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendIcebergRoutingAvroHeader(alloc, &out, icebergRoutingDataManifestSchema(), "fedcba9876543210");
+
+    var block = std.ArrayListUnmanaged(u8).empty;
+    defer block.deinit(alloc);
+    try appendIcebergRoutingDataManifestRecord(alloc, &block, 1, "s3://bucket/events/data/a.parquet", 3, 4096);
+    try appendIcebergRoutingDataManifestRecord(alloc, &block, 0, "s3://bucket/events/data/b.parquet", 2, 2048);
+
+    try appendIcebergRoutingAvroBlock(alloc, &out, block.items, 2, "fedcba9876543210");
+    return out;
+}
+
+fn icebergRoutingManifestListSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_file","fields":[
+    \\{"name":"manifest_path","type":"string"},
+    \\{"name":"manifest_length","type":"long"},
+    \\{"name":"partition_spec_id","type":"int"},
+    \\{"name":"content","type":"int"},
+    \\{"name":"sequence_number","type":"long"},
+    \\{"name":"added_files_count","type":"int"},
+    \\{"name":"existing_files_count","type":"int"},
+    \\{"name":"deleted_files_count","type":"int"},
+    \\{"name":"added_rows_count","type":"long"},
+    \\{"name":"existing_rows_count","type":"long"},
+    \\{"name":"deleted_rows_count","type":"long"}]}
+    ;
+}
+
+fn icebergRoutingDataManifestSchema() []const u8 {
+    return
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","type":"int"},
+    \\{"name":"snapshot_id","type":["null","long"]},
+    \\{"name":"data_sequence_number","type":["null","long"]},
+    \\{"name":"file_sequence_number","type":["null","long"]},
+    \\{"name":"data_file","type":{"type":"record","name":"data_file","fields":[
+    \\{"name":"content","type":"int"},
+    \\{"name":"file_path","type":"string"},
+    \\{"name":"file_format","type":"string"},
+    \\{"name":"record_count","type":"long"},
+    \\{"name":"file_size_in_bytes","type":"long"}]}}]}
+    ;
+}
+
+fn appendIcebergRoutingDataManifestRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    status: i64,
+    file_path: []const u8,
+    record_count: i64,
+    file_size_in_bytes: i64,
+) !void {
+    try appendIcebergRoutingLong(alloc, out, status);
+    try appendIcebergRoutingLong(alloc, out, 1);
+    try appendIcebergRoutingLong(alloc, out, 12);
+    try appendIcebergRoutingLong(alloc, out, 1);
+    try appendIcebergRoutingLong(alloc, out, 42);
+    try appendIcebergRoutingLong(alloc, out, 1);
+    try appendIcebergRoutingLong(alloc, out, 43);
+    try appendIcebergRoutingLong(alloc, out, 0);
+    try appendIcebergRoutingString(alloc, out, file_path);
+    try appendIcebergRoutingString(alloc, out, "PARQUET");
+    try appendIcebergRoutingLong(alloc, out, record_count);
+    try appendIcebergRoutingLong(alloc, out, file_size_in_bytes);
+}
+
+fn appendIcebergRoutingAvroHeader(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    schema: []const u8,
+    sync: []const u8,
+) !void {
+    try out.appendSlice(alloc, "Obj\x01");
+    try appendIcebergRoutingLong(alloc, out, 2);
+    try appendIcebergRoutingString(alloc, out, "avro.schema");
+    try appendIcebergRoutingBytes(alloc, out, schema);
+    try appendIcebergRoutingString(alloc, out, "avro.codec");
+    try appendIcebergRoutingBytes(alloc, out, "null");
+    try appendIcebergRoutingLong(alloc, out, 0);
+    try out.appendSlice(alloc, sync);
+}
+
+fn appendIcebergRoutingAvroBlock(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    block: []const u8,
+    count: i64,
+    sync: []const u8,
+) !void {
+    try appendIcebergRoutingLong(alloc, out, count);
+    try appendIcebergRoutingLong(alloc, out, @intCast(block.len));
+    try out.appendSlice(alloc, block);
+    try out.appendSlice(alloc, sync);
+}
+
+fn appendIcebergRoutingBytes(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    try appendIcebergRoutingLong(alloc, out, @intCast(bytes.len));
+    try out.appendSlice(alloc, bytes);
+}
+
+fn appendIcebergRoutingString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    try appendIcebergRoutingBytes(alloc, out, text);
+}
+
+fn appendIcebergRoutingLong(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: i64) !void {
+    var remaining = encodeIcebergRoutingZigzag(value);
+    while (remaining >= 0x80) {
+        try out.append(alloc, @as(u8, @intCast(remaining & 0x7f)) | 0x80);
+        remaining >>= 7;
+    }
+    try out.append(alloc, @intCast(remaining));
+}
+
+fn encodeIcebergRoutingZigzag(value: i64) u64 {
+    if (value >= 0) return @as(u64, @intCast(value)) << 1;
+    const magnitude: u64 = @intCast(-(value + 1));
+    return (magnitude << 1) | 1;
 }
 
 test "configured external lake resolver opens credentialed filesystem connection" {
