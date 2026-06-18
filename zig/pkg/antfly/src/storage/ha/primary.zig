@@ -26,6 +26,7 @@ const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
+const validation = @import("validation.zig");
 
 var test_path_counter: u64 = 0;
 
@@ -193,6 +194,7 @@ pub const Primary = struct {
     }
 
     pub fn createSlot(self: *Primary, name: []const u8, initial_lsn: u64) !void {
+        try validateSlotName(name);
         if (self.slots.get(name) != null) return error.SlotAlreadyExists;
         if (initial_lsn > self.lastLsn()) return error.InitialLsnAheadOfPrimary;
         try self.slots.createOrUpdate(.{
@@ -206,7 +208,7 @@ pub const Primary = struct {
     }
 
     pub fn beginBaseBackup(self: *Primary, request: BaseBackupStart) !BaseBackupStartResult {
-        if (request.slot_name.len == 0) return error.InvalidSlotName;
+        try validateSlotName(request.slot_name);
         if (request.manifest_id.len == 0) return error.InvalidManifestId;
 
         const backup_lsn = self.nextLsn();
@@ -249,18 +251,22 @@ pub const Primary = struct {
     }
 
     pub fn dropSlot(self: *Primary, name: []const u8) !void {
+        try validateSlotName(name);
         try self.slots.drop(name);
     }
 
     pub fn pauseSlot(self: *Primary, name: []const u8) !void {
+        try validateSlotName(name);
         try self.slots.pause(name);
     }
 
     pub fn resumeSlot(self: *Primary, name: []const u8) !void {
+        try validateSlotName(name);
         try self.slots.resumeSlot(name);
     }
 
     pub fn markSlotReseedRequired(self: *Primary, name: []const u8) !void {
+        try validateSlotName(name);
         try self.slots.markReseedRequired(name);
     }
 
@@ -269,6 +275,7 @@ pub const Primary = struct {
     }
 
     pub fn streamFrom(self: *Primary, alloc: Allocator, slot_name: []const u8, from_lsn: u64) ![]replication_log.Entry {
+        try validateSlotName(slot_name);
         const state = self.slots.get(slot_name) orelse return error.SlotNotFound;
         if (!state.active) return error.SlotInactive;
         if (state.reseed_required) return error.SlotRequiresReseed;
@@ -296,6 +303,7 @@ pub const Primary = struct {
         applied_lsn: u64,
         safe_read_lsn: u64,
     ) !void {
+        try validateSlotName(slot_name);
         if (timeline_id != self.identity.timeline_id) return error.WrongTimeline;
         const state = self.slots.get(slot_name) orelse return error.SlotNotFound;
         if (!state.active) return error.SlotInactive;
@@ -306,10 +314,12 @@ pub const Primary = struct {
     }
 
     pub fn reportReplicationError(self: *Primary, slot_name: []const u8, last_error: []const u8) !void {
+        try validateSlotName(slot_name);
         try self.slots.setLastError(slot_name, last_error);
     }
 
     pub fn clearReplicationError(self: *Primary, slot_name: []const u8) !void {
+        try validateSlotName(slot_name);
         try self.slots.clearLastError(slot_name);
     }
 
@@ -376,6 +386,7 @@ pub const Primary = struct {
                 .candidate_count = 0,
             };
         }
+        try validateSyncPolicyNames(policy.standby_names);
         if (policy.required == 0) return error.InvalidSyncPolicy;
         if (policy.selection != .all and policy.required > policy.standby_names.len) return error.InvalidSyncPolicy;
         if (policy.standby_names.len == 0) return decisionForUnsatisfied(target_lsn, policy, 0, policy.required, 0);
@@ -468,6 +479,7 @@ pub const Primary = struct {
     }
 
     fn reserveBaseBackupSlot(self: *Primary, slot_name: []const u8, backup_lsn: u64, previous_lsn: u64) !void {
+        try validateSlotName(slot_name);
         if (self.slots.get(slot_name)) |state| {
             if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
             if (!state.reseed_required) return error.BaseBackupSlotInUse;
@@ -512,6 +524,16 @@ pub const Primary = struct {
         if (slot_state.restart_lsn > start.backup_lsn) return error.BackupSlotNotRetained;
     }
 };
+
+fn validateSlotName(name: []const u8) !void {
+    if (!validation.isIdentifier(name)) return error.InvalidSlotName;
+}
+
+fn validateSyncPolicyNames(names: []const []const u8) !void {
+    for (names) |name| {
+        if (!validation.isIdentifier(name)) return error.InvalidSyncPolicy;
+    }
+}
 
 const BackupStartPayload = struct {
     cluster_id: u64,
@@ -841,6 +863,37 @@ test "storage.ha primary rejects future slot creation at storage boundary" {
     });
     try std.testing.expectEqual(DurabilityStatus.fail_closed, decision.status);
     try std.testing.expectEqual(@as(usize, 0), decision.satisfied_count);
+}
+
+test "storage.ha primary rejects invalid slot and sync standby identifiers" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "invalid-identifiers");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one" });
+
+    try std.testing.expectError(error.InvalidSlotName, primary.createSlot("standby bad", 0));
+    try std.testing.expectError(error.InvalidSlotName, primary.createSlot("standby/a", 0));
+    try std.testing.expectError(error.InvalidSlotName, primary.beginBaseBackup(.{
+        .slot_name = " standby-a",
+        .manifest_id = "manifest-1",
+    }));
+    try std.testing.expectError(error.InvalidSlotName, primary.streamFrom(alloc, "standby/a", 1));
+    try std.testing.expectError(
+        error.InvalidSlotName,
+        primary.standbyStatusUpdate("standby bad", identity.timeline_id, 1, 1),
+    );
+
+    const invalid_sync_names = [_][]const u8{ "standby-a", "standby bad" };
+    try std.testing.expectError(error.InvalidSyncPolicy, primary.evaluateDurability(1, .{
+        .mode = .remote_write,
+        .selection = .any,
+        .required = 1,
+        .standby_names = &invalid_sync_names,
+    }));
 }
 
 test "storage.ha primary begins base backup with slot retention pin" {

@@ -62,19 +62,19 @@ pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []co
 
 /// Drop an HA replication slot
 pub const DropHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; any non-empty UTF-8 name up to 128 bytes is accepted.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
     slot_name: []const u8,
 };
 
 /// Pause an HA replication slot
 pub const PauseHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; any non-empty UTF-8 name up to 128 bytes is accepted.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
     slot_name: []const u8,
 };
 
 /// Resume an HA replication slot
 pub const ResumeHAReplicationSlotPathParams = struct {
-    /// Stable standby replication slot name. Path values are percent-encoded; any non-empty UTF-8 name up to 128 bytes is accepted.
+    /// Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
     slot_name: []const u8,
 };
 

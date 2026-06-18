@@ -603,11 +603,9 @@ components:
       name: slot_name
       in: path
       required: true
-      description: Stable standby replication slot name. Path values are percent-encoded; any non-empty UTF-8 name up to 128 bytes is accepted.
+      description: Stable standby replication slot name. Path values are percent-encoded; names must be HA identifiers.
       schema:
-        type: string
-        minLength: 1
-        maxLength: 128
+        $ref: "#/components/schemas/HASlotName"
   responses:
     BadRequest:
       description: Invalid admin request.
@@ -634,16 +632,31 @@ components:
           schema:
             type: string
   schemas:
+    HAIdentifier:
+      type: string
+      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HASlotName:
+      description: Stable standby replication slot name.
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HANodeID:
+      description: Stable HA node id.
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
     ReplicationSlotCreateRequest:
       type: object
       required: [slot_name]
       additionalProperties: false
       properties:
         slot_name:
-          type: string
-          description: Stable standby replication slot name. Any non-empty UTF-8 name up to 128 bytes is accepted.
-          minLength: 1
-          maxLength: 128
+          $ref: "#/components/schemas/HASlotName"
         initial_lsn:
           type: integer
           format: uint64
@@ -656,10 +669,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          type: string
-          description: Stable standby replication slot name to reserve for the base backup. Any non-empty UTF-8 name up to 128 bytes is accepted.
-          minLength: 1
-          maxLength: 128
+          $ref: "#/components/schemas/HASlotName"
         manifest_id:
           type: string
           description: Operator-chosen stable id for the base-backup manifest.
@@ -710,8 +720,7 @@ components:
         standby_names:
           type: array
           items:
-            type: string
-            minLength: 1
+            $ref: "#/components/schemas/HASlotName"
           default: []
           description: Ordered candidate standby names for synchronous commit.
         failure_policy:
@@ -862,11 +871,9 @@ components:
         identity:
           $ref: "#/components/schemas/HAIdentity"
         old_primary_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
         promoted_node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
         new_timeline_id:
           type: integer
           format: uint64
@@ -910,11 +917,9 @@ components:
         identity:
           $ref: "#/components/schemas/HAIdentity"
         old_primary_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
         promoted_node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
         parent_timeline_id:
           type: integer
           format: uint64
@@ -961,8 +966,7 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Former primary node id that is attempting to rejoin.
         identity:
           $ref: "#/components/schemas/HAIdentity"
@@ -1121,8 +1125,7 @@ components:
           enum: [assessed, applied, already_applied]
           description: Idempotency state for this action response.
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Node id for the node-local admin endpoint that produced this receipt.
     HAReplicationSlotActionResponse:
       type: object
@@ -1165,8 +1168,7 @@ components:
         action:
           $ref: "#/components/schemas/HAActionReceipt"
         slot_name:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HASlotName"
           description: Stable standby replication slot reserved for the base backup.
         manifest_id:
           type: string
@@ -1326,8 +1328,7 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Former primary node id whose local log was rewound.
         fork_lsn:
           type: integer
@@ -1373,12 +1374,10 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Former primary node id scheduled for reseed.
         slot_name:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HASlotName"
         target_timeline_id:
           type: integer
           format: uint64
@@ -1462,8 +1461,7 @@ components:
       additionalProperties: false
       properties:
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Standby node id that executed the promotion.
         switch_lsn:
           type: integer
@@ -1513,8 +1511,7 @@ components:
             - wrong_table
             - local_lsn_before_fork
         former_node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
         target_timeline_id:
           type: integer
           format: uint64
@@ -1571,8 +1568,7 @@ components:
           type: string
           enum: [primary]
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Node id for the node-local admin endpoint that produced this status snapshot.
         identity:
           $ref: "#/components/schemas/HAIdentity"
@@ -1607,8 +1603,7 @@ components:
           type: string
           enum: [standby]
         node_id:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HANodeID"
           description: Node id for the node-local admin endpoint that produced this status snapshot.
         identity:
           $ref: "#/components/schemas/HAIdentity"
@@ -1973,7 +1968,7 @@ components:
       additionalProperties: false
       properties:
         slot_name:
-          type: string
+          $ref: "#/components/schemas/HASlotName"
         timeline_id:
           type: integer
           format: uint64

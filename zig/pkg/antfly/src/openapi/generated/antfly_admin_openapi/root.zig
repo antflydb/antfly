@@ -5,6 +5,9 @@ pub const types = @import("types.zig");
 pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
+pub const HAIdentifier = types.HAIdentifier;
+pub const HASlotName = types.HASlotName;
+pub const HANodeID = types.HANodeID;
 pub const ReplicationSlotCreateRequest = types.ReplicationSlotCreateRequest;
 pub const BaseBackupStartRequest = types.BaseBackupStartRequest;
 pub const BaseBackupManifestPathRequest = types.BaseBackupManifestPathRequest;

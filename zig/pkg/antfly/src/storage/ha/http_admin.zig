@@ -37,6 +37,7 @@ const rejoin = @import("rejoin.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
+const validation = @import("validation.zig");
 const write_gate = @import("write_gate.zig");
 
 var test_path_counter: u64 = 0;
@@ -1490,7 +1491,7 @@ fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy
         break :blk @as(usize, @intCast(parsed));
     } else 1;
     for (standby_names) |name| {
-        if (name.len == 0) return error.InvalidAdminRequest;
+        if (!validation.isIdentifier(name)) return error.InvalidAdminRequest;
     }
 
     return .{
@@ -1634,7 +1635,7 @@ fn buildSyncPolicyFromQuery(alloc: Allocator, query: []const u8) !QuerySyncPolic
         const key, const value = splitQueryPart(part);
         if (std.mem.eql(u8, key, "sync_standby")) {
             const decoded = try percentDecodeQueryValueAlloc(alloc, value);
-            if (decoded.len == 0) {
+            if (!validation.isIdentifier(decoded)) {
                 alloc.free(decoded);
                 return error.InvalidAdminRequest;
             }
@@ -3137,7 +3138,7 @@ test "storage.ha http admin decodes sync policy query values" {
     const alloc = std.testing.allocator;
     var sync = try buildSyncPolicyFromQuery(
         alloc,
-        "sync_mode=remote-apply&sync_selection=first&sync_required=1&sync_failure=fail-closed&sync_standby=standby%20b%25&sync_standby=standby+c",
+        "sync_mode=remote-apply&sync_selection=first&sync_required=1&sync_failure=fail-closed&sync_standby=standby-a&sync_standby=standby.b%3Az",
     );
     defer sync.deinit(alloc);
 
@@ -3146,8 +3147,8 @@ test "storage.ha http admin decodes sync policy query values" {
     try std.testing.expectEqual(primary_mod.StandbySelection.first, policy.selection);
     try std.testing.expectEqual(primary_mod.FailurePolicy.fail_closed, policy.failure_policy);
     try std.testing.expectEqual(@as(usize, 2), policy.standby_names.len);
-    try std.testing.expectEqualStrings("standby b%", policy.standby_names[0]);
-    try std.testing.expectEqualStrings("standby c", policy.standby_names[1]);
+    try std.testing.expectEqualStrings("standby-a", policy.standby_names[0]);
+    try std.testing.expectEqualStrings("standby.b:z", policy.standby_names[1]);
 
     var all_sync = try buildSyncPolicyFromQuery(
         alloc,
@@ -3161,6 +3162,10 @@ test "storage.ha http admin decodes sync policy query values" {
     try std.testing.expectError(
         error.InvalidAdminRequest,
         buildSyncPolicyFromQuery(alloc, "sync_mode=remote-write&sync_standby=standby%XX"),
+    );
+    try std.testing.expectError(
+        error.InvalidAdminRequest,
+        buildSyncPolicyFromQuery(alloc, "sync_mode=remote-write&sync_standby=standby%20bad"),
     );
     try std.testing.expectError(
         error.InvalidAdminRequest,
@@ -3191,6 +3196,11 @@ test "storage.ha http admin decodes OpenAPI ALL sync policy" {
         .mode = "remote_apply",
         .selection = "all",
         .standby_names = &.{},
+    }));
+    try std.testing.expectError(error.InvalidAdminRequest, syncPolicyFromOpenApi(.{
+        .mode = "remote_apply",
+        .selection = "any",
+        .standby_names = &.{"standby bad"},
     }));
 }
 

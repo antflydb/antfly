@@ -1362,27 +1362,27 @@ test "storage.ha http client round trips admin commands" {
     try std.testing.expectEqualStrings("drop", typed_dropped.parsed.value.slot_action);
     try std.testing.expectEqual(@as(?bool, true), typed_dropped.parsed.value.slot.dropped);
 
-    var encoded_created = try client.createReplicationSlot("http://ha-admin.test", "standby/a b%", 0);
+    var encoded_created = try client.createReplicationSlot("http://ha-admin.test", "standby:a.b", 0);
     defer encoded_created.deinit(alloc);
     try std.testing.expectEqualStrings("create", encoded_created.parsed.value.slot_action);
-    try std.testing.expectEqualStrings("standby/a b%", encoded_created.parsed.value.slot.slot_name);
+    try std.testing.expectEqualStrings("standby:a.b", encoded_created.parsed.value.slot.slot_name);
 
-    var encoded_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby/a b%");
+    var encoded_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby:a.b");
     defer encoded_paused.deinit(alloc);
     try std.testing.expectEqualStrings("pause", encoded_paused.parsed.value.slot_action);
-    try std.testing.expectEqualStrings("standby/a b%", encoded_paused.parsed.value.slot.slot_name);
+    try std.testing.expectEqualStrings("standby:a.b", encoded_paused.parsed.value.slot.slot_name);
     try std.testing.expect(!encoded_paused.parsed.value.slot.active);
 
-    var encoded_resumed = try client.resumeReplicationSlot("http://ha-admin.test", "standby/a b%");
+    var encoded_resumed = try client.resumeReplicationSlot("http://ha-admin.test", "standby:a.b");
     defer encoded_resumed.deinit(alloc);
     try std.testing.expectEqualStrings("resume", encoded_resumed.parsed.value.slot_action);
-    try std.testing.expectEqualStrings("standby/a b%", encoded_resumed.parsed.value.slot.slot_name);
+    try std.testing.expectEqualStrings("standby:a.b", encoded_resumed.parsed.value.slot.slot_name);
     try std.testing.expect(encoded_resumed.parsed.value.slot.active);
 
-    var encoded_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby/a b%");
+    var encoded_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby:a.b");
     defer encoded_dropped.deinit(alloc);
     try std.testing.expectEqualStrings("drop", encoded_dropped.parsed.value.slot_action);
-    try std.testing.expectEqualStrings("standby/a b%", encoded_dropped.parsed.value.slot.slot_name);
+    try std.testing.expectEqualStrings("standby:a.b", encoded_dropped.parsed.value.slot.slot_name);
     try std.testing.expectEqual(@as(?bool, true), encoded_dropped.parsed.value.slot.dropped);
 
     var stream_slot = try client.createReplicationSlot("http://ha-admin.test/", "standby-a", 0);
@@ -2135,7 +2135,7 @@ test "storage.ha http client maps admin errors" {
 
 test "storage.ha http client renders primary status sync query with OpenAPI enum spelling" {
     const alloc = std.testing.allocator;
-    const standby_names = [_][]const u8{ "standby-a", "standby b%" };
+    const standby_names = [_][]const u8{ "standby-a", "standby.b:z" };
     var uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.ha_primary_status});
     uri = try appendQuerySyncPolicy(alloc, uri, .{
         .mode = .remote_write,
@@ -2151,7 +2151,7 @@ test "storage.ha http client renders primary status sync query with OpenAPI enum
     try expectContains(uri, "sync_required=1");
     try expectContains(uri, "sync_failure=fail-closed");
     try expectContains(uri, "sync_standby=standby-a");
-    try expectContains(uri, "sync_standby=standby%20b%25");
+    try expectContains(uri, "sync_standby=standby.b%3Az");
 
     const all_names = [_][]const u8{ "standby-a", "standby-b" };
     var all_uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.ha_primary_status});

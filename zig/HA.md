@@ -504,15 +504,23 @@ Recommended split:
 
 Runtime HA validation should be shared but still field-aware. Helpers such as
 `paddedHAString` should evolve into a small classifier, for example
-`classifyHAString(value) -> ok | missing | padded`, so role validation can reuse
-the same whitespace and missing-value rules while preserving field-specific
-errors such as `HAPrimaryLogInvalid`, `HAStandbySlotMissing`, or
-`HAAdminTokenEnvInvalid`. Do not collapse validation into one generic
-string-cleaning function that silently trims operator input. HA runtime identity
-and path fields should fail closed when they contain leading or trailing
-whitespace, because those values become durable node identity, WAL path, fence,
-slot, URL, or token-env configuration. Field-specific validators should layer
-type checks on top of the shared classifier:
+
+```zig
+const HAStringValidation = enum { ok, missing, padded };
+
+fn classifyHAString(value: ?[]const u8) HAStringValidation
+```
+
+Role validation can reuse the same whitespace and missing-value rules while
+preserving field-specific errors such as `HAPrimaryLogInvalid`,
+`HAStandbySlotMissing`, or `HAAdminTokenEnvInvalid`. Do not collapse validation
+into one generic `validateHAString` function that decides every field's type
+rules, silently trims operator input, or returns generic errors. HA runtime
+identity and path fields should fail closed when they contain leading or
+trailing whitespace, because those values become durable node identity, WAL
+path, fence, slot, URL, or token-env configuration. Field-specific validators
+should translate `ok`, `missing`, or `padded` into the right field-specific HA
+error, then layer type checks on top of the shared classifier:
 
 - paths must pass path-specific safety rules: absolute, normalized, and bounded
   to an allowed storage root where appropriate. Do not accept paths whose raw
@@ -583,7 +591,8 @@ for explicitly local file-transfer or recovery steps.
 #### Review Decisions
 
 The review outcome is to keep HA validation, e2e coverage, simulation coverage,
-and the production bar explicit in the design.
+and the production bar explicit in the design. The implementation should not
+treat these as nice-to-have cleanup after the storage path streams records.
 
 Treat these review points as acceptance gates, not follow-up polish:
 
@@ -607,13 +616,13 @@ Treat these review points as acceptance gates, not follow-up polish:
 HA needs both black-box e2e coverage and deterministic simulation coverage. The
 Python e2e suite should add a Zig-backed standby test, for example
 `test_standby.py`, once the runtime and admin API are usable as real process
-surfaces. That e2e test should not exist only to assert argument validation. It
-should launch real Antfly processes and cover the user-visible Postgres-style
-flow:
+surfaces. That e2e test should not exist only to assert whitespace or argument
+validation. It should launch real Antfly processes and cover the user-visible
+Postgres-style flow:
 
 1. start a primary;
-2. create or reserve a replication slot;
-3. seed and start a standby;
+2. create a replication slot and seed a standby from the primary;
+3. start the standby against the seeded data and replication stream;
 4. write data to the primary;
 5. wait for standby catch-up and verify read-only standby visibility;
 6. restart the standby and verify local received-WAL replay plus stream resume;
@@ -644,7 +653,10 @@ model or harness coverage for:
 
 The expected split is: e2e proves the supported CLI/admin/operator path works
 with real processes and files, while Zig simulation proves the state machine is
-correct under crash, restart, partition, and replay ordering stress.
+correct under crash, restart, partition, and replay ordering stress. Production
+readiness should depend on the simulation matrix because it can cover failure
+windows, duplicate delivery, reordered delivery, and promotion races that would
+be too slow or nondeterministic to rely on in process e2e alone.
 
 ## Failure Cases
 

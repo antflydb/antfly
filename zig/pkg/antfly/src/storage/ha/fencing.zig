@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const Crc32 = std.hash.Crc32;
 const replication_record = @import("replication_record.zig");
 const standby_mod = @import("standby.zig");
+const validation = @import("validation.zig");
 const wal_mod = @import("../wal.zig");
 
 const magic = [8]u8{ 'A', 'F', 'H', 'A', 'F', 'N', 'C', '\n' };
@@ -247,8 +248,8 @@ pub fn freeReceipt(alloc: Allocator, receipt: Receipt) void {
 
 fn validateFenceRequest(request: FenceRequest) !void {
     if (request.identity.timeline_id == 0 or request.identity.epoch == 0) return error.InvalidTimelineSwitch;
-    if (request.old_primary_id.len == 0) return error.InvalidOldPrimaryId;
-    if (request.promoted_node_id.len == 0) return error.InvalidPromotedNodeId;
+    if (!validation.isIdentifier(request.old_primary_id)) return error.InvalidOldPrimaryId;
+    if (!validation.isIdentifier(request.promoted_node_id)) return error.InvalidPromotedNodeId;
     if (std.mem.eql(u8, request.old_primary_id, request.promoted_node_id)) return error.InvalidPromotedNodeId;
     if (request.new_timeline_id <= request.identity.timeline_id) return error.InvalidTimelineSwitch;
     if (request.new_epoch <= request.identity.epoch) return error.InvalidTimelineSwitch;
@@ -262,8 +263,8 @@ fn validateFenceRequest(request: FenceRequest) !void {
 }
 
 pub fn validateReceipt(receipt: Receipt) !void {
-    if (receipt.old_primary_id.len == 0) return error.InvalidOldPrimaryId;
-    if (receipt.promoted_node_id.len == 0) return error.InvalidPromotedNodeId;
+    if (!validation.isIdentifier(receipt.old_primary_id)) return error.InvalidOldPrimaryId;
+    if (!validation.isIdentifier(receipt.promoted_node_id)) return error.InvalidPromotedNodeId;
     if (receipt.token.len == 0) return error.InvalidFenceToken;
     if (std.mem.eql(u8, receipt.old_primary_id, receipt.promoted_node_id)) return error.InvalidPromotedNodeId;
     if (receipt.identity.timeline_id != receipt.new_timeline_id) return error.InvalidTimelineSwitch;
@@ -666,6 +667,42 @@ test "storage.ha fencing rejects unsafe and competing promotions" {
     try std.testing.expectEqual(@as(u64, 2), next.parent_timeline_id);
     try std.testing.expectEqualStrings("standby-b", next.old_primary_id);
     try std.testing.expectEqualStrings("standby-c", next.promoted_node_id);
+}
+
+test "storage.ha fencing rejects invalid node identifiers" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "invalid-node-identifiers");
+    defer alloc.free(path);
+
+    var store = try Store.open(alloc, path.ptr, .{});
+    defer store.close();
+
+    var invalid_old = baseRequest();
+    invalid_old.old_primary_id = "primary a";
+    try std.testing.expectError(error.InvalidOldPrimaryId, store.acquirePromotionFence(invalid_old));
+
+    var invalid_promoted = baseRequest();
+    invalid_promoted.promoted_node_id = "standby/a";
+    try std.testing.expectError(error.InvalidPromotedNodeId, store.acquirePromotionFence(invalid_promoted));
+
+    const valid_receipt = try store.acquirePromotionFence(baseRequest());
+    defer freeReceipt(alloc, valid_receipt);
+    const invalid_receipt = Receipt{
+        .identity = valid_receipt.identity,
+        .old_primary_id = valid_receipt.old_primary_id,
+        .promoted_node_id = "standby bad",
+        .parent_timeline_id = valid_receipt.parent_timeline_id,
+        .parent_epoch = valid_receipt.parent_epoch,
+        .new_timeline_id = valid_receipt.new_timeline_id,
+        .new_epoch = valid_receipt.new_epoch,
+        .required_lsn = valid_receipt.required_lsn,
+        .observed_lsn = valid_receipt.observed_lsn,
+        .generation = valid_receipt.generation,
+        .forced = valid_receipt.forced,
+        .token = valid_receipt.token,
+        .reason = valid_receipt.reason,
+    };
+    try std.testing.expectError(error.InvalidPromotedNodeId, validateReceipt(invalid_receipt));
 }
 
 test "storage.ha fencing rejects conflicting duplicate generations on replay" {

@@ -3,19 +3,14 @@
 
 const std = @import("std");
 
-pub const ReplicationSlotCreateRequest = struct {
-    /// Stable standby replication slot name. Any non-empty UTF-8 name up to 128 bytes is accepted.
-    slot_name: []const u8,
-    /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: ?i64 = null,
-};
+/// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+pub const HAIdentifier = []const u8;
 
-pub const BaseBackupStartRequest = struct {
-    /// Stable standby replication slot name to reserve for the base backup. Any non-empty UTF-8 name up to 128 bytes is accepted.
-    slot_name: []const u8,
-    /// Operator-chosen stable id for the base-backup manifest.
-    manifest_id: []const u8,
-};
+/// Stable standby replication slot name.
+pub const HASlotName = []const u8;
+
+/// Stable HA node id.
+pub const HANodeID = []const u8;
 
 pub const BaseBackupManifestPathRequest = struct {
     /// Pod-local path to the HA base-backup manifest.
@@ -27,19 +22,6 @@ pub const StandbyBootstrapRequest = struct {
     manifest_path: []const u8,
     /// Optional pod-local directory containing files referenced by the manifest.
     content_root: ?[]const u8 = null,
-};
-
-pub const HASyncPolicy = struct {
-    /// Durability mode to require before acknowledging the commit.
-    mode: []const u8,
-    /// How named standbys are selected to satisfy the policy.
-    selection: ?[]const u8 = null,
-    /// Number of eligible standbys required for `any` selection.
-    required: ?i64 = null,
-    /// Ordered candidate standby names for synchronous commit.
-    standby_names: ?[]const []const u8 = null,
-    /// Caller-visible action when synchronous durability is not currently satisfied.
-    failure_policy: ?[]const u8 = null,
 };
 
 pub const ReadCheckRequest = struct {
@@ -66,44 +48,6 @@ pub const PromotionAssessRequest = struct {
     use_current_fence: bool,
 };
 
-pub const HAActionReceipt = struct {
-    /// Stable action correlation id derived from the acted-on HA resource and boundary values.
-    action_id: []const u8,
-    /// Typed HA action that produced this response.
-    action_kind: []const u8,
-    /// Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
-    target: []const u8,
-    /// Idempotency state for this action response.
-    state: []const u8,
-    /// Node id for the node-local admin endpoint that produced this receipt.
-    node_id: []const u8,
-};
-
-pub const HARejoinRewindResult = struct {
-    /// Former primary node id whose local log was rewound.
-    node_id: []const u8,
-    fork_lsn: i64,
-    previous_last_lsn: i64,
-    current_last_lsn: i64,
-    next_lsn: i64,
-    discarded_lsn_count: i64,
-    target_timeline_id: i64,
-    target_epoch: i64,
-    data_loss_discarded: bool,
-};
-
-pub const HARejoinReseedResult = struct {
-    /// Former primary node id scheduled for reseed.
-    node_id: []const u8,
-    slot_name: []const u8,
-    target_timeline_id: i64,
-    target_epoch: i64,
-    fork_lsn: i64,
-    former_last_lsn: i64,
-    reseed_required: bool,
-    base_backup_required: bool,
-};
-
 pub const HAPromotionAssessment = struct {
     required_lsn: i64,
     received_lsn: i64,
@@ -119,28 +63,6 @@ pub const HAPromotionAssessment = struct {
     requires_fencing: bool,
     requires_force: bool,
     can_promote: bool,
-};
-
-pub const HARejoinAssessment = struct {
-    action: []const u8,
-    reason: []const u8,
-    former_node_id: []const u8,
-    target_timeline_id: i64,
-    target_epoch: i64,
-    /// Cluster identity of the retained parent-timeline fork record.
-    parent_cluster_id: i64,
-    /// Shard identity of the retained parent-timeline fork record.
-    parent_shard_id: i64,
-    /// Table identity of the retained parent-timeline fork record.
-    parent_table_id: i64,
-    /// Parent timeline that must contain the fork record before rewind.
-    parent_timeline_id: i64,
-    /// Parent epoch that must contain the fork record before rewind.
-    parent_epoch: i64,
-    fork_lsn: i64,
-    former_last_lsn: i64,
-    retained_from_lsn: i64,
-    data_loss_discarded: bool,
 };
 
 pub const HASlotSnapshot = struct {
@@ -196,8 +118,33 @@ pub const HAReadDecision = struct {
     metadata_missing_lsn_count: i64,
 };
 
+pub const ReplicationSlotCreateRequest = struct {
+    slot_name: HASlotName,
+    /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    initial_lsn: ?i64 = null,
+};
+
+pub const BaseBackupStartRequest = struct {
+    slot_name: HASlotName,
+    /// Operator-chosen stable id for the base-backup manifest.
+    manifest_id: []const u8,
+};
+
+pub const HASyncPolicy = struct {
+    /// Durability mode to require before acknowledging the commit.
+    mode: []const u8,
+    /// How named standbys are selected to satisfy the policy.
+    selection: ?[]const u8 = null,
+    /// Number of eligible standbys required for `any` selection.
+    required: ?i64 = null,
+    /// Ordered candidate standby names for synchronous commit.
+    standby_names: ?[]const HASlotName = null,
+    /// Caller-visible action when synchronous durability is not currently satisfied.
+    failure_policy: ?[]const u8 = null,
+};
+
 pub const HAReplicationSlot = struct {
-    slot_name: []const u8,
+    slot_name: HASlotName,
     timeline_id: i64,
     restart_lsn: i64,
     received_lsn: i64,
@@ -210,20 +157,64 @@ pub const HAReplicationSlot = struct {
     dropped: ?bool = null,
 };
 
-pub const CommitCheckRequest = struct {
-    target_lsn: i64,
-    sync_policy: HASyncPolicy,
+pub const HAActionReceipt = struct {
+    /// Stable action correlation id derived from the acted-on HA resource and boundary values.
+    action_id: []const u8,
+    /// Typed HA action that produced this response.
+    action_kind: []const u8,
+    /// Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
+    target: []const u8,
+    /// Idempotency state for this action response.
+    state: []const u8,
+    /// Node id for the node-local admin endpoint that produced this receipt.
+    node_id: HANodeID,
 };
 
-pub const CommitAppendRequest = struct {
-    /// Logical WAL/effects payload to append.
-    payload: []const u8,
-    kind: ?[]const u8 = null,
-    payload_codec: ?[]const u8 = null,
-    shard_id: ?i64 = null,
-    table_id: ?i64 = null,
-    commit_timestamp_ns: ?i64 = null,
-    sync_policy: HASyncPolicy,
+pub const HARejoinRewindResult = struct {
+    /// Former primary node id whose local log was rewound.
+    node_id: HANodeID,
+    fork_lsn: i64,
+    previous_last_lsn: i64,
+    current_last_lsn: i64,
+    next_lsn: i64,
+    discarded_lsn_count: i64,
+    target_timeline_id: i64,
+    target_epoch: i64,
+    data_loss_discarded: bool,
+};
+
+pub const HARejoinReseedResult = struct {
+    /// Former primary node id scheduled for reseed.
+    node_id: HANodeID,
+    slot_name: HASlotName,
+    target_timeline_id: i64,
+    target_epoch: i64,
+    fork_lsn: i64,
+    former_last_lsn: i64,
+    reseed_required: bool,
+    base_backup_required: bool,
+};
+
+pub const HARejoinAssessment = struct {
+    action: []const u8,
+    reason: []const u8,
+    former_node_id: HANodeID,
+    target_timeline_id: i64,
+    target_epoch: i64,
+    /// Cluster identity of the retained parent-timeline fork record.
+    parent_cluster_id: i64,
+    /// Shard identity of the retained parent-timeline fork record.
+    parent_shard_id: i64,
+    /// Table identity of the retained parent-timeline fork record.
+    parent_table_id: i64,
+    /// Parent timeline that must contain the fork record before rewind.
+    parent_timeline_id: i64,
+    /// Parent epoch that must contain the fork record before rewind.
+    parent_epoch: i64,
+    fork_lsn: i64,
+    former_last_lsn: i64,
+    retained_from_lsn: i64,
+    data_loss_discarded: bool,
 };
 
 pub const WriteCheckRequest = struct {
@@ -239,8 +230,8 @@ pub const OwnerJobCheckRequest = struct {
 
 pub const FenceAcquireRequest = struct {
     identity: HAIdentity,
-    old_primary_id: []const u8,
-    promoted_node_id: []const u8,
+    old_primary_id: HANodeID,
+    promoted_node_id: HANodeID,
     new_timeline_id: i64,
     new_epoch: i64,
     required_lsn: i64,
@@ -251,8 +242,8 @@ pub const FenceAcquireRequest = struct {
 
 pub const HAFenceReceipt = struct {
     identity: HAIdentity,
-    old_primary_id: []const u8,
-    promoted_node_id: []const u8,
+    old_primary_id: HANodeID,
+    promoted_node_id: HANodeID,
     parent_timeline_id: i64,
     parent_epoch: i64,
     new_timeline_id: i64,
@@ -267,7 +258,7 @@ pub const HAFenceReceipt = struct {
 
 pub const HAPromotionResult = struct {
     /// Standby node id that executed the promotion.
-    node_id: []const u8,
+    node_id: HANodeID,
     switch_lsn: i64,
     old_identity: HAIdentity,
     new_identity: HAIdentity,
@@ -278,7 +269,7 @@ pub const HAPromotionResult = struct {
 pub const HAStandbySnapshot = struct {
     role: []const u8,
     /// Node id for the node-local admin endpoint that produced this status snapshot.
-    node_id: []const u8,
+    node_id: HANodeID,
     identity: HAIdentity,
     received_lsn: i64,
     applied_lsn: i64,
@@ -306,11 +297,61 @@ pub const HAPromotionHandoff = struct {
     next_lsn: i64,
 };
 
+pub const HAPrimarySnapshot = struct {
+    role: []const u8,
+    /// Node id for the node-local admin endpoint that produced this status snapshot.
+    node_id: HANodeID,
+    identity: HAIdentity,
+    current_lsn: i64,
+    slots: []const HASlotSnapshot,
+    retention: HARetentionSnapshot,
+    durability: ?HADurabilityDecision = null,
+};
+
+pub const HACommitGate = struct {
+    target_lsn: i64,
+    action: []const u8,
+    durability: HADurabilityDecision,
+};
+
+pub const HAReadCheckResponse = struct {
+    schema_version: i64,
+    decision: HAReadDecision,
+};
+
+pub const CommitCheckRequest = struct {
+    target_lsn: i64,
+    sync_policy: HASyncPolicy,
+};
+
+pub const CommitAppendRequest = struct {
+    /// Logical WAL/effects payload to append.
+    payload: []const u8,
+    kind: ?[]const u8 = null,
+    payload_codec: ?[]const u8 = null,
+    shard_id: ?i64 = null,
+    table_id: ?i64 = null,
+    commit_timestamp_ns: ?i64 = null,
+    sync_policy: HASyncPolicy,
+};
+
+pub const HAReplicationSlotListResponse = struct {
+    schema_version: i64,
+    slots: []const HAReplicationSlot,
+};
+
+pub const HAReplicationSlotActionResponse = struct {
+    schema_version: i64,
+    action: HAActionReceipt,
+    slot_action: []const u8,
+    slot: HAReplicationSlot,
+};
+
 pub const HABaseBackupBeginResponse = struct {
     schema_version: i64,
     action: HAActionReceipt,
     /// Stable standby replication slot reserved for the base backup.
-    slot_name: []const u8,
+    slot_name: HASlotName,
     /// Stable base-backup manifest id for retry and action correlation.
     manifest_id: []const u8,
     /// LSN reserved as the base-backup start boundary.
@@ -353,43 +394,9 @@ pub const HARejoinAssessResponse = struct {
     reseed: ?HARejoinReseedResult = null,
 };
 
-pub const HAPrimarySnapshot = struct {
-    role: []const u8,
-    /// Node id for the node-local admin endpoint that produced this status snapshot.
-    node_id: []const u8,
-    identity: HAIdentity,
-    current_lsn: i64,
-    slots: []const HASlotSnapshot,
-    retention: HARetentionSnapshot,
-    durability: ?HADurabilityDecision = null,
-};
-
-pub const HACommitGate = struct {
-    target_lsn: i64,
-    action: []const u8,
-    durability: HADurabilityDecision,
-};
-
-pub const HAReadCheckResponse = struct {
-    schema_version: i64,
-    decision: HAReadDecision,
-};
-
-pub const HAReplicationSlotActionResponse = struct {
-    schema_version: i64,
-    action: HAActionReceipt,
-    slot_action: []const u8,
-    slot: HAReplicationSlot,
-};
-
-pub const HAReplicationSlotListResponse = struct {
-    schema_version: i64,
-    slots: []const HAReplicationSlot,
-};
-
 pub const RejoinAssessRequest = struct {
     /// Former primary node id that is attempting to rejoin.
-    node_id: []const u8,
+    node_id: HANodeID,
     identity: HAIdentity,
     /// Last local LSN durably present on the former primary.
     last_lsn: i64,

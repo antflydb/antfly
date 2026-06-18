@@ -122,6 +122,18 @@ components:
           schema:
             type: string
   schemas:
+    HAIdentifier:
+      type: string
+      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HASlotName:
+      description: Stable standby replication slot name.
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
     HAIdentity:
       type: object
       required: [cluster_id, shard_id, table_id, timeline_id, epoch]
@@ -169,9 +181,7 @@ components:
       required: [slot_name]
       properties:
         slot_name:
-          type: string
-          minLength: 1
-          description: Stable standby replication slot name.
+          $ref: "#/components/schemas/HASlotName"
         initial_lsn:
           type: integer
           format: uint64
@@ -191,8 +201,7 @@ components:
         - current_lsn
       properties:
         slot_name:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HASlotName"
         timeline_id:
           type: integer
           format: uint64
@@ -229,8 +238,7 @@ components:
       required: [slot_name, from_lsn]
       properties:
         slot_name:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HASlotName"
         from_lsn:
           type: integer
           format: uint64
@@ -292,8 +300,7 @@ components:
         - records
       properties:
         slot_name:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HASlotName"
         identity:
           $ref: "#/components/schemas/HAIdentity"
         record_format_version:
@@ -335,8 +342,7 @@ components:
       required: [slot_name, timeline_id, received_lsn, applied_lsn]
       properties:
         slot_name:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/HASlotName"
         timeline_id:
           type: integer
           format: uint64
