@@ -21,6 +21,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const artifact_ref = @import("../manifest/artifact_ref.zig");
+const artifact_store = @import("../artifacts/store.zig");
 const indexed_reader = @import("../query/indexed_reader.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
@@ -41,6 +42,15 @@ pub const TextSidecarBuildResult = struct {
 
     pub fn deinit(self: *TextSidecarBuildResult, alloc: Allocator) void {
         alloc.free(self.payload);
+        freeOwnedDeclaration(alloc, self.declaration);
+        self.* = undefined;
+    }
+};
+
+pub const TextSidecarPublishResult = struct {
+    declaration: sidecar_manifest.DeclaredArtifact,
+
+    pub fn deinit(self: *TextSidecarPublishResult, alloc: Allocator) void {
         freeOwnedDeclaration(alloc, self.declaration);
         self.* = undefined;
     }
@@ -123,6 +133,32 @@ pub fn buildTextSidecarFromRowSourceAlloc(
         .payload = payload,
         .declaration = declaration,
     };
+}
+
+pub fn publishTextSidecarFromRowSourceAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: TextSidecarBuildOptions,
+) !TextSidecarPublishResult {
+    var built = try buildTextSidecarFromRowSourceAlloc(alloc, source, binding, options);
+    defer alloc.free(built.payload);
+    errdefer freeOwnedDeclaration(alloc, built.declaration);
+
+    var metadata = try artifacts.put(built.payload);
+    var metadata_owned = true;
+    errdefer if (metadata_owned) metadata.deinit(alloc);
+
+    alloc.free(built.declaration.artifact.artifact_id);
+    alloc.free(built.declaration.artifact.checksum);
+    built.declaration.artifact.artifact_id = metadata.artifact_id;
+    built.declaration.artifact.byte_len = metadata.byte_len;
+    built.declaration.artifact.checksum = metadata.checksum;
+    metadata_owned = false;
+
+    try built.declaration.validate();
+    return .{ .declaration = built.declaration };
 }
 
 fn validateOptions(
@@ -309,6 +345,108 @@ fn lessTermEntry(_: void, lhs: text_segment.TermEntry, rhs: text_segment.TermEnt
     return std.mem.lessThan(u8, lhs.term, rhs.term);
 }
 
+const MemoryArtifactStore = struct {
+    alloc: Allocator,
+    bytes: ?[]u8 = null,
+
+    fn init(alloc: Allocator) MemoryArtifactStore {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *MemoryArtifactStore) void {
+        if (self.bytes) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+
+    fn artifactStore(self: *MemoryArtifactStore) artifact_store.ArtifactStore {
+        return .{
+            .allocator = self.alloc,
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn put(self: *MemoryArtifactStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
+        if (self.bytes) |bytes| self.alloc.free(bytes);
+        self.bytes = try self.alloc.dupe(u8, contents);
+        return .{
+            .artifact_id = try alloc.dupe(u8, "mem:text-sidecar"),
+            .byte_len = @intCast(contents.len),
+            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{contents.len}),
+        };
+    }
+
+    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+        if (!std.mem.eql(u8, artifact_id, "mem:text-sidecar")) return error.ArtifactNotFound;
+        const bytes = self.bytes orelse return error.ArtifactNotFound;
+        return try alloc.dupe(u8, bytes);
+    }
+
+    fn getRangeAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
+        const bytes = try self.getAlloc(alloc, artifact_id);
+        defer alloc.free(bytes);
+        if (offset > bytes.len) return error.InvalidRange;
+        const start: usize = @intCast(offset);
+        const end = @min(bytes.len, start + len);
+        return try alloc.dupe(u8, bytes[start..end]);
+    }
+
+    fn stat(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
+        if (!std.mem.eql(u8, artifact_id, "mem:text-sidecar")) return error.ArtifactNotFound;
+        const bytes = self.bytes orelse return error.ArtifactNotFound;
+        return .{
+            .artifact_id = try alloc.dupe(u8, "mem:text-sidecar"),
+            .byte_len = @intCast(bytes.len),
+            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{bytes.len}),
+        };
+    }
+
+    fn delete(self: *MemoryArtifactStore, artifact_id: []const u8) !void {
+        if (!std.mem.eql(u8, artifact_id, "mem:text-sidecar")) return error.ArtifactNotFound;
+        if (self.bytes) |bytes| self.alloc.free(bytes);
+        self.bytes = null;
+    }
+
+    const vtable: artifact_store.ArtifactStore.VTable = .{
+        .deinit = erasedDeinit,
+        .put = erasedPut,
+        .get_alloc = erasedGetAlloc,
+        .get_range_alloc = erasedGetRangeAlloc,
+        .stat = erasedStat,
+        .delete = erasedDelete,
+    };
+
+    fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    fn erasedPut(ptr: *anyopaque, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.put(alloc, contents);
+    }
+
+    fn erasedGetAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.getAlloc(alloc, artifact_id);
+    }
+
+    fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.getRangeAlloc(alloc, artifact_id, offset, len);
+    }
+
+    fn erasedStat(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.stat(alloc, artifact_id);
+    }
+
+    fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        try self.delete(artifact_id);
+    }
+};
+
 test "lake text sidecar builder consumes external row source batches" {
     const alloc = std.testing.allocator;
     const external_binding = external_rowsource.Binding{
@@ -428,6 +566,71 @@ test "lake text sidecar builder rejects stale source batches" {
             .text_column = "body",
         }),
     );
+}
+
+test "lake text sidecar publisher writes artifact store metadata into declaration" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    const external_binding = external_rowsource.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-125",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 1),
+    };
+    const bodies = [_][]const u8{ "Alpha beta", "gamma beta" };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "body", .values = .{ .bytes = &bodies } },
+    };
+    const batches = [_]rowsource.ColumnBatch{
+        .{
+            .snapshot = external_binding.snapshot(),
+            .row_refs = &row_refs,
+            .columns = &columns,
+        },
+    };
+
+    var batch_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+    const binding = source_binding.bindingFromSnapshot(
+        .text,
+        .external_iceberg,
+        external_binding.snapshot(),
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"body"},
+        "sha256:text:v1",
+    );
+
+    var result = try publishTextSidecarFromRowSourceAlloc(
+        alloc,
+        &artifacts,
+        batch_source.rowSource(),
+        binding,
+        .{
+            .name = "events.body.text",
+            .text_column = "body",
+        },
+    );
+    defer result.deinit(alloc);
+
+    try result.declaration.validate();
+    try std.testing.expectEqualStrings("mem:text-sidecar", result.declaration.artifact.artifact_id);
+    try std.testing.expect(result.declaration.artifact.byte_len > 0);
+
+    const stored = try artifacts.getAlloc(result.declaration.artifact.artifact_id);
+    defer alloc.free(stored);
+    try std.testing.expectEqual(@as(usize, @intCast(result.declaration.artifact.byte_len)), stored.len);
+
+    var segment = try text_segment.decodeAlloc(alloc, stored);
+    defer text_segment.freeSegment(alloc, &segment);
+    try std.testing.expectEqual(@as(usize, 2), segment.docs.len);
+    try std.testing.expectEqualStrings("events.body.text", segment.index_name);
 }
 
 fn findTerm(terms: []const text_segment.TermEntry, term: []const u8) ?text_segment.TermEntry {
