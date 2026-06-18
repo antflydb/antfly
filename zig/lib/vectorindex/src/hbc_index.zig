@@ -8605,13 +8605,18 @@ pub fn batchInsertWithMetadataTxnOptions(
     options: hbc_runtime.BatchInsertOptions,
 ) !void {
     try self.bindTxnLike(txn);
-    var transformed_vector_storage = try self.alloc.alloc(f32, self.config.dims);
-    const transformed_vector = transformed_vector_storage[0..];
-    defer self.alloc.free(transformed_vector);
-    const previous_vector_storage = try self.alloc.alloc(f32, self.config.dims);
-    defer self.alloc.free(previous_vector_storage);
-    const previous_transformed_storage = try self.alloc.alloc(f32, self.config.dims);
-    defer self.alloc.free(previous_transformed_storage);
+    const dims: usize = @intCast(self.config.dims);
+    const scratch_len = try std.math.mul(usize, dims, 3);
+    var scratch_stack: [12288]f32 = undefined;
+    const use_stack_scratch = scratch_len <= scratch_stack.len;
+    const scratch = if (use_stack_scratch)
+        scratch_stack[0..scratch_len]
+    else
+        try self.alloc.alloc(f32, scratch_len);
+    defer if (!use_stack_scratch) self.alloc.free(scratch);
+    const transformed_vector = scratch[0..dims];
+    const previous_vector_storage = scratch[dims .. 2 * dims];
+    const previous_transformed_storage = scratch[2 * dims .. scratch_len];
     var deferred_recompute_leaf_ids = std.ArrayListUnmanaged(u64).empty;
     defer deferred_recompute_leaf_ids.deinit(self.alloc);
     var deferred_leaf_centroid_deltas = std.ArrayListUnmanaged(DeferredLeafCentroidDelta).empty;
