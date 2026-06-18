@@ -3796,6 +3796,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_cascade_action: bool = false,
     unsupported_ddl_temporal_fk_update_action: bool = false,
     unsupported_ddl_prepare_recursive_cte_statement: bool = false,
+    unsupported_ddl_deferrable_unique_constraint: bool = false,
+    unsupported_ddl_deferrable_primary_key: bool = false,
     unsupported_write: bool = false,
     unsupported_insert: bool = false,
     unsupported_update: bool = false,
@@ -4919,6 +4921,14 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "PREPARE ") and
                     std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null);
+            self.unsupported_ddl_deferrable_unique_constraint = self.unsupported_ddl_deferrable_unique_constraint or
+                (std.mem.eql(u8, entry.classification_reason, "deferrable_unique_constraint") and
+                    std.mem.indexOf(u8, entry.sql, " UNIQUE ") != null and
+                    std.mem.indexOf(u8, entry.sql, " DEFERRABLE") != null);
+            self.unsupported_ddl_deferrable_primary_key = self.unsupported_ddl_deferrable_primary_key or
+                (std.mem.eql(u8, entry.classification_reason, "deferrable_primary_key") and
+                    std.mem.indexOf(u8, entry.sql, " PRIMARY KEY ") != null and
+                    std.mem.indexOf(u8, entry.sql, " DEFERRABLE") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -5865,6 +5875,8 @@ pub const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
         try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
         try std.testing.expect(self.unsupported_ddl_prepare_recursive_cte_statement);
+        try std.testing.expect(self.unsupported_ddl_deferrable_unique_constraint);
+        try std.testing.expect(self.unsupported_ddl_deferrable_primary_key);
         try std.testing.expect(self.read_row_lock_nowait);
         try std.testing.expect(self.read_row_lock_share);
         try std.testing.expect(self.read_row_lock_key_share);
