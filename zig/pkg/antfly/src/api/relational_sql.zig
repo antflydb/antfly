@@ -105,69 +105,9 @@ fn currentUtcDateStartNs() u64 {
 
 const InsertValueRows = []const []const []const u8;
 
-pub const LoweredSelect = struct {
-    table_name: []const u8,
-    ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    query: db_mod.types.RelationalRowsQueryRequest,
-    select_outputs: []const SelectOutputRef = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        for (self.ctes) |cte| {
-            alloc.free(cte.name);
-            var query = cte.query;
-            query.deinit(alloc);
-        }
-        if (self.ctes.len > 0) alloc.free(self.ctes);
-        self.query.deinit(alloc);
-        self.clearSelectOutputs(alloc);
-        self.* = undefined;
-    }
-
-    fn clearSelectOutputs(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.select_outputs.len > 0) alloc.free(self.select_outputs);
-        self.select_outputs = &.{};
-    }
-};
-
-pub const LoweredQueryPlan = struct {
-    table_name: []const u8,
-    plan: db_mod.types.RelationalRowsQueryPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        for (self.plan.ctes) |cte| {
-            alloc.free(cte.name);
-            var query = cte.query;
-            query.deinit(alloc);
-        }
-        if (self.plan.ctes.len > 0) alloc.free(self.plan.ctes);
-        self.plan.query.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredWindowPlan = struct {
-    table_name: []const u8,
-    plan: db_mod.types.RelationalRowsWindowPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        for (self.plan.ctes) |cte| {
-            alloc.free(cte.name);
-            var query = cte.query;
-            query.deinit(alloc);
-        }
-        if (self.plan.ctes.len > 0) alloc.free(self.plan.ctes);
-        self.plan.window.source.deinit(alloc);
-        freeWindowSpecs(alloc, self.plan.window.windows);
-        if (self.plan.window.windows.len > 0) alloc.free(self.plan.window.windows);
-        freeStringSlice(alloc, self.plan.window.select);
-        freeOrderBy(alloc, self.plan.window.order_by);
-        if (self.plan.window.order_by.len > 0) alloc.free(self.plan.window.order_by);
-        self.* = undefined;
-    }
-};
+pub const LoweredSelect = sql_adapter.LoweredSelect;
+pub const LoweredQueryPlan = sql_adapter.LoweredQueryPlan;
+pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
 
 pub const LoweredInsert = struct {
     table_name: []const u8,
@@ -362,113 +302,11 @@ pub const LowerWritePlanOptions = struct {
     insert_source_schema: ?runtime_schema.TableSchema = null,
 };
 
-pub const LoweredAggregate = struct {
-    table_name: []const u8,
-    aggregate: db_mod.types.RelationalRowsAggregateRequest,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.aggregate.source.deinit(alloc);
-        freeStringSlice(alloc, self.aggregate.group_by);
-        freeExpressionProjections(alloc, self.aggregate.group_expressions);
-        freeAggregateSpecs(alloc, self.aggregate.aggregations);
-        if (self.aggregate.aggregations.len > 0) alloc.free(self.aggregate.aggregations);
-        freeRelationalChecks(alloc, self.aggregate.having_predicates);
-        if (self.aggregate.having_predicates.len > 0) alloc.free(self.aggregate.having_predicates);
-        freeExpressionConditions(alloc, self.aggregate.having_expressions);
-        if (self.aggregate.having_expressions.len > 0) alloc.free(self.aggregate.having_expressions);
-        freeExpressionPredicateGroups(alloc, self.aggregate.having_any);
-        if (self.aggregate.having_any.len > 0) alloc.free(self.aggregate.having_any);
-        freeExpressionPredicateGroups(alloc, self.aggregate.having_not);
-        if (self.aggregate.having_not.len > 0) alloc.free(self.aggregate.having_not);
-        freeOrderBy(alloc, self.aggregate.order_by);
-        if (self.aggregate.order_by.len > 0) alloc.free(self.aggregate.order_by);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredAggregatePlan = struct {
-    table_name: []const u8,
-    plan: db_mod.types.RelationalRowsAggregatePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        for (self.plan.ctes) |cte| {
-            alloc.free(cte.name);
-            var query = cte.query;
-            query.deinit(alloc);
-        }
-        if (self.plan.ctes.len > 0) alloc.free(self.plan.ctes);
-        self.plan.aggregate.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredJoin = struct {
-    left_table_name: []const u8,
-    right_table_name: []const u8,
-    ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    left_ranges: []const db_mod.types.RelationalRowsDocKeyRange = &.{},
-    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange = &.{},
-    join: db_mod.types.RelationalRowsJoinRequest,
-
-    pub fn asPlan(self: @This()) db_mod.types.RelationalRowsJoinPlan {
-        return .{
-            .ctes = self.ctes,
-            .left_table = self.left_table_name,
-            .right_table = self.right_table_name,
-            .left_ranges = self.left_ranges,
-            .right_ranges = self.right_ranges,
-            .join = self.join,
-        };
-    }
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.left_table_name);
-        alloc.free(self.right_table_name);
-        for (self.ctes) |cte| {
-            var owned = cte;
-            owned.deinit(alloc);
-        }
-        if (self.ctes.len > 0) alloc.free(self.ctes);
-        freeRowsDocKeyRanges(alloc, self.left_ranges);
-        freeRowsDocKeyRanges(alloc, self.right_ranges);
-        self.join.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredLateralPlan = struct {
-    left_table_name: []const u8,
-    right_table_name: []const u8,
-    plan: db_mod.types.RelationalRowsLateralPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.left_table_name);
-        alloc.free(self.right_table_name);
-        self.plan.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredReadPlan = union(enum) {
-    query: LoweredQueryPlan,
-    aggregate: LoweredAggregatePlan,
-    join: LoweredJoin,
-    lateral: LoweredLateralPlan,
-    window: LoweredWindowPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .query => |*query| query.deinit(alloc),
-            .aggregate => |*aggregate| aggregate.deinit(alloc),
-            .join => |*join| join.deinit(alloc),
-            .lateral => |*lateral| lateral.deinit(alloc),
-            .window => |*window| window.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
+pub const LoweredAggregate = sql_adapter.LoweredAggregate;
+pub const LoweredAggregatePlan = sql_adapter.LoweredAggregatePlan;
+pub const LoweredJoin = sql_adapter.LoweredJoin;
+pub const LoweredLateralPlan = sql_adapter.LoweredLateralPlan;
+pub const LoweredReadPlan = sql_adapter.LoweredReadPlan;
 
 pub const LoweredExplainPlan = struct {
     analyze: bool = false,
@@ -498,24 +336,8 @@ pub const LoweredExplainSubject = union(enum) {
 
 pub const ExplainFormat = sql_adapter.SqlExplainFormat;
 
-pub const LoweredRelationPopulationPlan = struct {
-    mode: RelationPopulationMode,
-    target_table_name: []const u8,
-    target_lifetime: ?RelationLifetimeKind = null,
-    if_not_exists: bool = false,
-    source: LoweredReadPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.target_table_name);
-        self.source.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const RelationPopulationMode = enum {
-    create_table_as,
-    select_into,
-};
+pub const LoweredRelationPopulationPlan = sql_adapter.LoweredRelationPopulationPlan;
+pub const RelationPopulationMode = sql_adapter.RelationPopulationMode;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -613,10 +435,7 @@ pub const RelationLifetimePlan = struct {
     }
 };
 
-pub const RelationLifetimeKind = enum {
-    temporary,
-    unlogged,
-};
+pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
 
 pub const EnumTypeCatalogPlan = union(enum) {
     create: CreateEnumTypePlan,
@@ -2656,26 +2475,12 @@ pub fn lowerRelationPopulationPlanWithCatalogAlloc(
     const target = try normalizeSqlObjectIdentifierAlloc(alloc, parsed.target_identifier);
     errdefer alloc.free(target);
     return .{
-        .mode = relationPopulationModeFromSyntax(parsed.mode),
+        .mode = parsed.mode,
         .target_table_name = target,
-        .target_lifetime = relationLifetimeKindFromSyntax(parsed.target_lifetime),
+        .target_lifetime = parsed.target_lifetime,
         .if_not_exists = parsed.if_not_exists,
         .source = source,
     };
-}
-
-fn relationPopulationModeFromSyntax(mode: sql_adapter.RelationPopulationMode) RelationPopulationMode {
-    return switch (mode) {
-        .create_table_as => .create_table_as,
-        .select_into => .select_into,
-    };
-}
-
-fn relationLifetimeKindFromSyntax(kind: ?sql_adapter.RelationLifetimeKind) ?RelationLifetimeKind {
-    return if (kind) |value| switch (value) {
-        .temporary => .temporary,
-        .unlogged => .unlogged,
-    } else null;
 }
 
 pub fn lowerWindowPlanAlloc(

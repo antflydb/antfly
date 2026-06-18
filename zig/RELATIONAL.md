@@ -1052,10 +1052,13 @@ option grammar, row-security grammar
 syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
 tails, and relation-population syntax parsing for `SELECT INTO` and
-`CREATE TABLE AS`; `api/sql_adapter/lower_expr.zig` owns the expression keyword,
-function-name, and tail-boundary predicates that the shared expression lowerer
-uses; `api/relational_sql.zig` keeps the public lowering entrypoints
-and maps adapter syntax into Antfly-native typed plans. Row-lock target
+`CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan
+containers and relation-population plan container that wrap Antfly-native typed
+query, aggregate, join, lateral, window, and CTE plans while preserving the
+existing public entrypoints through facade aliases; `api/sql_adapter/lower_expr.zig`
+owns the expression keyword, function-name, and tail-boundary predicates that
+the shared expression lowerer uses; `api/relational_sql.zig` keeps the public
+lowering entrypoints and maps adapter syntax into Antfly-native typed plans. Row-lock target
 validation remains in the lowerer/binder boundary because it depends on table
 aliases and catalog-normalized object names, but the SQL grammar emits only the
 native row-claim mode and wait-policy struct used by REST/SDK plans. Continue extracting the shared expression grammar,
