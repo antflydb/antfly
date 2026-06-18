@@ -1970,6 +1970,11 @@ pub const ApiHttpServer = struct {
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET or req.method == .POST or req.method == .DELETE) {
+            if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.mcp_v1_extension_profiles_prefix)) {
+                const profile = uri_parts.path[routes.Routes.mcp_v1_extension_profiles_prefix.len..];
+                if (!std.mem.eql(u8, profile, "copilot")) return try jsonErrorResponse(self.alloc, 404, "not found");
+                return try protocol_adapters.handleMcpRequest(self, req, authenticated_identity);
+            }
             if (routes.Routes.matchMcpExtension(uri_parts.path)) |mcp_extension| {
                 return try protocol_adapters.handleExtensionMcpRequest(self, req, authenticated_identity, mcp_extension.name);
             }
@@ -1998,7 +2003,11 @@ pub const ApiHttpServer = struct {
                 snapshot_opt = try self.source.adminSnapshot();
                 break :blk self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity);
             } else null;
-            const body = try ard_catalog.catalogJsonWithExtensionsAlloc(self.alloc, .{ .mode = mode }, extension_context);
+            const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
+                self.alloc,
+                self.ardCatalogOptions(mode, uri_parts.query),
+                extension_context,
+            );
             return try self.ardCatalogResponse(200, body, true);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_catalog)) {
@@ -2006,7 +2015,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                .{ .mode = .tenant },
+                self.ardCatalogOptions(.tenant, uri_parts.query),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
             return try self.ardCatalogResponse(200, body, false);
@@ -2017,7 +2026,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                .{ .mode = .tenant },
+                self.ardCatalogOptions(.tenant, ""),
                 req.body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2033,7 +2042,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                .{ .mode = .tenant },
+                self.ardCatalogOptions(.tenant, ""),
                 req.body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2049,7 +2058,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.agentsJsonWithExtensionsAlloc(
                 self.alloc,
-                .{ .mode = .tenant },
+                self.ardCatalogOptions(.tenant, uri_parts.query),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
             return try self.ardCatalogResponse(200, body, false);
@@ -2086,9 +2095,19 @@ pub const ApiHttpServer = struct {
         _ = self;
         const snapshot = snapshot_opt orelse return null;
         return .{
+            .extension_packages = snapshot.extension_packages,
             .installed_extensions = snapshot.installed_extensions,
             .extension_members = snapshot.extension_members,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
+        };
+    }
+
+    fn ardCatalogOptions(_: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8) ard_catalog.CatalogOptions {
+        return .{
+            .mode = mode,
+            .profile = parseSimpleQueryParam(query, "profile"),
+            .types = parseSimpleQueryParam(query, "types"),
+            .include = parseSimpleQueryParam(query, "include"),
         };
     }
 
@@ -10543,6 +10562,32 @@ test "api http server filters extension mcp tools by trusted principal table per
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .extension_packages = @constCast((&[_]extension_domain.PackageManifest{
+                    .{
+                        .name = "docsaf",
+                        .version = "1.0.0",
+                        .description = "Docs extension package",
+                        .digest = "sha256:docs",
+                        .capabilities_requested = &.{
+                            .{ .name = "db:read", .scope = "docsaf" },
+                            .{ .name = "db:write", .scope = "docsaf" },
+                        },
+                        .artifacts = &.{
+                            .{ .kind = .manifest, .path = "antfly-extension.json", .digest = "sha256:docs-manifest" },
+                            .{ .kind = .wasm, .path = "docsaf.wasm", .digest = "sha256:docs-wasm" },
+                        },
+                        .install = .{},
+                    },
+                    .{
+                        .name = "memoryaf",
+                        .version = "1.0.0",
+                        .description = "Memory extension package",
+                        .digest = "sha256:memories",
+                        .capabilities_requested = &.{.{ .name = "db:read", .scope = "memoryaf" }},
+                        .artifacts = &.{.{ .kind = .wasm, .path = "memoryaf.wasm", .digest = "sha256:memory-wasm" }},
+                        .install = .{},
+                    },
+                })[0..]),
                 .installed_extensions = @constCast((&[_]extension_domain.InstalledExtension{
                     .{
                         .name = "docsaf",
@@ -10664,14 +10709,28 @@ test "api http server filters extension mcp tools by trusted principal table per
     defer ard_catalog_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), ard_catalog_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-installed-extension+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension-package:docsaf:1.0.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "\"digest\":\"sha256:docs-wasm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension-package:memoryaf:1.0.0") == null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:docsaf:mcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, ard_catalog_resp.body, "urn:ai:antfly.local:antfly:extension:memoryaf:mcp") == null);
+
+    var ard_filtered_catalog_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/catalog?types=application/mcp-server+json&profile=copilot",
+        .headers = &trusted_principal_headers,
+    });
+    defer ard_filtered_catalog_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), ard_filtered_catalog_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "Antfly Copilot MCP Profile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ard_filtered_catalog_resp.body, "\"type\":\"application/antfly-extension-package+json\"") == null);
 
     var ard_search_resp = try server.handle(.{
         .method = .POST,
         .uri = routes.Routes.ard_v1_search,
         .headers = &trusted_principal_headers,
-        .body = "{\"query\":{\"filter\":{\"type\":[\"application/mcp-server+json\"]}}}",
+        .body = "{\"query\":{\"text\":\"docsaf\",\"filter\":{\"type\":[\"application/mcp-server+json\"]}}}",
     });
     defer ard_search_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), ard_search_resp.status);

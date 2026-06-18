@@ -94,6 +94,7 @@ Behavior:
 
 - Requires normal Antfly auth when auth is enabled.
 - Accepts the ARD query model: `{ "query": { "text": "...", "filter": { ... } } }`.
+- Requires non-empty `query.text`, matching ARD Search semantics. Filter-only discovery belongs on `/ard/v1/explore`.
 - Returns ranked catalog entries.
 - Supports `federation` modes when federation is implemented: `auto`, `referrals`, and `none`.
 - Uses Antfly itself to index and search generated catalog entries when practical.
@@ -103,6 +104,8 @@ This should come after the catalog builder is stable.
 ### `POST /ard/v1/explore` and `GET /ard/v1/agents`
 
 Optional later additions if clients need ARD registry parity. These correspond to optional ARD registry operations under the `/ard/v1` base URL. They should reuse the same scoped index and catalog entry serializer.
+
+`POST /ard/v1/explore` may accept a text query, a filter, both, or neither. It is the correct endpoint for deterministic inventory questions such as available media types, publishers, or capabilities.
 
 ### `GET /ard/v1/skills/{skill}`
 
@@ -210,6 +213,13 @@ MCP profile entry:
 - `metadata.profile`: profile name, for example `copilot`
 - Visible only when the profile resolves to at least one visible tool.
 
+The first concrete profile should be `copilot`. Until Antfly has profile-specific policy configuration, `copilot` should resolve through the aggregate MCP visibility policy and remain explicitly identified by both the MCP endpoint and ARD resource descriptor:
+
+```text
+/mcp/v1/extensions/profiles/copilot
+/ard/v1/resources/mcp/profiles/copilot
+```
+
 The catalog builder should reuse the same permission filtering used by MCP tool listing.
 
 ### A2A
@@ -280,12 +290,16 @@ Skills can also point to extension MCP profiles where the skill is only useful w
 
 Extension package and installed extension entries should be included only in authenticated scoped catalogs unless explicitly public.
 
+Package visibility must be derived from a visible installed extension, not from the tenant package-store inventory. A table-scoped identity that can see `docsaf` must not learn that `memoryaf` packages are present merely because both packages exist in metadata.
+
 Package entry:
 
 - `type`: `application/antfly-extension-package+json`
 - `url`: `/extensions/v1/packages/{name}/versions/{version}`
 - `metadata.digest`: package digest
 - `metadata.artifacts`: manifest/wasm/native artifact summary
+
+If strict `ai-catalog` schema validation rejects structured metadata values, Antfly should keep the package URL as the canonical artifact document and move rich digest/artifact lineage to either that package document or `trustManifest.provenance`. The catalog entry must still preserve ARD's exactly-one-of `url` or `data` rule.
 
 Installed extension entry:
 
