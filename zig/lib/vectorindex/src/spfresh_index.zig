@@ -23,6 +23,7 @@ const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
 const flat_centroid_block_metadata_stack_capacity = 256;
+const flat_centroid_query_probe_stack_capacity = 128;
 
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
@@ -832,8 +833,13 @@ pub fn selectFlatRabitqPostings(
             profile.centroid_directory_block_centroids_scored += @intCast(directory.blocks.len);
         }
 
-        var block_probes = try self.alloc.alloc(FlatCentroidProbe, directory.blocks.len);
-        defer self.alloc.free(block_probes);
+        var block_probes_stack: [flat_centroid_query_probe_stack_capacity]FlatCentroidProbe = undefined;
+        const use_block_probes_stack = directory.blocks.len <= block_probes_stack.len;
+        var block_probes = if (use_block_probes_stack)
+            block_probes_stack[0..directory.blocks.len]
+        else
+            try self.alloc.alloc(FlatCentroidProbe, directory.blocks.len);
+        defer if (!use_block_probes_stack) self.alloc.free(block_probes);
         for (0..directory.blocks.len) |block_index| {
             block_probes[block_index] = .{
                 .posting_id = @intCast(block_index),
@@ -873,10 +879,15 @@ pub fn selectFlatRabitqPostings(
     else
         0;
     var quantized_posting_candidates: []FlatCentroidProbe = &.{};
+    var quantized_posting_candidates_stack: [flat_centroid_query_probe_stack_capacity]FlatCentroidProbe = undefined;
+    const use_quantized_posting_candidates_stack = quantized_posting_candidate_limit <= quantized_posting_candidates_stack.len;
     if (quantized_posting_candidate_limit != 0) {
-        quantized_posting_candidates = try self.alloc.alloc(FlatCentroidProbe, quantized_posting_candidate_limit);
+        quantized_posting_candidates = if (use_quantized_posting_candidates_stack)
+            quantized_posting_candidates_stack[0..quantized_posting_candidate_limit]
+        else
+            try self.alloc.alloc(FlatCentroidProbe, quantized_posting_candidate_limit);
     }
-    defer if (quantized_posting_candidate_limit != 0) self.alloc.free(quantized_posting_candidates);
+    defer if (quantized_posting_candidate_limit != 0 and !use_quantized_posting_candidates_stack) self.alloc.free(quantized_posting_candidates);
 
     for (selected_blocks) |block_index| {
         const block = &directory.blocks[block_index];
