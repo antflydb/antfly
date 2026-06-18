@@ -4658,6 +4658,12 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     if (!try lakeRowsRelationalChecksPassAlloc(alloc, row, request.predicates)) return false;
     if (!try lakeRowsPredicateGroupsPassAlloc(alloc, row, request.or_predicates)) return false;
     if (!try lakeRowsNotPredicateGroupsPassAlloc(alloc, row, request.not_predicates)) return false;
+    for (request.in_predicates) |predicate| {
+        if (!try lakeRowsInPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
+    for (request.text_patterns) |predicate| {
+        if (!try lakeRowsTextPatternPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
     for (request.expression_predicates) |condition| {
         if (!try lakeRowsExpressionConditionMatchesAlloc(alloc, row, condition)) return false;
     }
@@ -4680,9 +4686,6 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     for (request.array_eq) |predicate| {
         if (!try queryArrayEqPredicatePasses(alloc, parsed.value, predicate)) return false;
     }
-    for (request.in_predicates) |predicate| {
-        if (!try queryInPredicatePasses(alloc, parsed.value, predicate)) return false;
-    }
     for (request.json_contains) |predicate| {
         if (!try queryJsonContainsPredicatePasses(alloc, parsed.value, predicate)) return false;
     }
@@ -4691,9 +4694,6 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     }
     for (request.json_path_exists) |predicate| {
         if (!queryJsonPathExistsPredicatePasses(parsed.value, predicate)) return false;
-    }
-    for (request.text_patterns) |predicate| {
-        if (!queryTextPatternPredicatePasses(parsed.value, predicate)) return false;
     }
     for (request.expression_array_contains) |predicate| {
         if (!try queryExpressionArrayContainsPredicatePasses(alloc, parsed.value, predicate)) return false;
@@ -4707,11 +4707,9 @@ fn lakeRowsQueryResidualNeedsJson(request: OwnedRowsQueryRequest) bool {
         request.array_any.len != 0 or
         request.array_contains.len != 0 or
         request.array_eq.len != 0 or
-        request.in_predicates.len != 0 or
         request.json_contains.len != 0 or
         request.json_path_eq.len != 0 or
         request.json_path_exists.len != 0 or
-        request.text_patterns.len != 0 or
         request.expression_array_contains.len != 0;
 }
 

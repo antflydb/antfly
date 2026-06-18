@@ -17466,6 +17466,46 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 1), group_query_result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":30}", group_query_result.rows[0]);
 
+    const in_predicates = [_]db_mod.types.RelationalRowsInPredicate{.{
+        .field = "amount",
+        .values_json = "[30]",
+    }};
+    var in_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .in_predicates = in_predicates[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer in_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), in_query_result.total);
+    try std.testing.expectEqual(@as(usize, 1), in_query_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", in_query_result.rows[0]);
+
+    const text_patterns = [_]db_mod.types.RelationalRowsTextPatternPredicate{.{
+        .field = "tenant",
+        .pattern = "T_",
+        .case_insensitive = true,
+    }};
+    var text_pattern_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .text_patterns = text_patterns[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer text_pattern_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 6), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), text_pattern_query_result.total);
+    try std.testing.expectEqual(@as(usize, 2), text_pattern_query_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":20}", text_pattern_query_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"amount\":30}", text_pattern_query_result.rows[1]);
+
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17477,7 +17517,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 5), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 7), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
