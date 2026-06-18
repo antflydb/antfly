@@ -1109,6 +1109,7 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(Equal(http.StatusConflict))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("status 409"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("slot conflict"))
 
@@ -1123,6 +1124,68 @@ func TestReconcileHAAdminJobsMarksDirectAPIFailure(t *testing.T) {
 	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminJobFailed))
 	g.Expect(degraded.Message).To(ContainSubstring(haAdminDirectAPIName))
 	g.Expect(degraded.Message).To(ContainSubstring("status 409"))
+}
+
+func TestReconcileHAAdminJobsReportsUnauthorizedDirectAPIFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionCreateSlot),
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "create", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
+				}},
+			},
+		},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/replication-slots"))
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader("missing bearer token")),
+			}, nil
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	action := cluster.Status.HAStatus.PlannedActions[0]
+	g.Expect(action.AdminJobName).To(Equal(haAdminDirectAPIName))
+	g.Expect(action.AdminJobPhase).To(Equal(haAdminJobPhaseFailed))
+	g.Expect(action.AdminStatusCode).To(Equal(http.StatusUnauthorized))
+	g.Expect(action.AdminError).To(ContainSubstring("status 401"))
+	g.Expect(action.AdminError).To(ContainSubstring("missing bearer token"))
+
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminUnauthorized))
+	g.Expect(degraded.Message).To(ContainSubstring(haAdminDirectAPIName))
+	g.Expect(degraded.Message).To(ContainSubstring("status 401"))
 }
 
 func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
@@ -1182,6 +1245,7 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(Equal(http.StatusServiceUnavailable))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("status 503"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("primary restarting"))
 	reconciler.updateHAAdminJobExecutionCondition(cluster)
@@ -1195,6 +1259,7 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g.Expect(requests).To(Equal(2))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminStatusCode).To(BeZero())
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult).NotTo(BeNil())
 
 	var jobs batchv1.JobList

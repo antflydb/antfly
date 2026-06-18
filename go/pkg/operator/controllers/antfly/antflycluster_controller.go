@@ -3559,9 +3559,15 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 					action.AdminJobPhase = haAdminJobPhaseFailed
 				}
 				action.AdminError = err.Error()
+				if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+					action.AdminStatusCode = statusCode
+				} else {
+					action.AdminStatusCode = 0
+				}
 			} else {
 				action.AdminJobPhase = haAdminJobPhaseSucceeded
 				action.AdminError = ""
+				action.AdminStatusCode = 0
 			}
 			continue
 		}
@@ -7400,11 +7406,15 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		if strings.TrimSpace(action.AdminError) != "" {
 			message = fmt.Sprintf("%s: %s", message, strings.TrimSpace(action.AdminError))
 		}
+		reason := antflyv1.ReasonHAAdminJobFailed
+		if action.AdminStatusCode == http.StatusUnauthorized {
+			reason = antflyv1.ReasonHAAdminUnauthorized
+		}
 		setHACondition(
 			cluster,
 			antflyv1.TypeHADegraded,
 			metav1.ConditionTrue,
-			antflyv1.ReasonHAAdminJobFailed,
+			reason,
 			message,
 		)
 		return

@@ -224,6 +224,9 @@ const (
 	// ReasonHAAdminJobFailed indicates an HA admin execution failed.
 	ReasonHAAdminJobFailed = "HAAdminJobFailed"
 
+	// ReasonHAAdminUnauthorized indicates an HA admin execution was rejected by authentication.
+	ReasonHAAdminUnauthorized = "HAAdminUnauthorized"
+
 	// ReasonHAAdminActionRetrying indicates an HA admin action hit a retryable error and will be retried.
 	ReasonHAAdminActionRetrying = "HAAdminActionRetrying"
 
@@ -1746,6 +1749,10 @@ type HAPlannedActionStatus struct {
 	// AdminError records the latest direct /admin/v1 HA execution or result-validation error for this action.
 	// +optional
 	AdminError string `json:"adminError,omitempty"`
+
+	// AdminStatusCode records the latest typed /admin/v1 HA HTTP status code for this action.
+	// +optional
+	AdminStatusCode int `json:"adminStatusCode,omitempty"`
 
 	Reason string `json:"reason,omitempty"`
 }

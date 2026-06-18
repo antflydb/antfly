@@ -9177,6 +9177,10 @@ spec:
                               format: int64
                               type: integer
                           type: object
+                        adminStatusCode:
+                          description: AdminStatusCode records the latest typed /admin/v1
+                            HA HTTP status code for this action.
+                          type: integer
                         adminURL:
                           description: AdminURL is the HA admin endpoint for typed
                             /admin/v1/ha execution or CLI-backed job targeting.

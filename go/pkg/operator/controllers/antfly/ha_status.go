@@ -778,6 +778,7 @@ func haPreservePlannedActionExecution(action antflyv1.HAPlannedActionStatus, sta
 		action.AdminJobName = previous.AdminJobName
 		action.AdminJobPhase = previous.AdminJobPhase
 		action.AdminError = previous.AdminError
+		action.AdminStatusCode = previous.AdminStatusCode
 		if previous.AdminResult != nil {
 			action.AdminResult = previous.AdminResult.DeepCopy()
 		}
