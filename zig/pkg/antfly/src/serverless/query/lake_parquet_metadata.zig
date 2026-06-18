@@ -306,7 +306,9 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     var previous_field_id: i16 = 0;
     var version: ?i32 = null;
     var row_count: ?u64 = null;
+    var schema_columns: ?[]SchemaColumn = null;
     var row_groups: ?[]external_source.RowGroup = null;
+    errdefer if (schema_columns) |columns| freeSchemaColumns(alloc, columns);
     errdefer if (row_groups) |groups| {
         for (groups) |*group| group.deinit(alloc);
         alloc.free(groups);
@@ -315,6 +317,7 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
             1 => version = try reader.readRequiredI32(field.type),
+            2 => schema_columns = try parseSchemaColumnsAlloc(alloc, reader, field.type),
             3 => row_count = try reader.readRequiredU64(field.type),
             4 => {
                 if (field.type != .list) return error.InvalidParquetMetadata;
@@ -327,6 +330,11 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     const got_version = version orelse return error.InvalidParquetMetadata;
     const got_row_count = row_count orelse return error.InvalidParquetMetadata;
     const got_row_groups = row_groups orelse return error.InvalidParquetMetadata;
+    if (schema_columns) |columns| {
+        try applySchemaNullability(got_row_groups, columns);
+        freeSchemaColumns(alloc, columns);
+        schema_columns = null;
+    }
 
     var total_rows: u64 = 0;
     for (got_row_groups) |group| total_rows += group.row_count;
@@ -338,6 +346,169 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
         .row_count = got_row_count,
         .row_groups = got_row_groups,
     };
+}
+
+const SchemaElement = struct {
+    name: []u8,
+    repetition_type: ?i32 = null,
+    child_count: u32 = 0,
+
+    fn deinit(self: *SchemaElement, alloc: Allocator) void {
+        if (self.name.len > 0) alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const SchemaColumn = struct {
+    column_id: []u8,
+    nullable: bool,
+
+    fn deinit(self: *SchemaColumn, alloc: Allocator) void {
+        if (self.column_id.len > 0) alloc.free(self.column_id);
+        self.* = undefined;
+    }
+};
+
+fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]SchemaColumn {
+    if (field_type != .list) return error.InvalidParquetMetadata;
+    const list = try reader.readListHeader();
+    if (list.elem_type != .struct_) return error.InvalidParquetMetadata;
+    if (list.len == 0) return error.InvalidParquetMetadata;
+
+    const elements = try alloc.alloc(SchemaElement, list.len);
+    errdefer alloc.free(elements);
+    var initialized: usize = 0;
+    errdefer {
+        for (elements[0..initialized]) |*element| element.deinit(alloc);
+    }
+    for (elements) |*element| {
+        element.* = try parseSchemaElement(alloc, reader);
+        initialized += 1;
+    }
+
+    var columns = std.ArrayListUnmanaged(SchemaColumn).empty;
+    errdefer {
+        for (columns.items) |*column| column.deinit(alloc);
+        columns.deinit(alloc);
+    }
+
+    var path = std.ArrayListUnmanaged([]const u8).empty;
+    defer path.deinit(alloc);
+    var cursor: usize = 1;
+    try collectSchemaColumnsAlloc(alloc, elements, &cursor, elements[0].child_count, false, &path, &columns);
+    if (cursor != elements.len) return error.InvalidParquetMetadata;
+
+    for (elements) |*element| element.deinit(alloc);
+    alloc.free(elements);
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
+    var previous_field_id: i16 = 0;
+    var name: ?[]u8 = null;
+    var repetition_type: ?i32 = null;
+    var child_count: u32 = 0;
+    errdefer if (name) |value| alloc.free(value);
+
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        switch (field.id) {
+            3 => repetition_type = try reader.readRequiredI32(field.type),
+            4 => {
+                if (field.type != .binary) return error.InvalidParquetMetadata;
+                name = try reader.readBinaryAlloc(alloc);
+            },
+            5 => child_count = @intCast(try reader.readRequiredI32NonNegative(field.type)),
+            else => try reader.skip(field.type),
+        }
+    }
+
+    const got_name = name orelse return error.InvalidParquetMetadata;
+    if (got_name.len == 0) return error.InvalidParquetMetadata;
+    name = null;
+    return .{
+        .name = got_name,
+        .repetition_type = repetition_type,
+        .child_count = child_count,
+    };
+}
+
+fn collectSchemaColumnsAlloc(
+    alloc: Allocator,
+    elements: []const SchemaElement,
+    cursor: *usize,
+    child_count: u32,
+    inherited_nullable: bool,
+    path: *std.ArrayListUnmanaged([]const u8),
+    columns: *std.ArrayListUnmanaged(SchemaColumn),
+) !void {
+    for (0..child_count) |_| {
+        if (cursor.* >= elements.len) return error.InvalidParquetMetadata;
+        const element = elements[cursor.*];
+        cursor.* += 1;
+
+        const element_nullable = inherited_nullable or isNullableRepetition(element.repetition_type);
+        try path.append(alloc, element.name);
+        defer _ = path.pop();
+
+        if (element.child_count == 0) {
+            const column_id = try joinSchemaPathAlloc(alloc, path.items);
+            errdefer alloc.free(column_id);
+            try columns.append(alloc, .{
+                .column_id = column_id,
+                .nullable = element_nullable,
+            });
+        } else {
+            try collectSchemaColumnsAlloc(alloc, elements, cursor, element.child_count, element_nullable, path, columns);
+        }
+    }
+}
+
+fn isNullableRepetition(repetition_type: ?i32) bool {
+    return switch (repetition_type orelse 0) {
+        1, 2 => true,
+        else => false,
+    };
+}
+
+fn joinSchemaPathAlloc(alloc: Allocator, parts: []const []const u8) ![]u8 {
+    if (parts.len == 0) return error.InvalidParquetMetadata;
+    var total_len: usize = parts.len - 1;
+    for (parts) |part| {
+        if (part.len == 0) return error.InvalidParquetMetadata;
+        total_len += part.len;
+    }
+    const out = try alloc.alloc(u8, total_len);
+    var cursor: usize = 0;
+    for (parts, 0..) |part, idx| {
+        if (idx != 0) {
+            out[cursor] = '.';
+            cursor += 1;
+        }
+        @memcpy(out[cursor .. cursor + part.len], part);
+        cursor += part.len;
+    }
+    return out;
+}
+
+fn applySchemaNullability(row_groups: []external_source.RowGroup, columns: []const SchemaColumn) !void {
+    for (row_groups) |*row_group| {
+        for (row_group.column_chunks) |*chunk| {
+            const schema_column = schemaColumnForId(columns, chunk.column_id) orelse return error.InvalidParquetMetadata;
+            chunk.nullable = schema_column.nullable;
+        }
+    }
+}
+
+fn schemaColumnForId(columns: []const SchemaColumn, column_id: []const u8) ?SchemaColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.column_id, column_id)) return column;
+    }
+    return null;
+}
+
+fn freeSchemaColumns(alloc: Allocator, columns: []SchemaColumn) void {
+    for (columns) |*column| column.deinit(alloc);
+    alloc.free(columns);
 }
 
 fn parseRowGroupList(alloc: Allocator, reader: *Reader, file_len: u64) ![]external_source.RowGroup {
@@ -648,6 +819,12 @@ const Reader = struct {
         return try self.readI32();
     }
 
+    fn readRequiredI32NonNegative(self: *Reader, field_type: CompactType) !i32 {
+        const value = try self.readRequiredI32(field_type);
+        if (value < 0) return error.InvalidParquetMetadata;
+        return value;
+    }
+
     fn readRequiredU64(self: *Reader, field_type: CompactType) !u64 {
         if (field_type != .i64) return error.InvalidParquetMetadata;
         const value = try self.readI64();
@@ -822,6 +999,26 @@ test "parquet metadata parser extracts row groups and column chunks" {
     try std.testing.expectEqual(@as(u64, 40), footer.row_groups[0].column_chunks[0].compressed_len);
 }
 
+test "parquet metadata parser derives nullable columns from schema repetition" {
+    const alloc = std.testing.allocator;
+    var bytes = try buildSingleColumnMetadataFixtureWithSchema(alloc, true);
+    defer bytes.deinit(alloc);
+
+    var footer = try parseFooterMetadataAlloc(alloc, bytes.items, 1024);
+    defer footer.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), footer.row_groups.len);
+    try std.testing.expectEqual(@as(usize, 1), footer.row_groups[0].column_chunks.len);
+    try std.testing.expectEqualStrings("amount", footer.row_groups[0].column_chunks[0].column_id);
+    try std.testing.expect(footer.row_groups[0].column_chunks[0].nullable);
+
+    var required_bytes = try buildSingleColumnMetadataFixtureWithSchema(alloc, false);
+    defer required_bytes.deinit(alloc);
+    var required_footer = try parseFooterMetadataAlloc(alloc, required_bytes.items, 1024);
+    defer required_footer.deinit(alloc);
+    try std.testing.expect(!required_footer.row_groups[0].column_chunks[0].nullable);
+}
+
 test "parquet metadata parser rejects inconsistent row counts and ranges" {
     const alloc = std.testing.allocator;
     var bytes = try buildSingleColumnMetadataFixture(alloc);
@@ -950,6 +1147,85 @@ fn buildSingleColumnMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8
     var file_prev: i16 = 0;
     try appendField(&out, alloc, &file_prev, 1, .i32);
     try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &file_prev, 3, .i64);
+    try appendI64(&out, alloc, 2);
+    try appendField(&out, alloc, &file_prev, 4, .list);
+    try appendListHeader(&out, alloc, .struct_, 1);
+
+    var rg_prev: i16 = 0;
+    try appendField(&out, alloc, &rg_prev, 1, .list);
+    try appendListHeader(&out, alloc, .struct_, 1);
+
+    var chunk_prev: i16 = 0;
+    try appendField(&out, alloc, &chunk_prev, 2, .i64);
+    try appendI64(&out, alloc, 100);
+    try appendField(&out, alloc, &chunk_prev, 3, .struct_);
+
+    var meta_prev: i16 = 0;
+    try appendField(&out, alloc, &meta_prev, 1, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &meta_prev, 2, .list);
+    try appendListHeader(&out, alloc, .i32, 1);
+    try appendI32(&out, alloc, 0);
+    try appendField(&out, alloc, &meta_prev, 3, .list);
+    try appendListHeader(&out, alloc, .binary, 1);
+    try appendBinary(&out, alloc, "amount");
+    try appendField(&out, alloc, &meta_prev, 4, .i32);
+    try appendI32(&out, alloc, 6);
+    try appendField(&out, alloc, &meta_prev, 5, .i64);
+    try appendI64(&out, alloc, 2);
+    try appendField(&out, alloc, &meta_prev, 6, .i64);
+    try appendI64(&out, alloc, 80);
+    try appendField(&out, alloc, &meta_prev, 7, .i64);
+    try appendI64(&out, alloc, 40);
+    try appendField(&out, alloc, &meta_prev, 9, .i64);
+    try appendI64(&out, alloc, 120);
+    try appendField(&out, alloc, &meta_prev, 11, .i64);
+    try appendI64(&out, alloc, 100);
+    try appendStop(&out, alloc);
+
+    try appendStop(&out, alloc);
+
+    try appendField(&out, alloc, &rg_prev, 2, .i64);
+    try appendI64(&out, alloc, 80);
+    try appendField(&out, alloc, &rg_prev, 3, .i64);
+    try appendI64(&out, alloc, 2);
+    try appendField(&out, alloc, &rg_prev, 5, .i64);
+    try appendI64(&out, alloc, 100);
+    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendI64(&out, alloc, 0);
+    try appendStop(&out, alloc);
+
+    try appendStop(&out, alloc);
+    return out;
+}
+
+fn buildSingleColumnMetadataFixtureWithSchema(alloc: Allocator, nullable: bool) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var file_prev: i16 = 0;
+    try appendField(&out, alloc, &file_prev, 1, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &file_prev, 2, .list);
+    try appendListHeader(&out, alloc, .struct_, 2);
+
+    var root_prev: i16 = 0;
+    try appendField(&out, alloc, &root_prev, 4, .binary);
+    try appendBinary(&out, alloc, "schema");
+    try appendField(&out, alloc, &root_prev, 5, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendStop(&out, alloc);
+
+    var leaf_prev: i16 = 0;
+    try appendField(&out, alloc, &leaf_prev, 1, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &leaf_prev, 3, .i32);
+    try appendI32(&out, alloc, if (nullable) 1 else 0);
+    try appendField(&out, alloc, &leaf_prev, 4, .binary);
+    try appendBinary(&out, alloc, "amount");
+    try appendStop(&out, alloc);
+
     try appendField(&out, alloc, &file_prev, 3, .i64);
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &file_prev, 4, .list);

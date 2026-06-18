@@ -1073,7 +1073,9 @@ normalization, owned identifier/list parsing, adapter-noop grammar tails,
 syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
 tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
-direction/count tails, prepared-statement subject classification for read, write, and DDL
+direction/count tails, transaction-control grammar for `LOCK TABLE`,
+`SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
+mode clauses, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -4350,12 +4352,14 @@ storage. The production shape is a durable maintenance-job model with
 table/index generations, range ownership, leases, throttling, resumable
 progress, repair/rebuild integration, stats output, and catalog promotion
 semantics. `LOCK TABLE`, `SET CONSTRAINTS`, `SET TRANSACTION`, `START
-TRANSACTION ... ISOLATION LEVEL ...`, `BEGIN ... ISOLATION LEVEL ...`, and
-`pg_advisory_lock` / `pg_advisory_unlock` calls lower to typed
-transaction-control intents that capture table-lock mode, constraint
-scope/check mode, transaction starter, isolation level, read-only/read-write
-mode, deferrability, advisory-lock action, and advisory key values, then fail
-closed when applied to table schema or runtime storage. The production shape is
+TRANSACTION ... ISOLATION LEVEL ...`, and `BEGIN ... ISOLATION LEVEL ...`
+clauses parse in `api/sql_adapter/grammar.zig` before the lowerer allocates
+typed transaction-control intents that capture normalized table and constraint
+names, table-lock mode, constraint scope/check mode, transaction starter,
+isolation level, read-only/read-write mode, and deferrability. `pg_advisory_lock`
+and `pg_advisory_unlock` calls also lower to typed transaction-control intents
+with advisory-lock action and advisory key values. All of these fail closed when
+applied to table schema or runtime storage. The production shape is
 a native table/range/advisory lock barrier that composes with row claims,
 catalog epochs, range movement, and 2PC, plus transaction-scoped deferrable
 constraint state and request-level isolation/access/retry options. Plain

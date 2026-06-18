@@ -2659,6 +2659,58 @@ fn preparedStatementSubjectKindFromSyntax(syntax: sql_adapter.PreparedStatementS
     };
 }
 
+fn tableLockModeFromSyntax(syntax: sql_adapter.TableLockModeSyntax) TableLockMode {
+    return switch (syntax) {
+        .access_share => .access_share,
+        .row_share => .row_share,
+        .row_exclusive => .row_exclusive,
+        .share_update_exclusive => .share_update_exclusive,
+        .share => .share,
+        .share_row_exclusive => .share_row_exclusive,
+        .exclusive => .exclusive,
+        .access_exclusive => .access_exclusive,
+    };
+}
+
+fn constraintCheckModeFromSyntax(syntax: sql_adapter.ConstraintCheckModeSyntax) ConstraintCheckMode {
+    return switch (syntax) {
+        .immediate => .immediate,
+        .deferred => .deferred,
+    };
+}
+
+fn transactionModeStarterToSyntax(starter: TransactionModeStarter) sql_adapter.TransactionModeStarterSyntax {
+    return switch (starter) {
+        .set_transaction => .set_transaction,
+        .start_transaction => .start_transaction,
+        .begin => .begin,
+    };
+}
+
+fn transactionModeStarterFromSyntax(syntax: sql_adapter.TransactionModeStarterSyntax) TransactionModeStarter {
+    return switch (syntax) {
+        .set_transaction => .set_transaction,
+        .start_transaction => .start_transaction,
+        .begin => .begin,
+    };
+}
+
+fn transactionIsolationLevelFromSyntax(syntax: ?sql_adapter.TransactionIsolationLevelSyntax) ?TransactionIsolationLevel {
+    return switch (syntax orelse return null) {
+        .serializable => .serializable,
+        .repeatable_read => .repeatable_read,
+        .read_committed => .read_committed,
+        .read_uncommitted => .read_uncommitted,
+    };
+}
+
+fn transactionAccessModeFromSyntax(syntax: ?sql_adapter.TransactionAccessModeSyntax) ?TransactionAccessMode {
+    return switch (syntax orelse return null) {
+        .read_only => .read_only,
+        .read_write => .read_write,
+    };
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3969,149 +4021,36 @@ const Parser = struct {
     }
 
     fn parseTableLockDdl(self: *@This()) !TableLockPlan {
-        _ = self.matchKeyword("table");
-        var table_names = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (table_names.items) |table_name| self.alloc.free(table_name);
-            table_names.deinit(self.alloc);
-        }
-        while (true) {
-            const table_name = try self.parseSqlObjectIdentifierOwned();
-            var table_transferred = false;
-            errdefer if (!table_transferred) self.alloc.free(table_name);
-            try table_names.append(self.alloc, table_name);
-            table_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (table_names.items.len == 0) return error.UnsupportedSqlShape;
-        try self.expectKeyword("in");
-        const mode = try self.parseTableLockModeDdl();
-        try self.expectKeyword("mode");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseTableLockTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const table_names = syntax.table_names;
+        syntax.table_names = &.{};
         return .{
-            .table_names = try table_names.toOwnedSlice(self.alloc),
-            .mode = mode,
+            .table_names = table_names,
+            .mode = tableLockModeFromSyntax(syntax.mode),
         };
     }
 
-    fn parseTableLockModeDdl(self: *@This()) !TableLockMode {
-        if (self.matchKeyword("access")) {
-            if (self.matchKeyword("share")) return .access_share;
-            if (self.matchKeyword("exclusive")) return .access_exclusive;
-            return error.UnsupportedSqlShape;
-        }
-        if (self.matchKeyword("row")) {
-            if (self.matchKeyword("share")) return .row_share;
-            if (self.matchKeyword("exclusive")) return .row_exclusive;
-            return error.UnsupportedSqlShape;
-        }
-        if (self.matchKeyword("share")) {
-            if (self.matchKeyword("update")) {
-                try self.expectKeyword("exclusive");
-                return .share_update_exclusive;
-            }
-            if (self.matchKeyword("row")) {
-                try self.expectKeyword("exclusive");
-                return .share_row_exclusive;
-            }
-            return .share;
-        }
-        if (self.matchKeyword("exclusive")) return .exclusive;
-        return error.UnsupportedSqlShape;
-    }
-
     fn parseConstraintModeDdl(self: *@This()) !ConstraintModePlan {
-        try self.expectKeyword("constraints");
-        var all = false;
-        var constraint_names = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (constraint_names.items) |constraint_name| self.alloc.free(constraint_name);
-            constraint_names.deinit(self.alloc);
-        }
-        if (self.matchKeyword("all")) {
-            all = true;
-        } else {
-            while (true) {
-                const constraint_name = try self.parseSqlObjectIdentifierOwned();
-                var constraint_transferred = false;
-                errdefer if (!constraint_transferred) self.alloc.free(constraint_name);
-                try constraint_names.append(self.alloc, constraint_name);
-                constraint_transferred = true;
-                if (self.match(.comma) == null) break;
-            }
-        }
-        const mode: ConstraintCheckMode = if (self.matchKeyword("immediate"))
-            .immediate
-        else if (self.matchKeyword("deferred"))
-            .deferred
-        else
-            return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseConstraintModeTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const constraint_names = syntax.constraint_names;
+        syntax.constraint_names = &.{};
         return .{
-            .all = all,
-            .constraint_names = try constraint_names.toOwnedSlice(self.alloc),
-            .mode = mode,
+            .all = syntax.all,
+            .constraint_names = constraint_names,
+            .mode = constraintCheckModeFromSyntax(syntax.mode),
         };
     }
 
     fn parseTransactionModeDdl(self: *@This(), starter: TransactionModeStarter) !TransactionModePlan {
-        switch (starter) {
-            .set_transaction, .start_transaction => try self.expectKeyword("transaction"),
-            .begin => _ = self.matchKeyword("transaction"),
-        }
-        var plan: TransactionModePlan = .{ .starter = starter };
-        var saw_mode = false;
-        while (!self.atEnd()) {
-            if (self.match(.semicolon) != null) {
-                if (!self.atEnd()) return error.UnsupportedSqlShape;
-                break;
-            }
-            _ = self.match(.comma);
-            if (self.matchKeyword("isolation")) {
-                try self.expectKeyword("level");
-                if (plan.isolation_level != null) return error.UnsupportedSqlShape;
-                plan.isolation_level = try self.parseTransactionIsolationLevelDdl();
-                saw_mode = true;
-            } else if (self.matchKeyword("read")) {
-                if (plan.access_mode != null) return error.UnsupportedSqlShape;
-                if (self.matchKeyword("only")) {
-                    plan.access_mode = .read_only;
-                } else if (self.matchKeyword("write")) {
-                    plan.access_mode = .read_write;
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
-                saw_mode = true;
-            } else if (self.matchKeyword("not")) {
-                try self.expectKeyword("deferrable");
-                if (plan.deferrable != null) return error.UnsupportedSqlShape;
-                plan.deferrable = false;
-                saw_mode = true;
-            } else if (self.matchKeyword("deferrable")) {
-                if (plan.deferrable != null) return error.UnsupportedSqlShape;
-                plan.deferrable = true;
-                saw_mode = true;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        }
-        if (!saw_mode) return error.UnsupportedSqlShape;
-        return plan;
-    }
-
-    fn parseTransactionIsolationLevelDdl(self: *@This()) !TransactionIsolationLevel {
-        if (self.matchKeyword("serializable")) return .serializable;
-        if (self.matchKeyword("repeatable")) {
-            try self.expectKeyword("read");
-            return .repeatable_read;
-        }
-        if (self.matchKeyword("read")) {
-            if (self.matchKeyword("committed")) return .read_committed;
-            if (self.matchKeyword("uncommitted")) return .read_uncommitted;
-        }
-        return error.UnsupportedSqlShape;
+        const syntax = try sql_adapter.parseTransactionModeTail(self.tokens, &self.pos, transactionModeStarterToSyntax(starter));
+        return .{
+            .starter = transactionModeStarterFromSyntax(syntax.starter),
+            .isolation_level = transactionIsolationLevelFromSyntax(syntax.isolation_level),
+            .access_mode = transactionAccessModeFromSyntax(syntax.access_mode),
+            .deferrable = syntax.deferrable,
+        };
     }
 
     fn parseAdvisoryLockDdl(self: *@This()) !AdvisoryLockPlan {

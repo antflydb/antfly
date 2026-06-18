@@ -53,6 +53,68 @@ pub const ExecutePreparedStatementSyntax = struct {
     argument_count: usize = 0,
 };
 
+pub const TableLockModeSyntax = enum {
+    access_share,
+    row_share,
+    row_exclusive,
+    share_update_exclusive,
+    share,
+    share_row_exclusive,
+    exclusive,
+    access_exclusive,
+};
+
+pub const TableLockSyntax = struct {
+    table_names: []const []const u8 = &.{},
+    mode: TableLockModeSyntax,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.table_names);
+        self.* = undefined;
+    }
+};
+
+pub const ConstraintCheckModeSyntax = enum {
+    immediate,
+    deferred,
+};
+
+pub const ConstraintModeSyntax = struct {
+    all: bool = false,
+    constraint_names: []const []const u8 = &.{},
+    mode: ConstraintCheckModeSyntax,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.constraint_names);
+        self.* = undefined;
+    }
+};
+
+pub const TransactionModeStarterSyntax = enum {
+    set_transaction,
+    start_transaction,
+    begin,
+};
+
+pub const TransactionIsolationLevelSyntax = enum {
+    serializable,
+    repeatable_read,
+    read_committed,
+    read_uncommitted,
+};
+
+pub const TransactionAccessModeSyntax = enum {
+    read_only,
+    read_write,
+};
+
+pub const TransactionModeSyntax = struct {
+    starter: TransactionModeStarterSyntax,
+    isolation_level: ?TransactionIsolationLevelSyntax = null,
+    access_mode: ?TransactionAccessModeSyntax = null,
+    deferrable: ?bool = null,
+};
+
 pub const RowClaimSyntax = struct {
     clause: ast.SqlRowClaimClause,
     targets: []const []const u8 = &.{},
@@ -493,6 +555,120 @@ pub fn parseCloseCursorPortalTail(tokens: []const Token, pos: *usize) !NamedOrAl
     return try parseNamedOrAllTail(cursor);
 }
 
+pub fn parseTableLockTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TableLockSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    _ = cursor.matchKeyword("table");
+    var table_names = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &table_names);
+    while (true) {
+        const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+        var table_transferred = false;
+        errdefer if (!table_transferred) alloc.free(table_name);
+        try table_names.append(alloc, table_name);
+        table_transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    if (table_names.items.len == 0) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("in");
+    const mode = try parseTableLockMode(cursor);
+    try cursor.expectKeyword("mode");
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .table_names = try table_names.toOwnedSlice(alloc),
+        .mode = mode,
+    };
+}
+
+pub fn parseConstraintModeTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !ConstraintModeSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("constraints");
+    var all = false;
+    var constraint_names = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &constraint_names);
+    if (cursor.matchKeyword("all")) {
+        all = true;
+    } else {
+        while (true) {
+            const constraint_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+            var constraint_transferred = false;
+            errdefer if (!constraint_transferred) alloc.free(constraint_name);
+            try constraint_names.append(alloc, constraint_name);
+            constraint_transferred = true;
+            if (cursor.matchToken(.comma) == null) break;
+        }
+    }
+    const mode: ConstraintCheckModeSyntax = if (cursor.matchKeyword("immediate"))
+        .immediate
+    else if (cursor.matchKeyword("deferred"))
+        .deferred
+    else
+        return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .all = all,
+        .constraint_names = try constraint_names.toOwnedSlice(alloc),
+        .mode = mode,
+    };
+}
+
+pub fn parseTransactionModeTail(
+    tokens: []const Token,
+    pos: *usize,
+    starter: TransactionModeStarterSyntax,
+) !TransactionModeSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    switch (starter) {
+        .set_transaction, .start_transaction => try cursor.expectKeyword("transaction"),
+        .begin => _ = cursor.matchKeyword("transaction"),
+    }
+    var syntax = TransactionModeSyntax{ .starter = starter };
+    var saw_mode = false;
+    while (!cursor.atEnd()) {
+        if (cursor.matchToken(.semicolon) != null) {
+            if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+            break;
+        }
+        _ = cursor.matchToken(.comma);
+        if (cursor.matchKeyword("isolation")) {
+            try cursor.expectKeyword("level");
+            if (syntax.isolation_level != null) return error.UnsupportedSqlShape;
+            syntax.isolation_level = try parseTransactionIsolationLevel(cursor);
+            saw_mode = true;
+        } else if (cursor.matchKeyword("read")) {
+            if (syntax.access_mode != null) return error.UnsupportedSqlShape;
+            if (cursor.matchKeyword("only")) {
+                syntax.access_mode = .read_only;
+            } else if (cursor.matchKeyword("write")) {
+                syntax.access_mode = .read_write;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+            saw_mode = true;
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("deferrable");
+            if (syntax.deferrable != null) return error.UnsupportedSqlShape;
+            syntax.deferrable = false;
+            saw_mode = true;
+        } else if (cursor.matchKeyword("deferrable")) {
+            if (syntax.deferrable != null) return error.UnsupportedSqlShape;
+            syntax.deferrable = true;
+            saw_mode = true;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    if (!saw_mode) return error.UnsupportedSqlShape;
+    return syntax;
+}
+
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
     if (dot == 0) return error.UnsupportedSqlShape;
@@ -611,6 +787,45 @@ fn parseNamedOrAllTail(cursor: parser.Cursor) !NamedOrAllSyntax {
     return .{ .name = name.text };
 }
 
+fn parseTableLockMode(cursor: parser.Cursor) !TableLockModeSyntax {
+    if (cursor.matchKeyword("access")) {
+        if (cursor.matchKeyword("share")) return .access_share;
+        if (cursor.matchKeyword("exclusive")) return .access_exclusive;
+        return error.UnsupportedSqlShape;
+    }
+    if (cursor.matchKeyword("row")) {
+        if (cursor.matchKeyword("share")) return .row_share;
+        if (cursor.matchKeyword("exclusive")) return .row_exclusive;
+        return error.UnsupportedSqlShape;
+    }
+    if (cursor.matchKeyword("share")) {
+        if (cursor.matchKeyword("update")) {
+            try cursor.expectKeyword("exclusive");
+            return .share_update_exclusive;
+        }
+        if (cursor.matchKeyword("row")) {
+            try cursor.expectKeyword("exclusive");
+            return .share_row_exclusive;
+        }
+        return .share;
+    }
+    if (cursor.matchKeyword("exclusive")) return .exclusive;
+    return error.UnsupportedSqlShape;
+}
+
+fn parseTransactionIsolationLevel(cursor: parser.Cursor) !TransactionIsolationLevelSyntax {
+    if (cursor.matchKeyword("serializable")) return .serializable;
+    if (cursor.matchKeyword("repeatable")) {
+        try cursor.expectKeyword("read");
+        return .repeatable_read;
+    }
+    if (cursor.matchKeyword("read")) {
+        if (cursor.matchKeyword("committed")) return .read_committed;
+        if (cursor.matchKeyword("uncommitted")) return .read_uncommitted;
+    }
+    return error.UnsupportedSqlShape;
+}
+
 fn parseOptionalCursorFetchCount(cursor: parser.Cursor) !?i64 {
     if (cursor.peekKeyword("from") or cursor.peekKeyword("in")) return null;
     if (cursor.matchKeyword("all")) return null;
@@ -681,6 +896,16 @@ fn consumePreparedStatementSubjectTail(cursor: parser.Cursor) !void {
         }
         try cursor.advance(1);
     }
+}
+
+fn freeStringList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) void {
+    for (list.items) |value| alloc.free(@constCast(value));
+    list.deinit(alloc);
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(values);
 }
 
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
@@ -966,6 +1191,68 @@ test "sql adapter grammar matches transaction boundary noops" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, matchAdapterNoopTransactionBoundaryTail(extra_tokens.items, &extra_pos, .{}));
+}
+
+test "sql adapter grammar parses transaction control tails" {
+    const alloc = std.testing.allocator;
+
+    var lock_tokens = try lexer.tokenizeAlloc(alloc, "TABLE public.usage_records, audit_records IN SHARE ROW EXCLUSIVE MODE;");
+    defer lexer.freeTokens(alloc, &lock_tokens);
+    var lock_pos: usize = 0;
+    var lock = try parseTableLockTailAlloc(alloc, lock_tokens.items, &lock_pos);
+    defer lock.deinit(alloc);
+    try std.testing.expectEqual(lock_tokens.items.len, lock_pos);
+    try std.testing.expectEqual(@as(usize, 2), lock.table_names.len);
+    try std.testing.expectEqualStrings("usage_records", lock.table_names[0]);
+    try std.testing.expectEqualStrings("audit_records", lock.table_names[1]);
+    try std.testing.expectEqual(TableLockModeSyntax.share_row_exclusive, lock.mode);
+
+    var constraints_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINTS public.fk_usage_account, fk_usage_org DEFERRED;");
+    defer lexer.freeTokens(alloc, &constraints_tokens);
+    var constraints_pos: usize = 0;
+    var constraints = try parseConstraintModeTailAlloc(alloc, constraints_tokens.items, &constraints_pos);
+    defer constraints.deinit(alloc);
+    try std.testing.expectEqual(constraints_tokens.items.len, constraints_pos);
+    try std.testing.expect(!constraints.all);
+    try std.testing.expectEqual(@as(usize, 2), constraints.constraint_names.len);
+    try std.testing.expectEqualStrings("fk_usage_account", constraints.constraint_names[0]);
+    try std.testing.expectEqualStrings("fk_usage_org", constraints.constraint_names[1]);
+    try std.testing.expectEqual(ConstraintCheckModeSyntax.deferred, constraints.mode);
+
+    var constraints_all_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINTS ALL IMMEDIATE;");
+    defer lexer.freeTokens(alloc, &constraints_all_tokens);
+    var constraints_all_pos: usize = 0;
+    var constraints_all = try parseConstraintModeTailAlloc(alloc, constraints_all_tokens.items, &constraints_all_pos);
+    defer constraints_all.deinit(alloc);
+    try std.testing.expectEqual(constraints_all_tokens.items.len, constraints_all_pos);
+    try std.testing.expect(constraints_all.all);
+    try std.testing.expectEqual(@as(usize, 0), constraints_all.constraint_names.len);
+    try std.testing.expectEqual(ConstraintCheckModeSyntax.immediate, constraints_all.mode);
+
+    var transaction_tokens = try lexer.tokenizeAlloc(alloc, "TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY, NOT DEFERRABLE;");
+    defer lexer.freeTokens(alloc, &transaction_tokens);
+    var transaction_pos: usize = 0;
+    const transaction = try parseTransactionModeTail(transaction_tokens.items, &transaction_pos, .set_transaction);
+    try std.testing.expectEqual(transaction_tokens.items.len, transaction_pos);
+    try std.testing.expectEqual(TransactionModeStarterSyntax.set_transaction, transaction.starter);
+    try std.testing.expectEqual(TransactionIsolationLevelSyntax.repeatable_read, transaction.isolation_level.?);
+    try std.testing.expectEqual(TransactionAccessModeSyntax.read_only, transaction.access_mode.?);
+    try std.testing.expectEqual(false, transaction.deferrable.?);
+
+    var begin_tokens = try lexer.tokenizeAlloc(alloc, "READ WRITE DEFERRABLE;");
+    defer lexer.freeTokens(alloc, &begin_tokens);
+    var begin_pos: usize = 0;
+    const begin = try parseTransactionModeTail(begin_tokens.items, &begin_pos, .begin);
+    try std.testing.expectEqual(begin_tokens.items.len, begin_pos);
+    try std.testing.expectEqual(TransactionModeStarterSyntax.begin, begin.starter);
+    try std.testing.expect(begin.isolation_level == null);
+    try std.testing.expectEqual(TransactionAccessModeSyntax.read_write, begin.access_mode.?);
+    try std.testing.expectEqual(true, begin.deferrable.?);
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "TRANSACTION READ ONLY READ WRITE;");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseTransactionModeTail(duplicate_tokens.items, &duplicate_pos, .start_transaction));
 }
 
 test "sql adapter grammar parses savepoint transaction tails" {
