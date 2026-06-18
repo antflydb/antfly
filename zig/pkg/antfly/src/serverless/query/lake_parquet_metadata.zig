@@ -20,6 +20,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const external_source = @import("../external_source/types.zig");
+const external_binding = @import("../external_source/catalog_binding.zig");
+const lake_scan_plan = @import("lake_scan_plan.zig");
 
 const CompactType = enum(u4) {
     stop = 0,
@@ -60,6 +62,166 @@ pub fn parseFooterMetadataAlloc(
     errdefer footer.deinit(alloc);
     if (reader.cursor != reader.bytes.len) return error.InvalidParquetMetadata;
     return footer;
+}
+
+pub fn enrichInventoryFileWithFooterAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    footer: ParsedFooter,
+) !external_source.Inventory {
+    try inventory.validate();
+    if (inventory.format != .parquet) return error.InvalidParquetMetadata;
+    if (file_id.len == 0) return error.InvalidParquetMetadata;
+    if (footer.row_count == 0) return error.InvalidParquetMetadata;
+
+    const files = try alloc.alloc(external_source.FileEntry, inventory.files.len);
+    errdefer alloc.free(files);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |*file| file.deinit(alloc);
+    }
+
+    var found = false;
+    for (inventory.files, 0..) |file, idx| {
+        if (std.mem.eql(u8, file.file_id, file_id)) {
+            files[idx] = try cloneFileWithFooterAlloc(alloc, file, footer);
+            found = true;
+        } else {
+            files[idx] = try cloneFileAlloc(alloc, file);
+        }
+        initialized += 1;
+    }
+    if (!found) return error.ParquetInventoryFileNotFound;
+
+    const source_id = try alloc.dupe(u8, inventory.source_id);
+    errdefer alloc.free(source_id);
+    const source_uri = try alloc.dupe(u8, inventory.source_uri);
+    errdefer alloc.free(source_uri);
+    const snapshot_id = try alloc.dupe(u8, inventory.snapshot_id);
+    errdefer alloc.free(snapshot_id);
+    const schema_fingerprint = try alloc.dupe(u8, inventory.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+
+    var out = external_source.Inventory{
+        .format = inventory.format,
+        .source_id = source_id,
+        .source_uri = source_uri,
+        .snapshot_id = snapshot_id,
+        .schema_fingerprint = schema_fingerprint,
+        .files = files,
+    };
+    errdefer out.deinit(alloc);
+    try out.validate();
+    return out;
+}
+
+fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_source.FileEntry {
+    const file_id = try alloc.dupe(u8, file.file_id);
+    errdefer alloc.free(file_id);
+    const object_uri = try alloc.dupe(u8, file.object_uri);
+    errdefer alloc.free(object_uri);
+    const etag: []u8 = if (file.etag.len == 0) &.{} else try alloc.dupe(u8, file.etag);
+    errdefer if (etag.len > 0) alloc.free(etag);
+    const version_id: []u8 = if (file.version_id.len == 0) &.{} else try alloc.dupe(u8, file.version_id);
+    errdefer if (version_id.len > 0) alloc.free(version_id);
+    const row_groups = try cloneRowGroupsAlloc(alloc, file.row_groups);
+    errdefer freeMaybeOwnedRowGroups(alloc, row_groups);
+
+    return .{
+        .file_id = file_id,
+        .object_uri = object_uri,
+        .etag = etag,
+        .version_id = version_id,
+        .byte_len = file.byte_len,
+        .row_count = file.row_count,
+        .row_groups = row_groups,
+    };
+}
+
+fn cloneFileWithFooterAlloc(
+    alloc: Allocator,
+    file: external_source.FileEntry,
+    footer: ParsedFooter,
+) !external_source.FileEntry {
+    const file_id = try alloc.dupe(u8, file.file_id);
+    errdefer alloc.free(file_id);
+    const object_uri = try alloc.dupe(u8, file.object_uri);
+    errdefer alloc.free(object_uri);
+    const etag: []u8 = if (file.etag.len == 0) &.{} else try alloc.dupe(u8, file.etag);
+    errdefer if (etag.len > 0) alloc.free(etag);
+    const version_id: []u8 = if (file.version_id.len == 0) &.{} else try alloc.dupe(u8, file.version_id);
+    errdefer if (version_id.len > 0) alloc.free(version_id);
+    const row_groups = try cloneRowGroupsAlloc(alloc, footer.row_groups);
+    errdefer freeMaybeOwnedRowGroups(alloc, row_groups);
+
+    return .{
+        .file_id = file_id,
+        .object_uri = object_uri,
+        .etag = etag,
+        .version_id = version_id,
+        .byte_len = file.byte_len,
+        .row_count = footer.row_count,
+        .row_groups = row_groups,
+    };
+}
+
+fn freeMaybeOwnedRowGroups(alloc: Allocator, row_groups: []external_source.RowGroup) void {
+    for (row_groups) |*row_group| row_group.deinit(alloc);
+    if (row_groups.len > 0) alloc.free(row_groups);
+}
+
+fn cloneRowGroupsAlloc(alloc: Allocator, row_groups: []const external_source.RowGroup) ![]external_source.RowGroup {
+    if (row_groups.len == 0) return &.{};
+    const out = try alloc.alloc(external_source.RowGroup, row_groups.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*row_group| row_group.deinit(alloc);
+    }
+    for (row_groups, 0..) |row_group, idx| {
+        out[idx] = .{
+            .ordinal = row_group.ordinal,
+            .row_count = row_group.row_count,
+            .file_offset = row_group.file_offset,
+            .total_byte_len = row_group.total_byte_len,
+            .column_chunks = try cloneColumnChunksAlloc(alloc, row_group.column_chunks),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneColumnChunksAlloc(alloc: Allocator, chunks: []const external_source.ColumnChunk) ![]external_source.ColumnChunk {
+    if (chunks.len == 0) return &.{};
+    const out = try alloc.alloc(external_source.ColumnChunk, chunks.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*chunk| chunk.deinit(alloc);
+    }
+    for (chunks, 0..) |chunk, idx| {
+        out[idx] = try cloneColumnChunkAlloc(alloc, chunk);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !external_source.ColumnChunk {
+    const column_id = try alloc.dupe(u8, chunk.column_id);
+    errdefer alloc.free(column_id);
+    const compression_codec: []u8 = if (chunk.compression_codec.len == 0) &.{} else try alloc.dupe(u8, chunk.compression_codec);
+    errdefer if (compression_codec.len > 0) alloc.free(compression_codec);
+    const encoding: []u8 = if (chunk.encoding.len == 0) &.{} else try alloc.dupe(u8, chunk.encoding);
+    errdefer if (encoding.len > 0) alloc.free(encoding);
+    return .{
+        .column_id = column_id,
+        .file_offset = chunk.file_offset,
+        .compressed_len = chunk.compressed_len,
+        .uncompressed_len = chunk.uncompressed_len,
+        .compression_codec = compression_codec,
+        .encoding = encoding,
+    };
 }
 
 fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFooter {
@@ -571,6 +733,57 @@ test "parquet metadata parser rejects inconsistent row counts and ranges" {
     // and the value byte follows it.
     bytes.items[3] = 6;
     try std.testing.expectError(error.InvalidParquetMetadata, parseFooterMetadataAlloc(alloc, bytes.items, 1024));
+}
+
+test "parquet metadata parser enriches raw inventory for projected scan planning" {
+    const alloc = std.testing.allocator;
+    var bytes = try buildSingleColumnMetadataFixture(alloc);
+    defer bytes.deinit(alloc);
+    var footer = try parseFooterMetadataAlloc(alloc, bytes.items, 1024);
+    defer footer.deinit(alloc);
+
+    var raw = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer raw.deinit(alloc);
+    raw.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1024,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    try raw.validate();
+
+    var enriched = try enrichInventoryFileWithFooterAlloc(alloc, raw, "part-a.parquet", footer);
+    defer enriched.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), enriched.files[0].row_count);
+    try std.testing.expectEqual(@as(usize, 1), enriched.files[0].row_groups.len);
+    try std.testing.expectEqualStrings("amount", enriched.files[0].row_groups[0].column_chunks[0].column_id);
+
+    const binding = external_binding.Binding{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = "s3://bucket/events",
+        .snapshot_mode = .{ .object_version_digest = "sha256:objects" },
+        .schema_fingerprint = "schema-v1",
+    };
+    var plan = try lake_scan_plan.planProjectedScanAlloc(alloc, .{
+        .binding = binding,
+        .inventory = enriched,
+        .projected_columns = &[_][]const u8{"amount"},
+    });
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.logical_reads.len);
+    try std.testing.expectEqual(@as(u64, 100), plan.logical_reads[0].range.offset);
+    try std.testing.expectEqual(@as(u64, 40), plan.logical_reads[0].range.len);
 }
 
 fn buildSingleColumnMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {

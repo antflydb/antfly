@@ -95,6 +95,7 @@ pub const coalesceLakePhysicalReadsAlloc = lake_range_io.coalescePhysicalReadsAl
 pub const parseLakeParquetFooterPreflight = lake_parquet_footer.parseFooterPreflight;
 pub const planLakeParquetFooterMetadataRead = lake_parquet_footer.planFooterMetadataRead;
 pub const parseLakeParquetMetadataAlloc = lake_parquet_metadata.parseFooterMetadataAlloc;
+pub const enrichLakeInventoryFileWithParquetFooterAlloc = lake_parquet_metadata.enrichInventoryFileWithFooterAlloc;
 pub const planProjectedLakeScanAlloc = lake_scan_plan.planProjectedScanAlloc;
 pub const validateLakeBindingInventory = lake_scan_plan.validateBindingInventory;
 pub const executeLakeRowsGroupByAlloc = lake_rows.executeGroupByAlloc;
@@ -196,6 +197,7 @@ test "serverless query module compiles" {
     _ = parseLakeParquetFooterPreflight;
     _ = planLakeParquetFooterMetadataRead;
     _ = parseLakeParquetMetadataAlloc;
+    _ = enrichLakeInventoryFileWithParquetFooterAlloc;
     _ = planProjectedLakeScanAlloc;
     _ = validateLakeBindingInventory;
     _ = executeLakeRowsGroupByAlloc;

@@ -306,6 +306,7 @@ pub const coalesceLakePhysicalReadsAlloc = query.coalesceLakePhysicalReadsAlloc;
 pub const parseLakeParquetFooterPreflight = query.parseLakeParquetFooterPreflight;
 pub const planLakeParquetFooterMetadataRead = query.planLakeParquetFooterMetadataRead;
 pub const parseLakeParquetMetadataAlloc = query.parseLakeParquetMetadataAlloc;
+pub const enrichLakeInventoryFileWithParquetFooterAlloc = query.enrichLakeInventoryFileWithParquetFooterAlloc;
 pub const SparseEnricher = enrichment.SparseEnricher;
 pub const EnrichmentRunStats = enrichment.EnrichmentRunStats;
 pub const RuntimeConfig = runtime.RuntimeConfig;
@@ -594,6 +595,7 @@ test "serverless module compiles" {
     _ = parseLakeParquetFooterPreflight;
     _ = planLakeParquetFooterMetadataRead;
     _ = parseLakeParquetMetadataAlloc;
+    _ = enrichLakeInventoryFileWithParquetFooterAlloc;
     _ = SparseEnricher;
     _ = EnrichmentRunStats;
     _ = RuntimeConfig;
