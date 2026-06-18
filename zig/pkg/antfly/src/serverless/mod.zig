@@ -276,6 +276,7 @@ pub const validateExternalSourceBatchAgainstInventory = external_source.validate
 pub const ExternalSourceManifestPlan = build.ExternalSourceManifestPlan;
 pub const ExternalSourcePublishedArtifact = build.ExternalSourcePublishedArtifact;
 pub const planExternalSourceManifestAlloc = build.planExternalSourceManifestAlloc;
+pub const planExternalSourceManifestFromBindingAndInventoryAlloc = build.planExternalSourceManifestFromBindingAndInventoryAlloc;
 pub const LakeGcSnapshot = build.LakeGcSnapshot;
 pub const LakeGcCandidate = build.LakeGcCandidate;
 pub const LakeGcPlan = build.LakeGcPlan;
@@ -615,6 +616,7 @@ test "serverless module compiles" {
     _ = ExternalSourceManifestPlan;
     _ = ExternalSourcePublishedArtifact;
     _ = planExternalSourceManifestAlloc;
+    _ = planExternalSourceManifestFromBindingAndInventoryAlloc;
     _ = LakeGcSnapshot;
     _ = LakeGcCandidate;
     _ = LakeGcPlan;

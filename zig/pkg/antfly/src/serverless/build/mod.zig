@@ -47,6 +47,7 @@ pub const ArtifactFamily = impact_planner.ArtifactFamily;
 pub const ExternalSourceManifestPlan = external_source_manifest.Plan;
 pub const ExternalSourcePublishedArtifact = external_source_manifest.PublishedArtifact;
 pub const planExternalSourceManifestAlloc = external_source_manifest.planAlloc;
+pub const planExternalSourceManifestFromBindingAndInventoryAlloc = external_source_manifest.planFromBindingAndInventoryAlloc;
 pub const ImpactPlanInput = impact_planner.PlanInput;
 pub const planArtifactImpactAlloc = impact_planner.planAlloc;
 pub const LakeGcSnapshot = lake_gc.Snapshot;
@@ -121,6 +122,7 @@ test "serverless build module compiles" {
     _ = ExternalSourceManifestPlan;
     _ = ExternalSourcePublishedArtifact;
     _ = planExternalSourceManifestAlloc;
+    _ = planExternalSourceManifestFromBindingAndInventoryAlloc;
     _ = ImpactPlanInput;
     _ = planArtifactImpactAlloc;
     _ = LakeGcSnapshot;

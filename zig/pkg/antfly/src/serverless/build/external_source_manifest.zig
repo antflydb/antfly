@@ -16,6 +16,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const catalog_binding = @import("../external_source/catalog_binding.zig");
+const external_source = @import("../external_source/types.zig");
 const manifest_artifact = @import("../manifest/artifact_ref.zig");
 const manifest_base_source = @import("../manifest/base_source.zig");
 
@@ -97,6 +99,46 @@ pub fn planAlloc(
     };
 }
 
+pub fn planFromBindingAndInventoryAlloc(
+    alloc: Allocator,
+    binding: catalog_binding.Binding,
+    inventory: external_source.Inventory,
+    file_inventory: PublishedArtifact,
+) !Plan {
+    try binding.validateReadOnlyMvp();
+    try inventory.validate();
+    try validateBindingMatchesInventory(binding, inventory);
+
+    return planAlloc(
+        alloc,
+        binding.manifestFormat(),
+        binding.source_uri,
+        inventory.snapshot_id,
+        binding.schema_fingerprint,
+        file_inventory,
+    );
+}
+
+fn validateBindingMatchesInventory(
+    binding: catalog_binding.Binding,
+    inventory: external_source.Inventory,
+) !void {
+    if (binding.format != inventory.format) return error.ExternalSourceInventoryMismatch;
+    if (!std.mem.eql(u8, binding.table_id, inventory.source_id)) return error.ExternalSourceInventoryMismatch;
+    if (!std.mem.eql(u8, binding.source_uri, inventory.source_uri)) return error.ExternalSourceInventoryMismatch;
+    if (!std.mem.eql(u8, binding.schema_fingerprint, inventory.schema_fingerprint)) return error.ExternalSourceInventoryMismatch;
+
+    switch (binding.snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| {
+            if (!std.mem.eql(u8, snapshot_id, inventory.snapshot_id)) return error.ExternalSourceInventoryMismatch;
+        },
+        .object_version_digest => |digest| {
+            if (!std.mem.eql(u8, digest, inventory.snapshot_id)) return error.ExternalSourceInventoryMismatch;
+        },
+    }
+}
+
 fn cloneArtifactRef(
     alloc: Allocator,
     kind: manifest_artifact.ArtifactKind,
@@ -134,4 +176,85 @@ test "external source manifest plan creates inventory artifact and base source" 
     try std.testing.expectEqual(manifest_artifact.ArtifactKind.external_base_source, plan.artifacts[0].kind);
     try std.testing.expectEqualStrings("external-files-0001", plan.base_source.external_iceberg.file_inventory_artifact.?);
     try plan.base_source.validate();
+}
+
+test "external source manifest plan pins current catalog binding to discovered inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events"),
+        .snapshot_id = try alloc.dupe(u8, "iceberg-123"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "file-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/warehouse/events/file-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
+        .byte_len = 1024,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+
+    var plan = try planFromBindingAndInventoryAlloc(
+        alloc,
+        .{
+            .table_id = "events",
+            .format = .iceberg,
+            .source_uri = "s3://bucket/warehouse/events",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+        },
+        inventory,
+        .{
+            .artifact_id = "external-files-0001",
+            .byte_len = 4096,
+            .checksum = "sha256:files",
+        },
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("iceberg-123", plan.base_source.external_iceberg.snapshot_id);
+    try std.testing.expectEqualStrings("external-files-0001", plan.base_source.external_iceberg.file_inventory_artifact.?);
+    try plan.base_source.validate();
+}
+
+test "external source manifest plan rejects stale explicit catalog binding" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "logs"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/logs"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:new"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/logs/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-file-a"),
+        .byte_len = 1024,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+
+    try std.testing.expectError(error.ExternalSourceInventoryMismatch, planFromBindingAndInventoryAlloc(
+        alloc,
+        .{
+            .table_id = "logs",
+            .format = .parquet,
+            .source_uri = "s3://bucket/logs",
+            .snapshot_mode = .{ .object_version_digest = "sha256:old" },
+            .schema_fingerprint = "schema-v1",
+        },
+        inventory,
+        .{
+            .artifact_id = "external-files-0001",
+            .byte_len = 4096,
+            .checksum = "sha256:files",
+        },
+    ));
 }
