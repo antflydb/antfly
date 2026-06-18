@@ -42,6 +42,8 @@ pub const ColumnChunk = struct {
     stats_max_bytes: ?[]u8 = null,
     stats_min_bool: ?bool = null,
     stats_max_bool: ?bool = null,
+    stats_min_f64: ?f64 = null,
+    stats_max_f64: ?f64 = null,
     nullable: bool = false,
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
@@ -68,6 +70,11 @@ pub const ColumnChunk = struct {
         }
         if ((self.stats_min_bool == null) != (self.stats_max_bool == null)) return error.InvalidExternalSourceInventory;
         if (self.stats_min_bool == true and self.stats_max_bool == false) return error.InvalidExternalSourceInventory;
+        if ((self.stats_min_f64 == null) != (self.stats_max_f64 == null)) return error.InvalidExternalSourceInventory;
+        if (self.stats_min_f64) |min| {
+            const max = self.stats_max_f64.?;
+            if (std.math.isNan(min) or std.math.isNan(max) or min > max) return error.InvalidExternalSourceInventory;
+        }
     }
 };
 

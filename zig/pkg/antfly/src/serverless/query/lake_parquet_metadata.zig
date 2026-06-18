@@ -314,6 +314,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .stats_max_bytes = stats_max_bytes,
         .stats_min_bool = chunk.stats_min_bool,
         .stats_max_bool = chunk.stats_max_bool,
+        .stats_min_f64 = chunk.stats_min_f64,
+        .stats_max_f64 = chunk.stats_max_f64,
         .nullable = chunk.nullable,
     };
 }
@@ -695,6 +697,8 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .stats_max_bytes = meta.stats_max_bytes,
         .stats_min_bool = meta.stats_min_bool,
         .stats_max_bool = meta.stats_max_bool,
+        .stats_min_f64 = meta.stats_min_f64,
+        .stats_max_f64 = meta.stats_max_f64,
         .nullable = false,
     };
     chunk.validate(file_len) catch return error.InvalidParquetMetadata;
@@ -717,6 +721,8 @@ const ColumnMetadata = struct {
     stats_max_bytes: ?[]u8 = null,
     stats_min_bool: ?bool = null,
     stats_max_bool: ?bool = null,
+    stats_min_f64: ?f64 = null,
+    stats_max_f64: ?f64 = null,
 
     fn deinit(self: *ColumnMetadata, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
@@ -792,6 +798,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
         .stats_max_bytes = stats.max_bytes,
         .stats_min_bool = stats.min_bool,
         .stats_max_bool = stats.max_bool,
+        .stats_min_f64 = stats.min_f64,
+        .stats_max_f64 = stats.max_f64,
     };
 }
 
@@ -813,6 +821,8 @@ const NumericStats = struct {
     max_bytes: ?[]u8 = null,
     min_bool: ?bool = null,
     max_bool: ?bool = null,
+    min_f64: ?f64 = null,
+    max_f64: ?f64 = null,
 };
 
 fn parseColumnStatisticsAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) !RawColumnStatistics {
@@ -872,6 +882,26 @@ fn decodeColumnStatsAlloc(alloc: Allocator, raw: RawColumnStatistics, physical_t
         return .{
             .min_bool = min[0] != 0,
             .max_bool = max[0] != 0,
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(physical_type, "float")) {
+        if (min.len != 4 or max.len != 4) return error.InvalidParquetMetadata;
+        const min_f32: f32 = @bitCast(std.mem.readInt(u32, min[0..4], .little));
+        const max_f32: f32 = @bitCast(std.mem.readInt(u32, max[0..4], .little));
+        if (std.math.isNan(min_f32) or std.math.isNan(max_f32) or min_f32 > max_f32) return error.InvalidParquetMetadata;
+        return .{
+            .min_f64 = @floatCast(min_f32),
+            .max_f64 = @floatCast(max_f32),
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(physical_type, "double")) {
+        if (min.len != 8 or max.len != 8) return error.InvalidParquetMetadata;
+        const min_f64: f64 = @bitCast(std.mem.readInt(u64, min[0..8], .little));
+        const max_f64: f64 = @bitCast(std.mem.readInt(u64, max[0..8], .little));
+        if (std.math.isNan(min_f64) or std.math.isNan(max_f64) or min_f64 > max_f64) return error.InvalidParquetMetadata;
+        return .{
+            .min_f64 = min_f64,
+            .max_f64 = max_f64,
         };
     }
     return .{};
@@ -1340,6 +1370,36 @@ test "parquet metadata parser derives decimal columns from schema annotations" {
     try std.testing.expectEqual(@as(i32, 9), footer.row_groups[0].column_chunks[0].decimal_precision);
     try std.testing.expectEqual(@as(i32, 2), footer.row_groups[0].column_chunks[0].decimal_scale);
     try std.testing.expectEqual(@as(i32, 8), footer.row_groups[0].column_chunks[0].type_length);
+}
+
+test "parquet metadata parser decodes float and double statistics" {
+    const alloc = std.testing.allocator;
+
+    var min_f32_bytes: [4]u8 = undefined;
+    var max_f32_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &min_f32_bytes, @bitCast(@as(f32, 1.5)), .little);
+    std.mem.writeInt(u32, &max_f32_bytes, @bitCast(@as(f32, 2.5)), .little);
+    var raw_f32 = RawColumnStatistics{
+        .min = try alloc.dupe(u8, &min_f32_bytes),
+        .max = try alloc.dupe(u8, &max_f32_bytes),
+    };
+    defer raw_f32.deinit(alloc);
+    const stats_f32 = try decodeColumnStatsAlloc(alloc, raw_f32, "float");
+    try std.testing.expectEqual(@as(?f64, 1.5), stats_f32.min_f64);
+    try std.testing.expectEqual(@as(?f64, 2.5), stats_f32.max_f64);
+
+    var min_f64_bytes: [8]u8 = undefined;
+    var max_f64_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &min_f64_bytes, @bitCast(@as(f64, 10.25)), .little);
+    std.mem.writeInt(u64, &max_f64_bytes, @bitCast(@as(f64, 20.5)), .little);
+    var raw_f64 = RawColumnStatistics{
+        .min = try alloc.dupe(u8, &min_f64_bytes),
+        .max = try alloc.dupe(u8, &max_f64_bytes),
+    };
+    defer raw_f64.deinit(alloc);
+    const stats_f64 = try decodeColumnStatsAlloc(alloc, raw_f64, "double");
+    try std.testing.expectEqual(@as(?f64, 10.25), stats_f64.min_f64);
+    try std.testing.expectEqual(@as(?f64, 20.5), stats_f64.max_f64);
 }
 
 test "parquet metadata parser rejects inconsistent row counts and ranges" {
