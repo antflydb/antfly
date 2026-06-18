@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -1202,6 +1203,46 @@ func TestOperatorUsesAdminSDKWrapperOnly(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("scan operator imports: %v", err)
+	}
+}
+
+func TestOperatorProductionDoesNotHardCodeHAAdminPaths(t *testing.T) {
+	_, file, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test file")
+	}
+	operatorRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	fset := token.NewFileSet()
+
+	if err := filepath.WalkDir(operatorRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			lit, ok := node.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				t.Errorf("%s: unquote string literal %s: %v", path, lit.Value, err)
+				return true
+			}
+			if strings.Contains(value, "/admin/v1/ha") {
+				t.Errorf("%s hard-codes HA admin path %q; use go/pkg/sdk/admin wrapper constants instead", path, value)
+			}
+			return true
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("scan operator production sources: %v", err)
 	}
 }
 
