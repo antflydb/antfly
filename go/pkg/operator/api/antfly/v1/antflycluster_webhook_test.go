@@ -2865,6 +2865,31 @@ func TestValidateCreate_HighAvailabilityRejectsIncompleteSeedPaths(t *testing.T)
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsPaddedSeedPaths(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:             "standby-a",
+			SeedManifestPath: " /backup/base-standby-a/manifest.json ",
+			SeedContentRoot:  " /backup/base-standby-a ",
+		}},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected padded seed path validation errors")
+	}
+	for _, want := range []string{
+		"standbys[0].seedManifestPath must not have leading or trailing whitespace",
+		"standbys[0].seedContentRoot must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected padded seed path error %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsArmedSlotDropForDesiredStandby(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
