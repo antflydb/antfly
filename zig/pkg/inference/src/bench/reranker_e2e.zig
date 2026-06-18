@@ -22,6 +22,8 @@
 const std = @import("std");
 
 const inference = @import("inference_internal");
+const platform = inference.platform;
+const session_factory = inference.architectures.session_factory;
 const backends = inference.backends;
 const native_backend_choice = inference.native_backend_choice;
 
@@ -90,12 +92,12 @@ pub fn main(init: std.process.Init) !void {
     if (opts.batch_sweep) {
         for (sweep_doc_counts) |doc_count| {
             const docs = try docsForCount(allocator, opts.docs.items, doc_count);
-            const result = try runTimed(&pipeline, allocator, opts, docs);
+            const result = try runTimed(&pipeline, model.session, allocator, opts, docs);
             printResult(opts, doc_count, result);
             allocator.free(docs);
         }
     } else {
-        const result = try runTimed(&pipeline, allocator, opts, opts.docs.items);
+        const result = try runTimed(&pipeline, model.session, allocator, opts, opts.docs.items);
         printResult(opts, opts.docs.items.len, result);
     }
 }
@@ -106,10 +108,12 @@ const BenchResult = struct {
     p95_ms: f64,
     docs_per_s: f64,
     checksum: f64,
+    graph_stats: session_factory.CudaDebertaGraphRuntimeStats = .{},
 };
 
 fn runTimed(
     pipeline: anytype,
+    session: backends.Session,
     allocator: std.mem.Allocator,
     opts: Options,
     docs: []const []const u8,
@@ -156,6 +160,7 @@ fn runTimed(
         .p95_ms = p95_ms,
         .docs_per_s = docs_per_s,
         .checksum = checksum,
+        .graph_stats = session_factory.getCudaDebertaGraphRuntimeStats(session) orelse .{},
     };
 }
 
@@ -176,10 +181,24 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
                 result.docs_per_s,
                 result.checksum,
             });
+            print("graph_mode={s} qmatmul_variant={s} graph_captures={d} graph_replays={d} graph_fallbacks={d} graph_capture_failures={d} graph_buckets={d} graph_owned_bytes={d} graph_dynamic_copy_bytes={d} graph_last_fallback_reason={s}\n", .{
+                graphModeName(),
+                qmatmulVariantName(),
+                result.graph_stats.captures,
+                result.graph_stats.replays,
+                result.graph_stats.fallbacks,
+                result.graph_stats.capture_failures,
+                result.graph_stats.buckets,
+                result.graph_stats.graph_owned_bytes,
+                result.graph_stats.dynamic_copy_bytes,
+                result.graph_stats.last_fallback_reason,
+            });
         },
         .csv => {
-            print("{s},{s},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.6}\n", .{
+            print("{s},{s},{s},{s},{d},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.6},{d},{d},{d},{d},{d},{d},{d},{s}\n", .{
                 @tagName(opts.backend),
+                graphModeName(),
+                qmatmulVariantName(),
                 opts.model_dir,
                 doc_count,
                 opts.warmup_iters,
@@ -189,13 +208,31 @@ fn printResult(opts: Options, doc_count: usize, result: BenchResult) void {
                 result.p95_ms,
                 result.docs_per_s,
                 result.checksum,
+                result.graph_stats.captures,
+                result.graph_stats.replays,
+                result.graph_stats.fallbacks,
+                result.graph_stats.capture_failures,
+                result.graph_stats.buckets,
+                result.graph_stats.graph_owned_bytes,
+                result.graph_stats.dynamic_copy_bytes,
+                result.graph_stats.last_fallback_reason,
             });
         },
     }
 }
 
 fn printCsvHeader() void {
-    print("backend,model,docs,warmup_iters,measure_iters,avg_ms,min_ms,p95_ms,docs_per_s,checksum\n", .{});
+    print("backend,graph_mode,qmatmul_variant,model,docs,warmup_iters,measure_iters,avg_ms,min_ms,p95_ms,docs_per_s,checksum,graph_captures,graph_replays,graph_fallbacks,graph_capture_failures,graph_buckets,graph_owned_bytes,graph_dynamic_copy_bytes,graph_last_fallback_reason\n", .{});
+}
+
+fn graphModeName() []const u8 {
+    if (platform.env.getenvBool("ANTFLY_CUDA_REQUIRE_DEBERTA_GRAPHS")) return "required";
+    if (platform.env.getenvBool("ANTFLY_CUDA_ENABLE_DEBERTA_GRAPHS")) return "enabled";
+    return "disabled";
+}
+
+fn qmatmulVariantName() []const u8 {
+    return platform.env.getenv("ANTFLY_CUDA_QMATMUL_VARIANT") orelse "auto";
 }
 
 fn docsForCount(allocator: std.mem.Allocator, source: []const []const u8, count: usize) ![]const []const u8 {

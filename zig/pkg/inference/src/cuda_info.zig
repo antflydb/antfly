@@ -63,6 +63,7 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         print("cublas_available: {}\n", .{compute.hasCublas()});
         print("cublaslt_available: {}\n", .{compute.hasCublasLt()});
         print("dense_library_acceleration: {}\n", .{compute.hasDenseLibraryAcceleration()});
+        print("cuda_graph_available: {}\n", .{compute.cudaGraphAvailable()});
         print("capability_clipclap: {}\n", .{compute.supportsProfile(.clipclap)});
         print("capability_deberta_reranker: {}\n", .{compute.supportsProfile(.deberta_reranker)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});

@@ -843,11 +843,9 @@ fn encoderLayer(
     const ffn_out = if (use_tp)
         try linearMaybeShardedToReplicated(cb, ffn_gelu, ffn_o_w, ffn_o_b, total, I, H)
     else blk: {
-        if (isDenseF32Tensor(cb, ffn_o_w)) {
-            if (try cb.linearAdd(ffn_gelu, ffn_o_w, ffn_o_b, attn_normed, total, local_intermediate, H)) |fused| {
-                ffn_out_has_residual = true;
-                break :blk fused;
-            }
+        if (try cb.linearAdd(ffn_gelu, ffn_o_w, ffn_o_b, attn_normed, total, local_intermediate, H)) |fused| {
+            ffn_out_has_residual = true;
+            break :blk fused;
         }
         break :blk try cb.linear(ffn_gelu, ffn_o_w, ffn_o_b, total, local_intermediate, H);
     };
@@ -881,11 +879,6 @@ fn getLayerWeight(cb: *const ComputeBackend, layer: usize, suffix: []const u8, b
 fn tensorParallelWorldSize(cb: *const ComputeBackend) usize {
     _ = cb;
     return 1;
-}
-
-fn isDenseF32Tensor(cb: *const ComputeBackend, tensor: CT) bool {
-    const dtype = cb.tensorDType(tensor) catch return false;
-    return dtype == .f32;
 }
 
 fn linearReplicatedToMaybeSharded(
