@@ -10072,8 +10072,13 @@ fn assignPartitions(
         return;
     }
 
-    const offsets = self.alloc.alloc(usize, count) catch return;
-    defer self.alloc.free(offsets);
+    var offsets_stack: [1024]usize = undefined;
+    const use_offsets_stack = count <= offsets_stack.len;
+    const offsets = if (use_offsets_stack)
+        offsets_stack[0..count]
+    else
+        self.alloc.alloc(usize, count) catch return;
+    defer if (!use_offsets_stack) self.alloc.free(offsets);
     for (0..count) |i| offsets[i] = i;
 
     stableSortOffsetsByDistance(offsets, temp_dists);
