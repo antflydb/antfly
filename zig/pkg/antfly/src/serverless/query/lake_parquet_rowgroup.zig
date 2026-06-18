@@ -493,6 +493,28 @@ pub fn planRequiredPlainI64ObjectRangeRowGroupsAlloc(
     inventory: external_source.Inventory,
     projected_columns: []const []const u8,
 ) !ObjectRangeRowGroupPlan {
+    return try planObjectRangeRowGroupsAlloc(alloc, inventory, projected_columns, .none);
+}
+
+pub fn planSupportedI64ObjectRangeRowGroupsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+) !ObjectRangeRowGroupPlan {
+    return try planObjectRangeRowGroupsAlloc(alloc, inventory, projected_columns, .supported_i64);
+}
+
+const RowGroupPlanValidation = enum {
+    none,
+    supported_i64,
+};
+
+fn planObjectRangeRowGroupsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+    validation: RowGroupPlanValidation,
+) !ObjectRangeRowGroupPlan {
     try inventory.validate();
     if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
     if (projected_columns.len == 0) return error.InvalidParquetRowGroupBatch;
@@ -504,7 +526,8 @@ pub fn planRequiredPlainI64ObjectRangeRowGroupsAlloc(
     for (inventory.files) |file| {
         for (file.row_groups) |row_group| {
             for (projected_columns) |column| {
-                _ = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
+                const chunk = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
+                try validatePlannedChunk(chunk, validation);
             }
             total_row_groups += 1;
         }
@@ -526,6 +549,16 @@ pub fn planRequiredPlainI64ObjectRangeRowGroupsAlloc(
     }
 
     return .{ .row_groups = row_groups };
+}
+
+fn validatePlannedChunk(chunk: external_source.ColumnChunk, validation: RowGroupPlanValidation) !void {
+    switch (validation) {
+        .none => {},
+        .supported_i64 => {
+            _ = try plainI64ModeForColumnChunk(chunk);
+            _ = try compressionCodecForColumnChunk(chunk);
+        },
+    }
 }
 
 fn findColumnChunk(row_group: external_source.RowGroup, column_id: []const u8) ?external_source.ColumnChunk {
@@ -998,7 +1031,12 @@ test "parquet row group batch dispatches supported i64 encodings from inventory"
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30, 40 }, owned.batch.columns[0].values.i64);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8, 7, 8 }, owned.batch.columns[1].values.i64);
 
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "amount", "tenant" });
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+
     inventory.files[0].row_groups[0].column_chunks[1].encoding[0] = 'd';
+    try std.testing.expectError(error.UnsupportedParquetPage, planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"tenant"}));
     try std.testing.expectError(error.UnsupportedParquetPage, buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
         .{ .column_id = "tenant", .bytes = tenant_chunk.items },
     }));
@@ -1051,7 +1089,12 @@ test "parquet row group batch dispatches supported compression from inventory" {
     try owned.batch.validate();
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, owned.batch.columns[0].values.i64);
 
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"amount"});
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+
     inventory.files[0].row_groups[0].column_chunks[0].compression_codec[0] = 'z';
+    try std.testing.expectError(error.UnsupportedParquetPage, planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"amount"}));
     try std.testing.expectError(error.UnsupportedParquetPage, buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
         .column_id = "amount",
         .bytes = chunk.items,
@@ -1246,7 +1289,7 @@ test "parquet object range row group source reads chunks into lake rows" {
     try inventory.validate();
 
     const projection = [_][]const u8{"amount"};
-    var plan = try planRequiredPlainI64ObjectRangeRowGroupsAlloc(alloc, inventory, &projection);
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &projection);
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), plan.row_groups.len);
     try std.testing.expectEqualStrings("part-a.parquet", plan.row_groups[0].file_id);
@@ -1254,7 +1297,7 @@ test "parquet object range row group source reads chunks into lake rows" {
     try std.testing.expectEqual(@as(u32, 1), plan.row_groups[1].row_group_ordinal);
     try std.testing.expectError(
         error.ParquetColumnNotFound,
-        planRequiredPlainI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"missing"}),
+        planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"missing"}),
     );
 
     var source = try ObjectRangeRowGroupSource.init(range_reader.reader(), inventory, plan.row_groups);

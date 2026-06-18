@@ -51,6 +51,11 @@ pub const ParsedFooter = struct {
     }
 };
 
+pub const FileFooter = struct {
+    file_id: []const u8,
+    footer: ParsedFooter,
+};
+
 pub fn parseFooterMetadataAlloc(
     alloc: Allocator,
     footer_metadata: []const u8,
@@ -62,6 +67,68 @@ pub fn parseFooterMetadataAlloc(
     errdefer footer.deinit(alloc);
     if (reader.cursor != reader.bytes.len) return error.InvalidParquetMetadata;
     return footer;
+}
+
+pub fn enrichInventoryFilesWithFootersAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    footers: []const FileFooter,
+) !external_source.Inventory {
+    try inventory.validate();
+    if (inventory.format != .parquet) return error.InvalidParquetMetadata;
+    if (footers.len == 0) return error.InvalidParquetMetadata;
+    for (footers, 0..) |entry, idx| {
+        if (entry.file_id.len == 0) return error.InvalidParquetMetadata;
+        if (entry.footer.row_count == 0) return error.InvalidParquetMetadata;
+        for (footers[0..idx]) |previous| {
+            if (std.mem.eql(u8, previous.file_id, entry.file_id)) return error.InvalidParquetMetadata;
+        }
+    }
+
+    const files = try alloc.alloc(external_source.FileEntry, inventory.files.len);
+    errdefer alloc.free(files);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |*file| file.deinit(alloc);
+    }
+
+    var matched_footers = try alloc.alloc(bool, footers.len);
+    defer alloc.free(matched_footers);
+    @memset(matched_footers, false);
+
+    for (inventory.files, 0..) |file, idx| {
+        if (footerForFile(footers, file.file_id)) |match| {
+            files[idx] = try cloneFileWithFooterAlloc(alloc, file, match.footer);
+            matched_footers[match.idx] = true;
+        } else {
+            files[idx] = try cloneFileAlloc(alloc, file);
+        }
+        initialized += 1;
+    }
+    for (matched_footers) |matched| {
+        if (!matched) return error.ParquetInventoryFileNotFound;
+    }
+
+    const source_id = try alloc.dupe(u8, inventory.source_id);
+    errdefer alloc.free(source_id);
+    const source_uri = try alloc.dupe(u8, inventory.source_uri);
+    errdefer alloc.free(source_uri);
+    const snapshot_id = try alloc.dupe(u8, inventory.snapshot_id);
+    errdefer alloc.free(snapshot_id);
+    const schema_fingerprint = try alloc.dupe(u8, inventory.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+
+    var out = external_source.Inventory{
+        .format = inventory.format,
+        .source_id = source_id,
+        .source_uri = source_uri,
+        .snapshot_id = snapshot_id,
+        .schema_fingerprint = schema_fingerprint,
+        .files = files,
+    };
+    errdefer out.deinit(alloc);
+    try out.validate();
+    return out;
 }
 
 pub fn enrichInventoryFileWithFooterAlloc(
@@ -114,6 +181,13 @@ pub fn enrichInventoryFileWithFooterAlloc(
     errdefer out.deinit(alloc);
     try out.validate();
     return out;
+}
+
+fn footerForFile(footers: []const FileFooter, file_id: []const u8) ?struct { idx: usize, footer: ParsedFooter } {
+    for (footers, 0..) |entry, idx| {
+        if (std.mem.eql(u8, entry.file_id, file_id)) return .{ .idx = idx, .footer = entry.footer };
+    }
+    return null;
 }
 
 fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_source.FileEntry {
@@ -784,6 +858,62 @@ test "parquet metadata parser enriches raw inventory for projected scan planning
     try std.testing.expectEqual(@as(usize, 1), plan.logical_reads.len);
     try std.testing.expectEqual(@as(u64, 100), plan.logical_reads[0].range.offset);
     try std.testing.expectEqual(@as(u64, 40), plan.logical_reads[0].range.len);
+}
+
+test "parquet metadata parser enriches multiple inventory files with footers" {
+    const alloc = std.testing.allocator;
+    var bytes = try buildSingleColumnMetadataFixture(alloc);
+    defer bytes.deinit(alloc);
+    var footer_a = try parseFooterMetadataAlloc(alloc, bytes.items, 1024);
+    defer footer_a.deinit(alloc);
+    var footer_b = try parseFooterMetadataAlloc(alloc, bytes.items, 1024);
+    defer footer_b.deinit(alloc);
+
+    var raw = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 2),
+    };
+    defer raw.deinit(alloc);
+    raw.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1024,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    raw.files[1] = .{
+        .file_id = try alloc.dupe(u8, "part-b.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-b.parquet"),
+        .etag = try alloc.dupe(u8, "etag-b"),
+        .byte_len = 1024,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    try raw.validate();
+
+    const footers = [_]FileFooter{
+        .{ .file_id = "part-a.parquet", .footer = footer_a },
+        .{ .file_id = "part-b.parquet", .footer = footer_b },
+    };
+    var enriched = try enrichInventoryFilesWithFootersAlloc(alloc, raw, &footers);
+    defer enriched.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u64, 2), enriched.files[0].row_count);
+    try std.testing.expectEqual(@as(u64, 2), enriched.files[1].row_count);
+    try std.testing.expectEqualStrings("amount", enriched.files[0].row_groups[0].column_chunks[0].column_id);
+    try std.testing.expectEqualStrings("amount", enriched.files[1].row_groups[0].column_chunks[0].column_id);
+    try std.testing.expectError(error.InvalidParquetMetadata, enrichInventoryFilesWithFootersAlloc(alloc, raw, &[_]FileFooter{
+        .{ .file_id = "part-a.parquet", .footer = footer_a },
+        .{ .file_id = "part-a.parquet", .footer = footer_b },
+    }));
+    try std.testing.expectError(error.ParquetInventoryFileNotFound, enrichInventoryFilesWithFootersAlloc(alloc, raw, &[_]FileFooter{
+        .{ .file_id = "missing.parquet", .footer = footer_a },
+    }));
 }
 
 fn buildSingleColumnMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
