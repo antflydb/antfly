@@ -64,6 +64,18 @@
       "sql": "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
     },
     {
+      "name": "read classifier row query",
+      "family": "read",
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records ORDER BY (amount + quantity) DESC LIMIT 5"
+    },
+    {
+      "name": "read classifier aggregate",
+      "family": "read",
+      "plan": "read:aggregate:aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=1:aggs=1:agg_expr=0:filter_expr=0:having=1:order=1:limit=5",
+      "sql": "SELECT lower(status) AS status_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(status) HAVING status_key = 'open' ORDER BY status_key ASC LIMIT 5"
+    },
+    {
       "name": "execute prepared statement protocol plan",
       "family": "ddl",
       "summary": {

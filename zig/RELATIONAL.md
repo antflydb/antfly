@@ -6144,9 +6144,9 @@ cover portable SQL/data examples directly, including scalar and text expression
 queries, date/time expression queries, and JSON expression-projection queries,
 expression-membership/null-safe predicate queries, scalar OR/membership
 predicate queries, parenthesized arithmetic projection/order queries, and
-array/computed-array expression queries, while the embedded Zig seed corpus is
-reserved for cases that need local helper setup or in-process fixture
-construction.
+array/computed-array expression queries, and portable read-classifier
+query/aggregate examples, while the embedded Zig seed corpus is reserved for
+cases that need local helper setup or in-process fixture construction.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 

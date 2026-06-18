@@ -60876,18 +60876,6 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "ALTER TABLE usage_records DROP COLUMN metadata;",
         },
         .{
-            .name = "read classifier row query",
-            .family = .read,
-            .plan = "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
-            .sql = "SELECT id FROM usage_records ORDER BY (amount + quantity) DESC LIMIT 5",
-        },
-        .{
-            .name = "read classifier aggregate",
-            .family = .read,
-            .plan = "read:aggregate:aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=0:group_expr=1:aggs=1:agg_expr=0:filter_expr=0:having=1:order=1:limit=5",
-            .sql = "SELECT lower(status) AS status_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(status) HAVING status_key = 'open' ORDER BY status_key ASC LIMIT 5",
-        },
-        .{
             .name = "read classifier equality join",
             .family = .read,
             .plan = "read:join:join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
