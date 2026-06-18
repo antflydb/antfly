@@ -3389,6 +3389,7 @@ pub const DB = struct {
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
+        try self.enforceHAWriteGate();
         self.async_context.text_merge_deferred.store(true, .release);
         errdefer self.async_context.text_merge_deferred.store(false, .release);
         beginExternalDenseBulkSessionTracked(self.async_context);
@@ -3412,6 +3413,7 @@ pub const DB = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTracked(self.async_context);
@@ -3456,6 +3458,7 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
+        try self.enforceHAWriteGate();
         beginExternalDenseBulkSessionTracked(self.async_context);
         errdefer finishExternalDenseBulkSessionTracked(self.async_context);
         lockApply(self);
@@ -3466,6 +3469,7 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        try self.enforceHAWriteGate();
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
@@ -3477,6 +3481,7 @@ pub const DB = struct {
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         lockApply(self);
         defer self.core.unlockApply();
@@ -3505,6 +3510,7 @@ pub const DB = struct {
     }
 
     fn finishDenseAutoBulkIngestSessionWithOptionsInternal(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
+        try self.enforceHAWriteGate();
         try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTracked(self.async_context);
@@ -38092,6 +38098,21 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"client\"}" }},
     }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginBulkIngestSession());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginDenseAutoBulkIngestSession());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginPrimaryStoreAutoBulkIngestSession());
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.finishBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.finishDenseAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
+    );
 
     try db.batchReplicatedApply(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated\"}" }},
