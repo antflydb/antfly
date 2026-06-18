@@ -903,6 +903,16 @@ index-local metadata; they are not a second relational column store. Joins and
 `GROUP BY`-over-join are unchanged — they already exist (see `JOINS.md`,
 `ALGEBRAIC.md`).
 
+External base-source tables use the same typed row-plan envelope instead of a
+separate query API. When a relational table schema carries an
+`external_base_source`, the table-read source dispatches supported
+`rows:query` and global `rows:aggregate` plans through the lake row-scan hook,
+then adapts the projected lake rows back into the normal
+`RelationalRowsQueryResult` or `RelationalRowsAggregateResult` envelope.
+Unsupported plan features such as CTE ranges, grouped aggregates, expression
+aggregates, ordering, joins, windows, and broader predicates still fail closed
+until the lake executor implements those typed shapes directly.
+
 ### SQL adapter boundary
 
 Relational mode is the storage and API substrate that a SQL DSL can target. It
