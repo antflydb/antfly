@@ -1023,8 +1023,6 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
         .timeline_id = 0,
         .epoch = 0,
     };
-    var has_shard_id = false;
-    var has_table_id = false;
     var old_primary_id: ?[]const u8 = null;
     var promoted_node_id: ?[]const u8 = null;
     var new_timeline_id: ?u64 = null;
@@ -1040,11 +1038,9 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
             identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
         } else if (std.mem.eql(u8, arg, "--shard-id")) {
             _ = cursor.next();
-            has_shard_id = true;
             identity.shard_id = try parseU64(try cursor.value("--shard-id"));
         } else if (std.mem.eql(u8, arg, "--table-id")) {
             _ = cursor.next();
-            has_table_id = true;
             identity.table_id = try parseU64(try cursor.value("--table-id"));
         } else if (std.mem.eql(u8, arg, "--timeline-id")) {
             _ = cursor.next();
@@ -1082,8 +1078,6 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
     }
 
     if (identity.cluster_id == 0) return error.ClusterIdMissing;
-    if (!has_shard_id) return error.ShardIdMissing;
-    if (!has_table_id) return error.TableIdMissing;
     if (identity.timeline_id == 0) return error.TimelineIdMissing;
     if (identity.epoch == 0) return error.EpochMissing;
 
@@ -1118,8 +1112,6 @@ fn parseRejoin(cursor: *Cursor) !Command {
         .timeline_id = 0,
         .epoch = 0,
     };
-    var has_shard_id = false;
-    var has_table_id = false;
     var node_id: ?[]const u8 = null;
     var last_lsn: ?u64 = null;
     var policy = rejoin.RejoinPolicy{ .retained_from_lsn = 0 };
@@ -1147,11 +1139,9 @@ fn parseRejoin(cursor: *Cursor) !Command {
             identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
         } else if (std.mem.eql(u8, arg, "--shard-id")) {
             _ = cursor.next();
-            has_shard_id = true;
             identity.shard_id = try parseU64(try cursor.value("--shard-id"));
         } else if (std.mem.eql(u8, arg, "--table-id")) {
             _ = cursor.next();
-            has_table_id = true;
             identity.table_id = try parseU64(try cursor.value("--table-id"));
         } else if (std.mem.eql(u8, arg, "--timeline-id")) {
             _ = cursor.next();
@@ -1222,8 +1212,6 @@ fn parseRejoin(cursor: *Cursor) !Command {
     }
 
     if (identity.cluster_id == 0) return error.ClusterIdMissing;
-    if (!has_shard_id) return error.ShardIdMissing;
-    if (!has_table_id) return error.TableIdMissing;
     if (identity.timeline_id == 0) return error.TimelineIdMissing;
     if (identity.epoch == 0) return error.EpochMissing;
 
@@ -1881,10 +1869,6 @@ test "storage.ha admin cli parses fenced promotion request" {
         "acquire",
         "--cluster-id",
         "1",
-        "--shard-id",
-        "0",
-        "--table-id",
-        "0",
         "--timeline-id",
         "4",
         "--epoch",
@@ -1914,8 +1898,6 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
         "rejoin",              "assess",
         "--node-id",           "primary-a",
         "--cluster-id",        "1",
-        "--shard-id",          "0",
-        "--table-id",          "0",
         "--timeline-id",       "4",
         "--epoch",             "5",
         "--last-lsn",          "12",
@@ -1969,8 +1951,6 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
         "rejoin",                     "rewind",
         "--node-id",                  "primary-a",
         "--cluster-id",               "1",
-        "--shard-id",                 "0",
-        "--table-id",                 "0",
         "--timeline-id",              "4",
         "--epoch",                    "5",
         "--last-lsn",                 "12",
@@ -1994,8 +1974,6 @@ test "storage.ha admin cli parses former primary rejoin assessment" {
         "rejoin",                     "reseed",
         "--node-id",                  "primary-a",
         "--cluster-id",               "1",
-        "--shard-id",                 "0",
-        "--table-id",                 "0",
         "--timeline-id",              "4",
         "--epoch",                    "5",
         "--last-lsn",                 "12",
