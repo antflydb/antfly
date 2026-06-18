@@ -91,17 +91,53 @@ pub fn adapterNoopPlanMatchesReason(
     return planHasExactStringToken(plan, ":reason=", diagnostics.classificationReasonToken(reason));
 }
 
-fn planHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
-    var index: usize = 0;
-    var matches: usize = 0;
-    while (std.mem.indexOf(u8, plan[index..], token)) |relative| {
-        const value_start = index + relative + token.len;
+pub const PlanStringTokenScan = union(enum) {
+    absent,
+    value: []const u8,
+    invalid,
+};
+
+pub fn scanStringToken(plan: []const u8, token: []const u8) PlanStringTokenScan {
+    var start: usize = 0;
+    var found: ?[]const u8 = null;
+    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
+        const value_start = index + token.len;
         var value_end = value_start;
-        while (value_end < plan.len and plan[value_end] != ':') value_end += 1;
-        if (std.mem.eql(u8, plan[value_start..value_end], expected)) matches += 1;
-        index = value_end;
+        while (value_end < plan.len and plan[value_end] != ':') : (value_end += 1) {}
+        if (found != null) return .invalid;
+        found = plan[value_start..value_end];
+        start = index + token.len;
     }
-    return matches == 1;
+    if (found) |value| return .{ .value = value };
+    return .absent;
+}
+
+pub fn planHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
+    return switch (scanStringToken(plan, token)) {
+        .value => |value| std.mem.eql(u8, value, expected),
+        .absent, .invalid => false,
+    };
+}
+
+pub fn planHasStringToken(plan: []const u8, token: []const u8) bool {
+    return switch (scanStringToken(plan, token)) {
+        .value => |value| value.len > 0,
+        .absent, .invalid => false,
+    };
+}
+
+pub fn planTokenAbsent(plan: []const u8, token: []const u8) bool {
+    return switch (scanStringToken(plan, token)) {
+        .absent => true,
+        .value, .invalid => false,
+    };
+}
+
+pub fn planHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_values: []const []const u8) bool {
+    for (expected_values) |expected| {
+        if (planHasExactStringToken(plan, token, expected)) return true;
+    }
+    return false;
 }
 
 test "sql adapter corpus fingerprints unsupported and adapter no-op reasons" {
@@ -122,4 +158,20 @@ test "sql adapter corpus fingerprints unsupported and adapter no-op reasons" {
 
     try std.testing.expectError(error.UnsupportedSqlShape, unsupportedFingerprintAlloc(alloc, .write, .session_setting));
     try std.testing.expectError(error.UnsupportedSqlShape, adapterNoopFingerprintAlloc(alloc, "ddl", .set_operation_plan));
+}
+
+test "sql adapter corpus string token matching is exact and unique" {
+    const plan = "query:table=usage_records:claim=no_key_update_nowait:limit=none";
+    try std.testing.expect(planHasExactStringToken(plan, ":claim=", "no_key_update_nowait"));
+    try std.testing.expect(!planHasExactStringToken(plan, ":claim=", "no_key_update"));
+    try std.testing.expect(planHasStringToken(plan, ":limit="));
+    try std.testing.expect(planTokenAbsent(plan, ":offset="));
+    try std.testing.expect(planHasAnyExactStringToken(plan, ":claim=", &.{
+        "no_key_update",
+        "no_key_update_nowait",
+    }));
+
+    const duplicate = "read:query:table=usage_records:table=usage_records";
+    try std.testing.expect(!planHasExactStringToken(duplicate, ":table=", "usage_records"));
+    try std.testing.expect(!planHasStringToken(duplicate, ":table="));
 }

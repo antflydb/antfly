@@ -66333,53 +66333,24 @@ fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected:
     return value == expected;
 }
 
-const AppParityPlanStringTokenScan = union(enum) {
-    absent,
-    value: []const u8,
-    invalid,
-};
-
-fn appParityPlanScanStringToken(plan: []const u8, token: []const u8) AppParityPlanStringTokenScan {
-    var start: usize = 0;
-    var found: ?[]const u8 = null;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const value_start = index + token.len;
-        var value_end = value_start;
-        while (value_end < plan.len and plan[value_end] != ':') : (value_end += 1) {}
-        if (found != null) return .invalid;
-        found = plan[value_start..value_end];
-        start = index + token.len;
-    }
-    if (found) |value| return .{ .value = value };
-    return .absent;
+fn appParityPlanScanStringToken(plan: []const u8, token: []const u8) sql_adapter.PlanStringTokenScan {
+    return sql_adapter.scanStringToken(plan, token);
 }
 
 fn appParityPlanHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
-    return switch (appParityPlanScanStringToken(plan, token)) {
-        .value => |value| std.mem.eql(u8, value, expected),
-        .absent, .invalid => false,
-    };
+    return sql_adapter.planHasExactStringToken(plan, token, expected);
 }
 
 fn appParityPlanHasStringToken(plan: []const u8, token: []const u8) bool {
-    return switch (appParityPlanScanStringToken(plan, token)) {
-        .value => |value| value.len > 0,
-        .absent, .invalid => false,
-    };
+    return sql_adapter.planHasStringToken(plan, token);
 }
 
 fn appParityPlanTokenAbsent(plan: []const u8, token: []const u8) bool {
-    return switch (appParityPlanScanStringToken(plan, token)) {
-        .absent => true,
-        .value, .invalid => false,
-    };
+    return sql_adapter.planTokenAbsent(plan, token);
 }
 
 fn appParityPlanHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_values: []const []const u8) bool {
-    for (expected_values) |expected| {
-        if (appParityPlanHasExactStringToken(plan, token, expected)) return true;
-    }
-    return false;
+    return sql_adapter.planHasAnyExactStringToken(plan, token, expected_values);
 }
 
 fn appParityExplainPlanHasKind(plan: []const u8, expected: []const u8) bool {
