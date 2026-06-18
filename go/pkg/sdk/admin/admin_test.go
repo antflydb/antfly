@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -163,6 +168,57 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	if resp.Action.NodeId != "primary-a" {
 		t.Fatalf("Action.NodeId = %q, want primary-a", resp.Action.NodeId)
 	}
+}
+
+func TestHAClientPublicAPIDoesNotExposeGeneratedClient(t *testing.T) {
+	t.Parallel()
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to locate test file")
+	}
+	sourcePath := filepath.Join(filepath.Dir(file), "ha.go")
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, sourcePath, nil, 0)
+	if err != nil {
+		t.Fatalf("parse ha.go: %v", err)
+	}
+
+	for _, decl := range parsed.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || !fn.Name.IsExported() {
+			continue
+		}
+		if fn.Recv != nil && fn.Name.Name == "Client" {
+			t.Fatalf("HAClient must not expose the generated oapi client through an exported Client method")
+		}
+		if fn.Type.Params != nil && containsOAPISelector(fn.Type.Params) {
+			t.Fatalf("%s exposes generated oapi types in public HA wrapper parameters", fn.Name.Name)
+		}
+		if fn.Type.Results != nil && containsOAPISelector(fn.Type.Results) {
+			t.Fatalf("%s exposes generated oapi types in public HA wrapper results", fn.Name.Name)
+		}
+	}
+}
+
+func containsOAPISelector(node ast.Node) bool {
+	found := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		if found || n == nil {
+			return false
+		}
+		selector, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		ident, ok := selector.X.(*ast.Ident)
+		if ok && ident.Name == "oapi" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func TestHAClientCreateReplicationSlotRejectsMissingEvidence(t *testing.T) {

@@ -1912,11 +1912,10 @@ func NewHAClient(baseURL string, httpClient *http.Client) (*HAClient, error) {
 	if httpClient != nil {
 		opts = append(opts, oapi.WithHTTPClient(httpClient))
 	}
-	return NewHAClientWithOptions(baseURL, opts...)
+	return newHAClientWithOptions(baseURL, opts...)
 }
 
-// NewHAClientWithOptions creates a typed HA admin client with generated-client options.
-func NewHAClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*HAClient, error) {
+func newHAClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*HAClient, error) {
 	client, err := oapi.NewClientWithResponses(normalizeAdminBaseURL(baseURL), opts...)
 	if err != nil {
 		return nil, err
@@ -1935,11 +1934,6 @@ func (c *HAClient) WithToken(token string) *HAClient {
 		})
 	}
 	return c
-}
-
-// Client returns the underlying generated client for low-level operations.
-func (c *HAClient) Client() *oapi.ClientWithResponses {
-	return c.client
 }
 
 func acceptJSONEditor(_ context.Context, req *http.Request) error {
