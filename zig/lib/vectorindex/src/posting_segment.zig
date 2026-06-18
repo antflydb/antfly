@@ -2311,32 +2311,32 @@ pub fn compactSegmentsWithStatsAlloc(alloc: Allocator, segment_id: u64, segments
     stats.dropped_superseded_base_records = stats.input_base_records - stats.retained_base_records;
     stats.dropped_superseded_centroid_records = stats.input_centroid_records - stats.retained_centroid_records;
 
+    var retained_delta_records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
+    defer retained_delta_records.deinit(alloc);
+
     var posting_start: usize = 0;
     while (posting_start < deltas.items.len) {
         const posting_id = deltas.items[posting_start].posting_id;
         var posting_end = posting_start + 1;
         while (posting_end < deltas.items.len and deltas.items[posting_end].posting_id == posting_id) : (posting_end += 1) {}
 
-        {
-            var records = std.ArrayListUnmanaged(posting.PostingDeltaRecord).empty;
-            defer records.deinit(alloc);
-            var i = posting_start;
-            while (i < posting_end) {
-                var chosen = deltas.items[i];
-                var j = i + 1;
-                while (j < posting_end and deltas.items[j].record.sequence == chosen.record.sequence) : (j += 1) {
-                    chosen = deltas.items[j];
-                }
-                stats.dropped_duplicate_delta_records += j - i - 1;
-                try records.append(alloc, chosen.record);
-                stats.retained_delta_records += 1;
-                i = j;
+        retained_delta_records.clearRetainingCapacity();
+        var i = posting_start;
+        while (i < posting_end) {
+            var chosen = deltas.items[i];
+            var j = i + 1;
+            while (j < posting_end and deltas.items[j].record.sequence == chosen.record.sequence) : (j += 1) {
+                chosen = deltas.items[j];
             }
+            stats.dropped_duplicate_delta_records += j - i - 1;
+            try retained_delta_records.append(alloc, chosen.record);
+            stats.retained_delta_records += 1;
+            i = j;
+        }
 
-            if (records.items.len != 0) {
-                const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, records.items);
-                try writer.appendOwnedDelta(posting_id, records.items[0].sequence, encoded);
-            }
+        if (retained_delta_records.items.len != 0) {
+            const encoded = try posting.PostingFormat.encodeDeltaTail(alloc, retained_delta_records.items);
+            try writer.appendOwnedDelta(posting_id, retained_delta_records.items[0].sequence, encoded);
         }
         posting_start = posting_end;
     }
