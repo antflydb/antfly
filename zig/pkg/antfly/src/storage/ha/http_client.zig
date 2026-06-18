@@ -56,6 +56,7 @@ pub fn ParsedOutput(comptime T: type) type {
 pub const PrimaryStatusOptions = struct {
     max_lag_lsn: ?u64 = null,
     max_retained_bytes: ?u64 = null,
+    max_retained_age_ns: ?u64 = null,
     sync_policy: ?primary_mod.SyncPolicy = null,
 };
 
@@ -139,6 +140,9 @@ pub const Client = struct {
         }
         if (options.max_retained_bytes) |max_retained_bytes| {
             uri = try appendQueryU64(self.alloc, uri, "max_retained_bytes", max_retained_bytes);
+        }
+        if (options.max_retained_age_ns) |max_retained_age_ns| {
+            uri = try appendQueryU64(self.alloc, uri, "max_retained_age_ns", max_retained_age_ns);
         }
         if (options.sync_policy) |sync_policy| {
             uri = try appendQuerySyncPolicy(self.alloc, uri, sync_policy);

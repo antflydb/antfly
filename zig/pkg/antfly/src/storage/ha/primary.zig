@@ -318,9 +318,9 @@ pub const Primary = struct {
         policy: slot_store.RetentionPolicy,
     ) !slot_store.RetentionSnapshot {
         var snapshot = try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
-        snapshot.retained_byte_count = try self.retainedByteCount(snapshot);
-        while (policy.max_retained_bytes > 0 and
-            snapshot.retained_byte_count > policy.max_retained_bytes and
+        try self.fillRetainedMetrics(&snapshot);
+        while (((policy.max_retained_bytes > 0 and snapshot.retained_byte_count > policy.max_retained_bytes) or
+            (policy.max_retained_age_ns > 0 and snapshot.retained_age_ns > policy.max_retained_age_ns)) and
             snapshot.active_slots > 0 and
             snapshot.retained_lsn_count > 0)
         {
@@ -330,15 +330,26 @@ pub const Primary = struct {
             );
             if (marked == 0) break;
             snapshot = try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
-            snapshot.retained_byte_count = try self.retainedByteCount(snapshot);
+            try self.fillRetainedMetrics(&snapshot);
         }
         return snapshot;
+    }
+
+    fn fillRetainedMetrics(self: *Primary, snapshot: *slot_store.RetentionSnapshot) !void {
+        snapshot.retained_byte_count = try self.retainedByteCount(snapshot.*);
+        snapshot.retained_age_ns = try self.retainedAgeNs(snapshot.*);
     }
 
     fn retainedByteCount(self: *Primary, snapshot: slot_store.RetentionSnapshot) !u64 {
         if (snapshot.retained_lsn_count == 0) return 0;
         const from_lsn = @max(snapshot.oldest_restart_lsn, 1);
         return try self.log.encodedByteCount(from_lsn, snapshot.primary_lsn);
+    }
+
+    fn retainedAgeNs(self: *Primary, snapshot: slot_store.RetentionSnapshot) !u64 {
+        if (snapshot.retained_lsn_count == 0) return 0;
+        const from_lsn = @max(snapshot.oldest_restart_lsn, 1);
+        return try self.log.retainedAgeNs(from_lsn, snapshot.primary_lsn);
     }
 
     pub fn evaluateDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
@@ -888,6 +899,35 @@ test "storage.ha primary marks oldest slots when retained byte cap is exceeded" 
 
     const capped = try primary.retentionSnapshot(.{ .max_retained_bytes = current_only_bytes });
     try std.testing.expect(capped.retained_byte_count <= current_only_bytes);
+    try std.testing.expectEqual(@as(usize, 1), capped.active_slots);
+    try std.testing.expectEqual(@as(usize, 1), capped.reseed_recommended);
+    try std.testing.expectEqual(@as(u64, 3), capped.oldest_restart_lsn);
+
+    const old = primary.slot("old") orelse return error.TestExpectedEqual;
+    const current = primary.slot("current") orelse return error.TestExpectedEqual;
+    try std.testing.expect(old.reseed_required);
+    try std.testing.expect(!current.reseed_required);
+}
+
+test "storage.ha primary marks oldest slots when retained age cap is exceeded" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "retention-age-cap");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "one", .commit_timestamp_ns = 100 });
+    _ = try primary.append(.{ .payload = "two", .commit_timestamp_ns = 200 });
+    _ = try primary.append(.{ .payload = "three", .commit_timestamp_ns = 500 });
+    try primary.createSlot("old", 1);
+    try primary.createSlot("current", 3);
+
+    const uncapped = try primary.retentionSnapshot(.{});
+    try std.testing.expectEqual(@as(u64, 400), uncapped.retained_age_ns);
+
+    const capped = try primary.retentionSnapshot(.{ .max_retained_age_ns = 50 });
+    try std.testing.expect(capped.retained_age_ns <= 50);
     try std.testing.expectEqual(@as(usize, 1), capped.active_slots);
     try std.testing.expectEqual(@as(usize, 1), capped.reseed_recommended);
     try std.testing.expectEqual(@as(u64, 3), capped.oldest_restart_lsn);

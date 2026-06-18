@@ -3668,6 +3668,12 @@ spec:
                           Zero disables the cap.
                         format: int64
                         type: integer
+                      maxRetainedAgeNS:
+                        description: |-
+                          MaxRetainedAgeNS marks oldest standbys for reseed when retained WAL timestamp span exceeds this cap.
+                          Zero disables the cap.
+                        format: int64
+                        type: integer
                       maxRetainedBytes:
                         description: |-
                           MaxRetainedBytes marks oldest standbys for reseed when retained WAL bytes exceed this cap.

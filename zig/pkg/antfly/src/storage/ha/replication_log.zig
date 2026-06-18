@@ -138,6 +138,14 @@ pub const ReplicationLog = struct {
         return context.total;
     }
 
+    pub fn retainedAgeNs(self: *ReplicationLog, from_lsn: u64, to_lsn: u64) !u64 {
+        if (from_lsn == 0 or to_lsn < from_lsn) return 0;
+        var context = RetainedAgeContext{ .to_lsn = to_lsn };
+        try self.wal.iterateFromStreamingWithContext(from_lsn, &context, scanRetainedAge);
+        if (!context.has_timestamp) return 0;
+        return @intCast(context.max_timestamp_ns - context.min_timestamp_ns);
+    }
+
     pub fn truncate(self: *ReplicationLog, up_to_lsn: u64) !void {
         try self.wal.truncate(up_to_lsn);
     }
@@ -152,12 +160,32 @@ const EncodedByteCountContext = struct {
     total: u64 = 0,
 };
 
+const RetainedAgeContext = struct {
+    to_lsn: u64,
+    min_timestamp_ns: i64 = std.math.maxInt(i64),
+    max_timestamp_ns: i64 = std.math.minInt(i64),
+    has_timestamp: bool = false,
+};
+
 fn countEncodedBytes(context: *EncodedByteCountContext, entry: wal_mod.WalEntry) !wal_mod.WAL.ScanAction {
     if (entry.lsn > context.to_lsn) return .stop;
     const decoded = try replication_record.decode(entry.data);
     if (decoded.lsn != entry.lsn) return error.RecordWalLsnMismatch;
     if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
     context.total += @intCast(entry.data.len);
+    return .@"continue";
+}
+
+fn scanRetainedAge(context: *RetainedAgeContext, entry: wal_mod.WalEntry) !wal_mod.WAL.ScanAction {
+    if (entry.lsn > context.to_lsn) return .stop;
+    const decoded = try replication_record.decode(entry.data);
+    if (decoded.lsn != entry.lsn) return error.RecordWalLsnMismatch;
+    if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+    if (decoded.commit_timestamp_ns > 0) {
+        context.has_timestamp = true;
+        context.min_timestamp_ns = @min(context.min_timestamp_ns, decoded.commit_timestamp_ns);
+        context.max_timestamp_ns = @max(context.max_timestamp_ns, decoded.commit_timestamp_ns);
+    }
     return .@"continue";
 }
 
@@ -333,6 +361,29 @@ test "storage.ha replication log counts encoded retained bytes without materiali
     try std.testing.expectEqual(expected, try log.encodedByteCount(2, 3));
     try std.testing.expectEqual(@as(u64, 0), try log.encodedByteCount(4, 3));
     try std.testing.expectEqual(@as(u64, 0), try log.encodedByteCount(0, 3));
+}
+
+test "storage.ha replication log computes retained age from record timestamps" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "retained-age");
+    defer alloc.free(path);
+
+    var log = try ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+
+    var first = baseRecord(1, "one");
+    first.commit_timestamp_ns = 100;
+    var second = baseRecord(2, "two");
+    second.commit_timestamp_ns = 250;
+    var third = baseRecord(3, "three");
+    third.commit_timestamp_ns = 500;
+    _ = try log.append(alloc, first);
+    _ = try log.append(alloc, second);
+    _ = try log.append(alloc, third);
+
+    try std.testing.expectEqual(@as(u64, 400), try log.retainedAgeNs(1, 3));
+    try std.testing.expectEqual(@as(u64, 250), try log.retainedAgeNs(2, 3));
+    try std.testing.expectEqual(@as(u64, 0), try log.retainedAgeNs(4, 3));
 }
 
 test "storage.ha replication log truncates divergent suffix and reuses next lsn" {

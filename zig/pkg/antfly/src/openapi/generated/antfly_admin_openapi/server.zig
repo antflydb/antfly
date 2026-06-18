@@ -11,6 +11,8 @@ pub const GetHAPrimaryStatusParams = struct {
     max_lag_lsn: ?[]const u8 = null,
     /// Mark oldest slots reseed-recommended when retained WAL bytes exceed this cap.
     max_retained_bytes: ?[]const u8 = null,
+    /// Mark oldest slots reseed-recommended when retained WAL timestamp span exceeds this cap.
+    max_retained_age_ns: ?[]const u8 = null,
     /// Optional synchronous durability mode to evaluate.
     sync_mode: ?[]const u8 = null,
     /// How named standbys satisfy the synchronous policy.
@@ -234,6 +236,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const query_params = GetHAPrimaryStatusParams{
                 .max_lag_lsn = ctx.query("max_lag_lsn"),
                 .max_retained_bytes = ctx.query("max_retained_bytes"),
+                .max_retained_age_ns = ctx.query("max_retained_age_ns"),
                 .sync_mode = ctx.query("sync_mode"),
                 .sync_selection = ctx.query("sync_selection"),
                 .sync_required = ctx.query("sync_required"),

@@ -79,6 +79,7 @@ pub const SlotState = struct {
 pub const RetentionPolicy = struct {
     max_lag_lsn: u64 = 0,
     max_retained_bytes: u64 = 0,
+    max_retained_age_ns: u64 = 0,
 };
 
 pub const RetentionSnapshot = struct {
@@ -86,6 +87,7 @@ pub const RetentionSnapshot = struct {
     oldest_restart_lsn: u64,
     retained_lsn_count: u64,
     retained_byte_count: u64 = 0,
+    retained_age_ns: u64 = 0,
     active_slots: usize,
     reseed_recommended: usize,
 };

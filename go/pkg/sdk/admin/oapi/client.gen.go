@@ -913,6 +913,9 @@ type GetHAPrimaryStatusParams struct {
 	// MaxRetainedBytes Mark oldest slots reseed-recommended when retained WAL bytes exceed this cap.
 	MaxRetainedBytes uint64 `form:"max_retained_bytes,omitempty" json:"max_retained_bytes,omitempty,omitzero"`
 
+	// MaxRetainedAgeNs Mark oldest slots reseed-recommended when retained WAL timestamp span exceeds this cap.
+	MaxRetainedAgeNs uint64 `form:"max_retained_age_ns,omitempty" json:"max_retained_age_ns,omitempty,omitzero"`
+
 	// SyncMode Optional synchronous durability mode to evaluate.
 	SyncMode GetHAPrimaryStatusParamsSyncMode `form:"sync_mode,omitempty" json:"sync_mode,omitempty,omitzero"`
 
@@ -1920,6 +1923,18 @@ func NewGetHAPrimaryStatusRequest(server string, params *GetHAPrimaryStatusParam
 		}
 
 		if queryFrag, err := runtime.StyleParamWithLocation("form", true, "max_retained_bytes", runtime.ParamLocationQuery, params.MaxRetainedBytes); err != nil {
+			return nil, err
+		} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+			return nil, err
+		} else {
+			for k, v := range parsed {
+				for _, v2 := range v {
+					queryValues.Add(k, v2)
+				}
+			}
+		}
+
+		if queryFrag, err := runtime.StyleParamWithLocation("form", true, "max_retained_age_ns", runtime.ParamLocationQuery, params.MaxRetainedAgeNs); err != nil {
 			return nil, err
 		} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
 			return nil, err
@@ -4226,23 +4241,23 @@ var swaggerSpec = []string{
 	"e+Lu42tj6VfQ7Sthksc1B7HLZ2L2wImvJbUJYQtCee3APLEofgXdQtbBAhF3HOT0i5irgZNDvRv3SBoe",
 	"3ex7chWP1ziPQOK3mn0vfZa4W4FeAc4FFhKCFxt0bZfSuOjEjHFNN8QWK49ByfkvsyYDul+5WzWJ7Tl0",
 	"ugYN0rS6HTP5G5VfcZGm3OnoaXAowCW1YgxiTfmmia5fXF/iDbTMtPGvCjDSZeO3yZreh5nCHhaHxuCj",
-	"pNqDEP0UY+6TJ/Pj+YUL+8J9BvXVqhktd9HeOkGhTjoEH5nryc6qc6Nqf7SPTLyMu74ByFMXT5OattOk",
-	"pn1pUl1qI5lHYaZROIYm66iX3PCmogjNA5KUuhQ2KVvxTK0RZAZ59oPk/nqI3K+gBOr2MQJywqwpzNi6",
-	"LwtMn7MR+H5W+ryRhsRxmVWTROkNBgrNEJMu5dcRcl2e4hBuulejIg+TDKfbSYZTLaZ9SYYPnx91gorX",
-	"dI9MUO5FYo0yqdNCn89bqVe5786JvycsPpsEu99xj8Qmr8C78+95tdGtvhuVcu3rSaxI8QKXEtappjx3",
-	"jivYebAxIztBMnN3o/cvT/F5wM5HwkxPQtWDw83jw2SrWOBOsCi6AL0hTRG7l4MbJNl7rSFUSEY5mdd1",
-	"d+2NYjuh49ZO0z0BDm9tPjK9errF6TH6/8RC+RBRXFIpnyu/tUZtLaN7pCSB5gMXpldA80dS6k5m3qOr",
-	"c7c4ckTq5qUXH530KTM0JwsJasWNYuN2nai0PS0bR8YXwYbbfZuo92j46GYBPrmjEK0VG0GNTaub1n6Y",
-	"5ePzzAG7TDrdSi1Es24mrKKmeTcwmvKzcWDYSnR/AGMHMAyDAmD4nDRcttoa9y/J5ly5AdmJJ9/Gl4vK",
-	"3DGeE6ZIxd29IzsxVhcp7sOYef4HxnZgDNn9PWHMDqgHY4K7lMPaOSVBhdU40LxMpr4WTjSsesGU7tT0",
-	"UckjS72/+lHUX9lKiy2YeiZX1ZBK3p130oA60YhJn9OJSc/dIkqPpeM7Mq6fQdl3lSOLbZwhvTly+MWo",
-	"siXaJfoMTBfrqOvsd5+A/WCTQQuwN9e14fSzFGUMTFv7IrGBNK/MzEeXdA3JI0cfDwbAz7b6YQiAUdL8",
-	"0/6PLoX+RVT8aPEbkk8o/JmtUWdchSoWXDBPv2MA4PhelPyR4lMCwBUn7EPAFT7+jiFgB/iiMGBJPgwE",
-	"LqAxm9dnanZkotev+Poej+Q+9B3zeXLPobfqVgQvdQ0rz8iXtrfhR9kOiLbyhGPnjlxKa8nM+oEVoPYg",
-	"bUi+Ravezb58izrPqS41FB6kI2jHtSCGE1UQwCvosm+XtVWy6IhUhc9Pgc39W6o1ML+ZLdVaBPu2VDHJ",
-	"YmA0/aNPyDi9Oeoeg3tyQxSpwRKRNL71vWR2oRHCQ9QZ5S7OQhASXbwE5/nQPoQn+f752SginqSJWo/L",
-	"5kAfDU50VbJI3iT+EB66J67Tbk6PnnYw7U7wtD0sYzPpEmzY2tubFU0myf00Z6os6ObS/viOLVfk/Jay",
-	"os6Uf/j88P8BAAD//0HIgqnOqQAA",
+	"pNqDEP0UY+6TJ/Pj+YUL+8J9BvXVqhktd9HeOkGhvoUh+IvviSrRoTBjUYcNhi4h5acdjY8z9uSa1Zle",
+	"tXfdRydeLV7fZ+Spiyd9TdtJX9O+pK8utZE8qjBvKhxDk0PVS25471KE5gEpV10KmwS0eN7ZCDKDUwOD",
+	"5P56iNyvoATqdmUCcsIcMMw/uy8LTAa0+wn9rPRZMA2J4/LEJonSGwx7miEmXcqvI+S6rMsh3HSvRkUe",
+	"pkxOt1Mmp1pM+1ImHz4/6nQbr1AfmW7di8ROMaROcn0+36tes787J/7Ws/jcGOzlx/0rm4oD786/57VT",
+	"t5ZwVMq15yqxvsYLXBjZJQLluXPDwU6EjRnZCZKZu+m9f7GNzwN2PhJmetLDHhxuHh8mW6UPd4JF0QXo",
+	"DWlK8r0c3CDJ3gcPoUIyysm8riJs70fbCR23EpzuCdd4a/OR6dXTLbWP0f8nFsqHiOKSSvnM/60Vdyso",
+	"0CMlCTQfuMy+Apo/klJ38gwfXZ27pZ4jUjcvvfhYq08AojlZSFArbhQbNx9Fpe3Z3zgyvgg23O7btMNH",
+	"w0c3p/HJHYVo5dsIamyS4LT2wywfn2cO2GXS6VaiJJp1M2EVNc27gdEU040Dw9bV+wMYO4BhGBQAw2fY",
+	"4bLVVux/STbnyg3ITjz5Nr5cgOaO8ZwwRSrublHZibG65HIfxszzPzC2A2PI7u8JY3ZAPRgT3CVQ1s4p",
+	"CerFxoHmZTL1lX2iQeILpnSnQpFKHlnq/bWcov7KVpJvwdQzuaqGVPLuvJPU1IlGTPqcTkzh7paEeiwd",
+	"35E//gzKvqu4WmwbEOnNkcMvRpUt0S5taWDyW0ddZ7/7dPIHm9pagL2Hrw2nn6UoY2Da2uWJDaR5ZWY+",
+	"uqRrSB45+ngwAH62tRxDAIyS5p/2f3Qp9C+i4keL35B8QuHPbMU94ypUseCCefodAwDH96LkjxSfEgCu",
+	"1GIfAq7w8XcMATvAF4UBS/JhIHABjdm8PiG0I6++fsVXK3kk96Hv0NKTew69NcQieKkrcnlGvrS9DT/K",
+	"dkC0lfUcO0XlEnRLZtYPrAC1B2lDskda1Xv2ZY/UWVt14aTwWCBBO64FMZyoggBeQZd9u6ytAkxHpCp8",
+	"fgps7t9SrYH5zWyp1iLYt6WKSRYDo+kffULG6c1R91DfkxuiSEWZiKTxre8lTw2NEB4Jzyh3cRaCkOji",
+	"JTidiPYhPJf4z89GEfFcUNR6XDbHE2lwPq2SRfIm8UcK0T1xnXZzevS0g2l3HqntYRmbSZdgw9be3qxo",
+	"MknupzlTZUE3l/bHd2y5Iue3lBV13v/D54f/DwAA///cA/0CnKoAAA==",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
