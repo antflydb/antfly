@@ -4169,6 +4169,22 @@ fn applyLeafCentroidDelta(self: anytype, leaf: *types.Node, delta: []const f32) 
     posting.PostingStore.noteCentroidRefreshed(leaf);
 }
 
+fn applyLeafCentroidReplacementDelta(self: anytype, leaf: *types.Node, old_transformed: []const f32, new_transformed: []const f32) !void {
+    if (leaf.members.len == 0) {
+        @memset(leaf.centroid, 0);
+        return;
+    }
+    if (leaf.centroid.len != self.config.dims or old_transformed.len != self.config.dims or new_transformed.len != self.config.dims) {
+        return error.InvalidArgument;
+    }
+    const n: f32 = @floatFromInt(leaf.members.len);
+    for (leaf.centroid, old_transformed, new_transformed) |*c, old_value, new_value| {
+        c.* += (new_value - old_value) / n;
+    }
+    normalizeCentroidForMetric(self, leaf.centroid);
+    posting.PostingStore.noteCentroidRefreshed(leaf);
+}
+
 const DeferredLeafCentroidDelta = struct {
     leaf_id: u64,
     delta_sum: []f32,
@@ -5418,10 +5434,7 @@ fn tryUpdateExistingVectorInLeafTxnOptions(
     if (shouldDeferPostingCentroidRefresh(self, &existing_leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
     } else if (previous_transformed) |old_transformed| {
-        const delta_storage = try self.alloc.alloc(f32, self.config.dims);
-        defer self.alloc.free(delta_storage);
-        for (delta_storage, 0..) |*delta, i| delta.* = effective_transformed[i] - old_transformed[i];
-        applyLeafCentroidDelta(self, &existing_leaf, delta_storage) catch {
+        applyLeafCentroidReplacementDelta(self, &existing_leaf, old_transformed, effective_transformed) catch {
             try posting.PostingStore.recomputeCentroid(self, txn, &existing_leaf);
         };
     } else {
