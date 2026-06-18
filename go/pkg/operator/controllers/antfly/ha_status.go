@@ -2060,6 +2060,13 @@ func haEvaluatePrimaryRoute(cluster *antflyv1.AntflyCluster, status *antflyv1.HA
 			evaluation.FenceAuthority = promotion.FenceAuthority
 			evaluation.FenceGeneration = promotion.FenceGeneration
 			evaluation.DesiredTarget = promotion.PromotedStandbyID
+			if haPromotionAlreadyRecorded(cluster.Spec.HighAvailability, status) &&
+				currentFenceAuthority == "" &&
+				evaluation.CurrentTarget == evaluation.DesiredTarget &&
+				currentFenceGeneration != 0 &&
+				currentFenceGeneration == promotion.FenceGeneration {
+				currentFenceAuthority = promotion.FenceAuthority
+			}
 		}
 	}
 	if promotionTarget != "" {

@@ -4380,6 +4380,16 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5}`))
 	g.Expect(ok).To(BeFalse())
 
+	promotionAssess, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":0,"received_lsn":0,"applied_lsn":0,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`))
+	g.Expect(ok).To(BeTrue())
+	g.Expect(promotionAssess.PromotionRequiredLSN).To(Equal(uint64(0)))
+	g.Expect(promotionAssess.PromotionReceivedLSN).To(Equal(uint64(0)))
+	g.Expect(promotionAssess.PromotionAppliedLSN).To(Equal(uint64(0)))
+	g.Expect(promotionAssess.PromotionSafe).To(BeTrue())
+
+	_, ok = parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion_assess:standby-a","action_kind":"promotion_assess","target":"standby-a","state":"assessed","node_id":"standby-a"},"assessment":{"required_lsn":0,"received_lsn":0,"applied_lsn":0,"has_required_lsn":false,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true}}`))
+	g.Expect(ok).To(BeFalse())
+
 	finish, ok := parseHADirectAdminActionResult([]byte(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":8}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(finish.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))

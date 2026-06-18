@@ -4400,7 +4400,8 @@ func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultSt
 		return nil, false
 	}
 	if strings.TrimSpace(result.Action.ActionKind) == "promotion_assess" &&
-		!haPromotionAssessmentJSONComplete(result.Assessment) {
+		(!haPromotionAssessmentJSONComplete(result.Assessment) ||
+			!haPromotionAssessmentJSONConsistent(result.Assessment)) {
 		return nil, false
 	}
 	status := &antflyv1.HAAdminActionResultStatus{
@@ -5578,9 +5579,6 @@ func haPromotionAssessmentJSONConsistent(assessment haPromotionAssessmentJSON) b
 	requiredLSN := haUint64JSONValue(assessment.RequiredLSN)
 	receivedLSN := haUint64JSONValue(assessment.ReceivedLSN)
 	appliedLSN := haUint64JSONValue(assessment.AppliedLSN)
-	if requiredLSN == 0 {
-		return false
-	}
 	hasRequiredLSN := receivedLSN >= requiredLSN
 	caughtUpToReceived := appliedLSN >= receivedLSN
 	dataLossPossible := !hasRequiredLSN || !caughtUpToReceived || appliedLSN < requiredLSN
