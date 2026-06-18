@@ -2711,6 +2711,16 @@ fn transactionAccessModeFromSyntax(syntax: ?sql_adapter.TransactionAccessModeSyn
     };
 }
 
+fn reindexMaintenanceTargetFromSyntax(syntax: sql_adapter.ReindexMaintenanceTargetSyntax) ReindexMaintenanceTarget {
+    return switch (syntax) {
+        .index => .index,
+        .table => .table,
+        .schema => .schema,
+        .database => .database,
+        .system => .system,
+    };
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3773,111 +3783,41 @@ const Parser = struct {
     }
 
     fn parseVacuumMaintenanceDdl(self: *@This()) !VacuumMaintenancePlan {
-        var full = false;
-        var freeze = false;
-        var verbose = false;
-        var analyze = false;
-        if (self.match(.lparen) != null) {
-            while (true) {
-                if (self.matchKeyword("full")) {
-                    full = true;
-                } else if (self.matchKeyword("freeze")) {
-                    freeze = true;
-                } else if (self.matchKeyword("verbose")) {
-                    verbose = true;
-                } else if (self.matchKeyword("analyze")) {
-                    analyze = true;
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
-                if (self.match(.comma) == null) break;
-            }
-            try self.expect(.rparen);
-        } else {
-            while (true) {
-                if (self.matchKeyword("full")) {
-                    full = true;
-                } else if (self.matchKeyword("freeze")) {
-                    freeze = true;
-                } else if (self.matchKeyword("verbose")) {
-                    verbose = true;
-                } else if (self.matchKeyword("analyze")) {
-                    analyze = true;
-                } else {
-                    break;
-                }
-            }
-        }
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_transferred = false;
-        errdefer if (!table_transferred) self.alloc.free(table_name);
-        if (self.match(.lparen) != null) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        table_transferred = true;
-        return .{ .table_name = table_name, .full = full, .freeze = freeze, .verbose = verbose, .analyze = analyze };
+        var syntax = try sql_adapter.parseVacuumMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const table_name = syntax.table_name;
+        syntax.table_name = "";
+        return .{ .table_name = table_name, .full = syntax.full, .freeze = syntax.freeze, .verbose = syntax.verbose, .analyze = syntax.analyze };
     }
 
     fn parseAnalyzeMaintenanceDdl(self: *@This()) !AnalyzeMaintenancePlan {
-        const verbose = self.matchKeyword("verbose");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_transferred = false;
-        errdefer if (!table_transferred) self.alloc.free(table_name);
-        var column_count: usize = 0;
-        if (self.match(.lparen) != null) {
-            while (true) {
-                const column = try self.parseIdentifierOwned();
-                defer self.alloc.free(column);
-                column_count += 1;
-                if (self.match(.comma) == null) break;
-            }
-            try self.expect(.rparen);
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        table_transferred = true;
-        return .{ .table_name = table_name, .verbose = verbose, .column_count = column_count };
+        var syntax = try sql_adapter.parseAnalyzeMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const table_name = syntax.table_name;
+        syntax.table_name = "";
+        return .{ .table_name = table_name, .verbose = syntax.verbose, .column_count = syntax.column_count };
     }
 
     fn parseReindexMaintenanceDdl(self: *@This()) !ReindexMaintenancePlan {
-        const target: ReindexMaintenanceTarget = if (self.matchKeyword("index"))
-            .index
-        else if (self.matchKeyword("table"))
-            .table
-        else if (self.matchKeyword("schema"))
-            .schema
-        else if (self.matchKeyword("database"))
-            .database
-        else if (self.matchKeyword("system"))
-            .system
-        else
-            return error.UnsupportedSqlShape;
-        const concurrently = self.matchKeyword("concurrently");
-        const name = try self.parseSqlObjectIdentifierOwned();
-        var name_transferred = false;
-        errdefer if (!name_transferred) self.alloc.free(name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        name_transferred = true;
-        return .{ .target = target, .name = name, .concurrently = concurrently };
+        var syntax = try sql_adapter.parseReindexMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const name = syntax.name;
+        syntax.name = "";
+        return .{
+            .target = reindexMaintenanceTargetFromSyntax(syntax.target),
+            .name = name,
+            .concurrently = syntax.concurrently,
+        };
     }
 
     fn parseClusterMaintenanceDdl(self: *@This()) !ClusterMaintenancePlan {
-        const verbose = self.matchKeyword("verbose");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_transferred = false;
-        errdefer if (!table_transferred) self.alloc.free(table_name);
-        var index_name: ?[]const u8 = null;
-        var index_transferred = false;
-        errdefer if (!index_transferred) if (index_name) |name| self.alloc.free(name);
-        if (self.matchKeyword("using")) {
-            index_name = try self.parseSqlObjectIdentifierOwned();
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        table_transferred = true;
-        index_transferred = true;
-        return .{ .table_name = table_name, .index_name = index_name, .verbose = verbose };
+        var syntax = try sql_adapter.parseClusterMaintenanceTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const table_name = syntax.table_name;
+        const index_name = syntax.index_name;
+        syntax.table_name = "";
+        syntax.index_name = null;
+        return .{ .table_name = table_name, .index_name = index_name, .verbose = syntax.verbose };
     }
 
     fn parsePrepareStatementDdl(self: *@This()) !PrepareStatementPlan {

@@ -418,12 +418,16 @@ const SupportedColumnMode = union(enum) {
 
 const PlainI32Mode = enum {
     required,
+    optional,
     dictionary_required,
+    dictionary_optional,
 };
 
 const ByteArrayMode = enum {
     required,
+    optional,
     dictionary_required,
+    dictionary_optional,
 };
 
 const PlainI64ModeRequest = union(enum) {
@@ -514,9 +518,21 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded_columns[idx] = .{ .i64 = try parquet_page.scanPlainI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
                 },
+                .optional => {
+                    var decoded = try parquet_page.scanOptionalPlainI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .i64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
+                },
                 .dictionary_required => {
                     decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
+                },
+                .dictionary_optional => {
+                    var decoded = try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .i64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
                 },
             },
             .bytes => |byte_mode| switch (byte_mode) {
@@ -524,9 +540,21 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded_columns[idx] = .{ .bytes = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
                 },
+                .optional => {
+                    var decoded = try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .bytes = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
+                },
                 .dictionary_required => {
                     decoded_columns[idx] = .{ .bytes = try parquet_page.scanDictionaryByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
+                },
+                .dictionary_optional => {
+                    var decoded = try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .bytes = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
                 },
             },
         }
@@ -1062,19 +1090,19 @@ fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !Suppor
         return .{ .i64 = try plainI64ModeForColumnChunk(chunk) };
     }
     if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32")) {
-        if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .i32 = .required };
+        if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .i32 = if (chunk.nullable) .optional else .required };
         if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
             std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
         {
-            return .{ .i32 = .dictionary_required };
+            return .{ .i32 = if (chunk.nullable) .dictionary_optional else .dictionary_required };
         }
     }
     if (std.ascii.eqlIgnoreCase(chunk.physical_type, "byte_array")) {
-        if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .bytes = .required };
+        if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .bytes = if (chunk.nullable) .optional else .required };
         if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
             std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
         {
-            return .{ .bytes = .dictionary_required };
+            return .{ .bytes = if (chunk.nullable) .dictionary_optional else .dictionary_required };
         }
     }
     return error.UnsupportedParquetPage;
@@ -1639,6 +1667,111 @@ fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: All
     }
 }
 
+fn appendOptionalPlainI32DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?i32) !void {
+    var present_count: usize = 0;
+    for (values) |maybe| {
+        if (maybe != null) present_count += 1;
+    }
+    const level_group_count = (values.len + 7) / 8;
+    const definition_level_bytes: i32 = @intCast(1 + level_group_count);
+    const byte_len: i32 = @intCast(@as(usize, @intCast(definition_level_bytes)) + present_count * 4);
+    const null_count: i32 = @intCast(values.len - present_count);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 3);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 8, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, null_count);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 0);
+    try appendField(out, alloc, &data_prev, 5, .i32);
+    try appendI32(out, alloc, definition_level_bytes);
+    try appendField(out, alloc, &data_prev, 6, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try appendVarint(out, alloc, (@as(u64, @intCast(level_group_count)) << 1) | 1);
+    var packed_levels = try alloc.alloc(u8, level_group_count);
+    defer alloc.free(packed_levels);
+    @memset(packed_levels, 0);
+    for (values, 0..) |maybe, idx| {
+        if (maybe != null) packed_levels[idx / 8] |= @as(u8, 1) << @intCast(idx % 8);
+    }
+    try out.appendSlice(alloc, packed_levels);
+    for (values) |maybe| {
+        const value = maybe orelse continue;
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(i32, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
+fn appendOptionalPlainByteArrayDataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?[]const u8) !void {
+    var present_byte_len: usize = 0;
+    var present_count: usize = 0;
+    for (values) |maybe| {
+        if (maybe) |value| {
+            present_count += 1;
+            present_byte_len += 4 + value.len;
+        }
+    }
+    const level_group_count = (values.len + 7) / 8;
+    const definition_level_bytes: i32 = @intCast(1 + level_group_count);
+    const byte_len: i32 = @intCast(@as(usize, @intCast(definition_level_bytes)) + present_byte_len);
+    const null_count: i32 = @intCast(values.len - present_count);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 3);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 8, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, null_count);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 0);
+    try appendField(out, alloc, &data_prev, 5, .i32);
+    try appendI32(out, alloc, definition_level_bytes);
+    try appendField(out, alloc, &data_prev, 6, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try appendVarint(out, alloc, (@as(u64, @intCast(level_group_count)) << 1) | 1);
+    var packed_levels = try alloc.alloc(u8, level_group_count);
+    defer alloc.free(packed_levels);
+    @memset(packed_levels, 0);
+    for (values, 0..) |maybe, idx| {
+        if (maybe != null) packed_levels[idx / 8] |= @as(u8, 1) << @intCast(idx % 8);
+    }
+    try out.appendSlice(alloc, packed_levels);
+    for (values) |maybe| {
+        const value = maybe orelse continue;
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(value.len), .little);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, value);
+    }
+}
+
 test "parquet row group batch assembles decoded i64 columns with external row refs" {
     const alloc = std.testing.allocator;
     var inventory = external_source.Inventory{
@@ -2114,6 +2247,115 @@ test "parquet row group batch dispatches int32 columns from inventory" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+}
+
+test "parquet row group batch dispatches nullable int32 and byte array columns from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = 100,
+            .total_byte_len = 512,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "age"),
+                    .file_offset = 100,
+                    .compressed_len = 64,
+                    .uncompressed_len = 64,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int32"),
+                    .nullable = true,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "rank"),
+                    .file_offset = 164,
+                    .compressed_len = 64,
+                    .uncompressed_len = 64,
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                    .physical_type = try alloc.dupe(u8, "int32"),
+                    .nullable = true,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "tag"),
+                    .file_offset = 228,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "byte_array"),
+                    .nullable = true,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "tenant"),
+                    .file_offset = 324,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                    .physical_type = try alloc.dupe(u8, "byte_array"),
+                    .nullable = true,
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var age_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer age_chunk.deinit(alloc);
+    try appendOptionalPlainI32DataPageV2(&age_chunk, alloc, &[_]?i32{ 10, null, 30 });
+
+    var rank_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer rank_chunk.deinit(alloc);
+    try appendPlainI32DictionaryPage(&rank_chunk, alloc, &[_]i32{ 1, 2 });
+    try appendOptionalDictionaryI64DataPageV2(&rank_chunk, alloc, &[_]?u8{ 0, null, 1 }, 1, &[_]u8{ 3, 0b00000010 });
+
+    var tag_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer tag_chunk.deinit(alloc);
+    try appendOptionalPlainByteArrayDataPageV2(&tag_chunk, alloc, &[_]?[]const u8{ "alpha", null, "omega" });
+
+    var tenant_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer tenant_chunk.deinit(alloc);
+    try appendPlainByteArrayDictionaryPage(&tenant_chunk, alloc, &[_][]const u8{ "t1", "t2" });
+    try appendOptionalDictionaryI64DataPageV2(&tenant_chunk, alloc, &[_]?u8{ 0, null, 1 }, 1, &[_]u8{ 3, 0b00000010 });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "age", .bytes = age_chunk.items },
+        .{ .column_id = "rank", .bytes = rank_chunk.items },
+        .{ .column_id = "tag", .bytes = tag_chunk.items },
+        .{ .column_id = "tenant", .bytes = tenant_chunk.items },
+    });
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 0, 30 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[0].nulls.bytes);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 0, 2 }, owned.batch.columns[1].values.i64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[1].nulls.bytes);
+    try std.testing.expectEqualStrings("alpha", owned.batch.columns[2].values.bytes[0]);
+    try std.testing.expectEqualStrings("", owned.batch.columns[2].values.bytes[1]);
+    try std.testing.expectEqualStrings("omega", owned.batch.columns[2].values.bytes[2]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[2].nulls.bytes);
+    try std.testing.expectEqualStrings("t1", owned.batch.columns[3].values.bytes[0]);
+    try std.testing.expectEqualStrings("", owned.batch.columns[3].values.bytes[1]);
+    try std.testing.expectEqualStrings("t2", owned.batch.columns[3].values.bytes[2]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[3].nulls.bytes);
+
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "age", "rank", "tag", "tenant" });
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 }
 
 test "parquet row group batch dispatches dictionary byte array columns from inventory" {

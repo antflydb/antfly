@@ -1075,7 +1075,8 @@ syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 tails, cursor portal grammar for `DECLARE` scroll/hold prefixes plus `FETCH`
 direction/count tails, transaction-control grammar for `LOCK TABLE`,
 `SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
-mode clauses, prepared-statement subject classification for read, write, and DDL
+mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
+`CLUSTER`, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -4346,9 +4347,10 @@ work instead of just the typed plan it would execute.
 
 Maintenance and transaction-mode SQL also stays out of storage until it maps to
 native typed work. Table-targeted `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER`
-lower to typed maintenance-job intents that capture target table or index scope
-and supported options, then fail closed when applied to table schema or runtime
-storage. The production shape is a durable maintenance-job model with
+syntax parses in `api/sql_adapter/grammar.zig` before `relational_sql.zig`
+allocates typed maintenance-job intents that capture target table, index, or
+catalog scope and supported options, then fail closed when applied to table
+schema or runtime storage. The production shape is a durable maintenance-job model with
 table/index generations, range ownership, leases, throttling, resumable
 progress, repair/rebuild integration, stats output, and catalog promotion
 semantics. `LOCK TABLE`, `SET CONSTRAINTS`, `SET TRANSACTION`, `START
