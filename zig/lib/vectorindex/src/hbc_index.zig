@@ -8498,18 +8498,20 @@ pub fn buildBulkDocKeySeeded(
     inputs: []const bulk_build.PreparedBulkBuildInput,
 ) !BuiltBulkNode {
     const Entry = struct {
-        input: bulk_build.PreparedBulkBuildInput,
+        input_index: usize,
     };
 
     const entries = try self.alloc.alloc(Entry, inputs.len);
     defer self.alloc.free(entries);
-    for (inputs, 0..) |input, i| entries[i] = .{ .input = input };
+    for (entries, 0..) |*entry, i| entry.* = .{ .input_index = i };
 
-    std.mem.sort(Entry, entries, {}, struct {
-        fn lessThan(_: void, a: Entry, b: Entry) bool {
-            return switch (std.mem.order(u8, a.input.metadata, b.input.metadata)) {
+    std.mem.sort(Entry, entries, inputs, struct {
+        fn lessThan(source: []const bulk_build.PreparedBulkBuildInput, a: Entry, b: Entry) bool {
+            const left = source[a.input_index];
+            const right = source[b.input_index];
+            return switch (std.mem.order(u8, left.metadata, right.metadata)) {
                 .lt => true,
-                .eq => a.input.vector_id < b.input.vector_id,
+                .eq => left.vector_id < right.vector_id,
                 .gt => false,
             };
         }
@@ -8532,7 +8534,7 @@ pub fn buildBulkDocKeySeeded(
         const node_id = self.nextNodeId();
         const group_inputs = group_inputs_scratch[0..group_size];
         for (0..group_size) |i| {
-            group_inputs[i] = entries[entry_cursor + i].input;
+            group_inputs[i] = inputs[entries[entry_cursor + i].input_index];
         }
         current[current_count] = try buildBulkLeaf(self, txn, node_id, group_inputs, 0, 0);
         current_count += 1;
