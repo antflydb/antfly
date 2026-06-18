@@ -329,6 +329,14 @@ class HACluster:
         )
         assert begun["slot_name"] == "standby-a"
         assert begun["manifest_id"] == manifest_id
+        _assert_action_receipt(
+            begun,
+            action_id=f"base_backup_begin:{manifest_id}",
+            action_kind="base_backup_begin",
+            target=manifest_id,
+            state="applied",
+            node_id=self.primary.node_id,
+        )
         backup_lsn = int(begun["backup_lsn"])
         manifest_path = backup_root / "backup.afha"
         manifest_path.write_bytes(
@@ -353,6 +361,14 @@ class HACluster:
         assert finished["manifest_id"] == manifest_id
         assert int(finished["backup_lsn"]) == backup_lsn
         assert int(finished["end_record_lsn"]) >= backup_lsn
+        _assert_action_receipt(
+            finished,
+            action_id=f"base_backup_finish:{manifest_id}",
+            action_kind="base_backup_finish",
+            target=manifest_id,
+            state="applied",
+            node_id=self.primary.node_id,
+        )
         return {
             "backup_lsn": backup_lsn,
             "content_root": backup_root,
@@ -521,6 +537,24 @@ def _promotion_fence_request(cluster: HACluster, required_lsn: int) -> dict[str,
     }
 
 
+def _assert_action_receipt(
+    response: dict[str, Any],
+    *,
+    action_id: str,
+    action_kind: str,
+    target: str,
+    state: str,
+    node_id: str,
+) -> dict[str, Any]:
+    action = response["action"]
+    assert action["action_id"] == action_id
+    assert action["action_kind"] == action_kind
+    assert action["target"] == target
+    assert action["state"] == state
+    assert action["node_id"] == node_id
+    return action
+
+
 def _binary_supports_ha_swarm(binary: str) -> bool:
     result = subprocess.run(
         [binary, "swarm", "--help"],
@@ -585,6 +619,14 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert bootstrapped["manifest_id"] == seed["manifest_id"]
     assert int(bootstrapped["backup_lsn"]) == seed["backup_lsn"]
     assert int(bootstrapped["checkpoint_lsn"]) == seed["backup_lsn"]
+    _assert_action_receipt(
+        bootstrapped,
+        action_id=f"standby_bootstrap:{seed['manifest_id']}",
+        action_kind="standby_bootstrap",
+        target=seed["manifest_id"],
+        state="applied",
+        node_id="standby-a",
+    )
 
     ha_cluster.standby.restart()
 
@@ -723,24 +765,72 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
 
     fence_request = _promotion_fence_request(ha_cluster, second_lsn)
     fence = ha_cluster.standby.admin_post("/fence", fence_request)
+    _assert_action_receipt(
+        fence,
+        action_id="fence_acquire:standby-a",
+        action_kind="fence_acquire",
+        target="standby-a",
+        state="applied",
+        node_id="standby-a",
+    )
     assert fence["receipt"]["promoted_node_id"] == "standby-a"
     assert fence["receipt"]["old_primary_id"] == "primary-a"
+    assert fence["receipt"]["parent_timeline_id"] == 1
+    assert fence["receipt"]["parent_epoch"] == 1
     assert fence["receipt"]["new_timeline_id"] == 2
+    assert fence["receipt"]["new_epoch"] == 2
+    assert fence["receipt"]["required_lsn"] == second_lsn
+    assert fence["receipt"]["observed_lsn"] == second_lsn
+    assert fence["receipt"]["generation"] >= 1
+    assert fence["receipt"]["forced"] is False
+    assert fence["receipt"]["token"]
 
     assessment = ha_cluster.standby.admin_post(
         "/promotion/assess",
         {"required_lsn": second_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
     )
+    _assert_action_receipt(
+        assessment,
+        action_id="promotion_assess:standby-a",
+        action_kind="promotion_assess",
+        target="standby-a",
+        state="assessed",
+        node_id="standby-a",
+    )
     assert assessment["assessment"]["can_promote"] is True
     assert assessment["assessment"]["fencing_confirmed"] is True
+    assert assessment["assessment"]["mode"] == "safe"
+    assert assessment["assessment"]["force"] is False
+    assert assessment["assessment"]["requires_force"] is False
 
     promoted = ha_cluster.standby.admin_post("/promotion/current-fence", {})
+    _assert_action_receipt(
+        promoted,
+        action_id="promotion:standby-a",
+        action_kind="promotion",
+        target="standby-a",
+        state="applied",
+        node_id="standby-a",
+    )
     assert promoted["promotion"]["node_id"] == "standby-a"
     assert promoted["promotion"]["new_identity"]["timeline_id"] == 2
     assert promoted["promotion"]["new_identity"]["epoch"] == 2
     assert promoted["promotion"]["switch_lsn"] == second_lsn + 1
+    assert promoted["promotion"]["forced"] is False
+    assert promoted["promotion"]["data_loss_possible"] is False
+    assert promoted["forced"] is False
+    assert promoted["fence_generation"] == fence["receipt"]["generation"]
+    assert promoted["fence_token"] == fence["receipt"]["token"]
 
     primary_fence = ha_cluster.primary.admin_post("/fence", fence_request)
+    _assert_action_receipt(
+        primary_fence,
+        action_id="fence_acquire:standby-a",
+        action_kind="fence_acquire",
+        target="standby-a",
+        state="applied",
+        node_id="standby-a",
+    )
     assert primary_fence["receipt"]["promoted_node_id"] == "standby-a"
     fenced_write_check = ha_cluster.primary.admin_post(
         "/write/check",
@@ -757,7 +847,14 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         "allow_rewind_after_forced_promotion": False,
     }
     unfenced_rejoin = ha_cluster.primary.admin_post("/rejoin/assess", rejoin_request)
-    assert unfenced_rejoin["action"]["action_kind"] == "rejoin_assess"
+    _assert_action_receipt(
+        unfenced_rejoin,
+        action_id="rejoin_assess:primary-a",
+        action_kind="rejoin_assess",
+        target="primary-a",
+        state="assessed",
+        node_id="primary-a",
+    )
     assert unfenced_rejoin["assessment"]["action"] == "reject_unfenced"
     assert unfenced_rejoin["assessment"]["reason"] == "no_fence"
 
@@ -767,6 +864,14 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         "receipt": fence["receipt"],
     }
     rejoin_assessment = ha_cluster.primary.admin_post("/rejoin/assess", reseed_rejoin_request)
+    _assert_action_receipt(
+        rejoin_assessment,
+        action_id="rejoin_assess:primary-a",
+        action_kind="rejoin_assess",
+        target="primary-a",
+        state="assessed",
+        node_id="primary-a",
+    )
     assert rejoin_assessment["assessment"]["action"] == "reseed"
     assert rejoin_assessment["assessment"]["reason"] == "parent_timeline_wal_expired"
     assert rejoin_assessment["assessment"]["former_node_id"] == "primary-a"
@@ -775,9 +880,14 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert rejoin_assessment["assessment"]["fork_lsn"] == second_lsn
 
     rejoin_reseed = ha_cluster.primary.admin_post("/rejoin/reseed", reseed_rejoin_request)
-    assert rejoin_reseed["action"]["action_kind"] == "rejoin_reseed"
-    assert rejoin_reseed["action"]["state"] == "applied"
-    assert rejoin_reseed["action"]["target"] == "primary-a"
+    _assert_action_receipt(
+        rejoin_reseed,
+        action_id="rejoin_reseed:primary-a",
+        action_kind="rejoin_reseed",
+        target="primary-a",
+        state="applied",
+        node_id="primary-a",
+    )
     assert rejoin_reseed["reseed"]["node_id"] == "primary-a"
     assert rejoin_reseed["reseed"]["slot_name"] == "primary-a"
     assert rejoin_reseed["reseed"]["reseed_required"] is True
