@@ -35,6 +35,7 @@ pub const QMatmulVariant = enum {
     fast_r2c4,
     fast_r2c8,
     fast_r4c4,
+    tc_hmma,
 };
 
 pub const KernelModule = struct {
@@ -86,6 +87,10 @@ pub const KernelModule = struct {
     linear_q8_0_bias_f32_fast_r4c4: driver_mod.CUfunction = null,
     linear_q8_0_bias_gelu_f32_fast_r4c4: driver_mod.CUfunction = null,
     linear_q8_0_bias_add_f32_fast_r4c4: driver_mod.CUfunction = null,
+    linear_q8_0_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q8_0_bias_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q8_0_bias_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q8_0_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_0_f32: driver_mod.CUfunction = null,
     linear_q4_k_f32: driver_mod.CUfunction = null,
     linear_q4_k_bias_f32: driver_mod.CUfunction = null,
@@ -103,6 +108,10 @@ pub const KernelModule = struct {
     linear_q4_k_bias_f32_fast_r4c4: driver_mod.CUfunction = null,
     linear_q4_k_bias_gelu_f32_fast_r4c4: driver_mod.CUfunction = null,
     linear_q4_k_bias_add_f32_fast_r4c4: driver_mod.CUfunction = null,
+    linear_q4_k_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_k_bias_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_k_bias_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_k_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_bias_quick_gelu_f32_tile4: driver_mod.CUfunction = null,
     linear_q4_k_bias_relu_f32_tile4: driver_mod.CUfunction = null,
     linear_q4_k_bias_relu_f32_tile4_r2: driver_mod.CUfunction = null,
@@ -211,6 +220,10 @@ pub const KernelModule = struct {
         const linear_q8_0_bias_f32_fast_r4c4 = loadOptionalKernel(ctx, module, "termite_linear_q8_0_bias_f32_fast_r4c4");
         const linear_q8_0_bias_gelu_f32_fast_r4c4 = loadOptionalKernel(ctx, module, "termite_linear_q8_0_bias_gelu_f32_fast_r4c4");
         const linear_q8_0_bias_add_f32_fast_r4c4 = loadOptionalKernel(ctx, module, "termite_linear_q8_0_bias_add_f32_fast_r4c4");
+        const linear_q8_0_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q8_0_f32_tc_hmma");
+        const linear_q8_0_bias_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q8_0_bias_f32_tc_hmma");
+        const linear_q8_0_bias_gelu_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q8_0_bias_gelu_f32_tc_hmma");
+        const linear_q8_0_bias_add_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q8_0_bias_add_f32_tc_hmma");
         var linear_q4_0_f32: driver_mod.CUfunction = null;
         const q4_result = ctx.driver.fns.cuModuleGetFunction(&linear_q4_0_f32, module, "termite_linear_q4_0_f32");
         if (q4_result != driver_mod.CUDA_SUCCESS) {
@@ -242,6 +255,10 @@ pub const KernelModule = struct {
         const linear_q4_k_bias_f32_fast_r4c4 = loadOptionalKernel(ctx, module, "termite_linear_q4_k_bias_f32_fast_r4c4");
         const linear_q4_k_bias_gelu_f32_fast_r4c4 = loadOptionalKernel(ctx, module, "termite_linear_q4_k_bias_gelu_f32_fast_r4c4");
         const linear_q4_k_bias_add_f32_fast_r4c4 = loadOptionalKernel(ctx, module, "termite_linear_q4_k_bias_add_f32_fast_r4c4");
+        const linear_q4_k_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q4_k_f32_tc_hmma");
+        const linear_q4_k_bias_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q4_k_bias_f32_tc_hmma");
+        const linear_q4_k_bias_gelu_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q4_k_bias_gelu_f32_tc_hmma");
+        const linear_q4_k_bias_add_f32_tc_hmma = loadOptionalKernel(ctx, module, "termite_linear_q4_k_bias_add_f32_tc_hmma");
         var linear_q4_k_bias_quick_gelu_f32_tile4: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&linear_q4_k_bias_quick_gelu_f32_tile4, module, "termite_linear_q4_k_bias_quick_gelu_f32_tile4"));
         var linear_q4_k_bias_relu_f32_tile4: driver_mod.CUfunction = null;
@@ -315,6 +332,10 @@ pub const KernelModule = struct {
             .linear_q8_0_bias_f32_fast_r4c4 = linear_q8_0_bias_f32_fast_r4c4,
             .linear_q8_0_bias_gelu_f32_fast_r4c4 = linear_q8_0_bias_gelu_f32_fast_r4c4,
             .linear_q8_0_bias_add_f32_fast_r4c4 = linear_q8_0_bias_add_f32_fast_r4c4,
+            .linear_q8_0_f32_tc_hmma = linear_q8_0_f32_tc_hmma,
+            .linear_q8_0_bias_f32_tc_hmma = linear_q8_0_bias_f32_tc_hmma,
+            .linear_q8_0_bias_gelu_f32_tc_hmma = linear_q8_0_bias_gelu_f32_tc_hmma,
+            .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
             .linear_q4_0_f32 = linear_q4_0_f32,
             .linear_q4_k_f32 = linear_q4_k_f32,
             .linear_q4_k_bias_f32 = linear_q4_k_bias_f32,
@@ -332,6 +353,10 @@ pub const KernelModule = struct {
             .linear_q4_k_bias_f32_fast_r4c4 = linear_q4_k_bias_f32_fast_r4c4,
             .linear_q4_k_bias_gelu_f32_fast_r4c4 = linear_q4_k_bias_gelu_f32_fast_r4c4,
             .linear_q4_k_bias_add_f32_fast_r4c4 = linear_q4_k_bias_add_f32_fast_r4c4,
+            .linear_q4_k_f32_tc_hmma = linear_q4_k_f32_tc_hmma,
+            .linear_q4_k_bias_f32_tc_hmma = linear_q4_k_bias_f32_tc_hmma,
+            .linear_q4_k_bias_gelu_f32_tc_hmma = linear_q4_k_bias_gelu_f32_tc_hmma,
+            .linear_q4_k_bias_add_f32_tc_hmma = linear_q4_k_bias_add_f32_tc_hmma,
             .linear_q4_k_bias_quick_gelu_f32_tile4 = linear_q4_k_bias_quick_gelu_f32_tile4,
             .linear_q4_k_bias_relu_f32_tile4 = linear_q4_k_bias_relu_f32_tile4,
             .linear_q4_k_bias_relu_f32_tile4_r2 = linear_q4_k_bias_relu_f32_tile4_r2,
@@ -402,6 +427,10 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_f32_fast_r4c4 = null;
             self.linear_q8_0_bias_gelu_f32_fast_r4c4 = null;
             self.linear_q8_0_bias_add_f32_fast_r4c4 = null;
+            self.linear_q8_0_f32_tc_hmma = null;
+            self.linear_q8_0_bias_f32_tc_hmma = null;
+            self.linear_q8_0_bias_gelu_f32_tc_hmma = null;
+            self.linear_q8_0_bias_add_f32_tc_hmma = null;
             self.linear_q4_0_f32 = null;
             self.linear_q4_k_f32 = null;
             self.linear_q4_k_bias_f32 = null;
@@ -419,6 +448,10 @@ pub const KernelModule = struct {
             self.linear_q4_k_bias_f32_fast_r4c4 = null;
             self.linear_q4_k_bias_gelu_f32_fast_r4c4 = null;
             self.linear_q4_k_bias_add_f32_fast_r4c4 = null;
+            self.linear_q4_k_f32_tc_hmma = null;
+            self.linear_q4_k_bias_f32_tc_hmma = null;
+            self.linear_q4_k_bias_gelu_f32_tc_hmma = null;
+            self.linear_q4_k_bias_add_f32_tc_hmma = null;
             self.linear_q4_k_bias_quick_gelu_f32_tile4 = null;
             self.linear_q4_k_bias_relu_f32_tile4 = null;
             self.linear_q4_k_bias_relu_f32_tile4_r2 = null;
@@ -1845,6 +1878,7 @@ pub const KernelModule = struct {
     fn q8VariantFunction(self: *const KernelModule, variant: QMatmulVariant, mode: Q8Mode) ?Q8VariantFunction {
         return switch (variant) {
             .legacy => null,
+            .tc_hmma => null,
             .fast_r2c4 => .{
                 .function = switch (mode) {
                     .none => self.linear_q8_0_f32_tile4_r2 orelse return null,
@@ -1942,6 +1976,130 @@ pub const KernelModule = struct {
             null,
         };
         try launch2d(function, ctx, (out_dim + cols_per_block - 1) / cols_per_block, (rows + rows_per_block - 1) / rows_per_block, q8_0_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ8_0TcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q8_0_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, .{}, .{}, rows, in_dim, out_dim, .none);
+    }
+
+    pub fn launchLinearQ8_0BiasTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q8_0_bias_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias);
+    }
+
+    pub fn launchLinearQ8_0BiasGeluTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q8_0_bias_gelu_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias_gelu);
+    }
+
+    pub fn launchLinearQ8_0BiasAddTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q8_0_bias_add_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ8_0TcHmmaCommon(ctx, function, dst, input, weight_packed, bias, residual, rows, in_dim, out_dim, .bias_add);
+    }
+
+    fn launchLinearQ8_0TcHmmaCommon(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        function: driver_mod.CUfunction,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        mode: Q8Mode,
+    ) driver_mod.Error!void {
+        _ = self;
+        if (in_dim == 0 or in_dim % q8_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q8_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q8_0_tc_block_bytes));
+        if (mode == .bias or mode == .bias_gelu or mode == .bias_add) try checkBytes(bias, out_dim);
+        if (mode == .bias_add) try checkBytes(residual, out_count);
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_packed.ptr;
+        var bias_ptr = bias.ptr;
+        var residual_ptr = residual.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = if (mode == .bias_add) [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&residual_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        } else if (mode == .bias or mode == .bias_gelu) [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            null,
+        } else [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            null,
+            null,
+        };
+        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 
     pub fn launchLinearQ4_0F32(
@@ -2291,6 +2449,7 @@ pub const KernelModule = struct {
     fn q4VariantFunction(self: *const KernelModule, variant: QMatmulVariant, mode: Q4Mode) ?Q4VariantFunction {
         return switch (variant) {
             .legacy => null,
+            .tc_hmma => null,
             .fast_r2c4 => .{
                 .function = switch (mode) {
                     .bias => self.linear_q4_k_bias_f32_tile4_r2 orelse return null,
@@ -2376,6 +2535,137 @@ pub const KernelModule = struct {
             null,
         };
         try launch2d(function, ctx, (out_dim + cols_per_block - 1) / cols_per_block, (rows + rows_per_block - 1) / rows_per_block, q4_k_tiled_threads, &params);
+    }
+
+    pub fn launchLinearQ4KTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_k_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ4KTcHmmaCommon(ctx, function, dst, input, weight_packed, .{}, .{}, rows, in_dim, out_dim, .none);
+    }
+
+    pub fn launchLinearQ4KBiasTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_k_bias_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ4KTcHmmaCommon(ctx, function, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias);
+    }
+
+    pub fn launchLinearQ4KBiasGeluTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_k_bias_gelu_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ4KTcHmmaCommon(ctx, function, dst, input, weight_packed, bias, .{}, rows, in_dim, out_dim, .bias_gelu);
+    }
+
+    pub fn launchLinearQ4KBiasAddTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_k_bias_add_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        try self.launchLinearQ4KTcHmmaCommon(ctx, function, dst, input, weight_packed, bias, residual, rows, in_dim, out_dim, .bias_add);
+    }
+
+    const Q4TcMode = enum {
+        none,
+        bias,
+        bias_gelu,
+        bias_add,
+    };
+
+    fn launchLinearQ4KTcHmmaCommon(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        function: driver_mod.CUfunction,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_packed: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        mode: Q4TcMode,
+    ) driver_mod.Error!void {
+        _ = self;
+        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_k_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_packed, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_tc_block_bytes));
+        if (mode == .bias or mode == .bias_gelu or mode == .bias_add) try checkBytes(bias, out_dim);
+        if (mode == .bias_add) try checkBytes(residual, out_count);
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_packed.ptr;
+        var bias_ptr = bias.ptr;
+        var residual_ptr = residual.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = if (mode == .bias_add) [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&residual_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        } else if (mode == .bias or mode == .bias_gelu) [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            null,
+        } else [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+            null,
+            null,
+        };
+        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 
     pub fn launchLinearQ4KBiasQuickGeluTiledF32(
@@ -3066,6 +3356,7 @@ pub const ElementwiseOp = enum(u32) {
 
 const q8_0_values_per_block: usize = 32;
 const q8_0_block_bytes: usize = 34;
+const q8_0_tc_block_bytes: usize = 34;
 const q8_0_tiled_values_per_block: usize = 256;
 const q8_0_tiled_threads: usize = 256;
 const q8_0_col_tile: usize = 4;
@@ -3074,6 +3365,7 @@ const q4_0_values_per_block: usize = 32;
 const q4_0_block_bytes: usize = 18;
 const q4_k_values_per_block: usize = 256;
 const q4_k_block_bytes: usize = 144;
+const q4_k_tc_block_bytes: usize = 148;
 const q4_k_tiled_threads: usize = 256;
 const q4_k_col_tile: usize = 4;
 const q4_k_row_tile: usize = 2;
@@ -3083,6 +3375,9 @@ const q4_k_span_gather_row_tile: usize = 8;
 const f32_tiled_threads: usize = 256;
 const f32_col_tile: usize = 4;
 const f32_row_tile: usize = 2;
+const q_tc_hmma_threads: usize = 256;
+const q_tc_hmma_rows: usize = 64;
+const q_tc_hmma_cols: usize = 32;
 
 fn checkedTensorElements(a: usize, b: usize) driver_mod.Error!usize {
     return std.math.mul(usize, a, b) catch error.InvalidCudaState;
@@ -3805,6 +4100,11 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         try tiled_weight.copyFromHost(&ctx, &tiled_weight_raw);
         try tiled_bias.copyFromHost(&ctx, std.mem.sliceAsBytes(&tiled_bias_data));
         try tiled_residual.copyFromHost(&ctx, std.mem.sliceAsBytes(&tiled_residual_data));
+        var tiled_weight_tc_raw = [_]u8{0} ** (tiled_out_dim * tiled_row_blocks * q8_0_tc_block_bytes);
+        packQ8_0TcSmoke(&tiled_weight_tc_raw, &tiled_weight_raw, tiled_out_dim, tiled_row_blocks);
+        var tiled_weight_tc = try buffer_mod.DeviceBuffer.alloc(&ctx, tiled_weight_tc_raw.len);
+        defer tiled_weight_tc.free(&ctx);
+        try tiled_weight_tc.copyFromHost(&ctx, &tiled_weight_tc_raw);
 
         const tiled_out = try allocator.alloc(f32, tiled_rows * tiled_out_dim);
         defer allocator.free(tiled_out);
@@ -3824,6 +4124,11 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
         try ctx.synchronize();
         try expectApproxSlice(tiled_out, &expected_tiled, 0.1);
+        try module.launchLinearQ8_0TcHmmaF32(&ctx, tiled_output, tiled_input, tiled_weight_tc, tiled_rows, tiled_in_dim, tiled_out_dim);
+        try ctx.synchronize();
+        try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
+        try ctx.synchronize();
+        try expectApproxSlice(tiled_out, &expected_tiled, 0.5);
 
         const expected_tiled_bias = [_]f32{ 32896.25, 32895, -65790, 32896.5, -32895.75, -32897, 65794, -32895.5 };
         try module.launchLinearQ8_0BiasTile4Rows2F32(&ctx, tiled_output, tiled_input, tiled_weight, tiled_bias, tiled_rows, tiled_in_dim, tiled_out_dim);
@@ -3841,6 +4146,11 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
         try ctx.synchronize();
         try expectApproxSlice(tiled_out, &expected_tiled_bias, 0.1);
+        try module.launchLinearQ8_0BiasTcHmmaF32(&ctx, tiled_output, tiled_input, tiled_weight_tc, tiled_bias, tiled_rows, tiled_in_dim, tiled_out_dim);
+        try ctx.synchronize();
+        try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
+        try ctx.synchronize();
+        try expectApproxSlice(tiled_out, &expected_tiled_bias, 0.5);
 
         const expected_tiled_gelu = [_]f32{ 32896.25, 32895, 0, 32896.5, 0, 0, 65794, 0 };
         try module.launchLinearQ8_0BiasGeluTile4Rows2F32(&ctx, tiled_output, tiled_input, tiled_weight, tiled_bias, tiled_rows, tiled_in_dim, tiled_out_dim);
@@ -3858,6 +4168,11 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
         try ctx.synchronize();
         try expectApproxSlice(tiled_out, &expected_tiled_gelu, 0.1);
+        try module.launchLinearQ8_0BiasGeluTcHmmaF32(&ctx, tiled_output, tiled_input, tiled_weight_tc, tiled_bias, tiled_rows, tiled_in_dim, tiled_out_dim);
+        try ctx.synchronize();
+        try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
+        try ctx.synchronize();
+        try expectApproxSlice(tiled_out, &expected_tiled_gelu, 0.5);
 
         const expected_tiled_add = [_]f32{ 32897.25, 32897, -65787, 32900.5, -32890.75, -32891, 65801, -32887.5 };
         try module.launchLinearQ8_0BiasAddTile4Rows2F32(&ctx, tiled_output, tiled_input, tiled_weight, tiled_bias, tiled_residual, tiled_rows, tiled_in_dim, tiled_out_dim);
@@ -3875,6 +4190,11 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
         try ctx.synchronize();
         try expectApproxSlice(tiled_out, &expected_tiled_add, 0.1);
+        try module.launchLinearQ8_0BiasAddTcHmmaF32(&ctx, tiled_output, tiled_input, tiled_weight_tc, tiled_bias, tiled_residual, tiled_rows, tiled_in_dim, tiled_out_dim);
+        try ctx.synchronize();
+        try tiled_output.copyToHost(&ctx, std.mem.sliceAsBytes(tiled_out));
+        try ctx.synchronize();
+        try expectApproxSlice(tiled_out, &expected_tiled_add, 0.5);
     }
 }
 
@@ -3958,6 +4278,12 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try weight.copyFromHost(&ctx, &weight_raw);
     try bias.copyFromHost(&ctx, std.mem.sliceAsBytes(&bias_data));
     try residual.copyFromHost(&ctx, std.mem.sliceAsBytes(&residual_data));
+    const row_blocks = in_dim / q4_k_values_per_block;
+    var weight_tc_raw = [_]u8{0} ** (out_dim * row_blocks * q4_k_tc_block_bytes);
+    packQ4_KTcSmoke(&weight_tc_raw, &weight_raw, out_dim, row_blocks);
+    var weight_tc = try buffer_mod.DeviceBuffer.alloc(&ctx, weight_tc_raw.len);
+    defer weight_tc.free(&ctx);
+    try weight_tc.copyFromHost(&ctx, &weight_tc_raw);
 
     try module.launchLinearQ4KF32(&ctx, output, input, weight, rows, in_dim, out_dim);
     try ctx.synchronize();
@@ -3973,6 +4299,11 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.1);
+    try module.launchLinearQ4KTcHmmaF32(&ctx, output, input, weight_tc, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.5);
 
     try module.launchLinearQ4KBiasF32(&ctx, output, input, weight, bias, rows, in_dim, out_dim);
     try ctx.synchronize();
@@ -4002,6 +4333,11 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_bias, 0.1);
+    try module.launchLinearQ4KBiasTcHmmaF32(&ctx, output, input, weight_tc, bias, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_bias, 0.5);
 
     try module.launchLinearQ4KBiasGeluTile4Rows2F32(&ctx, output, input, weight, bias, rows, in_dim, out_dim);
     try ctx.synchronize();
@@ -4019,6 +4355,11 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_gelu, 0.1);
+    try module.launchLinearQ4KBiasGeluTcHmmaF32(&ctx, output, input, weight_tc, bias, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_gelu, 0.5);
 
     try module.launchLinearQ4KBiasAddTile4Rows2F32(&ctx, output, input, weight, bias, residual, rows, in_dim, out_dim);
     try ctx.synchronize();
@@ -4036,6 +4377,11 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_add, 0.1);
+    try module.launchLinearQ4KBiasAddTcHmmaF32(&ctx, output, input, weight_tc, bias, residual, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output.copyToHost(&ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_add, 0.5);
 
     if (module.hasGlinerSpanQ4KPrimitives()) {
         try module.launchLinearQ4KSpanBiasTile8Rows2F32(&ctx, output, input, weight, bias, rows, in_dim, out_dim);
@@ -4127,6 +4473,18 @@ fn writeQ8_0SmokeRow(dst: []u8, scale: f32, value: i8) void {
     for (0..q8_0_values_per_block) |i| dst[2 + i] = @bitCast(value);
 }
 
+fn packQ8_0TcSmoke(dst: []u8, raw: []const u8, out_dim: usize, row_blocks: usize) void {
+    const block_count = out_dim * row_blocks;
+    std.debug.assert(raw.len == block_count * q8_0_block_bytes);
+    std.debug.assert(dst.len == block_count * q8_0_tc_block_bytes);
+    const q_base = block_count * 2;
+    for (0..block_count) |block| {
+        const src = raw[block * q8_0_block_bytes ..][0..q8_0_block_bytes];
+        @memcpy(dst[block * 2 ..][0..2], src[0..2]);
+        @memcpy(dst[q_base + block * 32 ..][0..32], src[2..34]);
+    }
+}
+
 fn writeQ4_0SmokeRow(dst: []u8, scale: f32, value: i4) void {
     std.debug.assert(dst.len == q4_0_block_bytes);
     const scale_bits: u16 = @bitCast(@as(f16, @floatCast(scale)));
@@ -4152,6 +4510,36 @@ fn writeQ4_KSmokeRow(dst: []u8, scale: f32, value: u4) void {
     dst[15] = 1;
     const packed_byte = @as(u8, value) | (@as(u8, value) << 4);
     for (0..128) |i| dst[16 + i] = packed_byte;
+}
+
+fn packQ4_KTcSmoke(dst: []u8, raw: []const u8, out_dim: usize, row_blocks: usize) void {
+    const block_count = out_dim * row_blocks;
+    std.debug.assert(raw.len == block_count * q4_k_block_bytes);
+    std.debug.assert(dst.len == block_count * q4_k_tc_block_bytes);
+    const q_base = block_count * 20;
+    for (0..block_count) |block| {
+        const src = raw[block * q4_k_block_bytes ..][0..q4_k_block_bytes];
+        const meta = dst[block * 20 ..][0..20];
+        @memcpy(meta[0..4], src[0..4]);
+        const scales = src[4..16];
+        for (0..8) |sub| {
+            meta[4 + sub] = q4KSmokeScale(scales, sub);
+            meta[12 + sub] = q4KSmokeMin(scales, sub);
+        }
+        @memcpy(dst[q_base + block * 128 ..][0..128], src[16..144]);
+    }
+}
+
+fn q4KSmokeScale(scales: []const u8, sub: usize) u8 {
+    std.debug.assert(scales.len >= 12);
+    if (sub < 4) return scales[sub] & 63;
+    return (scales[sub + 4] & 0x0f) | ((scales[sub - 4] >> 6) << 4);
+}
+
+fn q4KSmokeMin(scales: []const u8, sub: usize) u8 {
+    std.debug.assert(scales.len >= 12);
+    if (sub < 4) return scales[sub + 4] & 63;
+    return (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
 }
 
 fn expectApproxSlice(actual: []const f32, expected: []const f32, tolerance: f32) !void {

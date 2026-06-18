@@ -39,9 +39,22 @@ pub const CudaTensor = struct {
     shape: []i64,
     elem_count: usize,
     quant_type: ?gguf_tensor_types.TensorType = null,
+    tc_quant: ?CudaTensorCoreQuantBuffer = null,
     owns_buffer: bool = true,
     owns_shape: bool = true,
     owned_by_tensor: bool = true,
+};
+
+pub const CudaTensorCoreQuantLayout = enum {
+    q8_0_hmma,
+    q4_k_hmma,
+};
+
+pub const CudaTensorCoreQuantBuffer = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    layout: CudaTensorCoreQuantLayout,
+    row_blocks: usize,
+    bytes: usize,
 };
 
 pub const GraphUploadKind = enum {
@@ -360,6 +373,8 @@ pub const CudaCompute = struct {
             var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
             errdefer device.free(&self.ctx);
             try device.copyFromHost(&self.ctx, storage.raw_bytes);
+            var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, storage.raw_bytes);
+            errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             try self.ctx.synchronize();
             errdefer self.allocator.free(owned_key);
             try self.resident_weights.put(self.allocator, owned_key, .{
@@ -368,6 +383,7 @@ pub const CudaCompute = struct {
                 .shape = shape,
                 .elem_count = elem_count,
                 .quant_type = storage.tensor_type,
+                .tc_quant = tc_quant,
                 .owns_buffer = false,
                 .owns_shape = false,
                 .owned_by_tensor = false,
@@ -384,6 +400,39 @@ pub const CudaCompute = struct {
             return self.insertWeightFromTensor(owned_key, &converted);
         }
         try self.insertWeightFromTensor(owned_key, &loaded.tensor);
+    }
+
+    fn prepareTensorCoreQuantOnUpload(
+        self: *CudaCompute,
+        tensor_type: gguf_tensor_types.TensorType,
+        shape: []const i64,
+        raw_bytes: []const u8,
+    ) !?CudaTensorCoreQuantBuffer {
+        if (!cudaTensorCoreQuantRequested()) return null;
+        if (!cudaTensorCoreQuantAvailable(self)) return null;
+        if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0) return null;
+
+        const out_dim: usize = @intCast(shape[0]);
+        const in_dim: usize = @intCast(shape[1]);
+        if (!isMxbaiDebertaTensorCoreLinearShape(in_dim, out_dim)) return null;
+
+        const known = knownQuantTensorType(tensor_type) orelse return null;
+        const packed_quant = switch (known) {
+            .Q8_0 => try packQ8_0TensorCore(self.allocator, raw_bytes, in_dim, out_dim),
+            .Q4_K => try packQ4_KTensorCore(self.allocator, raw_bytes, in_dim, out_dim),
+            else => return null,
+        };
+        defer self.allocator.free(packed_quant.bytes);
+
+        var device = try allocDeviceBuffer(self, packed_quant.bytes.len);
+        errdefer device.free(&self.ctx);
+        try device.copyFromHost(&self.ctx, packed_quant.bytes);
+        return .{
+            .buffer = device,
+            .layout = packed_quant.layout,
+            .row_blocks = packed_quant.row_blocks,
+            .bytes = packed_quant.bytes.len,
+        };
     }
 
     pub fn insertWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
@@ -487,6 +536,7 @@ const QMatmulVariantChoice = enum {
     fast_r2c4,
     fast_r2c8,
     fast_r4c4,
+    tc_hmma,
 };
 
 fn cudaQMatmulVariantChoice() QMatmulVariantChoice {
@@ -498,16 +548,20 @@ fn cudaQMatmulVariantChoice() QMatmulVariantChoice {
     if (std.ascii.eqlIgnoreCase(raw, "r2c8")) return .fast_r2c8;
     if (std.ascii.eqlIgnoreCase(raw, "fast_r4c4")) return .fast_r4c4;
     if (std.ascii.eqlIgnoreCase(raw, "r4c4")) return .fast_r4c4;
+    if (std.ascii.eqlIgnoreCase(raw, "tc_hmma")) return .tc_hmma;
+    if (std.ascii.eqlIgnoreCase(raw, "hmma")) return .tc_hmma;
+    if (std.ascii.eqlIgnoreCase(raw, "tensor_core")) return .tc_hmma;
     return .auto;
 }
 
 fn cudaQMatmulKernelVariant() ?kernels_mod.QMatmulVariant {
     return switch (cudaQMatmulVariantChoice()) {
         .legacy => null,
-        .auto => .fast_r4c4,
+        .auto => .tc_hmma,
         .fast_r2c4 => .fast_r2c4,
         .fast_r2c8 => .fast_r2c8,
         .fast_r4c4 => .fast_r4c4,
+        .tc_hmma => .tc_hmma,
     };
 }
 
@@ -517,6 +571,11 @@ fn isMxbaiDebertaLinearShape(in_dim: usize, out_dim: usize) bool {
     if (in_dim == 3072 and out_dim == 768) return true;
     if (in_dim == 768 and out_dim == 1) return true;
     return false;
+}
+
+fn isMxbaiDebertaTensorCoreLinearShape(in_dim: usize, out_dim: usize) bool {
+    if (out_dim == 1) return false;
+    return isMxbaiDebertaLinearShape(in_dim, out_dim);
 }
 
 fn useMxbaiQ8TiledKernel(rows: usize, in_dim: usize, out_dim: usize) bool {
@@ -531,7 +590,7 @@ fn mxbaiQ8Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatm
 }
 
 fn useMxbaiQ4FusionKernel(rows: usize, in_dim: usize, out_dim: usize) bool {
-    return cudaQ4FusionKernelsEnabled() and rows >= 2 and isMxbaiDebertaLinearShape(in_dim, out_dim);
+    return (cudaQ4FusionKernelsEnabled() or cudaTensorCoreQuantRequested()) and rows >= 2 and isMxbaiDebertaLinearShape(in_dim, out_dim);
 }
 
 fn mxbaiQ4Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
@@ -542,6 +601,110 @@ fn mxbaiQ4Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatm
 fn mxbaiQ4TiledVariant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
     if (rows < 2 or !isMxbaiDebertaLinearShape(in_dim, out_dim)) return null;
     return cudaQMatmulKernelVariant();
+}
+
+fn cudaTensorCoreQuantRequested() bool {
+    return switch (cudaQMatmulVariantChoice()) {
+        .auto, .tc_hmma => true,
+        .legacy, .fast_r2c4, .fast_r2c8, .fast_r4c4 => false,
+    };
+}
+
+fn cudaTensorCoreQuantAvailable(self: *const CudaCompute) bool {
+    return self.ctx.info.compute_major >= 8;
+}
+
+fn knownQuantTensorType(tensor_type: gguf_tensor_types.TensorType) ?gguf_tensor_types.KnownTensorType {
+    return switch (tensor_type) {
+        .known => |known| known,
+        else => null,
+    };
+}
+
+const Q8_0_VALUES_PER_BLOCK: usize = 32;
+const Q8_0_BLOCK_BYTES: usize = 34;
+const Q8_0_TC_SCALE_BYTES: usize = 2;
+const Q8_0_TC_Q_BYTES: usize = 32;
+const Q4_K_VALUES_PER_BLOCK: usize = 256;
+const Q4_K_BLOCK_BYTES: usize = 144;
+const Q4_K_TC_META_BYTES: usize = 20;
+const Q4_K_TC_Q_BYTES: usize = 128;
+const Q4_K_TC_BLOCK_BYTES: usize = Q4_K_TC_META_BYTES + Q4_K_TC_Q_BYTES;
+
+const PackedTensorCoreQuant = struct {
+    layout: CudaTensorCoreQuantLayout,
+    row_blocks: usize,
+    bytes: []u8,
+};
+
+fn packQ8_0TensorCore(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) !PackedTensorCoreQuant {
+    if (in_dim == 0 or in_dim % Q8_0_VALUES_PER_BLOCK != 0) return error.InvalidShape;
+    const row_blocks = in_dim / Q8_0_VALUES_PER_BLOCK;
+    const block_count = try checkedMul(out_dim, row_blocks);
+    const expected_raw = try checkedMul(block_count, Q8_0_BLOCK_BYTES);
+    if (raw.len != expected_raw) return error.InvalidShape;
+
+    const scales_bytes = try checkedMul(block_count, Q8_0_TC_SCALE_BYTES);
+    const q_bytes = try checkedMul(block_count, Q8_0_TC_Q_BYTES);
+    const out = try allocator.alloc(u8, try checkedAdd(scales_bytes, q_bytes));
+    errdefer allocator.free(out);
+
+    const q_base = scales_bytes;
+    for (0..block_count) |block| {
+        const src = raw[block * Q8_0_BLOCK_BYTES ..][0..Q8_0_BLOCK_BYTES];
+        @memcpy(out[block * Q8_0_TC_SCALE_BYTES ..][0..Q8_0_TC_SCALE_BYTES], src[0..2]);
+        @memcpy(out[q_base + block * Q8_0_TC_Q_BYTES ..][0..Q8_0_TC_Q_BYTES], src[2..34]);
+    }
+
+    return .{
+        .layout = .q8_0_hmma,
+        .row_blocks = row_blocks,
+        .bytes = out,
+    };
+}
+
+fn packQ4_KTensorCore(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) !PackedTensorCoreQuant {
+    if (in_dim == 0 or in_dim % Q4_K_VALUES_PER_BLOCK != 0) return error.InvalidShape;
+    const row_blocks = in_dim / Q4_K_VALUES_PER_BLOCK;
+    const block_count = try checkedMul(out_dim, row_blocks);
+    const expected_raw = try checkedMul(block_count, Q4_K_BLOCK_BYTES);
+    if (raw.len != expected_raw) return error.InvalidShape;
+
+    const meta_bytes = try checkedMul(block_count, Q4_K_TC_META_BYTES);
+    const q_bytes = try checkedMul(block_count, Q4_K_TC_Q_BYTES);
+    const out = try allocator.alloc(u8, try checkedAdd(meta_bytes, q_bytes));
+    errdefer allocator.free(out);
+
+    const q_base = meta_bytes;
+    for (0..block_count) |block| {
+        const src = raw[block * Q4_K_BLOCK_BYTES ..][0..Q4_K_BLOCK_BYTES];
+        const meta = out[block * Q4_K_TC_META_BYTES ..][0..Q4_K_TC_META_BYTES];
+        @memcpy(meta[0..4], src[0..4]);
+        const scales = src[4..16];
+        for (0..8) |sub| {
+            meta[4 + sub] = q4KScale(scales, sub);
+            meta[12 + sub] = q4KMin(scales, sub);
+        }
+        @memcpy(out[q_base + block * Q4_K_TC_Q_BYTES ..][0..Q4_K_TC_Q_BYTES], src[16..144]);
+    }
+
+    return .{
+        .layout = .q4_k_hmma,
+        .row_blocks = row_blocks,
+        .bytes = out,
+    };
+}
+
+fn q4KScale(scales: []const u8, sub: usize) u8 {
+    std.debug.assert(scales.len >= 12);
+    if (sub < 4) return scales[sub] & 63;
+    return (scales[sub + 4] & 0x0f) | ((scales[sub - 4] >> 6) << 4);
+}
+
+fn q4KMin(scales: []const u8, sub: usize) u8 {
+    std.debug.assert(scales.len >= 12);
+    if (sub < 4) return scales[sub + 4] & 63;
+    return (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
 }
 
 fn isGlinerSpanQ4Shape(rows: usize, in_dim: usize, out_dim: usize) bool {
@@ -675,6 +838,11 @@ fn deinitBackend(ctx: *anyopaque) void {
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
+    if (cuda_tensor.tc_quant) |*tc_quant| {
+        var packed_buffer = tc_quant.buffer;
+        releaseDeviceBuffer(self, &packed_buffer);
+        cuda_tensor.tc_quant = null;
+    }
     if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
     if (cuda_tensor.owns_shape) self.allocator.free(cuda_tensor.shape);
 }
@@ -1312,6 +1480,159 @@ fn tryDenseLtLinear16(
     return try self.dense_lt.linear(&self.ctx, &self.libraries, dst, activation16, weight, bias, rows, in_dim, out_dim, dtype);
 }
 
+fn tcQuantBuffer(tensor: *const CudaTensor, layout: CudaTensorCoreQuantLayout) ?buffer_mod.DeviceBuffer {
+    const tc_quant = tensor.tc_quant orelse return null;
+    if (tc_quant.layout != layout) return null;
+    return tc_quant.buffer;
+}
+
+fn missingTcSymbolFallback(err: anyerror) anyerror!bool {
+    return switch (err) {
+        error.CudaSymbolMissing => false,
+        else => err,
+    };
+}
+
+fn launchQ8TcHmmaNoBias(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q8_0_hmma) orelse return false;
+    self.kernels.launchLinearQ8_0TcHmmaF32(&self.ctx, dst, input, packed_buffer, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ8TcHmmaBias(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    bias: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q8_0_hmma) orelse return false;
+    self.kernels.launchLinearQ8_0BiasTcHmmaF32(&self.ctx, dst, input, packed_buffer, bias, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ8TcHmmaBiasGelu(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    bias: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q8_0_hmma) orelse return false;
+    self.kernels.launchLinearQ8_0BiasGeluTcHmmaF32(&self.ctx, dst, input, packed_buffer, bias, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ8TcHmmaBiasAdd(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    bias: buffer_mod.DeviceBuffer,
+    residual: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q8_0_hmma) orelse return false;
+    self.kernels.launchLinearQ8_0BiasAddTcHmmaF32(&self.ctx, dst, input, packed_buffer, bias, residual, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ4KTcHmmaNoBias(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q4_k_hmma) orelse return false;
+    self.kernels.launchLinearQ4KTcHmmaF32(&self.ctx, dst, input, packed_buffer, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ4KTcHmmaBias(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    bias: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q4_k_hmma) orelse return false;
+    self.kernels.launchLinearQ4KBiasTcHmmaF32(&self.ctx, dst, input, packed_buffer, bias, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ4KTcHmmaBiasGelu(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    bias: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q4_k_hmma) orelse return false;
+    self.kernels.launchLinearQ4KBiasGeluTcHmmaF32(&self.ctx, dst, input, packed_buffer, bias, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn launchQ4KTcHmmaBiasAdd(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: *const CudaTensor,
+    bias: buffer_mod.DeviceBuffer,
+    residual: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_buffer = tcQuantBuffer(weight, .q4_k_hmma) orelse return false;
+    self.kernels.launchLinearQ4KBiasAddTcHmmaF32(&self.ctx, dst, input, packed_buffer, bias, residual, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
+fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.QMatmulVariant {
+    return if (variant == .tc_hmma) .fast_r4c4 else variant;
+}
+
 fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -1333,19 +1654,20 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         switch (quant_type) {
             .known => |known| switch (known) {
                 .Q8_0 => if (mxbaiQ8Variant(rows, in_dim, out_dim)) |variant| {
-                    if (variant == .fast_r2c4)
+                    if (try launchQ8TcHmmaBias(self, variant, device, input_tensor.buffer, weight_tensor, bias_tensor.buffer, rows, in_dim, out_dim)) {} else if (variant == .fast_r2c4)
                         try self.kernels.launchLinearQ8_0BiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
                     else
-                        try self.kernels.launchLinearQ8_0BiasVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+                        try self.kernels.launchLinearQ8_0BiasVariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
                 } else {
                     try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
                 },
                 .Q4_K => if (useGlinerSpanQ4Kernel(self, rows, in_dim, out_dim))
                     try self.kernels.launchLinearQ4KSpanBiasTile4Rows8F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
-                else if (mxbaiQ4TiledVariant(rows, in_dim, out_dim)) |variant|
-                    try self.kernels.launchLinearQ4KBiasVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
-                else if (rows >= 2)
+                else if (mxbaiQ4TiledVariant(rows, in_dim, out_dim)) |variant| {
+                    if (!try launchQ4KTcHmmaBias(self, variant, device, input_tensor.buffer, weight_tensor, bias_tensor.buffer, rows, in_dim, out_dim))
+                        try self.kernels.launchLinearQ4KBiasVariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+                } else if (rows >= 2)
                     try self.kernels.launchLinearQ4KBiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
                 else
                     try self.kernels.launchLinearQ4KBiasTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim),
@@ -1451,12 +1773,13 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     if (q8_variant) |variant| {
-        if (variant == .fast_r2c4)
+        if (try launchQ8TcHmmaBiasGelu(self, variant, device, input_tensor.buffer, weight_tensor, bias_tensor.buffer, rows, in_dim, out_dim)) {} else if (variant == .fast_r2c4)
             try self.kernels.launchLinearQ8_0BiasGeluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim)
         else
-            try self.kernels.launchLinearQ8_0BiasGeluVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+            try self.kernels.launchLinearQ8_0BiasGeluVariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
     } else if (q4_variant) |variant| {
-        try self.kernels.launchLinearQ4KBiasGeluVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+        if (!try launchQ4KTcHmmaBiasGelu(self, variant, device, input_tensor.buffer, weight_tensor, bias_tensor.buffer, rows, in_dim, out_dim))
+            try self.kernels.launchLinearQ4KBiasGeluVariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
     } else {
         try self.kernels.launchLinearBiasGeluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
     }
@@ -1488,12 +1811,13 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     if (q8_variant) |variant| {
-        if (variant == .fast_r2c4)
+        if (try launchQ8TcHmmaBiasAdd(self, variant, device, input_tensor.buffer, weight_tensor, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim)) {} else if (variant == .fast_r2c4)
             try self.kernels.launchLinearQ8_0BiasAddTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim)
         else
-            try self.kernels.launchLinearQ8_0BiasAddVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
+            try self.kernels.launchLinearQ8_0BiasAddVariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
     } else if (q4_variant) |variant| {
-        try self.kernels.launchLinearQ4KBiasAddVariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
+        if (!try launchQ4KTcHmmaBiasAdd(self, variant, device, input_tensor.buffer, weight_tensor, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim))
+            try self.kernels.launchLinearQ4KBiasAddVariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
     } else {
         try self.kernels.launchLinearBiasAddTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, residual_tensor.buffer, rows, in_dim, out_dim);
     }
@@ -1518,13 +1842,16 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
         switch (quant_type) {
             .known => |known| switch (known) {
                 .Q8_0 => if (mxbaiQ8Variant(rows, in_dim, out_dim)) |variant| {
-                    if (variant == .fast_r2c4)
+                    if (try launchQ8TcHmmaNoBias(self, variant, device, input_tensor.buffer, weight_tensor, rows, in_dim, out_dim)) {} else if (variant == .fast_r2c4)
                         try self.kernels.launchLinearQ8_0Tile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)
                     else
-                        try self.kernels.launchLinearQ8_0VariantF32(variant, &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                        try self.kernels.launchLinearQ8_0VariantF32(simtQMatmulFallbackVariant(variant), &self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                 } else try self.kernels.launchLinearQ8_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 .Q4_0 => try self.kernels.launchLinearQ4_0F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                .Q4_K => try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+                .Q4_K => if (mxbaiQ4TiledVariant(rows, in_dim, out_dim)) |variant| {
+                    if (!try launchQ4KTcHmmaNoBias(self, variant, device, input_tensor.buffer, weight_tensor, rows, in_dim, out_dim))
+                        try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                } else try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,

@@ -116,10 +116,10 @@ for candidate_model_dir in "${model_dirs[@]}"; do
           ;;
       esac
       case "$qmatmul_variant" in
-        auto|legacy|fast_r2c4|fast_r2c8|fast_r4c4|r2c4|r2c8|r4c4)
+        auto|legacy|fast_r2c4|fast_r2c8|fast_r4c4|r2c4|r2c8|r4c4|tc_hmma|hmma|tensor_core)
           ;;
         *)
-          echo "unknown qmatmul variant '$qmatmul_variant'; expected auto, legacy, fast_r2c4, fast_r2c8, or fast_r4c4" >&2
+          echo "unknown qmatmul variant '$qmatmul_variant'; expected auto, legacy, fast_r2c4, fast_r2c8, fast_r4c4, or tc_hmma" >&2
           exit 1
           ;;
       esac

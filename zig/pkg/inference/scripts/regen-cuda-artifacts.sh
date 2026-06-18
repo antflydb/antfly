@@ -106,6 +106,10 @@ required_symbols=(
   termite_linear_q8_0_bias_f32_fast_r4c4
   termite_linear_q8_0_bias_gelu_f32_fast_r4c4
   termite_linear_q8_0_bias_add_f32_fast_r4c4
+  termite_linear_q8_0_f32_tc_hmma
+  termite_linear_q8_0_bias_f32_tc_hmma
+  termite_linear_q8_0_bias_gelu_f32_tc_hmma
+  termite_linear_q8_0_bias_add_f32_tc_hmma
   termite_linear_q4_k_bias_gelu_f32_tile4_r2
   termite_linear_q4_k_bias_add_f32_tile4_r2
   termite_linear_q4_k_bias_f32_fast_r2c8
@@ -114,6 +118,10 @@ required_symbols=(
   termite_linear_q4_k_bias_f32_fast_r4c4
   termite_linear_q4_k_bias_gelu_f32_fast_r4c4
   termite_linear_q4_k_bias_add_f32_fast_r4c4
+  termite_linear_q4_k_f32_tc_hmma
+  termite_linear_q4_k_bias_f32_tc_hmma
+  termite_linear_q4_k_bias_gelu_f32_tc_hmma
+  termite_linear_q4_k_bias_add_f32_tc_hmma
   termite_linear_q4_k_span_bias_f32_tile8_r2
   termite_linear_q4_k_span_bias_relu_f32_tile8_r2
   termite_linear_q4_k_span_bias_f32_tile4_r8
