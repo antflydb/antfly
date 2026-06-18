@@ -15,10 +15,10 @@
 //! Iceberg Avro manifest-list planning.
 //!
 //! This is a deliberately small Avro Object Container File reader for the
-//! Iceberg manifest-list boundary. It supports uncompressed OCF blocks and a
-//! schema-driven subset of primitive/nullable Avro fields so the next planner
-//! step can expand manifest-list rows into manifest files without inventing a
-//! JSON-only test format.
+//! Iceberg manifest-list boundary. It supports uncompressed and deflate OCF
+//! blocks plus a schema-driven subset of primitive/nullable Avro fields so the
+//! next planner step can expand manifest-list rows into manifest files without
+//! inventing a JSON-only test format.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -148,11 +148,11 @@ pub fn parseManifestListAlloc(alloc: Allocator, avro_ocf: []const u8) !ManifestL
     var reader = Reader.init(avro_ocf);
     try reader.expectBytes("Obj\x01");
 
-    const schema_json = try readMetadataMapAlloc(alloc, &reader);
-    defer alloc.free(schema_json);
+    var metadata = try readMetadataMapAlloc(alloc, &reader);
+    defer metadata.deinit(alloc);
     const sync = try reader.readSlice(16);
 
-    const fields = try parseSchemaFieldPlansAlloc(alloc, schema_json);
+    const fields = try parseSchemaFieldPlansAlloc(alloc, metadata.schema_json);
     defer alloc.free(fields);
 
     var entries = std.ArrayListUnmanaged(ManifestListEntry).empty;
@@ -167,14 +167,18 @@ pub fn parseManifestListAlloc(alloc: Allocator, avro_ocf: []const u8) !ManifestL
         const block_size_i64 = try reader.readLong();
         if (block_size_i64 < 0) return error.InvalidIcebergManifestList;
         const block_size = std.math.cast(usize, block_size_i64) orelse return error.InvalidIcebergManifestList;
-        const block = try reader.readSlice(block_size);
-        var block_reader = Reader.init(block);
-        const count = std.math.cast(usize, block_count) orelse return error.InvalidIcebergManifestList;
-        for (0..count) |_| {
-            const entry = try readManifestListEntryAlloc(alloc, &block_reader, fields);
-            try entries.append(alloc, entry);
+        const encoded_block = try reader.readSlice(block_size);
+        {
+            const decoded_block = try decodeBlockAlloc(alloc, metadata.codec, encoded_block);
+            defer decoded_block.deinit(alloc);
+            var block_reader = Reader.init(decoded_block.bytes);
+            const count = std.math.cast(usize, block_count) orelse return error.InvalidIcebergManifestList;
+            for (0..count) |_| {
+                const entry = try readManifestListEntryAlloc(alloc, &block_reader, fields);
+                try entries.append(alloc, entry);
+            }
+            if (!block_reader.eof()) return error.InvalidIcebergManifestList;
         }
-        if (!block_reader.eof()) return error.InvalidIcebergManifestList;
         const got_sync = try reader.readSlice(16);
         if (!std.mem.eql(u8, sync, got_sync)) return error.InvalidIcebergManifestList;
     }
@@ -189,11 +193,11 @@ pub fn parseDataManifestAlloc(alloc: Allocator, avro_ocf: []const u8) !DataManif
     var reader = Reader.init(avro_ocf);
     try reader.expectBytes("Obj\x01");
 
-    const schema_json = try readMetadataMapAlloc(alloc, &reader);
-    defer alloc.free(schema_json);
+    var metadata = try readMetadataMapAlloc(alloc, &reader);
+    defer metadata.deinit(alloc);
     const sync = try reader.readSlice(16);
 
-    var parsed_schema = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    var parsed_schema = try std.json.parseFromSlice(std.json.Value, alloc, metadata.schema_json, .{});
     defer parsed_schema.deinit();
     try validateRecordSchema(parsed_schema.value);
 
@@ -209,14 +213,18 @@ pub fn parseDataManifestAlloc(alloc: Allocator, avro_ocf: []const u8) !DataManif
         const block_size_i64 = try reader.readLong();
         if (block_size_i64 < 0) return error.InvalidIcebergDataManifest;
         const block_size = std.math.cast(usize, block_size_i64) orelse return error.InvalidIcebergDataManifest;
-        const block = try reader.readSlice(block_size);
-        var block_reader = Reader.init(block);
-        const count = std.math.cast(usize, block_count) orelse return error.InvalidIcebergDataManifest;
-        for (0..count) |_| {
-            const entry = try readDataManifestEntryAlloc(alloc, &block_reader, parsed_schema.value);
-            try entries.append(alloc, entry);
+        const encoded_block = try reader.readSlice(block_size);
+        {
+            const decoded_block = try decodeBlockAlloc(alloc, metadata.codec, encoded_block);
+            defer decoded_block.deinit(alloc);
+            var block_reader = Reader.init(decoded_block.bytes);
+            const count = std.math.cast(usize, block_count) orelse return error.InvalidIcebergDataManifest;
+            for (0..count) |_| {
+                const entry = try readDataManifestEntryAlloc(alloc, &block_reader, parsed_schema.value);
+                try entries.append(alloc, entry);
+            }
+            if (!block_reader.eof()) return error.InvalidIcebergDataManifest;
         }
-        if (!block_reader.eof()) return error.InvalidIcebergDataManifest;
         const got_sync = try reader.readSlice(16);
         if (!std.mem.eql(u8, sync, got_sync)) return error.InvalidIcebergDataManifest;
     }
@@ -311,9 +319,34 @@ fn decodeZigzag(raw: u64) ?i64 {
     return value;
 }
 
-fn readMetadataMapAlloc(alloc: Allocator, reader: *Reader) ![]u8 {
+const AvroCodec = enum {
+    null,
+    deflate,
+};
+
+const OcfMetadata = struct {
+    schema_json: []u8,
+    codec: AvroCodec = .null,
+
+    fn deinit(self: *OcfMetadata, alloc: Allocator) void {
+        alloc.free(self.schema_json);
+        self.* = undefined;
+    }
+};
+
+const DecodedBlock = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+
+    fn deinit(self: DecodedBlock, alloc: Allocator) void {
+        if (self.owned) |owned| alloc.free(owned);
+    }
+};
+
+fn readMetadataMapAlloc(alloc: Allocator, reader: *Reader) !OcfMetadata {
     var schema_json: ?[]u8 = null;
     errdefer if (schema_json) |schema| alloc.free(schema);
+    var codec: AvroCodec = .null;
 
     while (true) {
         var block_count = try reader.readLong();
@@ -332,12 +365,41 @@ fn readMetadataMapAlloc(alloc: Allocator, reader: *Reader) ![]u8 {
                 if (schema_json != null) return error.InvalidAvroContainer;
                 schema_json = try alloc.dupe(u8, value);
             } else if (std.mem.eql(u8, key, "avro.codec")) {
-                if (!std.mem.eql(u8, value, "null")) return error.UnsupportedAvroCodec;
+                codec = try parseAvroCodec(value);
             }
         }
     }
 
-    return schema_json orelse error.InvalidIcebergManifestList;
+    return .{
+        .schema_json = schema_json orelse return error.InvalidIcebergManifestList,
+        .codec = codec,
+    };
+}
+
+fn parseAvroCodec(value: []const u8) !AvroCodec {
+    if (std.mem.eql(u8, value, "null")) return .null;
+    if (std.mem.eql(u8, value, "deflate")) return .deflate;
+    return error.UnsupportedAvroCodec;
+}
+
+fn decodeBlockAlloc(
+    alloc: Allocator,
+    codec: AvroCodec,
+    encoded_block: []const u8,
+) !DecodedBlock {
+    return switch (codec) {
+        .null => .{ .bytes = encoded_block },
+        .deflate => blk: {
+            var in: std.Io.Reader = .fixed(encoded_block);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            var window: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompress: std.compress.flate.Decompress = .init(&in, .raw, &window);
+            _ = try decompress.reader.streamRemaining(&out.writer);
+            const decoded = try out.toOwnedSlice();
+            break :blk .{ .bytes = decoded, .owned = decoded };
+        },
+    };
 }
 
 const AvroPrimitive = enum {
@@ -974,9 +1036,22 @@ test "iceberg avro manifest-list decoder reads data and delete manifests" {
     try std.testing.expectEqual(@as(u64, 3), list.entries[1].deleted_rows_count);
 }
 
-test "iceberg avro manifest-list decoder rejects unsupported codec" {
+test "iceberg avro manifest-list decoder reads deflate blocks" {
     const alloc = std.testing.allocator;
     var fixture = try buildManifestListFixture(alloc, "deflate", true);
+    defer fixture.deinit(alloc);
+
+    var list = try parseManifestListAlloc(alloc, fixture.items);
+    defer list.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+    try std.testing.expectEqualStrings("s3://bucket/t/metadata/m0.avro", list.entries[0].manifest_path);
+    try std.testing.expectEqual(ManifestContent.deletes, list.entries[1].content);
+}
+
+test "iceberg avro manifest-list decoder rejects unsupported codec" {
+    const alloc = std.testing.allocator;
+    var fixture = try buildManifestListFixture(alloc, "snappy", true);
     defer fixture.deinit(alloc);
 
     try std.testing.expectError(error.UnsupportedAvroCodec, parseManifestListAlloc(alloc, fixture.items));
@@ -1024,9 +1099,22 @@ test "iceberg avro data-manifest decoder rejects unsupported data file format" {
     try std.testing.expectError(error.UnsupportedIcebergDataFileFormat, parseDataManifestAlloc(alloc, fixture.items));
 }
 
-test "iceberg avro data-manifest decoder rejects unsupported codec" {
+test "iceberg avro data-manifest decoder reads deflate blocks" {
     const alloc = std.testing.allocator;
     var fixture = try buildDataManifestFixture(alloc, "deflate", "PARQUET", 7);
+    defer fixture.deinit(alloc);
+
+    var manifest = try parseDataManifestAlloc(alloc, fixture.items);
+    defer manifest.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), manifest.entries.len);
+    try std.testing.expectEqualStrings("s3://bucket/t/data/a.parquet", manifest.entries[0].file_path);
+    try std.testing.expectEqualStrings("s3://bucket/t/data/b.parquet", manifest.entries[1].file_path);
+}
+
+test "iceberg avro data-manifest decoder rejects unsupported codec" {
+    const alloc = std.testing.allocator;
+    var fixture = try buildDataManifestFixture(alloc, "snappy", "PARQUET", 7);
     defer fixture.deinit(alloc);
 
     try std.testing.expectError(error.UnsupportedAvroCodec, parseDataManifestAlloc(alloc, fixture.items));
@@ -1055,9 +1143,11 @@ fn buildManifestListFixture(
     try appendManifestRecord(alloc, &block, "s3://bucket/t/metadata/m0.avro", .data, 42, 2, 1000, 0);
     try appendManifestRecord(alloc, &block, "s3://bucket/t/metadata/d0.avro", .deletes, 43, 0, 0, 3);
 
+    const encoded_block = try encodeFixtureBlockAlloc(alloc, codec, block.items);
+    defer if (encoded_block.owned) |owned| alloc.free(owned);
     try appendLong(alloc, &out, 2);
-    try appendLong(alloc, &out, @intCast(block.items.len));
-    try out.appendSlice(alloc, block.items);
+    try appendLong(alloc, &out, @intCast(encoded_block.bytes.len));
+    try out.appendSlice(alloc, encoded_block.bytes);
     try out.appendSlice(alloc, sync);
     return out;
 }
@@ -1133,6 +1223,29 @@ fn appendLong(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: i64) !v
     try out.append(alloc, @intCast(remaining));
 }
 
+const EncodedFixtureBlock = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+};
+
+fn encodeFixtureBlockAlloc(
+    alloc: Allocator,
+    codec: []const u8,
+    block: []const u8,
+) !EncodedFixtureBlock {
+    if (std.mem.eql(u8, codec, "deflate")) {
+        var out_buf: [4096]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var hist: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&out, hist[0..], .raw, .default);
+        try compressor.writer.writeAll(block);
+        try compressor.finish();
+        const compressed = try alloc.dupe(u8, out.buffered());
+        return .{ .bytes = compressed, .owned = compressed };
+    }
+    return .{ .bytes = block };
+}
+
 fn encodeZigzag(value: i64) u64 {
     if (value >= 0) return @as(u64, @intCast(value)) << 1;
     const magnitude: u64 = @intCast(-(value + 1));
@@ -1163,9 +1276,11 @@ fn buildDataManifestFixture(
     try appendDataManifestRecord(alloc, &block, .added, "s3://bucket/t/data/a.parquet", file_format, 3, 4096);
     try appendDataManifestRecord(alloc, &block, .deleted, "s3://bucket/t/data/b.parquet", file_format, 2, 2048);
 
+    const encoded_block = try encodeFixtureBlockAlloc(alloc, codec, block.items);
+    defer if (encoded_block.owned) |owned| alloc.free(owned);
     try appendLong(alloc, &out, 2);
-    try appendLong(alloc, &out, @intCast(block.items.len));
-    try out.appendSlice(alloc, block.items);
+    try appendLong(alloc, &out, @intCast(encoded_block.bytes.len));
+    try out.appendSlice(alloc, encoded_block.bytes);
     try out.appendSlice(alloc, sync);
     return out;
 }
