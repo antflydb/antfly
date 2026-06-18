@@ -634,6 +634,52 @@ The concrete follow-up decisions are:
   runbooks, compatibility tests, crash/e2e/operator coverage, and former-primary
   repair paths are all implemented and tested.
 
+#### Review Answer Details
+
+The HA string helper should be generic only at the whitespace/presence
+classification layer:
+
+```zig
+const HAStringValidation = enum { ok, missing, padded };
+
+fn classifyHAString(value: ?[]const u8) HAStringValidation
+```
+
+Callers should translate `missing` and `padded` into field-specific errors such
+as `HAPrimaryLogInvalid`, `HAStandbySlotMissing`, or the matching token-env,
+slot, URL, path, or node-id error. They should then run type-specific
+validation instead of putting all HA input policy into one generic
+`validateHAString` function:
+
+- paths must be absolute, normalized, and under the allowed storage root;
+- node ids and replication slot names must have restricted charset and length;
+- admin token environment variable names must use the existing env-var-name
+  validation rules;
+- admin and replication URLs must parse as URLs and reject hidden whitespace.
+
+`test_standby.py` belongs in the e2e suite once the admin API and runtime wiring
+are usable as real black-box process surfaces. Its first product-path version
+should start a primary, create a slot, seed a standby, start the standby, write
+to the primary, verify standby catch-up and read-only/stale-read status, restart
+the standby, and verify replay resumes. Later versions should add fenced
+promotion, forced-promotion receipts, old-primary write rejection, and
+rewind-or-reseed behavior.
+
+Zig simulation coverage is mandatory before this mode is treated as safe. It
+should cover crash after receive before apply, crash after apply before ack,
+primary crash before and after sync ack, duplicate/gap/out-of-order WAL records,
+promotion with and without fence evidence, old-primary rejoin, rewind, reseed,
+retained-WAL expiry forcing reseed, and timeline switch propagation.
+
+Production-grade Postgres-style parity requires more than streaming records. The
+bulk feature-parity bar includes end-to-end primary/standby runtime wiring,
+generated `/admin/v1/ha` Zig and Go SDK clients, `go/pkg/operator` integration,
+real base-backup and seed workflows, `remote_write` and `remote_apply`
+synchronous commit policies, hard-to-misuse fencing, promotion/timeline
+switch/former-primary repair, standby freshness controls, WAL retention and
+reseed status, auth, auditability, metrics, runbooks, format compatibility
+tests, black-box e2e, operator e2e, and crash/simulation coverage.
+
 ## Test Strategy
 
 HA needs both black-box e2e coverage and deterministic simulation coverage. The

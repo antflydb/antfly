@@ -2819,6 +2819,12 @@ pub fn build(b: *std.Build) void {
         "storage.ha compat keeps v1 replication record encoding stable",
         "storage.ha compat decodes v1 timeline switch record fixture",
         "storage.ha compat keeps v1 timeline switch encoding stable",
+        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
+        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
+        "storage.ha compat decodes v1 backup manifest fixture",
+        "storage.ha compat keeps v1 backup manifest encoding stable",
+        "storage.ha compat keeps v1 backup manifest file kind tags stable",
+        "storage.ha compat keeps v1 record kind tags stable",
     };
     const lib_ha_compat_tests = b.addTest(.{
         .root_module = lib_test_mod,

@@ -20,6 +20,7 @@
 //! drift is caught before two Antfly versions fail to replicate.
 
 const std = @import("std");
+const backup_manifest = @import("backup_manifest.zig");
 const replication_record = @import("replication_record.zig");
 
 const v1_payload = "v1-fixture";
@@ -188,6 +189,66 @@ const v1_checkpoint_encoded = [_]u8{
     0x7d,
 };
 
+const v1_manifest_files = [_]backup_manifest.FileEntry{
+    .{
+        .path = "metadata/local-metadata.json",
+        .kind = .metadata,
+        .size_bytes = 7,
+        .crc32 = 0x1b2c3247,
+    },
+    .{
+        .path = "store/sst/0001.sst",
+        .kind = .sstable,
+        .size_bytes = 6,
+        .crc32 = 0x7e7578e1,
+        .flags = 0x10,
+    },
+};
+
+const v1_manifest = backup_manifest.Manifest{
+    .identity = .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    },
+    .manifest_id = "base-0001",
+    .backup_lsn = 2,
+    .checkpoint_lsn = 5,
+    .files = &v1_manifest_files,
+    .flags = 0x01020304,
+};
+
+const v1_manifest_encoded = [_]u8{
+    0x41, 0x46, 0x48, 0x41, 0x42, 0x4b, 0x50, 0x0a,
+    0x01, 0x00, 0x60, 0x00, 0x04, 0x03, 0x02, 0x01,
+    0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x27, 0x0d, 0x9a, 0xca, 0xd2, 0xde, 0xf7, 0xe9,
+    0x62, 0x61, 0x73, 0x65, 0x2d, 0x30, 0x30, 0x30,
+    0x31, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x47, 0x32, 0x2c, 0x1b, 0x1c, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x6d, 0x65, 0x74,
+    0x61, 0x64, 0x61, 0x74, 0x61, 0x2f, 0x6c, 0x6f,
+    0x63, 0x61, 0x6c, 0x2d, 0x6d, 0x65, 0x74, 0x61,
+    0x64, 0x61, 0x74, 0x61, 0x2e, 0x6a, 0x73, 0x6f,
+    0x6e, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+    0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xe1, 0x78, 0x75, 0x7e, 0x12, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x73, 0x74, 0x6f,
+    0x72, 0x65, 0x2f, 0x73, 0x73, 0x74, 0x2f, 0x30,
+    0x30, 0x30, 0x31, 0x2e, 0x73, 0x73, 0x74,
+};
+
 test "storage.ha compat decodes v1 replication record fixture" {
     const decoded = try replication_record.decode(&v1_encoded);
 
@@ -234,6 +295,30 @@ test "storage.ha compat keeps v1 base backup and checkpoint encodings stable" {
     try std.testing.expectEqualSlices(u8, &v1_checkpoint_encoded, checkpoint_encoded);
 }
 
+test "storage.ha compat decodes v1 backup manifest fixture" {
+    const decoded = try backup_manifest.decodeAlloc(std.testing.allocator, &v1_manifest_encoded);
+    defer backup_manifest.freeDecoded(std.testing.allocator, decoded);
+
+    try expectManifestEqual(v1_manifest, decoded);
+}
+
+test "storage.ha compat keeps v1 backup manifest encoding stable" {
+    const encoded = try backup_manifest.encodeAlloc(std.testing.allocator, v1_manifest);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectEqual(@as(usize, backup_manifest.header_size + 111), encoded.len);
+    try std.testing.expectEqualSlices(u8, &v1_manifest_encoded, encoded);
+}
+
+test "storage.ha compat keeps v1 backup manifest file kind tags stable" {
+    try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(backup_manifest.FileKind.sstable));
+    try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(backup_manifest.FileKind.manifest));
+    try std.testing.expectEqual(@as(u16, 0x0003), @intFromEnum(backup_manifest.FileKind.metadata));
+    try std.testing.expectEqual(@as(u16, 0x0004), @intFromEnum(backup_manifest.FileKind.wal_tail));
+    try std.testing.expectEqual(@as(u16, 0x0005), @intFromEnum(backup_manifest.FileKind.artifact));
+    try std.testing.expectEqual(@as(u16, 0x00ff), @intFromEnum(backup_manifest.FileKind.other));
+}
+
 test "storage.ha compat keeps v1 record kind tags stable" {
     try std.testing.expectEqual(@as(u16, 0x0001), @intFromEnum(replication_record.RecordKind.batch_mutation));
     try std.testing.expectEqual(@as(u16, 0x0002), @intFromEnum(replication_record.RecordKind.metadata_mutation));
@@ -259,4 +344,26 @@ fn expectRecordEqual(expected: replication_record.Record, actual: replication_re
     try std.testing.expectEqual(expected.previous_lsn, actual.previous_lsn);
     try std.testing.expectEqual(expected.commit_timestamp_ns, actual.commit_timestamp_ns);
     try std.testing.expectEqualStrings(expected.payload, actual.payload);
+}
+
+fn expectManifestEqual(expected: backup_manifest.Manifest, actual: backup_manifest.ManifestView) !void {
+    try std.testing.expectEqual(expected.identity.cluster_id, actual.identity.cluster_id);
+    try std.testing.expectEqual(expected.identity.shard_id, actual.identity.shard_id);
+    try std.testing.expectEqual(expected.identity.table_id, actual.identity.table_id);
+    try std.testing.expectEqual(expected.identity.timeline_id, actual.identity.timeline_id);
+    try std.testing.expectEqual(expected.identity.epoch, actual.identity.epoch);
+    try std.testing.expectEqualStrings(expected.manifest_id, actual.manifest_id);
+    try std.testing.expectEqual(expected.backup_lsn, actual.backup_lsn);
+    try std.testing.expectEqual(expected.checkpoint_lsn, actual.checkpoint_lsn);
+    try std.testing.expectEqual(expected.flags, actual.flags);
+    try std.testing.expectEqual(expected.files.len, actual.files.len);
+    try std.testing.expectEqual(@as(u64, 13), actual.totalBytes());
+
+    for (expected.files, actual.files) |expected_file, actual_file| {
+        try std.testing.expectEqualStrings(expected_file.path, actual_file.path);
+        try std.testing.expectEqual(expected_file.kind, actual_file.kind);
+        try std.testing.expectEqual(expected_file.size_bytes, actual_file.size_bytes);
+        try std.testing.expectEqual(expected_file.crc32, actual_file.crc32);
+        try std.testing.expectEqual(expected_file.flags, actual_file.flags);
+    }
 }
