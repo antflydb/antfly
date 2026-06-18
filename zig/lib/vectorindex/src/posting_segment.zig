@@ -2318,6 +2318,7 @@ const PendingDeltaBatch = struct {
     encoded_value_bytes: usize = 0,
     min_sequence: u64 = 0,
     max_sequence: u64 = 0,
+    tombstone_records: usize = 0,
 
     fn deinit(self: *PendingDeltaBatch, alloc: Allocator) void {
         self.records.deinit(alloc);
@@ -2335,6 +2336,7 @@ const PendingDeltaBatch = struct {
             record.sequence
         else
             @max(self.max_sequence, record.sequence);
+        if (record.op == .tombstone) self.tombstone_records += 1;
     }
 
     fn noteAppendedRecords(self: *PendingDeltaBatch, records: []const posting.PostingDeltaRecord, encoded_value_bytes: usize) void {
@@ -2342,12 +2344,39 @@ const PendingDeltaBatch = struct {
         const first_records = self.records.items.len == records.len;
         var min_sequence = if (first_records) records[0].sequence else self.min_sequence;
         var max_sequence = if (first_records) records[0].sequence else self.max_sequence;
+        var tombstone_records: usize = if (first_records) 0 else self.tombstone_records;
         for (records) |record| {
             min_sequence = @min(min_sequence, record.sequence);
             max_sequence = @max(max_sequence, record.sequence);
+            if (record.op == .tombstone) tombstone_records += 1;
         }
         self.min_sequence = min_sequence;
         self.max_sequence = max_sequence;
+        self.tombstone_records = tombstone_records;
+    }
+
+    fn accumulateStatsAfterGeneration(
+        self: PendingDeltaBatch,
+        out: *posting.PostingDeltaTailStats,
+        base_generation: u64,
+    ) void {
+        out.encoded_value_bytes += self.encoded_value_bytes;
+        out.records += self.records.items.len;
+        if (self.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.max_sequence) <= base_generation) return;
+
+        if (self.min_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(self.min_sequence) > base_generation) {
+            out.records_after_generation += self.records.items.len;
+            out.tombstones_after_generation += self.tombstone_records;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, self.max_sequence);
+            return;
+        }
+
+        for (self.records.items) |record| {
+            if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+            out.records_after_generation += 1;
+            if (record.op == .tombstone) out.tombstones_after_generation += 1;
+            out.max_sequence_after_generation = @max(out.max_sequence_after_generation, record.sequence);
+        }
     }
 
     fn latestRecordAfterGenerationForMember(
@@ -2822,18 +2851,7 @@ pub const DirectoryBatchWriter = struct {
         var out = posting.PostingDeltaTailStats{};
         try self.accumulatePendingDeltaEntryStats(&out, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
-            out.encoded_value_bytes += batch.encoded_value_bytes;
-            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) {
-                out.records += batch.records.items.len;
-                return out;
-            }
-            for (batch.records.items) |record| {
-                out.records += 1;
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
-                out.records_after_generation += 1;
-                if (record.op == .tombstone) out.tombstones_after_generation += 1;
-                out.max_sequence_after_generation = @max(out.max_sequence_after_generation, record.sequence);
-            }
+            batch.accumulateStatsAfterGeneration(&out, base_generation);
         }
         return out;
     }
@@ -6448,6 +6466,7 @@ test "posting segment pending delta batch size uses cached min sequence" {
 
     try std.testing.expectEqual(records[1].sequence, batch.min_sequence);
     try std.testing.expectEqual(records[2].sequence, batch.max_sequence);
+    try std.testing.expectEqual(@as(usize, 1), batch.tombstone_records);
 }
 
 test "posting segment pending delta batch latest member scan preserves equal sequence order" {
@@ -6471,6 +6490,34 @@ test "posting segment pending delta batch latest member scan preserves equal seq
 
     try std.testing.expectEqual(sequence, best_sequence);
     try std.testing.expectEqual(posting.PostingDeltaOp.tombstone, best_record.?.op);
+}
+
+test "posting segment pending delta batch stats use cached all-live metadata" {
+    const alloc = std.testing.allocator;
+    const records = [_]posting.PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 10) << 32) | 1, .op = .insert, .vector_id = 10 },
+        .{ .sequence = (@as(u64, 10) << 32) | 2, .op = .tombstone, .vector_id = 20 },
+        .{ .sequence = (@as(u64, 11) << 32) | 1, .op = .insert, .vector_id = 30 },
+    };
+
+    var batch = PendingDeltaBatch{};
+    defer batch.deinit(alloc);
+    try batch.records.appendSlice(alloc, &records);
+    batch.noteAppendedRecords(&records, try posting.PostingFormat.encodedDeltaTailSize(&records));
+
+    var all_live = posting.PostingDeltaTailStats{};
+    batch.accumulateStatsAfterGeneration(&all_live, 9);
+    try std.testing.expectEqual(@as(usize, records.len), all_live.records);
+    try std.testing.expectEqual(@as(usize, records.len), all_live.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 1), all_live.tombstones_after_generation);
+    try std.testing.expectEqual(records[2].sequence, all_live.max_sequence_after_generation);
+
+    var partial = posting.PostingDeltaTailStats{};
+    batch.accumulateStatsAfterGeneration(&partial, 10);
+    try std.testing.expectEqual(@as(usize, records.len), partial.records);
+    try std.testing.expectEqual(@as(usize, 1), partial.records_after_generation);
+    try std.testing.expectEqual(@as(usize, 0), partial.tombstones_after_generation);
+    try std.testing.expectEqual(records[2].sequence, partial.max_sequence_after_generation);
 }
 
 test "posting segment directory batch writer flushes bounded segments" {
