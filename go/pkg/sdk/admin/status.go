@@ -308,8 +308,40 @@ func haRetentionStatusJSONComplete(retention *haRetentionStatusJSON) bool {
 		retention.OldestRestartLSN != nil &&
 		retention.RetainedLSNCount != nil &&
 		retention.RetainedByteCount != nil &&
+		retention.RetainedAgeNS != nil &&
 		retention.ActiveSlots != nil &&
 		retention.ReseedRecommended != nil
+}
+
+func ValidateHAPrimaryStatusResponseEvidence(raw []byte) error {
+	var direct haPrimaryStatusEnvelopeJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		return err
+	}
+	if direct.Snapshot == nil {
+		return fmt.Errorf("missing primary status snapshot field evidence")
+	}
+	if !haAdminIdentityJSONComplete(direct.Snapshot.Identity) {
+		return fmt.Errorf("missing primary status identity field evidence")
+	}
+	if direct.Snapshot.CurrentLSN == nil {
+		return fmt.Errorf("missing primary status current_lsn field evidence")
+	}
+	if !haRetentionStatusJSONComplete(direct.Snapshot.Retention) {
+		return fmt.Errorf("missing primary status retention field evidence")
+	}
+	if direct.Snapshot.Slots == nil {
+		return fmt.Errorf("missing primary status slots field evidence")
+	}
+	for i, slot := range *direct.Snapshot.Slots {
+		if !haSlotStatusJSONComplete(slot) {
+			return fmt.Errorf("missing primary status slot field evidence at index %d", i)
+		}
+	}
+	if direct.Snapshot.Durability != nil && !haDurabilityStatusJSONComplete(*direct.Snapshot.Durability) {
+		return fmt.Errorf("missing primary status durability field evidence")
+	}
+	return nil
 }
 
 func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionStatusJSON, slotCount int) error {
@@ -471,6 +503,23 @@ func haStandbyStatusJSONComplete(snapshot *haStandbyStatusJSON) bool {
 		snapshot.UnappliedLSNCount != nil &&
 		snapshot.CaughtUpToReceived != nil &&
 		snapshot.CanServeSafeReads != nil
+}
+
+func ValidateHAStandbyStatusResponseEvidence(raw []byte) error {
+	var direct haStandbyStatusEnvelopeJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		return err
+	}
+	if direct.Snapshot == nil {
+		return fmt.Errorf("missing standby status snapshot field evidence")
+	}
+	if !haAdminIdentityJSONComplete(direct.Snapshot.Identity) {
+		return fmt.Errorf("missing standby status identity field evidence")
+	}
+	if !haStandbyStatusJSONComplete(direct.Snapshot) {
+		return fmt.Errorf("missing standby status progress field evidence")
+	}
+	return nil
 }
 
 func haStandbyStatusJSONConsistent(snapshot *haStandbyStatusJSON) error {

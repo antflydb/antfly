@@ -78,6 +78,11 @@ func TestHAStatusParserRejectsInvalidPrimaryFields(t *testing.T) {
 			wantErr: "retention",
 		},
 		{
+			name:    "missing retained age evidence",
+			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"retained_age_ns":400,`, ``, 1),
+			wantErr: "retention",
+		},
+		{
 			name:    "slot applied beyond received",
 			body:    strings.Replace(haLegacyPrimaryStatusJSON(), `"applied_lsn":12`, `"applied_lsn":13`, 1),
 			wantErr: "slot",
@@ -244,6 +249,34 @@ func TestHAClientPrimaryStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 	}
 }
 
+func TestHAClientPrimaryStatusResponseRejectsMissingRequiredGeneratedField(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAPrimaryStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAPrimaryStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedPrimaryStatusJSON(), `"retained_age_ns":400,`, ``, 1))
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.PrimaryStatusResponse(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("PrimaryStatusResponse returned nil error, want missing field evidence error")
+	}
+	if !strings.Contains(err.Error(), "missing primary status retention field evidence") {
+		t.Fatalf("error = %q, want missing retention evidence", err.Error())
+	}
+}
+
 func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) {
 	t.Parallel()
 
@@ -272,6 +305,34 @@ func TestHAClientStandbyStatusResponseRejectsInvalidGeneratedBody(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "caught_up_to_received") {
 		t.Fatalf("error = %q, want caught_up_to_received invariant", err.Error())
+	}
+}
+
+func TestHAClientStandbyStatusResponseRejectsMissingRequiredGeneratedField(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAStandbyStatusPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAStandbyStatusPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, strings.Replace(haGeneratedStandbyStatusJSON(), `"safe_read_lsn":11,`, ``, 1))
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	_, err = client.StandbyStatusResponse(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("StandbyStatusResponse returned nil error, want missing field evidence error")
+	}
+	if !strings.Contains(err.Error(), "missing standby status progress field evidence") {
+		t.Fatalf("error = %q, want missing progress evidence", err.Error())
 	}
 }
 
@@ -433,6 +494,7 @@ func haLegacyPrimaryStatusJSON() string {
 					"oldest_restart_lsn":7,
 					"retained_lsn_count":5,
 					"retained_byte_count":512,
+					"retained_age_ns":400,
 					"active_slots":1,
 					"reseed_recommended":0
 				},

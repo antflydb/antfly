@@ -2133,7 +2133,7 @@ func (c *HAClient) PrimaryStatusResponse(ctx context.Context, params *HAPrimaryS
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("get HA primary status", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPrimaryStatusResponse)
+	return requireHAJSON200ValidatedEvidence("get HA primary status", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAPrimaryStatusResponse, ValidateHAPrimaryStatusResponseEvidence)
 }
 
 func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusParams) (*HAPrimaryStatusResponse, error) {
@@ -2168,7 +2168,7 @@ func (c *HAClient) StandbyStatusResponse(ctx context.Context, params *HAStandbyS
 	if resp == nil {
 		return nil, err
 	}
-	return requireHAJSON200Validated("get HA standby status", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyStatusResponse)
+	return requireHAJSON200ValidatedEvidence("get HA standby status", resp.StatusCode(), resp.Body, resp.JSON200, err, ValidateHAStandbyStatusResponse, ValidateHAStandbyStatusResponseEvidence)
 }
 
 func (c *HAClient) StandbyStatus(ctx context.Context, params *HAStandbyStatusParams) (*HAStandbyStatusResponse, error) {
