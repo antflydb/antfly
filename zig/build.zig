@@ -2887,6 +2887,7 @@ pub fn build(b: *std.Build) void {
         "storage.ha data server rejects writes and owner jobs after primary promotion fence",
         "data server applies routed HA replication records through standby write gate",
         "data server pulls and applies HA standby replication through internal HTTP client",
+        "data server resumes HA standby replication from durable progress after restart",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
