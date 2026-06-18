@@ -7251,12 +7251,18 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
 
     if (prepared.len > 1) std.mem.sort(PreparedBatchInsert, prepared, {}, lessPreparedBatchInsert);
 
-    const fallback_transformed = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(fallback_transformed);
+    const paired_scratch_len = try std.math.mul(usize, dims, 2);
+    var paired_scratch_stack: [8192]f32 = undefined;
+    const use_paired_scratch_stack = paired_scratch_len <= paired_scratch_stack.len;
+    const paired_scratch = if (use_paired_scratch_stack)
+        paired_scratch_stack[0..paired_scratch_len]
+    else
+        try self.alloc.alloc(f32, paired_scratch_len);
+    defer if (!use_paired_scratch_stack) self.alloc.free(paired_scratch);
+    const fallback_transformed = paired_scratch[0..dims];
     var mutate_leaf_ns: u64 = 0;
     var grouped_items: usize = 0;
-    const centroid_sum = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(centroid_sum);
+    const centroid_sum = paired_scratch[dims..paired_scratch_len];
     var split_candidates = std.ArrayListUnmanaged(u64).empty;
     defer split_candidates.deinit(self.alloc);
     var ancestor_range_refreshes = std.ArrayListUnmanaged(u64).empty;
