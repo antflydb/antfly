@@ -3016,7 +3016,6 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     if (request.source_cte.len != 0) return error.UnsupportedRowsQuery;
     if (request.row_claim != null) return error.UnsupportedRowsQuery;
     if (request.doc_key_range != null) return error.UnsupportedRowsQuery;
-    if (request.offset != 0) return error.UnsupportedRowsQuery;
     if (request.distinct_on.len != 0 or request.distinct_on_expressions.len != 0) return error.UnsupportedRowsQuery;
     try validateLakeRowsQueryPredicateGroupsSupported(alloc, schema, request);
     for (request.array_any) |predicate| {
@@ -3127,7 +3126,7 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     const scan = lake_rows.ScanRequest{
         .projected_columns = projected_columns,
         .predicate = predicate,
-        .limit = if (request.order_by.len == 0 and !lakeRowsQueryHasResidualPredicates(request)) if (request.limit) |limit| @as(usize, limit) else null else null,
+        .limit = if (request.order_by.len == 0 and !lakeRowsQueryHasResidualPredicates(request)) if (request.limit) |limit| std.math.add(usize, @as(usize, request.offset), @as(usize, limit)) catch return error.InvalidRowsRequest else null else null,
     };
     return .{
         .request = scan,
@@ -3183,22 +3182,24 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
         }
         std.sort.pdq(LakeRowsQueryOrderCandidate, ordered.items, QuerySortContext{ .order_by = request.order_by }, lakeRowsQueryOrderCandidateLessThan);
 
+        const start = @min(@as(usize, request.offset), ordered.items.len);
         const limited_len: usize = if (request.limit) |limit|
-            @min(@as(usize, limit), ordered.items.len)
+            @min(@as(usize, limit), ordered.items.len - start)
         else
-            ordered.items.len;
+            ordered.items.len - start;
         try rows.ensureUnusedCapacity(alloc, limited_len);
-        for (ordered.items[0..limited_len]) |candidate| {
+        for (ordered.items[start .. start + limited_len]) |candidate| {
             const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, candidate.row);
             rows.appendAssumeCapacity(encoded);
         }
     } else {
+        const start = @min(@as(usize, request.offset), filtered_rows.len);
         const limited_len: usize = if (request.limit) |limit|
-            @min(@as(usize, limit), filtered_rows.len)
+            @min(@as(usize, limit), filtered_rows.len - start)
         else
-            filtered_rows.len;
+            filtered_rows.len - start;
         try rows.ensureUnusedCapacity(alloc, limited_len);
-        for (filtered_rows[0..limited_len]) |row| {
+        for (filtered_rows[start .. start + limited_len]) |row| {
             const encoded = try lakeProjectedRowQueryJsonAlloc(alloc, request, row);
             rows.appendAssumeCapacity(encoded);
         }
