@@ -347,6 +347,8 @@ pub const buildLakeParquetPlainI64ObjectRangeRowGroupBatchAlloc = query.buildLak
 pub const buildLakeParquetSupportedI64ObjectRangeRowGroupBatchAlloc = query.buildLakeParquetSupportedI64ObjectRangeRowGroupBatchAlloc;
 pub const planLakeParquetPlainI64ObjectRangeRowGroupsAlloc = query.planLakeParquetPlainI64ObjectRangeRowGroupsAlloc;
 pub const planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc = query.planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc;
+pub const discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc = query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
+pub const LakeParquetDiscoveredObjectRangeRowGroupPlan = query.LakeParquetDiscoveredObjectRangeRowGroupPlan;
 pub const SparseEnricher = enrichment.SparseEnricher;
 pub const EnrichmentRunStats = enrichment.EnrichmentRunStats;
 pub const RuntimeConfig = runtime.RuntimeConfig;
@@ -676,6 +678,8 @@ test "serverless module compiles" {
     _ = buildLakeParquetSupportedI64ObjectRangeRowGroupBatchAlloc;
     _ = planLakeParquetPlainI64ObjectRangeRowGroupsAlloc;
     _ = planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc;
+    _ = discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
+    _ = LakeParquetDiscoveredObjectRangeRowGroupPlan;
     _ = SparseEnricher;
     _ = EnrichmentRunStats;
     _ = RuntimeConfig;
