@@ -1310,6 +1310,7 @@ fn serveUnifiedInner(
     // Internal group routes are still served by the legacy ApiHttpServer
     // implementation, but the shared httpx server owns the route table.
     active_api_server = api_server;
+    try registerHAAdminRoutes(&server);
     try registerMcpRoutes(&server);
     try registerInternalGroupRoutes(&server);
     try registerAntfarmRoutes(&server);
@@ -1374,6 +1375,19 @@ fn registerMcpRoutes(server: anytype) !void {
         try server.get(path, mcpBridgeHandler);
         try server.post(path, mcpBridgeHandler);
         try server.delete(path, mcpBridgeHandler);
+    }
+}
+
+fn registerHAAdminRoutes(server: anytype) !void {
+    const ha_paths = [_][]const u8{
+        antfly.admin.routes.ha,
+        antfly.admin.routes.ha ++ "/*",
+    };
+    inline for (ha_paths) |path| {
+        try server.get(path, haAdminBridgeHandler);
+        try server.post(path, haAdminBridgeHandler);
+        try server.put(path, haAdminBridgeHandler);
+        try server.delete(path, haAdminBridgeHandler);
     }
 }
 
@@ -1501,6 +1515,7 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         "/ml",
         "/antfly",
         "/metadata",
+        "/admin",
         "/internal",
         "/mcp",
         "/healthz",
@@ -1512,6 +1527,36 @@ fn isAntfarmReservedPath(path: []const u8) bool {
         if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and path[prefix.len] == '/') return true;
     }
     return false;
+}
+
+fn haAdminBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
+    const server = active_api_server orelse {
+        _ = ctx.status(503);
+        return ctx.text("not ready");
+    };
+
+    const method: http_common.Method = switch (ctx.request.method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        else => {
+            _ = ctx.status(405);
+            return ctx.text("method not allowed");
+        },
+    };
+
+    const body_data = (try ctx.body()) orelse "";
+    const legacy_req = http_common.HttpRequest{
+        .method = method,
+        .uri = ctx.request.uri.raw,
+        .authorization = ctx.header("authorization"),
+        .content_type = ctx.header("content-type"),
+        .body = body_data,
+    };
+
+    var resp = try server.handle(legacy_req);
+    return AntflyApiHandler.respond(ctx, &resp);
 }
 
 fn antfarmContentType(path: []const u8) []const u8 {
@@ -2442,6 +2487,7 @@ fn parsePositiveU64(raw: []const u8) !u64 {
 const RecordingRouteMethod = enum {
     get,
     post,
+    put,
     delete,
 };
 
@@ -2472,6 +2518,10 @@ const RecordingServer = struct {
 
     pub fn post(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
         try self.append(.post, path);
+    }
+
+    pub fn put(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
+        try self.append(.put, path);
     }
 
     pub fn delete(self: *@This(), comptime path: []const u8, _: httpx.Handler) !void {
@@ -2590,6 +2640,26 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_status_suffix));
 }
 
+test "swarm runtime registers HA admin bridge routes before antfarm catch-all" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    try registerHAAdminRoutes(&server);
+    try registerAntfarmRoutes(&server);
+
+    const ha_base = antfly.admin.routes.ha;
+    const ha_prefix = antfly.admin.routes.ha ++ "/*";
+    try std.testing.expect(server.hasRoute(.get, ha_base));
+    try std.testing.expect(server.hasRoute(.post, ha_base));
+    try std.testing.expect(server.hasRoute(.put, ha_base));
+    try std.testing.expect(server.hasRoute(.delete, ha_base));
+    try std.testing.expect(server.hasRoute(.get, ha_prefix));
+    try std.testing.expect(server.hasRoute(.post, ha_prefix));
+    try std.testing.expect(server.hasRoute(.put, ha_prefix));
+    try std.testing.expect(server.hasRoute(.delete, ha_prefix));
+    try std.testing.expect(server.hasRoute(.get, "/*"));
+}
+
 test "swarm runtime registers mcp routes before antfarm catch-all" {
     var server = RecordingServer{ .allocator = std.testing.allocator };
     defer server.deinit();
@@ -2623,6 +2693,7 @@ test "swarm runtime antfarm path guards keep api routes reserved" {
     try std.testing.expect(isAntfarmReservedPath("/db/v1/tables"));
     try std.testing.expect(isAntfarmReservedPath("/ai/v1/models"));
     try std.testing.expect(isAntfarmReservedPath("/antfly/readyz"));
+    try std.testing.expect(isAntfarmReservedPath("/admin/v1/ha/primary/status"));
     try std.testing.expect(!isAntfarmReservedPath("/models"));
     try std.testing.expect(hasUnsafeStaticPath("../index.html"));
     try std.testing.expect(hasUnsafeStaticPath("%2e%2e/index.html"));
