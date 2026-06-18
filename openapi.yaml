@@ -14977,6 +14977,8 @@ components:
         - tree_search: Execute tree search with beam search navigation
 
         - graph_search: Execute graph traversal search
+
+        - aggregate: Execute aggregations against an index
       enum:
         - add_filter
         - ask_clarification
@@ -14987,6 +14989,7 @@ components:
         - full_text_search
         - tree_search
         - graph_search
+        - aggregate
     WebSearchProvider:
       type: string
       enum:
