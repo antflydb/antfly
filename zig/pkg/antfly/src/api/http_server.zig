@@ -2164,7 +2164,9 @@ pub const ApiHttpServer = struct {
                 return try textResponse(self.alloc, 403, "forbidden");
             }
             if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
-                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
+                const resource = try required.resourceNameAlloc(self.alloc);
+                defer self.alloc.free(resource);
+                if (!permissionsAllow(identity.permissions, required.resource_type, resource, required.permission_type)) {
                     return try textResponse(self.alloc, 403, "forbidden");
                 }
             }
@@ -3707,6 +3709,214 @@ pub const ApiHttpServer = struct {
         return try jsonResponse(self.alloc, response);
     }
 
+    const PublicDatabaseCatalogResponse = struct {
+        database_id: u64,
+        name: []const u8,
+        settings_json: []const u8,
+    };
+
+    const PublicNamespaceCatalogResponse = struct {
+        namespace_id: u64,
+        database_id: u64,
+        database_name: []const u8,
+        name: []const u8,
+    };
+
+    fn handlePublicListDatabases(self: *ApiHttpServer) !http_common.HttpResponse {
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const out = try self.alloc.alloc(PublicDatabaseCatalogResponse, snapshot.databases.len);
+        defer self.alloc.free(out);
+        for (snapshot.databases, 0..) |database, i| out[i] = databaseResponse(database);
+        return try jsonResponse(self.alloc, out);
+    }
+
+    fn handlePublicGetDatabase(self: *ApiHttpServer, database_name: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const database = tables_api.findDatabaseByName(&snapshot, database_name) orelse return try textResponse(self.alloc, 404, "not found");
+        return try jsonResponse(self.alloc, databaseResponse(database.*));
+    }
+
+    fn handlePublicCreateDatabase(self: *ApiHttpServer, database_name: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        const sql = try std.fmt.allocPrint(self.alloc, "CREATE DATABASE {s};", .{database_name});
+        defer self.alloc.free(sql);
+        var applied = self.applyRelationalSqlDdl(sql) catch |err| switch (err) {
+            error.DatabaseAlreadyExists => return try textResponse(self.alloc, 409, "database already exists"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        defer applied.deinit(self.alloc);
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const database = tables_api.findDatabaseByName(&snapshot, database_name) orelse return try textResponse(self.alloc, 500, "database create did not converge");
+        return try jsonResponseWithStatus(self.alloc, 201, databaseResponse(database.*));
+    }
+
+    fn handlePublicDropDatabase(self: *ApiHttpServer, database_name: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        const sql = try std.fmt.allocPrint(self.alloc, "DROP DATABASE {s};", .{database_name});
+        defer self.alloc.free(sql);
+        var applied = self.applyRelationalSqlDdl(sql) catch |err| switch (err) {
+            error.DatabaseNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DatabaseNotEmpty => return try textResponse(self.alloc, 409, "database not empty"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        defer applied.deinit(self.alloc);
+        return .{ .status = 204, .content_type = null, .body = &.{} };
+    }
+
+    fn handlePublicListNamespaces(self: *ApiHttpServer, database_name: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const database = tables_api.findDatabaseByName(&snapshot, database_name) orelse return try textResponse(self.alloc, 404, "not found");
+        var count: usize = 0;
+        for (snapshot.namespaces) |namespace| {
+            if (namespace.database_id == database.database_id) count += 1;
+        }
+        const out = try self.alloc.alloc(PublicNamespaceCatalogResponse, count);
+        defer self.alloc.free(out);
+        var filled: usize = 0;
+        for (snapshot.namespaces) |namespace| {
+            if (namespace.database_id != database.database_id) continue;
+            out[filled] = namespaceResponse(database.*, namespace);
+            filled += 1;
+        }
+        return try jsonResponse(self.alloc, out);
+    }
+
+    fn handlePublicListNamespaceTables(self: *ApiHttpServer, database_name: []const u8, namespace_name: []const u8, query: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        if (!catalogApiIdentifierValid(namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        _ = tables_api.findDatabaseByName(&snapshot, database_name) orelse return try textResponse(self.alloc, 404, "not found");
+        _ = tables_api.findNamespaceByName(&snapshot, database_name, namespace_name) orelse return try textResponse(self.alloc, 404, "not found");
+        const params = try parseListTablesParams(query);
+        if (params.pattern != null) return try textResponse(self.alloc, 400, "unsupported table pattern");
+
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        const filtered_tables = try filteredCatalogTablesAlloc(arena, &snapshot, database_name, namespace_name);
+        const filtered_ranges = try filteredCatalogRangesAlloc(arena, &snapshot, filtered_tables);
+        var filtered = snapshot;
+        filtered.tables = filtered_tables;
+        filtered.ranges = filtered_ranges;
+        const response = try tables_api.buildTableListWithStorageStatuses(arena, &filtered, params.prefix, null);
+        return try jsonResponse(self.alloc, response);
+    }
+
+    fn filteredCatalogTablesAlloc(
+        alloc: std.mem.Allocator,
+        snapshot: *const metadata_api.AdminSnapshot,
+        database_name: []const u8,
+        namespace_name: []const u8,
+    ) ![]metadata_table_manager.TableRecord {
+        var count: usize = 0;
+        for (snapshot.tables) |table| {
+            if (std.mem.eql(u8, table.database_name, database_name) and std.mem.eql(u8, table.namespace_name, namespace_name)) count += 1;
+        }
+        const out = try alloc.alloc(metadata_table_manager.TableRecord, count);
+        var filled: usize = 0;
+        for (snapshot.tables) |table| {
+            if (!std.mem.eql(u8, table.database_name, database_name) or !std.mem.eql(u8, table.namespace_name, namespace_name)) continue;
+            out[filled] = table;
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn filteredCatalogRangesAlloc(
+        alloc: std.mem.Allocator,
+        snapshot: *const metadata_api.AdminSnapshot,
+        tables: []const metadata_table_manager.TableRecord,
+    ) ![]metadata_table_manager.RangeRecord {
+        var count: usize = 0;
+        for (snapshot.ranges) |range| {
+            if (catalogRangeBelongsToTables(range, tables)) count += 1;
+        }
+        const out = try alloc.alloc(metadata_table_manager.RangeRecord, count);
+        var filled: usize = 0;
+        for (snapshot.ranges) |range| {
+            if (!catalogRangeBelongsToTables(range, tables)) continue;
+            out[filled] = range;
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn catalogRangeBelongsToTables(range: metadata_table_manager.RangeRecord, tables: []const metadata_table_manager.TableRecord) bool {
+        for (tables) |table| {
+            if (range.table_id == table.table_id) return true;
+        }
+        return false;
+    }
+
+    fn handlePublicCreateNamespace(self: *ApiHttpServer, database_name: []const u8, namespace_name: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        if (!catalogApiIdentifierValid(namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+        self.source.createNamespace(database_name, namespace_name) catch |err| switch (err) {
+            error.DatabaseNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.NamespaceAlreadyExists => return try textResponse(self.alloc, 409, "namespace already exists"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const database = tables_api.findDatabaseByName(&snapshot, database_name) orelse return try textResponse(self.alloc, 500, "namespace create did not converge");
+        const namespace = tables_api.findNamespaceByName(&snapshot, database_name, namespace_name) orelse return try textResponse(self.alloc, 500, "namespace create did not converge");
+        return try jsonResponseWithStatus(self.alloc, 201, namespaceResponse(database.*, namespace.*));
+    }
+
+    fn handlePublicDropNamespace(self: *ApiHttpServer, database_name: []const u8, namespace_name: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        if (!catalogApiIdentifierValid(namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+        self.source.dropNamespace(database_name, namespace_name) catch |err| switch (err) {
+            error.DatabaseNotFound, error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.NamespaceNotEmpty => return try textResponse(self.alloc, 409, "namespace not empty"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => return err,
+        };
+        return .{ .status = 204, .content_type = null, .body = &.{} };
+    }
+
+    fn databaseResponse(database: metadata_table_manager.DatabaseRecord) PublicDatabaseCatalogResponse {
+        return .{
+            .database_id = database.database_id,
+            .name = database.name,
+            .settings_json = database.settings_json,
+        };
+    }
+
+    fn namespaceResponse(database: metadata_table_manager.DatabaseRecord, namespace: metadata_table_manager.NamespaceRecord) PublicNamespaceCatalogResponse {
+        return .{
+            .namespace_id = namespace.namespace_id,
+            .database_id = namespace.database_id,
+            .database_name = database.name,
+            .name = namespace.name,
+        };
+    }
+
+    fn catalogApiIdentifierValid(name: []const u8) bool {
+        if (name.len == 0) return false;
+        const first = name[0];
+        if (!(std.ascii.isAlphabetic(first) or first == '_')) return false;
+        for (name[1..]) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
+        }
+        return true;
+    }
+
+    fn defaultPublicCatalog(database_name: []const u8, namespace_name: []const u8) bool {
+        return std.mem.eql(u8, database_name, tables_api.default_database_name) and
+            std.mem.eql(u8, namespace_name, tables_api.default_namespace_name);
+    }
+
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
@@ -3734,6 +3944,21 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchDatabaseNamespaces(uri_parts.path)) |database_path| {
                 return try self.handlePublicListNamespaces(database_path.database_name);
             }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchDatabaseNamespaceTables(uri_parts.path)) |tables_path| {
+                return try self.handlePublicListNamespaceTables(tables_path.database_name, tables_path.namespace_name, uri_parts.query);
+            }
+        }
+        if (routes.Routes.matchDatabaseNamespaceTablePath(uri_parts.path)) |table_path| {
+            if (!catalogApiIdentifierValid(table_path.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+            if (!catalogApiIdentifierValid(table_path.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+            if (!defaultPublicCatalog(table_path.database_name, table_path.namespace_name)) {
+                return try textResponse(self.alloc, 501, "explicit catalog table routes are not fully supported for non-default database or namespace");
+            }
+            const legacy_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ routes.Routes.tables, table_path.table_path });
+            defer self.alloc.free(legacy_path);
+            return try self.dispatchPublicTableRoutes(req, .{ .path = legacy_path, .query = uri_parts.query }, authenticated_identity);
         }
         if (req.method == .POST) {
             if (routes.Routes.matchDatabaseNamespacePath(uri_parts.path)) |namespace_path| {
@@ -9071,9 +9296,85 @@ pub const RequiredPermission = struct {
     resource_type: usermgr.ResourceType,
     resource: []const u8,
     permission_type: usermgr.PermissionType,
+    database_name: ?[]const u8 = null,
+    namespace_name: ?[]const u8 = null,
+    table_name: ?[]const u8 = null,
+
+    pub fn resourceNameAlloc(self: RequiredPermission, alloc: std.mem.Allocator) ![]u8 {
+        if (self.database_name) |database_name| {
+            if (self.namespace_name) |namespace_name| {
+                if (self.table_name) |table_name| {
+                    return try catalog_resources.tableResourceNameAlloc(alloc, database_name, namespace_name, table_name);
+                }
+                return try catalog_resources.namespaceResourceNameAlloc(alloc, database_name, namespace_name);
+            }
+        }
+        return try alloc.dupe(u8, self.resource);
+    }
 };
 
 pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
+    if (std.mem.eql(u8, path, routes.Routes.databases)) return switch (method) {
+        .GET => .{
+            .resource_type = .database,
+            .resource = "*",
+            .permission_type = .read,
+        },
+        .POST, .PUT, .DELETE => null,
+    };
+    if (routes.Routes.matchDatabaseNamespaceTables(path)) |tables_path| return .{
+        .resource_type = .namespace,
+        .resource = tables_path.namespace_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => .admin,
+        },
+        .database_name = tables_path.database_name,
+        .namespace_name = tables_path.namespace_name,
+    };
+    if (routes.Routes.matchDatabaseNamespaceTablePath(path)) |table_path| {
+        const table_name = if (std.mem.indexOfScalar(u8, table_path.table_path, '/')) |slash|
+            table_path.table_path[0..slash]
+        else
+            table_path.table_path;
+        return .{
+            .resource_type = .table,
+            .resource = table_name,
+            .permission_type = switch (method) {
+                .GET => .read,
+                .POST, .PUT, .DELETE => .admin,
+            },
+            .database_name = table_path.database_name,
+            .namespace_name = table_path.namespace_name,
+            .table_name = table_name,
+        };
+    }
+    if (routes.Routes.matchDatabaseNamespaces(path)) |database_path| return .{
+        .resource_type = .database,
+        .resource = database_path.database_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => .admin,
+        },
+    };
+    if (routes.Routes.matchDatabaseNamespacePath(path)) |namespace_path| return .{
+        .resource_type = .namespace,
+        .resource = namespace_path.namespace_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => .admin,
+        },
+        .database_name = namespace_path.database_name,
+        .namespace_name = namespace_path.namespace_name,
+    };
+    if (routes.Routes.matchDatabasePath(path)) |database_path| return .{
+        .resource_type = .database,
+        .resource = database_path.database_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => .admin,
+        },
+    };
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET => .{
             .resource_type = .table,
@@ -9240,6 +9541,35 @@ test "table permissions allow default public qualified resources during migratio
     try std.testing.expect(permissionsAllow(&.{legacy}, .table, "default.public.docs", .read));
     try std.testing.expect(!permissionsAllow(&.{non_default}, .table, "docs", .read));
     try std.testing.expect(!permissionsAllow(&.{legacy}, .table, "tenant_ops.analytics.docs", .read));
+}
+
+test "explicit catalog routes declare qualified namespace and table permissions" {
+    const alloc = std.testing.allocator;
+
+    {
+        const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables").?;
+        try std.testing.expectEqual(usermgr.ResourceType.namespace, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics", resource);
+    }
+    {
+        const required = requiredPermissionForRequest(.DELETE, "/databases/tenant_ops/namespaces/analytics").?;
+        try std.testing.expectEqual(usermgr.ResourceType.namespace, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics", resource);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables/events").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
+    }
 }
 
 test "document artifact routes declare read and admin permissions" {
@@ -11529,6 +11859,10 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expectEqual(@as(u16, 200), card_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"query-builder\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"id\":\"retrieval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"scopes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"database:default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"namespace:default.public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, card_resp.body, "\"table:default.public.*\"") != null);
 
     var a2a_resp = try server.handle(.{
         .method = .POST,
@@ -11539,6 +11873,7 @@ test "api http server serves mcp and a2a protocol surfaces" {
     defer a2a_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), a2a_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"preferredTransport\":\"JSONRPC\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_resp.body, "\"table:default.public.*\"") != null);
 
     var stream_resp = try server.handle(.{
         .method = .POST,
@@ -11551,6 +11886,17 @@ test "api http server serves mcp and a2a protocol surfaces" {
     try std.testing.expectEqualStrings("text/event-stream", stream_resp.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, stream_resp.body, "event: message") != null);
     try std.testing.expect(std.mem.indexOf(u8, stream_resp.body, "event: done") != null);
+
+    var a2a_non_default_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.a2a,
+        .content_type = "application/json",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":\"non-default\",\"method\":\"message/send\",\"params\":{\"taskId\":\"t-non-default\",\"contextId\":\"c-non-default\",\"message\":{\"kind\":\"message\",\"role\":\"user\",\"metadata\":{\"skill\":\"query-builder\"},\"parts\":[{\"kind\":\"text\",\"text\":\"find docs\"},{\"kind\":\"data\",\"data\":{\"database\":\"tenant_ops\",\"namespace\":\"analytics\",\"table\":\"docs\"}}]}}}",
+    });
+    defer a2a_non_default_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), a2a_non_default_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_non_default_resp.body, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a2a_non_default_resp.body, "explicit database/namespace A2A table targets are not supported") != null);
 
     var task_resp = try server.handle(.{
         .method = .POST,
@@ -19495,6 +19841,216 @@ test "api http server serves provisioned index runtime backfill status across sh
     if (parsed_detail.value.shard_status.@"7002") |right_shard| {
         try std.testing.expectEqual(@as(?u64, 1), right_shard.doc_count);
     }
+}
+
+test "api http server serves database and namespace catalog routes" {
+    const FakeSource = struct {
+        tenant_created: bool = false,
+        analytics_created: bool = false,
+        default_database: metadata_table_manager.DatabaseRecord = .{
+            .database_id = metadata_table_manager.deriveDatabaseId("default"),
+            .name = "default",
+            .settings_json = "{}",
+        },
+        tenant_database: metadata_table_manager.DatabaseRecord = .{
+            .database_id = metadata_table_manager.deriveDatabaseId("tenant_ops"),
+            .name = "tenant_ops",
+            .settings_json = "{}",
+        },
+        public_namespace: metadata_table_manager.NamespaceRecord = .{
+            .namespace_id = metadata_table_manager.deriveNamespaceId(metadata_table_manager.deriveDatabaseId("default"), "public"),
+            .database_id = metadata_table_manager.deriveDatabaseId("default"),
+            .name = "public",
+        },
+        analytics_namespace: metadata_table_manager.NamespaceRecord = .{
+            .namespace_id = metadata_table_manager.deriveNamespaceId(metadata_table_manager.deriveDatabaseId("tenant_ops"), "analytics"),
+            .database_id = metadata_table_manager.deriveDatabaseId("tenant_ops"),
+            .name = "analytics",
+        },
+        docs_table: metadata_table_manager.TableRecord = .{
+            .table_id = tables_api.deriveQualifiedTableId("default", "public", "docs"),
+            .name = "docs",
+            .database_name = "default",
+            .namespace_name = "public",
+            .indexes_json = "{}",
+        },
+        events_table: metadata_table_manager.TableRecord = .{
+            .table_id = tables_api.deriveQualifiedTableId("tenant_ops", "analytics", "events"),
+            .name = "events",
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+            .indexes_json = "{}",
+        },
+        database_buf: [2]metadata_table_manager.DatabaseRecord = undefined,
+        namespace_buf: [2]metadata_table_manager.NamespaceRecord = undefined,
+        table_buf: [2]metadata_table_manager.TableRecord = undefined,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .apply_relational_sql_ddl = applyRelationalSqlDdl,
+                    .create_namespace = createNamespace,
+                    .drop_namespace = dropNamespace,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.database_buf[0] = self.default_database;
+            var database_len: usize = 1;
+            if (self.tenant_created) {
+                self.database_buf[database_len] = self.tenant_database;
+                database_len += 1;
+            }
+            self.namespace_buf[0] = self.public_namespace;
+            var namespace_len: usize = 1;
+            if (self.analytics_created) {
+                self.namespace_buf[namespace_len] = self.analytics_namespace;
+                namespace_len += 1;
+            }
+            self.table_buf[0] = self.docs_table;
+            var table_len: usize = 1;
+            if (self.analytics_created) {
+                self.table_buf[table_len] = self.events_table;
+                table_len += 1;
+            }
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .databases = self.database_buf[0..database_len],
+                .namespaces = self.namespace_buf[0..namespace_len],
+                .tables = self.table_buf[0..table_len],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn applyRelationalSqlDdl(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.eql(u8, sql, "CREATE DATABASE tenant_ops;")) {
+                if (self.tenant_created) return error.DatabaseAlreadyExists;
+                self.tenant_created = true;
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+                applied.created_database = true;
+                return applied;
+            }
+            if (std.mem.eql(u8, sql, "DROP DATABASE tenant_ops;")) {
+                if (!self.tenant_created) return error.DatabaseNotFound;
+                if (self.analytics_created) return error.DatabaseNotEmpty;
+                self.tenant_created = false;
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+                applied.dropped_database = true;
+                return applied;
+            }
+            return error.UnsupportedSqlShape;
+        }
+
+        fn createNamespace(ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant_ops", database_name);
+            try std.testing.expectEqualStrings("analytics", namespace_name);
+            if (!self.tenant_created) return error.DatabaseNotFound;
+            if (self.analytics_created) return error.NamespaceAlreadyExists;
+            self.analytics_created = true;
+        }
+
+        fn dropNamespace(ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant_ops", database_name);
+            try std.testing.expectEqualStrings("analytics", namespace_name);
+            if (!self.tenant_created) return error.DatabaseNotFound;
+            if (!self.analytics_created) return error.NamespaceNotFound;
+            self.analytics_created = false;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, null);
+
+    var create_db = try server.handle(.{
+        .method = .POST,
+        .uri = "/databases/tenant_ops",
+    });
+    defer create_db.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), create_db.status);
+    try std.testing.expect(std.mem.indexOf(u8, create_db.body, "\"name\":\"tenant_ops\"") != null);
+
+    var list_db = try server.handle(.{
+        .method = .GET,
+        .uri = "/databases",
+    });
+    defer list_db.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), list_db.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_db.body, "\"name\":\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_db.body, "\"name\":\"tenant_ops\"") != null);
+
+    var create_namespace = try server.handle(.{
+        .method = .POST,
+        .uri = "/databases/tenant_ops/namespaces/analytics",
+    });
+    defer create_namespace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), create_namespace.status);
+    try std.testing.expect(std.mem.indexOf(u8, create_namespace.body, "\"database_name\":\"tenant_ops\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_namespace.body, "\"name\":\"analytics\"") != null);
+
+    var list_namespaces = try server.handle(.{
+        .method = .GET,
+        .uri = "/databases/tenant_ops/namespaces",
+    });
+    defer list_namespaces.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), list_namespaces.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_namespaces.body, "\"name\":\"analytics\"") != null);
+
+    var list_namespace_tables = try server.handle(.{
+        .method = .GET,
+        .uri = "/databases/tenant_ops/namespaces/analytics/tables",
+    });
+    defer list_namespace_tables.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), list_namespace_tables.status);
+    try std.testing.expect(std.mem.indexOf(u8, list_namespace_tables.body, "\"name\":\"events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_namespace_tables.body, "\"name\":\"docs\"") == null);
+
+    var default_public_table = try server.handle(.{
+        .method = .GET,
+        .uri = "/databases/default/namespaces/public/tables/docs",
+    });
+    defer default_public_table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), default_public_table.status);
+    try std.testing.expect(std.mem.indexOf(u8, default_public_table.body, "\"name\":\"docs\"") != null);
+
+    var non_default_table = try server.handle(.{
+        .method = .GET,
+        .uri = "/databases/tenant_ops/namespaces/analytics/tables/events",
+    });
+    defer non_default_table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), non_default_table.status);
+
+    var drop_namespace = try server.handle(.{
+        .method = .DELETE,
+        .uri = "/databases/tenant_ops/namespaces/analytics",
+    });
+    defer drop_namespace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), drop_namespace.status);
+
+    var drop_db = try server.handle(.{
+        .method = .DELETE,
+        .uri = "/databases/tenant_ops",
+    });
+    defer drop_db.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), drop_db.status);
 }
 
 test "api http server serves table create and drop" {

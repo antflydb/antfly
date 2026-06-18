@@ -61,12 +61,26 @@ const McpToolFieldSpec = struct {
     items_json: ?[]const u8 = null,
 };
 
+const catalog_table_fields = [_]McpToolFieldSpec{
+    .{ .name = "database", .schema_type = .string, .description = "Database name. Defaults to the server default database." },
+    .{ .name = "namespace", .schema_type = .string, .description = "Namespace name. Defaults to public." },
+    .{ .name = "tableName", .schema_type = .string, .required = true },
+};
+
+const a2a_catalog_scopes = [_][]const u8{
+    "database:" ++ catalog_resources.default_database_name,
+    "namespace:" ++ catalog_resources.default_database_name ++ "." ++ catalog_resources.default_namespace_name,
+    "table:" ++ catalog_resources.default_database_name ++ "." ++ catalog_resources.default_namespace_name ++ ".*",
+};
+
 const mcp_tool_specs = [_]McpToolSpec{
     .{
         .kind = .create_table,
         .name = "create_table",
         .description = "Create an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "numShards", .schema_type = .integer, .default_json = "3" },
             .{ .name = "key", .schema_type = .string },
@@ -77,14 +91,24 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .drop_table,
         .name = "drop_table",
         .description = "Drop an Antfly table",
-        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+        .fields = &catalog_table_fields,
     },
-    .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{
+        .kind = .list_tables,
+        .name = "list_tables",
+        .description = "List Antfly tables",
+        .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
+        },
+    },
     .{
         .kind = .create_index,
         .name = "create_index",
         .description = "Create an Antfly index",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
             .{ .name = "field", .schema_type = .string },
@@ -99,6 +123,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "drop_index",
         .description = "Drop an Antfly index",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
         },
@@ -107,13 +133,15 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .list_indexes,
         .name = "list_indexes",
         .description = "List indexes for an Antfly table",
-        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+        .fields = &catalog_table_fields,
     },
     .{
         .kind = .get_document,
         .name = "get_document",
         .description = "Get an Antfly document by key",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "key", .schema_type = .string, .required = true },
             .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
@@ -124,6 +152,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "query",
         .description = "Run an Antfly table query",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "fullTextSearch", .schema_type = .string },
             .{ .name = "semanticSearch", .schema_type = .string },
@@ -139,6 +169,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "backup",
         .description = "Backup an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
             .{ .name = "location", .schema_type = .string, .required = true },
@@ -149,6 +181,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "restore",
         .description = "Restore an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
             .{ .name = "location", .schema_type = .string, .required = true },
@@ -159,6 +193,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "batch",
         .description = "Insert and delete documents in an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "writes", .schema_type = .object },
             .{ .name = "deletes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
@@ -232,7 +268,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             return switch (ctx.kind) {
                 .create_table => try ctx.createTable(alloc, args),
                 .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
-                .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
+                .list_tables => try ctx.listTables(alloc, args),
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
                 .list_indexes => try ctx.listIndexes(alloc, args),
@@ -245,7 +281,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse 3 });
             if (jsonStringArg(args, "fields")) |fields_json| {
@@ -262,8 +298,13 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             return try ctx.simpleRoute(alloc, .POST, uri, body_json);
         }
 
+        fn listTables(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            ensureDefaultCatalogArgs(args) catch |err| return catalogTableArgError(alloc, err);
+            return try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, "");
+        }
+
         fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "name", .{ .string = index_name });
@@ -282,13 +323,13 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ routes.Routes.tables, table_name });
             return try ctx.simpleRoute(alloc, .GET, uri, "");
         }
 
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
 
             var uri = std.ArrayListUnmanaged(u8).empty;
@@ -315,14 +356,14 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
             return try ctx.simpleRoute(alloc, method, uri, body);
         }
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             if (jsonStringArg(args, "fullTextSearch")) |full_text| {
                 if (full_text.len != 0) {
@@ -342,7 +383,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
             var body = std.json.ObjectMap.empty;
@@ -353,7 +394,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             if (jsonValueArg(args, "writes")) |writes| try body.put(alloc, "inserts", writes);
             if (jsonValueArg(args, "deletes")) |deletes| try body.put(alloc, "deletes", deletes);
@@ -362,7 +403,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn tableRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, table_arg: []const u8, suffix: ?[]const u8, body: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, table_arg) orelse return mcpError(alloc, "missing tableName");
+            _ = table_arg;
+            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
             const uri = if (suffix) |route_suffix|
                 try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, route_suffix })
             else
@@ -507,6 +549,66 @@ fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype)
         .batch => identityHasAnyPermission(identity.permissions, .table, .write),
         .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
     };
+}
+
+const CatalogToolArgError = error{
+    MissingTableName,
+    ExplicitCatalogTableRouteUnsupported,
+};
+
+fn catalogTableNameArg(args: std.json.Value) CatalogToolArgError![]const u8 {
+    const table_name = jsonStringArg(args, "tableName") orelse return error.MissingTableName;
+    try ensureDefaultCatalogArgs(args);
+    return table_name;
+}
+
+fn ensureDefaultCatalogArgs(args: std.json.Value) CatalogToolArgError!void {
+    const database_name = jsonStringArg(args, "database") orelse catalog_resources.default_database_name;
+    const namespace_name = jsonStringArg(args, "namespace") orelse catalog_resources.default_namespace_name;
+    if (!std.mem.eql(u8, database_name, catalog_resources.default_database_name) or
+        !std.mem.eql(u8, namespace_name, catalog_resources.default_namespace_name))
+    {
+        return error.ExplicitCatalogTableRouteUnsupported;
+    }
+}
+
+fn ensureDefaultCatalogQueryTargets(args: std.json.Value) CatalogToolArgError!void {
+    try ensureDefaultCatalogArgs(args);
+    if (args != .object) return;
+    const queries = args.object.get("queries") orelse return;
+    if (queries != .array) return;
+    for (queries.array.items) |query| {
+        try ensureDefaultCatalogArgs(query);
+    }
+}
+
+fn catalogTableArgError(alloc: std.mem.Allocator, err: CatalogToolArgError) !mcp.CallToolResult {
+    return switch (err) {
+        error.MissingTableName => mcpError(alloc, "missing tableName"),
+        error.ExplicitCatalogTableRouteUnsupported => mcpError(alloc, "explicit database/namespace table targets are not supported until explicit catalog table routes are available"),
+    };
+}
+
+fn validateA2aDefaultCatalogTarget(
+    alloc: std.mem.Allocator,
+    data: std.json.Value,
+    request_ctx: a2a.RequestContext,
+    queue: *a2a.EventQueue,
+) !bool {
+    ensureDefaultCatalogQueryTargets(data) catch |err| switch (err) {
+        error.ExplicitCatalogTableRouteUnsupported => {
+            try queue.status(
+                alloc,
+                request_ctx.task_id,
+                request_ctx.context_id,
+                "failed",
+                "explicit database/namespace A2A table targets are not supported until explicit catalog table routes are available",
+            );
+            return false;
+        },
+        error.MissingTableName => unreachable,
+    };
+    return true;
 }
 
 fn identityHasAnyPermission(permissions: []const usermgr.Permission, resource_type: usermgr.ResourceType, permission_type: usermgr.PermissionType) bool {
@@ -1009,8 +1111,8 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
         fn skill(ptr: *anyopaque, _: std.mem.Allocator) !a2a.Skill {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
             return switch (ctx.kind) {
-                .query_builder => .{ .id = "query-builder", .name = "Query Builder", .description = "Translate natural language into Antfly query requests", .tags = &.{ "antfly", "query" } },
-                .retrieval => .{ .id = "retrieval", .name = "Retrieval", .description = "Run Antfly retrieval and generation workflows", .tags = &.{ "antfly", "retrieval" } },
+                .query_builder => .{ .id = "query-builder", .name = "Query Builder", .description = "Translate natural language into Antfly query requests", .tags = &.{ "antfly", "query" }, .scopes = &a2a_catalog_scopes },
+                .retrieval => .{ .id = "retrieval", .name = "Retrieval", .description = "Run Antfly retrieval and generation workflows", .tags = &.{ "antfly", "retrieval" }, .scopes = &a2a_catalog_scopes },
             };
         }
 
@@ -1028,6 +1130,7 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             try body.put(alloc, "intent", .{ .string = text });
             if (a2a.firstDataPart(request_ctx.message)) |data| {
                 if (data == .object) {
+                    if (!try validateA2aDefaultCatalogTarget(alloc, data, request_ctx, queue)) return;
                     if (jsonStringObjectField(data.object, "table")) |table| try body.put(alloc, "table", .{ .string = table });
                     if (data.object.get("context")) |context| try body.put(alloc, "context", context);
                 }
@@ -1057,6 +1160,7 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             try body.put(alloc, "stream", .{ .bool = false });
             if (a2a.firstDataPart(request_ctx.message)) |data| {
                 if (data == .object) {
+                    if (!try validateA2aDefaultCatalogTarget(alloc, data, request_ctx, queue)) return;
                     if (data.object.get("queries")) |queries| {
                         try body.put(alloc, "queries", queries);
                     } else if (jsonStringObjectField(data.object, "table")) |table| {
@@ -1268,4 +1372,21 @@ fn mcpResultFromHttpResponse(alloc: std.mem.Allocator, resp: http_common.HttpRes
         .text = try alloc.dupe(u8, if (resp.body.len == 0) "ok" else resp.body),
         .structured = structured,
     };
+}
+
+test "mcp table tools expose catalog fields and reject non-default table targets" {
+    const alloc = std.testing.allocator;
+    const schema = try buildMcpInputSchema(alloc, mcp_tool_specs[0]);
+    defer alloc.free(schema);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"database\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"tableName\"") != null);
+
+    var default_args = try std.json.parseFromSlice(std.json.Value, alloc, "{\"database\":\"default\",\"namespace\":\"public\",\"tableName\":\"docs\"}", .{});
+    defer default_args.deinit();
+    try std.testing.expectEqualStrings("docs", try catalogTableNameArg(default_args.value));
+
+    var non_default_args = try std.json.parseFromSlice(std.json.Value, alloc, "{\"database\":\"tenant_ops\",\"namespace\":\"analytics\",\"tableName\":\"docs\"}", .{});
+    defer non_default_args.deinit();
+    try std.testing.expectError(error.ExplicitCatalogTableRouteUnsupported, catalogTableNameArg(non_default_args.value));
 }

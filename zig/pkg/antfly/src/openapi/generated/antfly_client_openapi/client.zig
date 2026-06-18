@@ -49,6 +49,11 @@ pub const ListBackupsParams = struct {
     location: []const u8,
 };
 
+pub const ListNamespaceTablesParams = struct {
+    /// Filter tables by name prefix.
+    prefix: ?[]const u8 = null,
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -446,6 +451,121 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
+    }
+
+    /// List databases
+    /// GET /db/v1/databases
+    pub fn listDatabases(self: *@This()) !ApiResponse([]const types.DatabaseCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get database
+    /// GET /db/v1/databases/{databaseName}
+    pub fn getDatabase(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, database_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create database
+    /// POST /db/v1/databases/{databaseName}
+    pub fn createDatabase(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, database_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop database
+    /// DELETE /db/v1/databases/{databaseName}
+    pub fn dropDatabase(self: *@This(), database_name: []const u8) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, database_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// List namespaces
+    /// GET /db/v1/databases/{databaseName}/namespaces
+    pub fn listNamespaces(self: *@This(), database_name: []const u8) !ApiResponse([]const types.NamespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces", .{ self.base_url, database_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create namespace
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}
+    pub fn createNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(types.NamespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, database_name, namespace_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop namespace
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}
+    pub fn dropNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, database_name, namespace_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// List tables in namespace
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables
+    pub fn listNamespaceTables(self: *@This(), database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !ApiResponse([]const types.TableStatus) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables", .{ self.base_url, database_name, namespace_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.prefix) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "prefix=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.TableStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get namespace table details
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
+    pub fn getNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(types.TableStatus) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TableStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
+    pub fn createNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.Table) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop namespace table
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
+    pub fn dropNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
     /// List all tables

@@ -549,7 +549,25 @@ pub fn buildSingleTableStatusWithStorageStatuses(
     table_name: []const u8,
     storage_statuses: ?[]const TableStorageStatus,
 ) !?metadata_openapi.TableStatus {
-    const table = findTableByName(snapshot, table_name) orelse return null;
+    return try buildSingleQualifiedTableStatusWithStorageStatuses(
+        alloc,
+        snapshot,
+        default_database_name,
+        default_namespace_name,
+        table_name,
+        storage_statuses,
+    );
+}
+
+pub fn buildSingleQualifiedTableStatusWithStorageStatuses(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    storage_statuses: ?[]const TableStorageStatus,
+) !?metadata_openapi.TableStatus {
+    const table = findTableByQualifiedName(snapshot, database_name, namespace_name, table_name) orelse return null;
     return try buildTableStatus(alloc, snapshot, table, findTableStorageStatus(storage_statuses, table.name), true);
 }
 
@@ -1020,12 +1038,21 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
 }
 
 pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
+    return deriveQualifiedTableRecord(default_database_name, default_namespace_name, table_name, req);
+}
+
+pub fn deriveQualifiedTableRecord(
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    req: CreateTableRequest,
+) metadata_table_manager.TableRecord {
     const min_ranges = req.num_shards orelse 1;
     return .{
-        .table_id = deriveTableId(table_name),
+        .table_id = deriveQualifiedTableId(database_name, namespace_name, table_name),
         .name = table_name,
-        .database_name = default_database_name,
-        .namespace_name = default_namespace_name,
+        .database_name = database_name,
+        .namespace_name = namespace_name,
         .description = req.description orelse "",
         .schema_json = effectiveSchemaJson(req.schema_json),
         .indexes_json = req.indexes_json orelse default_indexes_json,

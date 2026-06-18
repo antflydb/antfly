@@ -2806,6 +2806,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lake_scaffold_test_mod.addImport("objectstore", objectstore_mod);
     const lake_scaffold_tests = b.addTest(.{
         .root_module = lake_scaffold_test_mod,
     });
@@ -3646,6 +3647,7 @@ pub fn build(b: *std.Build) void {
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
         "public api routes compile",
+        "mcp table tools expose catalog fields and reject non-default table targets",
         "internal group write routes expose unique integrity",
         "internal group write routes expose foreign key action job requeue",
         "batch parser accepts Go transform op spelling",
@@ -3697,6 +3699,8 @@ pub fn build(b: *std.Build) void {
         "api http server serves local index runtime backfill status",
         "api http server graph metric action endpoint returns updated status",
         "api http server serves provisioned index runtime backfill status across shards",
+        "api http server serves database and namespace catalog routes",
+        "explicit catalog routes declare qualified namespace and table permissions",
         "api http server serves table create and drop",
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
@@ -3772,6 +3776,7 @@ pub fn build(b: *std.Build) void {
             "api http server returns json user auth errors",
             "api http server serves mcp and a2a protocol surfaces",
             "api http server hydrates trusted principal role settings from antfly user manager",
+            "explicit catalog routes declare qualified namespace and table permissions",
             "auth row filter resolver expands username references",
             "auth row filter resolver expands metadata references",
             "auth row filter validator accepts username references",

@@ -3550,9 +3550,11 @@ pub fn lowerUpdateJoinedMutationSourceWithSchemasAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return parser.parseUpdateJoinedMutationSource() catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
+    return parser.parseUpdateJoinedMutationSource() catch |err| {
+        return switch (err) {
+            error.InvalidRowsRequest => error.UnsupportedSqlShape,
+            else => err,
+        };
     };
 }
 
@@ -3640,7 +3642,9 @@ pub fn lowerWritePlanAlloc(
             const source_schema = options.joined_source_schema orelse schema;
             if (lowerUpdateJoinedMutationSourceWithSchemasAlloc(alloc, sql, schema, source_schema, params, row_claim)) |lowered| {
                 return .{ .update_joined_source = lowered };
-            } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
+            } else |err| {
+                if (!sqlWritePlanFallbackAllowed(err)) return err;
+            }
         }
         if (options.unique_resolver) |resolver| {
             if (lowerUpdateAlloc(alloc, sql, schema, params, resolver)) |lowered| {
@@ -10948,6 +10952,27 @@ const Parser = struct {
         }
     }
 
+    fn resolveJoinedMutationSourceForCtes(
+        self: *@This(),
+        tail: *ParsedJoinedMutationTail,
+        source_table_name: []const u8,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) ![]const u8 {
+        const base_ptr = base_table_name orelse return source_table_name;
+        if (findCteByName(ctes, source_table_name) != null) {
+            if (tail.join.right.source_cte.len != 0) return error.UnsupportedSqlShape;
+            tail.join.right.source_cte = try self.alloc.dupe(u8, source_table_name);
+            return base_ptr.* orelse return error.UnsupportedSqlShape;
+        }
+        if (base_ptr.*) |base| {
+            if (!std.mem.eql(u8, base, source_table_name)) return error.UnsupportedSqlShape;
+        } else {
+            base_ptr.* = try self.alloc.dupe(u8, source_table_name);
+        }
+        return source_table_name;
+    }
+
     fn findMatchingRParen(self: *@This()) !usize {
         var depth: usize = 1;
         var i = self.pos;
@@ -14108,6 +14133,43 @@ const Parser = struct {
     }
 
     fn parseUpdateJoinedMutationSource(self: *@This()) !LoweredJoinedMutationSource {
+        if (self.peekKeyword("with")) return try self.parseUpdateJoinedMutationSourceWithCtesRoot();
+        return try self.parseUpdateJoinedMutationSourceWithCtes(&.{}, null);
+    }
+
+    fn parseUpdateJoinedMutationSourceWithCtesRoot(self: *@This()) !LoweredJoinedMutationSource {
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |table| self.alloc.free(table);
+        const previous_schema = self.schema;
+        self.schema = self.joined_source_schema orelse self.schema;
+        var ctes = self.parseCtesForPlanAlloc(&base_table_name) catch |err| {
+            self.schema = previous_schema;
+            return err;
+        };
+        self.schema = previous_schema;
+        errdefer {
+            for (ctes) |cte| {
+                var owned = cte;
+                owned.deinit(self.alloc);
+            }
+            if (ctes.len > 0) self.alloc.free(ctes);
+        }
+
+        const lowered = try self.parseUpdateJoinedMutationSourceWithCtes(ctes, &base_table_name);
+        for (ctes) |cte| {
+            var owned = cte;
+            owned.deinit(self.alloc);
+        }
+        if (ctes.len > 0) self.alloc.free(ctes);
+        ctes = &.{};
+        return lowered;
+    }
+
+    fn parseUpdateJoinedMutationSourceWithCtes(
+        self: *@This(),
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) !LoweredJoinedMutationSource {
         try self.expectKeyword("update");
         const target_table = try self.parseTableAliasAlloc();
         defer freeTableAlias(self.alloc, target_table);
@@ -14157,9 +14219,9 @@ const Parser = struct {
             if (patch_expr.items.len != 0) return error.UnsupportedSqlShape;
             if (json_set.items.len != 0) return error.UnsupportedSqlShape;
             const lowered = if (self.peekKeyword("exists"))
-                try self.parseUpdateExistsMutationSource(target_table, patch.items, rewrite_identity)
+                try self.parseUpdateExistsMutationSource(target_table, patch.items, rewrite_identity, ctes, base_table_name)
             else
-                try self.parseUpdateSemiJoinMutationSource(target_table, patch.items, rewrite_identity);
+                try self.parseUpdateSemiJoinMutationSource(target_table, patch.items, rewrite_identity, ctes, base_table_name);
             freeFieldJsonValues(self.alloc, patch.items);
             patch.deinit(self.alloc);
             patch_expr.deinit(self.alloc);
@@ -14172,14 +14234,26 @@ const Parser = struct {
         const source_table = try self.parseTableAliasAlloc();
         defer freeTableAlias(self.alloc, source_table);
         if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.UnsupportedSqlShape;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const base_source_schema = self.joined_source_schema orelse self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        if (ctes.len != 0) {
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, base_source_schema, ctes);
+            if (relational_rows.rowsPlannedCteSchema(planned_ctes, source_table.name)) |cte_schema| {
+                self.joined_source_schema = cte_schema;
+            }
+        }
+        defer self.joined_source_schema = previous_joined_source_schema;
         try self.validateJoinedMutationSourceAssignments(source_assignments.items, source_table.alias);
 
         var tail = try self.parseJoinedMutationTail(target_table.alias, source_table.alias, &.{ target_table.name, target_table.alias });
         defer tail.deinit(self.alloc);
+        const resolved_source_table = try self.resolveJoinedMutationSourceForCtes(&tail, source_table.name, ctes, base_table_name);
 
-        const body_json = try self.joinedMutationSourceBodyJsonAlloc("update", source_table.name, tail, rewrite_identity, source_assignments.items, patch.items, patch_expr.items, json_set.items);
+        const body_json = try self.joinedMutationSourceBodyJsonAlloc("update", resolved_source_table, ctes, tail, rewrite_identity, source_assignments.items, patch.items, patch_expr.items, json_set.items);
         defer self.alloc.free(body_json);
-        var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, self.joined_source_schema orelse self.schema);
+        var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, base_source_schema);
         errdefer mutation.deinit(self.alloc);
 
         freeJoinedMutationSourceAssignments(self.alloc, source_assignments.items);
@@ -14193,7 +14267,7 @@ const Parser = struct {
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, source_table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
             .mutation = mutation,
         };
     }
@@ -14203,6 +14277,8 @@ const Parser = struct {
         target_table: TableAlias,
         patch: []const FieldJsonValue,
         rewrite_identity: bool,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
     ) !LoweredJoinedMutationSource {
         const target_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         const target_fields = try self.parseSemiJoinTargetFieldsAlloc(&target_qualifiers);
@@ -14292,15 +14368,16 @@ const Parser = struct {
         source.match_expression_array_contains = &.{};
         returning = .{};
         defer tail.deinit(self.alloc);
+        const resolved_source_table = try self.resolveJoinedMutationSourceForCtes(&tail, source_table.table.name, ctes, base_table_name);
 
-        const body_json = try self.joinedMutationSourceBodyJsonAlloc("update", source_table.table.name, tail, rewrite_identity, &.{}, patch, &.{}, &.{});
+        const body_json = try self.joinedMutationSourceBodyJsonAlloc("update", resolved_source_table, ctes, tail, rewrite_identity, &.{}, patch, &.{}, &.{});
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, self.joined_source_schema orelse self.schema);
         errdefer mutation.deinit(self.alloc);
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, source_table.table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
             .mutation = mutation,
         };
     }
@@ -14310,23 +14387,63 @@ const Parser = struct {
         target_table: TableAlias,
         patch: []const FieldJsonValue,
         rewrite_identity: bool,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
     ) !LoweredJoinedMutationSource {
         var parsed = try self.parseExistsSemiJoinMutationTail(target_table);
         defer parsed.deinit(self.alloc);
+        const resolved_source_table = try self.resolveJoinedMutationSourceForCtes(&parsed.tail, parsed.source_table.name, ctes, base_table_name);
 
-        const body_json = try self.joinedMutationSourceBodyJsonAlloc("update", parsed.source_table.name, parsed.tail, rewrite_identity, &.{}, patch, &.{}, &.{});
+        const body_json = try self.joinedMutationSourceBodyJsonAlloc("update", resolved_source_table, ctes, parsed.tail, rewrite_identity, &.{}, patch, &.{}, &.{});
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, self.joined_source_schema orelse self.schema);
         errdefer mutation.deinit(self.alloc);
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, parsed.source_table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
             .mutation = mutation,
         };
     }
 
     fn parseDeleteJoinedMutationSource(self: *@This()) !LoweredJoinedMutationSource {
+        if (self.peekKeyword("with")) return try self.parseDeleteJoinedMutationSourceWithCtesRoot();
+        return try self.parseDeleteJoinedMutationSourceWithCtes(&.{}, null);
+    }
+
+    fn parseDeleteJoinedMutationSourceWithCtesRoot(self: *@This()) !LoweredJoinedMutationSource {
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |table| self.alloc.free(table);
+        const previous_schema = self.schema;
+        self.schema = self.joined_source_schema orelse self.schema;
+        var ctes = self.parseCtesForPlanAlloc(&base_table_name) catch |err| {
+            self.schema = previous_schema;
+            return err;
+        };
+        self.schema = previous_schema;
+        errdefer {
+            for (ctes) |cte| {
+                var owned = cte;
+                owned.deinit(self.alloc);
+            }
+            if (ctes.len > 0) self.alloc.free(ctes);
+        }
+
+        const lowered = try self.parseDeleteJoinedMutationSourceWithCtes(ctes, &base_table_name);
+        for (ctes) |cte| {
+            var owned = cte;
+            owned.deinit(self.alloc);
+        }
+        if (ctes.len > 0) self.alloc.free(ctes);
+        ctes = &.{};
+        return lowered;
+    }
+
+    fn parseDeleteJoinedMutationSourceWithCtes(
+        self: *@This(),
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) !LoweredJoinedMutationSource {
         try self.expectKeyword("delete");
         try self.expectKeyword("from");
         const target_table = try self.parseTableAliasAlloc();
@@ -14334,27 +14451,39 @@ const Parser = struct {
 
         if (self.matchKeyword("where")) {
             if (self.peekKeyword("exists")) {
-                return try self.parseDeleteExistsMutationSource(target_table);
+                return try self.parseDeleteExistsMutationSource(target_table, ctes, base_table_name);
             }
-            return try self.parseDeleteSemiJoinMutationSource(target_table);
+            return try self.parseDeleteSemiJoinMutationSource(target_table, ctes, base_table_name);
         }
 
         try self.expectKeyword("using");
         const source_table = try self.parseTableAliasAlloc();
         defer freeTableAlias(self.alloc, source_table);
         if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.UnsupportedSqlShape;
+        var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const base_source_schema = self.joined_source_schema orelse self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        if (ctes.len != 0) {
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, base_source_schema, ctes);
+            if (relational_rows.rowsPlannedCteSchema(planned_ctes, source_table.name)) |cte_schema| {
+                self.joined_source_schema = cte_schema;
+            }
+        }
+        defer self.joined_source_schema = previous_joined_source_schema;
 
         var tail = try self.parseJoinedMutationTail(target_table.alias, source_table.alias, &.{ target_table.name, target_table.alias });
         defer tail.deinit(self.alloc);
+        const resolved_source_table = try self.resolveJoinedMutationSourceForCtes(&tail, source_table.name, ctes, base_table_name);
 
-        const body_json = try self.joinedMutationSourceBodyJsonAlloc("delete", source_table.name, tail, false, &.{}, &.{}, &.{}, &.{});
+        const body_json = try self.joinedMutationSourceBodyJsonAlloc("delete", resolved_source_table, ctes, tail, false, &.{}, &.{}, &.{}, &.{});
         defer self.alloc.free(body_json);
-        var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, self.joined_source_schema orelse self.schema);
+        var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, base_source_schema);
         errdefer mutation.deinit(self.alloc);
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, source_table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
             .mutation = mutation,
         };
     }
@@ -14362,6 +14491,8 @@ const Parser = struct {
     fn parseDeleteSemiJoinMutationSource(
         self: *@This(),
         target_table: TableAlias,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
     ) !LoweredJoinedMutationSource {
         const target_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         const target_fields = try self.parseSemiJoinTargetFieldsAlloc(&target_qualifiers);
@@ -14451,15 +14582,16 @@ const Parser = struct {
         source.match_expression_array_contains = &.{};
         returning = .{};
         defer tail.deinit(self.alloc);
+        const resolved_source_table = try self.resolveJoinedMutationSourceForCtes(&tail, source_table.table.name, ctes, base_table_name);
 
-        const body_json = try self.joinedMutationSourceBodyJsonAlloc("delete", source_table.table.name, tail, false, &.{}, &.{}, &.{}, &.{});
+        const body_json = try self.joinedMutationSourceBodyJsonAlloc("delete", resolved_source_table, ctes, tail, false, &.{}, &.{}, &.{}, &.{});
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, self.joined_source_schema orelse self.schema);
         errdefer mutation.deinit(self.alloc);
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, source_table.table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
             .mutation = mutation,
         };
     }
@@ -14467,18 +14599,21 @@ const Parser = struct {
     fn parseDeleteExistsMutationSource(
         self: *@This(),
         target_table: TableAlias,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
     ) !LoweredJoinedMutationSource {
         var parsed = try self.parseExistsSemiJoinMutationTail(target_table);
         defer parsed.deinit(self.alloc);
+        const resolved_source_table = try self.resolveJoinedMutationSourceForCtes(&parsed.tail, parsed.source_table.name, ctes, base_table_name);
 
-        const body_json = try self.joinedMutationSourceBodyJsonAlloc("delete", parsed.source_table.name, parsed.tail, false, &.{}, &.{}, &.{}, &.{});
+        const body_json = try self.joinedMutationSourceBodyJsonAlloc("delete", resolved_source_table, ctes, parsed.tail, false, &.{}, &.{}, &.{}, &.{});
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsJoinedMutationSourceRequestWithSchemas(self.alloc, body_json, self.schema, self.joined_source_schema orelse self.schema);
         errdefer mutation.deinit(self.alloc);
 
         return .{
             .target_table_name = try self.alloc.dupe(u8, target_table.name),
-            .source_table_name = try self.alloc.dupe(u8, parsed.source_table.name),
+            .source_table_name = try self.alloc.dupe(u8, resolved_source_table),
             .mutation = mutation,
         };
     }
@@ -24511,6 +24646,7 @@ const Parser = struct {
         self: *@This(),
         op: []const u8,
         source_table: []const u8,
+        ctes: []const db_mod.types.RelationalRowsCte,
         tail: ParsedJoinedMutationTail,
         rewrite_identity: bool,
         source_assignments: []const JoinedMutationSourceAssignment,
@@ -24522,10 +24658,24 @@ const Parser = struct {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         errdefer out.deinit();
         const writer = &out.writer;
-        try writer.print("{{\"op\":{f},\"source_table\":{f},\"target_side\":\"left\",\"join\":{{\"left\":", .{
+        try writer.print("{{\"op\":{f},\"source_table\":{f},\"target_side\":\"left\"", .{
             std.json.fmt(op, .{}),
             std.json.fmt(source_table, .{}),
         });
+        if (ctes.len > 0) {
+            try writer.writeAll(",\"ctes\":[");
+            for (ctes, 0..) |cte, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print("{{\"name\":{f},\"query\":", .{std.json.fmt(cte.name, .{})});
+                try self.writeMutationSourceQueryJson(writer, cte.query);
+                if (cte.max_rows) |max_rows| try writer.print(",\"max_rows\":{d}", .{max_rows});
+                if (cte.max_bytes) |max_bytes| try writer.print(",\"max_bytes\":{d}", .{max_bytes});
+                if (cte.spill_after_bytes) |spill_after_bytes| try writer.print(",\"spill_after_bytes\":{d}", .{spill_after_bytes});
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeAll(",\"join\":{\"left\":");
         try self.writeMutationSourceQueryJson(writer, join.left);
         try writer.writeAll(",\"right\":");
         try self.writeMutationSourceQueryJson(writer, join.right);
@@ -24627,6 +24777,21 @@ const Parser = struct {
         _ = self;
         try writer.writeByte('{');
         var wrote = false;
+        if (source.source_cte.len > 0) {
+            try writer.print("\"source_cte\":{f}", .{std.json.fmt(source.source_cte, .{})});
+            wrote = true;
+        }
+        if (!source.select_all) {
+            if (source.select.len == 0) return error.UnsupportedSqlShape;
+            if (wrote) try writer.writeByte(',');
+            try writer.writeAll("\"select\":[");
+            for (source.select, 0..) |field, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writer.print("{f}", .{std.json.fmt(field, .{})});
+            }
+            try writer.writeByte(']');
+            wrote = true;
+        }
         if (source.predicates.len > 0 or
             source.array_contains.len > 0 or
             source.array_eq.len > 0 or
@@ -24639,6 +24804,7 @@ const Parser = struct {
             source.or_predicates.len > 0 or
             source.not_predicates.len > 0)
         {
+            if (wrote) try writer.writeByte(',');
             try writer.writeAll("\"where\":{");
             var wrote_where = false;
             if (source.predicates.len > 0 or source.array_contains.len > 0 or source.array_eq.len > 0 or source.array_any.len > 0 or source.in_predicates.len > 0 or source.json_contains.len > 0 or source.json_path_eq.len > 0 or source.json_path_exists.len > 0 or source.text_patterns.len > 0) {
@@ -61086,10 +61252,12 @@ fn joinedSourceFingerprintAlloc(
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_or", req.match_expression_or_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_not", req.match_expression_not_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_array", req.match_expression_array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ctes", req.ctes.len);
+    fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "right_source_cte", req.join.right.source_cte.len != 0);
     fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "rewrite", req.rewrite_identity);
     fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "left", req.join.left);
     fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "right", req.join.right);
-    return fingerprint;
+    return try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, req.ctes);
 }
 
 fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregate) ![]u8 {
@@ -61841,6 +62009,7 @@ fn expectAppParityWriteSummary(summary: AppParityPlanSummary, lowered: LoweredWr
         },
         .update_joined_source => |update_joined_source| {
             try expectOptionalTableName(summary.table_name, update_joined_source.target_table_name);
+            try expectOptionalUsize(summary.ctes, update_joined_source.mutation.req.ctes.len);
             try expectCombinedQuerySourceSummary(summary, update_joined_source.mutation.req.join.left, update_joined_source.mutation.req.join.right);
             try expectOptionalUsize(summary.join_on, update_joined_source.mutation.req.join.on.len);
             try expectOptionalUsize(summary.order_by, update_joined_source.mutation.req.join.order_by.len);
@@ -61856,6 +62025,7 @@ fn expectAppParityWriteSummary(summary: AppParityPlanSummary, lowered: LoweredWr
         },
         .delete_joined_source => |delete_joined_source| {
             try expectOptionalTableName(summary.table_name, delete_joined_source.target_table_name);
+            try expectOptionalUsize(summary.ctes, delete_joined_source.mutation.req.ctes.len);
             try expectCombinedQuerySourceSummary(summary, delete_joined_source.mutation.req.join.left, delete_joined_source.mutation.req.join.right);
             try expectOptionalUsize(summary.join_on, delete_joined_source.mutation.req.join.on.len);
             try expectOptionalUsize(summary.order_by, delete_joined_source.mutation.req.join.order_by.len);
@@ -67007,7 +67177,9 @@ const AppParityCorpusCoverage = struct {
     delete_source: bool = false,
     truncate_source: bool = false,
     update_joined_source: bool = false,
+    update_joined_source_cte_mutation: bool = false,
     delete_joined_source: bool = false,
+    delete_joined_source_cte_mutation: bool = false,
     adapter_noop_ddl: bool = false,
     unsupported_query: bool = false,
     unsupported_read: bool = false,
@@ -67047,8 +67219,6 @@ const AppParityCorpusCoverage = struct {
     unsupported_read_row_lock_target: bool = false,
     unsupported_update_source_row_lock_target: bool = false,
     unsupported_update_joined_source_row_lock_target: bool = false,
-    unsupported_update_joined_source_cte_mutation: bool = false,
-    unsupported_delete_joined_source_cte_mutation: bool = false,
     unsupported_merge_mutation_cte: bool = false,
     update_identity_rewrite: bool = false,
     unsupported_update_non_unique_point_selector: bool = false,
@@ -68021,8 +68191,18 @@ const AppParityCorpusCoverage = struct {
             .update_source => self.update_source = true,
             .delete_source => self.delete_source = true,
             .truncate_source => self.truncate_source = true,
-            .update_joined_source => self.update_joined_source = true,
-            .delete_joined_source => self.delete_joined_source = true,
+            .update_joined_source => {
+                self.update_joined_source = true;
+                self.update_joined_source_cte_mutation = self.update_joined_source_cte_mutation or
+                    (std.mem.startsWith(u8, entry.sql, "WITH ") and
+                        appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 1));
+            },
+            .delete_joined_source => {
+                self.delete_joined_source = true;
+                self.delete_joined_source_cte_mutation = self.delete_joined_source_cte_mutation or
+                    (std.mem.startsWith(u8, entry.sql, "WITH ") and
+                        appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 1));
+            },
             .merge_mutation => self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.startsWith(u8, entry.plan, "merge_mutation:"),
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
             .unsupported => self.unsupported_query = true,
@@ -68139,16 +68319,8 @@ const AppParityCorpusCoverage = struct {
             self.unsupported_update_joined_source_row_lock_target = self.unsupported_update_joined_source_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
-            self.unsupported_update_joined_source_cte_mutation = self.unsupported_update_joined_source_cte_mutation or
-                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH ") and
-                    std.mem.indexOf(u8, entry.sql, " UPDATE ") != null);
         } else if (entry.family == .unsupported_delete_joined_source) {
             self.unsupported_delete_joined_multi_output_subquery_selector = self.unsupported_delete_joined_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
-            self.unsupported_delete_joined_source_cte_mutation = self.unsupported_delete_joined_source_cte_mutation or
-                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH ") and
-                    std.mem.indexOf(u8, entry.sql, " DELETE ") != null);
         } else if (entry.family == .unsupported_merge_mutation) {
             self.unsupported_merge_mutation_cte = self.unsupported_merge_mutation_cte or
                 (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
@@ -68932,7 +69104,9 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.delete_source);
         try std.testing.expect(self.truncate_source);
         try std.testing.expect(self.update_joined_source);
+        try std.testing.expect(self.update_joined_source_cte_mutation);
         try std.testing.expect(self.delete_joined_source);
+        try std.testing.expect(self.delete_joined_source_cte_mutation);
         try std.testing.expect(self.adapter_noop_ddl);
         try std.testing.expect(self.unsupported_query);
         try std.testing.expect(self.unsupported_read);
@@ -69062,8 +69236,6 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.unsupported_read_row_lock_target);
         try std.testing.expect(self.unsupported_update_source_row_lock_target);
         try std.testing.expect(self.unsupported_update_joined_source_row_lock_target);
-        try std.testing.expect(self.unsupported_update_joined_source_cte_mutation);
-        try std.testing.expect(self.unsupported_delete_joined_source_cte_mutation);
         try std.testing.expect(self.unsupported_merge_mutation_cte);
         try std.testing.expect(self.update_identity_rewrite);
         try std.testing.expect(self.unsupported_update_non_unique_point_selector);
@@ -76211,18 +76383,32 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
         },
         .{
-            .name = "unsupported cte-backed joined update mutation source",
-            .family = .unsupported_update_joined_source,
-            .plan = "unsupported:update_joined_source:requires=cte_mutation_source_plan",
-            .classification_reason = "cte_mutation_source_plan",
+            .name = "cte-backed semijoin update mutation source",
+            .family = .update_joined_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .join_on = 1, .operations = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
             .sql = "WITH ready_sources AS (SELECT id FROM archived_records WHERE status = 'ready') UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM ready_sources) RETURNING id",
         },
         .{
-            .name = "unsupported cte-backed joined delete mutation source",
-            .family = .unsupported_delete_joined_source,
-            .plan = "unsupported:delete_joined_source:requires=cte_mutation_source_plan",
-            .classification_reason = "cte_mutation_source_plan",
+            .name = "cte-backed semijoin delete mutation source",
+            .family = .delete_joined_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .join_on = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
             .sql = "WITH stale_sources AS (SELECT id FROM archived_records WHERE status = 'stale') DELETE FROM usage_records WHERE id IN (SELECT id FROM stale_sources) RETURNING id",
+        },
+        .{
+            .name = "cte-backed direct joined update mutation source",
+            .family = .update_joined_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .join_on = 1, .source_assignments = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=1:ops=0:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
+            .sql = "WITH ready_sources AS (SELECT id, status FROM source_records WHERE status = 'ready') UPDATE usage_records SET status = source.status FROM ready_sources AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
+        },
+        .{
+            .name = "cte-backed direct joined delete mutation source",
+            .family = .delete_joined_source,
+            .summary = .{ .table_name = "usage_records", .ctes = 1, .join_on = 1, .returning = 1, .row_claim_skip_locked = false },
+            .plan = "delete_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
+            .sql = "WITH stale_sources AS (SELECT id, status FROM source_records WHERE status = 'stale') DELETE FROM usage_records USING stale_sources AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
         },
         .{
             .name = "unsupported cte-backed merge mutation",
@@ -76712,6 +76898,50 @@ test "postgres sql adapter lowers joined mutation source with separate target an
     try std.testing.expectEqualStrings("source_quantity", lowered.mutation.req.source_assignments[0].source_field);
     try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.operations.len);
     try std.testing.expectEqual(@as(usize, 2), lowered.mutation.req.returning.len);
+
+    var cte_update = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "WITH ready_sources AS (SELECT source_pk, source_status FROM source_records WHERE source_status = 'ready') UPDATE usage_records SET status = source.source_status FROM ready_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer cte_update.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cte_update.target_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_update.source_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_update.mutation.req.source_table);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.ctes.len);
+    try std.testing.expectEqualStrings("ready_sources", cte_update.mutation.req.ctes[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.ctes[0].query.predicates.len);
+    try std.testing.expectEqualStrings("source_status", cte_update.mutation.req.ctes[0].query.predicates[0].field);
+    try std.testing.expectEqualStrings("ready_sources", cte_update.mutation.req.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_pk", cte_update.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.source_assignments.len);
+    try std.testing.expectEqualStrings("source_status", cte_update.mutation.req.source_assignments[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.returning.len);
+
+    var cte_delete = try lowerDeleteJoinedMutationSourceWithSchemasAlloc(
+        alloc,
+        "WITH stale_sources AS (SELECT source_pk FROM source_records WHERE source_status = 'stale') DELETE FROM usage_records USING stale_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer cte_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cte_delete.target_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_delete.source_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_delete.mutation.req.source_table);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.ctes.len);
+    try std.testing.expectEqualStrings("stale_sources", cte_delete.mutation.req.ctes[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.ctes[0].query.predicates.len);
+    try std.testing.expectEqualStrings("source_status", cte_delete.mutation.req.ctes[0].query.predicates[0].field);
+    try std.testing.expectEqualStrings("stale_sources", cte_delete.mutation.req.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_pk", cte_delete.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.returning.len);
 
     var primary_key_rewrite = try lowerUpdateJoinedMutationSourceWithSchemasAlloc(
         alloc,

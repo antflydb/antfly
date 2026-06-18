@@ -55,6 +55,7 @@ pub const http_internal_group_write_routes = @import("http_internal_group_write_
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const protocol_adapters = @import("protocol_adapters.zig");
 pub const connections = @import("connections.zig");
 
 pub const ClusterHealth = cluster.ClusterHealth;
@@ -83,6 +84,7 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test {
     _ = auth_sql_adapter;
+    _ = protocol_adapters;
 }
 
 test "linear merge request parser accepts raw payload value under public request cap" {

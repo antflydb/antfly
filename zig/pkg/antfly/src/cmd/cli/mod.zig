@@ -18,6 +18,8 @@ const antfly_client = @import("antfly-client");
 const httpx = @import("httpx");
 
 pub const table = @import("table.zig");
+pub const database_cmd = @import("database.zig");
+pub const namespace_cmd = @import("namespace.zig");
 pub const index = @import("index.zig");
 pub const query = @import("query.zig");
 pub const data = @import("data.zig");
@@ -80,6 +82,8 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 
 test "cli mod compiles" {
     _ = table;
+    _ = database_cmd;
+    _ = namespace_cmd;
     _ = index;
     _ = query;
     _ = data;

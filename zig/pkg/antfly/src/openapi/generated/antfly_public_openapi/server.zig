@@ -171,6 +171,94 @@ pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get database
+pub const GetDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Create database
+pub const CreateDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Drop database
+pub const DropDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// List namespaces
+pub const ListNamespacesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Create namespace
+pub const CreateNamespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Drop namespace
+pub const DropNamespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// List tables in namespace
+pub const ListNamespaceTablesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+pub const ListNamespaceTablesParams = struct {
+    /// Filter tables by name prefix.
+    prefix: ?[]const u8 = null,
+};
+
+/// Get namespace table details
+pub const GetNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Create namespace table
+pub const CreateNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for createNamespaceTable.
+pub fn parseCreateNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateTableRequest) {
+    return std.json.parseFromSlice(types.CreateTableRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop namespace table
+pub const DropNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -742,6 +830,17 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
     .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent" },
+    .{ .method = "GET", .path = "/databases", .operation_id = "listDatabases" },
+    .{ .method = "GET", .path = "/databases/{databaseName}", .operation_id = "getDatabase" },
+    .{ .method = "POST", .path = "/databases/{databaseName}", .operation_id = "createDatabase" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}", .operation_id = "dropDatabase" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces", .operation_id = "listNamespaces" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "createNamespace" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "dropNamespace" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables", .operation_id = "listNamespaceTables" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "getNamespaceTable" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "createNamespaceTable" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "dropNamespaceTable" },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables" },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable" },
     .{ .method = "POST", .path = "/tables/{tableName}", .operation_id = "createTable" },
@@ -831,6 +930,17 @@ pub const routes = [_]Route{
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listDatabases(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn createDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn dropDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn listNamespaces(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn createNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn dropNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn listNamespaceTables(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !httpx.Response
+//   fn getNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn createNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn dropNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn createTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

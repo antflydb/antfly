@@ -1135,12 +1135,14 @@ caps as read plans, validates source-side join fields against the materialized
 output, rejects ambiguous source-to-target matches, and then stages selected
 target preimages through the ordinary owner-local mutation-source path. Source
 CTEs that are unreferenced, missing, recursive, over cap, target-side, or mixed
-with embedded doc-key ranges fail request validation. SQL lowering for
-`WITH ... UPDATE` / `WITH ... DELETE` still must map into that native request
-before those SQL forms leave the `cte_mutation_source_plan` fail-closed corpus
-bucket; `WITH ... MERGE` remains fail-closed until the matched-mutation plan
-also carries the same source-side CTE contract. Recursive CTE-backed writes do
-not enter a write family until recursive stream semantics have a native plan.
+with embedded doc-key ranges fail request validation. SQL lowering now maps
+source-side CTE update/delete forms into that native request when the CTE is
+non-recursive and source-side only, including direct joined forms such as
+`WITH ... UPDATE ... FROM source_cte` / `WITH ... DELETE ... USING source_cte`
+and semijoin selectors such as `WHERE id IN (SELECT id FROM source_cte)`.
+`WITH ... MERGE` and recursive CTE-backed writes still fail closed under
+`cte_mutation_source_plan` until they are lowered through the same typed
+dependency and source-side CTE contract.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.

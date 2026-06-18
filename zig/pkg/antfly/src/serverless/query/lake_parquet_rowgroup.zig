@@ -83,6 +83,15 @@ pub const ObjectRangeRowGroupInput = struct {
     }
 };
 
+pub const ObjectRangeRowGroupPlan = struct {
+    row_groups: []ObjectRangeRowGroupInput,
+
+    pub fn deinit(self: *ObjectRangeRowGroupPlan, alloc: Allocator) void {
+        alloc.free(self.row_groups);
+        self.* = undefined;
+    }
+};
+
 pub const OwnedBatch = struct {
     batch: rowsource.ColumnBatch,
     row_refs: []rowsource.RowRef,
@@ -348,6 +357,46 @@ pub fn buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
     alloc.free(chunk_bytes);
     alloc.free(chunk_inputs);
     return owned;
+}
+
+pub fn planRequiredPlainI64ObjectRangeRowGroupsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+) !ObjectRangeRowGroupPlan {
+    try inventory.validate();
+    if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+    if (projected_columns.len == 0) return error.InvalidParquetRowGroupBatch;
+    for (projected_columns) |column| {
+        if (column.len == 0) return error.InvalidParquetRowGroupBatch;
+    }
+
+    var total_row_groups: usize = 0;
+    for (inventory.files) |file| {
+        for (file.row_groups) |row_group| {
+            for (projected_columns) |column| {
+                _ = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
+            }
+            total_row_groups += 1;
+        }
+    }
+    if (total_row_groups == 0) return error.InvalidParquetRowGroupBatch;
+
+    const row_groups = try alloc.alloc(ObjectRangeRowGroupInput, total_row_groups);
+    errdefer alloc.free(row_groups);
+    var out_idx: usize = 0;
+    for (inventory.files) |file| {
+        for (file.row_groups) |row_group| {
+            row_groups[out_idx] = .{
+                .file_id = file.file_id,
+                .row_group_ordinal = row_group.ordinal,
+                .projected_columns = projected_columns,
+            };
+            out_idx += 1;
+        }
+    }
+
+    return .{ .row_groups = row_groups };
 }
 
 fn findColumnChunk(row_group: external_source.RowGroup, column_id: []const u8) ?external_source.ColumnChunk {

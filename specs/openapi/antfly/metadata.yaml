@@ -2644,6 +2644,54 @@ components:
             $ref: "#/components/schemas/ReplicationSource"
           description: |
             PostgreSQL CDC replication sources configured for this table.
+    DatabaseCatalogRecord:
+      type: object
+      required:
+        - database_id
+        - name
+        - settings_json
+      description: Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+      properties:
+        database_id:
+          type: integer
+          format: uint64
+          description: Stable database catalog identifier.
+          example: 22
+        name:
+          type: string
+          description: Database name.
+          example: tenant_ops
+        settings_json:
+          type: string
+          description: JSON-encoded database settings owned by the catalog.
+          example: "{}"
+    NamespaceCatalogRecord:
+      type: object
+      required:
+        - namespace_id
+        - database_id
+        - database_name
+        - name
+      description: Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+      properties:
+        namespace_id:
+          type: integer
+          format: uint64
+          description: Stable namespace catalog identifier.
+          example: 222
+        database_id:
+          type: integer
+          format: uint64
+          description: Parent database identifier.
+          example: 22
+        database_name:
+          type: string
+          description: Parent database name.
+          example: tenant_ops
+        name:
+          type: string
+          description: Namespace name.
+          example: analytics
     TableMigration:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -9663,6 +9711,294 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /databases:
+    get:
+      summary: List databases
+      description: Lists database catalog objects visible to the caller. Shorthand table APIs resolve through the caller's current/default database.
+      tags:
+        - table_management
+      operationId: listDatabases
+      responses:
+        "200":
+          description: A list of databases
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get database
+      tags:
+        - table_management
+      operationId: getDatabase
+      responses:
+        "200":
+          description: Database details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create database
+      description: Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
+      tags:
+        - table_management
+      operationId: createDatabase
+      responses:
+        "201":
+          description: Database created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Database already exists
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop database
+      description: Drops an empty database catalog object. Non-empty databases fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropDatabase
+      responses:
+        "204":
+          description: Database dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Database is not empty
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List namespaces
+      description: Lists namespace catalog objects inside a database. PostgreSQL schemas map to these namespaces.
+      tags:
+        - table_management
+      operationId: listNamespaces
+      responses:
+        "200":
+          description: A list of namespaces in the database
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Create namespace
+      description: Creates a namespace catalog object in a database. The server applies the same semantics as `CREATE SCHEMA` for the selected database.
+      tags:
+        - table_management
+      operationId: createNamespace
+      responses:
+        "201":
+          description: Namespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Namespace already exists
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop namespace
+      description: Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropNamespace
+      responses:
+        "204":
+          description: Namespace dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Namespace is not empty
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List tables in namespace
+      description: Lists table catalog objects under an explicit database and namespace.
+      tags:
+        - table_management
+      operationId: listNamespaceTables
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 255
+          description: Filter tables by name prefix.
+      responses:
+        "200":
+          description: A list of tables in the namespace
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get namespace table details
+      description: Gets a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: getNamespaceTable
+      responses:
+        "200":
+          description: Table details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: Non-default explicit catalog table route is not yet backed by catalog-aware table I/O.
+    post:
+      summary: Create namespace table
+      description: Creates a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: createNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTableRequest"
+      responses:
+        "200":
+          description: Table created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Table"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "501":
+          description: Non-default explicit catalog table route is not yet backed by catalog-aware table I/O.
+    delete:
+      summary: Drop namespace table
+      description: Drops a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: dropNamespaceTable
+      responses:
+        "204":
+          description: Table dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: Non-default explicit catalog table route is not yet backed by catalog-aware table I/O.
   /tables:
     get:
       summary: List all tables

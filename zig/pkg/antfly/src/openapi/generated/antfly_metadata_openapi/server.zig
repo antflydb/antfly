@@ -172,6 +172,94 @@ pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !
     return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get database
+pub const GetDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Create database
+pub const CreateDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Drop database
+pub const DropDatabasePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// List namespaces
+pub const ListNamespacesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+};
+
+/// Create namespace
+pub const CreateNamespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// Drop namespace
+pub const DropNamespacePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+/// List tables in namespace
+pub const ListNamespaceTablesPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+};
+
+pub const ListNamespaceTablesParams = struct {
+    /// Filter tables by name prefix.
+    prefix: ?[]const u8 = null,
+};
+
+/// Get namespace table details
+pub const GetNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Create namespace table
+pub const CreateNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for createNamespaceTable.
+pub fn parseCreateNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CreateTableRequest) {
+    return std.json.parseFromSlice(types.CreateTableRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop namespace table
+pub const DropNamespaceTablePathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Table name
+    table_name: []const u8,
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -556,6 +644,17 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
     .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent" },
+    .{ .method = "GET", .path = "/databases", .operation_id = "listDatabases" },
+    .{ .method = "GET", .path = "/databases/{databaseName}", .operation_id = "getDatabase" },
+    .{ .method = "POST", .path = "/databases/{databaseName}", .operation_id = "createDatabase" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}", .operation_id = "dropDatabase" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces", .operation_id = "listNamespaces" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "createNamespace" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "dropNamespace" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables", .operation_id = "listNamespaceTables" },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "getNamespaceTable" },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "createNamespaceTable" },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "dropNamespaceTable" },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables" },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable" },
     .{ .method = "POST", .path = "/tables/{tableName}", .operation_id = "createTable" },
@@ -630,6 +729,17 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
         if (!@hasDecl(Impl, "queryBuilderAgent")) @compileError("ServerRouter: Impl missing required method 'queryBuilderAgent'");
         if (!@hasDecl(Impl, "retrievalAgent")) @compileError("ServerRouter: Impl missing required method 'retrievalAgent'");
+        if (!@hasDecl(Impl, "listDatabases")) @compileError("ServerRouter: Impl missing required method 'listDatabases'");
+        if (!@hasDecl(Impl, "getDatabase")) @compileError("ServerRouter: Impl missing required method 'getDatabase'");
+        if (!@hasDecl(Impl, "createDatabase")) @compileError("ServerRouter: Impl missing required method 'createDatabase'");
+        if (!@hasDecl(Impl, "dropDatabase")) @compileError("ServerRouter: Impl missing required method 'dropDatabase'");
+        if (!@hasDecl(Impl, "listNamespaces")) @compileError("ServerRouter: Impl missing required method 'listNamespaces'");
+        if (!@hasDecl(Impl, "createNamespace")) @compileError("ServerRouter: Impl missing required method 'createNamespace'");
+        if (!@hasDecl(Impl, "dropNamespace")) @compileError("ServerRouter: Impl missing required method 'dropNamespace'");
+        if (!@hasDecl(Impl, "listNamespaceTables")) @compileError("ServerRouter: Impl missing required method 'listNamespaceTables'");
+        if (!@hasDecl(Impl, "getNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTable'");
+        if (!@hasDecl(Impl, "createNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTable'");
+        if (!@hasDecl(Impl, "dropNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'dropNamespaceTable'");
         if (!@hasDecl(Impl, "listTables")) @compileError("ServerRouter: Impl missing required method 'listTables'");
         if (!@hasDecl(Impl, "getTable")) @compileError("ServerRouter: Impl missing required method 'getTable'");
         if (!@hasDecl(Impl, "createTable")) @compileError("ServerRouter: Impl missing required method 'createTable'");
@@ -705,6 +815,17 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/eval", evaluate);
             try server.post("/agents/query-builder", queryBuilderAgent);
             try server.post("/agents/retrieval", retrievalAgent);
+            try server.get("/databases", listDatabases);
+            try server.get("/databases/:databaseName", getDatabase);
+            try server.post("/databases/:databaseName", createDatabase);
+            try server.delete("/databases/:databaseName", dropDatabase);
+            try server.get("/databases/:databaseName/namespaces", listNamespaces);
+            try server.post("/databases/:databaseName/namespaces/:namespaceName", createNamespace);
+            try server.delete("/databases/:databaseName/namespaces/:namespaceName", dropNamespace);
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables", listNamespaceTables);
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", getNamespaceTable);
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", createNamespaceTable);
+            try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", dropNamespaceTable);
             try server.get("/tables", listTables);
             try server.get("/tables/:tableName", getTable);
             try server.post("/tables/:tableName", createTable);
@@ -961,6 +1082,105 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn retrievalAgent(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.retrievalAgent(ctx);
+        }
+
+        /// List databases
+        /// GET /databases
+        fn listDatabases(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.listDatabases(ctx);
+        }
+
+        /// Get database
+        /// GET /databases/{databaseName}
+        fn getDatabase(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            return impl.getDatabase(ctx, database_name);
+        }
+
+        /// Create database
+        /// POST /databases/{databaseName}
+        fn createDatabase(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            return impl.createDatabase(ctx, database_name);
+        }
+
+        /// Drop database
+        /// DELETE /databases/{databaseName}
+        fn dropDatabase(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            return impl.dropDatabase(ctx, database_name);
+        }
+
+        /// List namespaces
+        /// GET /databases/{databaseName}/namespaces
+        fn listNamespaces(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            return impl.listNamespaces(ctx, database_name);
+        }
+
+        /// Create namespace
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}
+        fn createNamespace(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            return impl.createNamespace(ctx, database_name, namespace_name);
+        }
+
+        /// Drop namespace
+        /// DELETE /databases/{databaseName}/namespaces/{namespaceName}
+        fn dropNamespace(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            return impl.dropNamespace(ctx, database_name, namespace_name);
+        }
+
+        /// List tables in namespace
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables
+        fn listNamespaceTables(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const query_params = ListNamespaceTablesParams{
+                .prefix = ctx.query("prefix"),
+            };
+            return impl.listNamespaceTables(ctx, database_name, namespace_name, query_params);
+        }
+
+        /// Get namespace table details
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
+        fn getNamespaceTable(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getNamespaceTable(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Create namespace table
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
+        fn createNamespaceTable(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.createNamespaceTable(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Drop namespace table
+        /// DELETE /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
+        fn dropNamespaceTable(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.dropNamespaceTable(ctx, database_name, namespace_name, table_name);
         }
 
         /// List all tables
@@ -1288,6 +1508,17 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listDatabases(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn createDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn dropDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn listNamespaces(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
+//   fn createNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn dropNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn listNamespaceTables(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !httpx.Response
+//   fn getNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn createNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn dropNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn createTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

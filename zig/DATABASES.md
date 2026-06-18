@@ -312,6 +312,45 @@ CLI table commands emit the same OpenAPI requests as hand-written HTTP calls.
 Qualified table grants do not leak across databases or namespaces.
 ```
 
+### Integration Contract by Surface
+
+The database and namespace model should integrate by making OpenAPI plus the
+shared catalog resolver the only semantic boundary. Other protocols are
+adapters:
+
+| Surface | Role in the model | Required behavior |
+| --- | --- | --- |
+| OpenAPI / REST | Canonical public contract | Exposes explicit database, namespace, and table routes; resolves shorthand through the shared catalog resolver before authorization and routing. |
+| SQL / relational | PostgreSQL-compatible syntax layer | Lowers `CREATE DATABASE`, `CREATE SCHEMA`, qualified table DDL/DML, `GRANT`, and `REVOKE` into the same catalog and auth operations used by REST. |
+| MCP | Tool protocol adapter | Mirrors OpenAPI request fields in tool schemas, maps the MCP session to an Antfly principal, and calls the same REST/service handlers instead of maintaining protocol-local catalog state. |
+| A2A | Delegated-agent adapter | Advertises catalog-scoped skills as discovery metadata, then executes each task as a delegated Antfly principal against the same resolver and authorization checks. |
+| CLI | Ergonomic generated-client wrapper | Stores local defaults for convenience, sends explicit database/namespace fields when present, and never creates server-only semantics that cannot be expressed through OpenAPI. |
+| User/role system | Authorization authority | Stores qualified resources (`database:name`, `namespace:db.ns`, `table:db.ns.table`) and evaluates inherited role grants consistently for HTTP, SQL, MCP, A2A, and CLI callers. |
+
+This means MCP, A2A, and CLI should not each gain their own idea of "current
+database" or "current namespace" beyond client/session defaults that feed the
+shared resolver. The resolved catalog target, authenticated principal, role
+memberships, extension capability grants, row-security settings, and audit
+metadata must be identical no matter which surface initiated the operation.
+
+The user/role system remains the enforcement point. Parent resources authorize
+catalog visibility and lifecycle operations, while the concrete table resource
+authorizes row reads, row writes, table DDL, indexes, change feeds, and
+extension-owned table behavior:
+
+```text
+database:tenant_ops              database lifecycle, namespace listing, backup scope
+namespace:tenant_ops.analytics   namespace lifecycle and table listing
+table:tenant_ops.analytics.events row/query/write/index/change-feed access
+```
+
+Delegated protocols should intersect, not expand, authority. An MCP tool
+provided by an extension runs with the caller's permissions intersected with the
+extension install's declared capabilities. An A2A task runs with the delegated
+principal's roles and task-scoped catalog limits. A CLI command runs as the
+configured user or service account. None of those paths should have an implicit
+superuser mode.
+
 ## Migration Path
 
 1. Keep `/tables/{table}` as shorthand for the default database and `public`

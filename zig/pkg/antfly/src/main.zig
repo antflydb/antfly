@@ -146,6 +146,8 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
 
     // Dispatch to the specific command
     if (std.mem.eql(u8, subcommand, "table")) return cmd.cli.table.run(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "database")) return cmd.cli.database_cmd.run(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "namespace")) return cmd.cli.namespace_cmd.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
