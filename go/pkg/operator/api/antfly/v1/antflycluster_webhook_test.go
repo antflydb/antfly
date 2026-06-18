@@ -2019,6 +2019,46 @@ func TestValidateCreate_HighAvailabilityRuntimeRequiresSwarmMode(t *testing.T) {
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRuntimeNodeIDMustMatchRoleIdentity(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: "standby-a",
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected primary runtime node identity mismatch to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.nodeID must match spec.highAvailability.identity.currentPrimaryID") {
+		t.Fatalf("expected primary runtime node identity validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRoleStandby
+	cluster.Spec.HighAvailability.Runtime.NodeID = "primary-a"
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected standby runtime using current primary node identity to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.nodeID must not match spec.highAvailability.identity.currentPrimaryID") {
+		t.Fatalf("expected standby runtime node identity validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected standby runtime with distinct node identity to be valid, got: %v", err)
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRejectsWhitespaceFormerPrimaryLogPath(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{

@@ -1347,8 +1347,16 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	}
 	runtime := ha.Runtime
 	var errors []string
+	nodeID := strings.TrimSpace(runtime.NodeID)
+	currentPrimaryID := ""
+	if ha.Identity != nil {
+		currentPrimaryID = strings.TrimSpace(ha.Identity.CurrentPrimaryID)
+	}
 	switch runtime.Role {
 	case HARuntimeRolePrimary:
+		if nodeID != "" && currentPrimaryID != "" && nodeID != currentPrimaryID {
+			errors = append(errors, "spec.highAvailability.runtime.nodeID must match spec.highAvailability.identity.currentPrimaryID when runtime.role is Primary")
+		}
 		if runtime.Standby != nil {
 			errors = append(errors, "spec.highAvailability.runtime.standby may only be set when runtime.role is Standby")
 		}
@@ -1361,6 +1369,9 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 			}
 		}
 	case HARuntimeRoleStandby:
+		if nodeID != "" && currentPrimaryID != "" && nodeID == currentPrimaryID {
+			errors = append(errors, "spec.highAvailability.runtime.nodeID must not match spec.highAvailability.identity.currentPrimaryID when runtime.role is Standby")
+		}
 		if runtime.Primary != nil {
 			errors = append(errors, "spec.highAvailability.runtime.primary may only be set when runtime.role is Primary")
 		}
@@ -1387,7 +1398,7 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	default:
 		errors = append(errors, "spec.highAvailability.runtime.role must be Primary or Standby")
 	}
-	if strings.TrimSpace(runtime.NodeID) == "" {
+	if nodeID == "" {
 		errors = append(errors, "spec.highAvailability.runtime.nodeID is required")
 	}
 	if strings.TrimSpace(runtime.FencePath) == "" && runtime.FencePath != "" {
