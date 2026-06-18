@@ -517,6 +517,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_rejects_total", "counter", "HA synchronous commit decisions rejected before local commit", ds.ha_primary_mirror_sync_reject_count.load(.acquire));
         try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_waits_total", "counter", "HA synchronous commit waits observed by this data runtime", ds.ha_primary_mirror_sync_wait_count.load(.acquire));
         try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_degraded_total", "counter", "HA synchronous commit decisions degraded to async by policy", ds.ha_primary_mirror_sync_degraded_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_standby_replication_failures_total", "counter", "HA standby replication rounds that exited early with an error", ds.ha_standby_replication_failure_count.load(.acquire));
 
         if (standby) |handle| {
             const upstream_lsn = if (ds.ha_cfg.standby_replication != null)
@@ -1801,6 +1802,7 @@ pub const DataServer = struct {
     ha_primary_mirror_sync_reject_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
+    ha_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -2294,16 +2296,19 @@ pub const DataServer = struct {
     }
 
     pub fn runRound(self: *DataServer) !void {
-        self.runHAStandbyReplicationRound() catch |err| switch (err) {
-            error.HttpConnectionClosing,
-            error.ConnectionResetByPeer,
-            error.ConnectionRefused,
-            error.BrokenPipe,
-            error.EndOfStream,
-            error.UnexpectedHttpStatus,
-            error.NotListening,
-            => std.log.warn("HA standby replication round skipped err={}", .{err}),
-            else => return err,
+        self.runHAStandbyReplicationRound() catch |err| {
+            _ = self.ha_standby_replication_failure_count.fetchAdd(1, .monotonic);
+            switch (err) {
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.ConnectionRefused,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.UnexpectedHttpStatus,
+                error.NotListening,
+                => std.log.warn("HA standby replication round skipped err={}", .{err}),
+                else => return err,
+            }
         };
         if (self.data_raft) |raft| {
             lockAtomic(&self.data_raft_mutex);
@@ -14340,6 +14345,131 @@ test "data server pulls and applies HA standby replication through internal HTTP
     )) orelse return error.TestExpectedEqual;
     defer lookup.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, lookup.json, "\"title\":\"from-http\"") != null);
+}
+
+test "data runtime records HA standby replication round failures" {
+    const alloc = std.testing.allocator;
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FailingExecutor = struct {
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+            return error.ConnectionRefused;
+        }
+    };
+
+    const nonce = platform_time.monotonicNs();
+    const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-root-{d}", .{nonce});
+    defer alloc.free(replica_root_raw);
+    const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+    defer alloc.free(replica_root);
+    const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-log-{d}", .{nonce});
+    defer alloc.free(standby_log_raw);
+    const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+    defer alloc.free(standby_log);
+    const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-progress-{d}", .{nonce});
+    defer alloc.free(standby_progress_raw);
+    const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+    defer alloc.free(standby_progress);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
+
+    var standby = try antfly.ha.standby.Standby.open(alloc, standby_log.ptr, standby_progress.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 77,
+        .table_id = 7,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var failing_executor = FailingExecutor{};
+    var server = DataServer.initFromLocalMetadataSources(alloc, .{
+        .replica_root_dir = replica_root,
+        .ha = .{
+            .admin_context = .{
+                .standby = &standby,
+                .standby_node_id = "standby-a",
+            },
+            .standby_replication = .{
+                .upstream_base_uri = "http://primary.internal.test",
+                .slot_name = "standby-a",
+                .executor = failing_executor.executor(),
+            },
+        },
+    }, FakeCatalog.iface(), FakeStatus.iface());
+    defer server.deinit();
+
+    try server.runRound();
+    try std.testing.expectEqual(@as(u64, 1), server.ha_standby_replication_failure_count.load(.acquire));
+
+    var health = HealthSource{ .data_server = &server };
+    var writer_buf: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const metrics = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_replication_failures_total 1\n") != null);
 }
 
 test "data runtime lsm maintenance scheduler defers under resource pressure" {
