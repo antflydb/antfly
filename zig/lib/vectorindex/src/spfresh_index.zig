@@ -22,6 +22,7 @@ const proto = @import("antfly_vector").proto;
 const vec = @import("antfly_vector").vector;
 
 const hilbert_coord_stack_capacity = 2048;
+const flat_centroid_block_metadata_stack_capacity = 256;
 
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
@@ -518,16 +519,22 @@ fn appendFlatCentroidBlocksFromEntries(
         std.mem.sort(FlatCentroidEntry, entries.items, FlatCentroidEntrySortContext{ .dim = sort_dim }, flatCentroidEntryLess);
     }
 
-    var posting_ids = try self.alloc.alloc(u64, block_size);
-    defer self.alloc.free(posting_ids);
-    var parents = try self.alloc.alloc(u64, block_size);
-    defer self.alloc.free(parents);
-    var levels = try self.alloc.alloc(u16, block_size);
-    defer self.alloc.free(levels);
-    var states = try self.alloc.alloc(types.PostingState, block_size);
-    defer self.alloc.free(states);
-    var radii = try self.alloc.alloc(f32, block_size);
-    defer self.alloc.free(radii);
+    var posting_ids_stack: [flat_centroid_block_metadata_stack_capacity]u64 = undefined;
+    var parents_stack: [flat_centroid_block_metadata_stack_capacity]u64 = undefined;
+    var levels_stack: [flat_centroid_block_metadata_stack_capacity]u16 = undefined;
+    var states_stack: [flat_centroid_block_metadata_stack_capacity]types.PostingState = undefined;
+    var radii_stack: [flat_centroid_block_metadata_stack_capacity]f32 = undefined;
+    const use_metadata_stack = block_size <= flat_centroid_block_metadata_stack_capacity;
+    var posting_ids = if (use_metadata_stack) posting_ids_stack[0..block_size] else try self.alloc.alloc(u64, block_size);
+    defer if (!use_metadata_stack) self.alloc.free(posting_ids);
+    var parents = if (use_metadata_stack) parents_stack[0..block_size] else try self.alloc.alloc(u64, block_size);
+    defer if (!use_metadata_stack) self.alloc.free(parents);
+    var levels = if (use_metadata_stack) levels_stack[0..block_size] else try self.alloc.alloc(u16, block_size);
+    defer if (!use_metadata_stack) self.alloc.free(levels);
+    var states = if (use_metadata_stack) states_stack[0..block_size] else try self.alloc.alloc(types.PostingState, block_size);
+    defer if (!use_metadata_stack) self.alloc.free(states);
+    var radii = if (use_metadata_stack) radii_stack[0..block_size] else try self.alloc.alloc(f32, block_size);
+    defer if (!use_metadata_stack) self.alloc.free(radii);
     var centroids = try self.alloc.alloc(f32, block_size * dims);
     defer self.alloc.free(centroids);
 
