@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -116,6 +117,11 @@ const root_openapi_yaml =
     \\      summary: Fetch an MCP resource descriptor
     \\
 ;
+
+const ArdOpenApiSpec = struct {
+    body: []const u8,
+    admin_only: bool = false,
+};
 
 const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.QueryRequest),
@@ -1995,6 +2001,16 @@ pub const ApiHttpServer = struct {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ard_v1_openapi)) {
             return try self.bodyResponse(200, "application/yaml", root_openapi_yaml, false);
         }
+        if (std.mem.startsWith(u8, uri_parts.path, routes.Routes.ard_v1_openapi_prefix)) {
+            if (req.method != .GET) return try jsonErrorResponse(self.alloc, 405, "method not allowed");
+            const name = uri_parts.path[routes.Routes.ard_v1_openapi_prefix.len..];
+            const spec = ardOpenApiSpec(name) orelse return try jsonErrorResponse(self.alloc, 404, "not found");
+            if (spec.admin_only and self.cfg.auth_enabled and !authenticatedIdentityIsAdmin(authenticated_identity)) {
+                if (authenticated_identity == null) return try unauthorizedResponse(self.alloc);
+                return try textResponse(self.alloc, 403, "forbidden");
+            }
+            return try self.bodyResponse(200, "application/yaml", spec.body, false);
+        }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.ai_catalog)) {
             const mode: ard_catalog.CatalogMode = if (authenticated_identity != null) .tenant else .public_bootstrap;
             var snapshot_opt: ?metadata_api.AdminSnapshot = null;
@@ -2005,7 +2021,7 @@ pub const ApiHttpServer = struct {
             } else null;
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(mode, uri_parts.query),
+                self.ardCatalogOptions(mode, uri_parts.query, authenticated_identity),
                 extension_context,
             );
             return try self.ardCatalogResponse(200, body, true);
@@ -2015,7 +2031,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.catalogJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query),
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
             return try self.ardCatalogResponse(200, body, false);
@@ -2026,7 +2042,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, ""),
+                self.ardCatalogOptions(.tenant, "", authenticated_identity),
                 req.body,
                 false,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2042,7 +2058,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = ard_catalog.searchJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, ""),
+                self.ardCatalogOptions(.tenant, "", authenticated_identity),
                 req.body,
                 true,
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -2058,7 +2074,7 @@ pub const ApiHttpServer = struct {
             defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
             const body = try ard_catalog.agentsJsonWithExtensionsAlloc(
                 self.alloc,
-                self.ardCatalogOptions(.tenant, uri_parts.query),
+                self.ardCatalogOptions(.tenant, uri_parts.query, authenticated_identity),
                 self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
             );
             return try self.ardCatalogResponse(200, body, false);
@@ -2102,13 +2118,28 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn ardCatalogOptions(_: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8) ard_catalog.CatalogOptions {
+    fn ardCatalogOptions(self: *ApiHttpServer, mode: ard_catalog.CatalogMode, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) ard_catalog.CatalogOptions {
         return .{
             .mode = mode,
+            .is_admin = !self.cfg.auth_enabled or authenticatedIdentityIsAdmin(authenticated_identity),
             .profile = parseSimpleQueryParam(query, "profile"),
             .types = parseSimpleQueryParam(query, "types"),
             .include = parseSimpleQueryParam(query, "include"),
         };
+    }
+
+    fn authenticatedIdentityIsAdmin(authenticated_identity: ?AuthenticatedIdentity) bool {
+        const identity = authenticated_identity orelse return false;
+        return permissionsAllow(identity.permissions, .@"*", "*", .admin);
+    }
+
+    fn ardOpenApiSpec(name: []const u8) ?ArdOpenApiSpec {
+        if (std.mem.eql(u8, name, "antfly.yaml")) return .{ .body = build_options.ard_openapi_antfly_yaml };
+        if (std.mem.eql(u8, name, "metadata.yaml")) return .{ .body = build_options.ard_openapi_metadata_yaml };
+        if (std.mem.eql(u8, name, "inference-config.yaml")) return .{ .body = build_options.ard_openapi_inference_config_yaml };
+        if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = build_options.ard_openapi_extensions_yaml, .admin_only = true };
+        if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = build_options.ard_openapi_auth_yaml, .admin_only = true };
+        return null;
     }
 
     fn ardCatalogResponse(self: *ApiHttpServer, status: u16, body: []u8, public_cors: bool) !http_common.HttpResponse {
@@ -10232,11 +10263,25 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     };
 
     const secret = "ard-catalog-trusted-principal-secret";
+    var auth = try initTestAuthManager(std.testing.allocator);
+    try bindTestAuthManager(std.testing.allocator, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var admin_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(std.testing.allocator, .@"*", "*", .admin),
+    };
+    defer admin_permission[0].deinit(std.testing.allocator);
+    var admin_user = try auth.manager.createUser("admin", "admin", &admin_permission);
+    defer admin_user.deinit(std.testing.allocator);
+
     var source = FakeSource{};
     var server = ApiHttpServer.init(
         std.testing.allocator,
         .{
             .auth_enabled = true,
+            .user_manager = &auth.manager,
             .trusted_principal_secret = secret,
             .trusted_principal_issuer = "trusted-upstream",
         },
@@ -10275,6 +10320,38 @@ test "api http server requires auth for ARD tenant catalog when auth is enabled"
     defer authorized.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expect(std.mem.indexOf(u8, authorized.body, "\"type\":\"application/mcp-server+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Extensions OpenAPI") == null);
+    try std.testing.expect(std.mem.indexOf(u8, authorized.body, "Antfly Auth OpenAPI") == null);
+
+    var forbidden_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/extensions.yaml",
+        .headers = &trusted_principal_headers,
+    });
+    defer forbidden_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 403), forbidden_spec.status);
+
+    const admin_auth = try encodeBasicAuthorization(std.testing.allocator, "admin", "admin");
+    defer std.testing.allocator.free(admin_auth);
+    var admin_catalog = try server.handle(.{
+        .method = .GET,
+        .uri = routes.Routes.ard_v1_catalog,
+        .authorization = admin_auth,
+    });
+    defer admin_catalog.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_catalog.status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Extensions OpenAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_catalog.body, "Antfly Auth OpenAPI") != null);
+
+    var admin_spec = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/extensions.yaml",
+        .authorization = admin_auth,
+    });
+    defer admin_spec.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), admin_spec.status);
+    try std.testing.expectEqualStrings("application/yaml", admin_spec.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, admin_spec.body, "title: Antfly Extensions API") != null);
 }
 
 test "api http server serves ARD OpenAPI, skill, resource, and registry endpoints" {
@@ -10302,6 +10379,8 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     defer catalog.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), catalog.status);
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/openapi+yaml\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "Antfly Public OpenAPI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.body, "Antfly Inference OpenAPI") != null);
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"type\":\"application/ai-skill+md\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, catalog.body, "\"representativeQueries\"") != null);
 
@@ -10313,6 +10392,24 @@ test "api http server serves ARD OpenAPI, skill, resource, and registry endpoint
     try std.testing.expectEqual(@as(u16, 200), openapi.status);
     try std.testing.expectEqualStrings("application/yaml", openapi.content_type.?);
     try std.testing.expect(std.mem.indexOf(u8, openapi.body, "openapi:") != null);
+
+    var antfly_openapi = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/antfly.yaml",
+    });
+    defer antfly_openapi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), antfly_openapi.status);
+    try std.testing.expectEqualStrings("application/yaml", antfly_openapi.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, antfly_openapi.body, "title: Antfly Public API") != null);
+
+    var inference_openapi = try server.handle(.{
+        .method = .GET,
+        .uri = "/ard/v1/openapi/inference-config.yaml",
+    });
+    defer inference_openapi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), inference_openapi.status);
+    try std.testing.expectEqualStrings("application/yaml", inference_openapi.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, inference_openapi.body, "title: Antfly Inference Configuration Schema") != null);
 
     var skill = try server.handle(.{
         .method = .GET,

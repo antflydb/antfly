@@ -40,6 +40,7 @@ pub const Routes = struct {
     pub const ai_catalog = "/.well-known/ai-catalog.json";
     pub const ard_v1 = "/ard/v1";
     pub const ard_v1_openapi = "/ard/v1/openapi.yaml";
+    pub const ard_v1_openapi_prefix = "/ard/v1/openapi/";
     pub const ard_v1_catalog = "/ard/v1/catalog";
     pub const ard_v1_search = "/ard/v1/search";
     pub const ard_v1_explore = "/ard/v1/explore";

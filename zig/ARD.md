@@ -16,11 +16,11 @@ Antfly already has most of the native execution surfaces ARD should advertise:
 
 - MCP: `/mcp/v1`
 - extension-scoped MCP: `/mcp/v1/extensions/{extension}`
-- extension MCP profiles: planned under `/mcp/v1/extensions/profiles/{profile}`
+- extension MCP profiles: `/mcp/v1/extensions/profiles/{profile}`, starting with `copilot`
 - A2A: `/a2a`
 - A2A agent card: `/.well-known/agent-card.json`
 - extension lifecycle and package metadata: `/extensions/v1`
-- OpenAPI specs: generated from `specs/openapi/**`
+- OpenAPI specs: `/ard/v1/openapi.yaml` and `/ard/v1/openapi/{spec}.yaml`, backed by generated or source specs from `openapi.yaml` and `specs/openapi/**`
 - agent-like HTTP endpoints: retrieval, query builder, and table APIs
 
 The design goal is to add ARD as a thin, tenant-aware discovery/export layer over these surfaces, not as a new execution runtime.
@@ -239,14 +239,16 @@ OpenAPI entries should advertise machine-readable Antfly API specs.
 
 Initial entries:
 
-- public Antfly API
-- extensions API
-- auth/user management API, admin-only
-- metadata/admin API, admin-only
-- inference/config API where applicable
+- ARD discovery API: `/ard/v1/openapi.yaml`
+- public Antfly API: `/ard/v1/openapi/antfly.yaml`
+- metadata/table/retrieval API: `/ard/v1/openapi/metadata.yaml`
+- extensions API: `/ard/v1/openapi/extensions.yaml`, admin-only
+- auth/user management API: `/ard/v1/openapi/auth.yaml`, admin-only
+- inference/config API: `/ard/v1/openapi/inference-config.yaml` where applicable
 
 Candidate media types:
 
+- `application/openapi+yaml`
 - `application/openapi+json`
 - `application/vnd.oai.openapi+json;version=3.0`
 
@@ -258,6 +260,8 @@ Each OpenAPI entry should include:
 - `capabilities`: coarse operation groups, not every operation
 - `metadata.requiredPermissions`: Antfly permission hints
 - `metadata.sourceSpec`: path or generated module name for debugging
+
+Admin-only OpenAPI entries should be hidden from non-admin scoped catalogs and the corresponding `/ard/v1/openapi/{spec}.yaml` resource route should return `403` for authenticated non-admin identities when auth is enabled. Public, metadata/table, and inference specs can be visible to authenticated tenant identities by default; operation invocation remains protected by the native route permissions.
 
 ### Skills
 
@@ -410,8 +414,8 @@ Later:
 - Should public `/.well-known/ai-catalog.json` default to `401` or a bootstrap-only catalog?
 - Should `/ard/v1/catalog` and `/.well-known/ai-catalog.json` return identical authenticated output or should the well-known route always omit some internal metadata?
 - Where should skill source content live before it is served through `/ard/v1/skills/{skill}`: source-controlled docs, generated from OpenAPI/docs, extension-owned package content, or a combination?
-- Which OpenAPI specs are safe to expose to non-admin users by default?
-- Do profiles belong only under `/mcp/v1/extensions/profiles/{profile}`, or should ARD introduce profile catalogs independent of MCP?
+- Should individual OpenAPI specs eventually be operation-filtered per identity instead of exposed or hidden as whole documents?
+- Do future profiles belong only under `/mcp/v1/extensions/profiles/{profile}`, or should ARD introduce profile catalogs independent of MCP after `copilot`?
 - Should Colony own cross-tenant/global registry search while Antfly nodes only expose tenant-local catalogs?
 
 ## Recommended Default

@@ -25,6 +25,7 @@ pub const CatalogOptions = struct {
     mode: CatalogMode = .public_bootstrap,
     publisher_domain: []const u8 = "antfly.local",
     display_name: []const u8 = "Antfly",
+    is_admin: bool = false,
     profile: ?[]const u8 = null,
     types: ?[]const u8 = null,
     include: ?[]const u8 = null,
@@ -48,6 +49,7 @@ const Entry = struct {
     tags: []const []const u8 = &.{},
     capabilities: []const []const u8 = &.{},
     representative_queries: []const []const u8 = &.{},
+    admin_only: bool = false,
 
     fn write(self: Entry, writer: *std.Io.Writer, publisher_domain: []const u8) !void {
         try writer.writeByte('{');
@@ -258,7 +260,7 @@ const tenant_entries = [_]Entry{
         .representative_queries = &.{ "search Antfly from Copilot", "list Copilot-visible extension MCP tools" },
     },
     .{
-        .identifier_suffix = "openapi:public",
+        .identifier_suffix = "openapi:ard",
         .display_name = "Antfly ARD OpenAPI",
         .media_type = "application/openapi+yaml",
         .description = "Machine-readable OpenAPI specification for Antfly ARD discovery APIs.",
@@ -267,6 +269,63 @@ const tenant_entries = [_]Entry{
         .tags = &.{ "openapi", "api", "public" },
         .capabilities = &.{ "table-management", "query", "retrieval", "extensions" },
         .representative_queries = &.{ "call the Antfly table query API", "manage Antfly extensions through HTTP", "inspect table schemas through OpenAPI" },
+    },
+    .{
+        .identifier_suffix = "openapi:public",
+        .display_name = "Antfly Public OpenAPI",
+        .media_type = "application/openapi+yaml",
+        .description = "Joined public OpenAPI specification for Antfly server APIs.",
+        .url = "/ard/v1/openapi/antfly.yaml",
+        .metadata = "{\"sourceSpec\":\"openapi.yaml\",\"requiredPermissions\":[\"tenant-api\"]}",
+        .tags = &.{ "openapi", "api", "public" },
+        .capabilities = &.{ "table-management", "query", "retrieval", "transactions", "extensions", "auth" },
+        .representative_queries = &.{ "call Antfly APIs from an OpenAPI client", "generate an Antfly SDK", "inspect Antfly API request schemas" },
+    },
+    .{
+        .identifier_suffix = "openapi:metadata",
+        .display_name = "Antfly Metadata OpenAPI",
+        .media_type = "application/openapi+yaml",
+        .description = "OpenAPI specification for Antfly table, transaction, retrieval, and admin metadata APIs.",
+        .url = "/ard/v1/openapi/metadata.yaml",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/antfly/metadata.yaml\",\"requiredPermissions\":[\"tenant-api\"]}",
+        .tags = &.{ "openapi", "api", "metadata" },
+        .capabilities = &.{ "table-management", "query", "retrieval", "transactions", "cluster-status" },
+        .representative_queries = &.{ "inspect Antfly table APIs", "call the retrieval agent API", "manage Antfly transactions" },
+    },
+    .{
+        .identifier_suffix = "openapi:extensions",
+        .display_name = "Antfly Extensions OpenAPI",
+        .media_type = "application/openapi+yaml",
+        .description = "OpenAPI specification for extension package and lifecycle management.",
+        .url = "/ard/v1/openapi/extensions.yaml",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/extensions/api.yaml\",\"requiredPermissions\":[\"admin\"]}",
+        .tags = &.{ "openapi", "api", "extensions", "admin" },
+        .capabilities = &.{ "extension-install", "extension-config", "extension-lifecycle", "package-catalog" },
+        .representative_queries = &.{ "install an Antfly extension through OpenAPI", "inspect installed extension config", "list extension packages" },
+        .admin_only = true,
+    },
+    .{
+        .identifier_suffix = "openapi:auth",
+        .display_name = "Antfly Auth OpenAPI",
+        .media_type = "application/openapi+yaml",
+        .description = "OpenAPI specification for user, API key, permission, role, and row-filter management.",
+        .url = "/ard/v1/openapi/auth.yaml",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/auth/api.yaml\",\"requiredPermissions\":[\"admin\"]}",
+        .tags = &.{ "openapi", "api", "auth", "admin" },
+        .capabilities = &.{ "user-management", "api-key-management", "permissions", "row-filters", "roles" },
+        .representative_queries = &.{ "create an Antfly API key", "assign table permissions to a user", "configure row filters" },
+        .admin_only = true,
+    },
+    .{
+        .identifier_suffix = "openapi:inference-config",
+        .display_name = "Antfly Inference OpenAPI",
+        .media_type = "application/openapi+yaml",
+        .description = "OpenAPI specification for Antfly inference and model-serving APIs.",
+        .url = "/ard/v1/openapi/inference-config.yaml",
+        .metadata = "{\"sourceSpec\":\"specs/openapi/inference/config.yaml\",\"requiredPermissions\":[\"inference-api\"]}",
+        .tags = &.{ "openapi", "api", "inference" },
+        .capabilities = &.{ "embedding", "chunking", "reranking", "generation", "extraction", "transcription" },
+        .representative_queries = &.{ "embed text through Antfly inference", "rerank search results", "list local inference models" },
     },
 };
 
@@ -403,15 +462,15 @@ fn writeScopedEntries(
     filter: ?std.json.Value,
 ) !void {
     for (static_entries) |entry| {
-        if (catalogOptionsAllowEntry(options, entry.media_type, entry.tags) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
+        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
-            if (catalogOptionsAllowEntry(options, entry.media_type, entry.tags) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
         }
         for (skills) |skill| {
             const entry = skillEntry(skill);
-            if (catalogOptionsAllowEntry(options, entry.media_type, entry.tags) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeEntry(writer, options.publisher_domain, first, entry);
         }
     }
 }
@@ -425,29 +484,29 @@ fn writeMatchedEntries(
     matched: *usize,
 ) !void {
     for (static_entries) |entry| {
-        if (catalogOptionsAllowEntry(options, entry.media_type, entry.tags) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
+        if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
-            if (catalogOptionsAllowEntry(options, entry.media_type, entry.tags) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
         }
         for (skills) |skill| {
             const entry = skillEntry(skill);
-            if (catalogOptionsAllowEntry(options, entry.media_type, entry.tags) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
+            if (catalogOptionsAllowStaticEntry(options, entry) and entryMatches(entry, options.publisher_domain, text, filter)) try writeSearchEntry(writer, options.publisher_domain, first, entry, matched, text);
         }
     }
 }
 
 fn writeAgentEntries(writer: *std.Io.Writer, options: CatalogOptions, first: *bool, count: *usize) !void {
     for (static_entries) |entry| {
-        if (isAgentLike(entry) and catalogOptionsAllowEntry(options, entry.media_type, entry.tags)) {
+        if (isAgentLike(entry) and catalogOptionsAllowStaticEntry(options, entry)) {
             try writeEntry(writer, options.publisher_domain, first, entry);
             count.* += 1;
         }
     }
     if (options.mode == .tenant) {
         for (tenant_entries) |entry| {
-            if (isAgentLike(entry) and catalogOptionsAllowEntry(options, entry.media_type, entry.tags)) {
+            if (isAgentLike(entry) and catalogOptionsAllowStaticEntry(options, entry)) {
                 try writeEntry(writer, options.publisher_domain, first, entry);
                 count.* += 1;
             }
@@ -469,7 +528,7 @@ fn writeExtensionEntries(
         if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
-                    catalogOptionsAllowEntry(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
+                    catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
                     dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, text, filter, options.publisher_domain))
                 {
                     try writeExtensionPackageEntry(writer, options.publisher_domain, first, package.*);
@@ -477,13 +536,13 @@ fn writeExtensionEntries(
             }
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
-            catalogOptionsAllowEntry(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
+            catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, text, filter, options.publisher_domain))
         {
             try writeInstalledExtensionEntry(writer, options.publisher_domain, first, installed);
         }
         if (has_visible_mcp) {
-            if (catalogOptionsAllowEntry(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
+            if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
                 dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, text, filter, options.publisher_domain))
             {
                 try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
@@ -507,7 +566,7 @@ fn writeMatchedExtensionEntries(
         if (try visibleInstalledCanExposeExtension(alloc, installed, ctx)) {
             if (findInstalledPackage(ctx.extension_packages, installed)) |package| {
                 if (!try visiblePackageAlreadyEmitted(alloc, ctx, package.*, index) and
-                    catalogOptionsAllowEntry(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
+                    catalogOptionsAllowMedia(options, "application/antfly-extension-package+json", &.{ "extension", "package" }) and
                     dynamicEntryMatches(package.name, "application/antfly-extension-package+json", "extension package", &.{ "extension", "package" }, text, filter, options.publisher_domain))
                 {
                     try writeSearchExtensionPackageEntry(writer, options.publisher_domain, first, package.*, matched, text);
@@ -515,13 +574,13 @@ fn writeMatchedExtensionEntries(
             }
         }
         if ((installedExtensionVisible(installed, ctx.permissions) or has_visible_mcp) and
-            catalogOptionsAllowEntry(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
+            catalogOptionsAllowMedia(options, "application/antfly-installed-extension+json", &.{ "extension", "installed" }) and
             dynamicEntryMatches(installed.name, "application/antfly-installed-extension+json", "extension", &.{ "extension", "installed" }, text, filter, options.publisher_domain))
         {
             try writeSearchInstalledExtensionEntry(writer, options.publisher_domain, first, installed, matched, text);
         }
         if (has_visible_mcp) {
-            if (catalogOptionsAllowEntry(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
+            if (catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" }) and
                 dynamicEntryMatches(installed.name, "application/mcp-server+json", "mcp extension", &.{ "mcp", "extension" }, text, filter, options.publisher_domain))
             {
                 try writeSearchExtensionMcpEntry(writer, options.publisher_domain, first, installed, matched, text);
@@ -540,7 +599,7 @@ fn writeAgentExtensionEntries(
 ) !void {
     for (ctx.installed_extensions) |installed| {
         if (!(try installedExtensionHasVisibleMcpTool(alloc, installed, ctx.extension_members, ctx.permissions))) continue;
-        if (!catalogOptionsAllowEntry(options, "application/mcp-server+json", &.{ "mcp", "extension" })) continue;
+        if (!catalogOptionsAllowMedia(options, "application/mcp-server+json", &.{ "mcp", "extension" })) continue;
         try writeExtensionMcpEntry(writer, options.publisher_domain, first, installed);
         count.* += 1;
     }
@@ -918,7 +977,12 @@ fn isAgentLike(entry: Entry) bool {
         std.mem.eql(u8, entry.media_type, "application/mcp-server+json");
 }
 
-fn catalogOptionsAllowEntry(options: CatalogOptions, media_type: []const u8, tags: []const []const u8) bool {
+fn catalogOptionsAllowStaticEntry(options: CatalogOptions, entry: Entry) bool {
+    if (entry.admin_only and !options.is_admin) return false;
+    return catalogOptionsAllowMedia(options, entry.media_type, entry.tags);
+}
+
+fn catalogOptionsAllowMedia(options: CatalogOptions, media_type: []const u8, tags: []const []const u8) bool {
     if (options.types) |types| {
         if (!commaListContains(types, media_type)) return false;
     }
