@@ -61149,27 +61149,15 @@ fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFami
 }
 
 fn appParityPlanNonNoneStringTokenUsize(plan: []const u8, token: []const u8) ?usize {
-    return switch (appParityPlanScanStringToken(plan, token)) {
-        .absent => 0,
-        .value => |value| if (std.mem.eql(u8, value, "none")) 0 else 1,
-        .invalid => null,
-    };
+    return sql_adapter.planNonNoneStringTokenUsize(plan, token);
 }
 
 fn appParityPlanNonNoneStringTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    var sum: usize = 0;
-    for (tokens) |token| {
-        sum += appParityPlanNonNoneStringTokenUsize(plan, token) orelse return false;
-    }
-    return sum == expected;
+    return sql_adapter.planNonNoneStringTokenSumMatches(plan, tokens, expected);
 }
 
 fn appParityPlanBoolTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    var sum: usize = 0;
-    for (tokens) |token| {
-        sum += appParityPlanBoolTokenUsize(plan, token) orelse return false;
-    }
-    return sum == expected;
+    return sql_adapter.planBoolTokenSumMatches(plan, tokens, expected);
 }
 
 fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
@@ -63971,20 +63959,11 @@ fn appParityPlanUsizeOptionalTokenValue(plan: []const u8, token: []const u8) ?us
 }
 
 fn appParityPlanUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    var sum: usize = 0;
-    for (tokens) |token| {
-        const value = appParityPlanUsizeTokenValue(plan, token) orelse return false;
-        sum += value;
-    }
-    return sum == expected;
+    return sql_adapter.planUsizeTokenSumMatches(plan, tokens, expected);
 }
 
 fn appParityPlanUsizeOptionalTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    var sum: usize = 0;
-    for (tokens) |token| {
-        sum += appParityPlanUsizeOptionalTokenValue(plan, token) orelse return false;
-    }
-    return sum == expected;
+    return sql_adapter.planUsizeOptionalTokenSumMatches(plan, tokens, expected);
 }
 
 fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
@@ -64043,10 +64022,7 @@ fn appParityAppliedPlanHasExactUsizeToken(plan: []const u8, token: []const u8, e
 }
 
 fn appParityPlanHasAnyNonZeroToken(plan: []const u8, tokens: []const []const u8) bool {
-    for (tokens) |token| {
-        if (appParityPlanHasNonZeroToken(plan, token)) return true;
-    }
-    return false;
+    return sql_adapter.planHasAnyNonZeroToken(plan, tokens);
 }
 
 fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bool {

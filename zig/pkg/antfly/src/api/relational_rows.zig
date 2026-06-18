@@ -3133,25 +3133,22 @@ pub fn buildRowsAggregateResultFromLakeRowsAlloc(
 ) !OwnedRowsAggregateResult {
     try validateLakeRowsAggregateShapeSupported(request);
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeByte('{');
-    for (request.aggregations, 0..) |aggregation, i| {
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{f}:", .{std.json.fmt(aggregation.name, .{})});
-        try writeLakeRowsAggregateValueJson(writer, aggregation, result);
-    }
-    try writer.writeByte('}');
+    const groups = try lakeRowsAggregateGroupsAlloc(alloc, request, result.rows);
+    defer freeLakeRowsAggregateGroups(alloc, groups, request.aggregations.len);
 
-    const encoded = try out.toOwnedSlice();
-    errdefer alloc.free(encoded);
-    const rows = try alloc.alloc([]const u8, 1);
-    errdefer alloc.free(rows);
-    rows[0] = encoded;
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+    try rows.ensureUnusedCapacity(alloc, groups.len);
+    for (groups) |group| {
+        const encoded = try lakeRowsAggregateGroupJsonAlloc(alloc, request, group);
+        rows.appendAssumeCapacity(encoded);
+    }
     return .{
-        .rows = rows,
-        .total_groups = 1,
+        .rows = try rows.toOwnedSlice(alloc),
+        .total_groups = @intCast(groups.len),
     };
 }
 
@@ -3189,6 +3186,13 @@ fn validateLakeRowsAggregateRequestSupported(
 ) !void {
     if (schema.storage_mode != .relational) return error.InvalidRowsRequest;
     try validateLakeRowsAggregateShapeSupported(request);
+    for (request.group_by) |field| {
+        const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+        switch (column.field_type) {
+            .embedding => return error.UnsupportedRowsQuery,
+            else => {},
+        }
+    }
     for (request.aggregations) |aggregation| {
         switch (aggregation.op) {
             .count => if (aggregation.field) |field| {
@@ -3215,10 +3219,10 @@ fn validateLakeRowsAggregateRequestSupported(
 
 fn validateLakeRowsAggregateShapeSupported(request: OwnedRowsAggregateRequest) !void {
     try validateLakeRowsAggregateSourceSupported(request.source);
-    if (request.group_by.len != 0 or request.group_expressions.len != 0) return error.UnsupportedRowsQuery;
+    if (request.group_expressions.len != 0) return error.UnsupportedRowsQuery;
     if (request.having_predicates.len != 0 or request.having_expressions.len != 0 or request.having_any.len != 0 or request.having_not.len != 0) return error.UnsupportedRowsQuery;
     if (request.order_by.len != 0 or request.limit != null or request.offset != 0) return error.UnsupportedRowsQuery;
-    if (request.aggregations.len == 0) return error.InvalidRowsRequest;
+    if (request.aggregations.len == 0 and request.group_by.len == 0) return error.InvalidRowsRequest;
     for (request.aggregations) |aggregation| {
         if (aggregation.name.len == 0) return error.InvalidRowsRequest;
         if (aggregation.expression != null or aggregation.distinct) return error.UnsupportedRowsQuery;
@@ -3260,6 +3264,9 @@ fn lakeRowsAggregateProjectedColumnsAlloc(
     var columns = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeLakeProjectedColumnList(alloc, &columns);
 
+    for (request.group_by) |field| {
+        try appendLakeProjectedColumnAlloc(alloc, &columns, field);
+    }
     for (request.aggregations) |aggregation| {
         if (aggregation.field) |field| try appendLakeProjectedColumnAlloc(alloc, &columns, field);
     }
@@ -3509,6 +3516,234 @@ const LakeNumericFold = struct {
         self.all_integral = false;
     }
 };
+
+const LakeAggregateFold = struct {
+    row_count: u64 = 0,
+    non_null_count: u64 = 0,
+    numeric: LakeNumericFold = .{},
+};
+
+const LakeAggregateGroup = struct {
+    key_json: []u8,
+    fields_json: []u8,
+    folds: []LakeAggregateFold,
+};
+
+fn lakeRowsAggregateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+    rows: []const lake_rows.ProjectedRow,
+) ![]LakeAggregateGroup {
+    var groups = std.ArrayListUnmanaged(LakeAggregateGroup).empty;
+    errdefer freeLakeRowsAggregateGroupList(alloc, &groups, request.aggregations.len);
+
+    if (request.group_by.len == 0) {
+        try appendLakeRowsAggregateGroupAlloc(alloc, request, &groups, null);
+    }
+
+    for (rows) |row| {
+        const group_index = if (request.group_by.len == 0)
+            @as(usize, 0)
+        else
+            try findOrAppendLakeRowsAggregateGroupAlloc(alloc, request, &groups, row);
+        try addLakeRowsAggregateRow(request.aggregations, &groups.items[group_index], row);
+    }
+
+    return try groups.toOwnedSlice(alloc);
+}
+
+fn findOrAppendLakeRowsAggregateGroupAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+    groups: *std.ArrayListUnmanaged(LakeAggregateGroup),
+    row: lake_rows.ProjectedRow,
+) !usize {
+    const key_json = try lakeRowsGroupKeyJsonAlloc(alloc, request.group_by, row);
+    errdefer alloc.free(key_json);
+    for (groups.items, 0..) |group, i| {
+        if (std.mem.eql(u8, group.key_json, key_json)) {
+            alloc.free(key_json);
+            return i;
+        }
+    }
+    const fields_json = try lakeRowsGroupFieldsJsonAlloc(alloc, request.group_by, row);
+    errdefer alloc.free(fields_json);
+    const folds = try alloc.alloc(LakeAggregateFold, request.aggregations.len);
+    @memset(folds, .{});
+    errdefer alloc.free(folds);
+    try groups.append(alloc, .{
+        .key_json = key_json,
+        .fields_json = fields_json,
+        .folds = folds,
+    });
+    return groups.items.len - 1;
+}
+
+fn appendLakeRowsAggregateGroupAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+    groups: *std.ArrayListUnmanaged(LakeAggregateGroup),
+    maybe_row: ?lake_rows.ProjectedRow,
+) !void {
+    const key_json = if (maybe_row) |row|
+        try lakeRowsGroupKeyJsonAlloc(alloc, request.group_by, row)
+    else
+        try alloc.dupe(u8, "[]");
+    errdefer alloc.free(key_json);
+    const fields_json = if (maybe_row) |row|
+        try lakeRowsGroupFieldsJsonAlloc(alloc, request.group_by, row)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(fields_json);
+    const folds = try alloc.alloc(LakeAggregateFold, request.aggregations.len);
+    @memset(folds, .{});
+    errdefer alloc.free(folds);
+    try groups.append(alloc, .{
+        .key_json = key_json,
+        .fields_json = fields_json,
+        .folds = folds,
+    });
+}
+
+fn addLakeRowsAggregateRow(
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    group: *LakeAggregateGroup,
+    row: lake_rows.ProjectedRow,
+) !void {
+    for (aggregations, 0..) |aggregation, i| {
+        switch (aggregation.op) {
+            .count => {
+                if (aggregation.field) |field| {
+                    if ((try lakeRowsAggregateCellValue(row, field)) != null) group.folds[i].non_null_count += 1;
+                } else {
+                    group.folds[i].row_count += 1;
+                }
+            },
+            .sum, .min, .max, .avg => {
+                const field = aggregation.field orelse return error.InvalidRowsRequest;
+                const value = (try lakeRowsAggregateCellValue(row, field)) orelse continue;
+                switch (value) {
+                    .i64 => |number| try group.folds[i].numeric.addI64(number),
+                    .f64 => |number| group.folds[i].numeric.addF64(number),
+                    else => return error.UnsupportedRowsQuery,
+                }
+            },
+            else => return error.UnsupportedRowsQuery,
+        }
+    }
+}
+
+fn lakeRowsAggregateGroupJsonAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+    group: LakeAggregateGroup,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    if (group.fields_json.len != 0) {
+        try writer.writeAll(group.fields_json);
+        first = false;
+    }
+    for (request.aggregations, 0..) |aggregation, i| {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(aggregation.name, .{})});
+        try writeLakeAggregateFoldValueJson(writer, aggregation, group.folds[i]);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn writeLakeAggregateFoldValueJson(
+    writer: *std.Io.Writer,
+    aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    fold: LakeAggregateFold,
+) !void {
+    switch (aggregation.op) {
+        .count => try writer.print("{d}", .{if (aggregation.field == null) fold.row_count else fold.non_null_count}),
+        .sum => {
+            if (fold.numeric.all_integral) {
+                try writer.print("{d}", .{fold.numeric.sum_i128});
+            } else {
+                try std.json.Stringify.value(fold.numeric.sum_f64, .{}, writer);
+            }
+        },
+        .min => try writeLakeNumericExtremumJson(writer, fold.numeric, .min),
+        .max => try writeLakeNumericExtremumJson(writer, fold.numeric, .max),
+        .avg => {
+            if (fold.numeric.count == 0) {
+                try writer.writeAll("null");
+            } else {
+                try std.json.Stringify.value(fold.numeric.sum_f64 / @as(f64, @floatFromInt(fold.numeric.count)), .{}, writer);
+            }
+        },
+        else => return error.UnsupportedRowsQuery,
+    }
+}
+
+fn lakeRowsGroupKeyJsonAlloc(
+    alloc: std.mem.Allocator,
+    group_by: []const []const u8,
+    row: lake_rows.ProjectedRow,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    for (group_by, 0..) |field, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writeLakeRowsCellJson(writer, (row.find(field) orelse return error.RowSourceColumnNotFound).value);
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn lakeRowsGroupFieldsJsonAlloc(
+    alloc: std.mem.Allocator,
+    group_by: []const []const u8,
+    row: lake_rows.ProjectedRow,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    for (group_by, 0..) |field, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(field, .{})});
+        try writeLakeRowsCellJson(writer, (row.find(field) orelse return error.RowSourceColumnNotFound).value);
+    }
+    return try out.toOwnedSlice();
+}
+
+fn freeLakeRowsAggregateGroups(
+    alloc: std.mem.Allocator,
+    groups: []LakeAggregateGroup,
+    aggregation_count: usize,
+) void {
+    for (groups) |group| freeLakeRowsAggregateGroup(alloc, group, aggregation_count);
+    if (groups.len > 0) alloc.free(groups);
+}
+
+fn freeLakeRowsAggregateGroupList(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(LakeAggregateGroup),
+    aggregation_count: usize,
+) void {
+    for (groups.items) |group| freeLakeRowsAggregateGroup(alloc, group, aggregation_count);
+    groups.deinit(alloc);
+}
+
+fn freeLakeRowsAggregateGroup(
+    alloc: std.mem.Allocator,
+    group: LakeAggregateGroup,
+    aggregation_count: usize,
+) void {
+    alloc.free(group.key_json);
+    alloc.free(group.fields_json);
+    if (aggregation_count > 0) alloc.free(group.folds);
+}
 
 fn writeLakeRowsAggregateValueJson(
     writer: *std.Io.Writer,
@@ -16601,6 +16836,53 @@ test "relational rows lake bridge folds projected rows as aggregate result" {
         .float => |value| try std.testing.expectApproxEqAbs(@as(f64, 15), value, 0.000001),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "relational rows lake bridge folds projected rows as grouped aggregate result" {
+    const alloc = std.testing.allocator;
+    const tenant_name_0 = @constCast("tenant"[0..]);
+    const amount_name_0 = @constCast("amount"[0..]);
+    const tenant_name_1 = @constCast("tenant"[0..]);
+    const amount_name_1 = @constCast("amount"[0..]);
+    const tenant_name_2 = @constCast("tenant"[0..]);
+    const amount_name_2 = @constCast("amount"[0..]);
+    var cells_0 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_0, .value = .{ .i64 = 7 } },
+        .{ .name = amount_name_0, .value = .{ .i64 = 10 } },
+    };
+    var cells_1 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_1, .value = .{ .i64 = 8 } },
+        .{ .name = amount_name_1, .value = .{ .i64 = 20 } },
+    };
+    var cells_2 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_2, .value = .{ .i64 = 8 } },
+        .{ .name = amount_name_2, .value = .{ .i64 = 30 } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .relational_key = "row:1" }, .cells = &cells_0 },
+        .{ .row_ref = .{ .relational_key = "row:2" }, .cells = &cells_1 },
+        .{ .row_ref = .{ .relational_key = "row:3" }, .cells = &cells_2 },
+    };
+    const group_by = [_][]const u8{"tenant"};
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .op = .sum, .field = "amount" },
+    };
+    const request = OwnedRowsAggregateRequest{
+        .group_by = &group_by,
+        .aggregations = &aggregations,
+    };
+
+    var result = try buildRowsAggregateResultFromLakeRowsAlloc(alloc, request, .{
+        .rows = &projected,
+        .total = 3,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"amount_sum\":10}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"amount_sum\":50}", result.rows[1]);
 }
 
 test "relational rows batch derives deterministic physical primary keys" {

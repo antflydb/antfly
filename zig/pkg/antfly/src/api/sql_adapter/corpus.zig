@@ -245,6 +245,54 @@ pub fn planHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool
     return value == expected;
 }
 
+pub fn planUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        const value = planUsizeTokenValue(plan, token) orelse return false;
+        sum += value;
+    }
+    return sum == expected;
+}
+
+pub fn planUsizeOptionalTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        sum += planUsizeOptionalTokenValue(plan, token) orelse return false;
+    }
+    return sum == expected;
+}
+
+pub fn planNonNoneStringTokenUsize(plan: []const u8, token: []const u8) ?usize {
+    return switch (scanStringToken(plan, token)) {
+        .absent => 0,
+        .value => |value| if (std.mem.eql(u8, value, "none")) 0 else 1,
+        .invalid => null,
+    };
+}
+
+pub fn planNonNoneStringTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        sum += planNonNoneStringTokenUsize(plan, token) orelse return false;
+    }
+    return sum == expected;
+}
+
+pub fn planBoolTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
+    var sum: usize = 0;
+    for (tokens) |token| {
+        sum += planBoolTokenUsize(plan, token) orelse return false;
+    }
+    return sum == expected;
+}
+
+pub fn planHasAnyNonZeroToken(plan: []const u8, tokens: []const []const u8) bool {
+    for (tokens) |token| {
+        if (planHasNonZeroToken(plan, token)) return true;
+    }
+    return false;
+}
+
 pub const SqlParameterScan = union(enum) {
     absent,
     value: usize,
@@ -455,7 +503,7 @@ test "sql adapter corpus string token matching is exact and unique" {
 }
 
 test "sql adapter corpus numeric and bool token matching is exact and unique" {
-    const plan = "applied:rebuild=true:validation=false:rewrite=false:unvalidated_unique=10:unvalidated_fk=1";
+    const plan = "applied:rebuild=true:validation=false:rewrite=false:unvalidated_unique=10:unvalidated_fk=1:expr=0:generated_expr=1:kind=none:setting=search_path";
     try std.testing.expect(planHasExactBoolToken(plan, "rebuild=", true));
     try std.testing.expect(planHasExactBoolToken(plan, "validation=", false));
     try std.testing.expectEqual(@as(?usize, 10), planUsizeTokenValue(plan, "unvalidated_unique="));
@@ -463,6 +511,12 @@ test "sql adapter corpus numeric and bool token matching is exact and unique" {
     try std.testing.expect(planHasNonZeroToken(plan, "unvalidated_unique="));
     try std.testing.expect(planHasNonZeroUsizeTokenNamePrefix(plan, "unvalidated_"));
     try std.testing.expectEqual(@as(?usize, 0), planUsizeOptionalTokenValue(plan, "missing="));
+    try std.testing.expect(planUsizeTokenSumMatches(plan, &.{ "unvalidated_unique=", "unvalidated_fk=" }, 11));
+    try std.testing.expect(planUsizeOptionalTokenSumMatches(plan, &.{ "unvalidated_fk=", "missing=", "generated_expr=" }, 2));
+    try std.testing.expect(planBoolTokenSumMatches(plan, &.{ "rebuild=", "validation=", "rewrite=" }, 1));
+    try std.testing.expect(planNonNoneStringTokenSumMatches(plan, &.{ "kind=", "setting=" }, 1));
+    try std.testing.expect(planHasAnyNonZeroToken(plan, &.{ "expr=", "generated_expr=" }));
+    try std.testing.expect(!planHasAnyNonZeroToken(plan, &.{ "expr=", "missing=" }));
     try std.testing.expect(!planHasExactUsizeToken("query:pred=10x", "pred=", 10));
     try std.testing.expect(!planHasExactUsizeToken("query:pred=1:pred=1", "pred=", 1));
     try std.testing.expect(!planHasExactBoolToken("ddl:replace=true_extra", "replace=", true));
