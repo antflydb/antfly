@@ -39,6 +39,29 @@ pub const NamedOrAllSyntax = struct {
     all: bool = false,
 };
 
+pub const RelationPopulationMode = enum {
+    create_table_as,
+    select_into,
+};
+
+pub const RelationLifetimeKind = enum {
+    temporary,
+    unlogged,
+};
+
+pub const RelationPopulationSyntax = struct {
+    mode: RelationPopulationMode,
+    target_identifier: []const u8,
+    target_lifetime: ?RelationLifetimeKind = null,
+    if_not_exists: bool = false,
+    source_sql: []u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.source_sql);
+        self.* = undefined;
+    }
+};
+
 pub fn parseAlterRowSecurity(tokens: []const Token, pos: *usize) !?RowSecurityAlterSyntax {
     const start = pos.*;
     var cursor = parser.Cursor.init(tokens, pos);
@@ -194,6 +217,91 @@ fn parseNamedOrAllTail(cursor: parser.Cursor) !NamedOrAllSyntax {
     const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     try parseAdapterNoopStatementEnd(cursor);
     return .{ .name = name.text };
+}
+
+pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "select")) {
+        return try parseSelectIntoPopulationSqlAlloc(alloc, sql, tokens.items);
+    }
+    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "create")) {
+        return try parseCreateTableAsPopulationSqlAlloc(alloc, sql, tokens.items);
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseSelectIntoPopulationSqlAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    tokens: []const Token,
+) !RelationPopulationSyntax {
+    const into_relative = parser.findTopLevelKeyword(tokens[1..], "into") orelse return error.UnsupportedSqlShape;
+    const into_index = 1 + into_relative;
+    const from_relative = parser.findTopLevelKeyword(tokens[into_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
+    const from_index = into_index + 1 + from_relative;
+    if (from_index != into_index + 2) return error.UnsupportedSqlShape;
+    if (tokens[into_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
+
+    const into_start = try tokenStartOffset(sql, tokens[into_index]);
+    const from_start = try tokenStartOffset(sql, tokens[from_index]);
+    const source_sql = try std.fmt.allocPrint(
+        alloc,
+        "{s} {s}",
+        .{ std.mem.trim(u8, sql[0..into_start], " \t\r\n"), sql[from_start..] },
+    );
+    return .{
+        .mode = .select_into,
+        .target_identifier = tokens[into_index + 1].text,
+        .target_lifetime = null,
+        .if_not_exists = false,
+        .source_sql = source_sql,
+    };
+}
+
+fn parseCreateTableAsPopulationSqlAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    tokens: []const Token,
+) !RelationPopulationSyntax {
+    var index: usize = 1;
+    const target_lifetime: ?RelationLifetimeKind = if (parser.matchKeyword(tokens, &index, "temporary") or parser.matchKeyword(tokens, &index, "temp"))
+        .temporary
+    else if (parser.matchKeyword(tokens, &index, "unlogged"))
+        .unlogged
+    else
+        null;
+    if (!parser.matchKeyword(tokens, &index, "table")) return error.UnsupportedSqlShape;
+    var if_not_exists = false;
+    if (parser.matchKeyword(tokens, &index, "if")) {
+        try parser.expectKeyword(tokens, &index, "not");
+        try parser.expectKeyword(tokens, &index, "exists");
+        if_not_exists = true;
+    }
+    if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
+    const target_identifier = tokens[index].text;
+    index += 1;
+    if (!parser.matchKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+    if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
+    const select_start = try tokenStartOffset(sql, tokens[index]);
+    const source_sql = try alloc.dupe(u8, sql[select_start..]);
+    return .{
+        .mode = .create_table_as,
+        .target_identifier = target_identifier,
+        .target_lifetime = target_lifetime,
+        .if_not_exists = if_not_exists,
+        .source_sql = source_sql,
+    };
+}
+
+fn tokenStartOffset(sql: []const u8, token: Token) !usize {
+    if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
+    const sql_start = @intFromPtr(sql.ptr);
+    const sql_end = sql_start + sql.len;
+    const token_start = @intFromPtr(token.text.ptr);
+    if (token_start < sql_start or token_start > sql_end) return error.UnsupportedSqlShape;
+    return token_start - sql_start;
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -693,4 +801,35 @@ test "sql adapter grammar parses protocol cleanup tails" {
     defer lexer.freeTokens(alloc, &extra_tokens);
     var extra_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCloseCursorPortalTail(extra_tokens.items, &extra_pos));
+}
+
+test "sql adapter grammar parses relation population syntax" {
+    const alloc = std.testing.allocator;
+
+    var select_into = try parseRelationPopulationSqlAlloc(
+        alloc,
+        "SELECT account_id, total INTO public.usage_archive FROM usage_records WHERE total > 10",
+    );
+    defer select_into.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.select_into, select_into.mode);
+    try std.testing.expectEqualStrings("public.usage_archive", select_into.target_identifier);
+    try std.testing.expect(select_into.target_lifetime == null);
+    try std.testing.expect(!select_into.if_not_exists);
+    try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into.source_sql);
+
+    var create_as = try parseRelationPopulationSqlAlloc(
+        alloc,
+        "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records",
+    );
+    defer create_as.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.create_table_as, create_as.mode);
+    try std.testing.expectEqualStrings("usage_session_archive", create_as.target_identifier);
+    try std.testing.expectEqual(RelationLifetimeKind.temporary, create_as.target_lifetime.?);
+    try std.testing.expect(create_as.if_not_exists);
+    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as.source_sql);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        parseRelationPopulationSqlAlloc(alloc, "CREATE TABLE usage_archive SELECT account_id FROM usage_records"),
+    );
 }

@@ -1037,7 +1037,13 @@ operator scans bounded by tail clauses, top-level tail-clause index scans, and
 end-of-input behavior are adapter-owned before statement-specific grammar moves
 out of the large lowerer file. Adapter-only control syntax such as `EXPLAIN`
 prefix and option parsing also belongs there so lowerers receive typed wrapper
-intent instead of scanning raw SQL. Next extract the shared expression grammar,
+intent instead of scanning raw SQL. This boundary is now partially implemented:
+`api/sql_adapter/` owns token definitions, lexer behavior, parser cursor
+helpers, statement classification, diagnostics, parity-corpus fingerprints,
+catalog/source-name prebinding, adapter-noop grammar tails, row-security grammar
+syntax, and relation-population syntax parsing for `SELECT INTO` and
+`CREATE TABLE AS`; `api/relational_sql.zig` keeps the public lowering entrypoints
+and maps adapter syntax into Antfly-native typed plans. Next extract the shared expression grammar,
 because expressions are reused by SELECT, DML, DDL checks, partial indexes,
 defaults, generated columns, conflict actions, and RETURNING. The binder boundary should
 own catalog source lookup, cross-table source-name pre-scans for read,
@@ -4294,15 +4300,19 @@ Schema namespace syntax is only adapter-only when it is proven boilerplate for
 the default `public` namespace, such as `CREATE SCHEMA IF NOT EXISTS public`.
 Non-public `CREATE SCHEMA`, `ALTER SCHEMA ... RENAME TO`, and `DROP SCHEMA`
 lower to typed schema-namespace catalog intents that record the namespace name,
-idempotence flag, rename target, and cascade/drop metadata. Schema application
-remains fail-closed until Antfly has durable namespace catalog objects,
-object-name resolution rules, dependency tracking, authorization boundaries,
-and schema promotion behavior. `public.` qualification can keep lowering away
-at the adapter boundary, but non-public namespaces must not be flattened into
-table-name strings. The durable product/catalog model is described in
-`DATABASES.md`: Antfly uses `database / namespace / table`, with existing
-`/tables/{table}` APIs resolving to the current/default database, the `public`
-namespace, and the requested table.
+idempotence flag, rename target, and cascade/drop metadata. Metadata now has
+first-class database and namespace records, table records carry
+`database_name` and `namespace_name`, default table APIs resolve through
+`default/public/<table>`, and non-default table identity derives separate table
+and range ids instead of flattening namespaces into table-name strings. Full
+schema-namespace DDL application still needs object-name resolution rules,
+dependency tracking, authorization boundaries, and catalog promotion behavior.
+`public.` qualification can keep lowering away at the adapter boundary, but
+non-public namespaces must not be flattened into table-name strings. The durable
+product/catalog model is described in `DATABASES.md`: Antfly uses
+`database / namespace / table`, with existing `/tables/{table}` APIs resolving
+to the current/default database, the `public` namespace, and the requested
+table.
 
 Database and tablespace lifecycle DDL is outside the table-plan contract but
 still lowers to typed catalog intent. Basic `CREATE DATABASE`,
@@ -4312,10 +4322,10 @@ flattening them into table names or schema JSON. Basic `CREATE TABLESPACE ...
 LOCATION`, `ALTER TABLESPACE ... RENAME TO`, and `DROP TABLESPACE` statements
 produce tablespace catalog plans so placement/storage-class intent is explicit
 but cannot silently change table storage paths. Applying those plans still fails
-closed until Antfly deployment and catalog management owns database identity,
-tenant or namespace binding, placement policy, storage-class selection,
-backup/restore scope, authorization boundaries, and catalog promotion as
-explicit typed objects. PostgreSQL syntax can later become an administrative
+closed until Antfly deployment and catalog management owns tenant binding,
+placement policy, storage-class selection, backup/restore scope, authorization
+boundaries, and catalog promotion around those explicit typed objects.
+PostgreSQL syntax can later become an administrative
 adapter for those objects, but SQL database or tablespace names should not
 silently change table storage paths or routing behavior.
 

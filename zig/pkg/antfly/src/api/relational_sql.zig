@@ -2643,128 +2643,36 @@ pub fn lowerRelationPopulationPlanWithCatalogAlloc(
     params: []const SqlValue,
     catalog: ?table_catalog.CatalogSource,
 ) !LoweredRelationPopulationPlan {
-    var parsed = try parseRelationPopulationSqlAlloc(alloc, sql);
+    var parsed = try sql_adapter.parseRelationPopulationSqlAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     var source = if (catalog) |source_catalog|
         try lowerReadPlanWithCatalogAlloc(alloc, parsed.source_sql, schema, params, source_catalog)
     else
         try lowerReadPlanAlloc(alloc, parsed.source_sql, schema, params);
     errdefer source.deinit(alloc);
-    const target = parsed.target_table_name;
-    parsed.target_table_name = "";
+    const target = try normalizeSqlObjectIdentifierAlloc(alloc, parsed.target_identifier);
+    errdefer alloc.free(target);
     return .{
-        .mode = parsed.mode,
+        .mode = relationPopulationModeFromSyntax(parsed.mode),
         .target_table_name = target,
-        .target_lifetime = parsed.target_lifetime,
+        .target_lifetime = relationLifetimeKindFromSyntax(parsed.target_lifetime),
         .if_not_exists = parsed.if_not_exists,
         .source = source,
     };
 }
 
-const ParsedRelationPopulationSql = struct {
-    mode: RelationPopulationMode,
-    target_table_name: []const u8,
-    target_lifetime: ?RelationLifetimeKind = null,
-    if_not_exists: bool = false,
-    source_sql: []u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.target_table_name.len > 0) alloc.free(self.target_table_name);
-        alloc.free(self.source_sql);
-        self.* = undefined;
-    }
-};
-
-fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !ParsedRelationPopulationSql {
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return error.UnsupportedSqlShape;
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "select")) {
-        return try parseSelectIntoPopulationSqlAlloc(alloc, sql, tokens.items);
-    }
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "create")) {
-        return try parseCreateTableAsPopulationSqlAlloc(alloc, sql, tokens.items);
-    }
-    return error.UnsupportedSqlShape;
-}
-
-fn parseSelectIntoPopulationSqlAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    tokens: []const Token,
-) !ParsedRelationPopulationSql {
-    const into_relative = sql_adapter.findTopLevelKeyword(tokens[1..], "into") orelse return error.UnsupportedSqlShape;
-    const into_index = 1 + into_relative;
-    const from_relative = sql_adapter.findTopLevelKeyword(tokens[into_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
-    const from_index = into_index + 1 + from_relative;
-    if (from_index != into_index + 2) return error.UnsupportedSqlShape;
-    if (tokens[into_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
-    const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[into_index + 1].text);
-    var target_transferred = false;
-    errdefer if (!target_transferred) alloc.free(target);
-
-    const into_start = try tokenStartOffset(sql, tokens[into_index]);
-    const from_start = try tokenStartOffset(sql, tokens[from_index]);
-    const source_sql = try std.fmt.allocPrint(
-        alloc,
-        "{s} {s}",
-        .{ std.mem.trim(u8, sql[0..into_start], " \t\r\n"), sql[from_start..] },
-    );
-    target_transferred = true;
-    return .{
-        .mode = .select_into,
-        .target_table_name = target,
-        .target_lifetime = null,
-        .if_not_exists = false,
-        .source_sql = source_sql,
+fn relationPopulationModeFromSyntax(mode: sql_adapter.RelationPopulationMode) RelationPopulationMode {
+    return switch (mode) {
+        .create_table_as => .create_table_as,
+        .select_into => .select_into,
     };
 }
 
-fn parseCreateTableAsPopulationSqlAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    tokens: []const Token,
-) !ParsedRelationPopulationSql {
-    var index: usize = 1;
-    const target_lifetime: ?RelationLifetimeKind = if (sql_adapter.matchKeyword(tokens, &index, "temporary") or sql_adapter.matchKeyword(tokens, &index, "temp"))
-        .temporary
-    else if (sql_adapter.matchKeyword(tokens, &index, "unlogged"))
-        .unlogged
-    else
-        null;
-    if (!sql_adapter.matchKeyword(tokens, &index, "table")) return error.UnsupportedSqlShape;
-    var if_not_exists = false;
-    if (sql_adapter.matchKeyword(tokens, &index, "if")) {
-        try sql_adapter.expectKeyword(tokens, &index, "not");
-        try sql_adapter.expectKeyword(tokens, &index, "exists");
-        if_not_exists = true;
-    }
-    if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
-    const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
-    var target_transferred = false;
-    errdefer if (!target_transferred) alloc.free(target);
-    index += 1;
-    if (!sql_adapter.matchKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
-    if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
-    const select_start = try tokenStartOffset(sql, tokens[index]);
-    const source_sql = try alloc.dupe(u8, sql[select_start..]);
-    target_transferred = true;
-    return .{
-        .mode = .create_table_as,
-        .target_table_name = target,
-        .target_lifetime = target_lifetime,
-        .if_not_exists = if_not_exists,
-        .source_sql = source_sql,
-    };
-}
-
-fn tokenStartOffset(sql: []const u8, token: Token) !usize {
-    if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
-    const sql_start = @intFromPtr(sql.ptr);
-    const sql_end = sql_start + sql.len;
-    const token_start = @intFromPtr(token.text.ptr);
-    if (token_start < sql_start or token_start > sql_end) return error.UnsupportedSqlShape;
-    return token_start - sql_start;
+fn relationLifetimeKindFromSyntax(kind: ?sql_adapter.RelationLifetimeKind) ?RelationLifetimeKind {
+    return if (kind) |value| switch (value) {
+        .temporary => .temporary,
+        .unlogged => .unlogged,
+    } else null;
 }
 
 pub fn lowerWindowPlanAlloc(

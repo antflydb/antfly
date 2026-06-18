@@ -3810,6 +3810,7 @@ pub fn build(b: *std.Build) void {
             "api query contract parses typed row claim request",
             "api query contract parses typed json filters",
             "derive initial ranges",
+            "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.
             "index encoders expose",
             "index encoders aggregate",
@@ -4496,6 +4497,8 @@ pub fn build(b: *std.Build) void {
             "table workflow can remove a table topology from desired state",
             "table workflow can reconcile projected local placement intents",
             "metadata raft apply store ",
+            "metadata.table record decoder",
+            "metadata catalog identity",
             "metadata state machine projects transitions through metadata apply store",
             "table provisioner restore rejects mismatched doc identity namespace",
         },

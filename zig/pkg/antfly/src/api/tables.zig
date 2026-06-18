@@ -35,6 +35,8 @@ const table_reads = @import("table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
+pub const default_database_name = metadata_table_manager.default_database_name;
+pub const default_namespace_name = metadata_table_manager.default_namespace_name;
 
 /// Name of the algebraic aggregation index auto-created for relational tables.
 pub const default_relational_algebraic_index_name = "algebraic_index_v0";
@@ -52,6 +54,11 @@ pub const AppliedRelationalSqlDdlRecord = struct {
     table: metadata_table_manager.TableRecord,
     created_table: bool = false,
     dropped_table: bool = false,
+    created_database: bool = false,
+    dropped_database: bool = false,
+    created_namespace: bool = false,
+    renamed_namespace: bool = false,
+    dropped_namespace: bool = false,
     noop: bool = false,
     requires_rebuild: bool = false,
     validation_required: bool = false,
@@ -62,6 +69,15 @@ pub const AppliedRelationalSqlDdlRecord = struct {
         self.* = undefined;
     }
 };
+
+pub fn emptyAppliedRelationalSqlDdlRecordAlloc(alloc: std.mem.Allocator) !AppliedRelationalSqlDdlRecord {
+    return .{
+        .table = try metadata_table_manager.cloneTable(alloc, .{
+            .table_id = 0,
+            .name = "",
+        }),
+    };
+}
 
 pub const RelationalSqlDdlAction = enum {
     create_table,
@@ -991,6 +1007,8 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
     return .{
         .table_id = deriveTableId(table_name),
         .name = table_name,
+        .database_name = default_database_name,
+        .namespace_name = default_namespace_name,
         .description = req.description orelse "",
         .schema_json = effectiveSchemaJson(req.schema_json),
         .indexes_json = req.indexes_json orelse default_indexes_json,
@@ -1002,11 +1020,23 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveTableId(table_name: []const u8) u64 {
-    return deriveId(table_name, 0x54424c45);
+    return deriveQualifiedTableId(default_database_name, default_namespace_name, table_name);
+}
+
+pub fn deriveQualifiedTableId(
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) u64 {
+    if (isDefaultCatalogIdentity(database_name, namespace_name)) return deriveId(table_name, 0x54424c45);
+    var hasher = std.hash.Wyhash.init(0x54424c45);
+    updateCatalogQualifiedHasher(&hasher, database_name, namespace_name, table_name);
+    const id = hasher.final();
+    return if (id == 0) 1 else id;
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
-    const group_id = deriveDataGroupId(table.name, 0x47525031);
+    const group_id = deriveQualifiedInitialDataGroupId(table.database_name, table.namespace_name, table.name);
     return .{
         .group_id = group_id,
         .range_id = group_id,
@@ -1057,7 +1087,7 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
-        const group_id = deriveShardGroupId(table.name, i);
+        const group_id = deriveQualifiedShardGroupId(table.database_name, table.namespace_name, table.name, i);
         out[i] = .{
             .group_id = group_id,
             .range_id = group_id,
@@ -2897,10 +2927,51 @@ fn parseU32Field(value: std.json.Value) !u32 {
 }
 
 pub fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
-    for (snapshot.tables) |*record| {
-        if (std.mem.eql(u8, record.name, table_name)) return record;
+    return findTableByQualifiedName(snapshot, default_database_name, default_namespace_name, table_name);
+}
+
+pub fn findDatabaseByName(snapshot: *const metadata_api.AdminSnapshot, database_name: []const u8) ?*const metadata_table_manager.DatabaseRecord {
+    const database_id = metadata_table_manager.deriveDatabaseId(database_name);
+    for (snapshot.databases) |*record| {
+        if (record.database_id == database_id and std.mem.eql(u8, record.name, database_name)) return record;
     }
     return null;
+}
+
+pub fn findNamespaceByName(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+) ?*const metadata_table_manager.NamespaceRecord {
+    const database_id = metadata_table_manager.deriveDatabaseId(database_name);
+    const namespace_id = metadata_table_manager.deriveNamespaceId(database_id, namespace_name);
+    for (snapshot.namespaces) |*record| {
+        if (record.namespace_id == namespace_id and record.database_id == database_id and std.mem.eql(u8, record.name, namespace_name)) return record;
+    }
+    return null;
+}
+
+pub fn findTableByQualifiedName(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) ?*const metadata_table_manager.TableRecord {
+    for (snapshot.tables) |*record| {
+        if (tableCatalogIdentityMatches(record.*, database_name, namespace_name, table_name)) return record;
+    }
+    return null;
+}
+
+pub fn tableCatalogIdentityMatches(
+    record: metadata_table_manager.TableRecord,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) bool {
+    return std.mem.eql(u8, record.database_name, database_name) and
+        std.mem.eql(u8, record.namespace_name, namespace_name) and
+        std.mem.eql(u8, record.name, table_name);
 }
 
 pub fn missingDropTableIfExistsNoopAlloc(
@@ -2914,6 +2985,191 @@ pub fn missingDropTableIfExistsNoopAlloc(
         }),
         .noop = true,
     };
+}
+
+pub fn applyRelationalCatalogDdlOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sql: []const u8,
+) !?AppliedRelationalSqlDdlRecord {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
+        @hasDecl(ServiceDeclType, "removeDatabase") and
+        @hasDecl(ServiceDeclType, "upsertNamespace") and
+        @hasDecl(ServiceDeclType, "removeNamespace")))
+    {
+        return null;
+    }
+
+    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    defer plan.deinit(alloc);
+
+    switch (plan) {
+        .database_catalog => |database_plan| return try applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, snapshot, database_plan),
+        .schema_namespace_catalog => |namespace_plan| return try applyNamespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, namespace_plan),
+        else => return null,
+    }
+}
+
+fn applyDatabaseCatalogPlanOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: relational_sql.DatabaseCatalogPlan,
+) !AppliedRelationalSqlDdlRecord {
+    var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    errdefer applied.deinit(alloc);
+    switch (plan) {
+        .create => |create| {
+            if (findDatabaseByName(snapshot, create.database_name) != null) return error.DatabaseAlreadyExists;
+            const database_id = metadata_table_manager.deriveDatabaseId(create.database_name);
+            try svc.upsertDatabase(.{
+                .database_id = database_id,
+                .name = create.database_name,
+            });
+            try svc.upsertNamespace(.{
+                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, default_namespace_name),
+                .database_id = database_id,
+                .name = default_namespace_name,
+            });
+            applied.created_database = true;
+        },
+        .alter => |alter| {
+            const existing = findDatabaseByName(snapshot, alter.database_name) orelse return error.DatabaseNotFound;
+            const settings_json = try databaseSettingsJsonAfterAlterAlloc(alloc, existing.settings_json, alter.operations);
+            defer alloc.free(settings_json);
+            try svc.upsertDatabase(.{
+                .database_id = existing.database_id,
+                .name = existing.name,
+                .settings_json = settings_json,
+            });
+        },
+        .drop => |drop| {
+            const existing = findDatabaseByName(snapshot, drop.database_name) orelse {
+                if (drop.if_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.DatabaseNotFound;
+            };
+            if (databaseHasTables(snapshot, existing.database_id)) return error.DatabaseNotEmpty;
+            if (drop.force) return error.UnsupportedSqlShape;
+            for (snapshot.namespaces) |namespace| {
+                if (namespace.database_id == existing.database_id) try svc.removeNamespace(namespace.namespace_id);
+            }
+            try svc.removeDatabase(existing.database_id);
+            applied.dropped_database = true;
+        },
+    }
+    return applied;
+}
+
+fn applyNamespaceCatalogPlanOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: relational_sql.SchemaNamespaceCatalogPlan,
+) !AppliedRelationalSqlDdlRecord {
+    var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    errdefer applied.deinit(alloc);
+    const database_id = metadata_table_manager.deriveDatabaseId(default_database_name);
+    switch (plan) {
+        .create => |create| {
+            if (findNamespaceByName(snapshot, default_database_name, create.schema_name) != null) {
+                if (create.if_not_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.NamespaceAlreadyExists;
+            }
+            if (findDatabaseByName(snapshot, default_database_name) == null) {
+                try svc.upsertDatabase(.{
+                    .database_id = database_id,
+                    .name = default_database_name,
+                });
+            }
+            try svc.upsertNamespace(.{
+                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, create.schema_name),
+                .database_id = database_id,
+                .name = create.schema_name,
+            });
+            applied.created_namespace = true;
+        },
+        .rename => |rename| {
+            const existing = findNamespaceByName(snapshot, default_database_name, rename.schema_name) orelse return error.NamespaceNotFound;
+            if (findNamespaceByName(snapshot, default_database_name, rename.new_schema_name) != null) return error.NamespaceAlreadyExists;
+            try svc.upsertNamespace(.{
+                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, rename.new_schema_name),
+                .database_id = database_id,
+                .name = rename.new_schema_name,
+            });
+            for (snapshot.tables) |table| {
+                if (!std.mem.eql(u8, table.database_name, default_database_name)) continue;
+                if (!std.mem.eql(u8, table.namespace_name, rename.schema_name)) continue;
+                var renamed_table = table;
+                renamed_table.namespace_name = rename.new_schema_name;
+                try svc.upsertTable(renamed_table);
+            }
+            try svc.removeNamespace(existing.namespace_id);
+            applied.renamed_namespace = true;
+        },
+        .drop => |drop| {
+            const existing = findNamespaceByName(snapshot, default_database_name, drop.schema_name) orelse {
+                if (drop.if_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.NamespaceNotFound;
+            };
+            if (namespaceHasTables(snapshot, database_id, drop.schema_name)) {
+                if (drop.cascade) return error.UnsupportedSqlShape;
+                return error.NamespaceNotEmpty;
+            }
+            try svc.removeNamespace(existing.namespace_id);
+            applied.dropped_namespace = true;
+        },
+    }
+    return applied;
+}
+
+fn databaseHasTables(snapshot: *const metadata_api.AdminSnapshot, database_id: u64) bool {
+    for (snapshot.tables) |table| {
+        if (metadata_table_manager.deriveDatabaseId(table.database_name) == database_id) return true;
+    }
+    return false;
+}
+
+fn namespaceHasTables(snapshot: *const metadata_api.AdminSnapshot, database_id: u64, namespace_name: []const u8) bool {
+    for (snapshot.tables) |table| {
+        if (metadata_table_manager.deriveDatabaseId(table.database_name) != database_id) continue;
+        if (std.mem.eql(u8, table.namespace_name, namespace_name)) return true;
+    }
+    return false;
+}
+
+fn databaseSettingsJsonAfterAlterAlloc(
+    alloc: std.mem.Allocator,
+    settings_json: []const u8,
+    operations: []const relational_sql.DatabaseAlterOperation,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, settings_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSchemaUpdateRequest;
+
+    for (operations) |operation| {
+        switch (operation) {
+            .set_parameter => |set| {
+                const value = try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), set.value_json, .{});
+                try parsed.value.object.put(try parsed.arena.allocator().dupe(u8, set.name), value);
+            },
+        }
+    }
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
 pub fn validateRelationalTableDropAllowed(
@@ -3055,12 +3311,51 @@ fn deriveDataGroupId(name: []const u8, seed: u64) u64 {
     return group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(seed, name));
 }
 
+fn deriveQualifiedInitialDataGroupId(database_name: []const u8, namespace_name: []const u8, table_name: []const u8) u64 {
+    if (isDefaultCatalogIdentity(database_name, namespace_name)) return deriveDataGroupId(table_name, 0x47525031);
+    var hasher = std.hash.Wyhash.init(0x47525031);
+    updateCatalogQualifiedHasher(&hasher, database_name, namespace_name, table_name);
+    return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
 fn deriveShardGroupId(table_name: []const u8, shard_index: u32) u64 {
     var hasher = std.hash.Wyhash.init(0x47525031);
     hasher.update(table_name);
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&shard_index));
     return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
+fn deriveQualifiedShardGroupId(
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    shard_index: u32,
+) u64 {
+    if (isDefaultCatalogIdentity(database_name, namespace_name)) return deriveShardGroupId(table_name, shard_index);
+    var hasher = std.hash.Wyhash.init(0x47525031);
+    updateCatalogQualifiedHasher(&hasher, database_name, namespace_name, table_name);
+    hasher.update(&[_]u8{0});
+    hasher.update(std.mem.asBytes(&shard_index));
+    return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
+fn isDefaultCatalogIdentity(database_name: []const u8, namespace_name: []const u8) bool {
+    return std.mem.eql(u8, database_name, default_database_name) and
+        std.mem.eql(u8, namespace_name, default_namespace_name);
+}
+
+fn updateCatalogQualifiedHasher(
+    hasher: *std.hash.Wyhash,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) void {
+    hasher.update(database_name);
+    hasher.update(&[_]u8{0});
+    hasher.update(namespace_name);
+    hasher.update(&[_]u8{0});
+    hasher.update(table_name);
 }
 
 fn deriveShardBoundaryKey(alloc: std.mem.Allocator, shard_index: u32, shard_count: u32) ![]u8 {
@@ -3532,6 +3827,41 @@ test "derive initial ranges honors shard count" {
     try std.testing.expectEqualStrings("c0", ranges[2].end_key.?);
     try std.testing.expectEqualStrings("c0", ranges[3].start_key);
     try std.testing.expect(ranges[3].end_key == null);
+}
+
+test "table catalog identity defaults table records to public namespace in default database" {
+    const table = deriveTableRecord("docs", .{});
+    try std.testing.expectEqual(deriveTableId("docs"), table.table_id);
+    try std.testing.expectEqualStrings(default_database_name, table.database_name);
+    try std.testing.expectEqualStrings(default_namespace_name, table.namespace_name);
+    try std.testing.expectEqualStrings("docs", table.name);
+}
+
+test "table catalog identity scopes lookup and derived ids" {
+    const default_table = deriveTableRecord("docs", .{});
+    const tenant_table: metadata_table_manager.TableRecord = .{
+        .table_id = deriveQualifiedTableId("tenant_ops", "billing", "docs"),
+        .name = "docs",
+        .database_name = "tenant_ops",
+        .namespace_name = "billing",
+    };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{ tenant_table, default_table })[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    try std.testing.expect(deriveTableId("docs") != tenant_table.table_id);
+    try std.testing.expectEqual(default_table.table_id, findTableByName(&snapshot, "docs").?.table_id);
+    try std.testing.expectEqual(
+        tenant_table.table_id,
+        findTableByQualifiedName(&snapshot, "tenant_ops", "billing", "docs").?.table_id,
+    );
+    try std.testing.expect(findTableByQualifiedName(&snapshot, "tenant_ops", default_namespace_name, "docs") == null);
 }
 
 test "create table parser rejects zero shards" {

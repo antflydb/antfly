@@ -296,6 +296,8 @@ pub const ReplicationSourceActionHint = struct {
 
 pub const AdminSnapshot = struct {
     status: MetadataStatus,
+    databases: []table_manager.DatabaseRecord = &.{},
+    namespaces: []table_manager.NamespaceRecord = &.{},
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
     foreign_key_ref_ranges: []table_manager.ForeignKeyReferenceRangeRecord = &.{},
@@ -336,6 +338,12 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
         .merge_transitions = &.{},
     };
     errdefer freeSnapshot(alloc, source, &snapshot);
+    if (@hasDecl(SourceDeclType, "listProjectedDatabases")) {
+        snapshot.databases = try source.listProjectedDatabases(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedNamespaces")) {
+        snapshot.namespaces = try source.listProjectedNamespaces(alloc);
+    }
     snapshot.tables = try source.listProjectedTables(alloc);
     snapshot.ranges = try source.listProjectedRanges(alloc);
     if (@hasDecl(SourceDeclType, "listProjectedForeignKeyReferenceRanges")) {
@@ -410,6 +418,12 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
         .pointer => |pointer| pointer.child,
         else => SourceType,
     };
+    if (@hasDecl(SourceDeclType, "freeProjectedDatabases") and snapshot.databases.len > 0) {
+        source.freeProjectedDatabases(alloc, snapshot.databases);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedNamespaces") and snapshot.namespaces.len > 0) {
+        source.freeProjectedNamespaces(alloc, snapshot.namespaces);
+    }
     source.freeProjectedTables(alloc, snapshot.tables);
     source.freeProjectedRanges(alloc, snapshot.ranges);
     if (@hasDecl(SourceDeclType, "freeProjectedForeignKeyReferenceRanges") and snapshot.foreign_key_ref_ranges.len > 0) {

@@ -2094,17 +2094,23 @@ fn applyRelationalSqlDdlOnMetadataService(
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
-    defer target.deinit(alloc);
-
     var snapshot = try service_impl.adminSnapshot();
     defer service_impl.freeAdminSnapshot(&snapshot);
+
+    if (try tables_api.applyRelationalCatalogDdlOnServiceAlloc(alloc, service_impl, &snapshot, sql)) |applied| {
+        return applied;
+    }
+
+    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
+    defer target.deinit(alloc);
 
     if (target.createsTable()) {
         if (findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
         const base_table: metadata_table_manager.TableRecord = .{
             .table_id = tables_api.deriveTableId(target.table_name),
             .name = target.table_name,
+            .database_name = tables_api.default_database_name,
+            .namespace_name = tables_api.default_namespace_name,
             .schema_json = "",
             .indexes_json = "{}",
             .replication_sources_json = "[]",
@@ -2993,10 +2999,7 @@ fn sanitizePostgresIdentifierAlloc(
 }
 
 fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
-    for (snapshot.tables) |*table| {
-        if (std.mem.eql(u8, table.name, table_name)) return table;
-    }
-    return null;
+    return tables_api.findTableByName(snapshot, table_name);
 }
 
 fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {

@@ -754,6 +754,8 @@ const LocalProjectionInputs = struct {
 };
 
 const ProjectedCoreSnapshot = struct {
+    databases: []metadata_table_manager.DatabaseRecord = &.{},
+    namespaces: []metadata_table_manager.NamespaceRecord = &.{},
     tables: []metadata_table_manager.TableRecord = &.{},
     ranges: []metadata_table_manager.RangeRecord = &.{},
     foreign_key_ref_ranges: []metadata_table_manager.ForeignKeyReferenceRangeRecord = &.{},
@@ -769,6 +771,10 @@ const ProjectedCoreSnapshot = struct {
     merge_transitions: []transition_state.MergeTransitionRecord = &.{},
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.databases) |record| metadata_table_manager.freeDatabase(alloc, record);
+        if (self.databases.len > 0) alloc.free(self.databases);
+        for (self.namespaces) |record| metadata_table_manager.freeNamespace(alloc, record);
+        if (self.namespaces.len > 0) alloc.free(self.namespaces);
         for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -799,6 +805,8 @@ const ProjectedCoreSnapshot = struct {
     fn diagnostics(self: *const @This()) ProjectedCoreSnapshotDiagnostics {
         var out = ProjectedCoreSnapshotDiagnostics{
             .cached = true,
+            .databases = self.databases.len,
+            .namespaces = self.namespaces.len,
             .tables = self.tables.len,
             .ranges = self.ranges.len,
             .stores = self.stores.len,
@@ -811,7 +819,9 @@ const ProjectedCoreSnapshot = struct {
             .replication_source_statuses = self.replication_source_statuses.len,
             .split_transitions = self.split_transitions.len,
             .merge_transitions = self.merge_transitions.len,
-            .estimated_bytes = @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
+            .estimated_bytes = @sizeOf(metadata_table_manager.DatabaseRecord) * self.databases.len +
+                @sizeOf(metadata_table_manager.NamespaceRecord) * self.namespaces.len +
+                @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
                 @sizeOf(metadata_table_manager.RangeRecord) * self.ranges.len +
                 @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
                 @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
@@ -822,6 +832,8 @@ const ProjectedCoreSnapshot = struct {
                 @sizeOf(transition_state.SplitTransitionRecord) * self.split_transitions.len +
                 @sizeOf(transition_state.MergeTransitionRecord) * self.merge_transitions.len,
         };
+        for (self.databases) |record| out.estimated_bytes += record.name.len + record.settings_json.len;
+        for (self.namespaces) |record| out.estimated_bytes += record.name.len;
         for (self.tables) |record| {
             out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
                 record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
@@ -879,6 +891,8 @@ const ProjectedCoreSnapshotCache = struct {
 
 const ProjectedCoreSnapshotDiagnostics = struct {
     cached: bool = false,
+    databases: usize = 0,
+    namespaces: usize = 0,
     tables: usize = 0,
     ranges: usize = 0,
     stores: usize = 0,
@@ -1025,6 +1039,40 @@ fn cloneProjectedTablesOwned(
     }
     for (records, 0..) |record, i| {
         out[i] = try metadata_table_manager.cloneTable(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedDatabasesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.DatabaseRecord,
+) ![]metadata_table_manager.DatabaseRecord {
+    const out = try alloc.alloc(metadata_table_manager.DatabaseRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeDatabase(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneDatabase(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedNamespacesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.NamespaceRecord,
+) ![]metadata_table_manager.NamespaceRecord {
+    const out = try alloc.alloc(metadata_table_manager.NamespaceRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeNamespace(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneNamespace(alloc, record);
         cloned = i + 1;
     }
     return out;
@@ -1608,6 +1656,22 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn upsertDatabase(self: *MetadataService, record: metadata_table_manager.DatabaseRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_database = record });
+    }
+
+    pub fn removeDatabase(self: *MetadataService, database_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_database = .{ .database_id = database_id } });
+    }
+
+    pub fn upsertNamespace(self: *MetadataService, record: metadata_table_manager.NamespaceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_namespace = record });
+    }
+
+    pub fn removeNamespace(self: *MetadataService, namespace_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_namespace = .{ .namespace_id = namespace_id } });
+    }
+
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
     }
@@ -2059,6 +2123,26 @@ pub const MetadataService = struct {
     pub fn listProjectedTables(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listTables(alloc, self.metadata_group_id);
+    }
+
+    pub fn listProjectedDatabases(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.DatabaseRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listDatabases(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedDatabases(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.DatabaseRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeDatabases(alloc, records);
+    }
+
+    pub fn listProjectedNamespaces(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.NamespaceRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listNamespaces(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedNamespaces(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.NamespaceRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeNamespaces(alloc, records);
     }
 
     pub fn freeProjectedTables(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
@@ -3108,6 +3192,22 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn upsertDatabase(self: *MetadataHttpService, record: metadata_table_manager.DatabaseRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_database = record });
+    }
+
+    pub fn removeDatabase(self: *MetadataHttpService, database_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_database = .{ .database_id = database_id } });
+    }
+
+    pub fn upsertNamespace(self: *MetadataHttpService, record: metadata_table_manager.NamespaceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_namespace = record });
+    }
+
+    pub fn removeNamespace(self: *MetadataHttpService, namespace_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_namespace = .{ .namespace_id = namespace_id } });
+    }
+
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
     }
@@ -3714,6 +3814,8 @@ pub const MetadataHttpService = struct {
         errdefer self.unlockRuntime();
         const core = try self.projectedCoreSnapshotLocked();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        snapshot.databases = try cloneProjectedDatabasesOwned(self.alloc, core.databases);
+        snapshot.namespaces = try cloneProjectedNamespacesOwned(self.alloc, core.namespaces);
         snapshot.tables = try cloneProjectedTablesOwned(self.alloc, core.tables);
         snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, core.ranges);
         snapshot.foreign_key_ref_ranges = try cloneProjectedForeignKeyReferenceRangesOwned(self.alloc, core.foreign_key_ref_ranges);
@@ -3791,6 +3893,8 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var snapshot: ProjectedCoreSnapshot = .{};
         errdefer snapshot.deinit(self.alloc);
+        snapshot.databases = try store.listDatabases(self.alloc, self.metadata_group_id);
+        snapshot.namespaces = try store.listNamespaces(self.alloc, self.metadata_group_id);
         snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
         snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
         snapshot.foreign_key_ref_ranges = try store.listForeignKeyReferenceRanges(self.alloc, self.metadata_group_id);
@@ -3855,6 +3959,30 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
         return try cloneProjectedTablesOwned(alloc, snapshot.tables);
+    }
+
+    pub fn listProjectedDatabases(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.DatabaseRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedDatabasesOwned(alloc, snapshot.databases);
+    }
+
+    pub fn freeProjectedDatabases(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.DatabaseRecord) void {
+        for (records) |record| metadata_table_manager.freeDatabase(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listProjectedNamespaces(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.NamespaceRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedNamespacesOwned(alloc, snapshot.namespaces);
+    }
+
+    pub fn freeProjectedNamespaces(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.NamespaceRecord) void {
+        for (records) |record| metadata_table_manager.freeNamespace(alloc, record);
+        alloc.free(records);
     }
 
     pub fn freeProjectedTables(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {

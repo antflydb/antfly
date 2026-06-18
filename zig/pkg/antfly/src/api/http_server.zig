@@ -827,17 +827,24 @@ fn applyRelationalSqlDdlOnService(
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
-    defer target.deinit(alloc);
-
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
+
+    if (try tables_api.applyRelationalCatalogDdlOnServiceAlloc(alloc, svc, &snapshot, sql)) |applied| {
+        try svc.runRound();
+        return applied;
+    }
+
+    var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
+    defer target.deinit(alloc);
 
     if (target.creates_table) {
         if (tables_api.findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
         const base_table: metadata_table_manager.TableRecord = .{
             .table_id = tables_api.deriveTableId(target.table_name),
             .name = target.table_name,
+            .database_name = tables_api.default_database_name,
+            .namespace_name = tables_api.default_namespace_name,
             .schema_json = "",
             .indexes_json = "{}",
             .replication_sources_json = "[]",
