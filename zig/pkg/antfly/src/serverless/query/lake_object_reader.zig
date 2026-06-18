@@ -23,9 +23,22 @@ const Allocator = std.mem.Allocator;
 
 pub const ObjectStorageRangeReader = struct {
     client: object_storage.ObjectStorage,
+    retry_policy: RetryPolicy = .{},
+
+    pub const RetryPolicy = struct {
+        max_attempts: u8 = 1,
+
+        fn attempts(self: RetryPolicy) u8 {
+            return @max(@as(u8, 1), self.max_attempts);
+        }
+    };
 
     pub fn init(client: object_storage.ObjectStorage) ObjectStorageRangeReader {
         return .{ .client = client };
+    }
+
+    pub fn initWithRetry(client: object_storage.ObjectStorage, retry_policy: RetryPolicy) ObjectStorageRangeReader {
+        return .{ .client = client, .retry_policy = retry_policy };
     }
 
     pub fn parquetReader(self: *@This()) lake_parquet_rowgroup.ObjectRangeReader {
@@ -45,9 +58,7 @@ pub const ObjectStorageRangeReader = struct {
         len: usize,
     ) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        var client = self.client;
-        client.allocator = alloc;
-        var result = try client.getObject(bucket, key, .{
+        var result = try self.getObjectWithRetry(alloc, bucket, key, .{
             .range = .{ .offset = offset, .length = len },
         });
         defer result.deinit(alloc);
@@ -62,10 +73,8 @@ pub const ObjectStorageRangeReader = struct {
     ) ![]u8 {
         try read.validate();
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        var client = self.client;
-        client.allocator = alloc;
         const len: usize = std.math.cast(usize, read.range.len) orelse return error.InvalidLakeRangeRead;
-        var result = try client.getObject(read.object.bucket, read.object.key, .{
+        var result = try self.getObjectWithRetry(alloc, read.object.bucket, read.object.key, .{
             .range = .{ .offset = read.range.offset, .length = len },
             .if_match_etag = if (read.object.version.etag.len == 0) null else read.object.version.etag,
             .version_id = if (read.object.version.version_id.len == 0) null else read.object.version.version_id,
@@ -74,7 +83,44 @@ pub const ObjectStorageRangeReader = struct {
         if (result.body.len != len) return error.InvalidLakeRangeRead;
         return try alloc.dupe(u8, result.body);
     }
+
+    fn getObjectWithRetry(
+        self: *@This(),
+        alloc: Allocator,
+        bucket: []const u8,
+        key: []const u8,
+        opts: object_storage.GetOptions,
+    ) !object_storage.GetResult {
+        const max_attempts = self.retry_policy.attempts();
+        var attempt: u8 = 0;
+        while (true) {
+            attempt += 1;
+            var client = self.client;
+            client.allocator = alloc;
+            return client.getObject(bucket, key, opts) catch |err| {
+                if (attempt >= max_attempts or !isRetryableObjectReadError(err)) return err;
+                continue;
+            };
+        }
+    }
 };
+
+fn isRetryableObjectReadError(err: anyerror) bool {
+    return switch (err) {
+        error.RemoteUnavailable,
+        error.RateLimited,
+        error.UnexpectedHttpStatus,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.NetworkUnreachable,
+        error.TemporaryNameServerFailure,
+        error.BrokenPipe,
+        error.Timeout,
+        error.WouldBlock,
+        => true,
+        else => false,
+    };
+}
 
 test "object storage range reader delegates lake parquet range reads" {
     const alloc = std.testing.allocator;
@@ -124,4 +170,174 @@ test "object storage range reader enforces planned object etag" {
     var overwritten = try client.putObject("bucket", "events/part-a.parquet", "stale-object-body", .{});
     defer overwritten.deinit(alloc);
     try std.testing.expectError(error.PreconditionFailed, parquet_reader.readPlannedAlloc(alloc, read));
+}
+
+test "object storage range reader retries transient planned reads only" {
+    const alloc = std.testing.allocator;
+    const FlakyObjectStorage = struct {
+        body: []const u8,
+        fail_count: usize,
+        get_attempts: usize = 0,
+        last_if_match: ?[]const u8 = null,
+
+        fn client(self: *@This()) object_storage.ObjectStorage {
+            return .{
+                .allocator = alloc,
+                .ptr = self,
+                .vtable = &.{
+                    .deinit = deinit,
+                    .bucket_exists = bucketExists,
+                    .make_bucket = makeBucket,
+                    .put_object = putObject,
+                    .get_object = getObject,
+                    .get_object_attributes = getObjectAttributes,
+                    .stat_object = statObject,
+                    .delete_object = deleteObject,
+                    .list_objects = listObjects,
+                },
+            };
+        }
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
+            return error.UnsupportedOperation;
+        }
+        fn getObject(ptr: *anyopaque, a: Allocator, bucket: []const u8, key: []const u8, opts: object_storage.GetOptions) !object_storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.get_attempts += 1;
+            self.last_if_match = opts.if_match_etag;
+            if (self.get_attempts <= self.fail_count) return error.RemoteUnavailable;
+            const range = opts.range orelse return error.InvalidRange;
+            const len = range.length orelse return error.InvalidRange;
+            const start: usize = std.math.cast(usize, range.offset) orelse return error.InvalidLakeRangeRead;
+            const read_len: usize = std.math.cast(usize, len) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or read_len > self.body.len - start) return error.InvalidRange;
+            return .{
+                .body = try a.dupe(u8, self.body[start..][0..read_len]),
+                .metadata = .{
+                    .bucket = try a.dupe(u8, bucket),
+                    .key = try a.dupe(u8, key),
+                    .etag = try a.dupe(u8, "etag-a"),
+                    .content_length = read_len,
+                },
+            };
+        }
+        fn getObjectAttributes(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectAttributes {
+            return error.UnsupportedOperation;
+        }
+        fn statObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectMetadata {
+            return error.UnsupportedOperation;
+        }
+        fn deleteObject(_: *anyopaque, _: []const u8, _: []const u8, _: object_storage.DeleteOptions) !void {
+            return error.UnsupportedOperation;
+        }
+        fn listObjects(_: *anyopaque, a: Allocator, _: []const u8, _: object_storage.ListOptions) !object_storage.ListResult {
+            return .{
+                .entries = try a.alloc(object_storage.ListEntry, 0),
+                .common_prefixes = try a.alloc([]u8, 0),
+            };
+        }
+    };
+
+    var flaky = FlakyObjectStorage{
+        .body = "0123456789abcdef",
+        .fail_count = 2,
+    };
+    var range_reader = ObjectStorageRangeReader.initWithRetry(flaky.client(), .{ .max_attempts = 3 });
+    const parquet_reader = range_reader.parquetReader();
+    const read = lake_range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "events/part-a.parquet",
+            .byte_len = 16,
+            .version = .{ .etag = "etag-a" },
+        },
+        .range = .{ .offset = 4, .len = 6 },
+        .purpose = .parquet_footer,
+    };
+
+    const bytes = try parquet_reader.readPlannedAlloc(alloc, read);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("456789", bytes);
+    try std.testing.expectEqual(@as(usize, 3), flaky.get_attempts);
+    try std.testing.expectEqualStrings("etag-a", flaky.last_if_match.?);
+
+    flaky.fail_count = 10;
+    flaky.get_attempts = 0;
+    try std.testing.expectError(error.RemoteUnavailable, parquet_reader.readPlannedAlloc(alloc, read));
+    try std.testing.expectEqual(@as(usize, 3), flaky.get_attempts);
+}
+
+test "object storage range reader does not retry stale object identity" {
+    const alloc = std.testing.allocator;
+    const PreconditionObjectStorage = struct {
+        get_attempts: usize = 0,
+
+        fn client(self: *@This()) object_storage.ObjectStorage {
+            return .{
+                .allocator = alloc,
+                .ptr = self,
+                .vtable = &.{
+                    .deinit = deinit,
+                    .bucket_exists = bucketExists,
+                    .make_bucket = makeBucket,
+                    .put_object = putObject,
+                    .get_object = getObject,
+                    .get_object_attributes = getObjectAttributes,
+                    .stat_object = statObject,
+                    .delete_object = deleteObject,
+                    .list_objects = listObjects,
+                },
+            };
+        }
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn bucketExists(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn makeBucket(_: *anyopaque, _: []const u8) !void {}
+        fn putObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: object_storage.PutOptions) !object_storage.PutResult {
+            return error.UnsupportedOperation;
+        }
+        fn getObject(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: object_storage.GetOptions) !object_storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.get_attempts += 1;
+            return error.PreconditionFailed;
+        }
+        fn getObjectAttributes(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectAttributes {
+            return error.UnsupportedOperation;
+        }
+        fn statObject(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !object_storage.ObjectMetadata {
+            return error.UnsupportedOperation;
+        }
+        fn deleteObject(_: *anyopaque, _: []const u8, _: []const u8, _: object_storage.DeleteOptions) !void {
+            return error.UnsupportedOperation;
+        }
+        fn listObjects(_: *anyopaque, a: Allocator, _: []const u8, _: object_storage.ListOptions) !object_storage.ListResult {
+            return .{
+                .entries = try a.alloc(object_storage.ListEntry, 0),
+                .common_prefixes = try a.alloc([]u8, 0),
+            };
+        }
+    };
+
+    var stale = PreconditionObjectStorage{};
+    var range_reader = ObjectStorageRangeReader.initWithRetry(stale.client(), .{ .max_attempts = 3 });
+    const parquet_reader = range_reader.parquetReader();
+    const read = lake_range_io.RangeRead{
+        .object = .{
+            .bucket = "bucket",
+            .key = "events/part-a.parquet",
+            .byte_len = 16,
+            .version = .{ .etag = "old-etag" },
+        },
+        .range = .{ .offset = 4, .len = 6 },
+        .purpose = .parquet_footer,
+    };
+    try std.testing.expectError(error.PreconditionFailed, parquet_reader.readPlannedAlloc(alloc, read));
+    try std.testing.expectEqual(@as(usize, 1), stale.get_attempts);
 }
