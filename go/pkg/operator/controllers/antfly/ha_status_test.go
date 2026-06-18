@@ -2308,6 +2308,17 @@ func TestUpdateHAStatusRequiresSafeReadProgressForAvailabilityAndAutomaticPromot
 
 	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 12
 	cluster.Status.HAStatus.Standbys[0].SafeReadLagLSN = 0
+	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = false
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	if cluster.Status.HAStatus.ReadSafeStandbyCount != 0 {
+		t.Fatalf("expected no read-safe standby while standby safe-read serving is disabled, got %d", cluster.Status.HAStatus.ReadSafeStandbyCount)
+	}
+	if cluster.Status.HAStatus.AutomaticPromotionAllowed {
+		t.Fatal("expected automatic promotion to wait for standby safe-read serving")
+	}
+
+	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = true
 	reconciler.updateHAStatusAndConditions(cluster)
 
 	if cluster.Status.HAStatus.ReadSafeStandbyCount != 1 {
@@ -3176,6 +3187,7 @@ func TestReconcileHAFencingLeaseAllowsRemoteWriteCandidate(t *testing.T) {
 	cluster.Status.HAStatus.Standbys[0].AppliedLSN = 11
 	cluster.Status.HAStatus.Standbys[0].SafeReadLSN = 11
 	cluster.Status.HAStatus.Standbys[0].ApplyLagLSN = 1
+	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = false
 	reconciler := testHAReconciler(t, cluster)
 
 	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
@@ -3219,13 +3231,14 @@ func TestReconcileHAFencingLeaseRetargetsUnsafeHolder(t *testing.T) {
 			SafeReadLSN: 10,
 			Status:      "lagging",
 		}, {
-			Name:        "standby-b",
-			SlotName:    "standby-b",
-			Active:      true,
-			ReceivedLSN: 12,
-			AppliedLSN:  12,
-			SafeReadLSN: 12,
-			Status:      "healthy",
+			Name:              "standby-b",
+			SlotName:          "standby-b",
+			Active:            true,
+			ReceivedLSN:       12,
+			AppliedLSN:        12,
+			SafeReadLSN:       12,
+			CanServeSafeReads: true,
+			Status:            "healthy",
 		}},
 	}
 	durationSeconds := int32(15)
@@ -3280,6 +3293,25 @@ func TestReconcileHAFencingLeaseSkipsWithoutSafeCandidate(t *testing.T) {
 	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected no fencing lease without safe candidate, got lease=%#v err=%v", lease, err)
+	}
+}
+
+func TestReconcileHAFencingLeaseSkipsCandidateWithoutSafeReadServing(t *testing.T) {
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Status.HAStatus.PrimaryAdminReachable = false
+	cluster.Status.HAStatus.PrimaryAdminLastError = "primary admin timeout"
+	cluster.Status.HAStatus.Standbys[0].CanServeSafeReads = false
+	reconciler := testHAReconciler(t, cluster)
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("reconcile fencing lease: %v", err)
+	}
+
+	lease := &coordinationv1.Lease{}
+	err := reconciler.Get(context.Background(), client.ObjectKey{Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace}, lease)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected no fencing lease without safe-read serving, got lease=%#v err=%v", lease, err)
 	}
 }
 
@@ -3453,14 +3485,15 @@ func caughtUpHAStatus() *antflyv1.HAStatus {
 	return &antflyv1.HAStatus{
 		PrimaryLSN: 12,
 		Standbys: []antflyv1.HAStandbyStatus{{
-			Name:        "standby-a",
-			SlotName:    "standby-a",
-			Active:      true,
-			ReceivedLSN: 12,
-			AppliedLSN:  12,
-			SafeReadLSN: 12,
-			ApplyLagLSN: 0,
-			Status:      "healthy",
+			Name:              "standby-a",
+			SlotName:          "standby-a",
+			Active:            true,
+			ReceivedLSN:       12,
+			AppliedLSN:        12,
+			SafeReadLSN:       12,
+			CanServeSafeReads: true,
+			ApplyLagLSN:       0,
+			Status:            "healthy",
 		}},
 	}
 }

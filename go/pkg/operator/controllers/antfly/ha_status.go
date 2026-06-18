@@ -1594,10 +1594,7 @@ func haAutomaticPromotionStandby(ha *antflyv1.HighAvailabilitySpec, status *antf
 		if standby.ReceivedLSN+maxLag < status.PrimaryLSN {
 			continue
 		}
-		if requireApply && standby.AppliedLSN+maxLag < status.PrimaryLSN {
-			continue
-		}
-		if requireApply && standbySafeReadLSN(standby)+maxLag < status.PrimaryLSN {
+		if requireApply && !standbyRemoteApplyReady(status, standby, maxLag) {
 			continue
 		}
 		return fenceHolder
@@ -1642,10 +1639,7 @@ func haKubernetesLeaseFenceCandidate(ha *antflyv1.HighAvailabilitySpec, status *
 		if standby.ReceivedLSN+maxLag < status.PrimaryLSN {
 			continue
 		}
-		if requireApply && standby.AppliedLSN+maxLag < status.PrimaryLSN {
-			continue
-		}
-		if requireApply && standbySafeReadLSN(standby)+maxLag < status.PrimaryLSN {
+		if requireApply && !standbyRemoteApplyReady(status, standby, maxLag) {
 			continue
 		}
 		return desired.Name
@@ -1657,7 +1651,13 @@ func standbyReadSafe(status *antflyv1.HAStatus, standby antflyv1.HAStandbyStatus
 	if !standbyPromotionEligible(standby) {
 		return false
 	}
-	return standbySafeReadLSN(standby) >= status.PrimaryLSN
+	return standby.CanServeSafeReads && standbySafeReadLSN(standby) >= status.PrimaryLSN
+}
+
+func standbyRemoteApplyReady(status *antflyv1.HAStatus, standby antflyv1.HAStandbyStatus, maxLag uint64) bool {
+	return standby.CanServeSafeReads &&
+		standby.AppliedLSN+maxLag >= status.PrimaryLSN &&
+		standbySafeReadLSN(standby)+maxLag >= status.PrimaryLSN
 }
 
 func standbyPromotionEligible(standby antflyv1.HAStandbyStatus) bool {
