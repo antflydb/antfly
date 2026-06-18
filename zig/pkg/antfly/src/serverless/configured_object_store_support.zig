@@ -31,6 +31,7 @@ pub const BindingObjectStoreOpenOptions = struct {
     file_bucket: []const u8 = "antfly",
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
+    read_only: bool = true,
 };
 
 pub fn openBindingObjectStoreAlloc(
@@ -39,10 +40,11 @@ pub fn openBindingObjectStoreAlloc(
     options: BindingObjectStoreOpenOptions,
 ) !object_store_support.OpenedObjectStore {
     if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
-    if (binding.credential_ref == null) return try object_store_support.OpenedObjectStore.initRemoteUri(
+    if (binding.credential_ref == null) return try object_store_support.OpenedObjectStore.initRemoteUriWithOptions(
         alloc,
         binding.source_uri,
         options.file_bucket,
+        .{ .ensure_bucket = !options.read_only },
     );
     return try openCredentialedBindingObjectStoreAlloc(alloc, binding, options);
 }
@@ -73,14 +75,26 @@ fn openCredentialedBindingObjectStoreAlloc(
             external_io,
             value.bucket,
             value.prefix,
+            options.read_only,
         ),
-        .gcs => |value| try openCredentialedGcsPrefixAlloc(alloc, external_io, value.bucket, value.prefix),
+        .gcs => |value| try openCredentialedGcsPrefixAlloc(
+            alloc,
+            external_io,
+            value.bucket,
+            value.prefix,
+            options.read_only,
+        ),
         .file => |path| blk: {
             if (external_io.protocol != .filesystem) return error.UnsupportedExternalLakeCredentialRef;
             if (external_io.prefix) |allowed| try ensurePrefixAllowed(path, allowed);
             const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
             defer alloc.free(file_uri);
-            break :blk try object_store_support.OpenedObjectStore.initFileUri(alloc, file_uri, options.file_bucket);
+            break :blk try object_store_support.OpenedObjectStore.initFileUriWithOptions(
+                alloc,
+                file_uri,
+                options.file_bucket,
+                .{ .ensure_bucket = !options.read_only },
+            );
         },
     };
 }
@@ -91,6 +105,7 @@ fn openCredentialedS3PrefixAlloc(
     external_io: common_config.Config.ExternalIoConnectionConfig,
     bucket: []const u8,
     prefix: []const u8,
+    read_only: bool,
 ) !object_store_support.OpenedObjectStore {
     if (external_io.protocol != .s3) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
@@ -105,13 +120,19 @@ fn openCredentialedS3PrefixAlloc(
     const session_token = if (external_io.session_token) |value| try common_secrets.resolveReferenceOwned(alloc, secret_store, value) else null;
     defer if (session_token) |value| alloc.free(value);
 
-    return try object_store_support.OpenedObjectStore.initS3UriWithOverrides(alloc, bucket, prefix, .{
-        .endpoint = endpoint,
-        .use_ssl = external_io.use_ssl orelse true,
-        .access_key_id = access_key_id,
-        .secret_access_key = secret_access_key,
-        .session_token = session_token,
-    });
+    return try object_store_support.OpenedObjectStore.initS3UriWithOverridesAndOptions(
+        alloc,
+        bucket,
+        prefix,
+        .{
+            .endpoint = endpoint,
+            .use_ssl = external_io.use_ssl orelse true,
+            .access_key_id = access_key_id,
+            .secret_access_key = secret_access_key,
+            .session_token = session_token,
+        },
+        .{ .ensure_bucket = !read_only },
+    );
 }
 
 fn openCredentialedGcsPrefixAlloc(
@@ -119,11 +140,17 @@ fn openCredentialedGcsPrefixAlloc(
     external_io: common_config.Config.ExternalIoConnectionConfig,
     bucket: []const u8,
     prefix: []const u8,
+    read_only: bool,
 ) !object_store_support.OpenedObjectStore {
     if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
     if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
-    return try object_store_support.OpenedObjectStore.initGcsUri(alloc, bucket, prefix);
+    return try object_store_support.OpenedObjectStore.initGcsUriWithOptions(
+        alloc,
+        bucket,
+        prefix,
+        .{ .ensure_bucket = !read_only },
+    );
 }
 
 fn ensureBucketAllowed(bucket: []const u8, allowed_buckets: []const []const u8) !void {
@@ -188,6 +215,7 @@ test "credentialed binding object store opens scoped filesystem source" {
     });
     defer opened.deinit();
     try std.testing.expectEqualStrings("external-lake", opened.bucket);
+    try std.testing.expect(!(try opened.client.bucketExists("external-lake")));
 
     const denied_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{denied_path});
     defer alloc.free(denied_uri);
@@ -201,4 +229,25 @@ test "credentialed binding object store opens scoped filesystem source" {
         .file_bucket = "external-lake",
         .node_config = &cfg,
     }));
+}
+
+test "credential-free binding object store opens read-only without creating file bucket" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lake_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/credential-free", .{tmp.sub_path});
+    defer alloc.free(lake_path);
+    const source_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{lake_path});
+    defer alloc.free(source_uri);
+
+    var opened = try openBindingObjectStoreAlloc(alloc, .{
+        .table_id = "events",
+        .format = .parquet,
+        .source_uri = source_uri,
+        .schema_fingerprint = "schema-v1",
+    }, .{ .file_bucket = "external-lake" });
+    defer opened.deinit();
+
+    try std.testing.expectEqualStrings("external-lake", opened.bucket);
+    try std.testing.expect(!(try opened.client.bucketExists("external-lake")));
 }

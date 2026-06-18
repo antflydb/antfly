@@ -54,7 +54,6 @@ const external_binding_api = @import("../serverless/external_source/catalog_bind
 const external_source_api = @import("../serverless/external_source/mod.zig");
 const object_store_support = @import("../serverless/object_store_support.zig");
 const configured_object_store_support = @import("../serverless/configured_object_store_support.zig");
-const remote_uri = @import("../serverless/remote_uri.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
 const object_storage_api = @import("../storage/object_storage.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -5241,7 +5240,6 @@ pub const RemoteUriExternalLakeObjectStoreResolver = struct {
 pub const ConfiguredExternalLakeObjectStoreResolver = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
-    fallback: RemoteUriExternalLakeObjectStoreResolver = .{},
 
     pub fn resolver(self: *@This()) ExternalLakeObjectStoreResolver {
         return .{
@@ -5265,9 +5263,6 @@ pub const ConfiguredExternalLakeObjectStoreResolver = struct {
     ) !object_store_support.OpenedObjectStore {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
-        if (binding.credential_ref == null) {
-            return try self.fallback.resolver().openParquetPrefixAlloc(alloc, binding, options);
-        }
         return try configured_object_store_support.openBindingObjectStoreAlloc(alloc, binding, .{
             .file_bucket = options.file_bucket,
             .node_config = self.node_config,
