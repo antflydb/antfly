@@ -17203,6 +17203,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         .{ .name = "tenant", .path = "tenant", .field_type = .keyword, .nullable = false },
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
         .{ .name = "attrs", .path = "attrs", .field_type = .json, .nullable = false },
+        .{ .name = "tags", .path = "tags", .field_type = .array, .nullable = false },
     };
     const schema = storage_schema.TableSchema{
         .storage_mode = .relational,
@@ -17357,6 +17358,8 @@ test "external lake rows query and aggregate plans route through lake scan hook"
                         .{ .bytes = try row_alloc.dupe(u8, "t2") }
                     else if (std.mem.eql(u8, column, "attrs"))
                         .{ .json = try row_alloc.dupe(u8, if (amount == 20) "{\"tier\":\"gold\",\"flags\":{\"vip\":true}}" else "{\"tier\":\"silver\",\"flags\":{\"vip\":false}}") }
+                    else if (std.mem.eql(u8, column, "tags"))
+                        .{ .json = try row_alloc.dupe(u8, if (amount == 20) "[\"hot\",\"vip\"]" else "[\"cold\"]") }
                     else
                         return error.UnexpectedLakeProjection,
                 };
@@ -17587,6 +17590,30 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqualStrings("{\"tier\":\"gold\",\"flags\":{\"vip\":true}}", json_extract_result.rows[0]);
     try std.testing.expectEqualStrings("{\"tier\":\"silver\",\"flags\":{\"vip\":false}}", json_extract_result.rows[1]);
 
+    const array_length = [_]db_mod.types.RelationalRowsArrayLengthProjection{.{
+        .output = "tag_count",
+        .field = "tags",
+    }};
+    const field_aliases = [_]db_mod.types.RelationalRowsFieldAliasProjection{.{
+        .output = "tenant_alias",
+        .field = "tenant",
+    }};
+    var shaped_projection_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select_all = false,
+            .array_length = array_length[0..],
+            .field_aliases = field_aliases[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer shaped_projection_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 11), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), shaped_projection_result.total);
+    try std.testing.expectEqual(@as(usize, 2), shaped_projection_result.rows.len);
+    try std.testing.expectEqualStrings("{\"tag_count\":2,\"tenant_alias\":\"t2\"}", shaped_projection_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tag_count\":1,\"tenant_alias\":\"t2\"}", shaped_projection_result.rows[1]);
+
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17598,7 +17625,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 11), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 12), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
