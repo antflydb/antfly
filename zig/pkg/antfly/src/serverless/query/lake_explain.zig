@@ -24,9 +24,12 @@ const base_source = @import("../manifest/base_source.zig");
 const lake_promotion = @import("../build/lake_promotion.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const lake_cache = @import("lake_cache.zig");
+const lake_rows = @import("lake_rows.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const lake_range_io = @import("lake_range_io.zig");
 const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
+const rowsource = @import("../../storage/rowsource/types.zig");
+const source_binding = @import("../segment/source_binding.zig");
 
 pub const Operation = enum {
     scan,
@@ -48,6 +51,7 @@ pub const Request = struct {
     sidecars: []const sidecar_manifest.DeclaredArtifact = &.{},
     desired_sidecars: []const lake_sidecar_selection.DesiredSidecar = &.{},
     sidecar_policy: lake_sidecar_selection.Policy = .{},
+    candidate_sets: []const lake_rows.SidecarCandidateSet = &.{},
     operation: Operation,
     projected_column_count: u16 = 0,
     cache_budget: lake_cache.Budget = .{},
@@ -70,6 +74,19 @@ pub const SidecarSelectionAccounting = struct {
     selected_count: u32 = 0,
     stale_ignored_count: u32 = 0,
     not_requested_count: u32 = 0,
+};
+
+pub const SidecarCandidateAccounting = struct {
+    supplied_set_count: u32 = 0,
+    supplied_ref_count: u64 = 0,
+    usable_set_count: u32 = 0,
+    usable_ref_count: u64 = 0,
+    empty_usable_set_count: u32 = 0,
+    selected_without_candidates_count: u32 = 0,
+    stale_ignored_candidate_set_count: u32 = 0,
+    not_requested_candidate_set_count: u32 = 0,
+    missing_declaration_candidate_set_count: u32 = 0,
+    hydration_possible: bool = false,
 };
 
 pub const RangeCacheLaneAccounting = struct {
@@ -119,6 +136,7 @@ pub const Plan = struct {
     cache_accounting: lake_cache.Accounting = .{},
     range_cache_accounting: RangeCacheAccounting = .{},
     sidecar_selection: SidecarSelectionAccounting = .{},
+    sidecar_candidates: SidecarCandidateAccounting = .{},
     recommendation: lake_promotion.Recommendation = .{ .kind = .none },
 };
 
@@ -137,6 +155,13 @@ pub fn explain(request: Request) !Plan {
         request.desired_sidecars,
         request.sidecar_policy,
     );
+    const sidecar_candidates = try summarizeSidecarCandidates(
+        request.base_source,
+        request.sidecars,
+        request.desired_sidecars,
+        request.sidecar_policy,
+        request.candidate_sets,
+    );
 
     const source_info = sourceInfo(request.base_source);
     return .{
@@ -150,6 +175,7 @@ pub fn explain(request: Request) !Plan {
         .cache_accounting = cache_accounting,
         .range_cache_accounting = summarizeRangeCache(request.range_cache_stats),
         .sidecar_selection = sidecar_selection,
+        .sidecar_candidates = sidecar_candidates,
         .recommendation = if (request.observation) |observation|
             lake_promotion.recommend(observation, request.thresholds)
         else
@@ -187,6 +213,59 @@ fn summarizeSidecarSelection(
     };
 }
 
+fn summarizeSidecarCandidates(
+    descriptor: base_source.BaseSourceDescriptor,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const lake_sidecar_selection.DesiredSidecar,
+    policy: lake_sidecar_selection.Policy,
+    candidate_sets: []const lake_rows.SidecarCandidateSet,
+) !SidecarCandidateAccounting {
+    var accounting = SidecarCandidateAccounting{};
+    for (candidate_sets) |candidate_set| {
+        if (candidate_set.sidecar_name.len == 0) return error.InvalidLakeSidecarSelection;
+        accounting.supplied_set_count += 1;
+        accounting.supplied_ref_count += @intCast(candidate_set.row_refs.len);
+
+        const declaration = findSidecarDeclaration(sidecars, candidate_set.sidecar_name) orelse {
+            accounting.missing_declaration_candidate_set_count += 1;
+            continue;
+        };
+        const requested = try lake_sidecar_selection.declarationMatchesDesired(declaration, desired);
+        if (!requested) {
+            accounting.not_requested_candidate_set_count += 1;
+            continue;
+        }
+
+        const fresh = try lake_sidecar_selection.declarationMatchesBaseSource(descriptor, declaration.binding);
+        if (!fresh) {
+            switch (policy.stale) {
+                .reject => return error.StaleLakeSidecar,
+                .ignore => {
+                    accounting.stale_ignored_candidate_set_count += 1;
+                    continue;
+                },
+            }
+        }
+
+        try source_binding.validateCandidateRowRefsAgainstBinding(declaration.binding, candidate_set.row_refs);
+        accounting.usable_set_count += 1;
+        accounting.usable_ref_count += @intCast(candidate_set.row_refs.len);
+        if (candidate_set.row_refs.len == 0) accounting.empty_usable_set_count += 1;
+    }
+
+    for (sidecars) |declaration| {
+        if (!(try lake_sidecar_selection.declarationMatchesDesired(declaration, desired))) continue;
+        const fresh = try lake_sidecar_selection.declarationMatchesBaseSource(descriptor, declaration.binding);
+        if (!fresh) continue;
+        if (findCandidateSet(candidate_sets, declaration.name) == null) {
+            accounting.selected_without_candidates_count += 1;
+        }
+    }
+
+    accounting.hydration_possible = accounting.usable_set_count != 0;
+    return accounting;
+}
+
 fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.ArtifactRef) !void {
     if (artifact.artifact_id.len == 0) return error.InvalidLakeExplainPlan;
     if (artifact.checksum.len == 0) return error.InvalidLakeExplainPlan;
@@ -199,6 +278,26 @@ fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.Artif
         .text_segment, .vector_segment, .sparse_segment, .graph_segment => accounting.search_sidecar_count += 1,
         .doc_values, .stored_fields, .mutation_segment, .document_segment => {},
     }
+}
+
+fn findCandidateSet(
+    candidate_sets: []const lake_rows.SidecarCandidateSet,
+    sidecar_name: []const u8,
+) ?lake_rows.SidecarCandidateSet {
+    for (candidate_sets) |candidate_set| {
+        if (std.mem.eql(u8, candidate_set.sidecar_name, sidecar_name)) return candidate_set;
+    }
+    return null;
+}
+
+fn findSidecarDeclaration(
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    sidecar_name: []const u8,
+) ?sidecar_manifest.DeclaredArtifact {
+    for (sidecars) |declaration| {
+        if (std.mem.eql(u8, declaration.name, sidecar_name)) return declaration;
+    }
+    return null;
 }
 
 fn validateBaseSourceArtifacts(
@@ -526,6 +625,86 @@ test "lake explain reports sidecar selection fallback" {
     try std.testing.expectEqual(@as(u32, 0), plan.sidecar_selection.selected_count);
     try std.testing.expectEqual(@as(u32, 1), plan.sidecar_selection.stale_ignored_count);
     try std.testing.expectEqual(@as(u32, 1), plan.sidecar_selection.not_requested_count);
+}
+
+test "lake explain reports sidecar candidate hydration accounting" {
+    const descriptor = base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+        .file_inventory_artifact = "files-1",
+    } };
+    const artifacts = [_]artifact_ref.ArtifactRef{
+        .{ .kind = .external_base_source, .artifact_id = "files-1", .byte_len = 4096, .checksum = "len:4096" },
+        .{ .kind = .text_segment, .name = "events.body.text", .artifact_id = "text-1", .byte_len = 256, .checksum = "len:256" },
+        .{ .kind = .vector_segment, .name = "events.embedding.vector", .artifact_id = "vector-1", .byte_len = 512, .checksum = "len:512" },
+    };
+    const sidecars = [_]sidecar_manifest.DeclaredArtifact{
+        .{
+            .name = "events.body.text",
+            .binding = .{
+                .sidecar_kind = .text,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-9",
+                .schema_fingerprint = "schema-v2",
+                .column_bindings = &[_][]const u8{"body"},
+                .index_config_hash = "sha256:text",
+            },
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.body.text",
+                .artifact_id = "text-1",
+                .byte_len = 256,
+                .checksum = "len:256",
+            },
+        },
+        .{
+            .name = "events.embedding.vector",
+            .binding = .{
+                .sidecar_kind = .vector,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-9",
+                .schema_fingerprint = "schema-v2",
+                .column_bindings = &[_][]const u8{"embedding"},
+                .index_config_hash = "sha256:vector",
+            },
+            .artifact = .{
+                .kind = .vector_segment,
+                .name = "events.embedding.vector",
+                .artifact_id = "vector-1",
+                .byte_len = 512,
+                .checksum = "len:512",
+            },
+        },
+    };
+    const text_candidates = [_]rowsource.RowRef{
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-9", .file_id = "part-a", .row_group_ordinal = 0, .row_ordinal = 7 } },
+        .{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-9", .file_id = "part-a", .row_group_ordinal = 0, .row_ordinal = 9 } },
+    };
+    const candidates = [_]lake_rows.SidecarCandidateSet{
+        .{ .sidecar_name = "events.body.text", .row_refs = &text_candidates },
+    };
+
+    const plan = try explain(.{
+        .base_source = descriptor,
+        .artifacts = &artifacts,
+        .sidecars = &sidecars,
+        .candidate_sets = &candidates,
+        .operation = .hydrate,
+    });
+
+    try std.testing.expectEqual(@as(u32, 2), plan.sidecar_selection.selected_count);
+    try std.testing.expectEqual(@as(u32, 1), plan.sidecar_candidates.supplied_set_count);
+    try std.testing.expectEqual(@as(u64, 2), plan.sidecar_candidates.supplied_ref_count);
+    try std.testing.expectEqual(@as(u32, 1), plan.sidecar_candidates.usable_set_count);
+    try std.testing.expectEqual(@as(u64, 2), plan.sidecar_candidates.usable_ref_count);
+    try std.testing.expectEqual(@as(u32, 1), plan.sidecar_candidates.selected_without_candidates_count);
+    try std.testing.expect(plan.sidecar_candidates.hydration_possible);
 }
 
 test "lake explain reports object range cache lane accounting" {

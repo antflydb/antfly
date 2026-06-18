@@ -185,6 +185,23 @@ pub fn summarize(
     return summary;
 }
 
+pub fn declarationMatchesDesired(
+    decl: sidecar_manifest.DeclaredArtifact,
+    desired: []const DesiredSidecar,
+) !bool {
+    try validateDesired(desired);
+    return desired.len == 0 or matchesDesired(decl, desired);
+}
+
+pub fn declarationMatchesBaseSource(
+    descriptor: base_source.BaseSourceDescriptor,
+    binding: source_binding.Binding,
+) !bool {
+    try descriptor.validate();
+    try binding.validate();
+    return try matchesBaseSource(descriptor, binding);
+}
+
 fn validateDesired(desired: []const DesiredSidecar) !void {
     for (desired) |want| {
         if (want.name.len == 0 and want.kind == null) return error.InvalidLakeSidecarSelection;
