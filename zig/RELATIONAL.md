@@ -1036,11 +1036,12 @@ balanced-paren normalization, wrapped identifier operands, top-level boolean
 operator scans bounded by tail clauses, top-level tail-clause index scans, and
 end-of-input behavior are adapter-owned before statement-specific grammar moves
 out of the large lowerer file. Adapter-only control syntax such as `EXPLAIN`
-prefix and option parsing also belongs there so lowerers receive typed wrapper
-intent instead of scanning raw SQL. This boundary is now partially implemented:
+prefix and option parsing belongs in grammar helpers so lowerers receive typed
+wrapper intent instead of scanning raw SQL. This boundary is now partially implemented:
 `api/sql_adapter/` owns token definitions, lexer behavior, parser cursor
 helpers, statement classification, diagnostics, parity-corpus fingerprints,
-catalog/source-name prebinding, adapter-noop grammar tails, row-security grammar
+catalog/source-name prebinding, adapter-noop grammar tails, `EXPLAIN` prefix and
+option grammar, row-security grammar
 syntax, row-lock grammar for `FOR UPDATE` / `FOR NO KEY UPDATE` /
 `FOR SHARE` / `FOR KEY SHARE` including `OF`, `NOWAIT`, and `SKIP LOCKED`
 tails, and relation-population syntax parsing for `SELECT INTO` and

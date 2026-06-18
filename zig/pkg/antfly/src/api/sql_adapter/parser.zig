@@ -17,7 +17,6 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const token_mod = @import("token.zig");
 
-pub const SqlExplainPrefix = ast.SqlExplainPrefix;
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 
@@ -172,110 +171,6 @@ pub fn consumeCteMaterializationHint(tokens: []const Token, pos: *usize) !void {
     if (matchKeyword(tokens, pos, "not") and !matchKeyword(tokens, pos, "materialized")) {
         return error.UnsupportedSqlShape;
     }
-}
-
-pub fn parseExplainPrefix(sql: []const u8) !SqlExplainPrefix {
-    var index = skipSqlWhitespace(sql, 0);
-    if (!consumeSqlKeyword(sql, &index, "explain")) return error.UnsupportedSqlShape;
-    index = skipSqlWhitespace(sql, index);
-    if (index >= sql.len) return error.UnsupportedSqlShape;
-
-    var prefix = SqlExplainPrefix{ .inner_sql = "" };
-    if (sql[index] == '(') {
-        try parseExplainOptions(sql, &index, &prefix);
-        index = skipSqlWhitespace(sql, index);
-        if (index >= sql.len) return error.UnsupportedSqlShape;
-    }
-
-    if (consumeSqlKeyword(sql, &index, "analyze")) {
-        prefix.analyze = true;
-        index = skipSqlWhitespace(sql, index);
-        if (index >= sql.len) return error.UnsupportedSqlShape;
-    }
-
-    const inner = std.mem.trim(u8, sql[index..], " \t\r\n;");
-    if (inner.len == 0) return error.UnsupportedSqlShape;
-    prefix.inner_sql = inner;
-    return prefix;
-}
-
-fn parseExplainOptions(sql: []const u8, index: *usize, prefix: *SqlExplainPrefix) !void {
-    if (index.* >= sql.len or sql[index.*] != '(') return error.UnsupportedSqlShape;
-    index.* += 1;
-    while (true) {
-        index.* = skipSqlWhitespace(sql, index.*);
-        if (index.* >= sql.len) return error.UnsupportedSqlShape;
-        if (consumeSqlKeyword(sql, index, "format")) {
-            index.* = skipSqlWhitespace(sql, index.*);
-            if (consumeSqlKeyword(sql, index, "json")) {
-                prefix.format = .json;
-            } else if (consumeSqlKeyword(sql, index, "text")) {
-                prefix.format = .text;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        } else if (consumeSqlKeyword(sql, index, "verbose")) {
-            prefix.verbose = try parseOptionalExplainBool(sql, index, true);
-        } else if (consumeSqlKeyword(sql, index, "costs")) {
-            prefix.costs = try parseOptionalExplainBool(sql, index, true);
-        } else if (consumeSqlKeyword(sql, index, "analyze")) {
-            prefix.analyze = try parseOptionalExplainBool(sql, index, true);
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-
-        index.* = skipSqlWhitespace(sql, index.*);
-        if (index.* >= sql.len) return error.UnsupportedSqlShape;
-        if (sql[index.*] == ',') {
-            index.* += 1;
-            continue;
-        }
-        if (sql[index.*] == ')') {
-            index.* += 1;
-            return;
-        }
-        return error.UnsupportedSqlShape;
-    }
-}
-
-fn parseOptionalExplainBool(sql: []const u8, index: *usize, default_value: bool) !bool {
-    const before = index.*;
-    index.* = skipSqlWhitespace(sql, index.*);
-    if (consumeSqlKeyword(sql, index, "true") or
-        consumeSqlKeyword(sql, index, "on") or
-        consumeSqlKeyword(sql, index, "yes"))
-    {
-        return true;
-    }
-    if (consumeSqlKeyword(sql, index, "false") or
-        consumeSqlKeyword(sql, index, "off") or
-        consumeSqlKeyword(sql, index, "no"))
-    {
-        return false;
-    }
-    index.* = before;
-    return default_value;
-}
-
-fn skipSqlWhitespace(sql: []const u8, start: usize) usize {
-    var index = start;
-    while (index < sql.len and std.ascii.isWhitespace(sql[index])) : (index += 1) {}
-    return index;
-}
-
-fn consumeSqlKeyword(sql: []const u8, index: *usize, keyword: []const u8) bool {
-    const start = index.*;
-    const end = start + keyword.len;
-    if (end > sql.len) return false;
-    if (!std.ascii.eqlIgnoreCase(sql[start..end], keyword)) return false;
-    if (end < sql.len and isSqlIdentifierByte(sql[end])) return false;
-    if (start > 0 and isSqlIdentifierByte(sql[start - 1])) return false;
-    index.* = end;
-    return true;
-}
-
-fn isSqlIdentifierByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
 pub fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
@@ -453,30 +348,6 @@ test "sql adapter parser consumes shared keyword helpers" {
     };
     var invalid_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, consumeCteMaterializationHint(invalid_tokens[0..], &invalid_pos));
-}
-
-test "sql adapter parser parses explain prefixes and options" {
-    const basic = try parseExplainPrefix("EXPLAIN SELECT id FROM usage_records;");
-    try std.testing.expect(!basic.analyze);
-    try std.testing.expectEqual(ast.SqlExplainFormat.text, basic.format);
-    try std.testing.expect(!basic.verbose);
-    try std.testing.expect(basic.costs);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", basic.inner_sql);
-
-    const options = try parseExplainPrefix("EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON) SELECT id FROM usage_records");
-    try std.testing.expect(options.analyze);
-    try std.testing.expectEqual(ast.SqlExplainFormat.json, options.format);
-    try std.testing.expect(options.verbose);
-    try std.testing.expect(!options.costs);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", options.inner_sql);
-
-    const analyze = try parseExplainPrefix("EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')");
-    try std.testing.expect(analyze.analyze);
-    try std.testing.expectEqualStrings("INSERT INTO usage_records (id) VALUES ('u1')", analyze.inner_sql);
-
-    try std.testing.expectError(error.UnsupportedSqlShape, parseExplainPrefix("EXPLAIN (FORMAT YAML) SELECT 1"));
-    try std.testing.expectError(error.UnsupportedSqlShape, parseExplainPrefix("EXPLAINED SELECT 1"));
-    try std.testing.expectError(error.UnsupportedSqlShape, parseExplainPrefix("EXPLAIN"));
 }
 
 fn testKeywordIsFrom(text: []const u8) bool {
