@@ -907,6 +907,246 @@ pub const DropSubscriptionPlan = struct {
     }
 };
 
+pub const TypeSystemCatalogPlan = union(enum) {
+    collation: CollationCatalogPlan,
+    operator: OperatorCatalogPlan,
+    aggregate: AggregateCatalogPlan,
+    cast: CastCatalogPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .collation => |*plan| plan.deinit(alloc),
+            .operator => |*plan| plan.deinit(alloc),
+            .aggregate => |*plan| plan.deinit(alloc),
+            .cast => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CollationCatalogPlan = union(enum) {
+    create: CreateCollationPlan,
+    rename: RenameCollationPlan,
+    drop: DropCollationPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .rename => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateCollationPlan = struct {
+    collation_name: []const u8,
+    option_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.collation_name);
+        self.* = undefined;
+    }
+};
+
+pub const RenameCollationPlan = struct {
+    collation_name: []const u8,
+    new_collation_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.collation_name);
+        alloc.free(self.new_collation_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropCollationPlan = struct {
+    collation_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.collation_name);
+        self.* = undefined;
+    }
+};
+
+pub const OperatorCatalogPlan = union(enum) {
+    create: CreateOperatorPlan,
+    drop: DropOperatorPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateOperatorPlan = struct {
+    operator_name: []const u8,
+    option_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.operator_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropOperatorPlan = struct {
+    operator_name: []const u8,
+    argument_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.operator_name);
+        self.* = undefined;
+    }
+};
+
+pub const AggregateCatalogPlan = union(enum) {
+    create: CreateAggregatePlan,
+    drop: DropAggregatePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateAggregatePlan = struct {
+    aggregate_name: []const u8,
+    argument_count: usize = 0,
+    option_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.aggregate_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropAggregatePlan = struct {
+    aggregate_name: []const u8,
+    argument_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.aggregate_name);
+        self.* = undefined;
+    }
+};
+
+pub const CastCatalogPlan = union(enum) {
+    create: CreateCastPlan,
+    drop: DropCastPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateCastPlan = struct {
+    source_type: []const u8,
+    target_type: []const u8,
+    function_name: []const u8,
+    assignment: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.source_type);
+        alloc.free(self.target_type);
+        alloc.free(self.function_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropCastPlan = struct {
+    source_type: []const u8,
+    target_type: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.source_type);
+        alloc.free(self.target_type);
+        self.* = undefined;
+    }
+};
+
+pub const MaintenanceJobPlan = union(enum) {
+    vacuum: VacuumMaintenancePlan,
+    analyze: AnalyzeMaintenancePlan,
+    reindex: ReindexMaintenancePlan,
+    cluster: ClusterMaintenancePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .vacuum => |*plan| plan.deinit(alloc),
+            .analyze => |*plan| plan.deinit(alloc),
+            .reindex => |*plan| plan.deinit(alloc),
+            .cluster => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const VacuumMaintenancePlan = struct {
+    table_name: []const u8,
+    full: bool = false,
+    freeze: bool = false,
+    verbose: bool = false,
+    analyze: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+pub const AnalyzeMaintenancePlan = struct {
+    table_name: []const u8,
+    verbose: bool = false,
+    column_count: usize = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+pub const ReindexMaintenancePlan = struct {
+    target: ReindexMaintenanceTarget,
+    name: []const u8,
+    concurrently: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const ReindexMaintenanceTarget = enum {
+    index,
+    table,
+    schema,
+    database,
+    system,
+};
+
+pub const ClusterMaintenancePlan = struct {
+    table_name: []const u8,
+    index_name: ?[]const u8 = null,
+    verbose: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        if (self.index_name) |index_name| alloc.free(index_name);
+        self.* = undefined;
+    }
+};
+
 pub const AdvisoryLockPlan = struct {
     action: AdvisoryLockAction,
     key1: i64,
@@ -1243,4 +1483,66 @@ test "SQL adapter DDL logical replication plans own nested strings" {
         .if_exists = true,
     } } };
     drop_subscription.deinit(alloc);
+}
+
+test "SQL adapter DDL type-system plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var collation: TypeSystemCatalogPlan = .{ .collation = .{ .rename = .{
+        .collation_name = try alloc.dupe(u8, "en_us_ci"),
+        .new_collation_name = try alloc.dupe(u8, "en_us_case_insensitive"),
+    } } };
+    collation.deinit(alloc);
+
+    var operator_plan: TypeSystemCatalogPlan = .{ .operator = .{ .create = .{
+        .operator_name = try alloc.dupe(u8, "###"),
+        .option_count = 2,
+    } } };
+    operator_plan.deinit(alloc);
+
+    var aggregate_plan: TypeSystemCatalogPlan = .{ .aggregate = .{ .drop = .{
+        .aggregate_name = try alloc.dupe(u8, "weighted_avg"),
+        .argument_count = 2,
+    } } };
+    aggregate_plan.deinit(alloc);
+
+    var cast_plan: TypeSystemCatalogPlan = .{ .cast = .{ .create = .{
+        .source_type = try alloc.dupe(u8, "jsonb"),
+        .target_type = try alloc.dupe(u8, "text"),
+        .function_name = try alloc.dupe(u8, "jsonb_to_text"),
+        .assignment = true,
+    } } };
+    cast_plan.deinit(alloc);
+}
+
+test "SQL adapter DDL maintenance plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var vacuum: MaintenanceJobPlan = .{ .vacuum = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .full = true,
+        .analyze = true,
+    } };
+    vacuum.deinit(alloc);
+
+    var analyze: MaintenanceJobPlan = .{ .analyze = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .verbose = true,
+        .column_count = 2,
+    } };
+    analyze.deinit(alloc);
+
+    var reindex: MaintenanceJobPlan = .{ .reindex = .{
+        .target = .index,
+        .name = try alloc.dupe(u8, "usage_records_status_idx"),
+        .concurrently = true,
+    } };
+    reindex.deinit(alloc);
+
+    var cluster: MaintenanceJobPlan = .{ .cluster = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .index_name = try alloc.dupe(u8, "usage_records_pkey"),
+        .verbose = true,
+    } };
+    cluster.deinit(alloc);
 }

@@ -227,6 +227,26 @@ pub const SubscriptionCatalogPlan = sql_adapter.SubscriptionCatalogPlan;
 pub const CreateSubscriptionPlan = sql_adapter.CreateSubscriptionPlan;
 pub const AlterSubscriptionPlan = sql_adapter.AlterSubscriptionPlan;
 pub const DropSubscriptionPlan = sql_adapter.DropSubscriptionPlan;
+pub const TypeSystemCatalogPlan = sql_adapter.TypeSystemCatalogPlan;
+pub const CollationCatalogPlan = sql_adapter.CollationCatalogPlan;
+pub const CreateCollationPlan = sql_adapter.CreateCollationPlan;
+pub const RenameCollationPlan = sql_adapter.RenameCollationPlan;
+pub const DropCollationPlan = sql_adapter.DropCollationPlan;
+pub const OperatorCatalogPlan = sql_adapter.OperatorCatalogPlan;
+pub const CreateOperatorPlan = sql_adapter.CreateOperatorPlan;
+pub const DropOperatorPlan = sql_adapter.DropOperatorPlan;
+pub const AggregateCatalogPlan = sql_adapter.AggregateCatalogPlan;
+pub const CreateAggregatePlan = sql_adapter.CreateAggregatePlan;
+pub const DropAggregatePlan = sql_adapter.DropAggregatePlan;
+pub const CastCatalogPlan = sql_adapter.CastCatalogPlan;
+pub const CreateCastPlan = sql_adapter.CreateCastPlan;
+pub const DropCastPlan = sql_adapter.DropCastPlan;
+pub const MaintenanceJobPlan = sql_adapter.MaintenanceJobPlan;
+pub const VacuumMaintenancePlan = sql_adapter.VacuumMaintenancePlan;
+pub const AnalyzeMaintenancePlan = sql_adapter.AnalyzeMaintenancePlan;
+pub const ReindexMaintenancePlan = sql_adapter.ReindexMaintenancePlan;
+pub const ReindexMaintenanceTarget = sql_adapter.ReindexMaintenanceTarget;
+pub const ClusterMaintenancePlan = sql_adapter.ClusterMaintenancePlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -593,246 +613,6 @@ pub const RowSecurityCurrentSettingPredicate = struct {
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.field);
         alloc.free(self.setting_name);
-        self.* = undefined;
-    }
-};
-
-pub const TypeSystemCatalogPlan = union(enum) {
-    collation: CollationCatalogPlan,
-    operator: OperatorCatalogPlan,
-    aggregate: AggregateCatalogPlan,
-    cast: CastCatalogPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .collation => |*plan| plan.deinit(alloc),
-            .operator => |*plan| plan.deinit(alloc),
-            .aggregate => |*plan| plan.deinit(alloc),
-            .cast => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CollationCatalogPlan = union(enum) {
-    create: CreateCollationPlan,
-    rename: RenameCollationPlan,
-    drop: DropCollationPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .rename => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateCollationPlan = struct {
-    collation_name: []const u8,
-    option_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.collation_name);
-        self.* = undefined;
-    }
-};
-
-pub const RenameCollationPlan = struct {
-    collation_name: []const u8,
-    new_collation_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.collation_name);
-        alloc.free(self.new_collation_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropCollationPlan = struct {
-    collation_name: []const u8,
-    if_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.collation_name);
-        self.* = undefined;
-    }
-};
-
-pub const OperatorCatalogPlan = union(enum) {
-    create: CreateOperatorPlan,
-    drop: DropOperatorPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateOperatorPlan = struct {
-    operator_name: []const u8,
-    option_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.operator_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropOperatorPlan = struct {
-    operator_name: []const u8,
-    argument_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.operator_name);
-        self.* = undefined;
-    }
-};
-
-pub const AggregateCatalogPlan = union(enum) {
-    create: CreateAggregatePlan,
-    drop: DropAggregatePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateAggregatePlan = struct {
-    aggregate_name: []const u8,
-    argument_count: usize = 0,
-    option_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.aggregate_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropAggregatePlan = struct {
-    aggregate_name: []const u8,
-    argument_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.aggregate_name);
-        self.* = undefined;
-    }
-};
-
-pub const CastCatalogPlan = union(enum) {
-    create: CreateCastPlan,
-    drop: DropCastPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateCastPlan = struct {
-    source_type: []const u8,
-    target_type: []const u8,
-    function_name: []const u8,
-    assignment: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.source_type);
-        alloc.free(self.target_type);
-        alloc.free(self.function_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropCastPlan = struct {
-    source_type: []const u8,
-    target_type: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.source_type);
-        alloc.free(self.target_type);
-        self.* = undefined;
-    }
-};
-
-pub const MaintenanceJobPlan = union(enum) {
-    vacuum: VacuumMaintenancePlan,
-    analyze: AnalyzeMaintenancePlan,
-    reindex: ReindexMaintenancePlan,
-    cluster: ClusterMaintenancePlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .vacuum => |*plan| plan.deinit(alloc),
-            .analyze => |*plan| plan.deinit(alloc),
-            .reindex => |*plan| plan.deinit(alloc),
-            .cluster => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const VacuumMaintenancePlan = struct {
-    table_name: []const u8,
-    full: bool = false,
-    freeze: bool = false,
-    verbose: bool = false,
-    analyze: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.* = undefined;
-    }
-};
-
-pub const AnalyzeMaintenancePlan = struct {
-    table_name: []const u8,
-    verbose: bool = false,
-    column_count: usize = 0,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.* = undefined;
-    }
-};
-
-pub const ReindexMaintenancePlan = struct {
-    target: ReindexMaintenanceTarget,
-    name: []const u8,
-    concurrently: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.name);
-        self.* = undefined;
-    }
-};
-
-pub const ReindexMaintenanceTarget = enum {
-    index,
-    table,
-    schema,
-    database,
-    system,
-};
-
-pub const ClusterMaintenancePlan = struct {
-    table_name: []const u8,
-    index_name: ?[]const u8 = null,
-    verbose: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        if (self.index_name) |index_name| alloc.free(index_name);
         self.* = undefined;
     }
 };
@@ -44129,10 +43909,25 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var archive_qualified = try lowerDdlPlanAlloc(
         alloc,
         "CREATE INDEX archive.usage_records_status_idx ON archive.usage_records (status);",
-    ));
+    );
+    defer archive_qualified.deinit(alloc);
+    switch (archive_qualified) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("archive.usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("archive.usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
 
     var idempotent = try lowerDdlPlanAlloc(
         alloc,
@@ -52938,12 +52733,15 @@ test "postgres sql adapter lowers equality join queries" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, null_inclusive_boolean_side_filters.join.right.expression_or_predicates[1].conditions[0].op);
     try std.testing.expectEqualStrings("enabled", null_inclusive_boolean_side_filters.join.right.expression_or_predicates[1].conditions[0].lhs.field);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinAlloc(
+    var archive_join = try lowerJoinAlloc(
         alloc,
         "SELECT o.id AS order_id FROM archive.usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id",
         schema,
         &.{},
-    ));
+    );
+    defer archive_join.deinit(alloc);
+    try std.testing.expectEqualStrings("archive.usage_records", archive_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", archive_join.right_table_name);
 
     var ordinal_order = try lowerJoinAlloc(
         alloc,
@@ -53345,12 +53143,15 @@ test "postgres sql adapter lowers bounded left join lateral queries" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[1].conditions[0].op);
     try std.testing.expectEqualStrings("enabled", null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[1].conditions[0].lhs.field);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralPlanAlloc(
+    var archive_lateral = try lowerLateralPlanAlloc(
         alloc,
         "SELECT org.id AS organization_id FROM archive.usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true",
         schema,
         &.{},
-    ));
+    );
+    defer archive_lateral.deinit(alloc);
+    try std.testing.expectEqualStrings("archive.usage_records", archive_lateral.plan.left_table);
+    try std.testing.expectEqualStrings("usage_records", archive_lateral.plan.right_table);
 
     var ordinal_lateral = try lowerLateralPlanAlloc(
         alloc,
@@ -84477,7 +84278,7 @@ test "postgres sql adapter rejects unsupported application shapes explicitly" {
         defer freeTokens(alloc, &with_update_tokens);
         try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.update, sql_adapter.classifyWriteStatement(with_update_tokens.items).?);
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanAlloc(
+    try std.testing.expectError(error.UnsupportedRowsSelector, lowerWritePlanAlloc(
         alloc,
         "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)",
         schema,
@@ -84496,7 +84297,7 @@ test "postgres sql adapter rejects unsupported application shapes explicitly" {
         defer freeTokens(alloc, &with_delete_tokens);
         try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.delete, sql_adapter.classifyWriteStatement(with_delete_tokens.items).?);
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanAlloc(
+    try std.testing.expectError(error.UnsupportedRowsSelector, lowerWritePlanAlloc(
         alloc,
         "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)",
         schema,

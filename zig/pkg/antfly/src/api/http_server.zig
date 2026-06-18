@@ -249,6 +249,10 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+    /// Optional resolver for external lake table bindings. When omitted,
+    /// public row reads use URI-native object-store opening for credential-free
+    /// bindings only.
+    external_lake_object_store_resolver: ?table_reads.ExternalLakeObjectStoreResolver = null,
 };
 
 const RowsUniqueSelectorResolverContext = struct {
@@ -1285,6 +1289,8 @@ pub const ApiHttpServer = struct {
     cfg: ApiHttpServerConfig,
     source: StatusSource,
     table_reads: ?table_reads.TableReadSource = null,
+    external_lake_remote_resolver: table_reads.RemoteUriExternalLakeObjectStoreResolver = .{},
+    external_lake_routing_reads: ?table_reads.ExternalLakeRoutingTableReadSource = null,
     table_writes: ?table_writes.TableWriteSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
@@ -1358,6 +1364,15 @@ pub const ApiHttpServer = struct {
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
         };
+    }
+
+    fn effectivePublicTableReads(self: *ApiHttpServer) ?table_reads.TableReadSource {
+        const base = self.table_reads orelse return null;
+        if (self.external_lake_routing_reads == null) {
+            const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_remote_resolver.resolver();
+            self.external_lake_routing_reads = table_reads.ExternalLakeRoutingTableReadSource.init(base, resolver, .{});
+        }
+        return self.external_lake_routing_reads.?.source();
     }
 
     pub fn initWithConfig(
@@ -7356,7 +7371,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
-        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
         const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
@@ -7375,7 +7390,7 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows query request"),
-            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
+            error.UnsupportedOperation, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
             else => {
@@ -7395,7 +7410,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !http_common.HttpResponse {
-        const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
+        const source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
         const schema = self.runtimeSchemaForPublicRows(table_name) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows request"),
@@ -7414,7 +7429,7 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
-            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
+            error.UnsupportedOperation, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
             else => {
@@ -17201,6 +17216,142 @@ test "api http server executes public relational row plan endpoints" {
     var unsupported_mutation_resp = try server.handlePublicTableRowsMutationSource("records", "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"worker:test\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"}}", unsupported_identity);
     defer unsupported_mutation_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), unsupported_mutation_resp.status);
+}
+
+test "api http server routes public external lake row queries through configured resolver" {
+    const alloc = std.testing.allocator;
+    const object_storage_api = @import("../storage/object_storage.zig");
+    const object_store_support = @import("../serverless/object_store_support.zig");
+    const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
+    const external_source_api = @import("../serverless/external_source/mod.zig");
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","schema_fingerprint":"schema-v1"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeBaseReads = struct {
+        rows_query_count: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedBaseLookup;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedBaseScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedBaseQuery;
+        }
+
+        fn rowsQueryPlan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: runtime_schema_mod.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rows_query_count += 1;
+            return error.BaseRowsQueryReached;
+        }
+    };
+
+    const FakeLakeResolver = struct {
+        memory: *object_storage_api.MemoryObjectStorage,
+        open_count: u32 = 0,
+
+        fn resolver(self: *@This()) table_reads.ExternalLakeObjectStoreResolver {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .open_parquet_prefix = openParquetPrefix,
+                },
+            };
+        }
+
+        fn openParquetPrefix(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            binding: external_binding_api.Binding,
+            _: table_reads.ExternalObjectStorageLakeRowsSourceOptions,
+        ) !object_store_support.OpenedObjectStore {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.open_count += 1;
+            try std.testing.expectEqual(external_source_api.Format.parquet, binding.format);
+            try std.testing.expectEqualStrings("s3://bucket/events", binding.source_uri);
+            return try object_store_support.OpenedObjectStore.initWithClient(inner_alloc, self.memory.client(), "bucket", "events");
+        }
+    };
+
+    var memory = object_storage_api.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "events/part-a.parquet", "not-a-real-parquet-file", .{});
+    defer put.deinit(alloc);
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var base_reads = FakeBaseReads{};
+    var resolver = FakeLakeResolver{ .memory = &memory };
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .external_lake_object_store_resolver = resolver.resolver() },
+        source.iface(),
+        base_reads.source(),
+        null,
+    );
+    defer server.deinit();
+
+    var response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"order_by\":[{\"field\":\"amount\"}]}}", null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), response.status);
+    try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 }
 
 test "api http server serves public transaction commit route" {
