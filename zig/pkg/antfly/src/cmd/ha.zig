@@ -276,14 +276,12 @@ fn executeTypedRemote(
             },
         },
         .slot_list => |command| {
-            if (command.retention_policy.max_lag_lsn == 0) {
+            if (isDefaultRetentionPolicy(command.retention_policy)) {
                 var out = try client.listReplicationSlots(remote_url);
                 defer out.deinit(alloc);
                 try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             } else {
-                var out = try client.getPrimaryStatus(remote_url, .{
-                    .max_lag_lsn = command.retention_policy.max_lag_lsn,
-                });
+                var out = try client.getPrimaryStatus(remote_url, primaryStatusOptionsFromRetention(command.retention_policy));
                 defer out.deinit(alloc);
                 try writeTypedRemoteBody(alloc, io, plan.output, out.body);
             }
@@ -319,10 +317,9 @@ fn executeTypedRemote(
         },
         .primary_status => |command| {
             if (command.view != .status and plan.output != .prometheus) return false;
-            var out = try client.getPrimaryStatus(remote_url, .{
-                .max_lag_lsn = if (command.retention_policy.max_lag_lsn == 0) null else command.retention_policy.max_lag_lsn,
-                .sync_policy = command.sync_policy,
-            });
+            var options = primaryStatusOptionsFromRetention(command.retention_policy);
+            options.sync_policy = command.sync_policy;
+            var out = try client.getPrimaryStatus(remote_url, options);
             defer out.deinit(alloc);
             try writePrimaryStatusRemote(alloc, io, plan.output, out.body, out.parsed.value.snapshot);
             return true;
@@ -447,6 +444,20 @@ fn executeTypedRemote(
         .operator_plan,
         => return false,
     }
+}
+
+fn isDefaultRetentionPolicy(policy: ha.slot_store.RetentionPolicy) bool {
+    return policy.max_lag_lsn == 0 and
+        policy.max_retained_bytes == 0 and
+        policy.max_retained_age_ns == 0;
+}
+
+fn primaryStatusOptionsFromRetention(policy: ha.slot_store.RetentionPolicy) ha.http_client.PrimaryStatusOptions {
+    return .{
+        .max_lag_lsn = if (policy.max_lag_lsn == 0) null else policy.max_lag_lsn,
+        .max_retained_bytes = if (policy.max_retained_bytes == 0) null else policy.max_retained_bytes,
+        .max_retained_age_ns = if (policy.max_retained_age_ns == 0) null else policy.max_retained_age_ns,
+    };
 }
 
 fn typedRemotePrometheusAllowed(command: ha.admin_cli.Command) bool {
@@ -1210,9 +1221,16 @@ test "ha cmd remote commands prefer typed admin routes" {
         "primary",
         "--max-lag-lsn",
         "4",
+        "--max-retained-bytes",
+        "4096",
+        "--max-retained-age-ns",
+        "1000000",
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectContains(recorder.last_uri.?, "max_lag_lsn=4");
+    try expectContains(recorder.last_uri.?, "max_retained_bytes=4096");
+    try expectContains(recorder.last_uri.?, "max_retained_age_ns=1000000");
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
@@ -1223,6 +1241,19 @@ test "ha cmd remote commands prefer typed admin routes" {
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+
+    try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
+        "slot",
+        "list",
+        "--max-retained-bytes",
+        "8192",
+        "--max-retained-age-ns",
+        "2000000",
+    }, recorder.executor());
+
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectContains(recorder.last_uri.?, "max_retained_bytes=8192");
+    try expectContains(recorder.last_uri.?, "max_retained_age_ns=2000000");
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "status",
