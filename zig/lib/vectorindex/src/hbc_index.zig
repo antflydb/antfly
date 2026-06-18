@@ -7040,12 +7040,23 @@ fn routeBatchNodeToLeaves(
     }
 
     profile.internal_nodes += 1;
-    const child_ids = try self.alloc.dupe(u64, node.children);
-    defer self.alloc.free(child_ids);
+    var child_id_stack: [128]u64 = undefined;
+    const use_child_id_stack = node.children.len <= child_id_stack.len;
+    const child_ids = if (use_child_id_stack)
+        child_id_stack[0..node.children.len]
+    else
+        try self.alloc.dupe(u64, node.children);
+    defer if (!use_child_id_stack) self.alloc.free(child_ids);
+    if (use_child_id_stack) @memcpy(child_ids, node.children);
 
     const NodeReadHandle = CachedNodeReadHandle(@TypeOf(self));
-    const child_handles = try self.alloc.alloc(NodeReadHandle, child_ids.len);
-    defer self.alloc.free(child_handles);
+    var child_handle_stack: [128]NodeReadHandle = undefined;
+    const use_child_handle_stack = child_ids.len <= child_handle_stack.len;
+    const child_handles = if (use_child_handle_stack)
+        child_handle_stack[0..child_ids.len]
+    else
+        try self.alloc.alloc(NodeReadHandle, child_ids.len);
+    defer if (!use_child_handle_stack) self.alloc.free(child_handles);
     var child_handle_count: usize = 0;
     defer {
         for (child_handles[0..child_handle_count]) |*handle| {
@@ -7053,8 +7064,13 @@ fn routeBatchNodeToLeaves(
         }
     }
 
-    const child_nodes = try self.alloc.alloc(*const types.Node, child_ids.len);
-    defer self.alloc.free(child_nodes);
+    var child_node_stack: [128]*const types.Node = undefined;
+    const use_child_node_stack = child_ids.len <= child_node_stack.len;
+    const child_nodes = if (use_child_node_stack)
+        child_node_stack[0..child_ids.len]
+    else
+        try self.alloc.alloc(*const types.Node, child_ids.len);
+    defer if (!use_child_node_stack) self.alloc.free(child_nodes);
     for (child_ids, 0..) |child_id, child_index| {
         child_handles[child_index] = try loadNodeReadHandle(self, txn, child_id);
         child_handle_count += 1;
