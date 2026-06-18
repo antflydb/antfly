@@ -539,6 +539,44 @@ func TestHAClientCurrentFenceAcceptsEmptyReceiptReason(t *testing.T) {
 	}
 }
 
+func TestHAClientGeneratedSpecIsDedicatedAdminAPI(t *testing.T) {
+	t.Parallel()
+
+	spec, err := oapi.GetSwagger()
+	if err != nil {
+		t.Fatalf("GetSwagger returned error: %v", err)
+	}
+	if spec.Info == nil || spec.Info.Title != "Antfly Admin API" {
+		t.Fatalf("spec title = %#v, want Antfly Admin API", spec.Info)
+	}
+	if len(spec.Servers) != 1 || spec.Servers[0].URL != AdminV1Path {
+		t.Fatalf("servers = %#v, want single %s server", spec.Servers, AdminV1Path)
+	}
+	if len(spec.Security) != 1 {
+		t.Fatalf("security requirements = %#v, want one BearerAuth requirement", spec.Security)
+	}
+	if _, ok := spec.Security[0]["BearerAuth"]; !ok {
+		t.Fatalf("security requirements = %#v, want BearerAuth", spec.Security)
+	}
+	bearer := spec.Components.SecuritySchemes["BearerAuth"]
+	if bearer == nil || bearer.Value == nil ||
+		bearer.Value.Type != "http" ||
+		bearer.Value.Scheme != "bearer" {
+		t.Fatalf("BearerAuth security scheme = %#v, want http bearer", bearer)
+	}
+	pathItem := spec.Paths.Find("/ha/primary/status")
+	if pathItem == nil || pathItem.Get == nil {
+		t.Fatalf("/ha/primary/status operation = %#v, want GET operation", pathItem)
+	}
+	req, err := oapi.NewGetHAPrimaryStatusRequest("http://admin.test"+AdminV1Path+"/", nil)
+	if err != nil {
+		t.Fatalf("NewGetHAPrimaryStatusRequest returned error: %v", err)
+	}
+	if req.Method != http.MethodGet || req.URL.Path != HAPrimaryStatusPath {
+		t.Fatalf("generated primary status request = %s %s, want GET %s", req.Method, req.URL.Path, HAPrimaryStatusPath)
+	}
+}
+
 func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	t.Parallel()
 
