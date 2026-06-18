@@ -481,6 +481,7 @@ pub const CreateIndexPlan = struct {
     expressions: []const runtime_schema.UniqueExpression = &.{},
     generated_expression: ?runtime_schema.RelationalGeneratedValue = null,
     without_overlaps_period: ?[]const u8 = null,
+    nulls_not_distinct: bool = false,
     where: []const runtime_schema.UniquePredicate = &.{},
     where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
 

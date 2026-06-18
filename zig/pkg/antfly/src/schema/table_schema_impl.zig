@@ -291,6 +291,7 @@ pub const UniqueConstraint = struct {
     expressions: []UniqueExpression = &.{},
     include_columns: [][]const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
+    nulls_not_distinct: bool = false,
     where: []UniquePredicate = &.{},
     where_expressions: []storage_schema.RelationalRowsExpressionCondition = &.{},
     validation_state: UniqueConstraintValidationState = .enforced,
@@ -1286,6 +1287,9 @@ fn validateUniqueConstraints(value: std.json.Value) !void {
         if (object.get("without_overlaps_period")) |period| {
             if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
         }
+        if (object.get("nulls_not_distinct")) |nulls_not_distinct| {
+            if (nulls_not_distinct != .bool) return error.InvalidSchemaUpdateRequest;
+        }
         if (object.get("where")) |where| {
             try validateUniquePredicateDefinition(where);
         }
@@ -1304,6 +1308,7 @@ fn isAllowedUniqueConstraintField(field: []const u8) bool {
         std.mem.eql(u8, field, "expressions") or
         std.mem.eql(u8, field, "include_columns") or
         std.mem.eql(u8, field, "without_overlaps_period") or
+        std.mem.eql(u8, field, "nulls_not_distinct") or
         std.mem.eql(u8, field, "where") or
         std.mem.eql(u8, field, "where_expressions") or
         std.mem.eql(u8, field, "validation_state");
@@ -2492,6 +2497,7 @@ fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
         if (constraint.columns.len + constraint.expressions.len == 0) return error.InvalidSchemaUpdateRequest;
         if (constraint.validation_state == .validating or constraint.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
         if (constraint.without_overlaps_period) |period| try validateRelationalPeriodReference(schema, period);
+        if (constraint.nulls_not_distinct and constraint.without_overlaps_period != null) return error.InvalidSchemaUpdateRequest;
         for (constraint.columns, 0..) |column, column_index| {
             const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
             if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
@@ -3055,6 +3061,7 @@ fn uniqueConstraintsEquivalent(a: UniqueConstraint, b: UniqueConstraint) bool {
     if (!stringSlicesEqual(a.columns, b.columns)) return false;
     if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
     if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
+    if (a.nulls_not_distinct != b.nulls_not_distinct) return false;
     return uniquePredicateSlicesEqual(a.where, b.where) and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }
@@ -5065,6 +5072,7 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
             .expressions = if (object.get("expressions")) |expressions| try parseUniqueExpressions(alloc, expressions) else &.{},
             .include_columns = if (object.get("include_columns")) |include_columns| try parseStringArrayAlloc(alloc, include_columns) else &.{},
             .without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null,
+            .nulls_not_distinct = if (object.get("nulls_not_distinct")) |value| value.bool else false,
             .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
             .where_expressions = if (object.get("where_expressions")) |where_expressions| try parseRelationalRowsExpressionConditionsAlloc(alloc, where_expressions) else &.{},
             .validation_state = if (object.get("validation_state")) |validation_state|

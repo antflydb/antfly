@@ -5528,13 +5528,13 @@ const Parser = struct {
             return;
         }
         if (self.matchKeyword("unique")) {
-            try self.consumeOptionalDdlUniqueNullsDistinct();
+            const nulls_not_distinct = try self.parseOptionalDdlUniqueNullsDistinct();
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
             try self.consumeOptionalDdlImmediateConstraintTiming();
-            var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
+            var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct);
             if (constraint_name) |name| self.alloc.free(name);
             constraint_name_transferred = true;
             constraint.validation_state = .unvalidated;
@@ -5598,11 +5598,11 @@ const Parser = struct {
 
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
             if (self.matchKeyword("unique")) {
-                try self.consumeOptionalDdlUniqueNullsDistinct();
+                const nulls_not_distinct = try self.parseOptionalDdlUniqueNullsDistinct();
                 const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                 defer freeStringSlice(self.alloc, include_columns);
                 try self.consumeOptionalDdlImmediateConstraintTiming();
-                var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, include_columns, null);
+                var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, include_columns, null, nulls_not_distinct);
                 constraint.validation_state = .unvalidated;
                 try unique_constraints.append(self.alloc, constraint);
             } else if (self.matchKeyword("check")) {
@@ -5620,11 +5620,11 @@ const Parser = struct {
                 var constraint_name_transferred = false;
                 errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
                 if (self.matchKeyword("unique")) {
-                    try self.consumeOptionalDdlUniqueNullsDistinct();
+                    const nulls_not_distinct = try self.parseOptionalDdlUniqueNullsDistinct();
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
                     try self.consumeOptionalDdlImmediateConstraintTiming();
-                    var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null);
+                    var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                     constraint.validation_state = .unvalidated;
@@ -5789,11 +5789,10 @@ const Parser = struct {
         try validateSqlIdentifierListUnique(columns.items);
         try validateSqlUniqueExpressionListUnique(expressions.items);
 
-        if (self.matchKeyword("nulls")) {
-            if (!unique) return error.UnsupportedSqlShape;
-            if (self.matchKeyword("not")) return error.UnsupportedSqlShape;
-            try self.expectKeyword("distinct");
-        }
+        const nulls_policy = try self.parseOptionalDdlUniqueNullsDistinct();
+        if (nulls_policy != null and !unique) return error.UnsupportedSqlShape;
+        const nulls_not_distinct = nulls_policy orelse false;
+        if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
 
         var include_columns: []const []const u8 = &.{};
         var include_columns_owned = false;
@@ -5859,6 +5858,7 @@ const Parser = struct {
             .expressions = owned_expressions,
             .generated_expression = generated_expression,
             .without_overlaps_period = period,
+            .nulls_not_distinct = nulls_not_distinct,
             .where = predicates,
             .where_expressions = where_expressions,
         };
@@ -7350,10 +7350,11 @@ const Parser = struct {
         return true;
     }
 
-    fn consumeOptionalDdlUniqueNullsDistinct(self: *@This()) !void {
-        if (!self.matchKeyword("nulls")) return;
-        if (self.matchKeyword("not")) return error.UnsupportedSqlShape;
+    fn parseOptionalDdlUniqueNullsDistinct(self: *@This()) !?bool {
+        if (!self.matchKeyword("nulls")) return null;
+        const not_distinct = self.matchKeyword("not");
         try self.expectKeyword("distinct");
+        return not_distinct;
     }
 
     fn consumeOptionalDdlImmediateConstraintTiming(self: *@This()) !void {

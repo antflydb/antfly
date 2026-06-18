@@ -145,6 +145,49 @@ pub fn scanUncompressedPlainI64ColumnChunkAlloc(alloc: Allocator, column_chunk_b
     return try scanPlainI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
 
+pub fn decodePlainI32AsI64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
+    try header.validatePlainRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    const count: usize = @intCast(header.value_count);
+    const needed = count * 4;
+    if (payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(i64, count);
+    for (values, 0..) |*value, idx| {
+        value.* = std.mem.readInt(i32, payload[idx * 4 .. idx * 4 + 4][0..4], .little);
+    }
+    return values;
+}
+
+pub fn scanUncompressedPlainI32AsI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
+    return try scanPlainI32AsI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanPlainI32AsI64ColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) ![]i64 {
+    var values = std.ArrayListUnmanaged(i64).empty;
+    errdefer values.deinit(alloc);
+    var cursor: usize = 0;
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validatePlainRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        const page_values = try decodePlainI32AsI64Alloc(alloc, parsed.header, payload.bytes);
+        defer alloc.free(page_values);
+        try values.appendSlice(alloc, page_values);
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
 pub fn scanPlainI64ColumnChunkAlloc(
     alloc: Allocator,
     column_chunk_bytes: []const u8,
@@ -182,6 +225,18 @@ pub fn decodePlainI64DictionaryPageAlloc(alloc: Allocator, header: Header, page_
     return values;
 }
 
+pub fn decodePlainI32DictionaryPageAsI64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
+    try header.validatePlainDictionary();
+    const count: usize = @intCast(header.value_count);
+    const needed = count * 4;
+    if (page_payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(i64, count);
+    for (values, 0..) |*value, idx| {
+        value.* = std.mem.readInt(i32, page_payload[idx * 4 .. idx * 4 + 4][0..4], .little);
+    }
+    return values;
+}
+
 pub fn decodeDictionaryI64DataPageAlloc(
     alloc: Allocator,
     header: Header,
@@ -209,6 +264,48 @@ pub fn decodeDictionaryI64DataPageAlloc(
 
 pub fn scanUncompressedDictionaryI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
     return try scanDictionaryI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanUncompressedDictionaryI32AsI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
+    return try scanDictionaryI32AsI64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanDictionaryI32AsI64ColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) ![]i64 {
+    var cursor: usize = 0;
+    if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
+
+    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+    try parsed_dictionary.header.validatePlainDictionary();
+    cursor += parsed_dictionary.header_len;
+    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+    cursor += parsed_dictionary.header.compressed_page_size;
+    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+    defer dictionary_payload.deinit(alloc);
+    const dictionary = try decodePlainI32DictionaryPageAsI64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    defer alloc.free(dictionary);
+
+    var values = std.ArrayListUnmanaged(i64).empty;
+    errdefer values.deinit(alloc);
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateDictionaryRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        const page_values = try decodeDictionaryI64DataPageAlloc(alloc, parsed.header, dictionary, payload.bytes);
+        defer alloc.free(page_values);
+        try values.appendSlice(alloc, page_values);
+    }
+    return try values.toOwnedSlice(alloc);
 }
 
 pub fn scanDictionaryI64ColumnChunkAlloc(

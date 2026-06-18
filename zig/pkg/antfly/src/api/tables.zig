@@ -1575,6 +1575,7 @@ fn uniqueConstraintsEqual(a: runtime_schema_mod.UniqueConstraint, b: runtime_sch
         uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
         stringSlicesEqual(a.include_columns, b.include_columns) and
         optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
+        a.nulls_not_distinct == b.nulls_not_distinct and
         uniquePredicateSlicesEqual(a.where, b.where) and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
 }

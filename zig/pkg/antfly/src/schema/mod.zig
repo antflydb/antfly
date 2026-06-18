@@ -569,6 +569,7 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
             .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
             .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
             .without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
+            .nulls_not_distinct = constraint.nulls_not_distinct,
             .where = try cloneUniquePredicates(alloc, constraint.where),
             .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, constraint.where_expressions),
             .validation_state = switch (constraint.validation_state) {

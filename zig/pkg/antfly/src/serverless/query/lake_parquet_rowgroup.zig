@@ -411,7 +411,13 @@ const PlainI64Mode = enum {
 
 const SupportedColumnMode = union(enum) {
     i64: PlainI64Mode,
+    i32: PlainI32Mode,
     bytes: ByteArrayMode,
+};
+
+const PlainI32Mode = enum {
+    required,
+    dictionary_required,
 };
 
 const ByteArrayMode = enum {
@@ -493,6 +499,16 @@ fn buildPlainI64RowGroupBatchAlloc(
                 },
                 .dictionary_required => {
                     decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression) };
+                    null_bitmaps[idx] = &.{};
+                },
+            },
+            .i32 => |i32_mode| switch (i32_mode) {
+                .required => {
+                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanPlainI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression) };
+                    null_bitmaps[idx] = &.{};
+                },
+                .dictionary_required => {
+                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
                 },
             },
@@ -1038,6 +1054,14 @@ fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !Suppor
     if (chunk.physical_type.len == 0 or std.ascii.eqlIgnoreCase(chunk.physical_type, "int64")) {
         return .{ .i64 = try plainI64ModeForColumnChunk(chunk) };
     }
+    if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32")) {
+        if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .i32 = .required };
+        if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
+            std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
+        {
+            return .{ .i32 = .dictionary_required };
+        }
+    }
     if (std.ascii.eqlIgnoreCase(chunk.physical_type, "byte_array")) {
         if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .bytes = .required };
         if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
@@ -1156,6 +1180,17 @@ fn appendPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, va
     }
 }
 
+fn appendPlainI32DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const i32) !void {
+    const byte_len: usize = values.len * 4;
+    try appendPlainI64DataPageHeader(out, alloc, values.len, byte_len, byte_len);
+
+    for (values) |value| {
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(i32, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
 fn appendSnappyPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const i64) !void {
     var payload = std.ArrayListUnmanaged(u8).empty;
     defer payload.deinit(alloc);
@@ -1235,6 +1270,32 @@ fn appendPlainI64DictionaryPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocat
     for (values) |value| {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(i64, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
+fn appendPlainI32DictionaryPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const i32) !void {
+    const byte_len: i32 = @intCast(values.len * 4);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 2);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 7, .struct_);
+
+    var dictionary_prev: i16 = 0;
+    try appendField(out, alloc, &dictionary_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &dictionary_prev, 2, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    for (values) |value| {
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(i32, &buf, value, .little);
         try out.appendSlice(alloc, &buf);
     }
 }
@@ -1847,6 +1908,96 @@ test "parquet row group batch dispatches required byte array columns from invent
 
     inventory.files[0].row_groups[0].column_chunks[1].encoding[0] = 'd';
     try std.testing.expectError(error.UnsupportedParquetPage, planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"tenant"}));
+}
+
+test "parquet row group batch dispatches int32 columns from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = 100,
+            .total_byte_len = 256,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 100,
+                    .compressed_len = 64,
+                    .uncompressed_len = 64,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int32"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "rank"),
+                    .file_offset = 164,
+                    .compressed_len = 64,
+                    .uncompressed_len = 64,
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                    .physical_type = try alloc.dupe(u8, "int32"),
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var amount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer amount_chunk.deinit(alloc);
+    try appendPlainI32DataPage(&amount_chunk, alloc, &[_]i32{ 10, 20, 30 });
+    var rank_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer rank_chunk.deinit(alloc);
+    try appendPlainI32DictionaryPage(&rank_chunk, alloc, &[_]i32{ 1, 2 });
+    try appendDictionaryI64DataPage(&rank_chunk, alloc, 3, 1, &[_]u8{ 3, 0b00000110 });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "amount", .bytes = amount_chunk.items },
+        .{ .column_id = "rank", .bytes = rank_chunk.items },
+    });
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 2 }, owned.batch.columns[1].values.i64);
+
+    const projection = [_][]const u8{"amount"};
+    const chunks = [_]ColumnChunkInput{
+        .{ .column_id = "amount", .bytes = amount_chunk.items },
+        .{ .column_id = "rank", .bytes = rank_chunk.items },
+    };
+    const row_groups = [_]RowGroupInput{.{
+        .file_id = "part-a.parquet",
+        .row_group_ordinal = 0,
+        .chunks = &chunks,
+    }};
+    var source = try RowGroupSource.init(inventory, &row_groups);
+    defer source.deinit(alloc);
+
+    var result = try lake_rows.scanRowsAlloc(alloc, source.rowSource(), .{
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "rank",
+            .op = .eq_i64,
+            .i64_value = 2,
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
 }
 
 test "parquet row group batch dispatches dictionary byte array columns from inventory" {
@@ -2914,6 +3065,133 @@ test "parquet object range discovery scans dictionary byte array predicates" {
             .column = "tenant",
             .op = .eq_bytes,
             .bytes_value = "t2",
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].cells[0].value.?.i64);
+    try std.testing.expectEqual(@as(i64, 30), result.rows[1].cells[0].value.?.i64);
+    try std.testing.expectEqual(@as(u64, 1), result.rows[0].row_ref.external.row_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), result.rows[1].row_ref.external.row_ordinal);
+}
+
+test "parquet object range discovery scans int32 predicates" {
+    const alloc = std.testing.allocator;
+
+    var amount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer amount_chunk.deinit(alloc);
+    try appendPlainI32DataPage(&amount_chunk, alloc, &[_]i32{ 10, 20, 30 });
+    var rank_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer rank_chunk.deinit(alloc);
+    try appendPlainI32DictionaryPage(&rank_chunk, alloc, &[_]i32{ 1, 2 });
+    try appendDictionaryI64DataPage(&rank_chunk, alloc, 3, 1, &[_]u8{ 3, 0b00000110 });
+
+    var object = std.ArrayListUnmanaged(u8).empty;
+    defer object.deinit(alloc);
+    try object.appendNTimes(alloc, 0, 100);
+    const amount_offset = object.items.len;
+    try object.appendSlice(alloc, amount_chunk.items);
+    const rank_offset = object.items.len;
+    try object.appendSlice(alloc, rank_chunk.items);
+
+    const footers = [_]TestColumnFooter{
+        .{
+            .column_id = "amount",
+            .column_offset = amount_offset,
+            .compressed_len = amount_chunk.items.len,
+            .uncompressed_len = amount_chunk.items.len,
+            .physical_type = 1,
+        },
+        .{
+            .column_id = "rank",
+            .column_offset = rank_offset,
+            .compressed_len = rank_chunk.items.len,
+            .uncompressed_len = rank_chunk.items.len,
+            .physical_type = 1,
+            .encoding = 7,
+        },
+    };
+    const metadata_start = object.items.len;
+    try appendPlainI64FooterMetadata(&object, alloc, 3, &footers);
+    const metadata_len = object.items.len - metadata_start;
+    try appendParquetTrailer(&object, alloc, metadata_len);
+
+    const MemoryRangeReader = struct {
+        body: []const u8,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings("bucket", bucket);
+            try std.testing.expectEqualStrings("events/part-a.parquet", key);
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var range_reader = MemoryRangeReader{ .body = object.items };
+
+    var raw = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer raw.deinit(alloc);
+    raw.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = object.items.len,
+        .row_count = 0,
+        .row_groups = &.{},
+    };
+    try raw.validate();
+
+    const projected = [_][]const u8{"amount"};
+    const scan_columns = [_][]const u8{ "amount", "rank" };
+    var discovered = try discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+        alloc,
+        range_reader.reader(),
+        raw,
+        &scan_columns,
+        16,
+    );
+    defer discovered.deinit(alloc);
+    try std.testing.expectEqualStrings("int32", discovered.inventory.files[0].row_groups[0].column_chunks[0].physical_type);
+    try std.testing.expectEqualStrings("int32", discovered.inventory.files[0].row_groups[0].column_chunks[1].physical_type);
+
+    var result = try querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .binding = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:objects" },
+            .schema_fingerprint = "schema-v1",
+        },
+        .reader = range_reader.reader(),
+        .inventory = discovered.inventory,
+        .projected_columns = &projected,
+        .predicate = .{
+            .column = "rank",
+            .op = .eq_i64,
+            .i64_value = 2,
         },
     });
     defer result.deinit(alloc);

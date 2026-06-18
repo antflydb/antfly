@@ -2672,7 +2672,7 @@ pub fn temporalPeriodEndBoundBytesFromJsonAlloc(
 pub fn uniqueConstraintTupleValueAlloc(alloc: Allocator, row_value: []const u8, constraint: schema_mod.UniqueConstraint) !?[]u8 {
     if (!(try rowMatchesUniqueConstraintPredicates(alloc, row_value, constraint.where))) return null;
     if (!(try rowMatchesExpressionConditions(alloc, row_value, constraint.where_expressions))) return null;
-    return try uniqueConstraintKeysTupleValueAlloc(alloc, row_value, constraint.columns, constraint.expressions);
+    return try uniqueConstraintKeysTupleValueAlloc(alloc, row_value, constraint.columns, constraint.expressions, constraint.nulls_not_distinct);
 }
 
 fn rowMatchesUniqueConstraintPredicates(alloc: Allocator, row_value: []const u8, predicates: []const schema_mod.UniquePredicate) !bool {
@@ -4417,26 +4417,44 @@ fn cellEqualsJsonLiteral(alloc: Allocator, cell: relational_row_codec.Cell, valu
     }
 }
 
-fn uniqueConstraintKeysTupleValueAlloc(alloc: Allocator, row_value: []const u8, columns: []const []const u8, expressions: []const schema_mod.UniqueExpression) !?[]u8 {
+fn uniqueConstraintKeysTupleValueAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    columns: []const []const u8,
+    expressions: []const schema_mod.UniqueExpression,
+    include_nulls: bool,
+) !?[]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     for (columns) |column_path| {
         const component = (try uniqueConstraintColumnValueAlloc(alloc, row_value, column_path)) orelse {
-            out.deinit(alloc);
-            return null;
+            if (!include_nulls) {
+                out.deinit(alloc);
+                return null;
+            }
+            try internal_keys.appendEncodedComponent(&out, alloc, typedJsonNullValue());
+            continue;
         };
         defer alloc.free(component);
         try internal_keys.appendEncodedComponent(&out, alloc, component);
     }
     for (expressions) |expression| {
         const component = (try uniqueConstraintExpressionValueAlloc(alloc, row_value, expression)) orelse {
-            out.deinit(alloc);
-            return null;
+            if (!include_nulls) {
+                out.deinit(alloc);
+                return null;
+            }
+            try internal_keys.appendEncodedComponent(&out, alloc, typedJsonNullValue());
+            continue;
         };
         defer alloc.free(component);
         try internal_keys.appendEncodedComponent(&out, alloc, component);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn typedJsonNullValue() []const u8 {
+    return &[_]u8{0xff};
 }
 
 fn requiredConstraintColumnsTupleValueAlloc(alloc: Allocator, row_value: []const u8, columns: []const []const u8) ![]u8 {

@@ -432,6 +432,7 @@ pub const UniqueConstraint = struct {
     expressions: []const UniqueExpression = &.{},
     include_columns: []const []const u8 = &.{},
     without_overlaps_period: ?[]const u8 = null,
+    nulls_not_distinct: bool = false,
     where: []const UniquePredicate = &.{},
     where_expressions: []const RelationalRowsExpressionCondition = &.{},
     validation_state: UniqueConstraintValidationState = .enforced,
@@ -656,6 +657,7 @@ pub fn uniqueConstraintCatalogsEqual(current: []const UniqueConstraint, next: []
         if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
         if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
         if (!optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period)) return false;
+        if (a.nulls_not_distinct != b.nulls_not_distinct) return false;
         if (!uniquePredicateSlicesEqual(a.where, b.where)) return false;
         if (!relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions)) return false;
         if (a.validation_state != b.validation_state) return false;
@@ -732,7 +734,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 38); // format version
+    try appendU32(&buf, alloc, 39); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -869,6 +871,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         }
         try appendStringSlice(&buf, alloc, constraint.include_columns);
         try appendOptStr(&buf, alloc, constraint.without_overlaps_period);
+        try buf.append(alloc, if (constraint.nulls_not_distinct) 1 else 0);
         try appendU32(&buf, alloc, @intCast(constraint.where.len));
         for (constraint.where) |predicate| {
             try buf.append(alloc, @intFromEnum(predicate.op));
@@ -964,7 +967,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 38) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 39) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1406,6 +1409,11 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeStringSlice(alloc, include_columns);
             const without_overlaps_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
             errdefer if (without_overlaps_period) |period| alloc.free(period);
+            const nulls_not_distinct = if (fmt_version >= 39) blk: {
+                const value = data[pos] == 1;
+                pos += 1;
+                break :blk value;
+            } else false;
             const where = if (fmt_version >= 19) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, where);
             const where_expressions = if (fmt_version >= 31) try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos) else &.{};
@@ -1421,6 +1429,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .expressions = expressions,
                 .include_columns = include_columns,
                 .without_overlaps_period = without_overlaps_period,
+                .nulls_not_distinct = nulls_not_distinct,
                 .where = where,
                 .where_expressions = where_expressions,
                 .validation_state = validation_state,
