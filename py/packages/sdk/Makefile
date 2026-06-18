@@ -27,7 +27,7 @@ docs:
 
 check:
 	uv run ruff check src tests --fix
-	uv run ruff format src tests --fix
+	uv run ruff format src tests
 	uv run pyright src tests
 
 update-deps:
