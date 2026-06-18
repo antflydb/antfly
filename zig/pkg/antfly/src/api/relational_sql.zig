@@ -60265,20 +60265,6 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT;",
         },
         .{
-            .name = "unsupported deferrable unique constraint",
-            .family = .unsupported_ddl,
-            .plan = "unsupported:ddl:requires=deferrable_unique_constraint",
-            .classification_reason = "deferrable_unique_constraint",
-            .sql = "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;",
-        },
-        .{
-            .name = "unsupported deferrable primary key",
-            .family = .unsupported_ddl,
-            .plan = "unsupported:ddl:requires=deferrable_primary_key",
-            .classification_reason = "deferrable_primary_key",
-            .sql = "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE;",
-        },
-        .{
             .name = "schema replace table",
             .family = .ddl,
             .summary = .{ .ddl_tag = .create_table, .table_name = "usage_records", .select = 1 },

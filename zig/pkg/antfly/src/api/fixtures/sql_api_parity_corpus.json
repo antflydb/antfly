@@ -272,20 +272,6 @@
       "sql": "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT;"
     },
     {
-      "name": "unsupported deferrable unique constraint",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=deferrable_unique_constraint",
-      "classification_reason": "deferrable_unique_constraint",
-      "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;"
-    },
-    {
-      "name": "unsupported deferrable primary key",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=deferrable_primary_key",
-      "classification_reason": "deferrable_primary_key",
-      "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE;"
-    },
-    {
       "name": "schema replace table",
       "family": "ddl",
       "summary": {
@@ -8092,6 +8078,20 @@
       "plan": "unsupported:ddl:requires=recursive_cte_stream_plan",
       "classification_reason": "recursive_cte_stream_plan",
       "sql": "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
+    },
+    {
+      "name": "unsupported deferrable unique constraint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=deferrable_unique_constraint",
+      "classification_reason": "deferrable_unique_constraint",
+      "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE"
+    },
+    {
+      "name": "unsupported deferrable primary key",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=deferrable_primary_key",
+      "classification_reason": "deferrable_primary_key",
+      "sql": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE"
     },
     {
       "name": "read classifier row query",

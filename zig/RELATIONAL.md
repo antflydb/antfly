@@ -1078,8 +1078,9 @@ statement, cursor portal, `EXPLAIN` wrapper, maintenance, transaction-control,
 catalog DDL, collation/operator/aggregate/cast catalog syntax, and adapter-only
 catalog no-op examples use this path because their expected behavior is fully
 described by SQL text, optional setup SQL, summary metadata, and a typed-plan
-fingerprint. Comment metadata, drop-table, truncate, and truncate fail-closed
-examples also use this path. Pure row-query workload examples, including JSON
+fingerprint. Comment metadata, drop-table, truncate, truncate fail-closed, and
+pure unsupported constraint examples such as deferrable primary/unique keys
+also use this path. Pure row-query workload examples, including JSON
 path projection/filtering, structured access predicates, schema-qualified table
 names, generated-column pushdown setup, alias-qualified outputs, row claims,
 statement-time projections, UUID/date projections, boolean predicates,
