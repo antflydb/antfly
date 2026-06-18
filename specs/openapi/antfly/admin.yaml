@@ -1695,7 +1695,7 @@ components:
           nullable: true
     HARetentionSnapshot:
       type: object
-      required: [primary_lsn, oldest_restart_lsn, retained_lsn_count, active_slots, reseed_recommended]
+      required: [primary_lsn, oldest_restart_lsn, retained_lsn_count, retained_byte_count, active_slots, reseed_recommended]
       additionalProperties: false
       properties:
         primary_lsn:
@@ -1707,6 +1707,10 @@ components:
           format: uint64
           minimum: 0
         retained_lsn_count:
+          type: integer
+          format: uint64
+          minimum: 0
+        retained_byte_count:
           type: integer
           format: uint64
           minimum: 0

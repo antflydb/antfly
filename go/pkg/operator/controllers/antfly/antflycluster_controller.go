@@ -6400,6 +6400,7 @@ func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) 
 		Retention: antflyv1.HARetentionStatus{
 			OldestRestartLSN:  snapshot.Retention.OldestRestartLsn,
 			RetainedLSNCount:  snapshot.Retention.RetainedLsnCount,
+			RetainedByteCount: snapshot.Retention.RetainedByteCount,
 			ActiveSlots:       haUint64ToInt32(snapshot.Retention.ActiveSlots),
 			ReseedRecommended: haUint64ToInt32(snapshot.Retention.ReseedRecommended),
 		},

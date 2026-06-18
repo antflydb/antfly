@@ -577,6 +577,7 @@ fn adminRetentionSnapshot(snapshot: slot_store.RetentionSnapshot) !admin_api.HAR
         .primary_lsn = try adminI64(snapshot.primary_lsn),
         .oldest_restart_lsn = try adminI64(snapshot.oldest_restart_lsn),
         .retained_lsn_count = try adminI64(snapshot.retained_lsn_count),
+        .retained_byte_count = try adminI64(snapshot.retained_byte_count),
         .active_slots = try adminI64(snapshot.active_slots),
         .reseed_recommended = try adminI64(snapshot.reseed_recommended),
     };
@@ -1413,6 +1414,7 @@ fn appendPrimarySnapshotLines(
     try appendU64Line(alloc, out, "retention.primary_lsn", snapshot.retention.primary_lsn);
     try appendU64Line(alloc, out, "retention.oldest_restart_lsn", snapshot.retention.oldest_restart_lsn);
     try appendU64Line(alloc, out, "retention.retained_lsn_count", snapshot.retention.retained_lsn_count);
+    try appendU64Line(alloc, out, "retention.retained_byte_count", snapshot.retention.retained_byte_count);
     try appendUsizeLine(alloc, out, "retention.active_slots", snapshot.retention.active_slots);
     try appendUsizeLine(alloc, out, "retention.reseed_recommended", snapshot.retention.reseed_recommended);
 
@@ -1490,6 +1492,7 @@ fn appendPrimaryMetricsLines(
     try appendU64Line(alloc, out, "max_retention_lag_lsn", snapshot.max_retention_lag_lsn);
     try appendU64Line(alloc, out, "retention_oldest_restart_lsn", snapshot.retention_oldest_restart_lsn);
     try appendU64Line(alloc, out, "retention_retained_lsn_count", snapshot.retention_retained_lsn_count);
+    try appendU64Line(alloc, out, "retention_retained_byte_count", snapshot.retention_retained_byte_count);
     try appendU64Line(alloc, out, "retention_active_slots", snapshot.retention_active_slots);
     try appendU64Line(alloc, out, "retention_reseed_recommended", snapshot.retention_reseed_recommended);
     try appendU64Line(alloc, out, "durability_configured", snapshot.durability_configured);

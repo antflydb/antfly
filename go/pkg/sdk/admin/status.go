@@ -45,6 +45,7 @@ type haRetentionStatusJSON struct {
 	PrimaryLSN        *uint64 `json:"primary_lsn"`
 	OldestRestartLSN  *uint64 `json:"oldest_restart_lsn"`
 	RetainedLSNCount  *uint64 `json:"retained_lsn_count"`
+	RetainedByteCount *uint64 `json:"retained_byte_count"`
 	ActiveSlots       *uint64 `json:"active_slots"`
 	ReseedRecommended *uint64 `json:"reseed_recommended"`
 }
@@ -153,6 +154,7 @@ func ParseHAPrimaryStatus(raw []byte) (*ParsedHAPrimaryStatus, error) {
 					PrimaryLsn:        haUint64StatusValue(snapshot.Retention.PrimaryLSN),
 					OldestRestartLsn:  haUint64StatusValue(snapshot.Retention.OldestRestartLSN),
 					RetainedLsnCount:  haUint64StatusValue(snapshot.Retention.RetainedLSNCount),
+					RetainedByteCount: haUint64StatusValue(snapshot.Retention.RetainedByteCount),
 					ActiveSlots:       haUint64StatusValue(snapshot.Retention.ActiveSlots),
 					ReseedRecommended: haUint64StatusValue(snapshot.Retention.ReseedRecommended),
 				},
@@ -291,6 +293,7 @@ func haRetentionStatusJSONComplete(retention *haRetentionStatusJSON) bool {
 		retention.PrimaryLSN != nil &&
 		retention.OldestRestartLSN != nil &&
 		retention.RetainedLSNCount != nil &&
+		retention.RetainedByteCount != nil &&
 		retention.ActiveSlots != nil &&
 		retention.ReseedRecommended != nil
 }

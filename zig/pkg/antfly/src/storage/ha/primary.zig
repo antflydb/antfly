@@ -317,7 +317,23 @@ pub const Primary = struct {
         self: *Primary,
         policy: slot_store.RetentionPolicy,
     ) !slot_store.RetentionSnapshot {
-        return try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
+        var snapshot = try self.slots.retentionSnapshotForTimeline(self.lastLsn(), self.identity.timeline_id, policy);
+        snapshot.retained_byte_count = try self.retainedByteCount(snapshot);
+        return snapshot;
+    }
+
+    fn retainedByteCount(self: *Primary, snapshot: slot_store.RetentionSnapshot) !u64 {
+        if (snapshot.retained_lsn_count == 0) return 0;
+        const from_lsn = @max(snapshot.oldest_restart_lsn, 1);
+        const entries = try self.log.iterateFrom(self.alloc, from_lsn);
+        defer replication_log.freeEntries(self.alloc, entries);
+
+        var total: u64 = 0;
+        for (entries) |entry| {
+            if (entry.wal_lsn > snapshot.primary_lsn) continue;
+            total += @intCast(entry.encoded.len);
+        }
+        return total;
     }
 
     pub fn evaluateDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
@@ -838,6 +854,7 @@ test "storage.ha primary begins base backup with slot retention pin" {
     const snapshot = try primary.retentionSnapshot(.{});
     try std.testing.expectEqual(@as(u64, 2), snapshot.oldest_restart_lsn);
     try std.testing.expectEqual(@as(u64, 1), snapshot.retained_lsn_count);
+    try std.testing.expect(snapshot.retained_byte_count > 0);
 
     const entries = try primary.streamFrom(alloc, "standby-a", started.backup_lsn);
     defer replication_log.freeEntries(alloc, entries);

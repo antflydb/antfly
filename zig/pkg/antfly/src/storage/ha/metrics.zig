@@ -66,6 +66,7 @@ pub const PrimaryMetrics = struct {
     max_retention_lag_lsn: u64,
     retention_oldest_restart_lsn: u64,
     retention_retained_lsn_count: u64,
+    retention_retained_byte_count: u64,
     retention_active_slots: u64,
     retention_reseed_recommended: u64,
     durability_configured: u64,
@@ -180,6 +181,7 @@ pub fn fromPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapsho
         .max_retention_lag_lsn = max_retention_lag_lsn,
         .retention_oldest_restart_lsn = snapshot.retention.oldest_restart_lsn,
         .retention_retained_lsn_count = snapshot.retention.retained_lsn_count,
+        .retention_retained_byte_count = snapshot.retention.retained_byte_count,
         .retention_active_slots = @intCast(snapshot.retention.active_slots),
         .retention_reseed_recommended = @intCast(snapshot.retention.reseed_recommended),
         .durability_configured = boolGauge(durability != null),
@@ -259,6 +261,7 @@ pub fn renderPrimaryPrometheusAlloc(alloc: Allocator, metrics: PrimaryMetrics) !
     try appendGauge(alloc, &out, "antfly_ha_primary_max_retention_lag_lsn", metrics.max_retention_lag_lsn);
     try appendGauge(alloc, &out, "antfly_ha_primary_retention_oldest_restart_lsn", metrics.retention_oldest_restart_lsn);
     try appendGauge(alloc, &out, "antfly_ha_primary_retention_retained_lsn_count", metrics.retention_retained_lsn_count);
+    try appendGauge(alloc, &out, "antfly_ha_primary_retention_retained_byte_count", metrics.retention_retained_byte_count);
     try appendGauge(alloc, &out, "antfly_ha_primary_retention_active_slots", metrics.retention_active_slots);
     try appendGauge(alloc, &out, "antfly_ha_primary_retention_reseed_recommended", metrics.retention_reseed_recommended);
     try appendGauge(alloc, &out, "antfly_ha_primary_durability_configured", metrics.durability_configured);
@@ -465,6 +468,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
             .primary_lsn = 20,
             .oldest_restart_lsn = 3,
             .retained_lsn_count = 17,
+            .retained_byte_count = 8192,
             .active_slots = 1,
             .reseed_recommended = 1,
         },
@@ -494,6 +498,7 @@ test "storage.ha metrics derives primary gauges from status snapshot" {
     try std.testing.expectEqual(@as(u64, 17), metrics.max_retention_lag_lsn);
     try std.testing.expectEqual(@as(u64, 3), metrics.retention_oldest_restart_lsn);
     try std.testing.expectEqual(@as(u64, 17), metrics.retention_retained_lsn_count);
+    try std.testing.expectEqual(@as(u64, 8192), metrics.retention_retained_byte_count);
     try std.testing.expectEqual(@as(u64, 1), metrics.retention_active_slots);
     try std.testing.expectEqual(@as(u64, 1), metrics.retention_reseed_recommended);
     try std.testing.expectEqual(@as(u64, 1), metrics.durability_configured);
@@ -596,6 +601,7 @@ test "storage.ha metrics renders prometheus text" {
         .max_retention_lag_lsn = 12,
         .retention_oldest_restart_lsn = 8,
         .retention_retained_lsn_count = 12,
+        .retention_retained_byte_count = 4096,
         .retention_active_slots = 1,
         .retention_reseed_recommended = 0,
         .durability_configured = 1,

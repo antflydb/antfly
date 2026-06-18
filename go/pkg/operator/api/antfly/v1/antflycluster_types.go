@@ -1988,6 +1988,9 @@ type HARetentionStatus struct {
 
 	RetainedLSNCount uint64 `json:"retainedLSNCount,omitempty"`
 
+	// RetainedByteCount is the encoded HA WAL bytes retained for active slots.
+	RetainedByteCount uint64 `json:"retainedByteCount,omitempty"`
+
 	ActiveSlots int32 `json:"activeSlots,omitempty"`
 
 	ReseedRecommended int32 `json:"reseedRecommended,omitempty"`

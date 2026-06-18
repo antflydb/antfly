@@ -164,6 +164,7 @@ pub const HARetentionSnapshot = struct {
     primary_lsn: i64,
     oldest_restart_lsn: i64,
     retained_lsn_count: i64,
+    retained_byte_count: i64,
     active_slots: i64,
     reseed_recommended: i64,
 };

@@ -84,6 +84,7 @@ pub const RetentionSnapshot = struct {
     primary_lsn: u64,
     oldest_restart_lsn: u64,
     retained_lsn_count: u64,
+    retained_byte_count: u64 = 0,
     active_slots: usize,
     reseed_recommended: usize,
 };

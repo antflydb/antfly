@@ -1131,6 +1131,7 @@ fn adminRetentionSnapshot(snapshot: slot_store.RetentionSnapshot) !admin_api.HAR
         .primary_lsn = try adminI64(snapshot.primary_lsn),
         .oldest_restart_lsn = try adminI64(snapshot.oldest_restart_lsn),
         .retained_lsn_count = try adminI64(snapshot.retained_lsn_count),
+        .retained_byte_count = try adminI64(snapshot.retained_byte_count),
         .active_slots = try adminI64(snapshot.active_slots),
         .reseed_recommended = try adminI64(snapshot.reseed_recommended),
     };

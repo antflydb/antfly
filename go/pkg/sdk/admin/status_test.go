@@ -32,6 +32,9 @@ func TestHAStatusParserAcceptsLegacyPrimaryEnvelope(t *testing.T) {
 	if snapshot.Retention.ActiveSlots != 1 || snapshot.Retention.ReseedRecommended != 0 {
 		t.Fatalf("Retention = %+v, want active_slots=1 reseed_recommended=0", snapshot.Retention)
 	}
+	if snapshot.Retention.RetainedByteCount != 512 {
+		t.Fatalf("RetainedByteCount = %d, want 512", snapshot.Retention.RetainedByteCount)
+	}
 	if got := len(snapshot.Slots); got != 1 {
 		t.Fatalf("len(Slots) = %d, want 1", got)
 	}
@@ -346,6 +349,7 @@ func haGeneratedPrimaryStatusJSON() string {
 				"primary_lsn":12,
 				"oldest_restart_lsn":7,
 				"retained_lsn_count":5,
+				"retained_byte_count":512,
 				"active_slots":1,
 				"reseed_recommended":0
 			},
@@ -424,6 +428,7 @@ func haLegacyPrimaryStatusJSON() string {
 					"primary_lsn":12,
 					"oldest_restart_lsn":7,
 					"retained_lsn_count":5,
+					"retained_byte_count":512,
 					"active_slots":1,
 					"reseed_recommended":0
 				},

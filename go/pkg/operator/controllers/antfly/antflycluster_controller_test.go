@@ -228,6 +228,7 @@ func haPromotionAdminResult(generation uint64, token string, promotedNodeID stri
 		FenceNewEpoch:         7,
 		FenceRequiredLSN:      12,
 		FenceObservedLSN:      12,
+		PromotionMode:         "safe",
 	}
 }
 
@@ -3033,6 +3034,7 @@ func TestHAPrimaryRouteActionRequiresDirectPromotionResultToMatchRecordedPromoti
 			FenceNewEpoch:         7,
 			FenceRequiredLSN:      12,
 			FenceObservedLSN:      13,
+			PromotionMode:         "safe",
 		},
 	}
 	route := antflyv1.HAPlannedActionStatus{
@@ -5129,7 +5131,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 			g.Expect(query.Get("sync_required")).To(Equal("1"))
 			g.Expect(query["sync_standby"]).To(Equal([]string{"standby-a"}))
 			g.Expect(query.Get("sync_failure")).To(Equal("fail-closed"))
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"would_block","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":11,"missing_lsn_count":1,"satisfied_count":0,"required_count":1,"candidate_count":1}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0},"durability":{"status":"would_block","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":11,"missing_lsn_count":1,"satisfied_count":0,"required_count":1,"candidate_count":1}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5163,6 +5165,7 @@ func TestObserveHAPrimaryAdminStatus(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PrimaryAdminLastError).To(BeEmpty())
 	g.Expect(cluster.Status.HAStatus.Retention.OldestRestartLSN).To(Equal(uint64(7)))
 	g.Expect(cluster.Status.HAStatus.Retention.RetainedLSNCount).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.Retention.RetainedByteCount).To(Equal(uint64(512)))
 	g.Expect(cluster.Status.HAStatus.Retention.ActiveSlots).To(Equal(int32(1)))
 	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
 	standby := cluster.Status.HAStatus.Standbys[0]
@@ -5197,7 +5200,7 @@ func TestObserveHAPrimaryAdminStatusTargetsPromotedPrimaryAdminURL(t *testing.T)
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 			observedHost = req.URL.Host
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"retained_byte_count":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5239,7 +5242,7 @@ func TestObserveHAPrimaryAdminStatusIgnoresIncompletePromotionForTargeting(t *te
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
 			observedHost = req.URL.Host
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":5,"epoch":7},"current_lsn":21,"slots":[],"retention":{"primary_lsn":21,"oldest_restart_lsn":21,"retained_lsn_count":0,"retained_byte_count":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5342,7 +5345,7 @@ func TestObserveHAPrimaryAdminStatusRejectsMismatchedIdentityScope(t *testing.T)
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			g.Expect(req.Method).To(Equal(http.MethodGet))
 			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/primary/status"))
-			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":99,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":12,"retained_lsn_count":0,"active_slots":0,"reseed_recommended":0}}}`
+			body := `{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":99,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":12,"retained_lsn_count":0,"retained_byte_count":0,"active_slots":0,"reseed_recommended":0}}}`
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -5538,23 +5541,23 @@ func TestObserveHAStandbyAdminStatusesRejectsMismatchedIdentityScope(t *testing.
 func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {
 	g := NewWithT(t)
 
-	primary, err := parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}}`))
+	primary, err := parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"healthy","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}}`))
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(primary.PrimaryLSN).To(Equal(uint64(12)))
 	g.Expect(primary.Standbys).To(HaveLen(1))
 	g.Expect(primary.Standbys[0].Name).To(Equal("standby-a"))
 	g.Expect(primary.Retention.OldestRestartLSN).To(Equal(uint64(7)))
 
-	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"catching_up","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0}}}`))
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[{"name":"standby-a","timeline_id":4,"active":true,"reseed_required":false,"restart_lsn":7,"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"write_lag_lsn":0,"apply_lag_lsn":1,"safe_read_lag_lsn":1,"retention_lag_lsn":5,"status":"catching_up","last_error":null}],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0}}}`))
 	g.Expect(err).To(HaveOccurred())
 
-	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"unknown","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}`))
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0},"durability":{"status":"unknown","mode":"remote_apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}`))
 	g.Expect(err).To(HaveOccurred())
 
-	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote-apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}`))
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote-apply","selection":"first","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}`))
 	g.Expect(err).To(HaveOccurred())
 
-	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply","selection":"priority","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}`))
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0},"durability":{"status":"satisfied","mode":"remote_apply","selection":"priority","target_lsn":12,"progress_lsn":12,"missing_lsn_count":0,"satisfied_count":1,"required_count":1,"candidate_count":1}}}`))
 	g.Expect(err).To(HaveOccurred())
 
 	standby, err := parseHAStandbyStatusJSON([]byte(`{"schema_version":1,"result":{"standby_status":{"role":"standby","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"unapplied_lsn_count":1,"caught_up_to_received":false,"can_serve_safe_reads":true}}}`), "standby-a", "slot-a")
@@ -5570,10 +5573,10 @@ func TestParseHAStatusJSONAcceptsLegacyCommandShape(t *testing.T) {
 	_, err = parseHAStandbyStatusJSON([]byte(`{"schema_version":1,"snapshot":{"role":"standby","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"unapplied_lsn_count":1,"caught_up_to_received":true}}`), "standby-a", "slot-a")
 	g.Expect(err).To(HaveOccurred())
 
-	_, err = parseHAPrimaryStatusJSON([]byte(`{"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0}}}`))
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"snapshot":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0}}}`))
 	g.Expect(err).To(HaveOccurred())
 
-	_, err = parseHAPrimaryStatusJSON([]byte(`{"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"active_slots":1,"reseed_recommended":0}}}}`))
+	_, err = parseHAPrimaryStatusJSON([]byte(`{"result":{"primary_status":{"role":"primary","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"current_lsn":12,"slots":[],"retention":{"primary_lsn":12,"oldest_restart_lsn":7,"retained_lsn_count":5,"retained_byte_count":512,"active_slots":1,"reseed_recommended":0}}}}`))
 	g.Expect(err).To(HaveOccurred())
 
 	_, err = parseHAStandbyStatusJSON([]byte(`{"snapshot":{"role":"standby","identity":{"cluster_id":1,"shard_id":2,"table_id":3,"timeline_id":4,"epoch":5},"received_lsn":12,"applied_lsn":11,"safe_read_lsn":11,"upstream_lsn":13,"write_lag_lsn":1,"receive_lag_lsn":1,"apply_lag_lsn":2,"unapplied_lsn_count":1,"caught_up_to_received":true,"can_serve_safe_reads":true}}`), "standby-a", "slot-a")
