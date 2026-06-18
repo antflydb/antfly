@@ -4664,6 +4664,15 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     for (request.text_patterns) |predicate| {
         if (!try lakeRowsTextPatternPredicateMatchesAlloc(alloc, row, predicate)) return false;
     }
+    for (request.json_contains) |predicate| {
+        if (!try lakeRowsJsonContainsPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
+    for (request.json_path_eq) |predicate| {
+        if (!try lakeRowsJsonPathEqPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
+    for (request.json_path_exists) |predicate| {
+        if (!try lakeRowsJsonPathExistsPredicateMatchesAlloc(alloc, row, predicate)) return false;
+    }
     for (request.expression_predicates) |condition| {
         if (!try lakeRowsExpressionConditionMatchesAlloc(alloc, row, condition)) return false;
     }
@@ -4686,15 +4695,6 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     for (request.array_eq) |predicate| {
         if (!try queryArrayEqPredicatePasses(alloc, parsed.value, predicate)) return false;
     }
-    for (request.json_contains) |predicate| {
-        if (!try queryJsonContainsPredicatePasses(alloc, parsed.value, predicate)) return false;
-    }
-    for (request.json_path_eq) |predicate| {
-        if (!try queryJsonPathEqPredicatePasses(alloc, parsed.value, predicate)) return false;
-    }
-    for (request.json_path_exists) |predicate| {
-        if (!queryJsonPathExistsPredicatePasses(parsed.value, predicate)) return false;
-    }
     for (request.expression_array_contains) |predicate| {
         if (!try queryExpressionArrayContainsPredicatePasses(alloc, parsed.value, predicate)) return false;
     }
@@ -4707,9 +4707,6 @@ fn lakeRowsQueryResidualNeedsJson(request: OwnedRowsQueryRequest) bool {
         request.array_any.len != 0 or
         request.array_contains.len != 0 or
         request.array_eq.len != 0 or
-        request.json_contains.len != 0 or
-        request.json_path_eq.len != 0 or
-        request.json_path_exists.len != 0 or
         request.expression_array_contains.len != 0;
 }
 
@@ -4857,11 +4854,19 @@ fn lakeRowsJsonContainsPredicateMatchesAlloc(
     row: lake_rows.ProjectedRow,
     predicate: db_mod.types.RelationalRowsJsonContainsPredicate,
 ) !bool {
-    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
-    defer alloc.free(row_json);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    const maybe_cell = row.find(predicate.field) orelse return error.RowSourceColumnNotFound;
+    const maybe_value = maybe_cell.value;
+    const value = maybe_value orelse return false;
+    const json = switch (value) {
+        .json => |bytes| bytes,
+        .bytes => |bytes| bytes,
+        else => return false,
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
-    return try queryJsonContainsPredicatePasses(alloc, parsed.value, predicate);
+    var wanted = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidRowsRequest;
+    defer wanted.deinit();
+    return jsonValueContains(parsed.value, wanted.value);
 }
 
 fn lakeRowsJsonPathEqPredicateMatchesAlloc(
@@ -4869,11 +4874,20 @@ fn lakeRowsJsonPathEqPredicateMatchesAlloc(
     row: lake_rows.ProjectedRow,
     predicate: db_mod.types.RelationalRowsJsonPathEqPredicate,
 ) !bool {
-    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
-    defer alloc.free(row_json);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    const maybe_cell = row.find(predicate.field) orelse return error.RowSourceColumnNotFound;
+    const maybe_value = maybe_cell.value;
+    const value = maybe_value orelse return false;
+    const json = switch (value) {
+        .json => |bytes| bytes,
+        .bytes => |bytes| bytes,
+        else => return false,
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
-    return try queryJsonPathEqPredicatePasses(alloc, parsed.value, predicate);
+    const actual = jsonValueAtPath(parsed.value, predicate.path) orelse return false;
+    var wanted = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidRowsRequest;
+    defer wanted.deinit();
+    return jsonValuesEqual(actual.*, wanted.value);
 }
 
 fn lakeRowsJsonPathExistsPredicateMatchesAlloc(
@@ -4881,11 +4895,17 @@ fn lakeRowsJsonPathExistsPredicateMatchesAlloc(
     row: lake_rows.ProjectedRow,
     predicate: db_mod.types.RelationalRowsJsonPathExistsPredicate,
 ) !bool {
-    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
-    defer alloc.free(row_json);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    const maybe_cell = row.find(predicate.field) orelse return error.RowSourceColumnNotFound;
+    const maybe_value = maybe_cell.value;
+    const value = maybe_value orelse return false;
+    const json = switch (value) {
+        .json => |bytes| bytes,
+        .bytes => |bytes| bytes,
+        else => return false,
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
-    return queryJsonPathExistsPredicatePasses(parsed.value, predicate);
+    return jsonValueAtPath(parsed.value, predicate.path) != null;
 }
 
 fn lakeRowsRelationalCheckMatchesAlloc(
