@@ -75,6 +75,8 @@ pub const OwnedStack = struct {
     catalog_store: catalog_mod.CatalogStore,
     builder: build_mod.Builder,
     catalog: catalog_mod.CatalogService,
+    external_source_object_store_resolver: build_mod.ExternalSourceRemoteUriObjectStoreResolver = .{},
+    external_source_plan_resolver: build_mod.ExternalSourcePublicationPlanResolver = undefined,
     api: api_mod.Service,
     query_cache: ?query_mod.QueryCache = null,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
@@ -120,6 +122,13 @@ pub const OwnedStack = struct {
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
+        self.external_source_object_store_resolver = .{};
+        self.external_source_plan_resolver = build_mod.ExternalSourcePublicationPlanResolver.init(
+            &self.artifacts,
+            self.external_source_object_store_resolver.resolver(),
+            .{},
+        );
+        self.catalog.setExternalSourcePlanResolver(self.external_source_plan_resolver.planResolver());
         self.api = api_mod.Service.init(alloc, &self.wal, &self.builder);
         if (cfg.query_cache_dir) |query_cache_dir| {
             self.query_cache = try query_mod.QueryCache.initWithConfig(alloc, query_cache_dir, .{

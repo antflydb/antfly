@@ -22,6 +22,7 @@ const schema_mod = @import("../../schema/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const external_binding = @import("../external_source/catalog_binding.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
+const external_source_plan_resolver_api = @import("external_source_plan_resolver_api.zig");
 const manifest_base_source = @import("../manifest/base_source.zig");
 
 pub const OwnedExternalTableBinding = struct {
@@ -44,32 +45,8 @@ pub const OwnedExternalTableBinding = struct {
     }
 };
 
-pub const ExternalSourcePlanResolveRequest = struct {
-    namespace: []const u8,
-    table_name: []const u8,
-    binding: external_binding.Binding,
-};
-
-pub const ExternalSourcePlanResolver = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        resolve: *const fn (
-            ptr: *anyopaque,
-            alloc: Allocator,
-            request: ExternalSourcePlanResolveRequest,
-        ) anyerror!?external_source_manifest.Plan,
-    };
-
-    pub fn resolveAlloc(
-        self: ExternalSourcePlanResolver,
-        alloc: Allocator,
-        request: ExternalSourcePlanResolveRequest,
-    ) !?external_source_manifest.Plan {
-        return try self.vtable.resolve(self.ptr, alloc, request);
-    }
-};
+pub const ExternalSourcePlanResolveRequest = external_source_plan_resolver_api.ResolveRequest;
+pub const ExternalSourcePlanResolver = external_source_plan_resolver_api.Resolver;
 
 pub const ArtifactAction = enum {
     reuse,
