@@ -61,6 +61,11 @@ pub const ObjectRangeReader = struct {
         offset: u64,
         len: usize,
     ) anyerror![]u8,
+    read_planned_range_alloc: ?*const fn (
+        ctx: *anyopaque,
+        alloc: Allocator,
+        read: range_io.RangeRead,
+    ) anyerror![]u8 = null,
 
     pub fn readAlloc(
         self: ObjectRangeReader,
@@ -72,6 +77,22 @@ pub const ObjectRangeReader = struct {
     ) ![]u8 {
         if (bucket.len == 0 or key.len == 0 or len == 0) return error.InvalidLakeRangeRead;
         const bytes = try self.read_range_alloc(self.ctx, alloc, bucket, key, offset, len);
+        errdefer alloc.free(bytes);
+        if (bytes.len != len) return error.InvalidLakeRangeRead;
+        return bytes;
+    }
+
+    pub fn readPlannedAlloc(
+        self: ObjectRangeReader,
+        alloc: Allocator,
+        read: range_io.RangeRead,
+    ) ![]u8 {
+        try read.validate();
+        const len: usize = std.math.cast(usize, read.range.len) orelse return error.InvalidLakeRangeRead;
+        const bytes = if (self.read_planned_range_alloc) |read_planned|
+            try read_planned(self.ctx, alloc, read)
+        else
+            try self.readAlloc(alloc, read.object.bucket, read.object.key, read.range.offset, len);
         errdefer alloc.free(bytes);
         if (bytes.len != len) return error.InvalidLakeRangeRead;
         return bytes;
@@ -1198,11 +1219,7 @@ fn readMaybeCachedObjectRangeAlloc(
 }
 
 fn readObjectRangeAlloc(alloc: Allocator, reader: ObjectRangeReader, read: range_io.RangeRead) ![]u8 {
-    const read_len: usize = std.math.cast(usize, read.range.len) orelse return error.InvalidLakeRangeRead;
-    const bytes = try reader.readAlloc(alloc, read.object.bucket, read.object.key, read.range.offset, read_len);
-    errdefer alloc.free(bytes);
-    if (bytes.len != read_len) return error.InvalidLakeRangeRead;
-    return bytes;
+    return try reader.readPlannedAlloc(alloc, read);
 }
 
 const RowGroupPlanValidation = enum {
