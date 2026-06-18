@@ -1069,11 +1069,22 @@ pub const PostingFormat = struct {
         const appended_ids = overlayAppendedIds(scratch);
         const appended_live = overlayAppendedLive(scratch);
         const appended_count = overlayAppendedCount(scratch).*;
-        var live_count: usize = 0;
-        for (appended_live[0..appended_count]) |live| {
-            if (live) live_count += 1;
+        if (scratch.member_ids.len < appended_count) {
+            var live_count: usize = 0;
+            for (appended_live[0..appended_count]) |live| {
+                if (live) live_count += 1;
+            }
+            try scratch.ensureMemberIdCapacity(alloc, live_count);
         }
-        try scratch.ensureMemberIdCapacity(alloc, live_count);
+        return collectSortedLiveAppendedIntoScratch(scratch, appended_ids, appended_live, appended_count);
+    }
+
+    fn collectSortedLiveAppendedIntoScratch(
+        scratch: anytype,
+        appended_ids: []const VectorId,
+        appended_live: []const bool,
+        appended_count: usize,
+    ) []VectorId {
         var out_count: usize = 0;
         var already_sorted = true;
         var previous: VectorId = 0;
