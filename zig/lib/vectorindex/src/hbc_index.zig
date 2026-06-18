@@ -7085,10 +7085,16 @@ fn routeBatchNodeToLeaves(
         choices[local_index] = std.mem.indexOfScalar(u64, child_ids, child_id) orelse return error.Corrupted;
     }
 
-    const starts = try self.alloc.alloc(usize, child_ids.len);
-    defer self.alloc.free(starts);
-    const ends = try self.alloc.alloc(usize, child_ids.len);
-    defer self.alloc.free(ends);
+    const range_storage_len = try std.math.mul(usize, child_ids.len, 2);
+    var range_storage_stack: [512]usize = undefined;
+    const use_range_storage_stack = range_storage_len <= range_storage_stack.len;
+    const range_storage = if (use_range_storage_stack)
+        range_storage_stack[0..range_storage_len]
+    else
+        try self.alloc.alloc(usize, range_storage_len);
+    defer if (!use_range_storage_stack) self.alloc.free(range_storage);
+    const starts = range_storage[0..child_ids.len];
+    const ends = range_storage[child_ids.len..range_storage_len];
 
     var write_index: usize = 0;
     for (child_ids, 0..) |_, child_index| {
