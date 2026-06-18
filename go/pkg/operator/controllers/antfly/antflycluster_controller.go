@@ -6273,7 +6273,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 		return haObservedPrimaryStatus{}, err
 	}
 	status := haObservedPrimaryStatusFromAdminSDK(*response.Value)
-	if err := haValidateObservedStatusScope(status.Identity, ha); err != nil {
+	if err := haValidateObservedStatusIdentity(status.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
 	return status, nil
@@ -6289,7 +6289,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Contex
 		return antflyv1.HAStandbyStatus{}, err
 	}
 	observed := haObservedStandbyStatusFromAdminSDK(*response.Value, standbyName, slotName)
-	if err := haValidateObservedStatusScope(observed.Identity, ha); err != nil {
+	if err := haValidateObservedStatusIdentity(observed.Identity, ha, cluster.Status.HAStatus); err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
 	return observed.Status, nil
@@ -6562,7 +6562,7 @@ func haObservedIdentityFromAdminSDK(identity adminsdk.HAIdentity) haObservedIden
 	}
 }
 
-func haValidateObservedStatusScope(observed haObservedIdentity, ha *antflyv1.HighAvailabilitySpec) error {
+func haValidateObservedStatusIdentity(observed haObservedIdentity, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) error {
 	identity := haReplicationIdentity(ha)
 	if identity == nil {
 		return nil
@@ -6580,7 +6580,42 @@ func haValidateObservedStatusScope(observed haObservedIdentity, ha *antflyv1.Hig
 			identity.TableID,
 		)
 	}
+	expectedTimelineID := identity.TimelineID
+	expectedEpoch := identity.Epoch
+	if haPromotionAdvancesIdentity(status, identity) {
+		expectedTimelineID = status.LastPromotion.NewTimelineID
+		expectedEpoch = status.LastPromotion.NewEpoch
+	}
+	if observed.TimelineID != expectedTimelineID || observed.Epoch != expectedEpoch {
+		return fmt.Errorf(
+			"observed HA admin identity timeline mismatch: got timeline_id=%d epoch=%d, expected timeline_id=%d epoch=%d",
+			observed.TimelineID,
+			observed.Epoch,
+			expectedTimelineID,
+			expectedEpoch,
+		)
+	}
 	return nil
+}
+
+func haPromotionAdvancesIdentity(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) bool {
+	if status == nil || status.LastPromotion == nil || identity == nil {
+		return false
+	}
+	promotion := status.LastPromotion
+	if promotion.NewTimelineID == 0 || promotion.NewEpoch == 0 {
+		return false
+	}
+	if promotion.ParentTimelineID != identity.TimelineID || promotion.ParentEpoch != identity.Epoch {
+		return false
+	}
+	if promotion.ClusterID != 0 &&
+		(promotion.ClusterID != identity.ClusterID ||
+			promotion.ShardID != identity.ShardID ||
+			promotion.TableID != identity.TableID) {
+		return false
+	}
+	return true
 }
 
 func haAdminIdentityJSONComplete(identity haAdminIdentityJSON) bool {
