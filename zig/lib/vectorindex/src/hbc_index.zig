@@ -5086,12 +5086,11 @@ pub fn insertWithMetadataTxnOptions(
         break :blk transformed_vector;
     };
     self.write_profile.insert_transform_ns += elapsed_fn_u64(transform_start);
-    var compare_vector_storage: ?[]f32 = null;
-    defer if (compare_vector_storage) |buf| self.alloc.free(buf);
-    var previous_vector_storage: ?[]f32 = null;
-    defer if (previous_vector_storage) |buf| self.alloc.free(buf);
-    var previous_transformed_storage: ?[]f32 = null;
-    defer if (previous_transformed_storage) |buf| self.alloc.free(buf);
+    var existing_update_stack: [8192]f32 = undefined;
+    var existing_update_heap: ?[]f32 = null;
+    defer if (existing_update_heap) |buf| self.alloc.free(buf);
+    var previous_vector_storage: []f32 = &.{};
+    var previous_transformed_storage: []f32 = &.{};
 
     const existing_leaf_id = if (assume_absent_ids)
         0
@@ -5102,13 +5101,19 @@ pub fn insertWithMetadataTxnOptions(
         };
 
     if (existing_leaf_id != 0) {
-        compare_vector_storage = try self.alloc.alloc(f32, self.config.dims);
-        if (try existingVectorMatchesNoOp(self, txn, vector_id, vector_data, metadata_value, compare_vector_storage.?)) {
+        const existing_scratch_len = try std.math.mul(usize, self.config.dims, 2);
+        const existing_update_scratch = if (existing_scratch_len <= existing_update_stack.len)
+            existing_update_stack[0..existing_scratch_len]
+        else blk: {
+            existing_update_heap = try self.alloc.alloc(f32, existing_scratch_len);
+            break :blk existing_update_heap.?;
+        };
+        previous_vector_storage = existing_update_scratch[0..self.config.dims];
+        previous_transformed_storage = existing_update_scratch[self.config.dims..existing_scratch_len];
+        if (try existingVectorMatchesNoOp(self, txn, vector_id, vector_data, metadata_value, previous_vector_storage)) {
             self.write_profile.noop_existing_skips += 1;
             return;
         }
-        previous_vector_storage = try self.alloc.alloc(f32, self.config.dims);
-        previous_transformed_storage = try self.alloc.alloc(f32, self.config.dims);
     }
 
     const target_leaf_id = blk_leaf: {
@@ -5126,8 +5131,8 @@ pub fn insertWithMetadataTxnOptions(
                     vector_data,
                     metadata_value,
                     effective_transformed,
-                    previous_vector_storage.?,
-                    previous_transformed_storage.?,
+                    previous_vector_storage,
+                    previous_transformed_storage,
                     skip_vector_store,
                     batch_insert_options,
                 )) {
@@ -5161,8 +5166,8 @@ pub fn insertWithMetadataTxnOptions(
                             vector_data,
                             metadata_value,
                             effective_transformed,
-                            previous_vector_storage.?,
-                            previous_transformed_storage.?,
+                            previous_vector_storage,
+                            previous_transformed_storage,
                             skip_vector_store,
                             batch_insert_options,
                         )) {
