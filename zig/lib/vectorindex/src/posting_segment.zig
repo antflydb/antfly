@@ -1089,6 +1089,7 @@ pub const LazyDirectorySnapshot = struct {
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
+        const newest_segment_id = if (self.manifest.next_segment_id == 0) 0 else self.manifest.next_segment_id - 1;
 
         var segment_index = self.manifest.segments.len;
         while (segment_index > 0) {
@@ -1103,6 +1104,7 @@ pub const LazyDirectorySnapshot = struct {
             best_segment_id = entry.meta.segment_id;
             best_manifest_entry = manifest_entry;
             best_index_entry = found;
+            if (best_segment_id == newest_segment_id) return try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
         }
 
         const manifest_entry = best_manifest_entry orelse return null;
@@ -1113,6 +1115,7 @@ pub const LazyDirectorySnapshot = struct {
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
+        const newest_segment_id = if (self.manifest.next_segment_id == 0) 0 else self.manifest.next_segment_id - 1;
 
         var segment_index = self.manifest.segments.len;
         while (segment_index > 0) {
@@ -1127,6 +1130,13 @@ pub const LazyDirectorySnapshot = struct {
             best_segment_id = entry.meta.segment_id;
             best_manifest_entry = manifest_entry;
             best_index_entry = found;
+            if (best_segment_id == newest_segment_id) {
+                var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
+                try readSegmentEntryValuePrefixInto(self.io, self.dir, manifest_entry, found, &header_data);
+                const header = try posting.PostingFormat.decodeBaseHeader(&header_data);
+                if (header.posting_id != posting_id) return error.CorruptedPostingSegment;
+                return header;
+            }
         }
 
         const manifest_entry = best_manifest_entry orelse return null;
