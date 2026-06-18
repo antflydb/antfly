@@ -5542,8 +5542,16 @@ fn batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
     try prepared.ensureTotalCapacity(self.alloc, @intCast(writes.len));
 
     const dims: usize = @intCast(self.config.dims);
-    const compare_vector = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(compare_vector);
+    const scratch_len = try std.math.mul(usize, dims, 2);
+    var vector_scratch_stack: [8192]f32 = undefined;
+    const use_stack_scratch = scratch_len <= vector_scratch_stack.len;
+    const vector_scratch = if (use_stack_scratch)
+        vector_scratch_stack[0..scratch_len]
+    else
+        try self.alloc.alloc(f32, scratch_len);
+    defer if (!use_stack_scratch) self.alloc.free(vector_scratch);
+    const compare_vector = vector_scratch[0..dims];
+    const transformed = vector_scratch[dims..scratch_len];
 
     var processed_count: usize = 0;
     for (writes, 0..) |item, item_index| {
@@ -5582,8 +5590,6 @@ fn batchCoalesceBaseDeltaExistingUpdatesTxnOptions(
         defer self.alloc.free(records);
         var record_count: usize = 0;
         var same_posting_update_count: usize = 0;
-        const transformed = try self.alloc.alloc(f32, dims);
-        defer self.alloc.free(transformed);
 
         const store_start = nowNsU64Fixed();
         for (group) |entry| {

@@ -849,10 +849,12 @@ implementations cleanly:
    `SearchScratch` also slabs the fixed transformed-query, centroid, and
    vector work buffers, and single-vector inserts use stack-backed transform
    scratch when possible. Existing-vector single updates reuse stack-backed
-   compare/previous-vector scratch instead of allocating separate buffers.
-   Posting-delta tail cache entries slab their sequence/id/op arrays, and
-   query/fold overlay append IDs plus live flags share one backing allocation.
-   Fold compact delta IDs plus ops are likewise slabbed.
+   compare/previous-vector scratch instead of allocating separate buffers, and
+   batch coalesced existing updates reuse one compare/transform scratch pair
+   across posting groups. Posting-delta tail cache entries slab their
+   sequence/id/op arrays, and query/fold overlay append IDs plus live flags
+   share one backing allocation. Fold compact delta IDs plus ops are likewise
+   slabbed.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.
