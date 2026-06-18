@@ -45,6 +45,18 @@ pub const DropRowSecurityPolicySyntax = struct {
     }
 };
 
+pub const DropUpdatePolicySyntax = struct {
+    trigger_name: []const u8,
+    table_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.trigger_name));
+        alloc.free(@constCast(self.table_name));
+        self.* = undefined;
+    }
+};
+
 pub const AdapterNoopTransactionBoundaryTail = struct {
     work: bool = false,
     transaction: bool = false,
@@ -1002,6 +1014,32 @@ pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
     policy_transferred = true;
     table_transferred = true;
     return .{ .policy_name = policy_name, .table_name = table_name, .if_exists = if_exists };
+}
+
+pub fn parseDropUpdatePolicyTriggerCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropUpdatePolicySyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("trigger");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const trigger_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var trigger_transferred = false;
+    errdefer if (!trigger_transferred) alloc.free(trigger_name);
+    try cursor.expectKeyword("on");
+    const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    trigger_transferred = true;
+    table_transferred = true;
+    return .{ .trigger_name = trigger_name, .table_name = table_name, .if_exists = if_exists };
 }
 
 pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !void {
@@ -3569,6 +3607,20 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqualStrings("tenant_policy", drop.policy_name);
     try std.testing.expectEqualStrings("usage_records", drop.table_name);
     try std.testing.expect(drop.if_exists);
+}
+
+test "sql adapter grammar parses update policy trigger catalog tails" {
+    const alloc = std.testing.allocator;
+    var tokens = try lexer.tokenizeAlloc(alloc, "TRIGGER IF EXISTS touch_updated_at ON ONLY public.usage_records CASCADE;");
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var pos: usize = 0;
+    var syntax = try parseDropUpdatePolicyTriggerCatalogTailAlloc(alloc, tokens.items, &pos);
+    defer syntax.deinit(alloc);
+    try std.testing.expectEqual(tokens.items.len, pos);
+    try std.testing.expectEqualStrings("touch_updated_at", syntax.trigger_name);
+    try std.testing.expectEqualStrings("usage_records", syntax.table_name);
+    try std.testing.expect(syntax.if_exists);
 }
 
 test "sql adapter grammar leaves non row security alter table to ddl parser" {

@@ -3817,6 +3817,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter value parses timestamp literals",
             "sql adapter value parses interval literals",
             "sql adapter grammar parses row security catalog tails",
+            "sql adapter grammar parses update policy trigger catalog tails",
             "sql adapter grammar parses relation population syntax",
             "sql adapter grammar parses authorization catalog tails",
             "sql adapter grammar parses logical replication catalog tails",

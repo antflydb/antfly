@@ -4187,36 +4187,22 @@ const Parser = struct {
     }
 
     fn parseDropTriggerPolicyDdl(self: *@This()) !AlterTablePlan {
-        try self.expectKeyword("trigger");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const trigger_name = try self.parseIdentifierOwned();
-        var trigger_name_transferred = false;
-        errdefer if (!trigger_name_transferred) self.alloc.free(trigger_name);
-        try self.expectKeyword("on");
-        const table_name = try self.parseSqlTableReferenceIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        _ = self.matchKeyword("cascade") or self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseDropUpdatePolicyTriggerCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var syntax_transferred = false;
+        errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
 
         const operations = try self.alloc.alloc(AlterTableOperation, 1);
         var operations_transferred = false;
         errdefer if (!operations_transferred) self.alloc.free(operations);
         operations[0] = .{ .drop_update_policy = .{
-            .trigger_name = trigger_name,
-            .if_exists = if_exists,
+            .trigger_name = syntax.trigger_name,
+            .if_exists = syntax.if_exists,
         } };
 
-        trigger_name_transferred = true;
-        table_name_transferred = true;
+        syntax_transferred = true;
         operations_transferred = true;
         return .{
-            .table_name = table_name,
+            .table_name = syntax.table_name,
             .operations = operations,
         };
     }
