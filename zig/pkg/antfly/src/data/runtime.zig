@@ -447,6 +447,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_replay_debt_indexes", "gauge", "Cached local indexes that still report replay catch-up debt", runtime_summary.indexes_with_replay_debt);
         try health_metrics.appendPromMetric(writer, "antfly_data_replay_debt_sequences", "gauge", "Total cached replay backlog measured as target minus applied sequence across local indexes", runtime_summary.outstanding_replay_sequences);
         try health_metrics.appendPromMetric(writer, "antfly_data_replay_debt_max_index_sequences", "gauge", "Largest cached replay backlog for any single local index", runtime_summary.max_index_replay_backlog);
+        try self.writeHAMetrics(writer);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_warmup_active", "gauge", "Whether the provisioned cache warmup worker is currently active", if (self.data_server.provisioned_warmup_active.load(.acquire)) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_warmup_started_total", "counter", "Provisioned cache warmup runs started", self.data_server.provisioned_warmup_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_warmup_completed_total", "counter", "Provisioned cache warmup runs completed", self.data_server.provisioned_warmup_completed.load(.monotonic));
@@ -488,6 +489,46 @@ pub const HealthSource = struct {
         try writeTextMergeMetrics(writer, self.data_server.write_source.textMergeStatsBestEffort());
         try writeAsyncIndexingMetrics(writer, self.data_server.write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
+    }
+
+    fn writeHAMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
+        const ds = self.data_server;
+        const ctx = ds.ha_cfg.admin_context;
+        const primary = if (ctx) |ha_ctx|
+            ha_ctx.primary orelse ds.ha_cfg.internal_primary
+        else
+            ds.ha_cfg.internal_primary;
+        const standby = if (ctx) |ha_ctx| ha_ctx.standby else null;
+
+        try health_metrics.appendPromMetric(writer, "antfly_ha_runtime_configured", "gauge", "Whether this data runtime has any HA role configured", if (primary != null or standby != null) 1 else 0);
+
+        if (primary) |handle| {
+            var snapshot = try antfly.ha.status.primarySnapshot(ds.alloc, handle, .{}, ds.ha_cfg.primary_sync_policy);
+            defer snapshot.deinit(ds.alloc);
+            var metrics = try antfly.ha.metrics.fromPrimarySnapshot(ds.alloc, snapshot);
+            defer metrics.deinit(ds.alloc);
+            const text = try antfly.ha.metrics.renderPrimaryPrometheusAlloc(ds.alloc, metrics);
+            defer ds.alloc.free(text);
+            try writer.print("{s}", .{text});
+        }
+
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_mirror_last_lsn", "gauge", "Last HA replication LSN mirrored by this data runtime", ds.ha_primary_mirror_last_lsn.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_mirror_failures_total", "counter", "HA primary replication mirror failures observed by this data runtime", ds.ha_primary_mirror_failure_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_rejects_total", "counter", "HA synchronous commit decisions rejected before local commit", ds.ha_primary_mirror_sync_reject_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_waits_total", "counter", "HA synchronous commit waits observed by this data runtime", ds.ha_primary_mirror_sync_wait_count.load(.acquire));
+        try health_metrics.appendPromMetric(writer, "antfly_ha_primary_sync_degraded_total", "counter", "HA synchronous commit decisions degraded to async by policy", ds.ha_primary_mirror_sync_degraded_count.load(.acquire));
+
+        if (standby) |handle| {
+            const upstream_lsn = if (ds.ha_cfg.standby_replication != null)
+                handle.currentProgress().received_lsn
+            else
+                null;
+            const snapshot = antfly.ha.status.standbySnapshot(handle, upstream_lsn);
+            const metrics = antfly.ha.metrics.fromStandbySnapshot(snapshot);
+            const text = try antfly.ha.metrics.renderStandbyPrometheusAlloc(ds.alloc, metrics);
+            defer ds.alloc.free(text);
+            try writer.print("{s}", .{text});
+        }
     }
 
     fn cachedLsmMaintenanceStats(self: *HealthSource) CachedLsmMaintenanceStats {
@@ -13549,6 +13590,7 @@ test "data server wires configured HA executors into API server" {
         .epoch = 1,
     }, .{});
     defer primary.close();
+    try primary.createSlot("standby-a", 0);
 
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = ".",
@@ -13581,6 +13623,17 @@ test "data server wires configured HA executors into API server" {
     defer internal_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
+
+    var health = HealthSource{ .data_server = &server };
+    var writer_buf: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const metrics = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
 }
 
 test "data server mirrors managed primary writes into HA replication log" {
@@ -14106,6 +14159,17 @@ test "data server pulls and applies HA standby replication through internal HTTP
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+
+    var health = HealthSource{ .data_server = &server };
+    var writer_buf: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&writer_buf);
+    try health.metricsWriter().writeMetrics(&writer);
+    const metrics = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_received_lsn 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_applied_lsn 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_upstream_configured 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_standby_caught_up_to_received 1\n") != null);
 
     var lookup = (try server.read_source.source().lookupGroupLocal(
         alloc,
