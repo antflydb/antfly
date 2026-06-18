@@ -537,6 +537,16 @@ def _promotion_fence_request(cluster: HACluster, required_lsn: int) -> dict[str,
     }
 
 
+def _whole_instance_identity(cluster: HACluster) -> dict[str, int]:
+    return {
+        "cluster_id": cluster.standby.cluster_id,
+        "shard_id": 0,
+        "table_id": 0,
+        "timeline_id": cluster.standby.timeline_id,
+        "epoch": cluster.standby.epoch,
+    }
+
+
 def _assert_action_receipt(
     response: dict[str, Any],
     *,
@@ -906,3 +916,76 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         ha_cluster.primary.lookup_key(table_name, "doc:old-primary")
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
+
+
+def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):
+    ha_cluster.standby.start(enable_replication=False)
+    _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
+
+    required_lsn = 1
+    forced_request = {
+        "identity": _whole_instance_identity(ha_cluster),
+        "old_primary_id": ha_cluster.primary.node_id,
+        "promoted_node_id": ha_cluster.standby.node_id,
+        "new_timeline_id": ha_cluster.standby.timeline_id + 1,
+        "new_epoch": ha_cluster.standby.epoch + 1,
+        "required_lsn": required_lsn,
+        "observed_lsn": 0,
+        "force": True,
+        "reason": "ha-standby-forced-e2e",
+    }
+
+    fence = ha_cluster.standby.admin_post("/fence", forced_request)
+    _assert_action_receipt(
+        fence,
+        action_id="fence_acquire:standby-a",
+        action_kind="fence_acquire",
+        target="standby-a",
+        state="applied",
+        node_id="standby-a",
+    )
+    assert fence["receipt"]["forced"] is True
+    assert fence["receipt"]["required_lsn"] == required_lsn
+    assert fence["receipt"]["observed_lsn"] == 0
+    assert fence["receipt"]["token"]
+
+    assessment = ha_cluster.standby.admin_post(
+        "/promotion/assess",
+        {"required_lsn": required_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
+    )
+    _assert_action_receipt(
+        assessment,
+        action_id="promotion_assess:standby-a",
+        action_kind="promotion_assess",
+        target="standby-a",
+        state="assessed",
+        node_id="standby-a",
+    )
+    assert assessment["assessment"]["can_promote"] is True
+    assert assessment["assessment"]["force"] is True
+    assert assessment["assessment"]["mode"] == "lossy"
+    assert assessment["assessment"]["data_loss_possible"] is True
+    assert assessment["assessment"]["safe"] is False
+    assert assessment["assessment"]["requires_force"] is False
+
+    promoted = ha_cluster.standby.admin_post("/promotion/current-fence", {})
+    _assert_action_receipt(
+        promoted,
+        action_id="promotion:standby-a",
+        action_kind="promotion",
+        target="standby-a",
+        state="applied",
+        node_id="standby-a",
+    )
+    assert promoted["forced"] is True
+    assert promoted["fence_generation"] == fence["receipt"]["generation"]
+    assert promoted["fence_token"] == fence["receipt"]["token"]
+    assert promoted["assessment"]["mode"] == "lossy"
+    assert promoted["assessment"]["data_loss_possible"] is True
+    assert promoted["assessment"]["safe"] is False
+    assert promoted["promotion"]["node_id"] == "standby-a"
+    assert promoted["promotion"]["new_identity"]["timeline_id"] == 2
+    assert promoted["promotion"]["new_identity"]["epoch"] == 2
+    assert promoted["promotion"]["switch_lsn"] == required_lsn
+    assert promoted["promotion"]["forced"] is True
+    assert promoted["promotion"]["data_loss_possible"] is True
