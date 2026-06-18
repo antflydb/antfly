@@ -1149,18 +1149,23 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name is required", i))
 			continue
 		}
+		if standby.Name != name {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name must not have leading or trailing whitespace", i))
+		}
 		if _, exists := names[name]; exists {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name %q is duplicated", i, name))
 		}
 		names[name] = struct{}{}
-		if strings.TrimSpace(standby.SlotName) == "" && standby.SlotName != "" {
+		slotName := strings.TrimSpace(standby.SlotName)
+		if slotName == "" && standby.SlotName != "" {
 			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not be whitespace", i))
+		} else if standby.SlotName != "" && standby.SlotName != slotName {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not have leading or trailing whitespace", i))
 		}
-		slotName := standby.SlotName
 		if slotName == "" {
 			slotName = name
 		}
-		if strings.TrimSpace(slotName) != "" {
+		if slotName != "" {
 			if first, exists := slotNames[slotName]; exists {
 				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName %q duplicates standby slot identity from spec.highAvailability.standbys[%d]", i, slotName, first))
 			}
@@ -1235,6 +1240,8 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		}
 		if strings.TrimSpace(identity.CurrentPrimaryID) == "" {
 			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID is required")
+		} else if identity.CurrentPrimaryID != strings.TrimSpace(identity.CurrentPrimaryID) {
+			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID must not have leading or trailing whitespace")
 		}
 	}
 
@@ -1272,17 +1279,21 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			}
 			seenSyncNames := map[string]int{}
 			for i, name := range sync.StandbyNames {
-				if strings.TrimSpace(name) == "" {
+				trimmedName := strings.TrimSpace(name)
+				if trimmedName == "" {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] is empty", i))
 					continue
 				}
-				if first, exists := seenSyncNames[name]; exists {
-					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, name, first))
+				if name != trimmedName {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] must not have leading or trailing whitespace", i))
 				}
-				seenSyncNames[name] = i
-				if _, ok := names[name]; !ok {
+				if first, exists := seenSyncNames[trimmedName]; exists {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, trimmedName, first))
+				}
+				seenSyncNames[trimmedName] = i
+				if _, ok := names[trimmedName]; !ok {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
-				} else if _, desired := desiredNames[name]; !desired {
+				} else if _, desired := desiredNames[trimmedName]; !desired {
 					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q must reference a desired standby", i, name))
 				}
 			}
@@ -1390,6 +1401,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 			upstreamURL := strings.TrimSpace(standby.UpstreamURL)
 			if slotName == "" && standby.SlotName != "" {
 				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not be whitespace")
+			} else if standby.SlotName != "" && standby.SlotName != slotName {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not have leading or trailing whitespace")
 			}
 			if upstreamURL != "" && slotName == "" {
 				errors = append(errors, "spec.highAvailability.runtime.standby.slotName is required when upstreamURL is set")
@@ -1403,6 +1416,8 @@ func validateHARuntime(ha *HighAvailabilitySpec) []string {
 	}
 	if nodeID == "" {
 		errors = append(errors, "spec.highAvailability.runtime.nodeID is required")
+	} else if runtime.NodeID != nodeID {
+		errors = append(errors, "spec.highAvailability.runtime.nodeID must not have leading or trailing whitespace")
 	}
 	if strings.TrimSpace(runtime.FencePath) == "" && runtime.FencePath != "" {
 		errors = append(errors, "spec.highAvailability.runtime.fencePath must not be whitespace")

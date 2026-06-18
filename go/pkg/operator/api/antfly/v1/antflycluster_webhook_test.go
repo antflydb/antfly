@@ -2005,6 +2005,48 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidAdminTokenEnvVar(t *testin
 	}
 }
 
+func TestValidateCreate_HighAvailabilityRejectsWhitespacePaddedIdentityFields(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Standbys: []HAStandbySpec{{
+			Name:     " standby-a ",
+			SlotName: " slot-a ",
+		}},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: " primary-a ",
+		},
+		Runtime: &HARuntimeSpec{
+			Role:   HARuntimeRolePrimary,
+			NodeID: " primary-a ",
+		},
+		SyncPolicy: &HASyncPolicy{
+			Mode:         HADurabilityModeRemoteWrite,
+			Required:     1,
+			StandbyNames: []string{" standby-a "},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected whitespace-padded HA identities to be rejected")
+	}
+	for _, want := range []string{
+		"standbys[0].name must not have leading or trailing whitespace",
+		"standbys[0].slotName must not have leading or trailing whitespace",
+		"identity.currentPrimaryID must not have leading or trailing whitespace",
+		"runtime.nodeID must not have leading or trailing whitespace",
+		"syncPolicy.standbyNames[0] must not have leading or trailing whitespace",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected validation error containing %q, got: %v", want, err)
+		}
+	}
+}
+
 func TestValidateCreate_HighAvailabilityRuntimeRequiresIdentityAndNodeID(t *testing.T) {
 	cluster := baseSwarmCluster()
 	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
@@ -2267,6 +2309,15 @@ func TestValidateCreate_HighAvailabilityRejectsInvalidStandbyRuntimeReplicationS
 	}
 	if !strings.Contains(err.Error(), "runtime.standby.slotName is required when upstreamURL is set") {
 		t.Fatalf("expected standby slotName validation error, got: %v", err)
+	}
+
+	cluster.Spec.HighAvailability.Runtime.Standby.SlotName = " standby-a "
+	err = cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA standby runtime slotName with surrounding whitespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "runtime.standby.slotName must not have leading or trailing whitespace") {
+		t.Fatalf("expected standby slotName whitespace validation error, got: %v", err)
 	}
 }
 
