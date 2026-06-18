@@ -68,6 +68,11 @@ pub const Header = struct {
         if (self.page_type != .data_page and self.page_type != .data_page_v2) return error.UnsupportedParquetPage;
         if (self.encoding != .plain) return error.UnsupportedParquetPage;
     }
+
+    pub fn validateUncompressedPlainRequired(self: Header) !void {
+        try self.validatePlainRequired();
+        if (self.compressed_page_size != self.uncompressed_page_size) return error.UnsupportedParquetPage;
+    }
 };
 
 pub const ParsedHeader = struct {
@@ -95,6 +100,25 @@ pub fn decodePlainI64Alloc(alloc: Allocator, header: Header, page_payload: []con
     return values;
 }
 
+pub fn scanUncompressedPlainI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
+    var values = std.ArrayListUnmanaged(i64).empty;
+    errdefer values.deinit(alloc);
+    var cursor: usize = 0;
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateUncompressedPlainRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+
+        const page_values = try decodePlainI64Alloc(alloc, parsed.header, payload);
+        defer alloc.free(page_values);
+        try values.appendSlice(alloc, page_values);
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
 pub fn decodePlainByteArraysAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![][]u8 {
     try header.validatePlainRequired();
     if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
@@ -117,6 +141,31 @@ pub fn decodePlainByteArraysAlloc(alloc: Allocator, header: Header, page_payload
         initialized += 1;
     }
     return values;
+}
+
+pub fn scanUncompressedPlainByteArrayColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![][]u8 {
+    var values = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (values.items) |value| alloc.free(value);
+        values.deinit(alloc);
+    }
+    var cursor: usize = 0;
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateUncompressedPlainRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+
+        const page_values = try decodePlainByteArraysAlloc(alloc, parsed.header, payload);
+        defer alloc.free(page_values);
+        try values.ensureUnusedCapacity(alloc, page_values.len);
+        for (page_values) |value| {
+            values.appendAssumeCapacity(value);
+        }
+    }
+    return try values.toOwnedSlice(alloc);
 }
 
 pub fn freePlainByteArrays(alloc: Allocator, values: [][]u8) void {
@@ -509,6 +558,65 @@ test "parquet page parser handles v2 level prefix before plain values" {
     const values = try decodePlainI64Alloc(alloc, parsed.header, &payload);
     defer alloc.free(values);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8 }, values);
+}
+
+test "parquet page scanner concatenates uncompressed plain i64 pages" {
+    const alloc = std.testing.allocator;
+    var header_a = try buildDataPageHeaderFixture(alloc, 2, 16);
+    defer header_a.deinit(alloc);
+    var header_b = try buildDataPageHeaderFixture(alloc, 1, 8);
+    defer header_b.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, header_a.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        10, 0, 0, 0, 0, 0, 0, 0,
+        20, 0, 0, 0, 0, 0, 0, 0,
+    });
+    try chunk.appendSlice(alloc, header_b.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        30, 0, 0, 0, 0, 0, 0, 0,
+    });
+
+    const values = try scanUncompressedPlainI64ColumnChunkAlloc(alloc, chunk.items);
+    defer alloc.free(values);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, values);
+}
+
+test "parquet page scanner concatenates uncompressed plain byte array pages" {
+    const alloc = std.testing.allocator;
+    var header_a = try buildDataPageHeaderFixture(alloc, 1, 9);
+    defer header_a.deinit(alloc);
+    var header_b = try buildDataPageHeaderFixture(alloc, 1, 9);
+    defer header_b.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, header_a.items);
+    try chunk.appendSlice(alloc, &[_]u8{ 5, 0, 0, 0, 'a', 'l', 'p', 'h', 'a' });
+    try chunk.appendSlice(alloc, header_b.items);
+    try chunk.appendSlice(alloc, &[_]u8{ 5, 0, 0, 0, 'o', 'm', 'e', 'g', 'a' });
+
+    const values = try scanUncompressedPlainByteArrayColumnChunkAlloc(alloc, chunk.items);
+    defer freePlainByteArrays(alloc, values);
+    try std.testing.expectEqualStrings("alpha", values[0]);
+    try std.testing.expectEqualStrings("omega", values[1]);
+}
+
+test "parquet page scanner rejects compressed pages for now" {
+    const alloc = std.testing.allocator;
+    var header = try buildDataPageHeaderFixture(alloc, 1, 8);
+    defer header.deinit(alloc);
+    var parsed = try parsePageHeader(header.items);
+    parsed.header.uncompressed_page_size = 16;
+    try std.testing.expectError(error.UnsupportedParquetPage, parsed.header.validateUncompressedPlainRequired());
+
+    // Patch the top-level uncompressed_page_size in the encoded fixture from 8
+    // to 16. The field value byte follows three bytes: field1+value, field2.
+    header.items[3] = 32;
+    try header.appendSlice(alloc, &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectError(error.UnsupportedParquetPage, scanUncompressedPlainI64ColumnChunkAlloc(alloc, header.items));
 }
 
 test "parquet page parser rejects unsupported pages and truncated payloads" {

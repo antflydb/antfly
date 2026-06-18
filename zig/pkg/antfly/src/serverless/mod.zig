@@ -312,6 +312,8 @@ pub const enrichLakeInventoryFileWithParquetFooterAlloc = query.enrichLakeInvent
 pub const parseLakeParquetPageHeader = query.parseLakeParquetPageHeader;
 pub const decodeLakeParquetPlainI64Alloc = query.decodeLakeParquetPlainI64Alloc;
 pub const decodeLakeParquetPlainByteArraysAlloc = query.decodeLakeParquetPlainByteArraysAlloc;
+pub const scanLakeParquetPlainI64ColumnChunkAlloc = query.scanLakeParquetPlainI64ColumnChunkAlloc;
+pub const scanLakeParquetPlainByteArrayColumnChunkAlloc = query.scanLakeParquetPlainByteArrayColumnChunkAlloc;
 pub const freeLakeParquetPlainByteArrays = query.freeLakeParquetPlainByteArrays;
 pub const SparseEnricher = enrichment.SparseEnricher;
 pub const EnrichmentRunStats = enrichment.EnrichmentRunStats;
@@ -607,6 +609,8 @@ test "serverless module compiles" {
     _ = parseLakeParquetPageHeader;
     _ = decodeLakeParquetPlainI64Alloc;
     _ = decodeLakeParquetPlainByteArraysAlloc;
+    _ = scanLakeParquetPlainI64ColumnChunkAlloc;
+    _ = scanLakeParquetPlainByteArrayColumnChunkAlloc;
     _ = freeLakeParquetPlainByteArrays;
     _ = SparseEnricher;
     _ = EnrichmentRunStats;

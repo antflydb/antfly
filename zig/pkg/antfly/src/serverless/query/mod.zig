@@ -102,6 +102,8 @@ pub const enrichLakeInventoryFileWithParquetFooterAlloc = lake_parquet_metadata.
 pub const parseLakeParquetPageHeader = lake_parquet_page.parsePageHeader;
 pub const decodeLakeParquetPlainI64Alloc = lake_parquet_page.decodePlainI64Alloc;
 pub const decodeLakeParquetPlainByteArraysAlloc = lake_parquet_page.decodePlainByteArraysAlloc;
+pub const scanLakeParquetPlainI64ColumnChunkAlloc = lake_parquet_page.scanUncompressedPlainI64ColumnChunkAlloc;
+pub const scanLakeParquetPlainByteArrayColumnChunkAlloc = lake_parquet_page.scanUncompressedPlainByteArrayColumnChunkAlloc;
 pub const freeLakeParquetPlainByteArrays = lake_parquet_page.freePlainByteArrays;
 pub const planProjectedLakeScanAlloc = lake_scan_plan.planProjectedScanAlloc;
 pub const validateLakeBindingInventory = lake_scan_plan.validateBindingInventory;
@@ -211,6 +213,8 @@ test "serverless query module compiles" {
     _ = parseLakeParquetPageHeader;
     _ = decodeLakeParquetPlainI64Alloc;
     _ = decodeLakeParquetPlainByteArraysAlloc;
+    _ = scanLakeParquetPlainI64ColumnChunkAlloc;
+    _ = scanLakeParquetPlainByteArrayColumnChunkAlloc;
     _ = freeLakeParquetPlainByteArrays;
     _ = planProjectedLakeScanAlloc;
     _ = validateLakeBindingInventory;
