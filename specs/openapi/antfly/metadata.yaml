@@ -9959,8 +9959,6 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
-        "501":
-          description: Non-default explicit catalog table route is not yet backed by catalog-aware table I/O.
     post:
       summary: Create namespace table
       description: Creates a table through an explicit database and namespace route.
@@ -9979,11 +9977,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Table"
+                $ref: "#/components/schemas/TableStatus"
         "400":
           $ref: "#/components/responses/BadRequest"
         "501":
-          description: Non-default explicit catalog table route is not yet backed by catalog-aware table I/O.
+          description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
     delete:
       summary: Drop namespace table
       description: Drops a table through an explicit database and namespace route.
@@ -9998,7 +9996,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "501":
-          description: Non-default explicit catalog table route is not yet backed by catalog-aware table I/O.
+          description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
   /tables:
     get:
       summary: List all tables

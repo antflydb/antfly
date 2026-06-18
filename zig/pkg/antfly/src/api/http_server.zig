@@ -424,8 +424,10 @@ pub const StatusSource = struct {
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
+        create_catalog_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: tables_api.CreateTableRequest) anyerror!void = null,
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
+        drop_catalog_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         create_namespace: ?*const fn (ptr: *anyopaque, database_name: []const u8, namespace_name: []const u8) anyerror!void = null,
@@ -471,6 +473,16 @@ pub const StatusSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
 
+    pub fn createCatalogTable(self: StatusSource, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: tables_api.CreateTableRequest) !void {
+        if (self.vtable.create_catalog_table) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, req);
+        if (std.mem.eql(u8, target.database_name, tables_api.default_database_name) and
+            std.mem.eql(u8, target.namespace_name, tables_api.default_namespace_name))
+        {
+            return try self.createTable(alloc, target.table_name, req);
+        }
+        return error.UnsupportedOperation;
+    }
+
     pub fn restoreTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !bool {
         const fn_ptr = self.vtable.restore_table orelse return false;
         try fn_ptr(self.ptr, alloc, table_name, location_uri, backup_id);
@@ -480,6 +492,16 @@ pub const StatusSource = struct {
     pub fn dropTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn dropCatalogTable(self: StatusSource, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) !void {
+        if (self.vtable.drop_catalog_table) |fn_ptr| return try fn_ptr(self.ptr, alloc, target);
+        if (std.mem.eql(u8, target.database_name, tables_api.default_database_name) and
+            std.mem.eql(u8, target.namespace_name, tables_api.default_namespace_name))
+        {
+            return try self.dropTable(alloc, target.table_name);
+        }
+        return error.UnsupportedOperation;
     }
 
     pub fn updateSchema(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -614,12 +636,20 @@ pub const StatusSource = struct {
                 return try createTableOnService(cast(ptr), alloc, table_name, req);
             }
 
+            fn createCatalogTable(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: tables_api.CreateTableRequest) anyerror!void {
+                return try createCatalogTableOnService(cast(ptr), alloc, target, req);
+            }
+
             fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void {
                 return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, backup_id, serviceSecretStore(cast(ptr)));
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
                 return try dropTableOnService(cast(ptr), alloc, table_name);
+            }
+
+            fn dropCatalogTable(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) anyerror!void {
+                return try dropCatalogTableOnService(cast(ptr), alloc, target);
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
@@ -717,8 +747,10 @@ pub const StatusSource = struct {
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
             .create_table = Gen.createTable,
+            .create_catalog_table = Gen.createCatalogTable,
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
+            .drop_catalog_table = Gen.dropCatalogTable,
             .update_schema = Gen.updateSchema,
             .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
             .create_namespace = Gen.createNamespace,
@@ -798,15 +830,33 @@ fn loadRestoreMetadataSpec(
 }
 
 fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+    return try createCatalogTableOnService(svc, alloc, .{
+        .database_name = tables_api.default_database_name,
+        .namespace_name = tables_api.default_namespace_name,
+        .table_name = table_name,
+    }, req);
+}
+
+fn createCatalogTableOnService(svc: anytype, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: tables_api.CreateTableRequest) !void {
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    if (!std.mem.eql(u8, target.database_name, tables_api.default_database_name) or
+        !std.mem.eql(u8, target.namespace_name, tables_api.default_namespace_name))
+    {
+        if (tables_api.findDatabaseByName(&snapshot, target.database_name) == null) return error.DatabaseNotFound;
+        if (tables_api.findNamespaceByName(&snapshot, target.database_name, target.namespace_name) == null) return error.NamespaceNotFound;
+    }
+    if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
+
     var normalized_req = req;
     var expanded_indexes_json: ?[]u8 = null;
     defer if (expanded_indexes_json) |value| alloc.free(value);
     const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-    expanded_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+    expanded_indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(alloc, target.table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
     normalized_req.indexes_json = expanded_indexes_json;
-    const table = tables_api.deriveTableRecord(table_name, normalized_req);
+    const table = tables_api.deriveQualifiedTableRecord(target.database_name, target.namespace_name, target.table_name, normalized_req);
     const ranges = try tables_api.deriveInitialRanges(alloc, table);
     defer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
@@ -817,10 +867,18 @@ fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
 }
 
 fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8) !void {
+    return try dropCatalogTableOnService(svc, alloc, .{
+        .database_name = tables_api.default_database_name,
+        .namespace_name = tables_api.default_namespace_name,
+        .table_name = table_name,
+    });
+}
+
+fn dropCatalogTableOnService(svc: anytype, alloc: std.mem.Allocator, target: catalog_resources.TableTarget) !void {
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
+    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    if (extensionOwnsTableScopedObject(&snapshot, target.table_name)) return error.ExtensionOwnedObject;
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
@@ -3917,6 +3975,155 @@ pub const ApiHttpServer = struct {
             std.mem.eql(u8, namespace_name, tables_api.default_namespace_name);
     }
 
+    fn handlePublicGetCatalogTable(self: *ApiHttpServer, target: catalog_resources.TableTarget) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(target.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        if (!catalogApiIdentifierValid(target.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+        if (!catalogApiIdentifierValid(target.table_name)) return try textResponse(self.alloc, 400, "invalid table name");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const response = (try tables_api.buildSingleQualifiedTableStatusWithStorageStatuses(
+            arena_impl.allocator(),
+            &snapshot,
+            target.database_name,
+            target.namespace_name,
+            target.table_name,
+            null,
+        )) orelse return try textResponse(self.alloc, 404, "not found");
+        return try jsonResponse(self.alloc, response);
+    }
+
+    fn handlePublicCreateCatalogTable(self: *ApiHttpServer, target: catalog_resources.TableTarget, body: []const u8) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(target.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        if (!catalogApiIdentifierValid(target.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+        if (!catalogApiIdentifierValid(target.table_name)) return try textResponse(self.alloc, 400, "invalid table name");
+        if (self.table_writes != null and !defaultPublicCatalog(target.database_name, target.namespace_name)) {
+            return try textResponse(self.alloc, 501, "explicit catalog table lifecycle is not supported by the local table write backend");
+        }
+        var create_req = table_contract.parseCreateTableRequest(self.alloc, body) catch |err| {
+            std.log.err("create table parse failed: {} body_len={d}", .{ err, body.len });
+            return try textResponse(self.alloc, 400, "invalid create table request");
+        };
+        defer create_req.deinit(self.alloc);
+        const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+            self.alloc,
+            create_req.indexes_json orelse tables_api.default_indexes_json,
+            .{
+                .antfly_provider = self.antfly_provider,
+                .secret_store = self.cfg.secret_store,
+                .remote_content = self.cfg.remote_content,
+            },
+        ) catch |err| switch (err) {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+            error.EmbeddingProbeUnavailable => return try textResponse(self.alloc, 503, "table index validation probe unavailable"),
+            else => return err,
+        };
+        if (create_req.indexes_json) |old_indexes_json| self.alloc.free(old_indexes_json);
+        create_req.indexes_json = normalized_indexes_json;
+        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
+            return try textResponse(self.alloc, 400, "unsupported table index configuration");
+        };
+
+        self.source.createCatalogTable(self.alloc, target, create_req) catch |err| switch (err) {
+            error.DatabaseNotFound, error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => {
+                std.log.err("public create catalog table metadata create failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
+                return err;
+            },
+        };
+
+        if (self.table_writes) |table_writes_source| {
+            if (defaultPublicCatalog(target.database_name, target.namespace_name)) {
+                _ = table_writes_source.createTable(self.alloc, target.table_name, create_req) catch |err| switch (err) {
+                    error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
+                    else => {
+                        std.log.err("public create catalog table local create failed table={s}.{s}.{s} err={}", .{ target.database_name, target.namespace_name, target.table_name, err });
+                        return err;
+                    },
+                };
+            }
+        }
+
+        self.waitForCatalogTableVisibility(target, .present) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "table create did not converge"),
+            else => return err,
+        };
+        return try self.handlePublicGetCatalogTable(target);
+    }
+
+    fn handlePublicDropCatalogTable(self: *ApiHttpServer, target: catalog_resources.TableTarget) !http_common.HttpResponse {
+        if (!catalogApiIdentifierValid(target.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
+        if (!catalogApiIdentifierValid(target.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
+        if (!catalogApiIdentifierValid(target.table_name)) return try textResponse(self.alloc, 400, "invalid table name");
+        if (self.table_writes != null and !defaultPublicCatalog(target.database_name, target.namespace_name)) {
+            return try textResponse(self.alloc, 501, "explicit catalog table lifecycle is not supported by the local table write backend");
+        }
+        var local_drop_group_ids: ?[]u64 = null;
+        defer if (local_drop_group_ids) |group_ids| self.alloc.free(group_ids);
+        if (self.table_writes != null and defaultPublicCatalog(target.database_name, target.namespace_name)) {
+            if (try self.source.adminSnapshot()) |snapshot_value| {
+                var snapshot = snapshot_value;
+                defer self.source.freeAdminSnapshot(&snapshot);
+                local_drop_group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, target.table_name);
+            }
+        }
+        self.source.dropCatalogTable(self.alloc, target) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+            else => {
+                std.log.err("public drop catalog table metadata remove failed table={s}.{s}.{s} err={s}", .{
+                    target.database_name,
+                    target.namespace_name,
+                    target.table_name,
+                    @errorName(err),
+                });
+                return err;
+            },
+        };
+        if (self.table_writes) |write_source| {
+            if (defaultPublicCatalog(target.database_name, target.namespace_name)) {
+                const group_ids = local_drop_group_ids orelse &.{};
+                _ = write_source.dropTable(self.alloc, target.table_name, group_ids) catch |err| switch (err) {
+                    error.TableNotFound => null,
+                    else => {
+                        std.log.err("public drop catalog table local cleanup failed table={s}.{s}.{s} err={s}", .{
+                            target.database_name,
+                            target.namespace_name,
+                            target.table_name,
+                            @errorName(err),
+                        });
+                        return err;
+                    },
+                };
+            }
+        }
+        self.waitForCatalogTableVisibility(target, .absent) catch |err| switch (err) {
+            error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "table delete did not converge"),
+            else => return err,
+        };
+        return .{ .status = 204, .content_type = null, .body = &.{} };
+    }
+
+    fn waitForCatalogTableVisibility(self: *ApiHttpServer, target: catalog_resources.TableTarget, expected: TableVisibility) !void {
+        const timeout_ns = 5 * std.time.ns_per_s;
+        const poll_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            if (try self.source.adminSnapshot()) |snapshot_value| {
+                var snapshot = snapshot_value;
+                defer self.source.freeAdminSnapshot(&snapshot);
+                const present = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null;
+                if ((expected == .present and present) or (expected == .absent and !present)) return;
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            sleepNs(poll_ns);
+        }
+    }
+
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
@@ -3953,12 +4160,21 @@ pub const ApiHttpServer = struct {
         if (routes.Routes.matchDatabaseNamespaceTablePath(uri_parts.path)) |table_path| {
             if (!catalogApiIdentifierValid(table_path.database_name)) return try textResponse(self.alloc, 400, "invalid database name");
             if (!catalogApiIdentifierValid(table_path.namespace_name)) return try textResponse(self.alloc, 400, "invalid namespace name");
-            if (!defaultPublicCatalog(table_path.database_name, table_path.namespace_name)) {
-                return try textResponse(self.alloc, 501, "explicit catalog table routes are not fully supported for non-default database or namespace");
+            if (std.mem.indexOfScalar(u8, table_path.table_path, '/') != null) {
+                return try textResponse(self.alloc, 501, "explicit catalog table subroutes are not supported until table storage APIs are catalog-aware");
             }
-            const legacy_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ routes.Routes.tables, table_path.table_path });
-            defer self.alloc.free(legacy_path);
-            return try self.dispatchPublicTableRoutes(req, .{ .path = legacy_path, .query = uri_parts.query }, authenticated_identity);
+            if (!catalogApiIdentifierValid(table_path.table_path)) return try textResponse(self.alloc, 400, "invalid table name");
+            const target: catalog_resources.TableTarget = .{
+                .database_name = table_path.database_name,
+                .namespace_name = table_path.namespace_name,
+                .table_name = table_path.table_path,
+            };
+            return switch (req.method) {
+                .GET => try self.handlePublicGetCatalogTable(target),
+                .POST => try self.handlePublicCreateCatalogTable(target, req.body),
+                .DELETE => try self.handlePublicDropCatalogTable(target),
+                else => try textResponse(self.alloc, 405, "method not allowed"),
+            };
         }
         if (req.method == .POST) {
             if (routes.Routes.matchDatabaseNamespacePath(uri_parts.path)) |namespace_path| {
@@ -19847,6 +20063,7 @@ test "api http server serves database and namespace catalog routes" {
     const FakeSource = struct {
         tenant_created: bool = false,
         analytics_created: bool = false,
+        ad_hoc_table_created: bool = false,
         default_database: metadata_table_manager.DatabaseRecord = .{
             .database_id = metadata_table_manager.deriveDatabaseId("default"),
             .name = "default",
@@ -19881,9 +20098,16 @@ test "api http server serves database and namespace catalog routes" {
             .namespace_name = "analytics",
             .indexes_json = "{}",
         },
+        ad_hoc_table: metadata_table_manager.TableRecord = .{
+            .table_id = tables_api.deriveQualifiedTableId("tenant_ops", "analytics", "new_events"),
+            .name = "new_events",
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+            .indexes_json = "{}",
+        },
         database_buf: [2]metadata_table_manager.DatabaseRecord = undefined,
         namespace_buf: [2]metadata_table_manager.NamespaceRecord = undefined,
-        table_buf: [2]metadata_table_manager.TableRecord = undefined,
+        table_buf: [3]metadata_table_manager.TableRecord = undefined,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -19895,6 +20119,8 @@ test "api http server serves database and namespace catalog routes" {
                     .apply_relational_sql_ddl = applyRelationalSqlDdl,
                     .create_namespace = createNamespace,
                     .drop_namespace = dropNamespace,
+                    .create_catalog_table = createCatalogTable,
+                    .drop_catalog_table = dropCatalogTable,
                 },
             };
         }
@@ -19921,6 +20147,10 @@ test "api http server serves database and namespace catalog routes" {
             var table_len: usize = 1;
             if (self.analytics_created) {
                 self.table_buf[table_len] = self.events_table;
+                table_len += 1;
+            }
+            if (self.analytics_created and self.ad_hoc_table_created) {
+                self.table_buf[table_len] = self.ad_hoc_table;
                 table_len += 1;
             }
             return .{
@@ -19973,7 +20203,27 @@ test "api http server serves database and namespace catalog routes" {
             try std.testing.expectEqualStrings("analytics", namespace_name);
             if (!self.tenant_created) return error.DatabaseNotFound;
             if (!self.analytics_created) return error.NamespaceNotFound;
+            if (self.ad_hoc_table_created) return error.NamespaceNotEmpty;
             self.analytics_created = false;
+        }
+
+        fn createCatalogTable(ptr: *anyopaque, _: std.mem.Allocator, target: catalog_resources.TableTarget, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("new_events", target.table_name);
+            if (!self.tenant_created or !self.analytics_created) return error.NamespaceNotFound;
+            if (self.ad_hoc_table_created) return error.TableAlreadyExists;
+            self.ad_hoc_table_created = true;
+        }
+
+        fn dropCatalogTable(ptr: *anyopaque, _: std.mem.Allocator, target: catalog_resources.TableTarget) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("new_events", target.table_name);
+            if (!self.ad_hoc_table_created) return error.TableNotFound;
+            self.ad_hoc_table_created = false;
         }
     };
 
@@ -20036,7 +20286,32 @@ test "api http server serves database and namespace catalog routes" {
         .uri = "/databases/tenant_ops/namespaces/analytics/tables/events",
     });
     defer non_default_table.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 501), non_default_table.status);
+    try std.testing.expectEqual(@as(u16, 200), non_default_table.status);
+    try std.testing.expect(std.mem.indexOf(u8, non_default_table.body, "\"name\":\"events\"") != null);
+
+    var non_default_table_subroute = try server.handle(.{
+        .method = .GET,
+        .uri = "/databases/tenant_ops/namespaces/analytics/tables/events/indexes",
+    });
+    defer non_default_table_subroute.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), non_default_table_subroute.status);
+
+    var create_non_default_table = try server.handle(.{
+        .method = .POST,
+        .uri = "/databases/tenant_ops/namespaces/analytics/tables/new_events",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer create_non_default_table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), create_non_default_table.status);
+    try std.testing.expect(std.mem.indexOf(u8, create_non_default_table.body, "\"name\":\"new_events\"") != null);
+
+    var drop_non_default_table = try server.handle(.{
+        .method = .DELETE,
+        .uri = "/databases/tenant_ops/namespaces/analytics/tables/new_events",
+    });
+    defer drop_non_default_table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), drop_non_default_table.status);
 
     var drop_namespace = try server.handle(.{
         .method = .DELETE,

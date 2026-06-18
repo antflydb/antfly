@@ -550,13 +550,13 @@ pub const Client = struct {
 
     /// Create namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
-    pub fn createNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.Table) {
+    pub fn createNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.TableStatus) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.TableStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Drop namespace table
