@@ -380,7 +380,9 @@ func listHuggingFaceFiles(ctx context.Context, client *http.Client, baseURL, rep
 func selectModelFiles(entries []hfTreeEntry, format, variant string) []hfTreeEntry {
 	format = strings.ToLower(strings.TrimSpace(format))
 	variant = normalizeVariant(variant)
-	var out []hfTreeEntry
+	var support []hfTreeEntry
+	var artifacts []hfTreeEntry
+	var onnxData []hfTreeEntry
 	for _, entry := range entries {
 		if entry.Type != "" && entry.Type != "file" {
 			continue
@@ -389,26 +391,33 @@ func selectModelFiles(entries []hfTreeEntry, format, variant string) []hfTreeEnt
 		ext := strings.ToLower(filepath.Ext(base))
 		switch ext {
 		case ".json", ".txt", ".model", ".spm", ".tiktoken":
-			out = append(out, entry)
+			support = append(support, entry)
 		case ".onnx":
 			if format == ModelFormatGGUF {
 				continue
 			}
 			if variant == "" || strings.Contains(normalizeVariant(base), variant) || !looksVariantFile(base) {
-				out = append(out, entry)
+				artifacts = append(artifacts, entry)
 			}
 		case ".gguf":
 			if format != "" && format != ModelFormatGGUF {
 				continue
 			}
 			if variant == "" || strings.Contains(normalizeVariant(base), variant) {
-				out = append(out, entry)
+				artifacts = append(artifacts, entry)
 			}
 		}
 		if format != ModelFormatGGUF && (strings.HasSuffix(base, ".onnx_data") || strings.HasSuffix(base, ".onnx.data")) {
-			out = append(out, entry)
+			onnxData = append(onnxData, entry)
 		}
 	}
+	if len(artifacts) == 0 {
+		return nil
+	}
+	out := make([]hfTreeEntry, 0, len(support)+len(artifacts)+len(onnxData))
+	out = append(out, support...)
+	out = append(out, artifacts...)
+	out = append(out, onnxData...)
 	return out
 }
 

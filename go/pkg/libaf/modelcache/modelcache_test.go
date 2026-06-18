@@ -104,6 +104,38 @@ func TestPullHuggingFaceModelSelectsClipclapQ4K(t *testing.T) {
 	}
 }
 
+func TestPullHuggingFaceModelRequiresMatchingArtifact(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/models/antflydb/clipclap/tree/main":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[
+				{"path":"config.json","type":"file","size":2},
+				{"path":"clipclap-Q4_K.gguf","type":"file","size":4}
+			]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	modelsDir := t.TempDir()
+	modelDir, err := PullHuggingFaceModel(context.Background(), "antflydb/clipclap:gguf:Q5_K", ModelSpec{
+		Task:           "embedder",
+		DefaultFormat:  ModelFormatGGUF,
+		DefaultVariant: "Q4_K",
+	}, ModelPullOptions{
+		ModelsDir:          modelsDir,
+		HuggingFaceBaseURL: server.URL,
+	})
+	if err == nil {
+		t.Fatalf("PullHuggingFaceModel returned modelDir=%q, want missing artifact error", modelDir)
+	}
+	if _, statErr := os.Stat(filepath.Join(modelsDir, "antflydb", "clipclap", "model_manifest.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest should not be written without matching artifact, stat err=%v", statErr)
+	}
+}
+
 func TestPullHuggingFaceModelReportsResumeAndResolvedSource(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

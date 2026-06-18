@@ -49,6 +49,29 @@ describe("model helpers", () => {
     expect(manifest).toContain('"source": "antflydb/clipclap:gguf:Q4_K"');
   });
 
+  it("rejects pulls without a matching runnable artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
+    const fetchMock = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/api/models/antflydb/clipclap/tree/main?recursive=1")) {
+        return Response.json([
+          { path: "config.json", type: "file", size: 2 },
+          { path: "clipclap-Q4_K.gguf", type: "file", size: 4 },
+        ]);
+      }
+      return new Response("missing", { status: 404 });
+    };
+
+    await expect(
+      pullHuggingFaceModel("antflydb/clipclap:gguf:Q5_K", {
+        modelsDir: root,
+        huggingFaceBaseUrl: "https://hf.test",
+        fetch: fetchMock as typeof fetch,
+      })
+    ).rejects.toThrow(/no downloadable files/);
+    await expect(stat(join(root, "antflydb", "clipclap", "model_manifest.json"))).rejects.toThrow();
+  });
+
   it("reports resume progress and resolved source for bare model refs", async () => {
     const root = await mkdtemp(join(tmpdir(), "antfly-sdk-models-"));
     const dir = join(root, "antflydb", "clipclap");

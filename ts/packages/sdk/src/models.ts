@@ -283,21 +283,32 @@ async function listHuggingFaceFiles(
 function selectModelFiles(entries: HuggingFaceTreeEntry[], format: string, variant: string): HuggingFaceTreeEntry[] {
   const normalizedFormat = format.trim().toLowerCase();
   const normalizedVariant = normalizeVariant(variant);
-  return entries.filter((entry) => {
-    if (entry.type && entry.type !== "file") return false;
+  const support: HuggingFaceTreeEntry[] = [];
+  const artifacts: HuggingFaceTreeEntry[] = [];
+  const onnxData: HuggingFaceTreeEntry[] = [];
+  for (const entry of entries) {
+    if (entry.type && entry.type !== "file") continue;
     const base = entry.path.split("/").pop()?.toLowerCase() || "";
-    if (/\.(json|txt|model|spm|tiktoken)$/.test(base)) return true;
-    if (base.endsWith(".onnx_data") || base.endsWith(".onnx.data")) return normalizedFormat !== MODEL_FORMAT_GGUF;
+    if (/\.(json|txt|model|spm|tiktoken)$/.test(base)) {
+      support.push(entry);
+      continue;
+    }
+    if (base.endsWith(".onnx_data") || base.endsWith(".onnx.data")) {
+      if (normalizedFormat !== MODEL_FORMAT_GGUF) onnxData.push(entry);
+      continue;
+    }
     if (base.endsWith(".onnx")) {
-      if (normalizedFormat === MODEL_FORMAT_GGUF) return false;
-      return !normalizedVariant || normalizeVariant(base).includes(normalizedVariant) || !looksVariantFile(base);
+      if (normalizedFormat === MODEL_FORMAT_GGUF) continue;
+      if (!normalizedVariant || normalizeVariant(base).includes(normalizedVariant) || !looksVariantFile(base)) artifacts.push(entry);
+      continue;
     }
     if (base.endsWith(".gguf")) {
-      if (normalizedFormat && normalizedFormat !== MODEL_FORMAT_GGUF) return false;
-      return !normalizedVariant || normalizeVariant(base).includes(normalizedVariant);
+      if (normalizedFormat && normalizedFormat !== MODEL_FORMAT_GGUF) continue;
+      if (!normalizedVariant || normalizeVariant(base).includes(normalizedVariant)) artifacts.push(entry);
     }
-    return false;
-  });
+  }
+  if (artifacts.length === 0) return [];
+  return [...support, ...artifacts, ...onnxData];
 }
 
 async function downloadFile(
