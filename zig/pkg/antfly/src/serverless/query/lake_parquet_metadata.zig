@@ -298,6 +298,7 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .compression_codec = compression_codec,
         .encoding = encoding,
         .physical_type = physical_type,
+        .nullable = chunk.nullable,
     };
 }
 
@@ -448,6 +449,7 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .compression_codec = meta.compression_codec,
         .encoding = meta.encoding,
         .physical_type = meta.physical_type,
+        .nullable = false,
     };
     chunk.validate(file_len) catch return error.InvalidParquetMetadata;
     meta.disown();

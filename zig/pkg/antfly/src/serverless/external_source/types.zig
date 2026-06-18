@@ -32,6 +32,7 @@ pub const ColumnChunk = struct {
     compression_codec: []u8 = &.{},
     encoding: []u8 = &.{},
     physical_type: []u8 = &.{},
+    nullable: bool = false,
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
         alloc.free(self.column_id);

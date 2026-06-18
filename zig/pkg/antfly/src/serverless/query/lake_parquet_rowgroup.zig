@@ -407,6 +407,7 @@ const PlainI64Mode = enum {
     required,
     optional,
     dictionary_required,
+    dictionary_optional,
 };
 
 const SupportedColumnMode = union(enum) {
@@ -500,6 +501,12 @@ fn buildPlainI64RowGroupBatchAlloc(
                 .dictionary_required => {
                     decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression) };
                     null_bitmaps[idx] = &.{};
+                },
+                .dictionary_optional => {
+                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .i64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
                 },
             },
             .i32 => |i32_mode| switch (i32_mode) {
@@ -1041,11 +1048,11 @@ fn findColumnChunk(row_group: external_source.RowGroup, column_id: []const u8) ?
 
 fn plainI64ModeForColumnChunk(chunk: external_source.ColumnChunk) !PlainI64Mode {
     if (chunk.physical_type.len != 0 and !std.ascii.eqlIgnoreCase(chunk.physical_type, "int64")) return error.UnsupportedParquetPage;
-    if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .required;
+    if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return if (chunk.nullable) .optional else .required;
     if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
         std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
     {
-        return .dictionary_required;
+        return if (chunk.nullable) .dictionary_optional else .dictionary_required;
     }
     return error.UnsupportedParquetPage;
 }
@@ -1359,6 +1366,59 @@ fn appendDictionaryI64DataPage(
     try appendStop(out, alloc);
     try appendStop(out, alloc);
 
+    try out.append(alloc, bit_width);
+    try out.appendSlice(alloc, encoded_indexes);
+}
+
+fn appendOptionalDictionaryI64DataPageV2(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    values: []const ?u8,
+    bit_width: u8,
+    encoded_indexes: []const u8,
+) !void {
+    var present_count: usize = 0;
+    for (values) |maybe| {
+        if (maybe != null) present_count += 1;
+    }
+    const level_group_count = (values.len + 7) / 8;
+    const definition_level_bytes: i32 = @intCast(1 + level_group_count);
+    const byte_len: i32 = @intCast(@as(usize, @intCast(definition_level_bytes)) + 1 + encoded_indexes.len);
+    const null_count: i32 = @intCast(values.len - present_count);
+
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 3);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 8, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, null_count);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 7);
+    try appendField(out, alloc, &data_prev, 5, .i32);
+    try appendI32(out, alloc, definition_level_bytes);
+    try appendField(out, alloc, &data_prev, 6, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try appendVarint(out, alloc, (@as(u64, @intCast(level_group_count)) << 1) | 1);
+    var packed_levels = try alloc.alloc(u8, level_group_count);
+    defer alloc.free(packed_levels);
+    @memset(packed_levels, 0);
+    for (values, 0..) |maybe, idx| {
+        if (maybe != null) packed_levels[idx / 8] |= @as(u8, 1) << @intCast(idx % 8);
+    }
+    try out.appendSlice(alloc, packed_levels);
     try out.append(alloc, bit_width);
     try out.appendSlice(alloc, encoded_indexes);
 }
@@ -1741,6 +1801,62 @@ test "parquet row group batch assembles dictionary i64 columns" {
     const row_ref = owned.batch.row_refs[3].external;
     try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
     try std.testing.expectEqual(@as(u64, 3), row_ref.row_ordinal);
+}
+
+test "parquet row group batch assembles optional dictionary i64 columns from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1024,
+        .row_count = 4,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 4,
+            .file_offset = 100,
+            .total_byte_len = 96,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 100,
+                .compressed_len = 96,
+                .uncompressed_len = 96,
+                .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                .physical_type = try alloc.dupe(u8, "int64"),
+                .nullable = true,
+            }}),
+        }}),
+    };
+    try inventory.validate();
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try appendPlainI64DictionaryPage(&chunk, alloc, &[_]i64{ 11, 22, 33 });
+    try appendOptionalDictionaryI64DataPageV2(&chunk, alloc, &[_]?u8{ 0, null, 2, 1 }, 2, &[_]u8{ 3, 0b00011000, 0 });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
+        .column_id = "amount",
+        .bytes = chunk.items,
+    }});
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqual(@as(usize, 4), owned.batch.rowCount());
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 11, 0, 33, 22 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0, 0 }, owned.batch.columns[0].nulls.bytes);
+    try std.testing.expect(!owned.batch.columns[0].nulls.isNull(0));
+    try std.testing.expect(owned.batch.columns[0].nulls.isNull(1));
+    try std.testing.expect(!owned.batch.columns[0].nulls.isNull(2));
+    try std.testing.expect(!owned.batch.columns[0].nulls.isNull(3));
 }
 
 test "parquet row group batch dispatches supported i64 encodings from inventory" {
