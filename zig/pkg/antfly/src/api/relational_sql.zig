@@ -3830,10 +3830,11 @@ const Parser = struct {
     }
 
     fn parsePreparedStatementSubjectKind(self: *@This()) !PreparedStatementSubjectKind {
-        if (self.peekKeyword("select") or self.peekKeyword("with")) return .read;
-        if (self.peekKeyword("insert") or self.peekKeyword("update") or self.peekKeyword("delete") or self.peekKeyword("truncate")) return .write;
-        if (self.peekKeyword("create") or self.peekKeyword("alter") or self.peekKeyword("drop")) return .ddl;
-        return error.UnsupportedSqlShape;
+        return switch (sql_adapter.classifyPreparedStatementSubjectKind(self.tokens, self.pos) orelse return error.UnsupportedSqlShape) {
+            .read => .read,
+            .write => .write,
+            .ddl => .ddl,
+        };
     }
 
     fn consumePreparedStatementSubjectTail(self: *@This()) !void {
@@ -47018,6 +47019,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:prepare_statement:name=usage_plan:params=1:subject=read", prepare_statement_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_statement));
 
+    var prepare_merge_statement = try lowerDdlPlanAlloc(alloc, "PREPARE merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
+    defer prepare_merge_statement.deinit(alloc);
+    const prepare_merge_statement_fingerprint = try ddlFingerprintAlloc(alloc, prepare_merge_statement);
+    defer alloc.free(prepare_merge_statement_fingerprint);
+    try std.testing.expectEqualStrings("ddl:prepare_statement:name=merge_plan:params=0:subject=write", prepare_merge_statement_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, prepare_merge_statement));
+
     var execute_statement = try lowerDdlPlanAlloc(alloc, "EXECUTE usage_plan('open');");
     defer execute_statement.deinit(alloc);
     const execute_statement_fingerprint = try ddlFingerprintAlloc(alloc, execute_statement);
@@ -47070,6 +47078,13 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(declare_scroll_hold_cursor_fingerprint);
     try std.testing.expectEqualStrings("ddl:declare_cursor:portal=usage_scroll_cursor:scroll=scroll:binary=true:hold=true:subject=read", declare_scroll_hold_cursor_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, declare_scroll_hold_cursor));
+
+    var declare_merge_cursor = try lowerDdlPlanAlloc(alloc, "DECLARE merge_cursor CURSOR FOR MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
+    defer declare_merge_cursor.deinit(alloc);
+    const declare_merge_cursor_fingerprint = try ddlFingerprintAlloc(alloc, declare_merge_cursor);
+    defer alloc.free(declare_merge_cursor_fingerprint);
+    try std.testing.expectEqualStrings("ddl:declare_cursor:portal=merge_cursor:scroll=default:binary=false:hold=false:subject=write", declare_merge_cursor_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, declare_merge_cursor));
 
     var fetch_cursor = try lowerDdlPlanAlloc(alloc, "FETCH NEXT FROM usage_cursor;");
     defer fetch_cursor.deinit(alloc);

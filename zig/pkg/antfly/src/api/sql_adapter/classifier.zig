@@ -40,6 +40,12 @@ pub const SqlWriteStatementKind = enum {
     merge,
 };
 
+pub const SqlPreparedStatementSubjectKind = enum {
+    read,
+    write,
+    ddl,
+};
+
 pub fn classifyStatementFamily(tokens: []const Token) ?SqlStatementFamily {
     const first = firstIdentifier(tokens) orelse return null;
     if (std.ascii.eqlIgnoreCase(first, "select")) return .select;
@@ -62,6 +68,25 @@ pub fn classifyWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
         .merge => .merge,
         .select, .ddl => null,
     };
+}
+
+pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize) ?SqlPreparedStatementSubjectKind {
+    if (statementStartsAt(tokens, start, "select") or statementStartsAt(tokens, start, "with")) return .read;
+    if (statementStartsAt(tokens, start, "insert") or
+        statementStartsAt(tokens, start, "update") or
+        statementStartsAt(tokens, start, "delete") or
+        statementStartsAt(tokens, start, "truncate") or
+        statementStartsAt(tokens, start, "merge"))
+    {
+        return .write;
+    }
+    if (statementStartsAt(tokens, start, "create") or
+        statementStartsAt(tokens, start, "alter") or
+        statementStartsAt(tokens, start, "drop"))
+    {
+        return .ddl;
+    }
+    return null;
 }
 
 fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
@@ -108,6 +133,12 @@ fn firstIdentifier(tokens: []const Token) ?[]const u8 {
     return tokens[0].text;
 }
 
+fn statementStartsAt(tokens: []const Token, start: usize, keyword: []const u8) bool {
+    if (start >= tokens.len) return false;
+    if (tokens[start].kind != .identifier) return false;
+    return std.ascii.eqlIgnoreCase(tokens[start].text, keyword);
+}
+
 test "sql adapter classifier identifies write statement families" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
@@ -152,4 +183,35 @@ test "sql adapter classifier rejects non-write and non-token statements" {
     try std.testing.expect(classifyWriteStatement(recursive_tokens.items) == null);
 
     try std.testing.expect(classifyStatementFamily(&.{}) == null);
+}
+
+test "sql adapter classifier identifies prepared statement subject families" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        start_keyword: []const u8,
+        expected: SqlPreparedStatementSubjectKind,
+    }{
+        .{ .sql = "PREPARE usage_plan AS SELECT id FROM usage_records", .start_keyword = "select", .expected = .read },
+        .{ .sql = "PREPARE usage_plan AS WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .start_keyword = "with", .expected = .read },
+        .{ .sql = "PREPARE usage_plan AS INSERT INTO usage_records(id) VALUES ($1)", .start_keyword = "insert", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS UPDATE usage_records SET status = $1", .start_keyword = "update", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS DELETE FROM usage_records", .start_keyword = "delete", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS TRUNCATE usage_records", .start_keyword = "truncate", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status", .start_keyword = "merge", .expected = .write },
+        .{ .sql = "PREPARE usage_plan AS CREATE TABLE usage_records(id text)", .start_keyword = "create", .expected = .ddl },
+        .{ .sql = "PREPARE usage_plan AS ALTER TABLE usage_records ADD COLUMN status text", .start_keyword = "alter", .expected = .ddl },
+        .{ .sql = "PREPARE usage_plan AS DROP TABLE usage_records", .start_keyword = "drop", .expected = .ddl },
+    };
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(alloc, case.sql);
+        defer lexer.freeTokens(alloc, &tokens);
+        const start = parser.findTopLevelKeyword(tokens.items, case.start_keyword).?;
+        try std.testing.expectEqual(case.expected, classifyPreparedStatementSubjectKind(tokens.items, start).?);
+    }
+
+    var explain_tokens = try lexer.tokenizeAlloc(alloc, "PREPARE usage_plan AS EXPLAIN SELECT id FROM usage_records");
+    defer lexer.freeTokens(alloc, &explain_tokens);
+    const explain_start = parser.findTopLevelKeyword(explain_tokens.items, "explain").?;
+    try std.testing.expect(classifyPreparedStatementSubjectKind(explain_tokens.items, explain_start) == null);
 }
