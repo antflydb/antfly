@@ -464,6 +464,15 @@ pub const DeltaTailWithStats = struct {
     }
 };
 
+const LatestPointValue = struct {
+    segment_id: u64,
+    data: []u8,
+
+    fn deinit(self: LatestPointValue, alloc: Allocator) void {
+        alloc.free(self.data);
+    }
+};
+
 pub const RuntimeDirectoryStore = struct {
     alloc: Allocator,
     io: std.Io,
@@ -858,8 +867,20 @@ pub const LazyDirectorySnapshot = struct {
         generation: u64,
         scratch: anytype,
     ) !posting.PostingDeltaTailStats {
+        return try self.appendDeltaTailAfterGenerationIntoScratchWithStatsFromSegment(alloc, posting_id, generation, 0, scratch);
+    }
+
+    fn appendDeltaTailAfterGenerationIntoScratchWithStatsFromSegment(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        posting_id: PostingId,
+        generation: u64,
+        min_segment_id: u64,
+        scratch: anytype,
+    ) !posting.PostingDeltaTailStats {
         var stats = posting.PostingDeltaTailStats{};
         for (self.manifest.segments) |entry| {
+            if (entry.meta.segment_id < min_segment_id) continue;
             if (!entry.meta.mayContainPosting(posting_id)) continue;
             if (entry.meta.max_delta_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(entry.meta.max_delta_sequence) <= generation) continue;
             try self.readDeltaRecordsIntoScratchWithStatsAlloc(alloc, entry, posting_id, generation, scratch, &stats);
@@ -879,7 +900,30 @@ pub const LazyDirectorySnapshot = struct {
         scratch.resetDeltaRecords();
         errdefer scratch.resetDeltaRecords();
 
-        const stats = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_generation, scratch);
+        const stats = try self.appendDeltaTailAfterGenerationIntoScratchWithStatsFromSegment(alloc, posting_id, base_generation, 0, scratch);
+        const result = posting.DeltaReplayResult{
+            .records = stats.records_after_generation,
+            .max_sequence = stats.max_sequence_after_generation,
+        };
+
+        try applyBufferedDeltaRecordsIntoScratch(alloc, scratch, member_count, base_members_are_sorted);
+        return result;
+    }
+
+    fn applyDeltaTailAfterGenerationIntoScratchFromSegment(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        posting_id: PostingId,
+        scratch: anytype,
+        member_count: *usize,
+        base_generation: u64,
+        min_segment_id: u64,
+        base_members_are_sorted: bool,
+    ) !posting.DeltaReplayResult {
+        scratch.resetDeltaRecords();
+        errdefer scratch.resetDeltaRecords();
+
+        const stats = try self.appendDeltaTailAfterGenerationIntoScratchWithStatsFromSegment(alloc, posting_id, base_generation, min_segment_id, scratch);
         const result = posting.DeltaReplayResult{
             .records = stats.records_after_generation,
             .max_sequence = stats.max_sequence_after_generation,
@@ -963,23 +1007,23 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     pub fn materializeMembersIntoScratch(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, scratch: anytype) !?usize {
-        const found_base_data = (try self.loadBaseData(alloc, posting_id)) orelse return null;
-        defer alloc.free(found_base_data);
+        const found_base = (try self.readLatestPointValueWithSegmentAlloc(alloc, posting_id, .base)) orelse return null;
+        defer found_base.deinit(alloc);
 
         scratch.resetDeltaRecords();
         errdefer scratch.resetDeltaRecords();
 
-        const base = try posting.PostingFormat.materializeBaseMembersIntoScratch(alloc, scratch, found_base_data);
+        const base = try posting.PostingFormat.materializeBaseMembersIntoScratch(alloc, scratch, found_base.data);
         var member_count = base.member_count;
 
-        _ = try self.applyDeltaTailAfterGenerationIntoScratch(alloc, posting_id, scratch, &member_count, base.header.generation, false);
+        _ = try self.applyDeltaTailAfterGenerationIntoScratchFromSegment(alloc, posting_id, scratch, &member_count, base.header.generation, found_base.segment_id, false);
         return member_count;
     }
 
     pub fn materializeSortedMembersIntoScratch(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, scratch: anytype) !?usize {
-        const found_base_data = (try self.loadBaseData(alloc, posting_id)) orelse return null;
-        defer alloc.free(found_base_data);
-        const base_header = try posting.PostingFormat.decodeBaseHeader(found_base_data);
+        const found_base = (try self.readLatestPointValueWithSegmentAlloc(alloc, posting_id, .base)) orelse return null;
+        defer found_base.deinit(alloc);
+        const base_header = try posting.PostingFormat.decodeBaseHeader(found_base.data);
         scratch.resetDeltaRecords();
         scratch.resetCompactDeltaRecords();
         errdefer {
@@ -987,10 +1031,10 @@ pub const LazyDirectorySnapshot = struct {
             scratch.resetCompactDeltaRecords();
         }
 
-        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_header.generation, scratch);
+        _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStatsFromSegment(alloc, posting_id, base_header.generation, found_base.segment_id, scratch);
         const records = scratch.deltaRecordsMut();
         if (records.len == 0) {
-            return try posting.PostingFormat.materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, found_base_data, base_header);
+            return try posting.PostingFormat.materializeBaseMembersWithHeaderIntoScratch(alloc, scratch, found_base.data, base_header);
         }
 
         sortPostingDeltaRecordsIfNeeded(records);
@@ -998,7 +1042,7 @@ pub const LazyDirectorySnapshot = struct {
         for (records) |record| {
             scratch.appendCompactDeltaRecordAssumeCapacity(record);
         }
-        return try posting.PostingFormat.materializeSortedBaseWithCompactDeltaRecordsIntoScratch(alloc, scratch, found_base_data);
+        return try posting.PostingFormat.materializeSortedBaseWithCompactDeltaRecordsIntoScratch(alloc, scratch, found_base.data);
     }
 
     fn loadDeltaTailFilteredAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
@@ -1036,6 +1080,11 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestPointValueAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?[]u8 {
+        const latest = (try self.readLatestPointValueWithSegmentAlloc(alloc, posting_id, kind)) orelse return null;
+        return latest.data;
+    }
+
+    fn readLatestPointValueWithSegmentAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?LatestPointValue {
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
@@ -1054,11 +1103,19 @@ pub const LazyDirectorySnapshot = struct {
             best_segment_id = entry.meta.segment_id;
             best_manifest_entry = manifest_entry;
             best_index_entry = found;
-            if (best_segment_id == newest_segment_id) return try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
+            if (best_segment_id == newest_segment_id) {
+                return .{
+                    .segment_id = best_segment_id,
+                    .data = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found),
+                };
+            }
         }
 
         const manifest_entry = best_manifest_entry orelse return null;
-        return try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, best_index_entry);
+        return .{
+            .segment_id = best_segment_id,
+            .data = try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, best_index_entry),
+        };
     }
 
     fn readLatestBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
@@ -6832,6 +6889,60 @@ test "posting segment lazy materialization sizes member scratch by live deltas" 
     try std.testing.expectEqual(@as(usize, 1), member_count);
     try std.testing.expectEqualSlices(posting.VectorId, &.{20}, scratch.member_ids[0..member_count]);
     try std.testing.expect(scratch.member_ids.len >= 2);
+}
+
+test "posting segment lazy materialization skips stale delta segments older than base" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 1,
+        .members = &.{ 10, 20 },
+    });
+    defer alloc.free(old_base);
+    const old_delta = try posting.PostingFormat.encodeDeltaTail(alloc, &.{
+        .{ .sequence = (@as(u64, 2) << 32) | 1, .op = .insert, .vector_id = 30 },
+    });
+    defer alloc.free(old_delta);
+    var old_writer = Writer.init(alloc);
+    defer old_writer.deinit();
+    try old_writer.appendBase(7, old_base);
+    try old_writer.appendDelta(7, (@as(u64, 2) << 32) | 1, old_delta);
+    var committed_old = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &old_writer, .{});
+    defer committed_old.deinit(alloc);
+
+    const new_base = try posting.PostingFormat.encodeBase(alloc, .{
+        .posting_id = 7,
+        .generation = 3,
+        .members = &.{ 10, 20, 30 },
+    });
+    defer alloc.free(new_base);
+    var new_writer = Writer.init(alloc);
+    defer new_writer.deinit();
+    try new_writer.appendBase(7, new_base);
+    var committed_new = try commitWriterToDirectoryAlloc(alloc, std.testing.io, tmp.dir, &new_writer, .{});
+    defer committed_new.deinit(alloc);
+
+    const corrupt_old = try tmp.dir.readFileAlloc(std.testing.io, committed_old.entry.path, alloc, .limited(committed_old.entry.meta.byte_len + 1));
+    defer alloc.free(corrupt_old);
+    corrupt_old[0] ^= 0xff;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = committed_old.entry.path,
+        .data = corrupt_old,
+    });
+
+    var lazy = try openLazyStoreFromDirectoryAlloc(alloc, std.testing.io, tmp.dir, .{});
+    defer lazy.deinit(alloc);
+    var scratch = posting.PostingStore.FoldScratch{};
+    defer scratch.deinit(alloc);
+
+    const member_count = (try lazy.snapshot().materializeMembersIntoScratch(alloc, 7, &scratch)).?;
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, scratch.member_ids[0..member_count]);
+
+    const sorted_count = (try lazy.snapshot().materializeSortedMembersIntoScratch(alloc, 7, &scratch)).?;
+    try std.testing.expectEqualSlices(posting.VectorId, &.{ 10, 20, 30 }, scratch.member_ids[0..sorted_count]);
 }
 
 test "posting segment lazy materialization uses adaptive overlay replay for large tails" {
