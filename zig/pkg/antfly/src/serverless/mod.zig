@@ -345,6 +345,7 @@ pub const buildLakeParquetDictionaryPlainI64RowGroupBatchAlloc = query.buildLake
 pub const buildLakeParquetSupportedI64RowGroupBatchAlloc = query.buildLakeParquetSupportedI64RowGroupBatchAlloc;
 pub const buildLakeParquetPlainI64ObjectRangeRowGroupBatchAlloc = query.buildLakeParquetPlainI64ObjectRangeRowGroupBatchAlloc;
 pub const buildLakeParquetSupportedI64ObjectRangeRowGroupBatchAlloc = query.buildLakeParquetSupportedI64ObjectRangeRowGroupBatchAlloc;
+pub const buildLakeParquetSupportedI64CoalescedObjectRangeRowGroupBatchAlloc = query.buildLakeParquetSupportedI64CoalescedObjectRangeRowGroupBatchAlloc;
 pub const planLakeParquetPlainI64ObjectRangeRowGroupsAlloc = query.planLakeParquetPlainI64ObjectRangeRowGroupsAlloc;
 pub const planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc = query.planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc;
 pub const discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc = query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
@@ -676,6 +677,7 @@ test "serverless module compiles" {
     _ = buildLakeParquetSupportedI64RowGroupBatchAlloc;
     _ = buildLakeParquetPlainI64ObjectRangeRowGroupBatchAlloc;
     _ = buildLakeParquetSupportedI64ObjectRangeRowGroupBatchAlloc;
+    _ = buildLakeParquetSupportedI64CoalescedObjectRangeRowGroupBatchAlloc;
     _ = planLakeParquetPlainI64ObjectRangeRowGroupsAlloc;
     _ = planLakeParquetSupportedI64ObjectRangeRowGroupsAlloc;
     _ = discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc;
