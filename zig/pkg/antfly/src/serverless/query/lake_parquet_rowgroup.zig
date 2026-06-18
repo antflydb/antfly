@@ -127,6 +127,15 @@ pub const ObjectRangeCachePolicy = struct {
     max_bytes_by_lane: [object_range_cache_lane_count]?usize = [_]?usize{null} ** object_range_cache_lane_count,
     protected_lanes: [object_range_cache_lane_count]bool = [_]bool{false} ** object_range_cache_lane_count,
 
+    pub fn lakeServingDefaults(max_total_bytes: usize) ObjectRangeCachePolicy {
+        var policy = ObjectRangeCachePolicy{};
+        policy.setTotalLimit(max_total_bytes);
+        policy.protectLane(.metadata);
+        policy.protectLane(.serving_sidecar);
+        policy.setLaneLimit(.broad_scan_scratch, max_total_bytes / 8);
+        return policy;
+    }
+
     pub fn withLaneLimit(cache_lane: range_io.CacheLane, max_bytes: usize) ObjectRangeCachePolicy {
         var policy = ObjectRangeCachePolicy{};
         policy.max_bytes_by_lane[@intFromEnum(cache_lane)] = max_bytes;
@@ -158,6 +167,10 @@ pub const ObjectRangeCache = struct {
     entries: std.StringHashMapUnmanaged([]u8) = .empty,
     stats: ObjectRangeCacheStats = .{},
     policy: ObjectRangeCachePolicy = .{},
+
+    pub fn initWithLakeServingDefaults(max_total_bytes: usize) ObjectRangeCache {
+        return .{ .policy = ObjectRangeCachePolicy.lakeServingDefaults(max_total_bytes) };
+    }
 
     pub fn deinit(self: *ObjectRangeCache, alloc: Allocator) void {
         var iter = self.entries.iterator();
@@ -5220,6 +5233,90 @@ test "parquet object range cache lets protected sidecars displace scratch" {
     try std.testing.expectEqual(@as(usize, 1), stats.lane(.serving_sidecar).hits);
     try std.testing.expectEqual(@as(usize, 0), stats.lane(.broad_scan_scratch).stored_bytes);
     try std.testing.expectEqual(@as(usize, 4), stats.lane(.broad_scan_scratch).evicted_bytes);
+}
+
+test "parquet object range cache serving defaults protect metadata and sidecars" {
+    const alloc = std.testing.allocator;
+    var cache = ObjectRangeCache.initWithLakeServingDefaults(16);
+    defer cache.deinit(alloc);
+
+    const CountingReader = struct {
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var reader = CountingReader{ .body = "abcdefghijklmnopqrstuvwxyz" };
+    const object = range_io.ObjectRef{
+        .bucket = "bucket",
+        .key = "events/default-policy.bin",
+        .byte_len = 26,
+        .version = .{ .etag = "etag-a" },
+    };
+    const metadata_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = 8 },
+        .purpose = .parquet_footer,
+    };
+    const sidecar_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 8, .len = 8 },
+        .purpose = .sidecar_payload,
+    };
+    const scratch_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 16, .len = 2 },
+        .purpose = .broad_scan_scratch,
+    };
+
+    try std.testing.expect(cache.policy.isProtected(.metadata));
+    try std.testing.expect(cache.policy.isProtected(.serving_sidecar));
+    try std.testing.expectEqual(@as(?usize, 2), cache.policy.laneLimit(.broad_scan_scratch));
+
+    const metadata_first = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_first);
+    const sidecar_first = try cache.readAlloc(alloc, reader.reader(), sidecar_read);
+    defer alloc.free(sidecar_first);
+    const scratch_first = try cache.readAlloc(alloc, reader.reader(), scratch_read);
+    defer alloc.free(scratch_first);
+    const metadata_second = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_second);
+    const sidecar_second = try cache.readAlloc(alloc, reader.reader(), sidecar_read);
+    defer alloc.free(sidecar_second);
+
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 3), reader.read_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.hits);
+    try std.testing.expectEqual(@as(usize, 16), stats.stored_bytes);
+    try std.testing.expectEqual(@as(usize, 2), stats.rejected_bytes);
+    try std.testing.expectEqual(@as(usize, 8), stats.lane(.metadata).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.metadata).hits);
+    try std.testing.expectEqual(@as(usize, 8), stats.lane(.serving_sidecar).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.serving_sidecar).hits);
+    try std.testing.expectEqual(@as(usize, 0), stats.lane(.broad_scan_scratch).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 2), stats.lane(.broad_scan_scratch).rejected_bytes);
 }
 
 test "parquet object range rows query filters on unprojected column" {
