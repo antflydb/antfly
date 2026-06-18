@@ -5147,6 +5147,23 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         return cache.statsSnapshot();
     }
 
+    pub fn planProjectedScanAlloc(
+        self: *const @This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        projected_columns: []const []const u8,
+    ) !serverless_query.LakeScanPlan {
+        const external_base_source = runtime_schema.external_base_source orelse return error.InvalidRowsRequest;
+        const binding = external_binding_api.bindingFromRuntimeExternalBaseSource(external_base_source);
+        return try serverless_query.planProjectedLakeScanAlloc(alloc, .{
+            .binding = binding,
+            .inventory = self.inventory,
+            .projected_columns = projected_columns,
+            .include_footer_reads = !inventoryHasAnyRowGroupMetadata(self.inventory),
+            .coalesce_options = self.pinned_source.scanner.coalesce_options,
+        });
+    }
+
     pub fn deinit(self: *@This()) void {
         if (self.owned_cache) |cache| {
             cache.deinit(self.alloc);
@@ -5275,6 +5292,13 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
         if (std.mem.endsWith(u8, base_uri, "/")) return try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, relative_key });
         return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base_uri, relative_key });
     }
+
+    fn inventoryHasAnyRowGroupMetadata(inventory: external_source_api.Inventory) bool {
+        for (inventory.files) |file| {
+            if (file.row_groups.len != 0) return true;
+        }
+        return false;
+    }
 };
 
 pub const OpenedExternalObjectStorageLakeRowsSource = struct {
@@ -5342,6 +5366,15 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
 
     pub fn rangeCacheStats(self: *const @This()) ?serverless_query.LakeParquetObjectRangeCacheStats {
         return self.owned_source.rangeCacheStats();
+    }
+
+    pub fn planProjectedScanAlloc(
+        self: *const @This(),
+        alloc: std.mem.Allocator,
+        runtime_schema: storage_schema.TableSchema,
+        projected_columns: []const []const u8,
+    ) !serverless_query.LakeScanPlan {
+        return try self.owned_source.planProjectedScanAlloc(alloc, runtime_schema, projected_columns);
     }
 
     pub fn deinit(self: *@This()) void {

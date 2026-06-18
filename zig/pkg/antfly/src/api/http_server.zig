@@ -8612,12 +8612,20 @@ pub const ApiHttpServer = struct {
         defer lake_source.deinit();
 
         const state = lake_source.pinnedState();
-        const explained = self.explainLakeRowsOperationAlloc(schema, body, authenticated_identity, table_name) catch |err| switch (err) {
+        var explained = self.explainLakeRowsOperationAlloc(schema, body, authenticated_identity, table_name) catch |err| switch (err) {
             error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows explain request"),
             error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows explain unavailable"),
             error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
             else => return err,
         };
+        defer explained.deinit(self.alloc);
+        var scan_plan = lake_source.planProjectedScanAlloc(self.alloc, schema, explained.projected_columns) catch |err| switch (err) {
+            error.InvalidLakeScanPlan, error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows explain request"),
+            error.ExternalLakeSnapshotMismatch => return try textResponse(self.alloc, 409, "external lake snapshot mismatch"),
+            else => return err,
+        };
+        defer scan_plan.deinit(self.alloc);
+        const physical_scan = lakeRowsExplainPhysicalScan(scan_plan);
         const plan = try serverless_query.explainLakeQuery(.{
             .base_source = externalLakeBaseSourceDescriptor(state),
             .artifacts = &.{},
@@ -8640,6 +8648,7 @@ pub const ApiHttpServer = struct {
             source: Source,
             explained_operation: []const u8,
             scan: LakeRowsExplainScan,
+            physical_scan: LakeRowsExplainPhysicalScan,
             plan: serverless_query.LakeExplainPlan,
         };
         return try jsonResponse(self.alloc, Response{
@@ -8655,6 +8664,7 @@ pub const ApiHttpServer = struct {
             },
             .explained_operation = explained.operation_name,
             .scan = explained.scan,
+            .physical_scan = physical_scan,
             .plan = plan,
         });
     }
@@ -8670,6 +8680,22 @@ pub const ApiHttpServer = struct {
         operation: serverless_query.LakeExplainOperation = .scan,
         projected_column_count: u16 = 0,
         scan: LakeRowsExplainScan = .{},
+        projected_columns: []const []const u8 = &.{},
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.projected_columns) |column| alloc.free(@constCast(column));
+            if (self.projected_columns.len > 0) alloc.free(self.projected_columns);
+            self.* = undefined;
+        }
+    };
+
+    const LakeRowsExplainPhysicalScan = struct {
+        logical_read_count: usize = 0,
+        physical_read_count: usize = 0,
+        logical_read_bytes: u64 = 0,
+        physical_read_bytes: u64 = 0,
+        footer_read_count: usize = 0,
+        column_chunk_read_count: usize = 0,
     };
 
     fn explainLakeRowsOperationAlloc(
@@ -8688,7 +8714,7 @@ pub const ApiHttpServer = struct {
                 try self.applyRowsQueryPlanRowFilter(table_name, authenticated_identity, schema, &plan);
                 var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsQueryAlloc(self.alloc, schema, plan.query);
                 defer lake_request.deinit(self.alloc);
-                break :blk lakeRowsExplainedOperationFromScan("query", .scan, lake_request.request);
+                break :blk try lakeRowsExplainedOperationFromScan(self.alloc, "query", .scan, lake_request.request);
             },
             .aggregate => blk: {
                 var plan = relational_rows_api.parseRowsAggregatePlanRequest(self.alloc, body, schema) catch return error.InvalidRowsRequest;
@@ -8696,18 +8722,21 @@ pub const ApiHttpServer = struct {
                 try self.applyRowsAggregatePlanRowFilter(table_name, authenticated_identity, schema, &plan);
                 var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsAggregateAlloc(self.alloc, schema, plan.aggregate);
                 defer lake_request.deinit(self.alloc);
-                break :blk lakeRowsExplainedOperationFromScan("aggregate", .group_by, lake_request.request);
+                break :blk try lakeRowsExplainedOperationFromScan(self.alloc, "aggregate", .group_by, lake_request.request);
             },
             .window, .join, .lateral => error.UnsupportedRowsQuery,
         };
     }
 
     fn lakeRowsExplainedOperationFromScan(
+        alloc: std.mem.Allocator,
         operation_name: []const u8,
         operation: serverless_query.LakeExplainOperation,
         scan: serverless_query.LakeRowsScanRequest,
     ) !LakeRowsExplainedOperation {
         const projected_column_count = std.math.cast(u16, scan.projected_columns.len) orelse return error.InvalidRowsRequest;
+        const projected_columns = try cloneStringSlice(alloc, scan.projected_columns);
+        errdefer freeStringSlice(alloc, projected_columns);
         return .{
             .operation_name = operation_name,
             .operation = operation,
@@ -8717,7 +8746,47 @@ pub const ApiHttpServer = struct {
                 .has_predicate = scan.predicate != null,
                 .scanner_limit = scan.limit,
             },
+            .projected_columns = projected_columns,
         };
+    }
+
+    fn lakeRowsExplainPhysicalScan(scan_plan: serverless_query.LakeScanPlan) LakeRowsExplainPhysicalScan {
+        var summary = LakeRowsExplainPhysicalScan{
+            .logical_read_count = scan_plan.logical_reads.len,
+            .physical_read_count = scan_plan.physical_reads.len,
+        };
+        for (scan_plan.logical_reads) |read| {
+            summary.logical_read_bytes +|= read.range.len;
+            switch (read.purpose) {
+                .parquet_footer => summary.footer_read_count += 1,
+                .parquet_column_chunk => summary.column_chunk_read_count += 1,
+                else => {},
+            }
+        }
+        for (scan_plan.physical_reads) |read| {
+            summary.physical_read_bytes +|= read.range.len;
+        }
+        return summary;
+    }
+
+    fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+        if (values.len == 0) return &.{};
+        const out = try alloc.alloc([]const u8, values.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |value| alloc.free(@constCast(value));
+            alloc.free(out);
+        }
+        for (values, out) |value, *slot| {
+            slot.* = try alloc.dupe(u8, value);
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+        for (values) |value| alloc.free(@constCast(value));
+        if (values.len > 0) alloc.free(values);
     }
 
     fn externalLakeBaseSourceDescriptor(
@@ -19033,6 +19102,12 @@ test "api http server routes public external lake row queries through configured
     const explain_scan = parsed_explain.value.object.get("scan").?.object;
     try std.testing.expectEqual(@as(i64, 0), explain_scan.get("projected_column_count").?.integer);
     try std.testing.expect(!explain_scan.get("has_predicate").?.bool);
+    const explain_physical = parsed_explain.value.object.get("physical_scan").?.object;
+    try std.testing.expectEqual(@as(i64, 1), explain_physical.get("logical_read_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), explain_physical.get("physical_read_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), explain_physical.get("footer_read_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), explain_physical.get("column_chunk_read_count").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(parquet_object.len)), explain_physical.get("physical_read_bytes").?.integer);
     const explain_plan = parsed_explain.value.object.get("plan").?.object;
     try std.testing.expectEqualStrings("scan", explain_plan.get("operation").?.string);
     try std.testing.expectEqualStrings("external_parquet", explain_plan.get("source_kind").?.string);
@@ -19061,6 +19136,10 @@ test "api http server routes public external lake row queries through configured
     try std.testing.expectEqual(@as(i64, 1), query_explain_scan.get("projected_column_count").?.integer);
     try std.testing.expect(query_explain_scan.get("has_predicate").?.bool);
     try std.testing.expectEqual(@as(i64, 1), query_explain_scan.get("scanner_limit").?.integer);
+    const query_explain_physical = parsed_query_explain.value.object.get("physical_scan").?.object;
+    try std.testing.expectEqual(@as(i64, 1), query_explain_physical.get("logical_read_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), query_explain_physical.get("physical_read_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), query_explain_physical.get("footer_read_count").?.integer);
     const query_explain_plan = parsed_query_explain.value.object.get("plan").?.object;
     try std.testing.expectEqualStrings("scan", query_explain_plan.get("operation").?.string);
     try std.testing.expectEqual(@as(i64, 1), query_explain_plan.get("projected_column_count").?.integer);
