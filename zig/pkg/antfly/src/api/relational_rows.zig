@@ -3246,6 +3246,9 @@ fn validateLakeRowsAggregateRequestSupported(
             const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
             if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidRowsRequest;
         }
+        for (aggregation.filter_expressions) |condition| {
+            try validateRowsExpressionConditionTypes(alloc, schema, condition.lhs, condition.op, condition.rhs);
+        }
     }
     if (request.source.predicates.len == 1) {
         const predicate = request.source.predicates[0];
@@ -3266,7 +3269,7 @@ fn validateLakeRowsAggregateShapeSupported(request: OwnedRowsAggregateRequest) !
         if (aggregation.array_order_by.len != 0 or aggregation.string_delimiter != null) return error.UnsupportedRowsQuery;
         if (aggregation.filter_array_any.len != 0 or aggregation.filter_array_contains.len != 0 or aggregation.filter_array_eq.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_json_contains.len != 0 or aggregation.filter_json_path_eq.len != 0 or aggregation.filter_json_path_exists.len != 0) return error.UnsupportedRowsQuery;
-        if (aggregation.filter_expressions.len != 0 or aggregation.filter_expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
+        if (aggregation.filter_expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_any.len != 0 or aggregation.filter_not.len != 0) return error.UnsupportedRowsQuery;
         switch (aggregation.op) {
             .count => {},
@@ -3315,6 +3318,9 @@ fn lakeRowsAggregateProjectedColumnsAlloc(
         }
         for (aggregation.filter_text_patterns) |predicate| {
             try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+        }
+        for (aggregation.filter_expressions) |condition| {
+            try appendLakeRowsExpressionConditionProjectedColumnsAlloc(alloc, &columns, condition);
         }
     }
     if (request.source.predicates.len == 1) {
@@ -3786,6 +3792,9 @@ fn lakeRowsAggregateFilterMatchesAlloc(
     for (aggregation.filter_text_patterns) |predicate| {
         if (!try lakeRowsTextPatternPredicateMatchesAlloc(alloc, row, predicate)) return false;
     }
+    for (aggregation.filter_expressions) |condition| {
+        if (!try lakeRowsExpressionConditionMatchesAlloc(alloc, row, condition)) return false;
+    }
     return true;
 }
 
@@ -3832,6 +3841,18 @@ fn lakeRowsTextPatternPredicateMatchesAlloc(
         else => return predicate.negated,
     };
     return if (predicate.negated) !matched else matched;
+}
+
+fn lakeRowsExpressionConditionMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) !bool {
+    const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+    defer alloc.free(row_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return try expressionConditionMatches(alloc, parsed.value, condition);
 }
 
 fn lakeRowsRelationalCheckMatchesAlloc(
@@ -17076,6 +17097,20 @@ test "relational rows lake bridge lowers supported aggregate to scan request" {
         .pattern = "op%",
         .case_insensitive = true,
     }};
+    const lower_status_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+        .field_source = .row,
+    }};
+    const open_status_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const open_status_expression_filter = [_]db_mod.types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .lower, .operands = &lower_status_operands },
+        .op = .eq,
+        .rhs = &open_status_rhs,
+    }};
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17083,6 +17118,7 @@ test "relational rows lake bridge lowers supported aggregate to scan request" {
         .{ .name = "net_amount", .op = .sum, .expression = net_amount_expression },
         .{ .name = "rank_two_amount", .op = .sum, .field = "amount", .filter_in_predicates = &rank_two_filter },
         .{ .name = "open_amount", .op = .sum, .field = "amount", .filter_text_patterns = &open_status_filter },
+        .{ .name = "open_expr_amount", .op = .sum, .field = "amount", .filter_expressions = &open_status_expression_filter },
     };
     const request = OwnedRowsAggregateRequest{
         .source = .{ .predicates = &predicates },
@@ -17266,6 +17302,20 @@ test "relational rows lake bridge applies scalar aggregate filters" {
         .case_insensitive = true,
         .negated = true,
     }};
+    const lower_status_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+        .field_source = .row,
+    }};
+    const open_status_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"open\"",
+    }};
+    const open_status_expression_filter = [_]db_mod.types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .lower, .operands = &lower_status_operands },
+        .op = .eq,
+        .rhs = &open_status_rhs,
+    }};
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "row_count", .op = .count },
         .{ .name = "large_amount_sum", .op = .sum, .field = "amount", .filter_predicates = &filter_predicates },
@@ -17273,6 +17323,7 @@ test "relational rows lake bridge applies scalar aggregate filters" {
         .{ .name = "rank_not_two_amount_sum", .op = .sum, .field = "amount", .filter_in_predicates = &rank_not_two_filter },
         .{ .name = "open_amount_sum", .op = .sum, .field = "amount", .filter_text_patterns = &open_status_filter },
         .{ .name = "not_open_amount_sum", .op = .sum, .field = "amount", .filter_text_patterns = &not_open_status_filter },
+        .{ .name = "open_expr_amount_sum", .op = .sum, .field = "amount", .filter_expressions = &open_status_expression_filter },
     };
     const request = OwnedRowsAggregateRequest{
         .group_by = &group_by,
@@ -17287,8 +17338,8 @@ test "relational rows lake bridge applies scalar aggregate filters" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0,\"rank_two_amount_sum\":0,\"rank_not_two_amount_sum\":10,\"open_amount_sum\":0,\"not_open_amount_sum\":10}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50,\"rank_two_amount_sum\":30,\"rank_not_two_amount_sum\":20,\"open_amount_sum\":20,\"not_open_amount_sum\":30}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0,\"rank_two_amount_sum\":0,\"rank_not_two_amount_sum\":10,\"open_amount_sum\":0,\"not_open_amount_sum\":10,\"open_expr_amount_sum\":0}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50,\"rank_two_amount_sum\":30,\"rank_not_two_amount_sum\":20,\"open_amount_sum\":20,\"not_open_amount_sum\":30,\"open_expr_amount_sum\":20}", result.rows[1]);
 }
 
 test "relational rows lake bridge folds expression aggregates" {
