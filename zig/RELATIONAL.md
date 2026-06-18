@@ -1501,14 +1501,21 @@ queue-style semantics.
 `PRIMARY KEY ... NOT DEFERRABLE [INITIALLY IMMEDIATE]`,
 `CREATE UNIQUE INDEX ... NULLS DISTINCT`, and `UNIQUE NULLS DISTINCT (...)`
 constraints are accepted as explicit syntax for ordinary immediate identity and
-unique-owner semantics. `CREATE UNIQUE INDEX ... NULLS NOT DISTINCT`, `UNIQUE
-NULLS NOT DISTINCT (...)`, deferrable primary keys, and deferrable unique
-constraints are intentionally classified as unsupported DDL shapes until
-null-equal or deferred identity/uniqueness is represented in native owner keys,
-conflict-target inference, validation jobs, repair, and write-time enforcement.
-The adapter must not normalize them to ordinary primary-key or unique metadata,
-because ordinary owner semantics do not treat multiple `NULL` values as the same
-key and do not defer conflict checks to transaction commit.
+unique-owner semantics. Ordinary non-temporal unique constraints and
+`CREATE UNIQUE INDEX` plans also support `NULLS NOT DISTINCT`: the catalog stores
+`nulls_not_distinct`, schema JSON round-trips it, unique-owner keys encode a
+stable null component for omitted/null fields, validation/repair rebuilds those
+owner rows, and write-time enforcement treats a second row with the same null
+unique tuple as a uniqueness violation. Default unique constraints keep
+PostgreSQL's ordinary `NULLS DISTINCT` behavior by skipping rows whose unique
+tuple contains a null component. Combining `NULLS NOT DISTINCT` with
+application-time `WITHOUT OVERLAPS` unique constraints still fails closed until
+temporal null-equal span semantics are represented explicitly. Deferrable primary
+keys and deferrable unique constraints also remain unsupported DDL shapes until
+deferred identity/uniqueness has native owner-key, validation-job, repair, and
+commit-time enforcement semantics. The adapter must not normalize those deferred
+forms to ordinary primary-key or unique metadata because ordinary owner checks do
+not defer conflict detection to transaction commit.
 
 The parity corpus includes same-table `UNION`, `INTERSECT`, and `EXCEPT`
 predicate-composition read plans, including identical expression-output

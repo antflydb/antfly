@@ -5072,7 +5072,7 @@ fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]Un
             .expressions = if (object.get("expressions")) |expressions| try parseUniqueExpressions(alloc, expressions) else &.{},
             .include_columns = if (object.get("include_columns")) |include_columns| try parseStringArrayAlloc(alloc, include_columns) else &.{},
             .without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null,
-            .nulls_not_distinct = if (object.get("nulls_not_distinct")) |value| value.bool else false,
+            .nulls_not_distinct = if (object.get("nulls_not_distinct")) |flag| flag.bool else false,
             .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
             .where_expressions = if (object.get("where_expressions")) |where_expressions| try parseRelationalRowsExpressionConditionsAlloc(alloc, where_expressions) else &.{},
             .validation_state = if (object.get("validation_state")) |validation_state|
@@ -6714,13 +6714,14 @@ test "relational schema rejects unsupported unique constraint shapes" {
     );
     var parsed_partial = try parseSchema(
         std.testing.allocator,
-        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"display_name\":{\"type\":\"text\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"include_columns\":[\"status\",\"display_name\"],\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"},{\"name\":\"email_upper_key\",\"expressions\":[{\"op\":\"upper\",\"field\":\"email\"}]},{\"name\":\"email_md5_key\",\"expressions\":[{\"op\":\"md5\",\"field\":\"email\"}]}]}",
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"display_name\":{\"type\":\"text\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"include_columns\":[\"status\",\"display_name\"],\"nulls_not_distinct\":true,\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"},{\"name\":\"email_upper_key\",\"expressions\":[{\"op\":\"upper\",\"field\":\"email\"}]},{\"name\":\"email_md5_key\",\"expressions\":[{\"op\":\"md5\",\"field\":\"email\"}]}]}",
     );
     defer parsed_partial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), parsed_partial.unique_constraints.len);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].include_columns.len);
     try std.testing.expectEqualStrings("status", parsed_partial.unique_constraints[0].include_columns[0]);
     try std.testing.expectEqualStrings("display_name", parsed_partial.unique_constraints[0].include_columns[1]);
+    try std.testing.expect(parsed_partial.unique_constraints[0].nulls_not_distinct);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, parsed_partial.unique_constraints[0].where[0].op);

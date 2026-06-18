@@ -7814,6 +7814,71 @@ test "relational write participant prepares commit and abort boundaries" {
     try std.testing.expect(deleted_raw == null);
 }
 
+test "relational unique constraints optionally treat null components as not distinct" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const row_a = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "alpha" },
+        },
+    });
+    defer alloc.free(row_a);
+    const row_b = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "title",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "beta" },
+        },
+    });
+    defer alloc.free(row_b);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(key);
+        owned_keys.deinit(alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    const default_unique = [_]schema_mod.UniqueConstraint{.{
+        .name = "events_email_key",
+        .columns = &.{"email"},
+    }};
+    var default_participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    default_participant.configureUniqueConstraints(&default_unique);
+    try default_participant.prepareUpsert("events", "doc:a", row_a, null);
+    try default_participant.prepareUpsert("events", "doc:b", row_b, null);
+
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+    const nulls_not_distinct_unique = [_]schema_mod.UniqueConstraint{.{
+        .name = "events_email_key",
+        .columns = &.{"email"},
+        .nulls_not_distinct = true,
+    }};
+    var strict_participant = WriteParticipant.init(alloc, &store, &writes, &deletes, &owned_keys, &owned_values);
+    strict_participant.configureUniqueConstraints(&nulls_not_distinct_unique);
+    try strict_participant.prepareUpsert("events", "doc:c", row_a, null);
+    try std.testing.expectError(
+        error.UniqueConstraintViolation,
+        strict_participant.prepareUpsert("events", "doc:d", row_b, null),
+    );
+}
+
 test "relational foreign key reference extraction implements match simple for composite nullable components" {
     const alloc = std.testing.allocator;
     const foreign_key = schema_mod.ForeignKey{

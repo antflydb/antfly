@@ -1409,10 +1409,10 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeStringSlice(alloc, include_columns);
             const without_overlaps_period = if (fmt_version >= 30) try readOptStrAlloc(alloc, data, &pos) else null;
             errdefer if (without_overlaps_period) |period| alloc.free(period);
-            const nulls_not_distinct = if (fmt_version >= 39) blk: {
-                const value = data[pos] == 1;
+            const nulls_not_distinct = if (fmt_version >= 39) nulls_blk: {
+                const flag = data[pos] == 1;
                 pos += 1;
-                break :blk value;
+                break :nulls_blk flag;
             } else false;
             const where = if (fmt_version >= 19) try readUniquePredicateSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeUniquePredicateSlice(alloc, where);
@@ -2750,6 +2750,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .name = "users_tenant_email_key",
                 .columns = &.{ "tenant_id", "email" },
                 .include_columns = &.{ "created_at", "request_id" },
+                .nulls_not_distinct = true,
                 .where = &.{
                     .{ .field = "email", .op = .is_not_null },
                 },
@@ -2900,6 +2901,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(usize, 2), loaded.unique_constraints[0].include_columns.len);
     try std.testing.expectEqualStrings("created_at", loaded.unique_constraints[0].include_columns[0]);
     try std.testing.expectEqualStrings("request_id", loaded.unique_constraints[0].include_columns[1]);
+    try std.testing.expect(loaded.unique_constraints[0].nulls_not_distinct);
     try std.testing.expectEqual(@as(usize, 1), loaded.unique_constraints[0].where.len);
     try std.testing.expectEqualStrings("email", loaded.unique_constraints[0].where[0].field);
     try std.testing.expectEqual(UniquePredicateOp.is_not_null, loaded.unique_constraints[0].where[0].op);

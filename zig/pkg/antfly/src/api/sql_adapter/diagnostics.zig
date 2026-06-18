@@ -30,7 +30,6 @@ pub const SqlAdapterClassificationReason = enum {
     multi_output_subquery_update_selector,
     multi_table_generation_barrier,
     non_unique_point_selector,
-    nulls_not_distinct_unique,
     recursive_cte_stream_plan,
     row_lock_mode_plan,
     schema_namespace,

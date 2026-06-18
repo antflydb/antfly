@@ -2313,6 +2313,7 @@ fn applyCreateIndexPlanAlloc(
             .expressions = plan.expressions,
             .include_columns = plan.include_columns,
             .without_overlaps_period = plan.without_overlaps_period,
+            .nulls_not_distinct = plan.nulls_not_distinct,
             .where = plan.where,
             .where_expressions = plan.where_expressions,
             .validation_state = .unvalidated,
@@ -5528,7 +5529,7 @@ const Parser = struct {
             return;
         }
         if (self.matchKeyword("unique")) {
-            const nulls_not_distinct = try self.parseOptionalDdlUniqueNullsDistinct();
+            const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
@@ -5598,7 +5599,7 @@ const Parser = struct {
 
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
             if (self.matchKeyword("unique")) {
-                const nulls_not_distinct = try self.parseOptionalDdlUniqueNullsDistinct();
+                const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
                 const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                 defer freeStringSlice(self.alloc, include_columns);
                 try self.consumeOptionalDdlImmediateConstraintTiming();
@@ -5620,7 +5621,7 @@ const Parser = struct {
                 var constraint_name_transferred = false;
                 errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
                 if (self.matchKeyword("unique")) {
-                    const nulls_not_distinct = try self.parseOptionalDdlUniqueNullsDistinct();
+                    const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
                     try self.consumeOptionalDdlImmediateConstraintTiming();
@@ -6349,11 +6350,11 @@ const Parser = struct {
                 try self.consumeOptionalDdlImmediateConstraintTiming();
                 try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, include_columns, null);
             } else if (self.matchKeyword("unique")) {
-                try self.consumeOptionalDdlUniqueNullsDistinct();
+                const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
                 const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                 defer freeStringSlice(self.alloc, include_columns);
                 try self.consumeOptionalDdlImmediateConstraintTiming();
-                try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, include_columns, null);
+                try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, include_columns, null, nulls_not_distinct);
             } else if (self.matchKeyword("check")) {
                 const check = try self.parseDdlCheckConstraint(null);
                 var check_transferred = false;
@@ -6380,11 +6381,11 @@ const Parser = struct {
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("unique")) {
-                    try self.consumeOptionalDdlUniqueNullsDistinct();
+                    const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
                     try self.consumeOptionalDdlImmediateConstraintTiming();
-                    try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, include_columns, null);
+                    try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
                     self.alloc.free(constraint_name);
                     constraint_name_transferred = true;
                 } else if (self.matchKeyword("check")) {
@@ -6674,13 +6675,13 @@ const Parser = struct {
             try self.consumeOptionalDdlImmediateConstraintTiming();
             try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("unique")) {
-            try self.consumeOptionalDdlUniqueNullsDistinct();
+            const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
             try self.consumeOptionalDdlImmediateConstraintTiming();
-            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
+            try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct);
         } else if (self.matchKeyword("foreign")) {
             const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
             var transferred = false;
@@ -7613,8 +7614,9 @@ const Parser = struct {
         columns: []const []const u8,
         include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
+        nulls_not_distinct: bool,
     ) !void {
-        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns, include_columns, without_overlaps_period);
+        const constraint = try self.makeDdlUniqueConstraint(constraint_name, columns, include_columns, without_overlaps_period, nulls_not_distinct);
         var transferred = false;
         errdefer if (!transferred) freeDdlUniqueConstraint(self.alloc, constraint);
         try unique_constraints.append(self.alloc, constraint);
@@ -7627,7 +7629,9 @@ const Parser = struct {
         columns: []const []const u8,
         include_columns: []const []const u8,
         without_overlaps_period: ?[]const u8,
+        nulls_not_distinct: bool,
     ) !runtime_schema.UniqueConstraint {
+        if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
         const owned_columns = try cloneStringSlice(self.alloc, columns);
         var columns_transferred = false;
         errdefer if (!columns_transferred) freeStringSlice(self.alloc, owned_columns);
@@ -7652,6 +7656,7 @@ const Parser = struct {
             .columns = owned_columns,
             .include_columns = owned_include_columns,
             .without_overlaps_period = owned_period,
+            .nulls_not_distinct = nulls_not_distinct,
         };
     }
 
@@ -18727,6 +18732,7 @@ const Parser = struct {
         var wrote = false;
         for (constraint.columns) |target_column| {
             const value_json = conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
+            if (!constraint.nulls_not_distinct and std.mem.eql(u8, value_json, "null")) return error.UnsupportedSqlShape;
             if (wrote) try writer.writeByte(',');
             try writer.print("{{\"column\":{f},\"value\":", .{std.json.fmt(target_column, .{})});
             try writer.writeAll(value_json);
@@ -37473,6 +37479,7 @@ fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: runtime
     if (constraint.expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "expressions"), try schemaJsonUniqueExpressionsAlloc(alloc, constraint.expressions));
     if (constraint.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, constraint.include_columns));
     if (constraint.without_overlaps_period) |period| try putJsonString(alloc, &object, "without_overlaps_period", period);
+    if (constraint.nulls_not_distinct) try object.put(alloc, try alloc.dupe(u8, "nulls_not_distinct"), .{ .bool = true });
     if (constraint.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, constraint.where));
     if (constraint.where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "where_expressions"), try schemaJsonExpressionConditionsAlloc(alloc, constraint.where_expressions));
     if (constraint.validation_state != .enforced) try putJsonString(alloc, &object, "validation_state", uniqueConstraintValidationStateString(constraint.validation_state));
@@ -37904,6 +37911,7 @@ fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_schema
     out.expressions = try cloneDdlUniqueExpressions(alloc, constraint.expressions);
     out.include_columns = try cloneStringSlice(alloc, constraint.include_columns);
     out.without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
+    out.nulls_not_distinct = constraint.nulls_not_distinct;
     out.where = try cloneDdlUniquePredicates(alloc, constraint.where);
     out.where_expressions = try cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
     out.validation_state = constraint.validation_state;
@@ -42096,14 +42104,35 @@ test "postgres sql adapter lowers create table ddl into typed schema plan" {
         alloc,
         "CREATE TABLE ONLY usage_records (id uuid PRIMARY KEY);",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var inline_nulls_not_distinct_unique = try lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_unique_nulls (id uuid PRIMARY KEY, email text UNIQUE NULLS NOT DISTINCT);",
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    );
+    defer inline_nulls_not_distinct_unique.deinit(alloc);
+    switch (inline_nulls_not_distinct_unique) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_unique_nulls", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expect(plan.unique_constraints[0].nulls_not_distinct);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var table_nulls_not_distinct_unique = try lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_table_unique_nulls (id uuid PRIMARY KEY, email text, CONSTRAINT bad_table_unique_nulls_email_key UNIQUE NULLS NOT DISTINCT (email));",
-    ));
+    );
+    defer table_nulls_not_distinct_unique.deinit(alloc);
+    switch (table_nulls_not_distinct_unique) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_table_unique_nulls", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expect(plan.unique_constraints[0].nulls_not_distinct);
+            try std.testing.expectEqualStrings("bad_table_unique_nulls_email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TABLE bad_deferred_unique (id uuid PRIMARY KEY, email text UNIQUE DEFERRABLE);",
@@ -43315,6 +43344,33 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
+    var nulls_not_distinct_unique = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;",
+    );
+    defer nulls_not_distinct_unique.deinit(alloc);
+    switch (nulls_not_distinct_unique) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expect(plan.nulls_not_distinct);
+            try std.testing.expectEqualStrings("usage_records_external_id_key", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("external_id", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX usage_records_external_id_idx ON usage_records (external_id) NULLS DISTINCT;",
+    ));
+
     var temporal_unique = try lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
@@ -43824,10 +43880,26 @@ test "postgres sql adapter lowers alter table ddl into typed schema plan" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var nulls_not_distinct_unique = try lowerDdlPlanAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS NOT DISTINCT (email);",
-    ));
+    );
+    defer nulls_not_distinct_unique.deinit(alloc);
+    switch (nulls_not_distinct_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expect(constraint.nulls_not_distinct);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE;",
@@ -48025,10 +48097,17 @@ test "postgres sql adapter rejects unsupported ddl shapes explicitly" {
         alloc,
         "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1",
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var nulls_not_distinct_unique_index = try lowerDdlPlanAlloc(
         alloc,
         "CREATE UNIQUE INDEX audit_log_external_id_key ON audit_log (external_id) NULLS NOT DISTINCT",
-    ));
+    );
+    defer nulls_not_distinct_unique_index.deinit(alloc);
+    const nulls_not_distinct_unique_index_plan = switch (nulls_not_distinct_unique_index) {
+        .create_index => |create_index| create_index,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(nulls_not_distinct_unique_index_plan.unique);
+    try std.testing.expect(nulls_not_distinct_unique_index_plan.nulls_not_distinct);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
         alloc,
         "CREATE TRIGGER audit_row AFTER UPDATE ON usage_records EXECUTE FUNCTION audit_changes()",
@@ -57754,7 +57833,8 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 base;
             const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, with_generated_op, "include", plan.include_columns.len);
             const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "where_expr", plan.where_expressions.len);
-            break :blk try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
+            const with_temporal = try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
+            break :blk try appendTrueBoolFingerprintAlloc(alloc, with_temporal, "nulls_not_distinct", plan.nulls_not_distinct);
         },
         .drop_index => |plan| try std.fmt.allocPrint(
             alloc,
@@ -64735,6 +64815,7 @@ const AppParityCorpusCoverage = struct {
     schema_partial_unique_conflict_target: bool = false,
     schema_expression_unique_conflict_target: bool = false,
     schema_mixed_expression_unique_conflict_target: bool = false,
+    schema_nulls_not_distinct_unique: bool = false,
     schema_temporal_numrange_insert: bool = false,
     schema_temporal_daterange_insert: bool = false,
     schema_temporal_open_daterange_insert: bool = false,
@@ -64760,7 +64841,6 @@ const AppParityCorpusCoverage = struct {
     schema_temporal_range_column_portion_update: bool = false,
     schema_temporal_range_column_portion_delete: bool = false,
     unsupported_ddl_system_time_temporal_table: bool = false,
-    unsupported_ddl_nulls_not_distinct_unique: bool = false,
     unsupported_duplicate_row_batch_target: bool = false,
     unsupported_duplicate_conflict_update_target: bool = false,
     unsupported_invalid_expression_conflict_target: bool = false,
@@ -65123,6 +65203,9 @@ const AppParityCorpusCoverage = struct {
             appParityPlanHasNonZeroToken(entry.plan, ":temporal_fk=") and
             std.mem.indexOf(u8, entry.sql, "PERIOD ") != null and
             std.mem.indexOf(u8, entry.sql, "FOREIGN KEY") != null);
+        self.schema_nulls_not_distinct_unique = self.schema_nulls_not_distinct_unique or (entry.family == .ddl and
+            std.mem.indexOf(u8, entry.sql, "UNIQUE ") != null and
+            std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
         self.schema_temporal_portion_update = self.schema_temporal_portion_update or (entry.family == .update_source and
             std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
             appParityPlanHasExactStringToken(entry.plan, "update_source:table=", "prices") and
@@ -65650,9 +65733,6 @@ const AppParityCorpusCoverage = struct {
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
-            self.unsupported_ddl_nulls_not_distinct_unique = self.unsupported_ddl_nulls_not_distinct_unique or
-                (std.mem.eql(u8, entry.classification_reason, "nulls_not_distinct_unique") and
-                    std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
         } else if (entry.family == .unsupported_update) {
             self.unsupported_update_non_unique_point_selector = self.unsupported_update_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
         } else if (entry.family == .unsupported_update_source) {
@@ -67018,8 +67098,8 @@ const AppParityCorpusCoverage = struct {
         try std.testing.expect(self.schema_temporal_portion_delete);
         try std.testing.expect(self.schema_temporal_range_column_portion_update);
         try std.testing.expect(self.schema_temporal_range_column_portion_delete);
+        try std.testing.expect(self.schema_nulls_not_distinct_unique);
         try std.testing.expect(self.unsupported_ddl_system_time_temporal_table);
-        try std.testing.expect(self.unsupported_ddl_nulls_not_distinct_unique);
     }
 };
 
@@ -67329,11 +67409,12 @@ test "postgres sql adapter classifies application parity corpus" {
             ,
         },
         .{
-            .name = "unsupported nulls not distinct unique index",
-            .family = .unsupported_ddl,
-            .plan = "unsupported:ddl:requires=nulls_not_distinct_unique",
-            .classification_reason = "nulls_not_distinct_unique",
-            .sql = "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;",
+            .name = "schema nulls not distinct unique index",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 1 },
+            .plan = "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=true:if_not_exists=false:nulls_not_distinct=1",
+            .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql = "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT;",
         },
         .{
             .name = "unsupported deferrable unique constraint",
