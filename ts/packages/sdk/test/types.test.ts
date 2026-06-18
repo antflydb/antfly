@@ -17,12 +17,12 @@ import type {
   QueryStringQuery,
   RowFilterEntry,
   RowOperation,
-  RowsArrayUpdateTransform,
   RowsAggregateHaving,
   RowsAggregateHavingPredicate,
   RowsAggregatePlanRequest,
   RowsAggregateRequest,
   RowsArrayLengthProjection,
+  RowsArrayUpdateTransform,
   RowsBatchRequest,
   RowsCoalesceFieldOperand,
   RowsCoalesceOperand,
@@ -36,21 +36,21 @@ import type {
   RowsExpressionField,
   RowsExpressionOperator,
   RowsExpressionValue,
-  RowsFieldPatch,
   RowsFieldAliasProjection,
+  RowsFieldPatch,
   RowsGetRequest,
   RowsGetResult,
   RowsGetResultSet,
-  RowsJoinRequest,
-  RowsJoinPlanRequest,
-  RowsJoinedMutationSourceAssignment,
-  RowsJoinedMutationSourceRequest,
   RowsInsertSourceAssignment,
   RowsInsertSourceRequest,
+  RowsJoinedMutationSourceAssignment,
+  RowsJoinedMutationSourceRequest,
+  RowsJoinPlanRequest,
+  RowsJoinRequest,
   RowsJsonExtractProjection,
   RowsJsonSetTransform,
-  RowsLateralRequest,
   RowsLateralPlanRequest,
+  RowsLateralRequest,
   RowsMutationSourceRequest,
   RowsMutationSourceResultSet,
   RowsNumericIncrement,
@@ -299,9 +299,7 @@ describe("Antfly Query Type Integration", () => {
 
       expect(stats.graph_metric_runtime?.role).toBe("worker_pool");
       expect(stats.graph_metric_runtime?.owner_id_hash).toBe(17);
-      expectTypeOf(stats.graph_metric_runtime).toMatchTypeOf<
-        GraphMetricRuntimeStats | undefined
-      >();
+      expectTypeOf(stats.graph_metric_runtime).toMatchTypeOf<GraphMetricRuntimeStats | undefined>();
     });
   });
 
@@ -704,6 +702,7 @@ describe("Relational row plan type integration", () => {
   it("should create a claimed mutation-source request and result", () => {
     const caseBranch: RowsExpressionCaseBranch = {
       when: { lhs: { field: "status" }, op: "eq", rhs: { value: "ready" } },
+      // biome-ignore lint/suspicious/noThenProperty: This mirrors the generated CASE branch API field.
       then: { value: "claimed:ready" },
     };
     const statusExpr: RowsExpression = { field: "status" };
