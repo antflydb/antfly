@@ -1396,8 +1396,19 @@ fn copyNodeMemberVectorsFromSource(
 }
 
 const SplitMemberVectorCopies = struct {
-    left: []f32,
-    right: []f32,
+    storage: []f32 = &.{},
+    left: []f32 = &.{},
+    right: []f32 = &.{},
+
+    pub fn deinit(self: *SplitMemberVectorCopies, alloc: Allocator) void {
+        if (self.storage.len > 0) {
+            alloc.free(self.storage);
+        } else {
+            if (self.left.len > 0) alloc.free(self.left);
+            if (self.right.len > 0) alloc.free(self.right);
+        }
+        self.* = .{};
+    }
 };
 
 fn copySplitMemberVectorsFromSourceOrder(
@@ -1411,10 +1422,12 @@ fn copySplitMemberVectorsFromSourceOrder(
     const dims: usize = @intCast(self.metadata.dims);
     if (source_vectors.len < source_ids.len * dims) return error.InvalidArgument;
 
-    const left = try self.alloc.alloc(f32, left_node.members.len * dims);
-    errdefer self.alloc.free(left);
-    const right = try self.alloc.alloc(f32, right_node.members.len * dims);
-    errdefer self.alloc.free(right);
+    const left_len = left_node.members.len * dims;
+    const right_len = right_node.members.len * dims;
+    const storage = try self.alloc.alloc(f32, left_len + right_len);
+    errdefer self.alloc.free(storage);
+    const left = storage[0..left_len];
+    const right = storage[left_len .. left_len + right_len];
 
     var left_index: usize = 0;
     var right_index: usize = 0;
@@ -1432,11 +1445,14 @@ fn copySplitMemberVectorsFromSourceOrder(
     }
 
     if (left_index == left_node.members.len and right_index == right_node.members.len) {
-        return .{ .left = left, .right = right };
+        return .{
+            .storage = storage,
+            .left = left,
+            .right = right,
+        };
     }
 
-    self.alloc.free(left);
-    self.alloc.free(right);
+    self.alloc.free(storage);
     return null;
 }
 
@@ -1505,9 +1521,8 @@ test "copy split member vectors from source order copies both sides in one pass"
         .members = &right_members,
     };
 
-    const copies = (try copySplitMemberVectorsFromSourceOrder(&mock, &left, &right, &source_ids, &source_vectors)).?;
-    defer std.testing.allocator.free(copies.left);
-    defer std.testing.allocator.free(copies.right);
+    var copies = (try copySplitMemberVectorsFromSourceOrder(&mock, &left, &right, &source_ids, &source_vectors)).?;
+    defer copies.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, copies.left);
     try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, copies.right);
 
@@ -6656,19 +6671,18 @@ pub fn splitLeafWithOptions(
     posting.PostingStore.noteCentroidRefreshed(&right_node);
 
     const publish_known_quantized_now = !(deferQuantizedRebuild(options) and shouldDeferQuantizedRebuildToBulkFinish(self, options));
-    var left_vectors: []f32 = &.{};
-    defer if (left_vectors.len > 0) self.alloc.free(left_vectors);
-    var right_vectors: []f32 = &.{};
-    defer if (right_vectors.len > 0) self.alloc.free(right_vectors);
+    var vector_copies = SplitMemberVectorCopies{};
+    defer vector_copies.deinit(self.alloc);
     if (publish_known_quantized_now) {
         if (try copySplitMemberVectorsFromSourceOrder(self, &left_node, &right_node, leaf.members, vec_data)) |copies| {
-            left_vectors = copies.left;
-            right_vectors = copies.right;
+            vector_copies = copies;
         } else {
-            left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
-            right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
+            vector_copies.left = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
+            vector_copies.right = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
         }
     }
+    const left_vectors = vector_copies.left;
+    const right_vectors = vector_copies.right;
 
     if (splitting_root) {
         const new_root_id = self.nextNodeId();
