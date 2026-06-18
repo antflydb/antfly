@@ -16,11 +16,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const external_binding = @import("../external_source/catalog_binding.zig");
 const external_source = @import("../external_source/types.zig");
 const rowsource_bridge = @import("../external_source/rowsource_bridge.zig");
 const parquet_footer = @import("lake_parquet_footer.zig");
 const parquet_metadata = @import("lake_parquet_metadata.zig");
 const parquet_page = @import("lake_parquet_page.zig");
+const lake_rows = @import("lake_rows.zig");
+const lake_scan_plan = @import("lake_scan_plan.zig");
 const range_io = @import("lake_range_io.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const snappy = @import("../../encoding/snappy.zig");
@@ -155,6 +158,17 @@ pub const DiscoveredObjectRangeRowGroupPlan = struct {
         self.inventory.deinit(alloc);
         self.* = undefined;
     }
+};
+
+pub const ObjectRangeRowsQueryRequest = struct {
+    binding: ?external_binding.Binding = null,
+    reader: ObjectRangeReader,
+    cache: ?*ObjectRangeCache = null,
+    inventory: external_source.Inventory,
+    projected_columns: []const []const u8,
+    predicate: ?lake_rows.Predicate = null,
+    limit: ?usize = null,
+    coalesce_options: range_io.CoalesceOptions = .{},
 };
 
 pub const OwnedBatch = struct {
@@ -712,6 +726,79 @@ pub fn planSupportedI64ObjectRangeRowGroupsAlloc(
     projected_columns: []const []const u8,
 ) !ObjectRangeRowGroupPlan {
     return try planObjectRangeRowGroupsAlloc(alloc, inventory, projected_columns, .supported_i64);
+}
+
+pub fn querySupportedI64ObjectRangeRowsAlloc(
+    alloc: Allocator,
+    request: ObjectRangeRowsQueryRequest,
+) !lake_rows.ScanResult {
+    if (request.binding) |binding| {
+        try lake_scan_plan.validateBindingInventory(binding, request.inventory);
+    } else {
+        try request.inventory.validate();
+        if (request.inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+    }
+
+    const scan_columns = try rowsQueryScanColumnsAlloc(alloc, request.projected_columns, request.predicate);
+    defer alloc.free(scan_columns);
+
+    var row_group_plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, request.inventory, scan_columns);
+    defer row_group_plan.deinit(alloc);
+
+    var source = if (request.cache) |cache|
+        try ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
+            request.reader,
+            cache,
+            request.inventory,
+            row_group_plan.row_groups,
+            request.coalesce_options,
+        )
+    else
+        try ObjectRangeRowGroupSource.initWithCoalesceOptions(
+            request.reader,
+            request.inventory,
+            row_group_plan.row_groups,
+            request.coalesce_options,
+        );
+    defer source.deinit(alloc);
+
+    return try lake_rows.scanRowsAlloc(alloc, source.rowSource(), .{
+        .projected_columns = request.projected_columns,
+        .predicate = request.predicate,
+        .limit = request.limit,
+    });
+}
+
+fn rowsQueryScanColumnsAlloc(
+    alloc: Allocator,
+    projected_columns: []const []const u8,
+    predicate: ?lake_rows.Predicate,
+) ![][]const u8 {
+    if (projected_columns.len == 0) return error.InvalidLakeRowsQuery;
+    var needs_predicate_column = false;
+    if (predicate) |pred| {
+        if (pred.column.len == 0) return error.InvalidLakeRowsQuery;
+        needs_predicate_column = !containsColumn(projected_columns, pred.column);
+    }
+
+    const len = projected_columns.len + @intFromBool(needs_predicate_column);
+    const scan_columns = try alloc.alloc([]const u8, len);
+    errdefer alloc.free(scan_columns);
+    for (projected_columns, 0..) |column, idx| {
+        if (column.len == 0) return error.InvalidLakeRowsQuery;
+        scan_columns[idx] = column;
+    }
+    if (needs_predicate_column) {
+        scan_columns[projected_columns.len] = predicate.?.column;
+    }
+    return scan_columns;
+}
+
+fn containsColumn(columns: []const []const u8, column: []const u8) bool {
+    for (columns) |candidate| {
+        if (std.mem.eql(u8, candidate, column)) return true;
+    }
+    return false;
 }
 
 pub fn discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
@@ -1522,7 +1609,6 @@ test "parquet row group batch dispatches supported compression from inventory" {
 
 test "parquet row group source scans through lake rows" {
     const alloc = std.testing.allocator;
-    const lake_rows = @import("lake_rows.zig");
 
     var inventory = external_source.Inventory{
         .format = .parquet,
@@ -1608,7 +1694,6 @@ test "parquet row group source scans through lake rows" {
 
 test "parquet object range row group source reads chunks into lake rows" {
     const alloc = std.testing.allocator;
-    const lake_rows = @import("lake_rows.zig");
 
     var first_chunk = std.ArrayListUnmanaged(u8).empty;
     defer first_chunk.deinit(alloc);
@@ -1985,9 +2070,132 @@ test "parquet object range cache reuses coalesced projected chunks" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 7, 8 }, second.batch.columns[1].values.i64);
 }
 
+test "parquet object range rows query filters on unprojected column" {
+    const alloc = std.testing.allocator;
+
+    var amount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer amount_chunk.deinit(alloc);
+    try appendPlainI64DataPage(&amount_chunk, alloc, &[_]i64{ 10, 20, 30 });
+    var tenant_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer tenant_chunk.deinit(alloc);
+    try appendPlainI64DataPage(&tenant_chunk, alloc, &[_]i64{ 7, 8, 9 });
+
+    const amount_offset: usize = 100;
+    const tenant_offset = amount_offset + amount_chunk.items.len;
+    const object_len = tenant_offset + tenant_chunk.items.len;
+    const object_bytes = try alloc.alloc(u8, object_len);
+    defer alloc.free(object_bytes);
+    @memset(object_bytes, 0);
+    @memcpy(object_bytes[amount_offset..][0..amount_chunk.items.len], amount_chunk.items);
+    @memcpy(object_bytes[tenant_offset..][0..tenant_chunk.items.len], tenant_chunk.items);
+
+    const CountingRangeReader = struct {
+        bucket: []const u8,
+        key: []const u8,
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, self.bucket, bucket)) return error.ObjectNotFound;
+            if (!std.mem.eql(u8, self.key, key)) return error.ObjectNotFound;
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var range_reader = CountingRangeReader{
+        .bucket = "bucket",
+        .key = "events/part-a.parquet",
+        .body = object_bytes,
+    };
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = object_len,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = amount_offset,
+            .total_byte_len = amount_chunk.items.len + tenant_chunk.items.len,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = amount_offset,
+                    .compressed_len = amount_chunk.items.len,
+                    .uncompressed_len = amount_chunk.items.len,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "tenant"),
+                    .file_offset = tenant_offset,
+                    .compressed_len = tenant_chunk.items.len,
+                    .uncompressed_len = tenant_chunk.items.len,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    const projection = [_][]const u8{"amount"};
+    var result = try querySupportedI64ObjectRangeRowsAlloc(alloc, .{
+        .binding = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "sha256:objects" },
+            .schema_fingerprint = "schema-v1",
+        },
+        .reader = range_reader.reader(),
+        .inventory = inventory,
+        .projected_columns = &projection,
+        .predicate = .{
+            .column = "tenant",
+            .op = .eq_i64,
+            .i64_value = 8,
+        },
+        .coalesce_options = .{},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), range_reader.read_count);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), result.rows[0].cells.len);
+    try std.testing.expectEqualStrings("amount", result.rows[0].cells[0].name);
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].cells[0].value.?.i64);
+    try std.testing.expectEqual(@as(u64, 1), result.rows[0].row_ref.external.row_ordinal);
+}
+
 test "parquet object range discovery reads footers and builds row group source" {
     const alloc = std.testing.allocator;
-    const lake_rows = @import("lake_rows.zig");
 
     const column_offset: usize = 100;
     var chunk = std.ArrayListUnmanaged(u8).empty;
