@@ -777,6 +777,59 @@ test "parquet row group batch assembles optional i64 columns with null bitmap" {
     try std.testing.expectEqual(@as(u64, 1), null_ref.row_ordinal);
 }
 
+test "parquet row group batch assembles dictionary i64 columns" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 1024,
+        .row_count = 4,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 4,
+            .file_offset = 100,
+            .total_byte_len = 96,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 100,
+                .compressed_len = 96,
+                .uncompressed_len = 96,
+                .encoding = try alloc.dupe(u8, "rle_dictionary"),
+            }}),
+        }}),
+    };
+    try inventory.validate();
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try appendPlainI64DictionaryPage(&chunk, alloc, &[_]i64{ 11, 22, 33 });
+    try appendDictionaryI64DataPage(&chunk, alloc, 4, 2, &[_]u8{ 3, 0b10000100, 0 });
+
+    var owned = try buildDictionaryPlainI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
+        .column_id = "amount",
+        .bytes = chunk.items,
+    }});
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqual(@as(usize, 4), owned.batch.rowCount());
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 11, 22, 11, 33 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqual(@as(usize, 0), owned.batch.columns[0].nulls.bytes.len);
+    const row_ref = owned.batch.row_refs[3].external;
+    try std.testing.expectEqualStrings("part-a.parquet", row_ref.file_id);
+    try std.testing.expectEqual(@as(u64, 3), row_ref.row_ordinal);
+}
+
 test "parquet row group source scans through lake rows" {
     const alloc = std.testing.allocator;
     const lake_rows = @import("lake_rows.zig");
