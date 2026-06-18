@@ -3922,69 +3922,18 @@ const Parser = struct {
     }
 
     fn parseCreateMaterializedViewDdl(self: *@This(), replace_existing: bool) !CreateMaterializedViewPlan {
-        try self.expectKeyword("materialized");
-        try self.expectKeyword("view");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const view_name = try self.parseSqlObjectIdentifierOwned();
-        var view_transferred = false;
-        errdefer if (!view_transferred) self.alloc.free(view_name);
-        const declared_output_fields = try self.parseOptionalViewColumnListOwned();
-        var declared_output_transferred = false;
-        errdefer if (!declared_output_transferred) if (declared_output_fields) |fields| freeStringSlice(self.alloc, fields);
-        try self.expectKeyword("as");
-        try self.expectKeyword("select");
-
-        var selected_fields = try self.parseSimpleViewSelectFieldsOwned();
-        var selected_fields_transferred = false;
-        errdefer if (!selected_fields_transferred) selected_fields.deinit(self.alloc);
-        try self.expectKeyword("from");
-        const source_table_name = try self.parseSqlObjectIdentifierOwned();
-        var source_transferred = false;
-        errdefer if (!source_transferred) self.alloc.free(source_table_name);
-        var populate_on_create = true;
-        if (self.matchKeyword("with")) {
-            if (self.matchKeyword("no")) {
-                try self.expectKeyword("data");
-                populate_on_create = false;
-            } else {
-                try self.expectKeyword("data");
-                populate_on_create = true;
-            }
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        const output_fields = if (declared_output_fields) |aliases| blk: {
-            if (aliases.len != selected_fields.source_fields.len) return error.UnsupportedSqlShape;
-            freeStringSlice(self.alloc, selected_fields.output_fields);
-            selected_fields.output_fields = &.{};
-            declared_output_transferred = true;
-            break :blk aliases;
-        } else blk: {
-            const fields = selected_fields.output_fields;
-            selected_fields.output_fields = &.{};
-            break :blk fields;
-        };
-        var output_fields_transferred = false;
-        errdefer if (!output_fields_transferred) freeStringSlice(self.alloc, output_fields);
-        view_transferred = true;
-        source_transferred = true;
-        const source_fields = selected_fields.source_fields;
-        selected_fields.source_fields = &.{};
-        selected_fields_transferred = true;
-        output_fields_transferred = true;
+        var syntax = try sql_adapter.parseCreateMaterializedViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .view_name = view_name,
-            .source_table_name = source_table_name,
-            .source_fields = source_fields,
-            .output_fields = output_fields,
-            .replace_existing = replace_existing,
-            .if_not_exists = if_not_exists,
-            .populate_on_create = populate_on_create,
+            .view_name = syntax.view_name,
+            .source_table_name = syntax.source_table_name,
+            .source_fields = syntax.source_fields,
+            .output_fields = syntax.output_fields,
+            .replace_existing = syntax.replace_existing,
+            .if_not_exists = syntax.if_not_exists,
+            .populate_on_create = syntax.populate_on_create,
         };
     }
 
@@ -4013,118 +3962,17 @@ const Parser = struct {
     }
 
     fn parseCreateViewDdl(self: *@This(), replace_existing: bool) !CreateViewPlan {
-        try self.expectKeyword("view");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const view_name = try self.parseSqlObjectIdentifierOwned();
-        var view_transferred = false;
-        errdefer if (!view_transferred) self.alloc.free(view_name);
-        const declared_output_fields = try self.parseOptionalViewColumnListOwned();
-        var declared_output_transferred = false;
-        errdefer if (!declared_output_transferred) if (declared_output_fields) |fields| freeStringSlice(self.alloc, fields);
-        try self.expectKeyword("as");
-        try self.expectKeyword("select");
-
-        var selected_fields = try self.parseSimpleViewSelectFieldsOwned();
-        var selected_fields_transferred = false;
-        errdefer if (!selected_fields_transferred) selected_fields.deinit(self.alloc);
-        try self.expectKeyword("from");
-        const source_table_name = try self.parseSqlObjectIdentifierOwned();
-        var source_transferred = false;
-        errdefer if (!source_transferred) self.alloc.free(source_table_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        const output_fields = if (declared_output_fields) |aliases| blk: {
-            if (aliases.len != selected_fields.source_fields.len) return error.UnsupportedSqlShape;
-            freeStringSlice(self.alloc, selected_fields.output_fields);
-            selected_fields.output_fields = &.{};
-            declared_output_transferred = true;
-            break :blk aliases;
-        } else blk: {
-            const fields = selected_fields.output_fields;
-            selected_fields.output_fields = &.{};
-            break :blk fields;
-        };
-        var output_fields_transferred = false;
-        errdefer if (!output_fields_transferred) freeStringSlice(self.alloc, output_fields);
-        view_transferred = true;
-        source_transferred = true;
-        const source_fields = selected_fields.source_fields;
-        selected_fields.source_fields = &.{};
-        selected_fields_transferred = true;
-        output_fields_transferred = true;
+        var syntax = try sql_adapter.parseCreateViewCatalogTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .view_name = view_name,
-            .source_table_name = source_table_name,
-            .source_fields = source_fields,
-            .output_fields = output_fields,
-            .replace_existing = replace_existing,
-            .if_not_exists = if_not_exists,
-        };
-    }
-
-    fn parseOptionalViewColumnListOwned(self: *@This()) !?[]const []const u8 {
-        if (self.match(.lparen) == null) return null;
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            freeStringSlice(self.alloc, fields.items);
-            fields.deinit(self.alloc);
-        }
-        while (true) {
-            if (self.peekKind(.rparen)) return error.UnsupportedSqlShape;
-            const field = try self.parseIdentifierOwned();
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            try fields.append(self.alloc, field);
-            field_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        if (fields.items.len == 0) return error.UnsupportedSqlShape;
-        return try fields.toOwnedSlice(self.alloc);
-    }
-
-    fn parseSimpleViewSelectFieldsOwned(self: *@This()) !SimpleViewSelectFields {
-        var source_fields = std.ArrayListUnmanaged([]const u8).empty;
-        var output_fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            freeStringSlice(self.alloc, source_fields.items);
-            source_fields.deinit(self.alloc);
-            freeStringSlice(self.alloc, output_fields.items);
-            output_fields.deinit(self.alloc);
-        }
-        while (true) {
-            if (self.peekKind(.star)) return error.UnsupportedSqlShape;
-            const field = try self.parseSqlObjectIdentifierOwned();
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            const output = if (self.matchKeyword("as"))
-                try self.parseIdentifierOwned()
-            else if (self.peekKind(.identifier) and !self.peekKeyword("from"))
-                try self.parseIdentifierOwned()
-            else
-                try self.alloc.dupe(u8, field);
-            var output_transferred = false;
-            errdefer if (!output_transferred) self.alloc.free(output);
-            try source_fields.append(self.alloc, field);
-            field_transferred = true;
-            try output_fields.append(self.alloc, output);
-            output_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (source_fields.items.len == 0 or source_fields.items.len != output_fields.items.len) return error.UnsupportedSqlShape;
-        const owned_source_fields = try source_fields.toOwnedSlice(self.alloc);
-        var source_fields_transferred = false;
-        errdefer if (!source_fields_transferred) freeStringSlice(self.alloc, owned_source_fields);
-        const owned_output_fields = try output_fields.toOwnedSlice(self.alloc);
-        source_fields_transferred = true;
-        return .{
-            .source_fields = owned_source_fields,
-            .output_fields = owned_output_fields,
+            .view_name = syntax.view_name,
+            .source_table_name = syntax.source_table_name,
+            .source_fields = syntax.source_fields,
+            .output_fields = syntax.output_fields,
+            .replace_existing = syntax.replace_existing,
+            .if_not_exists = syntax.if_not_exists,
         };
     }
 
@@ -14457,17 +14305,6 @@ const Parser = struct {
     const QualifiedProjection = struct {
         source: QualifiedField,
         output: []const u8,
-    };
-
-    const SimpleViewSelectFields = struct {
-        source_fields: []const []const u8 = &.{},
-        output_fields: []const []const u8 = &.{},
-
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-            freeStringSlice(alloc, self.source_fields);
-            freeStringSlice(alloc, self.output_fields);
-            self.* = undefined;
-        }
     };
 
     fn parseTableAliasAlloc(self: *@This()) !TableAlias {

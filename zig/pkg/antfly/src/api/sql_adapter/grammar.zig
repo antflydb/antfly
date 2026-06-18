@@ -505,6 +505,41 @@ pub const DropIndexSyntax = struct {
     }
 };
 
+pub const CreateViewSyntax = struct {
+    view_name: []const u8,
+    source_table_name: []const u8,
+    source_fields: []const []const u8 = &.{},
+    output_fields: []const []const u8 = &.{},
+    replace_existing: bool = false,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.view_name));
+        alloc.free(@constCast(self.source_table_name));
+        freeStringSlice(alloc, self.source_fields);
+        freeStringSlice(alloc, self.output_fields);
+        self.* = undefined;
+    }
+};
+
+pub const CreateMaterializedViewSyntax = struct {
+    view_name: []const u8,
+    source_table_name: []const u8,
+    source_fields: []const []const u8 = &.{},
+    output_fields: []const []const u8 = &.{},
+    replace_existing: bool = false,
+    if_not_exists: bool = false,
+    populate_on_create: bool = true,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.view_name));
+        alloc.free(@constCast(self.source_table_name));
+        freeStringSlice(alloc, self.source_fields);
+        freeStringSlice(alloc, self.output_fields);
+        self.* = undefined;
+    }
+};
+
 pub const DropViewSyntax = struct {
     view_name: []const u8,
     if_exists: bool = false,
@@ -2322,6 +2357,59 @@ pub fn parseDropIndexCatalogTailAlloc(
     return .{ .index_name = index_name, .if_exists = if_exists };
 }
 
+pub fn parseCreateViewCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    replace_existing: bool,
+) !CreateViewSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("view");
+    const if_not_exists = try parseOptionalIfNotExists(cursor);
+    var syntax = try parseSimpleViewDefinitionAlloc(alloc, cursor, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    try parseAdapterNoopStatementEnd(cursor);
+    syntax.replace_existing = replace_existing;
+    syntax.if_not_exists = if_not_exists;
+    return syntax;
+}
+
+pub fn parseCreateMaterializedViewCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    replace_existing: bool,
+) !CreateMaterializedViewSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("materialized");
+    try cursor.expectKeyword("view");
+    const if_not_exists = try parseOptionalIfNotExists(cursor);
+    var definition = try parseSimpleViewDefinitionAlloc(alloc, cursor, tokens, pos);
+    var definition_transferred = false;
+    errdefer if (!definition_transferred) definition.deinit(alloc);
+    var populate_on_create = true;
+    if (cursor.matchKeyword("with")) {
+        if (cursor.matchKeyword("no")) {
+            try cursor.expectKeyword("data");
+            populate_on_create = false;
+        } else {
+            try cursor.expectKeyword("data");
+            populate_on_create = true;
+        }
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    definition_transferred = true;
+    return .{
+        .view_name = definition.view_name,
+        .source_table_name = definition.source_table_name,
+        .source_fields = definition.source_fields,
+        .output_fields = definition.output_fields,
+        .replace_existing = replace_existing,
+        .if_not_exists = if_not_exists,
+        .populate_on_create = populate_on_create,
+    };
+}
+
 pub fn parseDropViewCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2415,6 +2503,141 @@ pub fn parseRenameViewCatalogTailAlloc(
     view_transferred = true;
     new_transferred = true;
     return .{ .view_name = view_name, .new_view_name = new_view_name };
+}
+
+const SimpleViewSelectFieldsSyntax = struct {
+    source_fields: []const []const u8 = &.{},
+    output_fields: []const []const u8 = &.{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.source_fields);
+        freeStringSlice(alloc, self.output_fields);
+        self.* = undefined;
+    }
+};
+
+fn parseOptionalIfNotExists(cursor: parser.Cursor) !bool {
+    if (!cursor.matchKeyword("if")) return false;
+    try cursor.expectKeyword("not");
+    try cursor.expectKeyword("exists");
+    return true;
+}
+
+fn parseSimpleViewDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateViewSyntax {
+    const view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var view_transferred = false;
+    errdefer if (!view_transferred) alloc.free(view_name);
+    const declared_output_fields = try parseOptionalViewColumnListAlloc(alloc, cursor, tokens, pos);
+    var declared_output_transferred = false;
+    errdefer if (!declared_output_transferred) if (declared_output_fields) |fields| freeStringSlice(alloc, fields);
+    try cursor.expectKeyword("as");
+    try cursor.expectKeyword("select");
+
+    var selected_fields = try parseSimpleViewSelectFieldsAlloc(alloc, cursor, tokens, pos);
+    var selected_fields_transferred = false;
+    errdefer if (!selected_fields_transferred) selected_fields.deinit(alloc);
+    try cursor.expectKeyword("from");
+    const source_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_table_name);
+
+    const output_fields = if (declared_output_fields) |aliases| blk: {
+        if (aliases.len != selected_fields.source_fields.len) return error.UnsupportedSqlShape;
+        freeStringSlice(alloc, selected_fields.output_fields);
+        selected_fields.output_fields = &.{};
+        declared_output_transferred = true;
+        break :blk aliases;
+    } else blk: {
+        const fields = selected_fields.output_fields;
+        selected_fields.output_fields = &.{};
+        break :blk fields;
+    };
+    var output_fields_transferred = false;
+    errdefer if (!output_fields_transferred) freeStringSlice(alloc, output_fields);
+
+    const source_fields = selected_fields.source_fields;
+    selected_fields.source_fields = &.{};
+    selected_fields_transferred = true;
+    view_transferred = true;
+    source_transferred = true;
+    output_fields_transferred = true;
+    return .{
+        .view_name = view_name,
+        .source_table_name = source_table_name,
+        .source_fields = source_fields,
+        .output_fields = output_fields,
+    };
+}
+
+fn parseOptionalViewColumnListAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !?[]const []const u8 {
+    if (cursor.matchToken(.lparen) == null) return null;
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &fields);
+    while (true) {
+        if (cursor.peekKind(.rparen)) return error.UnsupportedSqlShape;
+        const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try fields.append(alloc, field);
+        field_transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (fields.items.len == 0) return error.UnsupportedSqlShape;
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn parseSimpleViewSelectFieldsAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !SimpleViewSelectFieldsSyntax {
+    var source_fields = std.ArrayListUnmanaged([]const u8).empty;
+    var output_fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        freeStringList(alloc, &source_fields);
+        freeStringList(alloc, &output_fields);
+    }
+    while (true) {
+        if (cursor.peekKind(.star)) return error.UnsupportedSqlShape;
+        const field = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const output = if (cursor.matchKeyword("as"))
+            try parseIdentifierOwnedAlloc(alloc, tokens, pos)
+        else if (cursor.peekKind(.identifier) and !cursor.peekKeyword("from"))
+            try parseIdentifierOwnedAlloc(alloc, tokens, pos)
+        else
+            try alloc.dupe(u8, field);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        try source_fields.append(alloc, field);
+        field_transferred = true;
+        try output_fields.append(alloc, output);
+        output_transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    if (source_fields.items.len == 0 or source_fields.items.len != output_fields.items.len) return error.UnsupportedSqlShape;
+    const owned_source_fields = try source_fields.toOwnedSlice(alloc);
+    var source_fields_transferred = false;
+    errdefer if (!source_fields_transferred) freeStringSlice(alloc, owned_source_fields);
+    const owned_output_fields = try output_fields.toOwnedSlice(alloc);
+    source_fields_transferred = true;
+    return .{
+        .source_fields = owned_source_fields,
+        .output_fields = owned_output_fields,
+    };
 }
 
 pub fn parseCreateRoleCatalogTailAlloc(
@@ -4421,6 +4644,50 @@ test "sql adapter grammar parses drop table and index catalog tails" {
 
 test "sql adapter grammar parses view catalog tails" {
     const alloc = std.testing.allocator;
+
+    var create_view_tokens = try lexer.tokenizeAlloc(alloc, "VIEW public.active_accounts(account_id, contact_email) AS SELECT id, email FROM public.accounts;");
+    defer lexer.freeTokens(alloc, &create_view_tokens);
+    var create_view_pos: usize = 0;
+    var create_view = try parseCreateViewCatalogTailAlloc(alloc, create_view_tokens.items, &create_view_pos, false);
+    defer create_view.deinit(alloc);
+    try std.testing.expectEqual(create_view_tokens.items.len, create_view_pos);
+    try std.testing.expectEqualStrings("active_accounts", create_view.view_name);
+    try std.testing.expectEqualStrings("accounts", create_view.source_table_name);
+    try std.testing.expect(!create_view.replace_existing);
+    try std.testing.expect(!create_view.if_not_exists);
+    try std.testing.expectEqual(@as(usize, 2), create_view.source_fields.len);
+    try std.testing.expectEqualStrings("id", create_view.source_fields[0]);
+    try std.testing.expectEqualStrings("email", create_view.source_fields[1]);
+    try std.testing.expectEqualStrings("account_id", create_view.output_fields[0]);
+    try std.testing.expectEqualStrings("contact_email", create_view.output_fields[1]);
+
+    var replace_view_tokens = try lexer.tokenizeAlloc(alloc, "VIEW IF NOT EXISTS active_accounts AS SELECT id AS account_id FROM accounts;");
+    defer lexer.freeTokens(alloc, &replace_view_tokens);
+    var replace_view_pos: usize = 0;
+    var replace_view = try parseCreateViewCatalogTailAlloc(alloc, replace_view_tokens.items, &replace_view_pos, true);
+    defer replace_view.deinit(alloc);
+    try std.testing.expectEqual(replace_view_tokens.items.len, replace_view_pos);
+    try std.testing.expect(replace_view.replace_existing);
+    try std.testing.expect(replace_view.if_not_exists);
+    try std.testing.expectEqualStrings("account_id", replace_view.output_fields[0]);
+
+    var create_mv_tokens = try lexer.tokenizeAlloc(alloc, "MATERIALIZED VIEW account_rollups(record_id, record_status) AS SELECT id, status FROM usage_records WITH NO DATA;");
+    defer lexer.freeTokens(alloc, &create_mv_tokens);
+    var create_mv_pos: usize = 0;
+    var create_mv = try parseCreateMaterializedViewCatalogTailAlloc(alloc, create_mv_tokens.items, &create_mv_pos, true);
+    defer create_mv.deinit(alloc);
+    try std.testing.expectEqual(create_mv_tokens.items.len, create_mv_pos);
+    try std.testing.expectEqualStrings("account_rollups", create_mv.view_name);
+    try std.testing.expect(create_mv.replace_existing);
+    try std.testing.expect(!create_mv.if_not_exists);
+    try std.testing.expect(!create_mv.populate_on_create);
+    try std.testing.expectEqualStrings("id", create_mv.source_fields[0]);
+    try std.testing.expectEqualStrings("record_id", create_mv.output_fields[0]);
+
+    var bad_alias_tokens = try lexer.tokenizeAlloc(alloc, "VIEW active_accounts(account_id) AS SELECT id, email FROM accounts;");
+    defer lexer.freeTokens(alloc, &bad_alias_tokens);
+    var bad_alias_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateViewCatalogTailAlloc(alloc, bad_alias_tokens.items, &bad_alias_pos, false));
 
     var drop_view_tokens = try lexer.tokenizeAlloc(alloc, "VIEW IF EXISTS public.active_accounts CASCADE;");
     defer lexer.freeTokens(alloc, &drop_view_tokens);

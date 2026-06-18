@@ -1107,8 +1107,8 @@ comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
 `COMMENT ON INDEX`, and `COMMENT ON CONSTRAINT`,
 drop-catalog grammar for `DROP TABLE`, `DROP TABLE IF EXISTS`, `DROP INDEX`,
 `DROP INDEX CONCURRENTLY`, `DROP VIEW`, and `DROP MATERIALIZED VIEW`,
-view catalog grammar for `ALTER VIEW ... RENAME TO` and `REFRESH MATERIALIZED
-VIEW`,
+view catalog grammar for `CREATE VIEW`, `CREATE MATERIALIZED VIEW`,
+`ALTER VIEW ... RENAME TO`, and `REFRESH MATERIALIZED VIEW`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4534,7 +4534,8 @@ arity; selected source fields remain separate typed metadata so aliases do not
 erase the view's source-to-output mapping. Simple select-list aliases such as
 `SELECT field AS alias` and `SELECT field alias` use the same mapping: the
 selected source field remains durable metadata and the alias becomes the exposed
-output field;
+output field. `CREATE VIEW` tails parse in `api/sql_adapter/grammar.zig`, so the
+SQL lowerer only transfers owned grammar syntax into typed view catalog plans;
 `ALTER VIEW ... RENAME TO ...` and `DROP VIEW ...` record typed catalog rename
 and removal intents. The remaining production shape is the durable view catalog
 executor: full stored queries over the same Antfly row-query, join, lateral,
@@ -4554,6 +4555,9 @@ same typed definition with both flags preserved: catalog execution creates the
 materialized view when it is absent and replaces the existing definition when it
 is present, while still keeping population/refresh work in the materialized-view
 job family instead of applying SQL text directly.
+`CREATE MATERIALIZED VIEW` tails parse in `api/sql_adapter/grammar.zig`, so the
+SQL lowerer only transfers owned grammar syntax into typed materialized-view
+catalog plans.
 `REFRESH MATERIALIZED VIEW` records the target view plus `CONCURRENTLY` and
 populate/no-data policy, and `DROP MATERIALIZED VIEW` records typed removal
 metadata. The remaining production shape is the durable executor: output
