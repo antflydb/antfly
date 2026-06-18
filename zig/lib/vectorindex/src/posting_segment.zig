@@ -2258,6 +2258,7 @@ const PendingDeltaBatch = struct {
     records: std.ArrayListUnmanaged(posting.PostingDeltaRecord) = .empty,
     encoded_value_bytes: usize = 0,
     min_sequence: u64 = 0,
+    max_sequence: u64 = 0,
 
     fn deinit(self: *PendingDeltaBatch, alloc: Allocator) void {
         self.records.deinit(alloc);
@@ -2266,17 +2267,28 @@ const PendingDeltaBatch = struct {
 
     fn noteAppendedRecord(self: *PendingDeltaBatch, record: posting.PostingDeltaRecord, encoded_value_bytes: usize) void {
         self.encoded_value_bytes = encoded_value_bytes;
-        self.min_sequence = if (self.records.items.len == 1)
+        const first_record = self.records.items.len == 1;
+        self.min_sequence = if (first_record)
             record.sequence
         else
             @min(self.min_sequence, record.sequence);
+        self.max_sequence = if (first_record)
+            record.sequence
+        else
+            @max(self.max_sequence, record.sequence);
     }
 
     fn noteAppendedRecords(self: *PendingDeltaBatch, records: []const posting.PostingDeltaRecord, encoded_value_bytes: usize) void {
         self.encoded_value_bytes = encoded_value_bytes;
-        var min_sequence = if (self.records.items.len == records.len) records[0].sequence else self.min_sequence;
-        for (records) |record| min_sequence = @min(min_sequence, record.sequence);
+        const first_records = self.records.items.len == records.len;
+        var min_sequence = if (first_records) records[0].sequence else self.min_sequence;
+        var max_sequence = if (first_records) records[0].sequence else self.max_sequence;
+        for (records) |record| {
+            min_sequence = @min(min_sequence, record.sequence);
+            max_sequence = @max(max_sequence, record.sequence);
+        }
         self.min_sequence = min_sequence;
+        self.max_sequence = max_sequence;
     }
 };
 
@@ -2626,6 +2638,10 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntries(alloc, &records, posting_id, min_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             if (min_generation) |generation| {
+                if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= generation) {
+                    sortPostingDeltaRecordsIfNeeded(records.items);
+                    return try records.toOwnedSlice(alloc);
+                }
                 var reserved = false;
                 for (batch.records.items, 0..) |record, i| {
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
@@ -2653,6 +2669,14 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntriesWithStats(alloc, &records, &stats, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
+            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) {
+                stats.records += batch.records.items.len;
+                sortPostingDeltaRecordsIfNeeded(records.items);
+                return .{
+                    .records = try records.toOwnedSlice(alloc),
+                    .stats = stats,
+                };
+            }
             var reserved = false;
             for (batch.records.items, 0..) |record, i| {
                 stats.records += 1;
@@ -2687,6 +2711,10 @@ pub const DirectoryBatchWriter = struct {
         try self.appendPendingDeltaEntriesIntoScratchWithStats(alloc, scratch, &stats, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             stats.encoded_value_bytes += batch.encoded_value_bytes;
+            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) {
+                stats.records += batch.records.items.len;
+                return stats;
+            }
             var reserved = false;
             for (batch.records.items, 0..) |record, i| {
                 stats.records += 1;
@@ -2710,6 +2738,10 @@ pub const DirectoryBatchWriter = struct {
         try self.accumulatePendingDeltaEntryStats(&out, posting_id, base_generation);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
             out.encoded_value_bytes += batch.encoded_value_bytes;
+            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) {
+                out.records += batch.records.items.len;
+                return out;
+            }
             for (batch.records.items) |record| {
                 out.records += 1;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
@@ -2741,6 +2773,8 @@ pub const DirectoryBatchWriter = struct {
         var best_record: ?posting.PostingDeltaRecord = null;
         try self.latestPendingDeltaEntryAfterGenerationForMember(posting_id, vector_id, base_generation, &best_sequence, &best_record);
         if (self.pending_delta_batches.get(posting_id)) |batch| {
+            if (batch.max_sequence != 0 and posting.PostingFormat.deltaSequenceGeneration(batch.max_sequence) <= base_generation) return best_record;
+            if (best_record != null and batch.max_sequence < best_sequence) return best_record;
             for (batch.records.items) |record| {
                 if (record.vector_id != vector_id) continue;
                 if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
@@ -6337,6 +6371,7 @@ test "posting segment pending delta batch size uses cached min sequence" {
     }
 
     try std.testing.expectEqual(records[1].sequence, batch.min_sequence);
+    try std.testing.expectEqual(records[2].sequence, batch.max_sequence);
 }
 
 test "posting segment directory batch writer flushes bounded segments" {
