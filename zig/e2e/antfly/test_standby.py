@@ -20,9 +20,11 @@ import json
 import os
 import signal
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,11 @@ from conftest import (
 
 HA_ADMIN_ROOT = "/admin/v1/ha"
 DB_API_ROOT = "/db/v1"
+HA_BACKUP_MAGIC = b"AFHABKP\n"
+HA_BACKUP_HEADER_SIZE = 96
+HA_BACKUP_ENTRY_HEADER_SIZE = 28
+HA_BACKUP_FORMAT_VERSION = 1
+HA_BACKUP_FILE_KIND_METADATA = 3
 
 pytestmark = pytest.mark.ha_standby
 
@@ -94,7 +101,7 @@ class HASwarmNode:
     def catalog_path(self) -> Path:
         return self.node_root / "metadata" / "local-metadata.json"
 
-    def start(self) -> None:
+    def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
         command = _swarm_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
         command.extend(["--health-port", str(self.health_port)])
@@ -120,9 +127,9 @@ class HASwarmNode:
                     self.node_id,
                 ]
             )
-            if self.upstream_url is not None:
+            if enable_replication and self.upstream_url is not None:
                 command.extend(["--ha-standby-upstream-url", self.upstream_url])
-            if self.slot_name is not None:
+            if enable_replication and self.slot_name is not None:
                 command.extend(["--ha-standby-slot", self.slot_name])
         else:
             raise ValueError(f"unsupported HA role {self.role!r}")
@@ -174,11 +181,11 @@ class HASwarmNode:
                 self.proc.wait()
         self.proc = None
 
-    def restart(self) -> None:
+    def restart(self, *, enable_replication: bool = True) -> None:
         self.stop()
         self.log_file.close()
         self.log_file = self.log_path.open("a")
-        self.start()
+        self.start(enable_replication=enable_replication)
 
     def close(self) -> None:
         self.stop()
@@ -264,10 +271,58 @@ class HACluster:
             node.shard_id = shard_id
             node.table_id = table_id
 
-    def seed_standby_catalog_from_primary(self) -> None:
+    def seed_standby_catalog_from_primary(self) -> dict[str, Any]:
+        backup_root = self.root / "base-backup"
+        if backup_root.exists():
+            shutil.rmtree(backup_root)
+        catalog_rel = Path("metadata") / "local-metadata.json"
+        catalog_backup_path = backup_root / catalog_rel
+        catalog_backup_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_bytes = self.primary.catalog_path.read_bytes()
+        catalog_backup_path.write_bytes(catalog_bytes)
+
         self.standby.node_root.mkdir(parents=True, exist_ok=True)
         self.standby.catalog_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.primary.catalog_path, self.standby.catalog_path)
+
+        manifest_id = "base-standby-a"
+        begun = self.primary.admin_post(
+            "/base-backups",
+            {"slot_name": "standby-a", "manifest_id": manifest_id},
+        )
+        assert begun["slot_name"] == "standby-a"
+        assert begun["manifest_id"] == manifest_id
+        backup_lsn = int(begun["backup_lsn"])
+        manifest_path = backup_root / "backup.afha"
+        manifest_path.write_bytes(
+            _encode_ha_backup_manifest(
+                identity=_identity(self),
+                manifest_id=manifest_id,
+                backup_lsn=backup_lsn,
+                checkpoint_lsn=backup_lsn,
+                files=[
+                    {
+                        "path": catalog_rel.as_posix(),
+                        "kind": HA_BACKUP_FILE_KIND_METADATA,
+                        "data": catalog_bytes,
+                    }
+                ],
+            )
+        )
+        finished = self.primary.admin_post(
+            "/base-backups/finish",
+            {"manifest_path": str(manifest_path)},
+        )
+        assert finished["manifest_id"] == manifest_id
+        assert int(finished["backup_lsn"]) == backup_lsn
+        assert int(finished["end_record_lsn"]) >= backup_lsn
+        return {
+            "backup_lsn": backup_lsn,
+            "content_root": backup_root,
+            "finished": finished,
+            "manifest_id": manifest_id,
+            "manifest_path": manifest_path,
+        }
 
     def close(self) -> None:
         self.standby.close()
@@ -367,6 +422,54 @@ def _identity(cluster: HACluster) -> dict[str, int]:
     }
 
 
+def _encode_ha_backup_manifest(
+    *,
+    identity: dict[str, int],
+    manifest_id: str,
+    backup_lsn: int,
+    checkpoint_lsn: int,
+    files: list[dict[str, Any]],
+) -> bytes:
+    manifest_id_bytes = manifest_id.encode()
+    body = bytearray(manifest_id_bytes)
+    for file in files:
+        path_bytes = str(file["path"]).encode()
+        data = bytes(file["data"])
+        body.extend(
+            struct.pack(
+                "<HHIQIII",
+                int(file["kind"]),
+                0,
+                0,
+                len(data),
+                zlib.crc32(data) & 0xFFFFFFFF,
+                len(path_bytes),
+                0,
+            )
+        )
+        assert HA_BACKUP_ENTRY_HEADER_SIZE == struct.calcsize("<HHIQIII")
+        body.extend(path_bytes)
+
+    header = bytearray(HA_BACKUP_HEADER_SIZE)
+    header[0:8] = HA_BACKUP_MAGIC
+    struct.pack_into("<H", header, 8, HA_BACKUP_FORMAT_VERSION)
+    struct.pack_into("<H", header, 10, HA_BACKUP_HEADER_SIZE)
+    struct.pack_into("<I", header, 12, 0)
+    struct.pack_into("<Q", header, 16, identity["cluster_id"])
+    struct.pack_into("<Q", header, 24, identity["shard_id"])
+    struct.pack_into("<Q", header, 32, identity["table_id"])
+    struct.pack_into("<Q", header, 40, identity["timeline_id"])
+    struct.pack_into("<Q", header, 48, identity["epoch"])
+    struct.pack_into("<Q", header, 56, backup_lsn)
+    struct.pack_into("<Q", header, 64, checkpoint_lsn)
+    struct.pack_into("<I", header, 72, len(files))
+    struct.pack_into("<I", header, 76, len(manifest_id_bytes))
+    struct.pack_into("<Q", header, 80, len(body))
+    struct.pack_into("<I", header, 88, zlib.crc32(body) & 0xFFFFFFFF)
+    struct.pack_into("<I", header, 92, zlib.crc32(header[:92]) & 0xFFFFFFFF)
+    return bytes(header + body)
+
+
 def _promotion_fence_request(cluster: HACluster, required_lsn: int) -> dict[str, Any]:
     return {
         "identity": _identity(cluster),
@@ -401,17 +504,21 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     shard_id, table_id = _table_identity_from_catalog(ha_cluster.primary, table_name)
     ha_cluster.primary.reset_ha_state()
     ha_cluster.configure_table_identity(shard_id=shard_id, table_id=table_id)
-    ha_cluster.seed_standby_catalog_from_primary()
     ha_cluster.primary.start()
 
-    created = ha_cluster.primary.admin_post(
-        "/replication-slots",
-        {"slot_name": "standby-a", "initial_lsn": 0},
-    )
-    assert created["slot"]["slot_name"] == "standby-a"
-    assert created["slot"]["restart_lsn"] == 0
+    seed = ha_cluster.seed_standby_catalog_from_primary()
+    assert seed["backup_lsn"] >= 1
 
-    ha_cluster.standby.start()
+    ha_cluster.standby.start(enable_replication=False)
+    bootstrapped = ha_cluster.standby.admin_post(
+        "/standby/bootstrap",
+        {"manifest_path": str(seed["manifest_path"]), "content_root": str(seed["content_root"])},
+    )
+    assert bootstrapped["manifest_id"] == seed["manifest_id"]
+    assert int(bootstrapped["backup_lsn"]) == seed["backup_lsn"]
+    assert int(bootstrapped["checkpoint_lsn"]) == seed["backup_lsn"]
+
+    ha_cluster.standby.restart()
 
     ha_cluster.primary.batch_write(table_name, {"doc:first": {"title": "first"}})
     first_lsn = _primary_lsn(ha_cluster)
