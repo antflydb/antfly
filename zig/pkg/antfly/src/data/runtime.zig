@@ -503,7 +503,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_ha_runtime_configured", "gauge", "Whether this data runtime has any HA role configured", if (primary != null or standby != null) 1 else 0);
 
         if (primary) |handle| {
-            var snapshot = try antfly.ha.status.primarySnapshot(ds.alloc, handle, .{}, ds.ha_cfg.primary_sync_policy);
+            var snapshot = try antfly.ha.status.primarySnapshot(ds.alloc, handle, ds.ha_cfg.primary_retention_policy, ds.ha_cfg.primary_sync_policy);
             defer snapshot.deinit(ds.alloc);
             var metrics = try antfly.ha.metrics.fromPrimarySnapshot(ds.alloc, snapshot);
             defer metrics.deinit(ds.alloc);
@@ -1465,6 +1465,7 @@ pub const DataServerHAConfig = struct {
     admin_context: ?antfly.ha.admin_exec.Context = null,
     admin_bearer_token: ?[]const u8 = null,
     internal_primary: ?*antfly.ha.primary.Primary = null,
+    primary_retention_policy: antfly.ha.slot_store.RetentionPolicy = .{},
     primary_sync_policy: antfly.ha.primary.SyncPolicy = .{},
     standby_replication: ?HAStandbyReplicationConfig = null,
 };
@@ -13591,6 +13592,8 @@ test "data server wires configured HA executors into API server" {
     }, .{});
     defer primary.close();
     try primary.createSlot("standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
 
     var server = DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = ".",
@@ -13599,6 +13602,7 @@ test "data server wires configured HA executors into API server" {
                 .primary = &primary,
                 .primary_node_id = "primary-a",
             },
+            .primary_retention_policy = .{ .max_lag_lsn = 1 },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
     defer server.deinit();
@@ -13631,8 +13635,10 @@ test "data server wires configured HA executors into API server" {
     const metrics = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_runtime_configured 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_slot_count 1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_active_slots 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_retention_reseed_recommended 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_status_code{slot=\"standby-a\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
 }
 

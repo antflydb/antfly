@@ -221,6 +221,9 @@ func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		if adminTokenEnvVar != "" {
 			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
 		}
+		if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
+			appendHAUint("--ha-retention-max-lag-lsn", ha.Retention.MaxLagLSN)
+		}
 		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
 	case antflyv1.HARuntimeRoleStandby:
 		standby := runtime.Standby
