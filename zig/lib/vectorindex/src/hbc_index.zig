@@ -7136,14 +7136,25 @@ fn routeBatchInsertsToLeaves(
     var profile = BatchRouteProfile{};
     if (item_count == 0) return profile;
 
-    const current = try self.alloc.alloc(usize, item_count);
-    defer self.alloc.free(current);
-    const next = try self.alloc.alloc(usize, item_count);
-    defer self.alloc.free(next);
-    const choices = try self.alloc.alloc(usize, item_count);
-    defer self.alloc.free(choices);
-    const query_measures = try self.alloc.alloc(f32, item_count);
-    defer self.alloc.free(query_measures);
+    const index_storage_len = try std.math.mul(usize, item_count, 3);
+    var index_storage_stack: [3072]usize = undefined;
+    const use_index_storage_stack = index_storage_len <= index_storage_stack.len;
+    const index_storage = if (use_index_storage_stack)
+        index_storage_stack[0..index_storage_len]
+    else
+        try self.alloc.alloc(usize, index_storage_len);
+    defer if (!use_index_storage_stack) self.alloc.free(index_storage);
+    const current = index_storage[0..item_count];
+    const next = index_storage[item_count .. 2 * item_count];
+    const choices = index_storage[2 * item_count .. index_storage_len];
+
+    var query_measure_stack: [1024]f32 = undefined;
+    const use_query_measure_stack = item_count <= query_measure_stack.len;
+    const query_measures = if (use_query_measure_stack)
+        query_measure_stack[0..item_count]
+    else
+        try self.alloc.alloc(f32, item_count);
+    defer if (!use_query_measure_stack) self.alloc.free(query_measures);
 
     const dims: usize = @intCast(self.config.dims);
     for (current, 0..) |*slot, i| {
