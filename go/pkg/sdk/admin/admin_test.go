@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
 )
 
 func TestInternalClientGetMetadataStatusSendsToken(t *testing.T) {
@@ -498,116 +500,157 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		got  HAOperation
-		want HAOperation
+		name      string
+		got       HAOperation
+		generated func(*testing.T) HAOperation
 	}{
 		{
 			name: "primary status",
 			got:  HAPrimaryStatusOperation(),
-			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/primary/status"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewGetHAPrimaryStatusRequest(server, nil)
+			}),
 		},
 		{
 			name: "standby status",
 			got:  HAStandbyStatusOperation(),
-			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/standby/status"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewGetHAStandbyStatusRequest(server, nil)
+			}),
 		},
 		{
 			name: "check commit",
 			got:  HACheckCommitOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/commit/check"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCheckHACommitRequest(server, oapi.CheckHACommitJSONRequestBody{})
+			}),
 		},
 		{
 			name: "append commit",
 			got:  HAAppendCommitOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/commit/append"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewAppendHACommitRequest(server, oapi.AppendHACommitJSONRequestBody{})
+			}),
 		},
 		{
 			name: "check read",
 			got:  HACheckReadOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/read/check"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCheckHAReadRequest(server, oapi.CheckHAReadJSONRequestBody{})
+			}),
 		},
 		{
 			name: "check write",
 			got:  HACheckWriteOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/write/check"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCheckHAWriteRequest(server, oapi.CheckHAWriteJSONRequestBody{})
+			}),
 		},
 		{
 			name: "check owner job",
 			got:  HACheckOwnerJobOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/owner-jobs/check"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCheckHAOwnerJobRequest(server, oapi.CheckHAOwnerJobJSONRequestBody{})
+			}),
 		},
 		{
 			name: "list replication slots",
 			got:  HAListReplicationSlotsOperation(),
-			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/replication-slots"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewListHAReplicationSlotsRequest(server)
+			}),
 		},
 		{
 			name: "create replication slot",
 			got:  HACreateReplicationSlotOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/replication-slots"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewCreateHAReplicationSlotRequest(server, oapi.CreateHAReplicationSlotJSONRequestBody{})
+			}),
 		},
 		{
 			name: "begin base backup",
 			got:  HABeginBaseBackupOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/base-backups"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewBeginHABaseBackupRequest(server, oapi.BeginHABaseBackupJSONRequestBody{})
+			}),
 		},
 		{
 			name: "finish base backup",
 			got:  HAFinishBaseBackupOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/base-backups/finish"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewFinishHABaseBackupRequest(server, oapi.FinishHABaseBackupJSONRequestBody{})
+			}),
 		},
 		{
 			name: "bootstrap standby",
 			got:  HABootstrapStandbyOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/standby/bootstrap"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewBootstrapHAStandbyRequest(server, oapi.BootstrapHAStandbyJSONRequestBody{})
+			}),
 		},
 		{
 			name: "acquire fence",
 			got:  HAAcquireFenceOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/fence"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewAcquireHAFenceRequest(server, oapi.AcquireHAFenceJSONRequestBody{})
+			}),
 		},
 		{
 			name: "current fence",
 			got:  HACurrentFenceOperation(),
-			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/fence/current"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewGetHACurrentFenceRequest(server)
+			}),
 		},
 		{
 			name: "assess promotion",
 			got:  HAAssessPromotionOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion/assess"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewAssessHAPromotionRequest(server, oapi.AssessHAPromotionJSONRequestBody{})
+			}),
 		},
 		{
 			name: "promote with current fence",
 			got:  HAPromoteWithCurrentFenceOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion/current-fence"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewPromoteHAWithCurrentFenceRequest(server)
+			}),
 		},
 		{
 			name: "promote",
 			got:  HAPromoteOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewPromoteHARequest(server, oapi.PromoteHAJSONRequestBody{})
+			}),
 		},
 		{
 			name: "assess rejoin",
 			got:  HAAssessRejoinOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/rejoin/assess"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewAssessHARejoinRequest(server, oapi.AssessHARejoinJSONRequestBody{})
+			}),
 		},
 		{
 			name: "rewind rejoin",
 			got:  HARewindRejoinOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/rejoin/rewind"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewRewindHARejoinRequest(server, oapi.RewindHARejoinJSONRequestBody{})
+			}),
 		},
 		{
 			name: "reseed rejoin",
 			got:  HAReseedRejoinOperation(),
-			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/rejoin/reseed"},
+			generated: generatedHAOperation(func(server string) (*http.Request, error) {
+				return oapi.NewReseedHARejoinRequest(server, oapi.ReseedHARejoinJSONRequestBody{})
+			}),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if tt.got != tt.want {
-				t.Fatalf("operation = %#v, want %#v", tt.got, tt.want)
+			want := tt.generated(t)
+			if tt.got != want {
+				t.Fatalf("operation = %#v, want generated OpenAPI operation %#v", tt.got, want)
 			}
 		})
 	}
@@ -622,26 +665,47 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 	if _, ok := HAReplicationSlotPath(" "); ok {
 		t.Fatal("HAReplicationSlotPath returned ok=true for empty slot")
 	}
+	generatedDrop := generatedHAOperation(func(server string) (*http.Request, error) {
+		return oapi.NewDropHAReplicationSlotRequest(server, "standby a/%")
+	})(t)
+	if dropPath := (HAOperation{Method: http.MethodDelete, Path: slotPath}); dropPath != generatedDrop {
+		t.Fatalf("drop slot path operation = %#v, want generated OpenAPI operation %#v", dropPath, generatedDrop)
+	}
 	resume, ok := HAResumeReplicationSlotOperation("standby a/%")
 	if !ok {
 		t.Fatal("HAResumeReplicationSlotOperation returned ok=false")
 	}
-	if want := (HAOperation{Method: http.MethodPut, Path: "/admin/v1/ha/replication-slots/standby%20a%2F%25/resume"}); resume != want {
-		t.Fatalf("resume operation = %#v, want %#v", resume, want)
+	if want := generatedHAOperation(func(server string) (*http.Request, error) {
+		return oapi.NewResumeHAReplicationSlotRequest(server, "standby a/%")
+	})(t); resume != want {
+		t.Fatalf("resume operation = %#v, want generated OpenAPI operation %#v", resume, want)
 	}
 	pause, ok := HAPauseReplicationSlotOperation("standby a/%")
 	if !ok {
 		t.Fatal("HAPauseReplicationSlotOperation returned ok=false")
 	}
-	if want := (HAOperation{Method: http.MethodPut, Path: "/admin/v1/ha/replication-slots/standby%20a%2F%25/pause"}); pause != want {
-		t.Fatalf("pause operation = %#v, want %#v", pause, want)
+	if want := generatedHAOperation(func(server string) (*http.Request, error) {
+		return oapi.NewPauseHAReplicationSlotRequest(server, "standby a/%")
+	})(t); pause != want {
+		t.Fatalf("pause operation = %#v, want generated OpenAPI operation %#v", pause, want)
 	}
 	drop, ok := HADropReplicationSlotOperation("standby a/%")
 	if !ok {
 		t.Fatal("HADropReplicationSlotOperation returned ok=false")
 	}
-	if want := (HAOperation{Method: http.MethodDelete, Path: "/admin/v1/ha/replication-slots/standby%20a%2F%25"}); drop != want {
-		t.Fatalf("drop operation = %#v, want %#v", drop, want)
+	if drop != generatedDrop {
+		t.Fatalf("drop operation = %#v, want generated OpenAPI operation %#v", drop, generatedDrop)
+	}
+}
+
+func generatedHAOperation(build func(string) (*http.Request, error)) func(*testing.T) HAOperation {
+	return func(t *testing.T) HAOperation {
+		t.Helper()
+		req, err := build("http://admin.test" + AdminV1Path + "/")
+		if err != nil {
+			t.Fatalf("generated OpenAPI request builder returned error: %v", err)
+		}
+		return HAOperation{Method: req.Method, Path: req.URL.EscapedPath()}
 	}
 }
 
