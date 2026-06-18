@@ -176,7 +176,7 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
-func TestHAClientRejectsInvalidReplicationSlotNamesLocally(t *testing.T) {
+func TestHAClientRejectsInvalidHAIdentifiersLocally(t *testing.T) {
 	t.Parallel()
 
 	var requests atomic.Int32
@@ -189,6 +189,38 @@ func TestHAClientRejectsInvalidReplicationSlotNamesLocally(t *testing.T) {
 	client, err := NewHAClient(server.URL, server.Client())
 	if err != nil {
 		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	identity := HAIdentity{
+		ClusterId:  1,
+		ShardId:    0,
+		TableId:    0,
+		TimelineId: 1,
+		Epoch:      1,
+	}
+	validFence := FenceAcquireRequest{
+		Identity:       identity,
+		OldPrimaryId:   "primary-a",
+		PromotedNodeId: "standby-a",
+		NewTimelineId:  2,
+		NewEpoch:       2,
+		RequiredLsn:    9,
+		ObservedLsn:    9,
+		Force:          false,
+	}
+	validRejoin := RejoinAssessRequest{
+		NodeId:                          "primary-a",
+		Identity:                        identity,
+		LastLsn:                         9,
+		RetainedFromLsn:                 1,
+		AllowRewindAfterForcedPromotion: false,
+		Receipt:                         HAFenceReceipt{},
+	}
+	validSyncPolicy := HASyncPolicy{
+		Mode:          HASyncPolicyModeRemoteWrite,
+		Selection:     HASyncPolicySelectionAny,
+		Required:      1,
+		FailurePolicy: HASyncPolicyFailureFailClosed,
+		StandbyNames:  []string{"standby-a"},
 	}
 
 	tests := []struct {
@@ -226,11 +258,129 @@ func TestHAClientRejectsInvalidReplicationSlotNamesLocally(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "primary status sync standby padded",
+			call: func() error {
+				_, err := client.PrimaryStatus(context.Background(), &HAPrimaryStatusParams{
+					SyncStandby: []string{"standby-a "},
+				})
+				return err
+			},
+		},
+		{
+			name: "append commit sync standby hidden whitespace",
+			call: func() error {
+				policy := validSyncPolicy
+				policy.StandbyNames = []string{"standby a"}
+				_, err := client.AppendCommit(context.Background(), CommitAppendRequest{
+					Payload:      "{}",
+					SyncPolicy:   policy,
+					Kind:         CommitAppendKindBatchMutation,
+					PayloadCodec: CommitAppendRequestCodec("json"),
+				})
+				return err
+			},
+		},
+		{
+			name: "check commit sync standby path separator",
+			call: func() error {
+				policy := validSyncPolicy
+				policy.StandbyNames = []string{"standby/a"}
+				_, err := client.CheckCommit(context.Background(), CommitCheckRequest{
+					TargetLsn:  9,
+					SyncPolicy: policy,
+				})
+				return err
+			},
+		},
+		{
+			name: "begin base backup slot hidden whitespace",
+			call: func() error {
+				_, err := client.BeginBaseBackup(context.Background(), BaseBackupStartRequest{
+					SlotName:   "standby a",
+					ManifestId: "manifest-a",
+				})
+				return err
+			},
+		},
+		{
+			name: "acquire fence padded old primary id",
+			call: func() error {
+				body := validFence
+				body.OldPrimaryId = " primary-a"
+				_, err := client.AcquireFence(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "promote padded promoted node id",
+			call: func() error {
+				body := validFence
+				body.PromotedNodeId = "standby-a "
+				_, err := client.Promote(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "assess rejoin invalid node id",
+			call: func() error {
+				body := validRejoin
+				body.NodeId = "primary/a"
+				_, err := client.AssessRejoin(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "rewind rejoin invalid receipt old primary id",
+			call: func() error {
+				body := validRejoin
+				body.Receipt = HAFenceReceipt{
+					Identity:         identity,
+					OldPrimaryId:     "primary a",
+					PromotedNodeId:   "standby-a",
+					ParentTimelineId: 1,
+					ParentEpoch:      1,
+					NewTimelineId:    2,
+					NewEpoch:         2,
+					RequiredLsn:      9,
+					ObservedLsn:      9,
+					Generation:       1,
+					Forced:           false,
+					Token:            "token-a",
+					Reason:           "test",
+				}
+				_, err := client.RewindRejoin(context.Background(), body)
+				return err
+			},
+		},
+		{
+			name: "reseed rejoin invalid receipt promoted node id",
+			call: func() error {
+				body := validRejoin
+				body.Receipt = HAFenceReceipt{
+					Identity:         identity,
+					OldPrimaryId:     "primary-a",
+					PromotedNodeId:   strings.Repeat("a", 129),
+					ParentTimelineId: 1,
+					ParentEpoch:      1,
+					NewTimelineId:    2,
+					NewEpoch:         2,
+					RequiredLsn:      9,
+					ObservedLsn:      9,
+					Generation:       1,
+					Forced:           false,
+					Token:            "token-a",
+					Reason:           "test",
+				}
+				_, err := client.ReseedRejoin(context.Background(), body)
+				return err
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.call(); err == nil || !strings.Contains(err.Error(), "invalid HA replication slot name") {
-				t.Fatalf("error = %v, want local invalid slot name error", err)
+			if err := tt.call(); err == nil || !strings.Contains(err.Error(), "invalid HA") {
+				t.Fatalf("error = %v, want local invalid HA identifier error", err)
 			}
 		})
 	}

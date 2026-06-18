@@ -2186,6 +2186,9 @@ func haResponseValue[T any](response *HAResponse[T], err error) (*T, error) {
 }
 
 func (c *HAClient) PrimaryStatusResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[HAPrimaryStatusResponse], error) {
+	if err := validateHAPrimaryStatusParamsForRequest("get HA primary status", params); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, appendHARequestEditors(c.editors, haPrimaryStatusQueryEditor(params))...)
 	if resp == nil {
 		return nil, err
@@ -2198,6 +2201,9 @@ func (c *HAClient) PrimaryStatus(ctx context.Context, params *HAPrimaryStatusPar
 }
 
 func (c *HAClient) PrimaryStatusParsedResponse(ctx context.Context, params *HAPrimaryStatusParams) (*HAResponse[ParsedHAPrimaryStatus], error) {
+	if err := validateHAPrimaryStatusParamsForRequest("get HA primary status", params); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.GetHAPrimaryStatusWithResponse(ctx, params, appendHARequestEditors(c.editors, haPrimaryStatusQueryEditor(params))...)
 	if resp == nil {
 		return nil, err
@@ -2306,6 +2312,9 @@ func haStandbyStatusQueryEditor(params *HAStandbyStatusParams) oapi.RequestEdito
 }
 
 func (c *HAClient) AppendCommitResponse(ctx context.Context, body CommitAppendRequest) (*HAResponse[HACommitAppendResponse], error) {
+	if err := validateHASyncPolicyForRequest("append HA commit", body.SyncPolicy); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.AppendHACommitWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2318,6 +2327,9 @@ func (c *HAClient) AppendCommit(ctx context.Context, body CommitAppendRequest) (
 }
 
 func (c *HAClient) CheckCommitResponse(ctx context.Context, body CommitCheckRequest) (*HAResponse[HACommitCheckResponse], error) {
+	if err := validateHASyncPolicyForRequest("check HA commit", body.SyncPolicy); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.CheckHACommitWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2438,13 +2450,68 @@ func (c *HAClient) DropReplicationSlot(ctx context.Context, slotName string) (*H
 }
 
 func validateHAReplicationSlotNameForRequest(operation string, slotName string) error {
-	if validHAIdentifier(slotName) {
+	return validateHAIdentifierForRequest(operation, "replication slot name", slotName)
+}
+
+func validateHANodeIDForRequest(operation string, field string, nodeID string) error {
+	return validateHAIdentifierForRequest(operation, field, nodeID)
+}
+
+func validateHAIdentifierForRequest(operation string, field string, value string) error {
+	if validHAIdentifier(value) {
 		return nil
 	}
-	return fmt.Errorf("%s: invalid HA replication slot name %q", operation, slotName)
+	return fmt.Errorf("%s: invalid HA %s %q", operation, field, value)
+}
+
+func validateHAIdentifierListForRequest(operation string, field string, values []string) error {
+	for i, value := range values {
+		if err := validateHAIdentifierForRequest(operation, fmt.Sprintf("%s[%d]", field, i), value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateHAPrimaryStatusParamsForRequest(operation string, params *HAPrimaryStatusParams) error {
+	if params == nil {
+		return nil
+	}
+	return validateHAIdentifierListForRequest(operation, "sync_standby", params.SyncStandby)
+}
+
+func validateHASyncPolicyForRequest(operation string, policy HASyncPolicy) error {
+	return validateHAIdentifierListForRequest(operation, "standby_names", policy.StandbyNames)
+}
+
+func validateHAFenceAcquireRequestForRequest(operation string, body FenceAcquireRequest) error {
+	if err := validateHANodeIDForRequest(operation, "old_primary_id", body.OldPrimaryId); err != nil {
+		return err
+	}
+	return validateHANodeIDForRequest(operation, "promoted_node_id", body.PromotedNodeId)
+}
+
+func validateHARejoinAssessRequestForRequest(operation string, body RejoinAssessRequest) error {
+	if err := validateHANodeIDForRequest(operation, "node_id", body.NodeId); err != nil {
+		return err
+	}
+	if HAFenceReceiptEmpty(body.Receipt) {
+		return nil
+	}
+	return validateHAFenceReceiptIdentifiersForRequest(operation, "receipt", body.Receipt)
+}
+
+func validateHAFenceReceiptIdentifiersForRequest(operation string, field string, receipt HAFenceReceipt) error {
+	if err := validateHANodeIDForRequest(operation, field+".old_primary_id", receipt.OldPrimaryId); err != nil {
+		return err
+	}
+	return validateHANodeIDForRequest(operation, field+".promoted_node_id", receipt.PromotedNodeId)
 }
 
 func (c *HAClient) BeginBaseBackupResponse(ctx context.Context, body BaseBackupStartRequest) (*HAResponse[HABaseBackupBeginResponse], error) {
+	if err := validateHAReplicationSlotNameForRequest("begin HA base backup", body.SlotName); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.BeginHABaseBackupWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2481,6 +2548,9 @@ func (c *HAClient) BootstrapStandby(ctx context.Context, body StandbyBootstrapRe
 }
 
 func (c *HAClient) AcquireFenceResponse(ctx context.Context, body FenceAcquireRequest) (*HAResponse[HAFenceResponse], error) {
+	if err := validateHAFenceAcquireRequestForRequest("acquire HA fence", body); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.AcquireHAFenceWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2517,6 +2587,9 @@ func (c *HAClient) AssessPromotion(ctx context.Context, body PromotionAssessRequ
 }
 
 func (c *HAClient) PromoteResponse(ctx context.Context, body FenceAcquireRequest) (*HAResponse[HAPromotionResponse], error) {
+	if err := validateHAFenceAcquireRequestForRequest("promote HA standby", body); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.PromoteHAWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2541,6 +2614,9 @@ func (c *HAClient) PromoteWithCurrentFence(ctx context.Context) (*HAPromotionRes
 }
 
 func (c *HAClient) AssessRejoinResponse(ctx context.Context, body RejoinAssessRequest) (*HAResponse[HARejoinAssessResponse], error) {
+	if err := validateHARejoinAssessRequestForRequest("assess HA rejoin", body); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.AssessHARejoinWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2553,6 +2629,9 @@ func (c *HAClient) AssessRejoin(ctx context.Context, body RejoinAssessRequest) (
 }
 
 func (c *HAClient) RewindRejoinResponse(ctx context.Context, body RejoinAssessRequest) (*HAResponse[HARejoinAssessResponse], error) {
+	if err := validateHARejoinAssessRequestForRequest("rewind HA rejoin", body); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.RewindHARejoinWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
@@ -2565,6 +2644,9 @@ func (c *HAClient) RewindRejoin(ctx context.Context, body RejoinAssessRequest) (
 }
 
 func (c *HAClient) ReseedRejoinResponse(ctx context.Context, body RejoinAssessRequest) (*HAResponse[HARejoinAssessResponse], error) {
+	if err := validateHARejoinAssessRequestForRequest("reseed HA rejoin", body); err != nil {
+		return nil, err
+	}
 	resp, err := c.client.ReseedHARejoinWithResponse(ctx, body, c.editors...)
 	if resp == nil {
 		return nil, err
