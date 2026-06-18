@@ -18,6 +18,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const catalog_binding = @import("../external_source/catalog_binding.zig");
 const external_source = @import("../external_source/types.zig");
+const manifest_compatibility = @import("../manifest/compatibility.zig");
 const manifest_artifact = @import("../manifest/artifact_ref.zig");
 const manifest_base_source = @import("../manifest/base_source.zig");
 
@@ -50,6 +51,42 @@ pub const Plan = struct {
         self.* = undefined;
     }
 };
+
+pub const AttachedArtifacts = struct {
+    base_source: manifest_base_source.BaseSourceDescriptor,
+    artifacts: []manifest_artifact.ArtifactRef,
+    compatibility_report: manifest_compatibility.Report,
+
+    pub fn deinit(self: *AttachedArtifacts, alloc: Allocator) void {
+        manifest_base_source.freeOwnedDescriptor(alloc, &self.base_source);
+        freeArtifactRefs(alloc, self.artifacts);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+};
+
+pub fn attachArtifactsAlloc(
+    alloc: Allocator,
+    existing_artifacts: []const manifest_artifact.ArtifactRef,
+    plan: Plan,
+    policy: manifest_compatibility.Policy,
+) !AttachedArtifacts {
+    const artifacts = try cloneAppendedArtifactsAlloc(alloc, existing_artifacts, plan.artifacts);
+    errdefer {
+        freeArtifactRefs(alloc, artifacts);
+        alloc.free(artifacts);
+    }
+    var base_source = try manifest_base_source.cloneDescriptorAlloc(alloc, plan.base_source);
+    errdefer manifest_base_source.freeOwnedDescriptor(alloc, &base_source);
+
+    const report = try manifest_compatibility.checkLakeBaseSource(base_source, artifacts, policy);
+
+    return .{
+        .base_source = base_source,
+        .artifacts = artifacts,
+        .compatibility_report = report,
+    };
+}
 
 pub fn planAlloc(
     alloc: Allocator,
@@ -155,6 +192,50 @@ fn cloneArtifactRef(
     };
 }
 
+fn cloneAppendedArtifactsAlloc(
+    alloc: Allocator,
+    existing_artifacts: []const manifest_artifact.ArtifactRef,
+    extra_artifacts: []const manifest_artifact.ArtifactRef,
+) ![]manifest_artifact.ArtifactRef {
+    const combined = try alloc.alloc(manifest_artifact.ArtifactRef, existing_artifacts.len + extra_artifacts.len);
+    errdefer alloc.free(combined);
+    var initialized: usize = 0;
+    errdefer {
+        freeArtifactRefs(alloc, combined[0..initialized]);
+    }
+
+    for (existing_artifacts) |artifact| {
+        combined[initialized] = try cloneArtifactRef(alloc, artifact.kind, .{
+            .artifact_id = artifact.artifact_id,
+            .byte_len = artifact.byte_len,
+            .checksum = artifact.checksum,
+            .name = artifact.name,
+        });
+        initialized += 1;
+    }
+    for (extra_artifacts) |artifact| {
+        combined[initialized] = try cloneArtifactRef(alloc, artifact.kind, .{
+            .artifact_id = artifact.artifact_id,
+            .byte_len = artifact.byte_len,
+            .checksum = artifact.checksum,
+            .name = artifact.name,
+        });
+        initialized += 1;
+    }
+
+    return combined;
+}
+
+fn freeArtifactRef(alloc: Allocator, artifact: manifest_artifact.ArtifactRef) void {
+    if (artifact.name.len != 0) alloc.free(artifact.name);
+    alloc.free(artifact.artifact_id);
+    alloc.free(artifact.checksum);
+}
+
+fn freeArtifactRefs(alloc: Allocator, artifacts: []const manifest_artifact.ArtifactRef) void {
+    for (artifacts) |artifact| freeArtifactRef(alloc, artifact);
+}
+
 test "external source manifest plan creates inventory artifact and base source" {
     const alloc = std.testing.allocator;
     var plan = try planAlloc(
@@ -257,4 +338,42 @@ test "external source manifest plan rejects stale explicit catalog binding" {
             .checksum = "sha256:files",
         },
     ));
+}
+
+test "external source manifest plan attaches inventory artifacts to publication artifact set" {
+    const alloc = std.testing.allocator;
+    var existing_artifacts = [_]manifest_artifact.ArtifactRef{.{
+        .kind = .vector_segment,
+        .name = try alloc.dupe(u8, "semantic_idx"),
+        .artifact_id = try alloc.dupe(u8, "vec-1"),
+        .byte_len = 128,
+        .checksum = try alloc.dupe(u8, "len:128"),
+    }};
+    defer freeArtifactRefs(alloc, &existing_artifacts);
+
+    var plan = try planAlloc(
+        alloc,
+        .iceberg,
+        "s3://bucket/warehouse/events",
+        "iceberg-123",
+        "schema-v1",
+        .{
+            .artifact_id = "external-files-0001",
+            .byte_len = 4096,
+            .checksum = "sha256:files",
+            .name = "events.files",
+        },
+    );
+    defer plan.deinit(alloc);
+
+    var attached = try attachArtifactsAlloc(alloc, &existing_artifacts, plan, .{});
+    defer attached.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), attached.artifacts.len);
+    try std.testing.expectEqual(manifest_artifact.ArtifactKind.vector_segment, attached.artifacts[0].kind);
+    try std.testing.expectEqual(manifest_artifact.ArtifactKind.external_base_source, attached.artifacts[1].kind);
+    try std.testing.expectEqualStrings("external-files-0001", attached.base_source.external_iceberg.file_inventory_artifact.?);
+    try std.testing.expectEqual(manifest_base_source.BaseSourceKind.external_iceberg, attached.compatibility_report.source_kind);
+    try std.testing.expectEqual(@as(u32, 1), attached.compatibility_report.external_metadata_count);
+    try std.testing.expectEqual(@as(u32, 1), attached.compatibility_report.sidecar_count);
 }
