@@ -1482,6 +1482,58 @@ pub fn saveExistingNodeBodyWithAddedVectorsOptions(
     }
 }
 
+fn saveExistingNodeBodyWithAddedVectorSourceOptions(
+    self: anytype,
+    txn: anytype,
+    node: *const types.Node,
+    source: anytype,
+    options: anytype,
+    now_fn: fn () i128,
+    elapsed_fn: fn (i128) u64,
+) !void {
+    var posting_state_to_save = node.posting_state;
+    var posting_payload_refreshed = node.is_leaf and !self.config.use_quantization;
+    const defer_posting_payload_refresh = shouldDeferPostingPayloadRefresh(self, node);
+
+    try saveDeltaBackedLeafNodeValue(self, txn, node);
+
+    if (defer_posting_payload_refresh) {
+        self.write_profile.posting_lazy_payload_deferrals += 1;
+    } else if (deferQuantizedRebuild(options) and suppressQuantizedPayloadPersist(options)) {
+        self.invalidateQuantizedCache(node.id);
+        try recordDeferredQuantizedNode(self, node.id);
+    } else if (deferQuantizedRebuild(options)) {
+        const quant_start = now_fn();
+        if (shouldDeferOversizedLeafQuantizedPayload(self, node, options)) {
+            invalidateCachedQuantizedIfAvailable(self, node.id);
+            try recordDeferredQuantizedNode(self, node.id);
+        } else if (try updateQuantizedWithAddedVectorSource(self, txn, node, source, now_fn, elapsed_fn, quant_start)) {
+            posting_payload_refreshed = node.is_leaf;
+        } else {
+            _ = try primeDeferredLeafNonQuantCacheWithAddedVectorSource(self, txn, node, source, now_fn, elapsed_fn, quant_start);
+            try recordDeferredQuantizedNode(self, node.id);
+        }
+    } else {
+        const quant_start = now_fn();
+        if (try updateQuantizedWithAddedVectorSource(self, txn, node, source, now_fn, elapsed_fn, quant_start)) {
+            posting_payload_refreshed = node.is_leaf;
+        } else {
+            try refreshQuantizedWithOptions(self, txn, node, options, nowNsU64Fixed, elapsedSinceU64Fixed);
+            self.write_profile.refresh_quantized_ns += elapsed_fn(quant_start);
+            posting_payload_refreshed = node.is_leaf;
+        }
+    }
+    if (node.is_leaf) {
+        if (posting_payload_refreshed) posting_state_to_save.notePayloadRefreshed();
+        try posting.PostingStore.saveState(self, txn, node.id, posting_state_to_save);
+        var node_for_cache = node.*;
+        node_for_cache.posting_state = posting_state_to_save;
+        try self.cacheNode(&node_for_cache);
+    } else {
+        try self.cacheNode(node);
+    }
+}
+
 fn saveDeferredBaseDeltaLeafMutationState(self: anytype, txn: anytype, node: *const types.Node) !void {
     if (!node.is_leaf or !shouldUseBaseDeltaAsCanonicalPosting(self)) return error.InvalidArgument;
     try ensurePostingBaseExists(self, txn, node);
@@ -1705,6 +1757,115 @@ pub fn updateQuantizedWithAddedVectors(
     return true;
 }
 
+fn resizeQuantizedSlice(comptime T: type, alloc: Allocator, slice: []T, new_len: usize) ![]T {
+    if (slice.len == 0) return try alloc.alloc(T, new_len);
+    return try alloc.realloc(slice, new_len);
+}
+
+fn appendNonQuantVectorsFromSource(self: anytype, set: anytype, source: anytype) !void {
+    const added_count = source.count();
+    const old_len = set.vectors.data.len;
+    const new_len = old_len + source.floatCount();
+    set.vectors.dims = @intCast(self.config.dims);
+    set.vectors.count += @intCast(added_count);
+    if (set.vectors.data.len == 0) {
+        set.vectors.data = try self.alloc.alloc(f32, new_len);
+    } else {
+        set.vectors.data = try self.alloc.realloc(set.vectors.data, new_len);
+    }
+    var write_offset = old_len;
+    for (0..added_count) |i| {
+        const transformed = source.vectorAt(i);
+        @memcpy(set.vectors.data[write_offset..][0..transformed.len], transformed);
+        write_offset += transformed.len;
+    }
+}
+
+fn quantizeWithSetFromSource(self: anytype, set: *proto.RaBitQuantizedVectorSet, source: anytype) !void {
+    const added_count = source.count();
+    if (added_count == 0) return;
+
+    const dims: usize = @intCast(self.config.dims);
+    const width = rabitq.codeWidth(dims);
+    const old_count = set.getCount();
+    const new_count = old_count + added_count;
+
+    set.codes.data = try resizeQuantizedSlice(u64, self.alloc, set.codes.data, new_count * width);
+    set.codes.count = @intCast(new_count);
+    set.codes.width = @intCast(width);
+    set.code_counts = try resizeQuantizedSlice(u32, self.alloc, set.code_counts, new_count);
+    set.centroid_distances = try resizeQuantizedSlice(f32, self.alloc, set.centroid_distances, new_count);
+    set.quantized_dot_products = try resizeQuantizedSlice(f32, self.alloc, set.quantized_dot_products, new_count);
+
+    if (self.quantizer.distance_metric != .l2_squared) {
+        set.centroid_dot_products = try resizeQuantizedSlice(f32, self.alloc, set.centroid_dot_products, new_count);
+        for (0..added_count) |i| {
+            const transformed = source.vectorAt(i);
+            set.centroid_dot_products[old_count + i] = vec.dot(transformed, set.centroid);
+        }
+    }
+
+    const temp_diffs = try self.alloc.alloc(f32, source.floatCount());
+    defer self.alloc.free(temp_diffs);
+
+    for (0..added_count) |i| {
+        const transformed = source.vectorAt(i);
+        const diff = temp_diffs[i * dims ..][0..dims];
+        vec.subTo(diff, transformed, set.centroid);
+        const dist = vec.norm(diff);
+        set.centroid_distances[old_count + i] = dist;
+        if (dist != 0) vec.scale(1.0 / dist, diff);
+    }
+
+    rabitq.quantizeVectors(
+        temp_diffs,
+        set.codes.data[old_count * width ..],
+        set.quantized_dot_products[old_count..],
+        set.code_counts[old_count..],
+        self.quantizer.sqrt_dims_inv,
+        added_count,
+        dims,
+        width,
+    );
+}
+
+fn updateQuantizedWithAddedVectorSource(
+    self: anytype,
+    txn: anytype,
+    node: *const types.Node,
+    source: anytype,
+    now_fn: fn () i128,
+    elapsed_fn: fn (i128) u64,
+    compute_start: i128,
+) !bool {
+    if (!self.config.use_quantization) return false;
+    if (!node.is_leaf) return false;
+    if (node.centroid.len == 0) return false;
+    if (node.members.len == 0) return false;
+    const added_count = source.count();
+    if (added_count == 0) return true;
+
+    const previous_count = node.members.len - added_count;
+    _ = self.getQuantized(txn, node.id, usesNonQuantizedPayload(node), previous_count) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
+
+    switch (cached.*) {
+        .nonquant => |*set| try appendNonQuantVectorsFromSource(self, set, source),
+        .rabit => |*set| try quantizeWithSetFromSource(self, set, source),
+    }
+    noteMutatedCachedQuantized(self, node.id);
+    self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
+
+    const store_start = now_fn();
+    try self.putQuantizedCached(txn, node.id, cached);
+    self.write_profile.quantized_store_ns += elapsed_fn(store_start);
+    self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
+    return true;
+}
+
 fn primeDeferredLeafNonQuantCacheWithAddedVectors(
     self: anytype,
     txn: anytype,
@@ -1750,6 +1911,59 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
                 set.vectors.data = try self.alloc.realloc(set.vectors.data, old_len + transformed_vectors.len);
                 @memcpy(set.vectors.data[old_len..][0..transformed_vectors.len], transformed_vectors);
             }
+            noteMutatedCachedQuantized(self, node.id);
+            self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
+            return true;
+        },
+        .rabit => return false,
+    }
+}
+
+fn primeDeferredLeafNonQuantCacheWithAddedVectorSource(
+    self: anytype,
+    txn: anytype,
+    node: *const types.Node,
+    source: anytype,
+    now_fn: fn () i128,
+    elapsed_fn: fn (i128) u64,
+    compute_start: i128,
+) !bool {
+    _ = now_fn;
+    if (!self.config.use_quantization) return false;
+    if (!node.is_leaf) return false;
+    if (!usesNonQuantizedPayload(node)) return false;
+    if (node.centroid.len == 0) return false;
+    if (node.members.len == 0) return false;
+    const added_count = source.count();
+    if (added_count == 0) return true;
+
+    const previous_count = node.members.len - added_count;
+    if (previous_count == 0) {
+        const vector_data = try self.alloc.alloc(f32, source.floatCount());
+        errdefer self.alloc.free(vector_data);
+        var write_offset: usize = 0;
+        for (0..added_count) |i| {
+            const transformed = source.vectorAt(i);
+            @memcpy(vector_data[write_offset..][0..transformed.len], transformed);
+            write_offset += transformed.len;
+        }
+        const fresh: hbc_runtime.QuantizedSet = .{ .nonquant = .{
+            .vectors = .{
+                .dims = @intCast(self.config.dims),
+                .count = @intCast(added_count),
+                .data = vector_data,
+            },
+        } };
+        _ = try self.cacheQuantizedOwned(node.id, fresh);
+        self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
+        return true;
+    }
+
+    _ = try self.getQuantized(txn, node.id, true, previous_count);
+    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
+    switch (cached.*) {
+        .nonquant => |*set| {
+            try appendNonQuantVectorsFromSource(self, set, source);
             noteMutatedCachedQuantized(self, node.id);
             self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
             return true;
@@ -6825,6 +7039,25 @@ const TargetPostingDeltaRecord = struct {
     record: posting.PostingDeltaRecord,
 };
 
+const PreparedTransformedVectorSource = struct {
+    transformed_data: []const f32,
+    entries: []const PreparedBatchInsert,
+    dims: usize,
+
+    fn count(self: *const PreparedTransformedVectorSource) usize {
+        return self.entries.len;
+    }
+
+    fn floatCount(self: *const PreparedTransformedVectorSource) usize {
+        return self.entries.len * self.dims;
+    }
+
+    fn vectorAt(self: *const PreparedTransformedVectorSource, index: usize) []const f32 {
+        const item_index = self.entries[index].item_index;
+        return self.transformed_data[item_index * self.dims ..][0..self.dims];
+    }
+};
+
 const BatchRouteProfile = struct {
     internal_nodes: u64 = 0,
     leaf_groups: u64 = 0,
@@ -7361,16 +7594,18 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             try shadowAppendPostingDeltas(self, txn, leaf.id, delta_records);
         }
 
-        const added_vectors = try self.alloc.alloc(f32, group_len * dims);
-        defer self.alloc.free(added_vectors);
+        const transformed_source = PreparedTransformedVectorSource{
+            .transformed_data = transformed_data,
+            .entries = prepared[group_start..group_end],
+            .dims = dims,
+        };
         var updated_range: ?types.NodeSplitRange = null;
         defer if (updated_range) |*range| range.deinit(self.alloc);
         var range_changed = false;
         @memset(centroid_sum, 0);
-        for (prepared[group_start..group_end], 0..) |entry, j| {
+        for (prepared[group_start..group_end]) |entry| {
             const item = items[entry.item_index];
             const transformed = transformed_data[entry.item_index * dims ..][0..dims];
-            @memcpy(added_vectors[j * dims ..][0..dims], transformed);
 
             for (centroid_sum, 0..) |*sum, dim| sum.* += transformed[dim];
 
@@ -7438,7 +7673,7 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             if (defer_leaf_split and shouldUseBaseDeltaAsCanonicalPosting(self)) {
                 try saveDeferredBaseDeltaLeafMutationState(self, txn, &leaf);
             } else {
-                try saveExistingNodeBodyWithAddedVectorsOptions(self, txn, &leaf, added_vectors, group_len, save_options, now_fn_u64_adapter(now_fn), elapsed_fn_u64_adapter(elapsed_fn));
+                try saveExistingNodeBodyWithAddedVectorSourceOptions(self, txn, &leaf, &transformed_source, save_options, now_fn_u64_adapter(now_fn), elapsed_fn_u64_adapter(elapsed_fn));
                 self.write_profile.save_node_calls += 1;
                 grouped_node_body_writes += 1;
             }
