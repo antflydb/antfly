@@ -1080,7 +1080,8 @@ mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
 `UNLISTEN`, database/tablespace catalog grammar for `CREATE DATABASE`, `ALTER
 DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
 RENAME TO`, and `DROP TABLESPACE`, bulk I/O grammar for `COPY ... FROM` and
-`COPY ... TO`, prepared-statement subject classification for read, write, and DDL
+`COPY ... TO`, schema-namespace catalog grammar for `CREATE SCHEMA`, `ALTER
+SCHEMA ... RENAME TO`, and `DROP SCHEMA`, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -4388,8 +4389,9 @@ runtime work rather than syntax state.
 Schema namespace syntax is only adapter-only when it is proven boilerplate for
 the default `public` namespace, such as `CREATE SCHEMA IF NOT EXISTS public`.
 Non-public `CREATE SCHEMA`, `ALTER SCHEMA ... RENAME TO`, and `DROP SCHEMA`
-lower to typed schema-namespace catalog intents that record the namespace name,
-idempotence flag, rename target, and cascade/drop metadata. Metadata now has
+tails parse in `api/sql_adapter/grammar.zig` and lower to typed
+schema-namespace catalog intents that record the namespace name, idempotence
+flag, rename target, and cascade/drop metadata. Metadata now has
 first-class database and namespace records, table records carry
 `database_name` and `namespace_name`, default table APIs resolve through
 `default/public/<table>`, and non-default table identity derives separate table

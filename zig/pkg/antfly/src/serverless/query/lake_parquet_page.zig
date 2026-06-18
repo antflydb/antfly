@@ -60,6 +60,7 @@ pub const CompressionCodec = enum {
     uncompressed,
     snappy,
     gzip,
+    zstd,
 };
 
 pub const Header = struct {
@@ -1261,6 +1262,15 @@ fn decodePagePayloadAlloc(
             if (decoded.len != expected_len) return error.InvalidParquetPage;
             break :blk decoded;
         },
+        .zstd => blk: {
+            var in: std.Io.Reader = .fixed(compressed_payload);
+            var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
+            var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
+            const decoded = try decompress.reader.allocRemaining(alloc, .unlimited);
+            errdefer alloc.free(decoded);
+            if (decoded.len != expected_len) return error.InvalidParquetPage;
+            break :blk decoded;
+        },
     };
     return .{ .bytes = bytes };
 }
@@ -2013,6 +2023,38 @@ test "parquet page scanner decodes gzip plain i64 pages" {
     try chunk.appendSlice(alloc, compressed);
 
     const values = try scanPlainI64ColumnChunkAlloc(alloc, chunk.items, .gzip);
+    defer alloc.free(values);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20 }, values);
+    try std.testing.expectError(error.UnsupportedParquetPage, scanUncompressedPlainI64ColumnChunkAlloc(alloc, chunk.items));
+}
+
+test "parquet page scanner decodes zstd plain i64 pages" {
+    const alloc = std.testing.allocator;
+    const payload = [_]u8{
+        10, 0, 0, 0, 0, 0, 0, 0,
+        20, 0, 0, 0, 0, 0, 0, 0,
+    };
+    const compressed = [_]u8{
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x81, 0x00, 0x00, 0x0a, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xd7, 0x96, 0xbf, 0xba,
+    };
+
+    var header = try buildDataPageHeaderFixtureWithSizesAndEncoding(
+        alloc,
+        2,
+        @intCast(payload.len),
+        @intCast(compressed.len),
+        0,
+    );
+    defer header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, header.items);
+    try chunk.appendSlice(alloc, &compressed);
+
+    const values = try scanPlainI64ColumnChunkAlloc(alloc, chunk.items, .zstd);
     defer alloc.free(values);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20 }, values);
     try std.testing.expectError(error.UnsupportedParquetPage, scanUncompressedPlainI64ColumnChunkAlloc(alloc, chunk.items));

@@ -236,6 +236,38 @@ pub const DropTablespaceSyntax = struct {
     }
 };
 
+pub const CreateSchemaNamespaceSyntax = struct {
+    schema_name: []const u8,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.schema_name));
+        self.* = undefined;
+    }
+};
+
+pub const RenameSchemaNamespaceSyntax = struct {
+    schema_name: []const u8,
+    new_schema_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.schema_name));
+        alloc.free(@constCast(self.new_schema_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropSchemaNamespaceSyntax = struct {
+    schema_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.schema_name));
+        self.* = undefined;
+    }
+};
+
 pub const BulkIoDirectionSyntax = enum {
     from,
     to,
@@ -1087,6 +1119,72 @@ pub fn parseDropTablespaceCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     tablespace_transferred = true;
     return .{ .tablespace_name = tablespace_name, .if_exists = if_exists };
+}
+
+pub fn parseCreateSchemaNamespaceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateSchemaNamespaceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("schema");
+    var if_not_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("exists");
+        if_not_exists = true;
+    }
+    const schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var schema_transferred = false;
+    errdefer if (!schema_transferred) alloc.free(schema_name);
+    if (cursor.peekKeyword("authorization") or cursor.peekKeyword("create") or cursor.peekKeyword("grant")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    schema_transferred = true;
+    return .{ .schema_name = schema_name, .if_not_exists = if_not_exists };
+}
+
+pub fn parseRenameSchemaNamespaceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !RenameSchemaNamespaceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("schema");
+    const schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var schema_transferred = false;
+    errdefer if (!schema_transferred) alloc.free(schema_name);
+    try cursor.expectKeyword("rename");
+    try cursor.expectKeyword("to");
+    const new_schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var new_schema_transferred = false;
+    errdefer if (!new_schema_transferred) alloc.free(new_schema_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    schema_transferred = true;
+    new_schema_transferred = true;
+    return .{ .schema_name = schema_name, .new_schema_name = new_schema_name };
+}
+
+pub fn parseDropSchemaNamespaceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropSchemaNamespaceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("schema");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var schema_transferred = false;
+    errdefer if (!schema_transferred) alloc.free(schema_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    schema_transferred = true;
+    return .{ .schema_name = schema_name, .if_exists = if_exists, .cascade = cascade };
 }
 
 pub fn parseBulkIoTailAlloc(
@@ -1947,6 +2045,48 @@ test "sql adapter grammar parses database and tablespace catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tablespace_tokens);
     var unsupported_tablespace_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTablespaceCatalogTailAlloc(alloc, unsupported_tablespace_tokens.items, &unsupported_tablespace_pos));
+}
+
+test "sql adapter grammar parses schema namespace catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "SCHEMA IF NOT EXISTS tenant_ops;");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateSchemaNamespaceCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("tenant_ops", create.schema_name);
+    try std.testing.expect(create.if_not_exists);
+
+    var rename_tokens = try lexer.tokenizeAlloc(alloc, "SCHEMA public.tenant_ops RENAME TO public.tenant_ops_archive;");
+    defer lexer.freeTokens(alloc, &rename_tokens);
+    var rename_pos: usize = 0;
+    var rename = try parseRenameSchemaNamespaceCatalogTailAlloc(alloc, rename_tokens.items, &rename_pos);
+    defer rename.deinit(alloc);
+    try std.testing.expectEqual(rename_tokens.items.len, rename_pos);
+    try std.testing.expectEqualStrings("tenant_ops", rename.schema_name);
+    try std.testing.expectEqualStrings("tenant_ops_archive", rename.new_schema_name);
+
+    var drop_tokens = try lexer.tokenizeAlloc(alloc, "SCHEMA IF EXISTS tenant_ops CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_tokens);
+    var drop_pos: usize = 0;
+    var drop = try parseDropSchemaNamespaceCatalogTailAlloc(alloc, drop_tokens.items, &drop_pos);
+    defer drop.deinit(alloc);
+    try std.testing.expectEqual(drop_tokens.items.len, drop_pos);
+    try std.testing.expectEqualStrings("tenant_ops", drop.schema_name);
+    try std.testing.expect(drop.if_exists);
+    try std.testing.expect(drop.cascade);
+
+    var unsupported_create_tokens = try lexer.tokenizeAlloc(alloc, "SCHEMA tenant_ops AUTHORIZATION app;");
+    defer lexer.freeTokens(alloc, &unsupported_create_tokens);
+    var unsupported_create_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateSchemaNamespaceCatalogTailAlloc(alloc, unsupported_create_tokens.items, &unsupported_create_pos));
+
+    var unsupported_drop_tokens = try lexer.tokenizeAlloc(alloc, "SCHEMA tenant_ops, other_ops;");
+    defer lexer.freeTokens(alloc, &unsupported_drop_tokens);
+    var unsupported_drop_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDropSchemaNamespaceCatalogTailAlloc(alloc, unsupported_drop_tokens.items, &unsupported_drop_pos));
 }
 
 test "sql adapter grammar parses bulk io tails" {

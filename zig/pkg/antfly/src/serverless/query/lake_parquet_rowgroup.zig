@@ -1117,6 +1117,7 @@ fn compressionCodecForColumnChunk(chunk: external_source.ColumnChunk) !parquet_p
     }
     if (std.ascii.eqlIgnoreCase(chunk.compression_codec, "snappy")) return .snappy;
     if (std.ascii.eqlIgnoreCase(chunk.compression_codec, "gzip")) return .gzip;
+    if (std.ascii.eqlIgnoreCase(chunk.compression_codec, "zstd")) return .zstd;
     return error.UnsupportedParquetPage;
 }
 
@@ -1260,6 +1261,17 @@ fn appendGzipPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator
     const compressed = writer.buffered();
     try appendPlainI64DataPageHeader(out, alloc, values.len, payload.items.len, compressed.len);
     try out.appendSlice(alloc, compressed);
+}
+
+fn appendZstdPlainI64FixtureDataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator) !void {
+    const uncompressed_len = 24;
+    const compressed = [_]u8{
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0xa5, 0x00, 0x00, 0x60, 0x01, 0x00,
+        0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+        0x60, 0xe0, 0x01, 0x60, 0x01, 0xfa, 0xcd, 0xc0, 0xe5,
+    };
+    try appendPlainI64DataPageHeader(out, alloc, 3, uncompressed_len, compressed.len);
+    try out.appendSlice(alloc, &compressed);
 }
 
 fn appendPlainByteArrayDataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const []const u8) !void {
@@ -2512,6 +2524,14 @@ test "parquet row group batch dispatches supported compression from inventory" {
                     .compression_codec = try alloc.dupe(u8, "gzip"),
                     .encoding = try alloc.dupe(u8, "plain"),
                 },
+                .{
+                    .column_id = try alloc.dupe(u8, "zcount"),
+                    .file_offset = 292,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .compression_codec = try alloc.dupe(u8, "zstd"),
+                    .encoding = try alloc.dupe(u8, "plain"),
+                },
             }),
         }}),
     };
@@ -2523,6 +2543,9 @@ test "parquet row group batch dispatches supported compression from inventory" {
     var count_chunk = std.ArrayListUnmanaged(u8).empty;
     defer count_chunk.deinit(alloc);
     try appendGzipPlainI64DataPage(&count_chunk, alloc, &[_]i64{ 1, 2, 3 });
+    var zcount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer zcount_chunk.deinit(alloc);
+    try appendZstdPlainI64FixtureDataPage(&zcount_chunk, alloc);
 
     var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
         .{
@@ -2533,18 +2556,23 @@ test "parquet row group batch dispatches supported compression from inventory" {
             .column_id = "count",
             .bytes = count_chunk.items,
         },
+        .{
+            .column_id = "zcount",
+            .bytes = zcount_chunk.items,
+        },
     });
     defer owned.deinit(alloc);
 
     try owned.batch.validate();
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, owned.batch.columns[0].values.i64);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, owned.batch.columns[1].values.i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, owned.batch.columns[2].values.i64);
 
-    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "amount", "count" });
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "amount", "count", "zcount" });
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 
-    inventory.files[0].row_groups[0].column_chunks[0].compression_codec[0] = 'z';
+    @memcpy(inventory.files[0].row_groups[0].column_chunks[0].compression_codec[0..6], "brotli");
     try std.testing.expectError(error.UnsupportedParquetPage, planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"amount"}));
     try std.testing.expectError(error.UnsupportedParquetPage, buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
         .column_id = "amount",

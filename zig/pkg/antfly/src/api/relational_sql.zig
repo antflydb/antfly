@@ -3122,57 +3122,29 @@ const Parser = struct {
     }
 
     fn parseCreateSchemaNamespaceDdl(self: *@This()) !CreateSchemaNamespacePlan {
-        try self.expectKeyword("schema");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const schema_name = try self.parseSqlObjectIdentifierOwned();
-        var schema_transferred = false;
-        errdefer if (!schema_transferred) self.alloc.free(schema_name);
-        if (self.peekKeyword("authorization") or self.peekKeyword("create") or self.peekKeyword("grant")) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        schema_transferred = true;
-        return .{ .schema_name = schema_name, .if_not_exists = if_not_exists };
+        var syntax = try sql_adapter.parseCreateSchemaNamespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const schema_name = syntax.schema_name;
+        syntax.schema_name = "";
+        return .{ .schema_name = schema_name, .if_not_exists = syntax.if_not_exists };
     }
 
     fn parseRenameSchemaNamespaceDdl(self: *@This()) !RenameSchemaNamespacePlan {
-        try self.expectKeyword("schema");
-        const schema_name = try self.parseSqlObjectIdentifierOwned();
-        var schema_transferred = false;
-        errdefer if (!schema_transferred) self.alloc.free(schema_name);
-        try self.expectKeyword("rename");
-        try self.expectKeyword("to");
-        const new_schema_name = try self.parseSqlObjectIdentifierOwned();
-        var new_schema_transferred = false;
-        errdefer if (!new_schema_transferred) self.alloc.free(new_schema_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        schema_transferred = true;
-        new_schema_transferred = true;
+        var syntax = try sql_adapter.parseRenameSchemaNamespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const schema_name = syntax.schema_name;
+        const new_schema_name = syntax.new_schema_name;
+        syntax.schema_name = "";
+        syntax.new_schema_name = "";
         return .{ .schema_name = schema_name, .new_schema_name = new_schema_name };
     }
 
     fn parseDropSchemaNamespaceDdl(self: *@This()) !DropSchemaNamespacePlan {
-        try self.expectKeyword("schema");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const schema_name = try self.parseSqlObjectIdentifierOwned();
-        var schema_transferred = false;
-        errdefer if (!schema_transferred) self.alloc.free(schema_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        schema_transferred = true;
-        return .{ .schema_name = schema_name, .if_exists = if_exists, .cascade = cascade };
+        var syntax = try sql_adapter.parseDropSchemaNamespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const schema_name = syntax.schema_name;
+        syntax.schema_name = "";
+        return .{ .schema_name = schema_name, .if_exists = syntax.if_exists, .cascade = syntax.cascade };
     }
 
     fn parseCreateExtensionDdl(self: *@This()) !CreateExtensionPlan {
