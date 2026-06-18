@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
     struct {
         pub const reader = struct {
@@ -70,8 +71,37 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
     }
 else
     @import("antfly_pdf");
+const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+    @import("../scraping_stub.zig")
+else
+    @import("antfly_scraping");
+const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+    @import("../template_remote_stub.zig")
+else
+    @import("../../../template_remote.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
+    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+        if (remote_content) |remote| {
+            if (remote.security) |security| {
+                if (security.max_download_size_bytes) |value| return value;
+            }
+        }
+    }
+    return template_remote.default_remote_fetch_max_download_size_bytes;
+}
+
+pub fn inlineDataUriSourceTooLarge(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !bool {
+    if (!std.mem.startsWith(u8, source_text, "data:")) return false;
+    const decoded_len = scraping.dataUriDecodedSize(source_text) catch return false;
+    return @as(u64, @intCast(decoded_len)) > effectiveRemoteContentMaxDownloadSize(remote_content);
+}
+
+pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentConfig, source_text: []const u8) !void {
+    if (try inlineDataUriSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
+}
 
 pub const TextRegion = struct {
     span: [2]u32,
@@ -130,6 +160,19 @@ pub const Result = struct {
         if (self.units.len > 0) alloc.free(self.units);
         self.* = undefined;
     }
+};
+
+pub const StreamInfo = struct {
+    content_type: []const u8,
+    route_type: []const u8,
+    unsupported_reason: []const u8 = "",
+};
+
+pub const UnitSink = struct {
+    ptr: *anyopaque,
+    on_begin: *const fn (ptr: *anyopaque, info: StreamInfo) anyerror!void,
+    on_unit: *const fn (ptr: *anyopaque, unit: *Unit) anyerror!void,
+    on_end: *const fn (ptr: *anyopaque) anyerror!void,
 };
 
 pub const Config = struct {
@@ -551,6 +594,143 @@ pub fn extractDownloadedAlloc(
     return try unsupportedResultAlloc(alloc, content_type, "unsupported_content_type");
 }
 
+pub fn extractDownloadedStreaming(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: Config,
+    sink: UnitSink,
+) !void {
+    const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
+    for (config.routes) |route| {
+        if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, sink);
+    }
+    if (config.route_preset == .explicit_only) {
+        try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
+        return;
+    }
+    if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, sink);
+    }
+    if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
+    }
+    if (isEmailContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, downloaded.data, content_type, "email"), sink);
+    }
+    if (isDocxContent(content_type, config.filename, source_url)) {
+        return try streamBufferedExtraction(alloc, try extractDocxAlloc(alloc, downloaded.data, content_type), sink);
+    }
+    if (isPptxContent(content_type, config.filename, source_url)) {
+        return try streamBufferedExtraction(alloc, try extractPptxAlloc(alloc, downloaded.data, content_type), sink);
+    }
+    if (isXlsxContent(content_type, config.filename, source_url)) {
+        return try streamBufferedExtraction(alloc, try extractXlsxAlloc(alloc, downloaded.data, content_type), sink);
+    }
+    if (isZipArchiveContent(content_type, config.filename, source_url)) {
+        return try streamBufferedExtraction(alloc, try extractZipArchiveAlloc(alloc, downloaded.data, content_type), sink);
+    }
+    if (isImageContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try streamBufferedExtraction(alloc, try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "image", "image:000001", "image", "ocr_pending", "pending_ocr", false, false), sink);
+    }
+    if (isAudioContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try streamBufferedExtraction(alloc, try extractMediaPlaceholderAlloc(alloc, downloaded.data, content_type, "audio", "audio:000001", "audio", "transcript_pending", "pending_transcription", false, false), sink);
+    }
+    if (isTextContent(content_type, config.filename, source_url, downloaded.data)) {
+        return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "document:000001", "document", "text", false, sink);
+    }
+    try streamUnsupportedResult(sink, content_type, "unsupported_content_type");
+}
+
+fn extractWithRouteStreaming(
+    alloc: Allocator,
+    bytes: []const u8,
+    content_type: []const u8,
+    route: Route,
+    html_strip_tags: bool,
+    sink: UnitSink,
+) !void {
+    switch (route.extractor_type) {
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, sink),
+        .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
+        .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
+        .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
+        .docx => return try streamBufferedExtraction(alloc, try extractDocxAlloc(alloc, bytes, content_type), sink),
+        .pptx => return try streamBufferedExtraction(alloc, try extractPptxAlloc(alloc, bytes, content_type), sink),
+        .xlsx => return try streamBufferedExtraction(alloc, try extractXlsxAlloc(alloc, bytes, content_type), sink),
+        .archive => return try streamBufferedExtraction(alloc, try extractZipArchiveAlloc(alloc, bytes, content_type), sink),
+        .ocr => return try streamBufferedExtraction(alloc, try extractConfiguredMediaPlaceholderAlloc(alloc, bytes, content_type, "image", route.unit, "image", "ocr_pending", "pending_ocr"), sink),
+        .audio => return try streamBufferedExtraction(alloc, try extractConfiguredMediaPlaceholderAlloc(alloc, bytes, content_type, "audio", route.unit, "audio", "transcript_pending", "pending_transcription"), sink),
+        .unsupported => return try streamUnsupportedResult(sink, content_type, "matched_unsupported_route"),
+    }
+}
+
+fn extractSingleConfiguredUnitStreaming(
+    alloc: Allocator,
+    bytes: []const u8,
+    content_type: []const u8,
+    configured_unit: []const u8,
+    default_unit: []const u8,
+    method: []const u8,
+    strip_html: bool,
+    sink: UnitSink,
+) !void {
+    const unit_type = if (configured_unit.len > 0) configured_unit else default_unit;
+    const unit_id = try std.fmt.allocPrint(alloc, "{s}:000001", .{unit_type});
+    defer alloc.free(unit_id);
+    try extractSingleTextUnitStreaming(alloc, bytes, content_type, unit_id, unit_type, method, strip_html, sink);
+}
+
+fn extractSingleTextUnitStreaming(
+    alloc: Allocator,
+    bytes: []const u8,
+    content_type: []const u8,
+    unit_id: []const u8,
+    unit_type: []const u8,
+    method: []const u8,
+    strip_html: bool,
+    sink: UnitSink,
+) !void {
+    try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = if (strip_html) "html" else "text" });
+    var text = if (strip_html)
+        try htmlToTextAlloc(alloc, bytes)
+    else
+        try alloc.dupe(u8, bytes);
+    errdefer alloc.free(text);
+    var unit = Unit{
+        .unit_id = try alloc.dupe(u8, unit_id),
+        .unit_type = try alloc.dupe(u8, unit_type),
+        .text = text,
+        .method = try alloc.dupe(u8, method),
+        .char_start = 0,
+        .char_end = std.math.cast(u32, text.len),
+    };
+    text = &.{};
+    defer unit.deinit(alloc);
+    try sink.on_unit(sink.ptr, &unit);
+    try sink.on_end(sink.ptr);
+}
+
+fn streamUnsupportedResult(sink: UnitSink, content_type: []const u8, reason: []const u8) !void {
+    try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "unsupported", .unsupported_reason = reason });
+    try sink.on_end(sink.ptr);
+}
+
+fn streamBufferedExtraction(alloc: Allocator, result: Result, sink: UnitSink) !void {
+    var buffered = result;
+    defer buffered.deinit(alloc);
+    try sink.on_begin(sink.ptr, .{
+        .content_type = buffered.content_type,
+        .route_type = buffered.route_type,
+        .unsupported_reason = buffered.unsupported_reason,
+    });
+    for (buffered.units) |*unit| {
+        try sink.on_unit(sink.ptr, unit);
+    }
+    try sink.on_end(sink.ptr);
+}
+
 fn routeMatches(match: RouteMatch, content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (match.content_type.len == 0 and match.content_type_prefix.len == 0 and match.extensions.len == 0 and match.magic_prefixes.len == 0) return true;
     if (match.content_type.len > 0 and contentTypeEquals(content_type, match.content_type)) return true;
@@ -684,6 +864,67 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         .route_type = try alloc.dupe(u8, "pdf"),
         .units = units,
     };
+}
+
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, sink: UnitSink) !void {
+    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+    defer parsed.deinit();
+
+    const page_count = try parsed.pageCount();
+    try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
+
+    var page_num: usize = 1;
+    var cursor: usize = 0;
+    while (page_num <= page_count) : (page_num += 1) {
+        var text = try parsed.extractPageTextAlloc(page_num);
+        errdefer alloc.free(text);
+        var text_regions = try extractPdfTextRegionsAlloc(alloc, &parsed, page_num, text);
+        errdefer if (text_regions.len > 0) alloc.free(text_regions);
+        const page_text_len = text.len;
+        const page_box = parsed.extractPageBox(page_num) catch null;
+        const page_rotation = parsed.extractPageRotation(page_num) catch null;
+        const char_start = std.math.cast(u32, cursor);
+        const char_end = std.math.cast(u32, cursor + page_text_len);
+        const scanned_page = page_text_len == 0;
+        var unit_id: ?[]u8 = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num});
+        errdefer if (unit_id) |value| alloc.free(value);
+        var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
+        errdefer if (unit_type) |value| alloc.free(value);
+        var method: ?[]u8 = try alloc.dupe(u8, if (scanned_page) "pdf_ocr_pending" else "pdf_text");
+        errdefer if (method) |value| alloc.free(value);
+        var extraction_status: ?[]u8 = if (scanned_page) try alloc.dupe(u8, "pending_ocr") else null;
+        errdefer if (extraction_status) |value| alloc.free(value);
+        var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
+        errdefer if (page_label) |value| alloc.free(value);
+        var unit = Unit{
+            .unit_id = unit_id.?,
+            .unit_type = unit_type.?,
+            .text = text,
+            .method = method.?,
+            .extraction_status = extraction_status,
+            .ocr_used = false,
+            .page_number = @intCast(page_num),
+            .page_label = page_label.?,
+            .page_bbox = if (page_box) |box| .{ box.min_x, box.min_y, box.max_x, box.max_y } else null,
+            .page_rotation = page_rotation,
+            .text_regions = text_regions,
+            .char_start = char_start,
+            .char_end = char_end,
+        };
+        unit_id = null;
+        unit_type = null;
+        method = null;
+        extraction_status = null;
+        page_label = null;
+        text = &.{};
+        text_regions = &.{};
+        errdefer unit.deinit(alloc);
+        try sink.on_unit(sink.ptr, &unit);
+        unit.deinit(alloc);
+        cursor += page_text_len;
+    }
+
+    try sink.on_end(sink.ptr);
 }
 
 fn extractPdfTextRegionsAlloc(
@@ -2573,6 +2814,54 @@ test "document extraction strips simple html tags" {
     try std.testing.expectEqual(@as(usize, 1), result.units.len);
     try std.testing.expectEqualStrings("article", result.units[0].unit_type);
     try std.testing.expectEqualStrings("Alpha Beta", result.units[0].text);
+}
+
+test "document extraction streaming emits text unit without buffering result" {
+    const alloc = std.testing.allocator;
+    var downloaded = TestDownloadedContent{
+        .content_type = try alloc.dupe(u8, "text/plain"),
+        .data = try alloc.dupe(u8, "alpha beta"),
+    };
+    defer downloaded.deinit(alloc);
+
+    const Ctx = struct {
+        begin_count: usize = 0,
+        unit_count: usize = 0,
+        end_count: usize = 0,
+        route_type: []const u8 = "",
+        saw_unit_text: bool = false,
+
+        fn onBegin(ptr: *anyopaque, info: StreamInfo) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.begin_count += 1;
+            self.route_type = info.route_type;
+        }
+
+        fn onUnit(ptr: *anyopaque, unit: *Unit) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.unit_count += 1;
+            try std.testing.expectEqualStrings("alpha beta", unit.text);
+            self.saw_unit_text = true;
+        }
+
+        fn onEnd(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.end_count += 1;
+        }
+    };
+
+    var ctx = Ctx{};
+    try extractDownloadedStreaming(alloc, downloaded, "https://example.test/doc.txt", .{}, .{
+        .ptr = &ctx,
+        .on_begin = Ctx.onBegin,
+        .on_unit = Ctx.onUnit,
+        .on_end = Ctx.onEnd,
+    });
+    try std.testing.expectEqual(@as(usize, 1), ctx.begin_count);
+    try std.testing.expectEqual(@as(usize, 1), ctx.unit_count);
+    try std.testing.expectEqual(@as(usize, 1), ctx.end_count);
+    try std.testing.expectEqualStrings("text", ctx.route_type);
+    try std.testing.expect(ctx.saw_unit_text);
 }
 
 test "document extraction classifies unsupported content without units" {

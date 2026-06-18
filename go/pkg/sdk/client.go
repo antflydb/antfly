@@ -98,6 +98,16 @@ func NewAntflyClient(baseURL string, httpClient *http.Client) (*AntflyClient, er
 	}, nil
 }
 
+// NewAntflyClientWithToken creates a new Antfly client that sends a bearer token
+// on every request. This is convenient for Antfly Cloud API tokens.
+func NewAntflyClientWithToken(baseURL string, httpClient *http.Client, token string) (*AntflyClient, error) {
+	opts := []oapi.ClientOption{oapi.WithHTTPClient(httpClient)}
+	if strings.TrimSpace(token) != "" {
+		opts = append(opts, oapi.WithRequestEditorFn(WithToken(strings.TrimSpace(token))))
+	}
+	return NewAntflyClientWithOptions(baseURL, opts...)
+}
+
 // NewAntflyClientWithOptions creates a new Antfly client with variadic options.
 // Use with WithBasicAuth, WithApiKey, or WithToken for authentication.
 func NewAntflyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*AntflyClient, error) {

@@ -125,6 +125,87 @@ fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
 }
 
+fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void {
+    var has_document_extraction_asset = false;
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .asset) continue;
+        var producer_cfg = asset_producer_mod.parseProducerConfig(db.alloc, entry.producer_json) catch continue;
+        defer producer_cfg.deinit(db.alloc);
+        if (producer_cfg.type == .document_extraction) {
+            has_document_extraction_asset = true;
+            break;
+        }
+    }
+    if (!has_document_extraction_asset) return;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, db.alloc, doc_value, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .asset) continue;
+        var producer_cfg = asset_producer_mod.parseProducerConfig(db.alloc, entry.producer_json) catch continue;
+        defer producer_cfg.deinit(db.alloc);
+        if (producer_cfg.type != .document_extraction) continue;
+
+        if (entry.source_template.len > 0) {
+            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch continue;
+            defer db.alloc.free(rendered);
+            try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+            continue;
+        }
+
+        const source = parsed.value.object.get(entry.source_field) orelse continue;
+        if (source != .string) continue;
+        try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
+    }
+}
+
+test "document extraction inline source size uses remote content limit" {
+    const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    var remote_content = scraping.RemoteContentConfig{ .security = security };
+    try std.testing.expect(try document_extraction_mod.inlineDataUriSourceTooLarge(&remote_content, "data:text/plain;base64,aGVsbG8="));
+    try std.testing.expect(!try document_extraction_mod.inlineDataUriSourceTooLarge(&remote_content, "data:text/plain;base64,Zm9v"));
+    try std.testing.expect(!try document_extraction_mod.inlineDataUriSourceTooLarge(&remote_content, "data:"));
+}
+
+test "document extraction templated inline source size is rejected before persistence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    var remote_content = scraping.RemoteContentConfig{ .security = security };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .remote_content = &remote_content,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .template = "{{url}}",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try std.testing.expectError(error.StreamTooLong, db.batch(.{
+        .writes = &.{.{
+            .key = "doc:templated-too-large",
+            .value = "{\"url\":\"data:text/plain;base64,aGVsbG8=\"}",
+        }},
+        .sync_level = .write,
+    }));
+
+    const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:templated-too-large");
+    defer alloc.free(doc_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_key));
+}
+
 pub const OpenOptions = struct {
     pub const OpenMode = enum {
         writer,
@@ -2989,6 +3070,7 @@ pub const DB = struct {
             var enrichment_cfg = raw_enrichment_cfg;
             if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
             if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
+            if (enrichment_cfg.resource_manager == null) enrichment_cfg.resource_manager = opts.resource_manager;
             try self.initOptionalEnrichmentRuntime(enrichment_cfg);
         }
         if (opts.ttl_cleanup.enabled) {
@@ -4196,6 +4278,7 @@ pub const DB = struct {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
             if (extracted[i].cleaned_value) |cleaned| {
+                try validateDocumentExtractionInlineSources(self, cleaned);
                 const strip_store_value_start_ns = monotonicTimeNs();
                 const store_value = try strippedStoredDocumentValueAlloc(
                     self.alloc,
@@ -15591,6 +15674,8 @@ fn extractAssetSourceValue(
 ) !?[]u8 {
     if (request.source_template.len > 0) {
         const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch return null;
+        errdefer alloc.free(rendered);
+        try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
         return @constCast(rendered);
     }
 
@@ -15600,8 +15685,16 @@ fn extractAssetSourceValue(
     const source = parsed.value.object.get(request.source_field) orelse return null;
     return switch (source) {
         .null => null,
-        .string => |value| try alloc.dupe(u8, value),
-        else => try std.json.Stringify.valueAlloc(alloc, source, .{}),
+        .string => |value| blk: {
+            try document_extraction_mod.validateInlineSourceSize(db.remote_content, value);
+            break :blk try alloc.dupe(u8, value);
+        },
+        else => blk: {
+            const rendered = try std.json.Stringify.valueAlloc(alloc, source, .{});
+            errdefer alloc.free(rendered);
+            try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+            break :blk rendered;
+        },
     };
 }
 
@@ -31075,6 +31168,51 @@ test "db document extraction asset materializes unit artifacts from data url" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
 }
 
+test "db async document extraction accounts resource manager working set" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .resource_manager = &resource_manager,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
+
+    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)];
+    try std.testing.expect(stats.peak_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+}
+
 test "db document extraction routes mixed files using source metadata fields" {
     const alloc = std.testing.allocator;
 
@@ -31309,6 +31447,52 @@ test "db document extraction completes image OCR with reader producer" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+}
+
+test "db async document extraction reuses generated OCR text across streaming passes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"ocr\":{\"enabled\":true,\"config\":{\"provider\":\"mock-reader\"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:image-ocr-async",
+            .value = "{\"filename\":\"scan.png\",\"mime_type\":\"image/png\",\"url\":\"data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr-async", "document_units_v1", "image:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
 }
 
@@ -33085,6 +33269,95 @@ test "db open quarantines dense index with unsupported artifact version" {
     }, 1);
     defer recovered.deinit();
     try std.testing.expect(recovered.total_hits >= 1);
+}
+
+fn corruptNonEmptyFilesUnderDir(alloc: Allocator, root_path: []const u8) !usize {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer root_dir.close(io);
+
+    var walker = try root_dir.walk(alloc);
+    defer walker.deinit();
+
+    var corrupted: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_path, entry.path });
+        defer alloc.free(full_path);
+        const stat = try std.Io.Dir.cwd().statFile(io, full_path, .{});
+        if (stat.size == 0) continue;
+
+        const bytes = try alloc.alloc(u8, @intCast(stat.size));
+        defer alloc.free(bytes);
+        for (bytes, 0..) |*byte, i| {
+            byte.* = @truncate((i *% 131) +% 17);
+        }
+        try std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = full_path,
+            .data = bytes,
+        });
+        corrupted += 1;
+    }
+    return corrupted;
+}
+
+test "db drops quarantined dense index after persisted index directory corruption" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const path_slice = std.mem.span(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dv_corrupt",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_corrupt\"}}",
+    };
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const open_options: OpenOptions = .{
+        .enrichment = .{
+            .owner_id = "corrupt-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    {
+        var db = try DB.open(alloc, path_slice, open_options);
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try std.testing.expect(db.core.denseIndex("dv_corrupt") != null);
+    }
+
+    const index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_corrupt", .{path_slice});
+    defer alloc.free(index_path);
+    try std.testing.expect((try corruptNonEmptyFilesUnderDir(alloc, index_path)) > 0);
+
+    var db = try DB.open(alloc, path_slice, open_options);
+    defer db.close();
+
+    try std.testing.expect(db.core.denseIndex("dv_corrupt") == null);
+    _ = db.core.index_manager.loadFailure("dv_corrupt") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(try db.deleteIndex("dv_corrupt"));
+    try std.testing.expect(db.core.index_manager.loadFailure("dv_corrupt") == null);
+    try std.testing.expect(db.core.index_manager.get("dv_corrupt") == null);
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_impl.io(), index_path, .{}));
 }
 
 test "db quarantined index self-heals via retryQuarantinedIndexLoads" {

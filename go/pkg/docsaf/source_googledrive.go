@@ -19,7 +19,7 @@ import (
 	"google.golang.org/api/option"
 )
 
-// maxFileDownloadSize is the maximum size for a single file download (100MB).
+// maxFileDownloadSize is the maximum size for a single file download (100 MiB).
 const maxFileDownloadSize = 100 * 1024 * 1024
 
 // Workspace MIME types and the format to export them as.
@@ -46,12 +46,16 @@ var folderIDRegexp = regexp.MustCompile(`/folders/([a-zA-Z0-9_-]+)`)
 
 // GoogleDriveSourceConfig holds configuration for a GoogleDriveSource.
 type GoogleDriveSourceConfig struct {
+	// TokenSource is an OAuth2 token source, usually backed by a refresh token.
+	// If set, it takes precedence over AccessToken and CredentialsJSON.
+	TokenSource oauth2.TokenSource
+
 	// CredentialsJSON is a service account key JSON string or file path.
-	// Either CredentialsJSON or AccessToken must be provided.
+	// TokenSource, CredentialsJSON, or AccessToken must be provided.
 	CredentialsJSON string
 
 	// AccessToken is a pre-obtained OAuth2 access token.
-	// Either CredentialsJSON or AccessToken must be provided.
+	// TokenSource, CredentialsJSON, or AccessToken must be provided.
 	AccessToken string
 
 	// FolderID is the Google Drive folder ID or full folder URL (required).
@@ -91,8 +95,8 @@ type GoogleDriveSource struct {
 
 // NewGoogleDriveSource creates a new Google Drive content source.
 func NewGoogleDriveSource(ctx context.Context, config GoogleDriveSourceConfig) (*GoogleDriveSource, error) {
-	if config.CredentialsJSON == "" && config.AccessToken == "" {
-		return nil, fmt.Errorf("either CredentialsJSON or AccessToken is required")
+	if config.TokenSource == nil && config.CredentialsJSON == "" && config.AccessToken == "" {
+		return nil, fmt.Errorf("TokenSource, CredentialsJSON, or AccessToken is required")
 	}
 	if config.FolderID == "" {
 		return nil, fmt.Errorf("FolderID is required")
@@ -108,7 +112,9 @@ func NewGoogleDriveSource(ctx context.Context, config GoogleDriveSourceConfig) (
 
 	// Build Drive service
 	var opts []option.ClientOption
-	if config.AccessToken != "" {
+	if config.TokenSource != nil {
+		opts = append(opts, option.WithTokenSource(config.TokenSource))
+	} else if config.AccessToken != "" {
 		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.AccessToken})
 		opts = append(opts, option.WithTokenSource(ts))
 	} else {
@@ -183,7 +189,12 @@ func (s *GoogleDriveSource) Traverse(ctx context.Context) (<-chan ContentItem, <
 // downloadSlot holds the result channel for a single concurrent download,
 // allowing ordered emission after concurrent downloads complete.
 type downloadSlot struct {
-	ch chan ContentItem
+	ch chan downloadResult
+}
+
+type downloadResult struct {
+	item ContentItem
+	err  error
 }
 
 // traverseFolder recursively lists files in a folder and sends them to the items channel.
@@ -287,19 +298,19 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 		slots := make([]downloadSlot, len(files))
 		var wg sync.WaitGroup
 		for i, fe := range files {
-			slots[i] = downloadSlot{ch: make(chan ContentItem, 1)}
+			slots[i] = downloadSlot{ch: make(chan downloadResult, 1)}
 
 			wg.Add(1)
 			s.semaphore <- struct{}{}
-			go func(f *drive.File, relPath string, slot chan<- ContentItem) {
+			go func(f *drive.File, relPath string, slot chan<- downloadResult) {
 				defer wg.Done()
 				defer func() { <-s.semaphore }()
 				defer close(slot)
 
 				content, contentType, err := s.downloadFile(ctx, f)
 				if err != nil {
-					log.Printf("Warning: Failed to download %s: %v", relPath, err)
-					return // slot closed empty — skipped in emission
+					slot <- downloadResult{err: fmt.Errorf("failed to download %s: %w", relPath, err)}
+					return
 				}
 
 				driveURL := f.WebViewLink
@@ -308,18 +319,23 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 				}
 
 				select {
-				case slot <- ContentItem{
-					Path:        relPath,
-					SourceURL:   driveURL,
-					Content:     content,
-					ContentType: contentType,
-					Metadata: map[string]any{
-						"source_type":   "google_drive",
-						"drive_file_id": f.Id,
-						"mime_type":     f.MimeType,
-						"modified_time": f.ModifiedTime,
-						"md5_checksum":  f.Md5Checksum,
-						"size":          f.Size,
+				case slot <- downloadResult{
+					item: ContentItem{
+						Path:        relPath,
+						SourceURL:   driveURL,
+						Content:     content,
+						ContentType: contentType,
+						Metadata: map[string]any{
+							"source_type":   "google_drive",
+							"drive_file_id": f.Id,
+							"etag":          f.Md5Checksum,
+							"file_size":     f.Size,
+							"mime_type":     f.MimeType,
+							"mod_time":      f.ModifiedTime,
+							"modified_time": f.ModifiedTime,
+							"md5_checksum":  f.Md5Checksum,
+							"size":          f.Size,
+						},
 					},
 				}:
 				case <-ctx.Done():
@@ -330,9 +346,13 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 		// Emit items in name-sorted order by reading slots sequentially.
 		// Each slot blocks until that file's download completes.
 		for _, slot := range slots {
-			if item, ok := <-slot.ch; ok {
+			if result, ok := <-slot.ch; ok {
+				if result.err != nil {
+					wg.Wait()
+					return result.err
+				}
 				select {
-				case items <- item:
+				case items <- result.item:
 				case <-ctx.Done():
 					wg.Wait()
 					return ctx.Err()
@@ -340,8 +360,7 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 			}
 		}
 
-		// Wait for any remaining goroutines (e.g., failed downloads
-		// whose slots were already closed empty).
+		// Wait for any remaining goroutines.
 		wg.Wait()
 
 		pageToken = fileList.NextPageToken
@@ -368,7 +387,7 @@ func (s *GoogleDriveSource) downloadFile(ctx context.Context, file *drive.File) 
 		}
 		defer resp.Body.Close() //nolint:errcheck // best-effort close in deferred cleanup
 
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxFileDownloadSize))
+		data, err := readLimitedDriveContent(resp.Body, maxFileDownloadSize)
 		if err != nil {
 			return nil, "", fmt.Errorf("reading exported file %s: %w", file.Name, err)
 		}
@@ -382,13 +401,24 @@ func (s *GoogleDriveSource) downloadFile(ctx context.Context, file *drive.File) 
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close in deferred cleanup
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxFileDownloadSize))
+	data, err := readLimitedDriveContent(resp.Body, maxFileDownloadSize)
 	if err != nil {
 		return nil, "", fmt.Errorf("reading file %s: %w", file.Name, err)
 	}
 
 	contentType := DetectContentType(file.Name, data)
 	return data, contentType, nil
+}
+
+func readLimitedDriveContent(r io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("Google Drive file exceeds download limit of %d bytes", maxBytes)
+	}
+	return data, nil
 }
 
 // parseFolderID extracts a folder ID from a Google Drive URL or returns the input as-is.

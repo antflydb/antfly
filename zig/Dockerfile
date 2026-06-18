@@ -35,6 +35,24 @@ RUN case "${TARGETARCH}" in \
     cd zig && \
     zig build -Dtarget="${zig_target}" -Doptimize=ReleaseFast -Dedition=full install --prefix /out
 
+FROM --platform=$BUILDPLATFORM alpine:3.21 AS wasmtime
+
+ARG WASMTIME_VERSION=v45.0.2
+ARG TARGETARCH
+
+RUN apk add --no-cache ca-certificates curl xz
+
+RUN case "${TARGETARCH}" in \
+        amd64) wasmtime_arch="x86_64" ;; \
+        arm64) wasmtime_arch="aarch64" ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    archive="wasmtime-${WASMTIME_VERSION}-${wasmtime_arch}-musl-c-api.tar.xz" && \
+    curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${archive}" -o "/tmp/${archive}" && \
+    mkdir -p /opt/wasmtime && \
+    tar -xJf "/tmp/${archive}" -C /opt/wasmtime --strip-components=1 && \
+    test -f /opt/wasmtime/lib/libwasmtime.so
+
 FROM --platform=$TARGETPLATFORM alpine:3.21
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
@@ -46,6 +64,11 @@ RUN addgroup -S antfly && adduser -S -G antfly -h /home/antfly antfly
 WORKDIR /
 COPY --from=builder /out/bin/antfly /antfly
 COPY --from=builder /out/share/antfly /usr/share/antfly
+COPY --from=wasmtime /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
+
+ENV ANTFLY_WASMTIME_LIB=/usr/local/lib/libwasmtime.so
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV ANTFLY_EXTENSION_PACKAGE_STORE=/tmp/antflydb/extensions
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget -qO- http://localhost:4200/readyz || exit 1

@@ -22,6 +22,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
+const platform = @import("antfly_platform");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const public_api_max_requests_per_connection: u32 = 64;
@@ -924,6 +925,7 @@ pub fn runFromIterator(
             .secret_store = &secret_store,
             .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
         },
@@ -2016,13 +2018,7 @@ fn resolvePaths(
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
-    const extension_package_store_dir = if (cli.extension_package_store_dir) |path|
-        try normalizeResolvedPathAlloc(alloc, path)
-    else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
-        defer alloc.free(raw);
-        break :blk try normalizeResolvedPathAlloc(alloc, raw);
-    };
+    const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
     const secret_store_path = if (cli.secret_store_path) |path|
         try normalizeResolvedPathAlloc(alloc, path)
@@ -2048,6 +2044,39 @@ fn resolvePaths(
         .secret_store_path = secret_store_path,
         .auth_store_root_dir = auth_store_root_dir,
     };
+}
+
+fn resolveExtensionPackageStoreDir(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+) ![]u8 {
+    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    defer alloc.free(env_var_z);
+    return try resolveExtensionPackageStoreDirWithEnv(
+        alloc,
+        cli_path,
+        local_base,
+        platform.env.getenvSlice(env_var_z),
+    );
+}
+
+fn resolveExtensionPackageStoreDirWithEnv(
+    alloc: std.mem.Allocator,
+    cli_path: ?[]const u8,
+    local_base: []const u8,
+    env_path: ?[]const u8,
+) ![]u8 {
+    if (cli_path) |path| return try normalizeResolvedPathAlloc(alloc, path);
+    if (env_path) |path| {
+        if (std.mem.trim(u8, path, " \t\r\n").len > 0) {
+            return try normalizeResolvedPathAlloc(alloc, path);
+        }
+    }
+
+    const raw = try std.fmt.allocPrint(alloc, "{s}/extensions", .{local_base});
+    defer alloc.free(raw);
+    return try normalizeResolvedPathAlloc(alloc, raw);
 }
 
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -2617,6 +2646,18 @@ test "swarm runtime resolves explicit extension package store path" {
     const resolved = try resolvePaths(alloc, .{ .extension_package_store_dir = "/opt/antfly/extensions" }, null);
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", resolved.extension_package_store_dir);
+}
+
+test "swarm runtime resolves extension package store env before local default" {
+    const alloc = std.testing.allocator;
+
+    const env_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, null, "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(env_resolved);
+    try std.testing.expectEqualStrings("/antfly-extension-env", env_resolved);
+
+    const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
+    defer alloc.free(cli_resolved);
+    try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
 }
 
 test "swarm runtime resolves explicit secret store path" {

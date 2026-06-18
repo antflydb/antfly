@@ -95,6 +95,18 @@ func TestNewBleveIndexV2(t *testing.T) {
 	}
 }
 
+func TestBleveIndexV2CloseBeforeOpen(t *testing.T) {
+	logger := zaptest.NewLogger(t).Sugar().Desugar()
+	db, tempDir, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	idx, err := NewBleveIndexV2(logger, nil, db, tempDir, "close_before_open",
+		NewFullTextIndexConfig("", false), nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, idx.Close())
+}
+
 func TestBleveIndexV2_Open(t *testing.T) {
 	logger := zaptest.NewLogger(t).Sugar().Desugar()
 	db, tempDir, cleanup := setupTestDB(t)

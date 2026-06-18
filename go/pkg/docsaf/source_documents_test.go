@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,6 +55,40 @@ func TestSourceDocumentFromContentItemInline(t *testing.T) {
 	}
 }
 
+func TestSourceDocumentFromContentItemCanonicalMetadata(t *testing.T) {
+	modTime := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	item := ContentItem{
+		Path:        "drive/report.pdf",
+		SourceURL:   "https://drive.google.com/file/d/file-id/view",
+		Content:     []byte("%PDF"),
+		ContentType: "application/pdf",
+		Metadata: map[string]any{
+			"source_type": "google_drive",
+			"file_size":   int64(42),
+			"mod_time":    modTime,
+			"etag":        "checksum",
+			"version":     "revision",
+		},
+	}
+
+	doc, err := SourceDocumentFromContentItem(item, SourceDocumentOptions{})
+	if err != nil {
+		t.Fatalf("SourceDocumentFromContentItem: %v", err)
+	}
+	if doc.SizeBytes != 42 {
+		t.Fatalf("SizeBytes = %d, want 42", doc.SizeBytes)
+	}
+	if !doc.ModifiedAt.Equal(modTime) {
+		t.Fatalf("ModifiedAt = %v, want %v", doc.ModifiedAt, modTime)
+	}
+	if doc.ETag != "checksum" {
+		t.Fatalf("ETag = %q, want checksum", doc.ETag)
+	}
+	if doc.Version != "revision" {
+		t.Fatalf("Version = %q, want revision", doc.Version)
+	}
+}
+
 func TestBuildSourceDocumentsRequiresURL(t *testing.T) {
 	source := singleItemSource{item: ContentItem{
 		Path:    "a.txt",
@@ -63,6 +98,19 @@ func TestBuildSourceDocumentsRequiresURL(t *testing.T) {
 	_, err := BuildSourceDocuments(context.Background(), source, SourceDocumentOptions{})
 	if err == nil {
 		t.Fatal("expected missing source URL error")
+	}
+}
+
+func TestSourceDocumentInlineContentLimit(t *testing.T) {
+	_, err := SourceDocumentFromContentItem(ContentItem{
+		Path:    "large.pdf",
+		Content: []byte(strings.Repeat("x", 8)),
+	}, SourceDocumentOptions{
+		InlineContent:  true,
+		MaxInlineBytes: 4,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeding inline content limit 4 bytes") {
+		t.Fatalf("SourceDocumentFromContentItem error = %v, want inline limit error", err)
 	}
 }
 
