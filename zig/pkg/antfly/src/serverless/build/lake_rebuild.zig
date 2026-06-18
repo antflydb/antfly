@@ -453,6 +453,8 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
         });
     }
 
+    try appendAlgebraicDesiredArtifactsAlloc(alloc, &artifacts, source, index_root);
+
     std.mem.sort(DesiredArtifact, artifacts.items, {}, compareDesiredArtifact);
     return .{ .artifacts = try artifacts.toOwnedSlice(alloc) };
 }
@@ -862,6 +864,156 @@ fn listGraphIndexNamesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) ![
     }
     std.mem.sort([]u8, names.items, {}, lessString);
     return try names.toOwnedSlice(alloc);
+}
+
+fn appendAlgebraicDesiredArtifactsAlloc(
+    alloc: Allocator,
+    artifacts: *std.ArrayListUnmanaged(DesiredArtifact),
+    source: LakeSourceSnapshot,
+    index_root: std.json.ObjectMap,
+) !void {
+    var it = index_root.iterator();
+    while (it.next()) |entry| {
+        if (!isTypedIndexConfig(entry.value_ptr.*, "algebraic")) continue;
+        const config_json = try indexConfigJsonAlloc(alloc, index_root, entry.key_ptr.*);
+        defer alloc.free(config_json);
+        const materializations = entry.value_ptr.object.get("materializations") orelse continue;
+        if (materializations != .array) return error.InvalidTableIndexMetadata;
+        for (materializations.array.items) |materialization| {
+            try appendAlgebraicMaterializationDesiredArtifactAlloc(
+                alloc,
+                artifacts,
+                source,
+                entry.key_ptr.*,
+                config_json,
+                materialization,
+            );
+        }
+    }
+}
+
+fn appendAlgebraicMaterializationDesiredArtifactAlloc(
+    alloc: Allocator,
+    artifacts: *std.ArrayListUnmanaged(DesiredArtifact),
+    source: LakeSourceSnapshot,
+    index_name: []const u8,
+    config_json: []const u8,
+    materialization: std.json.Value,
+) !void {
+    if (materialization != .object) return error.InvalidTableIndexMetadata;
+    if (hasAnyJsonField(materialization, &[_][]const u8{
+        "join",
+        "time",
+        "bucket",
+        "histogram_field",
+        "range_field",
+        "axes",
+    })) return;
+
+    const materialization_name = jsonStringField(materialization, "name") orelse return error.InvalidTableIndexMetadata;
+    if (materialization_name.len == 0) return error.InvalidTableIndexMetadata;
+    const op = supportedAlgebraicOp(materialization) orelse return;
+    const value_column = algebraicValueColumn(materialization);
+    if (op != .count and (value_column == null or value_column.?.len == 0)) return error.InvalidTableIndexMetadata;
+
+    const group_by = try jsonStringArrayFieldAlloc(alloc, materialization, "group_by");
+    defer freeOwnedStrings(alloc, group_by);
+    if (group_by.len > 1) return;
+
+    const artifact_name = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ index_name, materialization_name });
+    defer alloc.free(artifact_name);
+
+    if (group_by.len == 1) {
+        var columns_buf: [2][]const u8 = undefined;
+        columns_buf[0] = group_by[0];
+        var column_count: usize = 1;
+        if (op != .count) {
+            columns_buf[1] = value_column.?;
+            column_count = 2;
+        }
+        const columns = columns_buf[0..column_count];
+        const index_hash = try indexConfigHashAlloc(alloc, "algebraic", artifact_name, config_json, columns);
+        defer alloc.free(index_hash);
+        try appendDesiredArtifactAlloc(alloc, artifacts, source, .{
+            .name = artifact_name,
+            .sidecar_kind = .algebraic,
+            .artifact_kind = .algebraic_segment,
+            .column_bindings = columns,
+            .index_config_hash = index_hash,
+            .build_spec = .{ .algebraic_group_by = .{
+                .group_column = group_by[0],
+                .value_column = if (op == .count) &.{} else value_column.?,
+                .op = op,
+            } },
+        });
+        return;
+    }
+
+    var columns_buf: [1][]const u8 = undefined;
+    const columns = if (op == .count) &[_][]const u8{} else blk: {
+        columns_buf[0] = value_column.?;
+        break :blk columns_buf[0..1];
+    };
+    const index_hash = try indexConfigHashAlloc(alloc, "algebraic", artifact_name, config_json, columns);
+    defer alloc.free(index_hash);
+    const expressions = [_]algebraic_segment.ExpressionSpec{.{
+        .name = materialization_name,
+        .value_column = if (op == .count) &.{} else value_column.?,
+        .op = op,
+    }};
+    try appendDesiredArtifactAlloc(alloc, artifacts, source, .{
+        .name = artifact_name,
+        .sidecar_kind = .algebraic,
+        .artifact_kind = .algebraic_segment,
+        .column_bindings = columns,
+        .index_config_hash = index_hash,
+        .build_spec = .{ .algebraic_expression = .{ .expressions = &expressions } },
+    });
+}
+
+fn isTypedIndexConfig(value: std.json.Value, expected_type: []const u8) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return false;
+    return type_value == .string and std.mem.eql(u8, type_value.string, expected_type);
+}
+
+fn hasAnyJsonField(value: std.json.Value, fields: []const []const u8) bool {
+    if (value != .object) return false;
+    for (fields) |field| {
+        if (value.object.get(field) != null) return true;
+    }
+    return false;
+}
+
+fn supportedAlgebraicOp(materialization: std.json.Value) ?algebraic_segment.AggregateOp {
+    const op = jsonStringField(materialization, "op") orelse return null;
+    if (std.mem.eql(u8, op, "count")) return .count;
+    if (std.mem.eql(u8, op, "sum") or std.mem.eql(u8, op, "sum_i64")) return .sum_i64;
+    if (std.mem.eql(u8, op, "min") or std.mem.eql(u8, op, "min_i64")) return .min_i64;
+    if (std.mem.eql(u8, op, "max") or std.mem.eql(u8, op, "max_i64")) return .max_i64;
+    return null;
+}
+
+fn algebraicValueColumn(materialization: std.json.Value) ?[]const u8 {
+    return jsonStringField(materialization, "measure") orelse jsonStringField(materialization, "value_field");
+}
+
+fn jsonStringArrayFieldAlloc(alloc: Allocator, value: std.json.Value, field: []const u8) ![][]u8 {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    const raw = value.object.get(field) orelse return try alloc.alloc([]u8, 0);
+    if (raw != .array) return error.InvalidTableIndexMetadata;
+    const out = try alloc.alloc([]u8, raw.array.items.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+    }
+    for (raw.array.items, 0..) |item, idx| {
+        if (item != .string or item.string.len == 0) return error.InvalidTableIndexMetadata;
+        out[idx] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
 }
 
 fn validateDesiredArtifact(want: DesiredArtifact) !void {
@@ -1549,6 +1701,53 @@ test "lake rebuild desired artifacts use default lake columns for named indexes"
     try std.testing.expectEqualStrings("sparse_idx", desired.find("sparse_idx").?.binding.column_bindings[0]);
     try std.testing.expectEqualStrings("graph_edges", desired.find("graph_idx").?.binding.column_bindings[0]);
     try std.testing.expect(desired.find("semantic_idx").?.binding.index_config_hash.len > "wyhash64:".len);
+}
+
+test "lake rebuild desired artifacts derive supported algebraic materializations" {
+    const alloc = std.testing.allocator;
+    var desired = try desiredArtifactsFromTableDefinitionAlloc(alloc, .{
+        .source_kind = .external_iceberg,
+        .source_id = "events",
+        .snapshot_id = "iceberg-43",
+        .schema_fingerprint = "schema-v6",
+    }, .{
+        .table_name = "events",
+        .schema_json = "{\"version\":1}",
+        .indexes_json =
+        \\{
+        \\  "alg":{"type":"algebraic","materializations":[
+        \\    {"name":"count_by_tenant","op":"count","group_by":["tenant"]},
+        \\    {"name":"sum_amount","op":"sum","measure":"amount"},
+        \\    {"name":"avg_by_tenant","op":"avg","group_by":["tenant"],"measure":"amount"},
+        \\    {"name":"sum_by_region_channel","op":"sum","group_by":["region","channel"],"measure":"amount"},
+        \\    {"name":"joined_sum","op":"sum","join":"profiles","group_by":["region"],"measure":"amount"}
+        \\  ]}
+        \\}
+        ,
+    });
+    defer desired.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), desired.artifacts.len);
+    try std.testing.expect(desired.find(default_full_text_index_name) != null);
+
+    const grouped = desired.find("alg.count_by_tenant").?;
+    try std.testing.expectEqual(source_binding.SidecarKind.algebraic, grouped.binding.sidecar_kind);
+    try std.testing.expectEqual(BuilderKind.algebraic_group_by, std.meta.activeTag(grouped.build_spec.?));
+    try std.testing.expectEqualStrings("tenant", grouped.build_spec.?.algebraic_group_by.group_column);
+    try std.testing.expectEqual(algebraic_segment.AggregateOp.count, grouped.build_spec.?.algebraic_group_by.op);
+
+    const expression = desired.find("alg.sum_amount").?;
+    try std.testing.expectEqual(BuilderKind.algebraic_expression, std.meta.activeTag(expression.build_spec.?));
+    try std.testing.expectEqual(@as(usize, 1), expression.build_spec.?.algebraic_expression.expressions.len);
+    try std.testing.expectEqualStrings("sum_amount", expression.build_spec.?.algebraic_expression.expressions[0].name);
+    try std.testing.expectEqualStrings("amount", expression.build_spec.?.algebraic_expression.expressions[0].value_column);
+    try std.testing.expectEqual(algebraic_segment.AggregateOp.sum_i64, expression.build_spec.?.algebraic_expression.expressions[0].op);
+
+    var operations = try planOperationsAlloc(alloc, desired.artifacts, &.{});
+    defer operations.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), operations.operations.len);
+    try std.testing.expectEqual(BuilderKind.algebraic_group_by, operations.find("alg.count_by_tenant").?.builder_kind.?);
+    try std.testing.expectEqual(BuilderKind.algebraic_expression, operations.find("alg.sum_amount").?.builder_kind.?);
 }
 
 test "lake rebuild planner rebuilds stale source snapshots and missing folds" {
