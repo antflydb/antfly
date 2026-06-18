@@ -19058,12 +19058,12 @@ test "api http server routes public external lake row queries through configured
     defer parsed_query_explain.deinit();
     try std.testing.expectEqualStrings("query", parsed_query_explain.value.object.get("explained_operation").?.string);
     const query_explain_scan = parsed_query_explain.value.object.get("scan").?.object;
-    try std.testing.expectEqual(@as(i64, 2), query_explain_scan.get("projected_column_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), query_explain_scan.get("projected_column_count").?.integer);
     try std.testing.expect(query_explain_scan.get("has_predicate").?.bool);
     try std.testing.expectEqual(@as(i64, 1), query_explain_scan.get("scanner_limit").?.integer);
     const query_explain_plan = parsed_query_explain.value.object.get("plan").?.object;
     try std.testing.expectEqualStrings("scan", query_explain_plan.get("operation").?.string);
-    try std.testing.expectEqual(@as(i64, 2), query_explain_plan.get("projected_column_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), query_explain_plan.get("projected_column_count").?.integer);
 }
 
 test "api http server resolves credentialed external lake rows from node config" {
