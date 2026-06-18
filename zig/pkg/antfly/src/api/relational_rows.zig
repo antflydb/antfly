@@ -3210,6 +3210,13 @@ fn validateLakeRowsAggregateRequestSupported(
             },
             else => return error.UnsupportedRowsQuery,
         }
+        for (aggregation.filter_predicates) |predicate| {
+            const column = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
+            switch (column.field_type) {
+                .embedding, .json, .array => return error.UnsupportedRowsQuery,
+                else => {},
+            }
+        }
     }
     if (request.source.predicates.len == 1) {
         const predicate = request.source.predicates[0];
@@ -3227,7 +3234,7 @@ fn validateLakeRowsAggregateShapeSupported(request: OwnedRowsAggregateRequest) !
         if (aggregation.name.len == 0) return error.InvalidRowsRequest;
         if (aggregation.expression != null or aggregation.distinct) return error.UnsupportedRowsQuery;
         if (aggregation.array_order_by.len != 0 or aggregation.string_delimiter != null) return error.UnsupportedRowsQuery;
-        if (aggregation.filter_predicates.len != 0 or aggregation.filter_array_any.len != 0 or aggregation.filter_array_contains.len != 0 or aggregation.filter_array_eq.len != 0) return error.UnsupportedRowsQuery;
+        if (aggregation.filter_array_any.len != 0 or aggregation.filter_array_contains.len != 0 or aggregation.filter_array_eq.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_in_predicates.len != 0 or aggregation.filter_json_contains.len != 0 or aggregation.filter_json_path_eq.len != 0 or aggregation.filter_json_path_exists.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_text_patterns.len != 0 or aggregation.filter_expressions.len != 0 or aggregation.filter_expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
         if (aggregation.filter_any.len != 0 or aggregation.filter_not.len != 0) return error.UnsupportedRowsQuery;
@@ -3269,6 +3276,9 @@ fn lakeRowsAggregateProjectedColumnsAlloc(
     }
     for (request.aggregations) |aggregation| {
         if (aggregation.field) |field| try appendLakeProjectedColumnAlloc(alloc, &columns, field);
+        for (aggregation.filter_predicates) |predicate| {
+            try appendLakeProjectedColumnAlloc(alloc, &columns, predicate.field);
+        }
     }
     if (request.source.predicates.len == 1) {
         try appendLakeProjectedColumnAlloc(alloc, &columns, request.source.predicates[0].field);
@@ -3546,7 +3556,7 @@ fn lakeRowsAggregateGroupsAlloc(
             @as(usize, 0)
         else
             try findOrAppendLakeRowsAggregateGroupAlloc(alloc, request, &groups, row);
-        try addLakeRowsAggregateRow(request.aggregations, &groups.items[group_index], row);
+        try addLakeRowsAggregateRow(alloc, request.aggregations, &groups.items[group_index], row);
     }
 
     return try groups.toOwnedSlice(alloc);
@@ -3606,11 +3616,13 @@ fn appendLakeRowsAggregateGroupAlloc(
 }
 
 fn addLakeRowsAggregateRow(
+    alloc: std.mem.Allocator,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     group: *LakeAggregateGroup,
     row: lake_rows.ProjectedRow,
 ) !void {
     for (aggregations, 0..) |aggregation, i| {
+        if (!try lakeRowsAggregateFilterMatchesAlloc(alloc, aggregation, row)) continue;
         switch (aggregation.op) {
             .count => {
                 if (aggregation.field) |field| {
@@ -3631,6 +3643,104 @@ fn addLakeRowsAggregateRow(
             else => return error.UnsupportedRowsQuery,
         }
     }
+}
+
+fn lakeRowsAggregateFilterMatchesAlloc(
+    alloc: std.mem.Allocator,
+    aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    row: lake_rows.ProjectedRow,
+) !bool {
+    for (aggregation.filter_predicates) |predicate| {
+        if (!try lakeRowsRelationalCheckMatchesAlloc(alloc, row, predicate)) return false;
+    }
+    return true;
+}
+
+fn lakeRowsRelationalCheckMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    check: runtime_schema.RelationalCheck,
+) !bool {
+    if (check.expression != null) return error.UnsupportedRowsQuery;
+    const maybe_cell = row.find(check.field) orelse return error.RowSourceColumnNotFound;
+    const maybe_value = maybe_cell.value;
+    return switch (check.op) {
+        .is_null => maybe_value == null,
+        .is_not_null => maybe_value != null,
+        .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => blk: {
+            const expected_json = check.value_json orelse return error.InvalidRowsRequest;
+            var expected = std.json.parseFromSlice(std.json.Value, alloc, expected_json, .{}) catch return error.InvalidRowsRequest;
+            defer expected.deinit();
+            const comparison = if (maybe_value) |value|
+                try compareLakeRowsCellValueToJsonAlloc(alloc, value, expected.value)
+            else
+                compareLakeRowsNullToJson(expected.value);
+            const not_distinct = if (comparison) |actual_comparison| actual_comparison == .eq else false;
+            break :blk switch (check.op) {
+                .eq => if (comparison) |actual_comparison| actual_comparison == .eq else false,
+                .ne => if (comparison) |actual_comparison| actual_comparison != .eq else false,
+                .gt => if (comparison) |actual_comparison| actual_comparison == .gt else false,
+                .gte => if (comparison) |actual_comparison| actual_comparison == .gt or actual_comparison == .eq else false,
+                .lt => if (comparison) |actual_comparison| actual_comparison == .lt else false,
+                .lte => if (comparison) |actual_comparison| actual_comparison == .lt or actual_comparison == .eq else false,
+                .is_distinct => !not_distinct,
+                .is_not_distinct => not_distinct,
+                else => unreachable,
+            };
+        },
+    };
+}
+
+fn compareLakeRowsCellValueToJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: lake_rows.CellValue,
+    expected: std.json.Value,
+) !?ScalarComparison {
+    return switch (value) {
+        .i64 => |number| compareLakeRowsNumericToJson(@floatFromInt(number), expected),
+        .f64 => |number| compareLakeRowsNumericToJson(number, expected),
+        .bool => |actual| switch (expected) {
+            .bool => |wanted| if (actual == wanted) .eq else if (!actual and wanted) .lt else .gt,
+            else => null,
+        },
+        .bytes => |actual| switch (expected) {
+            .string => |wanted| scalarComparisonFromOrder(std.mem.order(u8, actual, wanted)),
+            else => null,
+        },
+        .json => |json| blk: {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed.deinit();
+            break :blk compareJsonScalars(parsed.value, expected);
+        },
+        .vector_f32 => null,
+    };
+}
+
+fn compareLakeRowsNumericToJson(actual: f64, expected: std.json.Value) ?ScalarComparison {
+    const wanted = switch (expected) {
+        .integer => |number| @as(f64, @floatFromInt(number)),
+        .float => |number| number,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        else => return null,
+    };
+    if (actual < wanted) return .lt;
+    if (actual > wanted) return .gt;
+    return .eq;
+}
+
+fn compareLakeRowsNullToJson(expected: std.json.Value) ?ScalarComparison {
+    return switch (expected) {
+        .null => .eq,
+        else => null,
+    };
+}
+
+fn scalarComparisonFromOrder(order: std.math.Order) ScalarComparison {
+    return switch (order) {
+        .lt => .lt,
+        .eq => .eq,
+        .gt => .gt,
+    };
 }
 
 fn lakeRowsAggregateGroupJsonAlloc(
@@ -16883,6 +16993,59 @@ test "relational rows lake bridge folds projected rows as grouped aggregate resu
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"amount_sum\":10}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"amount_sum\":50}", result.rows[1]);
+}
+
+test "relational rows lake bridge applies scalar aggregate filters" {
+    const alloc = std.testing.allocator;
+    const tenant_name_0 = @constCast("tenant"[0..]);
+    const amount_name_0 = @constCast("amount"[0..]);
+    const tenant_name_1 = @constCast("tenant"[0..]);
+    const amount_name_1 = @constCast("amount"[0..]);
+    const tenant_name_2 = @constCast("tenant"[0..]);
+    const amount_name_2 = @constCast("amount"[0..]);
+    var cells_0 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_0, .value = .{ .i64 = 7 } },
+        .{ .name = amount_name_0, .value = .{ .i64 = 10 } },
+    };
+    var cells_1 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_1, .value = .{ .i64 = 8 } },
+        .{ .name = amount_name_1, .value = .{ .i64 = 20 } },
+    };
+    var cells_2 = [_]lake_rows.ProjectedCell{
+        .{ .name = tenant_name_2, .value = .{ .i64 = 8 } },
+        .{ .name = amount_name_2, .value = .{ .i64 = 30 } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .relational_key = "row:1" }, .cells = &cells_0 },
+        .{ .row_ref = .{ .relational_key = "row:2" }, .cells = &cells_1 },
+        .{ .row_ref = .{ .relational_key = "row:3" }, .cells = &cells_2 },
+    };
+    const group_by = [_][]const u8{"tenant"};
+    const filter_predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .op = .gte,
+        .value_json = "20",
+    }};
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "large_amount_sum", .op = .sum, .field = "amount", .filter_predicates = &filter_predicates },
+    };
+    const request = OwnedRowsAggregateRequest{
+        .group_by = &group_by,
+        .aggregations = &aggregations,
+    };
+
+    var result = try buildRowsAggregateResultFromLakeRowsAlloc(alloc, request, .{
+        .rows = &projected,
+        .total = 3,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50}", result.rows[1]);
 }
 
 test "relational rows batch derives deterministic physical primary keys" {

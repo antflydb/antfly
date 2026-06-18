@@ -1009,8 +1009,9 @@ moves behind a `api/sql_adapter/` package:
   lowering into Antfly typed read plans, write plans, and catalog/schema plans.
 - `diagnostics.zig`: span-aware unsupported-shape diagnostics and stable
   required-feature classification.
-- `corpus.zig`: SQL/API parity corpus helpers and fingerprint assertions, if
-  those remain implemented in Zig source instead of external fixtures.
+- `corpus.zig`: SQL/API parity corpus fixture metadata, helper predicates, and
+  fingerprint assertions, if those remain implemented in Zig source instead of
+  external fixtures.
 
 The internal flow is always:
 
