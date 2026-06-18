@@ -62,7 +62,7 @@ class RowsQueryRequest:
             limit (int | Unset):
             offset (int | Unset):
             row_claim (RowsRowClaim | Unset): Lockable base-row claim metadata. Public row-plan endpoints reject this
-                field; it is only accepted by `rows:mutation-source` lockable base-row
+                field; it is only accepted by `rows/mutation-source` lockable base-row
                 sources and internal/coordinator execution paths. `transaction_id` is
                 the canonical field name.
             doc_key_range (Any | Unset): Physical row-key range selector used by routed typed row plans after

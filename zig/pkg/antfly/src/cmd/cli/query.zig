@@ -18,6 +18,7 @@ const cli = @import("mod.zig");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
+    var catalog = cli.CatalogFlags.defaultsFromEnv();
     var full_text_search: ?[]const u8 = null;
     var full_text_search_json: ?[]const u8 = null;
     var semantic_search: ?[]const u8 = null;
@@ -33,6 +34,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             table_name = args.next();
+        } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
+            continue;
         } else if (std.mem.eql(u8, arg, "--full-text-search")) {
             full_text_search = args.next();
         } else if (std.mem.eql(u8, arg, "--full-text-search-json")) {
@@ -146,12 +149,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     defer parsed.deinit();
 
     if (table_name) |tbl| {
-        var resp = try client.queryTable(tbl, parsed.value);
+        var resp = if (catalog.explicit()) |explicit|
+            try client.inner.queryNamespaceTable(explicit.database, explicit.namespace, tbl, parsed.value)
+        else
+            try client.queryTable(tbl, parsed.value);
         defer resp.deinit();
         if (resp.data) |data| {
             try cli.writeJson(allocator, io, data.value);
         }
     } else {
+        if (catalog.explicit() != null) {
+            cli.fatal("--database/--namespace require --table for query commands", .{});
+        }
         var resp = try client.query(parsed.value);
         defer resp.deinit();
         if (resp.data) |data| {
@@ -162,11 +171,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
 
 pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
+    var catalog = cli.CatalogFlags.defaultsFromEnv();
     var key: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             table_name = args.next();
+        } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
+            continue;
         } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
             key = args.next();
         }
@@ -175,7 +187,10 @@ pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
     const tbl = table_name orelse cli.fatal("--table is required", .{});
     const k = key orelse cli.fatal("--key is required", .{});
 
-    var resp = try client.lookupKey(tbl, k, .{});
+    var resp = if (catalog.explicit()) |explicit|
+        try client.inner.lookupNamespaceTableDocument(explicit.database, explicit.namespace, tbl, k, .{})
+    else
+        try client.lookupKey(tbl, k, .{});
     defer resp.deinit();
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);

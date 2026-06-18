@@ -21,6 +21,7 @@ const ddl_plan = @import("ddl_plan.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
 const sql_value = @import("value.zig");
 
@@ -86,6 +87,16 @@ pub const CreateUpdatePolicySyntax = struct {
 pub const AdapterNoopTransactionBoundaryTail = struct {
     work: bool = false,
     transaction: bool = false,
+};
+
+pub const SetSearchPathSyntax = struct {
+    namespaces: []const []const u8 = &.{},
+    local: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.namespaces);
+        self.* = undefined;
+    }
 };
 
 pub const SavepointNameSyntax = struct {
@@ -269,10 +280,12 @@ pub const DropDatabaseSyntax = struct {
 pub const CreateTablespaceSyntax = struct {
     tablespace_name: []const u8,
     location_json: []const u8,
+    placement_policy_json: []const u8,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.tablespace_name));
         alloc.free(@constCast(self.location_json));
+        alloc.free(@constCast(self.placement_policy_json));
         self.* = undefined;
     }
 };
@@ -483,6 +496,24 @@ pub const DropDomainSyntax = struct {
     }
 };
 
+pub const CreateDomainHeaderSyntax = struct {
+    domain_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.domain_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterDomainHeaderSyntax = struct {
+    domain_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.domain_name));
+        self.* = undefined;
+    }
+};
+
 pub const CommentMetadataSyntax = struct {
     target: ddl_plan.CommentMetadataTarget,
     object_name: []const u8,
@@ -518,8 +549,285 @@ pub const DropIndexSyntax = struct {
     }
 };
 
+pub const AlterTableHeaderSyntax = struct {
+    table_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableValidateConstraintSyntax = struct {
+    constraint_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.constraint_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableRenameTargetSyntax = enum {
+    column,
+    constraint,
+};
+
+pub const AlterTableRenameOperationSyntax = struct {
+    target: AlterTableRenameTargetSyntax,
+    old_name: []const u8,
+    new_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.old_name));
+        alloc.free(@constCast(self.new_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableDropTargetSyntax = enum {
+    column,
+    constraint,
+};
+
+pub const AlterTableDropOperationSyntax = struct {
+    target: AlterTableDropTargetSyntax,
+    name: []const u8,
+    if_exists: bool = false,
+    dependency_mode: ddl_plan.DropDependencyMode,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableColumnNullabilitySyntax = struct {
+    column_name: []const u8,
+    nullable: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.column_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableColumnDefaultActionSyntax = enum {
+    set,
+    drop,
+};
+
+pub const AlterTableColumnDefaultSyntax = struct {
+    column_name: []const u8,
+    action: AlterTableColumnDefaultActionSyntax,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.column_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableColumnTypeHeaderSyntax = struct {
+    column_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.column_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterTableColumnUsingSyntax = struct {
+    column_name: []const u8,
+    wrapped: bool = false,
+};
+
+pub const AlterTableAddColumnHeaderSyntax = struct {
+    if_not_exists: bool = false,
+};
+
+pub const AlterTableAddOperationKindSyntax = enum {
+    period,
+    primary_key,
+    unique,
+    foreign_key,
+    check,
+};
+
+pub const AlterTableAddOperationPrefixSyntax = struct {
+    kind: AlterTableAddOperationKindSyntax,
+    constraint_name: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.constraint_name) |constraint_name| alloc.free(@constCast(constraint_name));
+        self.* = undefined;
+    }
+};
+
+pub const IdentityAllocatorTableHeaderSyntax = struct {
+    table_name: []const u8,
+    column_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        alloc.free(@constCast(self.column_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateIndexHeaderSyntax = struct {
+    index_name: []const u8,
+    table_name: []const u8,
+    if_not_exists: bool = false,
+    method: ddl_plan.DdlIndexMethod = .btree,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.index_name));
+        alloc.free(@constCast(self.table_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateIndexElementOrderDirectionSyntax = enum {
+    default,
+    asc,
+    desc,
+};
+
+pub const CreateIndexElementNullsOrderSyntax = enum {
+    default,
+    first,
+    last,
+};
+
+pub const CreateIndexElementSuffixSyntax = struct {
+    opclass: ddl_plan.DdlIndexOpClass = .default,
+    order_direction: CreateIndexElementOrderDirectionSyntax = .default,
+    nulls_order: CreateIndexElementNullsOrderSyntax = .default,
+};
+
+pub const DdlTemporalColumnListSyntax = struct {
+    columns: []const []const u8,
+    without_overlaps_period: ?[]const u8 = null,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.columns);
+        if (self.without_overlaps_period) |period| alloc.free(@constCast(period));
+    }
+};
+
+pub const DdlForeignKeyActionSyntax = enum {
+    restrict,
+    cascade,
+    no_action,
+    set_null,
+};
+
+pub const DdlForeignKeyTimingSyntax = enum {
+    immediate,
+    deferred,
+};
+
+pub const DdlForeignKeyOptionsSyntax = struct {
+    on_delete: DdlForeignKeyActionSyntax = .restrict,
+    on_update: DdlForeignKeyActionSyntax = .restrict,
+    deferrable: bool = false,
+    timing: DdlForeignKeyTimingSyntax = .immediate,
+};
+
+pub const DdlForeignKeyColumnListSyntax = struct {
+    columns: []const []const u8,
+    period: ?[]const u8 = null,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.columns);
+        if (self.period) |period| alloc.free(@constCast(period));
+    }
+};
+
+pub const DdlPeriodSyntax = struct {
+    name: []const u8,
+    start_column: []const u8,
+    end_column: []const u8,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.name));
+        alloc.free(@constCast(self.start_column));
+        alloc.free(@constCast(self.end_column));
+    }
+};
+
+pub const DdlKnownDefaultSyntax = enum {
+    null_literal,
+    uuid_v4,
+    now_ns,
+    current_date_ns,
+};
+
+pub const DdlTypeSyntax = struct {
+    field_type: runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType = null,
+};
+
 pub const TableClonePlan = ddl_plan.TableClonePlan;
 pub const TableCloneOptions = ddl_plan.TableCloneOptions;
+pub const CreateTableDefinitionHeaderSyntax = struct {
+    table_name: []const u8,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateTableElementKindSyntax = enum {
+    column,
+    period,
+    primary_key,
+    unique,
+    foreign_key,
+    check,
+};
+
+pub const CreateTableElementPrefixSyntax = struct {
+    kind: CreateTableElementKindSyntax,
+    constraint_name: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.constraint_name) |constraint_name| alloc.free(@constCast(constraint_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateTableColumnConstraintKindSyntax = enum {
+    primary_key,
+    unique,
+    check,
+    references,
+};
+
+pub const CreateTableColumnConstraintPrefixSyntax = struct {
+    kind: CreateTableColumnConstraintKindSyntax,
+    constraint_name: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.constraint_name) |constraint_name| alloc.free(@constCast(constraint_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateTablePartitionPlan = ddl_plan.CreateTablePartitionPlan;
+pub const CreatePartitionedTableTailSyntax = struct {
+    method: ddl_plan.TablePartitionMethod,
+    keys: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.keys);
+        self.* = undefined;
+    }
+};
+pub const TablePartitionBounds = ddl_plan.TablePartitionBounds;
+pub const TablePartitionCatalogPlan = ddl_plan.TablePartitionCatalogPlan;
 
 pub const CreateViewSyntax = struct {
     view_name: []const u8,
@@ -699,6 +1007,16 @@ pub const UnlistenNotificationSyntax = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.channel_name) |channel_name| alloc.free(@constCast(channel_name));
+        self.* = undefined;
+    }
+};
+
+pub const TruncateMutationSourceSyntax = struct {
+    table_name: []const u8,
+    restart_identity: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
         self.* = undefined;
     }
 };
@@ -922,6 +1240,10 @@ pub const RelationPopulationMode = enum {
 pub const RelationLifetimeKind = enum {
     temporary,
     unlogged,
+};
+
+pub const RelationLifetimePrefixSyntax = struct {
+    kind: RelationLifetimeKind,
 };
 
 pub const RelationPopulationSyntax = struct {
@@ -1258,6 +1580,26 @@ pub fn parseAdapterNoopSetStatementTail(tokens: []const Token, pos: *usize) !voi
     try parseAdapterNoopSetValueTail(cursor, setting.text);
 }
 
+pub fn parseSetSearchPathTailAlloc(alloc: std.mem.Allocator, tokens: []const Token, pos: *usize) !SetSearchPathSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const local = cursor.matchKeyword("local");
+    if (!local) _ = cursor.matchKeyword("session");
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(setting.text, "search_path")) return error.UnsupportedSqlShape;
+    if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
+
+    var namespaces = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &namespaces);
+    while (true) {
+        const token = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+        if (!sqlSessionNamespaceNameValid(token.text)) return error.UnsupportedSqlShape;
+        try namespaces.append(alloc, try alloc.dupe(u8, token.text));
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{ .namespaces = try namespaces.toOwnedSlice(alloc), .local = local };
+}
+
 pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchKeyword("all")) {
@@ -1270,6 +1612,13 @@ pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !v
     try parseAdapterNoopStatementEnd(cursor);
 }
 
+pub fn parseResetSearchPathTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(setting.text, "search_path")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
 pub fn parseAdapterNoopShowStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
@@ -1277,7 +1626,20 @@ pub fn parseAdapterNoopShowStatementTail(tokens: []const Token, pos: *usize) !vo
     try parseAdapterNoopStatementEnd(cursor);
 }
 
+pub fn parseShowSearchPathTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(setting.text, "search_path")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
 pub fn parseAdapterNoopDiscardStatementTail(tokens: []const Token, pos: *usize) !void {
+    var cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("all");
+    try parseAdapterNoopStatementEnd(cursor);
+}
+
+pub fn parseDiscardAllTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("all");
     try parseAdapterNoopStatementEnd(cursor);
@@ -1820,9 +2182,11 @@ pub fn parseCreateTablespaceCatalogTailAlloc(
     errdefer if (!location_transferred) alloc.free(@constCast(location_json));
     if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
     try parseAdapterNoopStatementEnd(cursor);
+    const placement_policy_json = try alloc.dupe(u8, "{}");
+    errdefer alloc.free(placement_policy_json);
     tablespace_transferred = true;
     location_transferred = true;
-    return .{ .tablespace_name = tablespace_name, .location_json = location_json };
+    return .{ .tablespace_name = tablespace_name, .location_json = location_json, .placement_policy_json = placement_policy_json };
 }
 
 pub fn parseRenameTablespaceCatalogTailAlloc(
@@ -2209,6 +2573,39 @@ pub fn parseIdentitySequenceOptionAlloc(
     try parseCreateSequenceOption(alloc, cursor, tokens, pos, options);
 }
 
+pub fn parseIdentityAllocatorSpecAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.IdentityAllocatorSpec {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("serial")) return .{ .kind = .serial };
+    if (cursor.matchKeyword("bigserial")) return .{ .kind = .bigserial };
+
+    const ddl_type = try parseDdlType(tokens, pos);
+    if (ddl_type.field_type != .numeric) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("generated");
+    const kind: ddl_plan.IdentityAllocatorKind = if (cursor.matchKeyword("always"))
+        .generated_always
+    else blk: {
+        try cursor.expectKeyword("by");
+        try cursor.expectKeyword("default");
+        break :blk .generated_by_default;
+    };
+    try cursor.expectKeyword("as");
+    try cursor.expectKeyword("identity");
+
+    var options: ddl_plan.SequenceOptions = .{};
+    errdefer options.deinit(alloc);
+    if (cursor.matchToken(.lparen) != null) {
+        while (!cursor.peekKind(.rparen)) {
+            try parseIdentitySequenceOptionAlloc(alloc, tokens, pos, &options);
+        }
+        try cursor.expectToken(.rparen);
+    }
+    return .{ .kind = kind, .options = options };
+}
+
 pub fn parseCreateEnumTypeCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2309,6 +2706,39 @@ pub fn parseDropEnumTypeCatalogTailAlloc(
     try parseAdapterNoopStatementEnd(cursor);
     type_transferred = true;
     return .{ .type_name = type_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseCreateDomainHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateDomainHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("domain");
+    if (cursor.matchKeyword("if")) return error.UnsupportedSqlShape;
+    const domain_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var domain_transferred = false;
+    errdefer if (!domain_transferred) alloc.free(domain_name);
+    try cursor.expectKeyword("as");
+
+    domain_transferred = true;
+    return .{ .domain_name = domain_name };
+}
+
+pub fn parseAlterDomainHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterDomainHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("domain");
+    if (cursor.matchKeyword("if")) return error.UnsupportedSqlShape;
+    const domain_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var domain_transferred = false;
+    errdefer if (!domain_transferred) alloc.free(domain_name);
+
+    domain_transferred = true;
+    return .{ .domain_name = domain_name };
 }
 
 pub fn parseDropDomainCatalogTailAlloc(
@@ -2432,6 +2862,924 @@ pub fn parseDropIndexCatalogTailAlloc(
     return .{ .index_name = index_name, .if_exists = if_exists };
 }
 
+pub fn parseAlterTableHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("table");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    table_transferred = true;
+    return .{ .table_name = table_name, .if_exists = if_exists };
+}
+
+pub fn parseAlterTableValidateConstraintOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableValidateConstraintSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("validate");
+    try cursor.expectKeyword("constraint");
+    const constraint_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var constraint_transferred = false;
+    errdefer if (!constraint_transferred) alloc.free(constraint_name);
+
+    constraint_transferred = true;
+    return .{ .constraint_name = constraint_name };
+}
+
+pub fn parseAlterTableRenameOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableRenameOperationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("rename");
+    const target: AlterTableRenameTargetSyntax = if (cursor.matchKeyword("constraint"))
+        .constraint
+    else blk: {
+        _ = cursor.matchKeyword("column");
+        break :blk .column;
+    };
+
+    const old_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var old_transferred = false;
+    errdefer if (!old_transferred) alloc.free(old_name);
+    try cursor.expectKeyword("to");
+    const new_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var new_transferred = false;
+    errdefer if (!new_transferred) alloc.free(new_name);
+
+    old_transferred = true;
+    new_transferred = true;
+    return .{ .target = target, .old_name = old_name, .new_name = new_name };
+}
+
+pub fn parseAlterTableDropOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableDropOperationSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("drop");
+    const target: AlterTableDropTargetSyntax = if (cursor.matchKeyword("constraint"))
+        .constraint
+    else blk: {
+        _ = cursor.matchKeyword("column");
+        break :blk .column;
+    };
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+
+    var dependency_mode: ddl_plan.DropDependencyMode = if (target == .constraint) .restrict else .cascade;
+    if (cursor.matchKeyword("cascade")) {
+        dependency_mode = .cascade;
+    } else if (cursor.matchKeyword("restrict")) {
+        dependency_mode = .restrict;
+    }
+
+    name_transferred = true;
+    return .{
+        .target = target,
+        .name = name,
+        .if_exists = if_exists,
+        .dependency_mode = dependency_mode,
+    };
+}
+
+pub fn parseAlterTableColumnNullabilityOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableColumnNullabilitySyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("alter");
+    _ = cursor.matchKeyword("column");
+    const column_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+
+    const nullable: bool = if (cursor.matchKeyword("set")) blk: {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("null");
+        break :blk false;
+    } else if (cursor.matchKeyword("drop")) blk: {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("null");
+        break :blk true;
+    } else return error.UnsupportedSqlShape;
+
+    column_transferred = true;
+    return .{ .column_name = column_name, .nullable = nullable };
+}
+
+pub fn parseAlterTableColumnDefaultOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableColumnDefaultSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("alter");
+    _ = cursor.matchKeyword("column");
+    const column_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+
+    const action: AlterTableColumnDefaultActionSyntax = if (cursor.matchKeyword("set")) blk: {
+        try cursor.expectKeyword("default");
+        break :blk .set;
+    } else if (cursor.matchKeyword("drop")) blk: {
+        try cursor.expectKeyword("default");
+        break :blk .drop;
+    } else return error.UnsupportedSqlShape;
+
+    column_transferred = true;
+    return .{ .column_name = column_name, .action = action };
+}
+
+pub fn parseAlterTableColumnTypeHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableColumnTypeHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("alter");
+    _ = cursor.matchKeyword("column");
+    const column_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+
+    if (cursor.matchKeyword("set")) {
+        try cursor.expectKeyword("data");
+        try cursor.expectKeyword("type");
+    } else {
+        try cursor.expectKeyword("type");
+    }
+
+    column_transferred = true;
+    return .{ .column_name = column_name };
+}
+
+pub fn parseOptionalAlterTableColumnUsing(
+    tokens: []const Token,
+    pos: *usize,
+) !?AlterTableColumnUsingSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("using")) return null;
+    const wrapped = cursor.matchToken(.lparen) != null;
+    const using_column = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (wrapped) try cursor.expectToken(.rparen);
+    return .{ .column_name = using_column.text, .wrapped = wrapped };
+}
+
+pub fn parseAlterTableAddColumnHeader(
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableAddColumnHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("add");
+    try cursor.expectKeyword("column");
+    const if_not_exists = try parseOptionalIfNotExists(cursor);
+    return .{ .if_not_exists = if_not_exists };
+}
+
+pub fn parseAlterTableAddOperationPrefixAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterTableAddOperationPrefixSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("add");
+    if (cursor.matchKeyword("period")) return .{ .kind = .period };
+
+    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
+        try parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        null;
+    var constraint_name_transferred = false;
+    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
+
+    const kind: AlterTableAddOperationKindSyntax = if (cursor.peekKeyword("primary")) blk: {
+        break :blk .primary_key;
+    } else if (cursor.peekKeyword("unique")) blk: {
+        break :blk .unique;
+    } else if (cursor.peekKeyword("foreign")) blk: {
+        break :blk .foreign_key;
+    } else if (cursor.peekKeyword("check")) blk: {
+        break :blk .check;
+    } else {
+        return error.UnsupportedSqlShape;
+    };
+
+    constraint_name_transferred = true;
+    return .{
+        .kind = kind,
+        .constraint_name = constraint_name,
+    };
+}
+
+pub fn parseIdentityAllocatorTableHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !IdentityAllocatorTableHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("table");
+    if (cursor.matchKeyword("if")) return error.UnsupportedSqlShape;
+
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectToken(.lparen);
+
+    const column_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+
+    table_transferred = true;
+    column_transferred = true;
+    return .{ .table_name = table_name, .column_name = column_name };
+}
+
+pub fn parseCreateIndexHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateIndexHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("index");
+    _ = cursor.matchKeyword("concurrently");
+    const if_not_exists = try parseOptionalIfNotExists(cursor);
+
+    const index_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var index_transferred = false;
+    errdefer if (!index_transferred) alloc.free(index_name);
+    try cursor.expectKeyword("on");
+    const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    var method: ddl_plan.DdlIndexMethod = .btree;
+    if (cursor.matchKeyword("using")) {
+        const method_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+        if (std.ascii.eqlIgnoreCase(method_token.text, "btree")) {
+            method = .btree;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "gin")) {
+            method = .gin;
+        } else return error.UnsupportedSqlShape;
+    }
+
+    index_transferred = true;
+    table_transferred = true;
+    return .{
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = if_not_exists,
+        .method = method,
+    };
+}
+
+pub fn parseCreateIndexElementSuffix(
+    tokens: []const Token,
+    pos: *usize,
+    method: ddl_plan.DdlIndexMethod,
+    allow_opclass: bool,
+) !CreateIndexElementSuffixSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var suffix: CreateIndexElementSuffixSyntax = .{};
+    if (allow_opclass and method == .gin and cursor.peekKind(.identifier)) {
+        const opclass_token = cursor.matchToken(.identifier) orelse unreachable;
+        if (std.ascii.eqlIgnoreCase(opclass_token.text, "jsonb_path_ops")) {
+            suffix.opclass = .jsonb_path_ops;
+        } else if (std.ascii.eqlIgnoreCase(opclass_token.text, "array_ops")) {
+            suffix.opclass = .array_ops;
+        } else return error.UnsupportedSqlShape;
+    }
+
+    if (cursor.peekKind(.lparen)) return error.UnsupportedSqlShape;
+    if (cursor.matchKeyword("asc")) {
+        suffix.order_direction = .asc;
+    } else if (cursor.matchKeyword("desc")) {
+        suffix.order_direction = .desc;
+    }
+
+    if (cursor.matchKeyword("nulls")) {
+        if (cursor.matchKeyword("first")) {
+            suffix.nulls_order = .first;
+        } else if (cursor.matchKeyword("last")) {
+            suffix.nulls_order = .last;
+        } else return error.UnsupportedSqlShape;
+    }
+
+    return suffix;
+}
+
+pub fn consumeOptionalDdlNotValid(tokens: []const Token, pos: *usize) bool {
+    if (!peekDdlNotValid(tokens, pos.*)) return false;
+    pos.* += 2;
+    return true;
+}
+
+pub fn parseOptionalDdlUniqueNullsDistinct(tokens: []const Token, pos: *usize) !?bool {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("nulls")) return null;
+    const not_distinct = cursor.matchKeyword("not");
+    try cursor.expectKeyword("distinct");
+    return not_distinct;
+}
+
+pub fn consumeOptionalDdlImmediateConstraintTiming(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("deferrable")) return error.UnsupportedSqlShape;
+    const checkpoint = cursor.checkpoint();
+    if (!cursor.matchKeyword("not")) return;
+    if (!cursor.matchKeyword("deferrable")) {
+        cursor.restore(checkpoint);
+        return;
+    }
+    if (cursor.matchKeyword("initially")) {
+        if (cursor.matchKeyword("deferred")) return error.UnsupportedSqlShape;
+        try cursor.expectKeyword("immediate");
+    }
+}
+
+pub fn peekDdlNotValid(tokens: []const Token, pos: usize) bool {
+    if (pos + 1 >= tokens.len) return false;
+    const not_token = tokens[pos];
+    const valid_token = tokens[pos + 1];
+    return not_token.kind == .identifier and valid_token.kind == .identifier and
+        std.ascii.eqlIgnoreCase(not_token.text, "not") and
+        std.ascii.eqlIgnoreCase(valid_token.text, "valid");
+}
+
+pub fn parseDdlColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    while (true) {
+        const column = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var transferred = false;
+        errdefer if (!transferred) alloc.free(column);
+        try columns.append(alloc, column);
+        transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    return try columns.toOwnedSlice(alloc);
+}
+
+pub fn parseOptionalDdlConstraintIncludeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("include")) return &.{};
+    return try parseDdlColumnListAlloc(alloc, tokens, pos);
+}
+
+pub fn parseDdlTemporalColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DdlTemporalColumnListSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    var without_overlaps_period: ?[]const u8 = null;
+    errdefer if (without_overlaps_period) |period| alloc.free(period);
+    while (true) {
+        const column = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var column_transferred = false;
+        errdefer if (!column_transferred) alloc.free(column);
+        if (cursor.matchKeyword("without")) {
+            try cursor.expectKeyword("overlaps");
+            if (without_overlaps_period != null) return error.UnsupportedSqlShape;
+            without_overlaps_period = column;
+            column_transferred = true;
+        } else {
+            try columns.append(alloc, column);
+            column_transferred = true;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    const owned_columns = try columns.toOwnedSlice(alloc);
+    errdefer freeStringSlice(alloc, owned_columns);
+    const period = without_overlaps_period;
+    without_overlaps_period = null;
+    return .{ .columns = owned_columns, .without_overlaps_period = period };
+}
+
+pub fn parseDdlForeignKeyColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DdlForeignKeyColumnListSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    var period: ?[]const u8 = null;
+    errdefer if (period) |value| alloc.free(value);
+    while (true) {
+        if (cursor.matchKeyword("period")) {
+            if (period != null) return error.UnsupportedSqlShape;
+            period = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        } else {
+            const column = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            var transferred = false;
+            errdefer if (!transferred) alloc.free(column);
+            try columns.append(alloc, column);
+            transferred = true;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    const owned_columns = try columns.toOwnedSlice(alloc);
+    errdefer freeStringSlice(alloc, owned_columns);
+    const owned_period = period;
+    period = null;
+    return .{ .columns = owned_columns, .period = owned_period };
+}
+
+pub fn parseDdlPeriodConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DdlPeriodSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("for");
+    const name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    try cursor.expectToken(.lparen);
+    const start_column = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var start_transferred = false;
+    errdefer if (!start_transferred) alloc.free(start_column);
+    try cursor.expectToken(.comma);
+    const end_column = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var end_transferred = false;
+    errdefer if (!end_transferred) alloc.free(end_column);
+    try cursor.expectToken(.rparen);
+
+    name_transferred = true;
+    start_transferred = true;
+    end_transferred = true;
+    return .{ .name = name, .start_column = start_column, .end_column = end_column };
+}
+
+pub fn consumeDdlStoredGeneratedValuePrefix(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("always");
+    try cursor.expectKeyword("as");
+    try cursor.expectToken(.lparen);
+}
+
+pub fn consumeDdlStoredGeneratedValueSuffix(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.rparen);
+    try cursor.expectKeyword("stored");
+}
+
+pub fn parseDdlStoredGeneratedValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !runtime_schema.RelationalGeneratedValue {
+    try consumeDdlStoredGeneratedValuePrefix(tokens, pos);
+    const generated = try parseDdlGeneratedExpressionAlloc(alloc, tokens, pos);
+    var generated_transferred = false;
+    errdefer if (!generated_transferred) freeDdlGeneratedValue(alloc, generated);
+    try consumeDdlStoredGeneratedValueSuffix(tokens, pos);
+    generated_transferred = true;
+    return generated;
+}
+
+pub fn peekDdlIndexElementExpression(
+    tokens: []const Token,
+    pos: usize,
+    include_generated_concat: bool,
+) bool {
+    var scan = pos;
+    while (scan < tokens.len and tokens[scan].kind == .lparen) : (scan += 1) {}
+    if (scan >= tokens.len or tokens[scan].kind != .identifier) return false;
+    const text = tokens[scan].text;
+    if (std.ascii.eqlIgnoreCase(text, "lower") or
+        std.ascii.eqlIgnoreCase(text, "upper") or
+        sqlKeywordIsMd5Function(text))
+    {
+        return true;
+    }
+    return include_generated_concat and
+        (std.ascii.eqlIgnoreCase(text, "concat") or std.ascii.eqlIgnoreCase(text, "concat_ws"));
+}
+
+pub fn consumeDdlIndexExpressionWrappers(tokens: []const Token, pos: *usize) usize {
+    var count: usize = 0;
+    while (pos.* < tokens.len and tokens[pos.*].kind == .lparen) {
+        pos.* += 1;
+        count += 1;
+    }
+    return count;
+}
+
+pub fn closeDdlIndexExpressionWrappers(tokens: []const Token, pos: *usize, count: usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var remaining = count;
+    while (remaining > 0) : (remaining -= 1) {
+        try cursor.expectToken(.rparen);
+    }
+}
+
+pub fn parseDdlUniqueExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !runtime_schema.UniqueExpression {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const op: runtime_schema.UniqueExpressionOp = if (cursor.matchKeyword("lower"))
+        .lower
+    else if (cursor.matchKeyword("upper"))
+        .upper
+    else blk: {
+        if (cursor.matchIdentifierIf(sqlKeywordIsMd5Function) == null) return error.UnsupportedSqlShape;
+        break :blk .md5;
+    };
+    try cursor.expectToken(.lparen);
+    const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try cursor.expectToken(.rparen);
+    field_transferred = true;
+    return .{ .op = op, .field = field };
+}
+
+pub fn parseDdlGeneratedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !runtime_schema.RelationalGeneratedValue {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.peekKeyword("lower") or cursor.peekKeyword("upper") or cursor.peekFunctionCallIf(sqlKeywordIsMd5Function)) {
+        const op: runtime_schema.RelationalGeneratedOp = if (cursor.matchKeyword("lower"))
+            .lower
+        else if (cursor.matchKeyword("upper"))
+            .upper
+        else blk: {
+            if (cursor.matchIdentifierIf(sqlKeywordIsMd5Function) == null) return error.UnsupportedSqlShape;
+            break :blk .md5;
+        };
+        try cursor.expectToken(.lparen);
+        const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try cursor.expectToken(.rparen);
+        const separator = try alloc.dupe(u8, "");
+        var separator_transferred = false;
+        errdefer if (!separator_transferred) alloc.free(separator);
+        field_transferred = true;
+        separator_transferred = true;
+        return .{ .op = op, .field = field, .separator = separator };
+    }
+    if (cursor.matchKeyword("concat")) return try parseDdlGeneratedConcatExpressionAlloc(alloc, cursor, tokens, pos, .concat);
+    if (cursor.matchKeyword("concat_ws")) return try parseDdlGeneratedConcatExpressionAlloc(alloc, cursor, tokens, pos, .concat_ws);
+    return error.UnsupportedSqlShape;
+}
+
+fn parseDdlGeneratedConcatExpressionAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+    op: runtime_schema.RelationalGeneratedOp,
+) !runtime_schema.RelationalGeneratedValue {
+    try cursor.expectToken(.lparen);
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &fields);
+
+    var separator: ?[]const u8 = null;
+    errdefer if (separator) |value| alloc.free(@constCast(value));
+    if (op == .concat_ws) {
+        const separator_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+        separator = try alloc.dupe(u8, separator_token.text);
+        try cursor.expectToken(.comma);
+    }
+
+    const first = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var first_transferred = false;
+    errdefer if (!first_transferred) alloc.free(first);
+    try fields.append(alloc, first);
+    first_transferred = true;
+
+    while (cursor.matchToken(.comma) != null) {
+        if (op == .concat) {
+            if (cursor.matchToken(.string)) |token| {
+                if (separator) |existing| {
+                    if (!std.mem.eql(u8, existing, token.text)) return error.UnsupportedSqlShape;
+                } else {
+                    separator = try alloc.dupe(u8, token.text);
+                }
+                try cursor.expectToken(.comma);
+            }
+        } else if (separator == null) {
+            separator = try alloc.dupe(u8, "");
+        }
+        const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try fields.append(alloc, field);
+        field_transferred = true;
+    }
+    try cursor.expectToken(.rparen);
+    if (fields.items.len < 2) return error.UnsupportedSqlShape;
+
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    var fields_transferred = false;
+    errdefer if (!fields_transferred) freeStringSlice(alloc, owned_fields);
+    const owned_separator = separator orelse try alloc.dupe(u8, "");
+    separator = null;
+    fields_transferred = true;
+    return .{ .op = op, .fields = owned_fields, .separator = owned_separator };
+}
+
+pub fn parseOptionalDdlKnownDefault(tokens: []const Token, pos: *usize) !?DdlKnownDefaultSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("null")) return .null_literal;
+    if (cursor.matchKeyword("gen_random_uuid") or cursor.matchKeyword("uuid_generate_v4")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectToken(.rparen);
+        return .uuid_v4;
+    }
+    if (cursor.matchKeyword("now")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectToken(.rparen);
+        return .now_ns;
+    }
+    if (cursor.matchKeyword("current_timestamp")) {
+        try parseOptionalCurrentTimestampPrecision(tokens, pos);
+        return .now_ns;
+    }
+    if (cursor.matchKeyword("current_date")) return .current_date_ns;
+    return null;
+}
+
+pub fn parseDdlForeignKeyOptions(tokens: []const Token, pos: *usize) !DdlForeignKeyOptionsSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var options: DdlForeignKeyOptionsSyntax = .{};
+    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon)) {
+        if (peekDdlNotValid(tokens, pos.*)) break;
+        if (cursor.matchKeyword("on")) {
+            if (cursor.matchKeyword("delete")) {
+                options.on_delete = try parseDdlForeignKeyActionSyntax(cursor);
+            } else if (cursor.matchKeyword("update")) {
+                options.on_update = try parseDdlForeignKeyActionSyntax(cursor);
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (cursor.matchKeyword("deferrable")) {
+            options.deferrable = true;
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("deferrable");
+            options.deferrable = false;
+        } else if (cursor.matchKeyword("initially")) {
+            if (cursor.matchKeyword("deferred")) {
+                options.timing = .deferred;
+                options.deferrable = true;
+            } else {
+                try cursor.expectKeyword("immediate");
+                options.timing = .immediate;
+            }
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    return options;
+}
+
+fn parseDdlForeignKeyActionSyntax(cursor: parser.Cursor) !DdlForeignKeyActionSyntax {
+    if (cursor.matchKeyword("cascade")) return .cascade;
+    if (cursor.matchKeyword("restrict")) return .restrict;
+    if (cursor.matchKeyword("no")) {
+        try cursor.expectKeyword("action");
+        return .no_action;
+    }
+    if (cursor.matchKeyword("set")) {
+        try cursor.expectKeyword("null");
+        return .set_null;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseOptionalDdlCollationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !?[]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("collate")) return null;
+    const first = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (std.mem.endsWith(u8, first.text, ".")) {
+        const second = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ first.text, second.text });
+    }
+    return try alloc.dupe(u8, first.text);
+}
+
+pub fn parseOptionalCurrentTimestampPrecision(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.lparen) == null) return;
+    const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    const precision = std.fmt.parseUnsigned(u8, token.text, 10) catch return error.UnsupportedSqlShape;
+    if (precision > 6) return error.UnsupportedSqlShape;
+    try cursor.expectToken(.rparen);
+}
+
+pub fn parseDdlType(tokens: []const Token, pos: *usize) !DdlTypeSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const first = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const base = ddlBaseTypeForName(first.text) orelse blk: {
+        if (std.ascii.eqlIgnoreCase(first.text, "character")) {
+            try cursor.expectKeyword("varying");
+            break :blk runtime_schema.AntflyType.keyword;
+        }
+        if (std.ascii.eqlIgnoreCase(first.text, "double")) {
+            try cursor.expectKeyword("precision");
+            break :blk runtime_schema.AntflyType.numeric;
+        }
+        if (std.ascii.eqlIgnoreCase(first.text, "timestamp")) {
+            if (cursor.matchKeyword("with")) {
+                try cursor.expectKeyword("time");
+                try cursor.expectKeyword("zone");
+            } else if (cursor.matchKeyword("without")) {
+                try cursor.expectKeyword("time");
+                try cursor.expectKeyword("zone");
+            }
+            break :blk runtime_schema.AntflyType.datetime;
+        }
+        return error.UnsupportedSqlShape;
+    };
+
+    if (cursor.peekKind(.lparen)) try skipParenthesizedTokens(cursor);
+    const is_array = if (cursor.matchToken(.lbracket) != null) blk: {
+        try cursor.expectToken(.rbracket);
+        break :blk true;
+    } else false;
+    if (!is_array) return .{ .field_type = base };
+    if (base == .json or base == .array or base == .blob) return error.UnsupportedSqlShape;
+    return .{ .field_type = .array, .array_item_type = base };
+}
+
+fn ddlBaseTypeForName(name: []const u8) ?runtime_schema.AntflyType {
+    if (std.ascii.eqlIgnoreCase(name, "uuid")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "text")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "varchar")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "citext")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "integer")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int4")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "bigint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int8")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "smallint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "numeric")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "decimal")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "real")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "float4")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "float8")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "boolean")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "bool")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "date")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "timestamptz")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "json")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "jsonb")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "bytea")) return .blob;
+    return null;
+}
+
+fn skipParenthesizedTokens(cursor: parser.Cursor) !void {
+    try cursor.expectToken(.lparen);
+    var depth: usize = 1;
+    while (depth > 0) {
+        if (cursor.atEnd()) return error.UnsupportedSqlShape;
+        if (cursor.matchToken(.lparen) != null) {
+            depth += 1;
+        } else if (cursor.matchToken(.rparen) != null) {
+            depth -= 1;
+        } else {
+            try cursor.advance(1);
+        }
+    }
+}
+
+pub fn parseCreateTableDefinitionHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateTableDefinitionHeaderSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("table");
+    const if_not_exists = try parseOptionalIfNotExists(cursor);
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectToken(.lparen);
+
+    table_transferred = true;
+    return .{ .table_name = table_name, .if_not_exists = if_not_exists };
+}
+
+pub fn parseCreateTableElementPrefixAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateTableElementPrefixSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
+        try parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        null;
+    var constraint_name_transferred = false;
+    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
+
+    const kind: CreateTableElementKindSyntax = if (cursor.peekKeyword("period")) blk: {
+        break :blk .period;
+    } else if (cursor.peekKeyword("primary")) blk: {
+        break :blk .primary_key;
+    } else if (cursor.peekKeyword("unique")) blk: {
+        break :blk .unique;
+    } else if (cursor.peekKeyword("foreign")) blk: {
+        break :blk .foreign_key;
+    } else if (cursor.peekKeyword("check")) blk: {
+        break :blk .check;
+    } else blk: {
+        if (constraint_name != null) return error.UnsupportedSqlShape;
+        break :blk .column;
+    };
+
+    constraint_name_transferred = true;
+    return .{
+        .kind = kind,
+        .constraint_name = constraint_name,
+    };
+}
+
+pub fn parseCreateTableColumnConstraintPrefixAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateTableColumnConstraintPrefixSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
+        try parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        null;
+    var constraint_name_transferred = false;
+    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
+
+    const kind: CreateTableColumnConstraintKindSyntax = if (cursor.peekKeyword("primary")) blk: {
+        break :blk .primary_key;
+    } else if (cursor.peekKeyword("unique")) blk: {
+        break :blk .unique;
+    } else if (cursor.peekKeyword("check")) blk: {
+        break :blk .check;
+    } else if (cursor.peekKeyword("references")) blk: {
+        break :blk .references;
+    } else {
+        return error.UnsupportedSqlShape;
+    };
+
+    constraint_name_transferred = true;
+    return .{
+        .kind = kind,
+        .constraint_name = constraint_name,
+    };
+}
+
 pub fn parseCreateTableCloneCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2514,6 +3862,147 @@ fn parseTableCloneOption(cursor: parser.Cursor, options: *TableCloneOptions, inc
         return;
     }
     return error.UnsupportedSqlShape;
+}
+
+pub fn parseCreateTablePartitionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateTablePartitionPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp") or cursor.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("table");
+    if (try parseOptionalIfNotExists(cursor)) return error.UnsupportedSqlShape;
+
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectKeyword("partition");
+    try cursor.expectKeyword("of");
+    const parent_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var parent_transferred = false;
+    errdefer if (!parent_transferred) alloc.free(parent_table_name);
+    const bounds = try parseTablePartitionBoundsAlloc(alloc, cursor, tokens, pos);
+    var bounds_transferred = false;
+    errdefer if (!bounds_transferred) {
+        var mutable_bounds = bounds;
+        mutable_bounds.deinit(alloc);
+    };
+    try parseAdapterNoopStatementEnd(cursor);
+
+    table_transferred = true;
+    parent_transferred = true;
+    bounds_transferred = true;
+    return .{
+        .table_name = table_name,
+        .parent_table_name = parent_table_name,
+        .bounds = bounds,
+    };
+}
+
+pub fn parseCreatePartitionedTableCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreatePartitionedTableTailSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("partition");
+    try cursor.expectKeyword("by");
+    const method: ddl_plan.TablePartitionMethod = if (cursor.matchKeyword("range"))
+        .range
+    else
+        return error.UnsupportedSqlShape;
+    const keys = try parseParenthesizedIdentifierListAlloc(alloc, cursor, tokens, pos);
+    var keys_transferred = false;
+    errdefer if (!keys_transferred) freeStringSlice(alloc, keys);
+    try parseAdapterNoopStatementEnd(cursor);
+
+    keys_transferred = true;
+    return .{
+        .method = method,
+        .keys = keys,
+    };
+}
+
+pub fn parseAlterTablePartitionCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TablePartitionCatalogPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("table");
+    const parent_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var parent_transferred = false;
+    errdefer if (!parent_transferred) alloc.free(parent_table_name);
+
+    if (cursor.matchKeyword("attach")) {
+        try cursor.expectKeyword("partition");
+        const partition_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+        var partition_transferred = false;
+        errdefer if (!partition_transferred) alloc.free(partition_table_name);
+        const bounds = try parseTablePartitionBoundsAlloc(alloc, cursor, tokens, pos);
+        var bounds_transferred = false;
+        errdefer if (!bounds_transferred) {
+            var mutable_bounds = bounds;
+            mutable_bounds.deinit(alloc);
+        };
+        try parseAdapterNoopStatementEnd(cursor);
+
+        parent_transferred = true;
+        partition_transferred = true;
+        bounds_transferred = true;
+        return .{ .attach = .{
+            .parent_table_name = parent_table_name,
+            .partition_table_name = partition_table_name,
+            .bounds = bounds,
+        } };
+    }
+
+    if (cursor.matchKeyword("detach")) {
+        try cursor.expectKeyword("partition");
+        const partition_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+        var partition_transferred = false;
+        errdefer if (!partition_transferred) alloc.free(partition_table_name);
+        try parseAdapterNoopStatementEnd(cursor);
+
+        parent_transferred = true;
+        partition_transferred = true;
+        return .{ .detach = .{
+            .parent_table_name = parent_table_name,
+            .partition_table_name = partition_table_name,
+        } };
+    }
+
+    return error.UnsupportedSqlShape;
+}
+
+fn parseTablePartitionBoundsAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !TablePartitionBounds {
+    try cursor.expectKeyword("for");
+    try cursor.expectKeyword("values");
+    try cursor.expectKeyword("from");
+    try cursor.expectToken(.lparen);
+    const lower_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var lower_transferred = false;
+    errdefer if (!lower_transferred) alloc.free(lower_json);
+    try cursor.expectToken(.rparen);
+    try cursor.expectKeyword("to");
+    try cursor.expectToken(.lparen);
+    const upper_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var upper_transferred = false;
+    errdefer if (!upper_transferred) alloc.free(upper_json);
+    try cursor.expectToken(.rparen);
+
+    lower_transferred = true;
+    upper_transferred = true;
+    return .{
+        .lower_json = lower_json,
+        .upper_json = upper_json,
+    };
 }
 
 pub fn parseCreateViewCatalogTailAlloc(
@@ -3027,6 +4516,36 @@ pub fn parseUnlistenNotificationTailAlloc(
     return .{ .channel_name = channel_name };
 }
 
+pub fn parseTruncateMutationSourceSqlAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TruncateMutationSourceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("truncate");
+    _ = cursor.matchKeyword("table");
+    const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+
+    var restart_identity = false;
+    if (cursor.matchKeyword("restart")) {
+        try cursor.expectKeyword("identity");
+        restart_identity = true;
+    } else if (cursor.matchKeyword("continue")) {
+        try cursor.expectKeyword("identity");
+    } else if (cursor.matchKeyword("identity")) {
+        return error.UnsupportedSqlShape;
+    }
+    if (cursor.matchKeyword("cascade")) return error.UnsupportedSqlShape;
+    _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+
+    table_transferred = true;
+    return .{ .table_name = table_name, .restart_identity = restart_identity };
+}
+
 pub fn parseCreatePublicationCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3358,6 +4877,13 @@ pub fn parseDropCastCatalogTailAlloc(
     return .{ .source_type = source_type, .target_type = target_type };
 }
 
+pub fn parseRelationLifetimePrefix(tokens: []const Token, pos: *usize) !RelationLifetimePrefixSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp")) return .{ .kind = .temporary };
+    if (cursor.matchKeyword("unlogged")) return .{ .kind = .unlogged };
+    return error.UnsupportedSqlShape;
+}
+
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
     if (dot == 0) return error.UnsupportedSqlShape;
@@ -3396,6 +4922,44 @@ pub fn parseIdentifierListAlloc(
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseOptionalCteColumnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    if (parser.matchToken(tokens, pos, .lparen) == null) return &.{};
+
+    var aliases = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &aliases);
+    while (true) {
+        const alias = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var alias_transferred = false;
+        errdefer if (!alias_transferred) alloc.free(@constCast(alias));
+        for (aliases.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, alias)) return error.UnsupportedSqlShape;
+        }
+        try aliases.append(alloc, alias);
+        alias_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+
+    try parser.expectToken(tokens, pos, .rparen);
+    return try aliases.toOwnedSlice(alloc);
+}
+
+fn parseParenthesizedIdentifierListAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    try cursor.expectToken(.lparen);
+    const values = try parseIdentifierListAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, values);
+    try cursor.expectToken(.rparen);
+    return values;
 }
 
 pub fn parseSqlObjectIdentifierOwnedAlloc(
@@ -3898,6 +5462,12 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
+fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.RelationalGeneratedValue) void {
+    if (generated.field) |field| alloc.free(@constCast(field));
+    freeStringSlice(alloc, generated.fields);
+    alloc.free(@constCast(generated.separator));
+}
+
 fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: ddl_plan.SequenceAlterOperation) void {
     switch (operation) {
         .set_type => |value| alloc.free(@constCast(value)),
@@ -4004,6 +5574,16 @@ fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
         std.ascii.eqlIgnoreCase(setting, "check_function_bodies") or
         std.ascii.eqlIgnoreCase(setting, "xmloption") or
         std.ascii.eqlIgnoreCase(setting, "client_min_messages");
+}
+
+fn sqlSessionNamespaceNameValid(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const first = name[0];
+    if (!(std.ascii.isAlphabetic(first) or first == '_')) return false;
+    for (name[1..]) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
+    }
+    return true;
 }
 
 fn adapterNoopResetSessionSettingAllowed(setting: []const u8) bool {
@@ -4206,10 +5786,16 @@ test "sql adapter grammar accepts allowlisted adapter session cleanup" {
 test "sql adapter grammar rejects semantic session changes as noops" {
     const alloc = std.testing.allocator;
 
-    var tenant_path_tokens = try lexer.tokenizeAlloc(alloc, "search_path TO tenant_schema;");
+    var tenant_path_tokens = try lexer.tokenizeAlloc(alloc, "search_path TO tenant_schema, public;");
     defer lexer.freeTokens(alloc, &tenant_path_tokens);
     var tenant_path_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopSetStatementTail(tenant_path_tokens.items, &tenant_path_pos));
+    tenant_path_pos = 0;
+    var tenant_path = try parseSetSearchPathTailAlloc(alloc, tenant_path_tokens.items, &tenant_path_pos);
+    defer tenant_path.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tenant_path.namespaces.len);
+    try std.testing.expectEqualStrings("tenant_schema", tenant_path.namespaces[0]);
+    try std.testing.expectEqualStrings("public", tenant_path.namespaces[1]);
 
     var latin1_tokens = try lexer.tokenizeAlloc(alloc, "client_encoding = 'LATIN1';");
     defer lexer.freeTokens(alloc, &latin1_tokens);
@@ -4735,6 +6321,22 @@ test "sql adapter grammar parses enum type catalog tails" {
 test "sql adapter grammar parses domain catalog tails" {
     const alloc = std.testing.allocator;
 
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN public.positive_amount AS numeric CHECK (VALUE > 0);");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateDomainHeaderAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqualStrings("positive_amount", create.domain_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(create_tokens.items[create_pos].text, "numeric"));
+
+    var alter_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN public.positive_amount SET NOT NULL;");
+    defer lexer.freeTokens(alloc, &alter_tokens);
+    var alter_pos: usize = 0;
+    var alter = try parseAlterDomainHeaderAlloc(alloc, alter_tokens.items, &alter_pos);
+    defer alter.deinit(alloc);
+    try std.testing.expectEqualStrings("positive_amount", alter.domain_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(alter_tokens.items[alter_pos].text, "set"));
+
     var drop_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN IF EXISTS public.positive_amount CASCADE;");
     defer lexer.freeTokens(alloc, &drop_tokens);
     var drop_pos: usize = 0;
@@ -4749,6 +6351,11 @@ test "sql adapter grammar parses domain catalog tails" {
     defer lexer.freeTokens(alloc, &multi_tokens);
     var multi_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropDomainCatalogTailAlloc(alloc, multi_tokens.items, &multi_pos));
+
+    var if_not_exists_tokens = try lexer.tokenizeAlloc(alloc, "DOMAIN IF NOT EXISTS positive_amount AS numeric;");
+    defer lexer.freeTokens(alloc, &if_not_exists_tokens);
+    var if_not_exists_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateDomainHeaderAlloc(alloc, if_not_exists_tokens.items, &if_not_exists_pos));
 }
 
 test "sql adapter grammar parses comment metadata catalog tails" {
@@ -4820,6 +6427,1068 @@ test "sql adapter grammar parses drop table and index catalog tails" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseDropTableCatalogTailAlloc(alloc, multi_table_tokens.items, &multi_table_pos));
 }
 
+test "sql adapter grammar parses create index headers" {
+    const alloc = std.testing.allocator;
+
+    var gin_tokens = try lexer.tokenizeAlloc(alloc, "INDEX CONCURRENTLY IF NOT EXISTS public.usage_records_status_idx ON ONLY public.usage_records USING gin (metadata jsonb_path_ops);");
+    defer lexer.freeTokens(alloc, &gin_tokens);
+    var gin_pos: usize = 0;
+    var gin = try parseCreateIndexHeaderAlloc(alloc, gin_tokens.items, &gin_pos);
+    defer gin.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records_status_idx", gin.index_name);
+    try std.testing.expectEqualStrings("usage_records", gin.table_name);
+    try std.testing.expect(gin.if_not_exists);
+    try std.testing.expectEqual(ddl_plan.DdlIndexMethod.gin, gin.method);
+    try std.testing.expect(gin_tokens.items[gin_pos].kind == .lparen);
+
+    var btree_tokens = try lexer.tokenizeAlloc(alloc, "INDEX usage_records_status_idx ON usage_records (status);");
+    defer lexer.freeTokens(alloc, &btree_tokens);
+    var btree_pos: usize = 0;
+    var btree = try parseCreateIndexHeaderAlloc(alloc, btree_tokens.items, &btree_pos);
+    defer btree.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records_status_idx", btree.index_name);
+    try std.testing.expectEqualStrings("usage_records", btree.table_name);
+    try std.testing.expect(!btree.if_not_exists);
+    try std.testing.expectEqual(ddl_plan.DdlIndexMethod.btree, btree.method);
+    try std.testing.expect(btree_tokens.items[btree_pos].kind == .lparen);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "INDEX usage_records_status_idx ON usage_records USING gist (status);");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateIndexHeaderAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+
+    var opclass_tokens = try lexer.tokenizeAlloc(alloc, "metadata jsonb_path_ops)");
+    defer lexer.freeTokens(alloc, &opclass_tokens);
+    var opclass_pos: usize = 1;
+    const opclass = try parseCreateIndexElementSuffix(opclass_tokens.items, &opclass_pos, .gin, true);
+    try std.testing.expectEqual(ddl_plan.DdlIndexOpClass.jsonb_path_ops, opclass.opclass);
+    try std.testing.expectEqual(CreateIndexElementOrderDirectionSyntax.default, opclass.order_direction);
+    try std.testing.expectEqual(CreateIndexElementNullsOrderSyntax.default, opclass.nulls_order);
+    try std.testing.expect(opclass_tokens.items[opclass_pos].kind == .rparen);
+
+    var ordered_tokens = try lexer.tokenizeAlloc(alloc, "status DESC NULLS LAST,");
+    defer lexer.freeTokens(alloc, &ordered_tokens);
+    var ordered_pos: usize = 1;
+    const ordered = try parseCreateIndexElementSuffix(ordered_tokens.items, &ordered_pos, .btree, true);
+    try std.testing.expectEqual(ddl_plan.DdlIndexOpClass.default, ordered.opclass);
+    try std.testing.expectEqual(CreateIndexElementOrderDirectionSyntax.desc, ordered.order_direction);
+    try std.testing.expectEqual(CreateIndexElementNullsOrderSyntax.last, ordered.nulls_order);
+    try std.testing.expect(ordered_tokens.items[ordered_pos].kind == .comma);
+
+    var invalid_nulls_tokens = try lexer.tokenizeAlloc(alloc, "status NULLS MIDDLE)");
+    defer lexer.freeTokens(alloc, &invalid_nulls_tokens);
+    var invalid_nulls_pos: usize = 1;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateIndexElementSuffix(invalid_nulls_tokens.items, &invalid_nulls_pos, .btree, true));
+
+    var invalid_opclass_tokens = try lexer.tokenizeAlloc(alloc, "metadata ASC)");
+    defer lexer.freeTokens(alloc, &invalid_opclass_tokens);
+    var invalid_opclass_pos: usize = 1;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateIndexElementSuffix(invalid_opclass_tokens.items, &invalid_opclass_pos, .gin, true));
+}
+
+test "sql adapter grammar parses ddl constraint suffixes" {
+    const alloc = std.testing.allocator;
+
+    var not_valid_tokens = try lexer.tokenizeAlloc(alloc, "NOT VALID,");
+    defer lexer.freeTokens(alloc, &not_valid_tokens);
+    var not_valid_pos: usize = 0;
+    try std.testing.expect(peekDdlNotValid(not_valid_tokens.items, not_valid_pos));
+    try std.testing.expect(consumeOptionalDdlNotValid(not_valid_tokens.items, &not_valid_pos));
+    try std.testing.expect(not_valid_tokens.items[not_valid_pos].kind == .comma);
+
+    var distinct_tokens = try lexer.tokenizeAlloc(alloc, "NULLS DISTINCT (tenant_id)");
+    defer lexer.freeTokens(alloc, &distinct_tokens);
+    var distinct_pos: usize = 0;
+    try std.testing.expectEqual(false, (try parseOptionalDdlUniqueNullsDistinct(distinct_tokens.items, &distinct_pos)).?);
+    try std.testing.expect(distinct_tokens.items[distinct_pos].kind == .lparen);
+
+    var not_distinct_tokens = try lexer.tokenizeAlloc(alloc, "NULLS NOT DISTINCT (tenant_id)");
+    defer lexer.freeTokens(alloc, &not_distinct_tokens);
+    var not_distinct_pos: usize = 0;
+    try std.testing.expectEqual(true, (try parseOptionalDdlUniqueNullsDistinct(not_distinct_tokens.items, &not_distinct_pos)).?);
+    try std.testing.expect(not_distinct_tokens.items[not_distinct_pos].kind == .lparen);
+
+    var missing_distinct_tokens = try lexer.tokenizeAlloc(alloc, "NULLS NOT (tenant_id)");
+    defer lexer.freeTokens(alloc, &missing_distinct_tokens);
+    var missing_distinct_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlUniqueNullsDistinct(missing_distinct_tokens.items, &missing_distinct_pos));
+
+    var timing_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY IMMEDIATE,");
+    defer lexer.freeTokens(alloc, &timing_tokens);
+    var timing_pos: usize = 0;
+    try consumeOptionalDdlImmediateConstraintTiming(timing_tokens.items, &timing_pos);
+    try std.testing.expect(timing_tokens.items[timing_pos].kind == .comma);
+
+    var deferred_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY DEFERRED,");
+    defer lexer.freeTokens(alloc, &deferred_tokens);
+    var deferred_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, consumeOptionalDdlImmediateConstraintTiming(deferred_tokens.items, &deferred_pos));
+
+    var deferrable_tokens = try lexer.tokenizeAlloc(alloc, "DEFERRABLE,");
+    defer lexer.freeTokens(alloc, &deferrable_tokens);
+    var deferrable_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, consumeOptionalDdlImmediateConstraintTiming(deferrable_tokens.items, &deferrable_pos));
+}
+
+test "sql adapter grammar parses ddl constraint column lists" {
+    const alloc = std.testing.allocator;
+
+    var list_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, usage_id) INCLUDE (status)");
+    defer lexer.freeTokens(alloc, &list_tokens);
+    var list_pos: usize = 0;
+    const columns = try parseDdlColumnListAlloc(alloc, list_tokens.items, &list_pos);
+    defer freeStringSlice(alloc, columns);
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqualStrings("tenant_id", columns[0]);
+    try std.testing.expectEqualStrings("usage_id", columns[1]);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(list_tokens.items[list_pos].text, "include"));
+
+    const include = try parseOptionalDdlConstraintIncludeAlloc(alloc, list_tokens.items, &list_pos);
+    defer freeStringSlice(alloc, include);
+    try std.testing.expectEqual(@as(usize, 1), include.len);
+    try std.testing.expectEqualStrings("status", include[0]);
+    try std.testing.expectEqual(list_tokens.items.len, list_pos);
+
+    var temporal_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, valid_at WITHOUT OVERLAPS)");
+    defer lexer.freeTokens(alloc, &temporal_tokens);
+    var temporal_pos: usize = 0;
+    const temporal = try parseDdlTemporalColumnListAlloc(alloc, temporal_tokens.items, &temporal_pos);
+    defer temporal.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), temporal.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", temporal.columns[0]);
+    try std.testing.expectEqualStrings("valid_at", temporal.without_overlaps_period.?);
+    try std.testing.expectEqual(temporal_tokens.items.len, temporal_pos);
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, tenant_id)");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    const duplicate = try parseDdlColumnListAlloc(alloc, duplicate_tokens.items, &duplicate_pos);
+    defer freeStringSlice(alloc, duplicate);
+    try std.testing.expectEqual(@as(usize, 2), duplicate.len);
+
+    var empty_tokens = try lexer.tokenizeAlloc(alloc, "()");
+    defer lexer.freeTokens(alloc, &empty_tokens);
+    var empty_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlColumnListAlloc(alloc, empty_tokens.items, &empty_pos));
+
+    var double_period_tokens = try lexer.tokenizeAlloc(alloc, "(valid_from WITHOUT OVERLAPS, valid_to WITHOUT OVERLAPS)");
+    defer lexer.freeTokens(alloc, &double_period_tokens);
+    var double_period_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlTemporalColumnListAlloc(alloc, double_period_tokens.items, &double_period_pos));
+}
+
+test "sql adapter grammar parses ddl foreign key options" {
+    const alloc = std.testing.allocator;
+
+    var action_tokens = try lexer.tokenizeAlloc(alloc, "ON DELETE CASCADE ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED NOT VALID");
+    defer lexer.freeTokens(alloc, &action_tokens);
+    var action_pos: usize = 0;
+    const action = try parseDdlForeignKeyOptions(action_tokens.items, &action_pos);
+    try std.testing.expectEqual(DdlForeignKeyActionSyntax.cascade, action.on_delete);
+    try std.testing.expectEqual(DdlForeignKeyActionSyntax.set_null, action.on_update);
+    try std.testing.expect(action.deferrable);
+    try std.testing.expectEqual(DdlForeignKeyTimingSyntax.deferred, action.timing);
+    try std.testing.expect(peekDdlNotValid(action_tokens.items, action_pos));
+
+    var no_action_tokens = try lexer.tokenizeAlloc(alloc, "ON DELETE NO ACTION ON UPDATE RESTRICT,");
+    defer lexer.freeTokens(alloc, &no_action_tokens);
+    var no_action_pos: usize = 0;
+    const no_action = try parseDdlForeignKeyOptions(no_action_tokens.items, &no_action_pos);
+    try std.testing.expectEqual(DdlForeignKeyActionSyntax.no_action, no_action.on_delete);
+    try std.testing.expectEqual(DdlForeignKeyActionSyntax.restrict, no_action.on_update);
+    try std.testing.expect(!no_action.deferrable);
+    try std.testing.expectEqual(DdlForeignKeyTimingSyntax.immediate, no_action.timing);
+    try std.testing.expect(no_action_tokens.items[no_action_pos].kind == .comma);
+
+    var immediate_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY IMMEDIATE)");
+    defer lexer.freeTokens(alloc, &immediate_tokens);
+    var immediate_pos: usize = 0;
+    const immediate = try parseDdlForeignKeyOptions(immediate_tokens.items, &immediate_pos);
+    try std.testing.expect(!immediate.deferrable);
+    try std.testing.expectEqual(DdlForeignKeyTimingSyntax.immediate, immediate.timing);
+    try std.testing.expect(immediate_tokens.items[immediate_pos].kind == .rparen);
+
+    var invalid_action_tokens = try lexer.tokenizeAlloc(alloc, "ON DELETE SET DEFAULT)");
+    defer lexer.freeTokens(alloc, &invalid_action_tokens);
+    var invalid_action_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlForeignKeyOptions(invalid_action_tokens.items, &invalid_action_pos));
+
+    var invalid_on_tokens = try lexer.tokenizeAlloc(alloc, "ON TRUNCATE CASCADE)");
+    defer lexer.freeTokens(alloc, &invalid_on_tokens);
+    var invalid_on_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlForeignKeyOptions(invalid_on_tokens.items, &invalid_on_pos));
+}
+
+test "sql adapter grammar parses ddl foreign key column lists" {
+    const alloc = std.testing.allocator;
+
+    var list_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, customer_id) REFERENCES customers");
+    defer lexer.freeTokens(alloc, &list_tokens);
+    var list_pos: usize = 0;
+    const list = try parseDdlForeignKeyColumnListAlloc(alloc, list_tokens.items, &list_pos);
+    defer list.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), list.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", list.columns[0]);
+    try std.testing.expectEqualStrings("customer_id", list.columns[1]);
+    try std.testing.expect(list.period == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(list_tokens.items[list_pos].text, "references"));
+
+    var temporal_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, PERIOD valid_time)");
+    defer lexer.freeTokens(alloc, &temporal_tokens);
+    var temporal_pos: usize = 0;
+    const temporal = try parseDdlForeignKeyColumnListAlloc(alloc, temporal_tokens.items, &temporal_pos);
+    defer temporal.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), temporal.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", temporal.columns[0]);
+    try std.testing.expectEqualStrings("valid_time", temporal.period.?);
+    try std.testing.expectEqual(temporal_tokens.items.len, temporal_pos);
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, tenant_id)");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    const duplicate = try parseDdlForeignKeyColumnListAlloc(alloc, duplicate_tokens.items, &duplicate_pos);
+    defer duplicate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), duplicate.columns.len);
+
+    var empty_tokens = try lexer.tokenizeAlloc(alloc, "()");
+    defer lexer.freeTokens(alloc, &empty_tokens);
+    var empty_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlForeignKeyColumnListAlloc(alloc, empty_tokens.items, &empty_pos));
+
+    var double_period_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, PERIOD valid_time, PERIOD valid_time_2)");
+    defer lexer.freeTokens(alloc, &double_period_tokens);
+    var double_period_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlForeignKeyColumnListAlloc(alloc, double_period_tokens.items, &double_period_pos));
+}
+
+test "sql adapter grammar parses ddl period constraints" {
+    const alloc = std.testing.allocator;
+
+    var period_tokens = try lexer.tokenizeAlloc(alloc, "FOR valid_time (valid_from, valid_to),");
+    defer lexer.freeTokens(alloc, &period_tokens);
+    var period_pos: usize = 0;
+    const period = try parseDdlPeriodConstraintAlloc(alloc, period_tokens.items, &period_pos);
+    defer period.deinit(alloc);
+    try std.testing.expectEqualStrings("valid_time", period.name);
+    try std.testing.expectEqualStrings("valid_from", period.start_column);
+    try std.testing.expectEqualStrings("valid_to", period.end_column);
+    try std.testing.expect(period_tokens.items[period_pos].kind == .comma);
+
+    var qualified_tokens = try lexer.tokenizeAlloc(alloc, "FOR application_time (sys_from, sys_to)");
+    defer lexer.freeTokens(alloc, &qualified_tokens);
+    var qualified_pos: usize = 0;
+    const qualified = try parseDdlPeriodConstraintAlloc(alloc, qualified_tokens.items, &qualified_pos);
+    defer qualified.deinit(alloc);
+    try std.testing.expectEqualStrings("application_time", qualified.name);
+    try std.testing.expectEqual(qualified_tokens.items.len, qualified_pos);
+
+    var missing_for_tokens = try lexer.tokenizeAlloc(alloc, "valid_time (valid_from, valid_to)");
+    defer lexer.freeTokens(alloc, &missing_for_tokens);
+    var missing_for_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlPeriodConstraintAlloc(alloc, missing_for_tokens.items, &missing_for_pos));
+
+    var missing_end_tokens = try lexer.tokenizeAlloc(alloc, "FOR valid_time (valid_from)");
+    defer lexer.freeTokens(alloc, &missing_end_tokens);
+    var missing_end_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlPeriodConstraintAlloc(alloc, missing_end_tokens.items, &missing_end_pos));
+}
+
+test "sql adapter grammar parses stored generated value wrappers" {
+    const alloc = std.testing.allocator;
+
+    var generated_tokens = try lexer.tokenizeAlloc(alloc, "ALWAYS AS (lower(email)) STORED NOT NULL");
+    defer lexer.freeTokens(alloc, &generated_tokens);
+    var generated_pos: usize = 0;
+    try consumeDdlStoredGeneratedValuePrefix(generated_tokens.items, &generated_pos);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(generated_tokens.items[generated_pos].text, "lower"));
+    while (generated_pos + 1 < generated_tokens.items.len and !std.ascii.eqlIgnoreCase(generated_tokens.items[generated_pos + 1].text, "stored")) generated_pos += 1;
+    try consumeDdlStoredGeneratedValueSuffix(generated_tokens.items, &generated_pos);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(generated_tokens.items[generated_pos].text, "not"));
+
+    var missing_always_tokens = try lexer.tokenizeAlloc(alloc, "AS (lower(email)) STORED");
+    defer lexer.freeTokens(alloc, &missing_always_tokens);
+    var missing_always_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, consumeDdlStoredGeneratedValuePrefix(missing_always_tokens.items, &missing_always_pos));
+
+    var virtual_tokens = try lexer.tokenizeAlloc(alloc, "ALWAYS AS (lower(email)) VIRTUAL");
+    defer lexer.freeTokens(alloc, &virtual_tokens);
+    var virtual_pos: usize = 0;
+    try consumeDdlStoredGeneratedValuePrefix(virtual_tokens.items, &virtual_pos);
+    while (virtual_pos + 1 < virtual_tokens.items.len and !std.ascii.eqlIgnoreCase(virtual_tokens.items[virtual_pos + 1].text, "virtual")) virtual_pos += 1;
+    try std.testing.expectError(error.UnsupportedSqlShape, consumeDdlStoredGeneratedValueSuffix(virtual_tokens.items, &virtual_pos));
+
+    var suffix_without_close_tokens = try lexer.tokenizeAlloc(alloc, "STORED");
+    defer lexer.freeTokens(alloc, &suffix_without_close_tokens);
+    var suffix_without_close_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, consumeDdlStoredGeneratedValueSuffix(suffix_without_close_tokens.items, &suffix_without_close_pos));
+
+    var stored_tokens = try lexer.tokenizeAlloc(alloc, "ALWAYS AS (concat_ws(':', tenant_id, status)) STORED NOT NULL");
+    defer lexer.freeTokens(alloc, &stored_tokens);
+    var stored_pos: usize = 0;
+    const stored = try parseDdlStoredGeneratedValueAlloc(alloc, stored_tokens.items, &stored_pos);
+    defer freeDdlGeneratedValue(alloc, stored);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat_ws, stored.op);
+    try std.testing.expectEqual(@as(usize, 2), stored.fields.len);
+    try std.testing.expectEqualStrings("tenant_id", stored.fields[0]);
+    try std.testing.expectEqualStrings("status", stored.fields[1]);
+    try std.testing.expectEqualStrings(":", stored.separator);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(stored_tokens.items[stored_pos].text, "not"));
+}
+
+test "sql adapter grammar parses ddl generated expressions" {
+    const alloc = std.testing.allocator;
+
+    var lower_tokens = try lexer.tokenizeAlloc(alloc, "lower(email)) STORED");
+    defer lexer.freeTokens(alloc, &lower_tokens);
+    var lower_pos: usize = 0;
+    const lower = try parseDdlGeneratedExpressionAlloc(alloc, lower_tokens.items, &lower_pos);
+    defer freeDdlGeneratedValue(alloc, lower);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, lower.op);
+    try std.testing.expectEqualStrings("email", lower.field.?);
+    try std.testing.expect(lower_tokens.items[lower_pos].kind == .rparen);
+
+    var upper_tokens = try lexer.tokenizeAlloc(alloc, "upper(status)");
+    defer lexer.freeTokens(alloc, &upper_tokens);
+    var upper_pos: usize = 0;
+    const upper = try parseDdlGeneratedExpressionAlloc(alloc, upper_tokens.items, &upper_pos);
+    defer freeDdlGeneratedValue(alloc, upper);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, upper.op);
+    try std.testing.expectEqualStrings("status", upper.field.?);
+    try std.testing.expectEqual(upper_tokens.items.len, upper_pos);
+
+    var md5_tokens = try lexer.tokenizeAlloc(alloc, "md5(request_id)");
+    defer lexer.freeTokens(alloc, &md5_tokens);
+    var md5_pos: usize = 0;
+    const md5 = try parseDdlGeneratedExpressionAlloc(alloc, md5_tokens.items, &md5_pos);
+    defer freeDdlGeneratedValue(alloc, md5);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, md5.op);
+    try std.testing.expectEqualStrings("request_id", md5.field.?);
+
+    var concat_tokens = try lexer.tokenizeAlloc(alloc, "concat(tenant_id, ':', status)");
+    defer lexer.freeTokens(alloc, &concat_tokens);
+    var concat_pos: usize = 0;
+    const concat = try parseDdlGeneratedExpressionAlloc(alloc, concat_tokens.items, &concat_pos);
+    defer freeDdlGeneratedValue(alloc, concat);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, concat.op);
+    try std.testing.expectEqual(@as(usize, 2), concat.fields.len);
+    try std.testing.expectEqualStrings("tenant_id", concat.fields[0]);
+    try std.testing.expectEqualStrings("status", concat.fields[1]);
+    try std.testing.expectEqualStrings(":", concat.separator);
+
+    var concat_ws_tokens = try lexer.tokenizeAlloc(alloc, "concat_ws(':', tenant_id, status)");
+    defer lexer.freeTokens(alloc, &concat_ws_tokens);
+    var concat_ws_pos: usize = 0;
+    const concat_ws = try parseDdlGeneratedExpressionAlloc(alloc, concat_ws_tokens.items, &concat_ws_pos);
+    defer freeDdlGeneratedValue(alloc, concat_ws);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat_ws, concat_ws.op);
+    try std.testing.expectEqual(@as(usize, 2), concat_ws.fields.len);
+    try std.testing.expectEqualStrings(":", concat_ws.separator);
+
+    var single_concat_tokens = try lexer.tokenizeAlloc(alloc, "concat(status)");
+    defer lexer.freeTokens(alloc, &single_concat_tokens);
+    var single_concat_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, single_concat_tokens.items, &single_concat_pos));
+
+    var mismatched_separator_tokens = try lexer.tokenizeAlloc(alloc, "concat(tenant_id, ':', status, '-', id)");
+    defer lexer.freeTokens(alloc, &mismatched_separator_tokens);
+    var mismatched_separator_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, mismatched_separator_tokens.items, &mismatched_separator_pos));
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "replace(status, 'a', 'b')");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlGeneratedExpressionAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses ddl unique expressions" {
+    const alloc = std.testing.allocator;
+
+    var lower_tokens = try lexer.tokenizeAlloc(alloc, "lower(email) WHERE");
+    defer lexer.freeTokens(alloc, &lower_tokens);
+    var lower_pos: usize = 0;
+    const lower = try parseDdlUniqueExpressionAlloc(alloc, lower_tokens.items, &lower_pos);
+    defer alloc.free(lower.field);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, lower.op);
+    try std.testing.expectEqualStrings("email", lower.field);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(lower_tokens.items[lower_pos].text, "where"));
+
+    var upper_tokens = try lexer.tokenizeAlloc(alloc, "upper(status)");
+    defer lexer.freeTokens(alloc, &upper_tokens);
+    var upper_pos: usize = 0;
+    const upper = try parseDdlUniqueExpressionAlloc(alloc, upper_tokens.items, &upper_pos);
+    defer alloc.free(upper.field);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.upper, upper.op);
+    try std.testing.expectEqualStrings("status", upper.field);
+    try std.testing.expectEqual(upper_tokens.items.len, upper_pos);
+
+    var md5_tokens = try lexer.tokenizeAlloc(alloc, "md5(request_id)");
+    defer lexer.freeTokens(alloc, &md5_tokens);
+    var md5_pos: usize = 0;
+    const md5 = try parseDdlUniqueExpressionAlloc(alloc, md5_tokens.items, &md5_pos);
+    defer alloc.free(md5.field);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.md5, md5.op);
+    try std.testing.expectEqualStrings("request_id", md5.field);
+
+    var concat_tokens = try lexer.tokenizeAlloc(alloc, "concat(tenant_id, ':', status)");
+    defer lexer.freeTokens(alloc, &concat_tokens);
+    var concat_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlUniqueExpressionAlloc(alloc, concat_tokens.items, &concat_pos));
+}
+
+test "sql adapter grammar parses ddl index expression wrappers" {
+    const alloc = std.testing.allocator;
+
+    var wrapped_tokens = try lexer.tokenizeAlloc(alloc, "((lower(email))) ASC");
+    defer lexer.freeTokens(alloc, &wrapped_tokens);
+    try std.testing.expect(peekDdlIndexElementExpression(wrapped_tokens.items, 0, false));
+    var wrapped_pos: usize = 0;
+    const wrappers = consumeDdlIndexExpressionWrappers(wrapped_tokens.items, &wrapped_pos);
+    try std.testing.expectEqual(@as(usize, 2), wrappers);
+    const expression = try parseDdlUniqueExpressionAlloc(alloc, wrapped_tokens.items, &wrapped_pos);
+    defer alloc.free(expression.field);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, expression.op);
+    try std.testing.expectEqualStrings("email", expression.field);
+    try closeDdlIndexExpressionWrappers(wrapped_tokens.items, &wrapped_pos, wrappers);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(wrapped_tokens.items[wrapped_pos].text, "asc"));
+
+    var concat_tokens = try lexer.tokenizeAlloc(alloc, "(concat(tenant_id, ':', status))");
+    defer lexer.freeTokens(alloc, &concat_tokens);
+    try std.testing.expect(!peekDdlIndexElementExpression(concat_tokens.items, 0, false));
+    try std.testing.expect(peekDdlIndexElementExpression(concat_tokens.items, 0, true));
+
+    var column_tokens = try lexer.tokenizeAlloc(alloc, "(email)");
+    defer lexer.freeTokens(alloc, &column_tokens);
+    try std.testing.expect(!peekDdlIndexElementExpression(column_tokens.items, 0, true));
+}
+
+test "sql adapter grammar parses ddl collations" {
+    const alloc = std.testing.allocator;
+
+    var simple_tokens = try lexer.tokenizeAlloc(alloc, "COLLATE \"C\" NOT NULL");
+    defer lexer.freeTokens(alloc, &simple_tokens);
+    var simple_pos: usize = 0;
+    const simple = (try parseOptionalDdlCollationAlloc(alloc, simple_tokens.items, &simple_pos)).?;
+    defer alloc.free(simple);
+    try std.testing.expectEqualStrings("C", simple);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(simple_tokens.items[simple_pos].text, "not"));
+
+    var qualified_tokens = try lexer.tokenizeAlloc(alloc, "COLLATE public.en_US DEFAULT 'active'");
+    defer lexer.freeTokens(alloc, &qualified_tokens);
+    var qualified_pos: usize = 0;
+    const qualified = (try parseOptionalDdlCollationAlloc(alloc, qualified_tokens.items, &qualified_pos)).?;
+    defer alloc.free(qualified);
+    try std.testing.expectEqualStrings("public.en_US", qualified);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(qualified_tokens.items[qualified_pos].text, "default"));
+
+    var absent_tokens = try lexer.tokenizeAlloc(alloc, "NOT NULL");
+    defer lexer.freeTokens(alloc, &absent_tokens);
+    var absent_pos: usize = 0;
+    try std.testing.expect((try parseOptionalDdlCollationAlloc(alloc, absent_tokens.items, &absent_pos)) == null);
+    try std.testing.expectEqual(@as(usize, 0), absent_pos);
+
+    var missing_name_tokens = try lexer.tokenizeAlloc(alloc, "COLLATE");
+    defer lexer.freeTokens(alloc, &missing_name_tokens);
+    var missing_name_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlCollationAlloc(alloc, missing_name_tokens.items, &missing_name_pos));
+}
+
+test "sql adapter grammar parses current timestamp precision" {
+    const alloc = std.testing.allocator;
+
+    var absent_tokens = try lexer.tokenizeAlloc(alloc, "DEFAULT");
+    defer lexer.freeTokens(alloc, &absent_tokens);
+    var absent_pos: usize = 0;
+    try parseOptionalCurrentTimestampPrecision(absent_tokens.items, &absent_pos);
+    try std.testing.expectEqual(@as(usize, 0), absent_pos);
+
+    var valid_tokens = try lexer.tokenizeAlloc(alloc, "(6) + interval '1 day'");
+    defer lexer.freeTokens(alloc, &valid_tokens);
+    var valid_pos: usize = 0;
+    try parseOptionalCurrentTimestampPrecision(valid_tokens.items, &valid_pos);
+    try std.testing.expect(valid_tokens.items[valid_pos].kind == .plus);
+
+    var zero_tokens = try lexer.tokenizeAlloc(alloc, "(0)");
+    defer lexer.freeTokens(alloc, &zero_tokens);
+    var zero_pos: usize = 0;
+    try parseOptionalCurrentTimestampPrecision(zero_tokens.items, &zero_pos);
+    try std.testing.expectEqual(zero_tokens.items.len, zero_pos);
+
+    var too_large_tokens = try lexer.tokenizeAlloc(alloc, "(7)");
+    defer lexer.freeTokens(alloc, &too_large_tokens);
+    var too_large_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalCurrentTimestampPrecision(too_large_tokens.items, &too_large_pos));
+
+    var missing_number_tokens = try lexer.tokenizeAlloc(alloc, "()");
+    defer lexer.freeTokens(alloc, &missing_number_tokens);
+    var missing_number_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalCurrentTimestampPrecision(missing_number_tokens.items, &missing_number_pos));
+}
+
+test "sql adapter grammar parses ddl known defaults" {
+    const alloc = std.testing.allocator;
+
+    var null_tokens = try lexer.tokenizeAlloc(alloc, "NULL,");
+    defer lexer.freeTokens(alloc, &null_tokens);
+    var null_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefaultSyntax.null_literal, (try parseOptionalDdlKnownDefault(null_tokens.items, &null_pos)).?);
+    try std.testing.expect(null_tokens.items[null_pos].kind == .comma);
+
+    var uuid_tokens = try lexer.tokenizeAlloc(alloc, "gen_random_uuid() PRIMARY KEY");
+    defer lexer.freeTokens(alloc, &uuid_tokens);
+    var uuid_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefaultSyntax.uuid_v4, (try parseOptionalDdlKnownDefault(uuid_tokens.items, &uuid_pos)).?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(uuid_tokens.items[uuid_pos].text, "primary"));
+
+    var uuid_v4_tokens = try lexer.tokenizeAlloc(alloc, "uuid_generate_v4()");
+    defer lexer.freeTokens(alloc, &uuid_v4_tokens);
+    var uuid_v4_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefaultSyntax.uuid_v4, (try parseOptionalDdlKnownDefault(uuid_v4_tokens.items, &uuid_v4_pos)).?);
+    try std.testing.expectEqual(uuid_v4_tokens.items.len, uuid_v4_pos);
+
+    var now_tokens = try lexer.tokenizeAlloc(alloc, "now() NOT NULL");
+    defer lexer.freeTokens(alloc, &now_tokens);
+    var now_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefaultSyntax.now_ns, (try parseOptionalDdlKnownDefault(now_tokens.items, &now_pos)).?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(now_tokens.items[now_pos].text, "not"));
+
+    var timestamp_tokens = try lexer.tokenizeAlloc(alloc, "CURRENT_TIMESTAMP(6)");
+    defer lexer.freeTokens(alloc, &timestamp_tokens);
+    var timestamp_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefaultSyntax.now_ns, (try parseOptionalDdlKnownDefault(timestamp_tokens.items, &timestamp_pos)).?);
+    try std.testing.expectEqual(timestamp_tokens.items.len, timestamp_pos);
+
+    var date_tokens = try lexer.tokenizeAlloc(alloc, "CURRENT_DATE");
+    defer lexer.freeTokens(alloc, &date_tokens);
+    var date_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefaultSyntax.current_date_ns, (try parseOptionalDdlKnownDefault(date_tokens.items, &date_pos)).?);
+    try std.testing.expectEqual(date_tokens.items.len, date_pos);
+
+    var literal_tokens = try lexer.tokenizeAlloc(alloc, "'active'");
+    defer lexer.freeTokens(alloc, &literal_tokens);
+    var literal_pos: usize = 0;
+    try std.testing.expect((try parseOptionalDdlKnownDefault(literal_tokens.items, &literal_pos)) == null);
+    try std.testing.expectEqual(@as(usize, 0), literal_pos);
+
+    var malformed_uuid_tokens = try lexer.tokenizeAlloc(alloc, "gen_random_uuid");
+    defer lexer.freeTokens(alloc, &malformed_uuid_tokens);
+    var malformed_uuid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlKnownDefault(malformed_uuid_tokens.items, &malformed_uuid_pos));
+}
+
+test "sql adapter grammar parses ddl type names" {
+    const alloc = std.testing.allocator;
+    _ = alloc;
+
+    var numeric_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "numeric(18, 2) DEFAULT 0");
+    defer lexer.freeTokens(std.testing.allocator, &numeric_tokens);
+    var numeric_pos: usize = 0;
+    const numeric = try parseDdlType(numeric_tokens.items, &numeric_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, numeric.field_type);
+    try std.testing.expect(numeric.array_item_type == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(numeric_tokens.items[numeric_pos].text, "default"));
+
+    var character_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "character varying(255) COLLATE \"C\"");
+    defer lexer.freeTokens(std.testing.allocator, &character_tokens);
+    var character_pos: usize = 0;
+    const character = try parseDdlType(character_tokens.items, &character_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, character.field_type);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(character_tokens.items[character_pos].text, "collate"));
+
+    var double_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "double precision NOT NULL");
+    defer lexer.freeTokens(std.testing.allocator, &double_tokens);
+    var double_pos: usize = 0;
+    const double = try parseDdlType(double_tokens.items, &double_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, double.field_type);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(double_tokens.items[double_pos].text, "not"));
+
+    var timestamp_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "timestamp with time zone DEFAULT now()");
+    defer lexer.freeTokens(std.testing.allocator, &timestamp_tokens);
+    var timestamp_pos: usize = 0;
+    const timestamp = try parseDdlType(timestamp_tokens.items, &timestamp_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, timestamp.field_type);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(timestamp_tokens.items[timestamp_pos].text, "default"));
+
+    var array_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "text[] NOT NULL");
+    defer lexer.freeTokens(std.testing.allocator, &array_tokens);
+    var array_pos: usize = 0;
+    const array = try parseDdlType(array_tokens.items, &array_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.array, array.field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, array.array_item_type.?);
+
+    var json_array_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "jsonb[]");
+    defer lexer.freeTokens(std.testing.allocator, &json_array_tokens);
+    var json_array_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlType(json_array_tokens.items, &json_array_pos));
+
+    var unknown_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "money");
+    defer lexer.freeTokens(std.testing.allocator, &unknown_tokens);
+    var unknown_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlType(unknown_tokens.items, &unknown_pos));
+
+    var unclosed_tokens = try lexer.tokenizeAlloc(std.testing.allocator, "numeric(18, 2");
+    defer lexer.freeTokens(std.testing.allocator, &unclosed_tokens);
+    var unclosed_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlType(unclosed_tokens.items, &unclosed_pos));
+}
+
+test "sql adapter grammar parses alter table headers" {
+    const alloc = std.testing.allocator;
+
+    var if_exists_tokens = try lexer.tokenizeAlloc(alloc, "TABLE IF EXISTS ONLY public.usage_records ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &if_exists_tokens);
+    var if_exists_pos: usize = 0;
+    var if_exists = try parseAlterTableHeaderAlloc(alloc, if_exists_tokens.items, &if_exists_pos);
+    defer if_exists.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", if_exists.table_name);
+    try std.testing.expect(if_exists.if_exists);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(if_exists_tokens.items[if_exists_pos].text, "add"));
+
+    var plain_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records DROP COLUMN status;");
+    defer lexer.freeTokens(alloc, &plain_tokens);
+    var plain_pos: usize = 0;
+    var plain = try parseAlterTableHeaderAlloc(alloc, plain_tokens.items, &plain_pos);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", plain.table_name);
+    try std.testing.expect(!plain.if_exists);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(plain_tokens.items[plain_pos].text, "drop"));
+
+    var missing_table_tokens = try lexer.tokenizeAlloc(alloc, "ONLY usage_records ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &missing_table_tokens);
+    var missing_table_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableHeaderAlloc(alloc, missing_table_tokens.items, &missing_table_pos));
+
+    var validate_tokens = try lexer.tokenizeAlloc(alloc, "VALIDATE CONSTRAINT usage_records_amount_check, ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &validate_tokens);
+    var validate_pos: usize = 0;
+    var validate = try parseAlterTableValidateConstraintOperationAlloc(alloc, validate_tokens.items, &validate_pos);
+    defer validate.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records_amount_check", validate.constraint_name);
+    try std.testing.expect(validate_tokens.items[validate_pos].kind == .comma);
+
+    var invalid_validate_tokens = try lexer.tokenizeAlloc(alloc, "VALIDATE usage_records_amount_check;");
+    defer lexer.freeTokens(alloc, &invalid_validate_tokens);
+    var invalid_validate_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableValidateConstraintOperationAlloc(alloc, invalid_validate_tokens.items, &invalid_validate_pos));
+
+    var rename_column_tokens = try lexer.tokenizeAlloc(alloc, "RENAME COLUMN old_status TO status, DROP COLUMN legacy_status;");
+    defer lexer.freeTokens(alloc, &rename_column_tokens);
+    var rename_column_pos: usize = 0;
+    var rename_column = try parseAlterTableRenameOperationAlloc(alloc, rename_column_tokens.items, &rename_column_pos);
+    defer rename_column.deinit(alloc);
+    try std.testing.expectEqual(AlterTableRenameTargetSyntax.column, rename_column.target);
+    try std.testing.expectEqualStrings("old_status", rename_column.old_name);
+    try std.testing.expectEqualStrings("status", rename_column.new_name);
+    try std.testing.expect(rename_column_tokens.items[rename_column_pos].kind == .comma);
+
+    var rename_constraint_tokens = try lexer.tokenizeAlloc(alloc, "RENAME CONSTRAINT usage_status_key TO usage_status_unique;");
+    defer lexer.freeTokens(alloc, &rename_constraint_tokens);
+    var rename_constraint_pos: usize = 0;
+    var rename_constraint = try parseAlterTableRenameOperationAlloc(alloc, rename_constraint_tokens.items, &rename_constraint_pos);
+    defer rename_constraint.deinit(alloc);
+    try std.testing.expectEqual(AlterTableRenameTargetSyntax.constraint, rename_constraint.target);
+    try std.testing.expectEqualStrings("usage_status_key", rename_constraint.old_name);
+    try std.testing.expectEqualStrings("usage_status_unique", rename_constraint.new_name);
+
+    var rename_default_tokens = try lexer.tokenizeAlloc(alloc, "RENAME old_status TO status;");
+    defer lexer.freeTokens(alloc, &rename_default_tokens);
+    var rename_default_pos: usize = 0;
+    var rename_default = try parseAlterTableRenameOperationAlloc(alloc, rename_default_tokens.items, &rename_default_pos);
+    defer rename_default.deinit(alloc);
+    try std.testing.expectEqual(AlterTableRenameTargetSyntax.column, rename_default.target);
+    try std.testing.expectEqualStrings("old_status", rename_default.old_name);
+    try std.testing.expectEqualStrings("status", rename_default.new_name);
+
+    var invalid_rename_tokens = try lexer.tokenizeAlloc(alloc, "RENAME COLUMN old_status status;");
+    defer lexer.freeTokens(alloc, &invalid_rename_tokens);
+    var invalid_rename_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableRenameOperationAlloc(alloc, invalid_rename_tokens.items, &invalid_rename_pos));
+
+    var drop_column_tokens = try lexer.tokenizeAlloc(alloc, "DROP COLUMN IF EXISTS legacy_status RESTRICT, ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &drop_column_tokens);
+    var drop_column_pos: usize = 0;
+    var drop_column = try parseAlterTableDropOperationAlloc(alloc, drop_column_tokens.items, &drop_column_pos);
+    defer drop_column.deinit(alloc);
+    try std.testing.expectEqual(AlterTableDropTargetSyntax.column, drop_column.target);
+    try std.testing.expect(drop_column.if_exists);
+    try std.testing.expectEqualStrings("legacy_status", drop_column.name);
+    try std.testing.expectEqual(ddl_plan.DropDependencyMode.restrict, drop_column.dependency_mode);
+    try std.testing.expect(drop_column_tokens.items[drop_column_pos].kind == .comma);
+
+    var drop_constraint_tokens = try lexer.tokenizeAlloc(alloc, "DROP CONSTRAINT usage_status_key CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_constraint_tokens);
+    var drop_constraint_pos: usize = 0;
+    var drop_constraint = try parseAlterTableDropOperationAlloc(alloc, drop_constraint_tokens.items, &drop_constraint_pos);
+    defer drop_constraint.deinit(alloc);
+    try std.testing.expectEqual(AlterTableDropTargetSyntax.constraint, drop_constraint.target);
+    try std.testing.expect(!drop_constraint.if_exists);
+    try std.testing.expectEqualStrings("usage_status_key", drop_constraint.name);
+    try std.testing.expectEqual(ddl_plan.DropDependencyMode.cascade, drop_constraint.dependency_mode);
+
+    var drop_default_tokens = try lexer.tokenizeAlloc(alloc, "DROP legacy_status;");
+    defer lexer.freeTokens(alloc, &drop_default_tokens);
+    var drop_default_pos: usize = 0;
+    var drop_default = try parseAlterTableDropOperationAlloc(alloc, drop_default_tokens.items, &drop_default_pos);
+    defer drop_default.deinit(alloc);
+    try std.testing.expectEqual(AlterTableDropTargetSyntax.column, drop_default.target);
+    try std.testing.expectEqualStrings("legacy_status", drop_default.name);
+    try std.testing.expectEqual(ddl_plan.DropDependencyMode.cascade, drop_default.dependency_mode);
+
+    var invalid_drop_tokens = try lexer.tokenizeAlloc(alloc, "DROP COLUMN IF legacy_status;");
+    defer lexer.freeTokens(alloc, &invalid_drop_tokens);
+    var invalid_drop_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableDropOperationAlloc(alloc, invalid_drop_tokens.items, &invalid_drop_pos));
+
+    var set_not_null_tokens = try lexer.tokenizeAlloc(alloc, "ALTER COLUMN status SET NOT NULL, DROP COLUMN legacy_status;");
+    defer lexer.freeTokens(alloc, &set_not_null_tokens);
+    var set_not_null_pos: usize = 0;
+    var set_not_null = try parseAlterTableColumnNullabilityOperationAlloc(alloc, set_not_null_tokens.items, &set_not_null_pos);
+    defer set_not_null.deinit(alloc);
+    try std.testing.expectEqualStrings("status", set_not_null.column_name);
+    try std.testing.expect(!set_not_null.nullable);
+    try std.testing.expect(set_not_null_tokens.items[set_not_null_pos].kind == .comma);
+
+    var drop_not_null_tokens = try lexer.tokenizeAlloc(alloc, "ALTER status DROP NOT NULL;");
+    defer lexer.freeTokens(alloc, &drop_not_null_tokens);
+    var drop_not_null_pos: usize = 0;
+    var drop_not_null = try parseAlterTableColumnNullabilityOperationAlloc(alloc, drop_not_null_tokens.items, &drop_not_null_pos);
+    defer drop_not_null.deinit(alloc);
+    try std.testing.expectEqualStrings("status", drop_not_null.column_name);
+    try std.testing.expect(drop_not_null.nullable);
+
+    var set_default_tokens = try lexer.tokenizeAlloc(alloc, "ALTER COLUMN status SET DEFAULT 'active';");
+    defer lexer.freeTokens(alloc, &set_default_tokens);
+    var set_default_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableColumnNullabilityOperationAlloc(alloc, set_default_tokens.items, &set_default_pos));
+
+    set_default_pos = 0;
+    var set_default = try parseAlterTableColumnDefaultOperationAlloc(alloc, set_default_tokens.items, &set_default_pos);
+    defer set_default.deinit(alloc);
+    try std.testing.expectEqualStrings("status", set_default.column_name);
+    try std.testing.expectEqual(AlterTableColumnDefaultActionSyntax.set, set_default.action);
+    try std.testing.expect(set_default_tokens.items[set_default_pos].kind == .string);
+
+    var drop_column_default_tokens = try lexer.tokenizeAlloc(alloc, "ALTER COLUMN status DROP DEFAULT;");
+    defer lexer.freeTokens(alloc, &drop_column_default_tokens);
+    var drop_column_default_pos: usize = 0;
+    var drop_column_default = try parseAlterTableColumnDefaultOperationAlloc(alloc, drop_column_default_tokens.items, &drop_column_default_pos);
+    defer drop_column_default.deinit(alloc);
+    try std.testing.expectEqualStrings("status", drop_column_default.column_name);
+    try std.testing.expectEqual(AlterTableColumnDefaultActionSyntax.drop, drop_column_default.action);
+
+    var drop_default_shorthand_tokens = try lexer.tokenizeAlloc(alloc, "ALTER status DROP DEFAULT;");
+    defer lexer.freeTokens(alloc, &drop_default_shorthand_tokens);
+    var drop_default_shorthand_pos: usize = 0;
+    var drop_default_shorthand = try parseAlterTableColumnDefaultOperationAlloc(alloc, drop_default_shorthand_tokens.items, &drop_default_shorthand_pos);
+    defer drop_default_shorthand.deinit(alloc);
+    try std.testing.expectEqualStrings("status", drop_default_shorthand.column_name);
+    try std.testing.expectEqual(AlterTableColumnDefaultActionSyntax.drop, drop_default_shorthand.action);
+
+    var type_tokens = try lexer.tokenizeAlloc(alloc, "ALTER COLUMN status TYPE text;");
+    defer lexer.freeTokens(alloc, &type_tokens);
+    var type_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableColumnDefaultOperationAlloc(alloc, type_tokens.items, &type_pos));
+
+    type_pos = 0;
+    var type_header = try parseAlterTableColumnTypeHeaderAlloc(alloc, type_tokens.items, &type_pos);
+    defer type_header.deinit(alloc);
+    try std.testing.expectEqualStrings("status", type_header.column_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(type_tokens.items[type_pos].text, "text"));
+
+    var set_data_type_tokens = try lexer.tokenizeAlloc(alloc, "ALTER COLUMN status SET DATA TYPE varchar;");
+    defer lexer.freeTokens(alloc, &set_data_type_tokens);
+    var set_data_type_pos: usize = 0;
+    var set_data_type = try parseAlterTableColumnTypeHeaderAlloc(alloc, set_data_type_tokens.items, &set_data_type_pos);
+    defer set_data_type.deinit(alloc);
+    try std.testing.expectEqualStrings("status", set_data_type.column_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(set_data_type_tokens.items[set_data_type_pos].text, "varchar"));
+
+    var type_shorthand_tokens = try lexer.tokenizeAlloc(alloc, "ALTER status TYPE text;");
+    defer lexer.freeTokens(alloc, &type_shorthand_tokens);
+    var type_shorthand_pos: usize = 0;
+    var type_shorthand = try parseAlterTableColumnTypeHeaderAlloc(alloc, type_shorthand_tokens.items, &type_shorthand_pos);
+    defer type_shorthand.deinit(alloc);
+    try std.testing.expectEqualStrings("status", type_shorthand.column_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(type_shorthand_tokens.items[type_shorthand_pos].text, "text"));
+
+    var invalid_type_tokens = try lexer.tokenizeAlloc(alloc, "ALTER COLUMN status SET TYPE text;");
+    defer lexer.freeTokens(alloc, &invalid_type_tokens);
+    var invalid_type_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableColumnTypeHeaderAlloc(alloc, invalid_type_tokens.items, &invalid_type_pos));
+
+    var using_tokens = try lexer.tokenizeAlloc(alloc, "USING status,");
+    defer lexer.freeTokens(alloc, &using_tokens);
+    var using_pos: usize = 0;
+    const using = (try parseOptionalAlterTableColumnUsing(using_tokens.items, &using_pos)).?;
+    try std.testing.expectEqualStrings("status", using.column_name);
+    try std.testing.expect(!using.wrapped);
+    try std.testing.expect(using_tokens.items[using_pos].kind == .comma);
+
+    var wrapped_using_tokens = try lexer.tokenizeAlloc(alloc, "USING (status);");
+    defer lexer.freeTokens(alloc, &wrapped_using_tokens);
+    var wrapped_using_pos: usize = 0;
+    const wrapped_using = (try parseOptionalAlterTableColumnUsing(wrapped_using_tokens.items, &wrapped_using_pos)).?;
+    try std.testing.expectEqualStrings("status", wrapped_using.column_name);
+    try std.testing.expect(wrapped_using.wrapped);
+    try std.testing.expect(wrapped_using_tokens.items[wrapped_using_pos].kind == .semicolon);
+
+    var absent_using_tokens = try lexer.tokenizeAlloc(alloc, "COLLATE \"C\"");
+    defer lexer.freeTokens(alloc, &absent_using_tokens);
+    var absent_using_pos: usize = 0;
+    try std.testing.expect((try parseOptionalAlterTableColumnUsing(absent_using_tokens.items, &absent_using_pos)) == null);
+    try std.testing.expectEqual(@as(usize, 0), absent_using_pos);
+
+    var malformed_using_tokens = try lexer.tokenizeAlloc(alloc, "USING (status;");
+    defer lexer.freeTokens(alloc, &malformed_using_tokens);
+    var malformed_using_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalAlterTableColumnUsing(malformed_using_tokens.items, &malformed_using_pos));
+
+    var add_column_tokens = try lexer.tokenizeAlloc(alloc, "ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &add_column_tokens);
+    var add_column_pos: usize = 0;
+    const add_column = try parseAlterTableAddColumnHeader(add_column_tokens.items, &add_column_pos);
+    try std.testing.expect(!add_column.if_not_exists);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_column_tokens.items[add_column_pos].text, "status"));
+
+    var add_if_not_exists_tokens = try lexer.tokenizeAlloc(alloc, "ADD COLUMN IF NOT EXISTS status text;");
+    defer lexer.freeTokens(alloc, &add_if_not_exists_tokens);
+    var add_if_not_exists_pos: usize = 0;
+    const add_if_not_exists = try parseAlterTableAddColumnHeader(add_if_not_exists_tokens.items, &add_if_not_exists_pos);
+    try std.testing.expect(add_if_not_exists.if_not_exists);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_if_not_exists_tokens.items[add_if_not_exists_pos].text, "status"));
+
+    var add_period_tokens = try lexer.tokenizeAlloc(alloc, "ADD PERIOD FOR valid_at (valid_from, valid_to);");
+    defer lexer.freeTokens(alloc, &add_period_tokens);
+    var add_period_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableAddColumnHeader(add_period_tokens.items, &add_period_pos));
+
+    add_period_pos = 0;
+    var add_period_prefix = try parseAlterTableAddOperationPrefixAlloc(alloc, add_period_tokens.items, &add_period_pos);
+    defer add_period_prefix.deinit(alloc);
+    try std.testing.expectEqual(AlterTableAddOperationKindSyntax.period, add_period_prefix.kind);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_period_tokens.items[add_period_pos].text, "for"));
+
+    var add_unique_tokens = try lexer.tokenizeAlloc(alloc, "ADD CONSTRAINT usage_records_status_key UNIQUE (tenant_id, status);");
+    defer lexer.freeTokens(alloc, &add_unique_tokens);
+    var add_unique_pos: usize = 0;
+    var add_unique = try parseAlterTableAddOperationPrefixAlloc(alloc, add_unique_tokens.items, &add_unique_pos);
+    defer add_unique.deinit(alloc);
+    try std.testing.expectEqual(AlterTableAddOperationKindSyntax.unique, add_unique.kind);
+    try std.testing.expectEqualStrings("usage_records_status_key", add_unique.constraint_name.?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_unique_tokens.items[add_unique_pos].text, "unique"));
+
+    var add_foreign_tokens = try lexer.tokenizeAlloc(alloc, "ADD FOREIGN KEY (tenant_id) REFERENCES tenants(id);");
+    defer lexer.freeTokens(alloc, &add_foreign_tokens);
+    var add_foreign_pos: usize = 0;
+    var add_foreign = try parseAlterTableAddOperationPrefixAlloc(alloc, add_foreign_tokens.items, &add_foreign_pos);
+    defer add_foreign.deinit(alloc);
+    try std.testing.expectEqual(AlterTableAddOperationKindSyntax.foreign_key, add_foreign.kind);
+    try std.testing.expect(add_foreign.constraint_name == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_foreign_tokens.items[add_foreign_pos].text, "foreign"));
+
+    var add_primary_tokens = try lexer.tokenizeAlloc(alloc, "ADD CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id);");
+    defer lexer.freeTokens(alloc, &add_primary_tokens);
+    var add_primary_pos: usize = 0;
+    var add_primary = try parseAlterTableAddOperationPrefixAlloc(alloc, add_primary_tokens.items, &add_primary_pos);
+    defer add_primary.deinit(alloc);
+    try std.testing.expectEqual(AlterTableAddOperationKindSyntax.primary_key, add_primary.kind);
+    try std.testing.expectEqualStrings("usage_records_pk", add_primary.constraint_name.?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_primary_tokens.items[add_primary_pos].text, "primary"));
+
+    var add_check_tokens = try lexer.tokenizeAlloc(alloc, "ADD CHECK (amount >= 0);");
+    defer lexer.freeTokens(alloc, &add_check_tokens);
+    var add_check_pos: usize = 0;
+    var add_check = try parseAlterTableAddOperationPrefixAlloc(alloc, add_check_tokens.items, &add_check_pos);
+    defer add_check.deinit(alloc);
+    try std.testing.expectEqual(AlterTableAddOperationKindSyntax.check, add_check.kind);
+    try std.testing.expect(add_check.constraint_name == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(add_check_tokens.items[add_check_pos].text, "check"));
+
+    var add_unsupported_tokens = try lexer.tokenizeAlloc(alloc, "ADD COLUMN status text;");
+    defer lexer.freeTokens(alloc, &add_unsupported_tokens);
+    var add_unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAlterTableAddOperationPrefixAlloc(alloc, add_unsupported_tokens.items, &add_unsupported_pos));
+}
+
+test "sql adapter grammar parses identity allocator table headers" {
+    const alloc = std.testing.allocator;
+
+    var serial_tokens = try lexer.tokenizeAlloc(alloc, "TABLE public.usage_records (id bigserial PRIMARY KEY);");
+    defer lexer.freeTokens(alloc, &serial_tokens);
+    var serial_pos: usize = 0;
+    var serial = try parseIdentityAllocatorTableHeaderAlloc(alloc, serial_tokens.items, &serial_pos);
+    defer serial.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", serial.table_name);
+    try std.testing.expectEqualStrings("id", serial.column_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(serial_tokens.items[serial_pos].text, "bigserial"));
+
+    var generated_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY);");
+    defer lexer.freeTokens(alloc, &generated_tokens);
+    var generated_pos: usize = 0;
+    var generated = try parseIdentityAllocatorTableHeaderAlloc(alloc, generated_tokens.items, &generated_pos);
+    defer generated.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated.table_name);
+    try std.testing.expectEqualStrings("id", generated.column_name);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(generated_tokens.items[generated_pos].text, "bigint"));
+
+    var if_not_exists_tokens = try lexer.tokenizeAlloc(alloc, "TABLE IF NOT EXISTS usage_records (id bigserial);");
+    defer lexer.freeTokens(alloc, &if_not_exists_tokens);
+    var if_not_exists_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseIdentityAllocatorTableHeaderAlloc(alloc, if_not_exists_tokens.items, &if_not_exists_pos));
+}
+
+test "sql adapter grammar parses identity allocator specs" {
+    const alloc = std.testing.allocator;
+
+    var serial_tokens = try lexer.tokenizeAlloc(alloc, "serial PRIMARY KEY");
+    defer lexer.freeTokens(alloc, &serial_tokens);
+    var serial_pos: usize = 0;
+    var serial = try parseIdentityAllocatorSpecAlloc(alloc, serial_tokens.items, &serial_pos);
+    defer serial.deinit(alloc);
+    try std.testing.expectEqual(ddl_plan.IdentityAllocatorKind.serial, serial.kind);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(serial_tokens.items[serial_pos].text, "primary"));
+
+    var bigserial_tokens = try lexer.tokenizeAlloc(alloc, "bigserial)");
+    defer lexer.freeTokens(alloc, &bigserial_tokens);
+    var bigserial_pos: usize = 0;
+    var bigserial = try parseIdentityAllocatorSpecAlloc(alloc, bigserial_tokens.items, &bigserial_pos);
+    defer bigserial.deinit(alloc);
+    try std.testing.expectEqual(ddl_plan.IdentityAllocatorKind.bigserial, bigserial.kind);
+    try std.testing.expect(bigserial_tokens.items[bigserial_pos].kind == .rparen);
+
+    var generated_tokens = try lexer.tokenizeAlloc(alloc, "bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 10 INCREMENT BY 2 CACHE 8) PRIMARY KEY");
+    defer lexer.freeTokens(alloc, &generated_tokens);
+    var generated_pos: usize = 0;
+    var generated = try parseIdentityAllocatorSpecAlloc(alloc, generated_tokens.items, &generated_pos);
+    defer generated.deinit(alloc);
+    try std.testing.expectEqual(ddl_plan.IdentityAllocatorKind.generated_by_default, generated.kind);
+    try std.testing.expectEqual(@as(?i64, 10), generated.options.start_with);
+    try std.testing.expectEqual(@as(?i64, 2), generated.options.increment_by);
+    try std.testing.expectEqual(@as(?i64, 8), generated.options.cache);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(generated_tokens.items[generated_pos].text, "primary"));
+
+    var always_tokens = try lexer.tokenizeAlloc(alloc, "numeric(18, 0) GENERATED ALWAYS AS IDENTITY");
+    defer lexer.freeTokens(alloc, &always_tokens);
+    var always_pos: usize = 0;
+    var always = try parseIdentityAllocatorSpecAlloc(alloc, always_tokens.items, &always_pos);
+    defer always.deinit(alloc);
+    try std.testing.expectEqual(ddl_plan.IdentityAllocatorKind.generated_always, always.kind);
+    try std.testing.expectEqual(always_tokens.items.len, always_pos);
+
+    var text_tokens = try lexer.tokenizeAlloc(alloc, "text GENERATED BY DEFAULT AS IDENTITY");
+    defer lexer.freeTokens(alloc, &text_tokens);
+    var text_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseIdentityAllocatorSpecAlloc(alloc, text_tokens.items, &text_pos));
+}
+
+test "sql adapter grammar parses create table definition headers" {
+    const alloc = std.testing.allocator;
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "TABLE IF NOT EXISTS public.usage_records (id uuid PRIMARY KEY);");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateTableDefinitionHeaderAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", create.table_name);
+    try std.testing.expect(create.if_not_exists);
+    try std.testing.expect(create_tokens.items[create_pos].kind == .identifier);
+    try std.testing.expectEqualStrings("id", create_tokens.items[create_pos].text);
+
+    var plain_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records (id uuid);");
+    defer lexer.freeTokens(alloc, &plain_tokens);
+    var plain_pos: usize = 0;
+    var plain = try parseCreateTableDefinitionHeaderAlloc(alloc, plain_tokens.items, &plain_pos);
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", plain.table_name);
+    try std.testing.expect(!plain.if_not_exists);
+
+    var missing_open_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records id uuid);");
+    defer lexer.freeTokens(alloc, &missing_open_tokens);
+    var missing_open_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTableDefinitionHeaderAlloc(alloc, missing_open_tokens.items, &missing_open_pos));
+
+    var column_tokens = try lexer.tokenizeAlloc(alloc, "id uuid PRIMARY KEY, status text);");
+    defer lexer.freeTokens(alloc, &column_tokens);
+    var column_pos: usize = 0;
+    var column = try parseCreateTableElementPrefixAlloc(alloc, column_tokens.items, &column_pos);
+    defer column.deinit(alloc);
+    try std.testing.expectEqual(CreateTableElementKindSyntax.column, column.kind);
+    try std.testing.expect(column.constraint_name == null);
+    try std.testing.expectEqualStrings("id", column_tokens.items[column_pos].text);
+
+    var named_primary_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id), status text);");
+    defer lexer.freeTokens(alloc, &named_primary_tokens);
+    var named_primary_pos: usize = 0;
+    var named_primary = try parseCreateTableElementPrefixAlloc(alloc, named_primary_tokens.items, &named_primary_pos);
+    defer named_primary.deinit(alloc);
+    try std.testing.expectEqual(CreateTableElementKindSyntax.primary_key, named_primary.kind);
+    try std.testing.expectEqualStrings("usage_records_pk", named_primary.constraint_name.?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(named_primary_tokens.items[named_primary_pos].text, "primary"));
+
+    var foreign_tokens = try lexer.tokenizeAlloc(alloc, "FOREIGN KEY (tenant_id) REFERENCES tenants(id));");
+    defer lexer.freeTokens(alloc, &foreign_tokens);
+    var foreign_pos: usize = 0;
+    var foreign = try parseCreateTableElementPrefixAlloc(alloc, foreign_tokens.items, &foreign_pos);
+    defer foreign.deinit(alloc);
+    try std.testing.expectEqual(CreateTableElementKindSyntax.foreign_key, foreign.kind);
+    try std.testing.expect(foreign.constraint_name == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(foreign_tokens.items[foreign_pos].text, "foreign"));
+
+    var period_tokens = try lexer.tokenizeAlloc(alloc, "PERIOD FOR valid_at (valid_from, valid_to));");
+    defer lexer.freeTokens(alloc, &period_tokens);
+    var period_pos: usize = 0;
+    var period = try parseCreateTableElementPrefixAlloc(alloc, period_tokens.items, &period_pos);
+    defer period.deinit(alloc);
+    try std.testing.expectEqual(CreateTableElementKindSyntax.period, period.kind);
+    try std.testing.expect(period.constraint_name == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(period_tokens.items[period_pos].text, "period"));
+
+    var invalid_constraint_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINT usage_records_status text);");
+    defer lexer.freeTokens(alloc, &invalid_constraint_tokens);
+    var invalid_constraint_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTableElementPrefixAlloc(alloc, invalid_constraint_tokens.items, &invalid_constraint_pos));
+
+    var inline_primary_tokens = try lexer.tokenizeAlloc(alloc, "PRIMARY KEY, status text);");
+    defer lexer.freeTokens(alloc, &inline_primary_tokens);
+    var inline_primary_pos: usize = 0;
+    var inline_primary = try parseCreateTableColumnConstraintPrefixAlloc(alloc, inline_primary_tokens.items, &inline_primary_pos);
+    defer inline_primary.deinit(alloc);
+    try std.testing.expectEqual(CreateTableColumnConstraintKindSyntax.primary_key, inline_primary.kind);
+    try std.testing.expect(inline_primary.constraint_name == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(inline_primary_tokens.items[inline_primary_pos].text, "primary"));
+
+    var inline_named_unique_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINT usage_status_key UNIQUE, status text);");
+    defer lexer.freeTokens(alloc, &inline_named_unique_tokens);
+    var inline_named_unique_pos: usize = 0;
+    var inline_named_unique = try parseCreateTableColumnConstraintPrefixAlloc(alloc, inline_named_unique_tokens.items, &inline_named_unique_pos);
+    defer inline_named_unique.deinit(alloc);
+    try std.testing.expectEqual(CreateTableColumnConstraintKindSyntax.unique, inline_named_unique.kind);
+    try std.testing.expectEqualStrings("usage_status_key", inline_named_unique.constraint_name.?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(inline_named_unique_tokens.items[inline_named_unique_pos].text, "unique"));
+
+    var inline_named_check_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINT usage_amount_check CHECK (amount >= 0));");
+    defer lexer.freeTokens(alloc, &inline_named_check_tokens);
+    var inline_named_check_pos: usize = 0;
+    var inline_named_check = try parseCreateTableColumnConstraintPrefixAlloc(alloc, inline_named_check_tokens.items, &inline_named_check_pos);
+    defer inline_named_check.deinit(alloc);
+    try std.testing.expectEqual(CreateTableColumnConstraintKindSyntax.check, inline_named_check.kind);
+    try std.testing.expectEqualStrings("usage_amount_check", inline_named_check.constraint_name.?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(inline_named_check_tokens.items[inline_named_check_pos].text, "check"));
+
+    var inline_refs_tokens = try lexer.tokenizeAlloc(alloc, "REFERENCES tenants(id));");
+    defer lexer.freeTokens(alloc, &inline_refs_tokens);
+    var inline_refs_pos: usize = 0;
+    var inline_refs = try parseCreateTableColumnConstraintPrefixAlloc(alloc, inline_refs_tokens.items, &inline_refs_pos);
+    defer inline_refs.deinit(alloc);
+    try std.testing.expectEqual(CreateTableColumnConstraintKindSyntax.references, inline_refs.kind);
+    try std.testing.expect(inline_refs.constraint_name == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(inline_refs_tokens.items[inline_refs_pos].text, "references"));
+
+    var inline_invalid_tokens = try lexer.tokenizeAlloc(alloc, "CONSTRAINT usage_status NOT NULL);");
+    defer lexer.freeTokens(alloc, &inline_invalid_tokens);
+    var inline_invalid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTableColumnConstraintPrefixAlloc(alloc, inline_invalid_tokens.items, &inline_invalid_pos));
+}
+
 test "sql adapter grammar parses table clone catalog tails" {
     const alloc = std.testing.allocator;
 
@@ -4854,6 +7523,72 @@ test "sql adapter grammar parses table clone catalog tails" {
     defer lexer.freeTokens(alloc, &temporary_tokens);
     var temporary_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTableCloneCatalogTailAlloc(alloc, temporary_tokens.items, &temporary_pos));
+}
+
+test "sql adapter grammar parses table partition catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var partitioned_tokens = try lexer.tokenizeAlloc(alloc, "PARTITION BY RANGE (tenant_id, event_date);");
+    defer lexer.freeTokens(alloc, &partitioned_tokens);
+    var partitioned_pos: usize = 0;
+    var partitioned = try parseCreatePartitionedTableCatalogTailAlloc(alloc, partitioned_tokens.items, &partitioned_pos);
+    defer partitioned.deinit(alloc);
+    try std.testing.expectEqual(partitioned_tokens.items.len, partitioned_pos);
+    try std.testing.expectEqual(ddl_plan.TablePartitionMethod.range, partitioned.method);
+    try std.testing.expectEqual(@as(usize, 2), partitioned.keys.len);
+    try std.testing.expectEqualStrings("tenant_id", partitioned.keys[0]);
+    try std.testing.expectEqualStrings("event_date", partitioned.keys[1]);
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "TABLE public.usage_events_2026 PARTITION OF public.usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateTablePartitionCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("usage_events_2026", create.table_name);
+    try std.testing.expectEqualStrings("usage_events", create.parent_table_name);
+    try std.testing.expectEqualStrings("\"2026-01-01\"", create.bounds.lower_json);
+    try std.testing.expectEqualStrings("\"2027-01-01\"", create.bounds.upper_json);
+
+    var attach_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    defer lexer.freeTokens(alloc, &attach_tokens);
+    var attach_pos: usize = 0;
+    var attach = try parseAlterTablePartitionCatalogTailAlloc(alloc, attach_tokens.items, &attach_pos);
+    defer attach.deinit(alloc);
+    try std.testing.expectEqual(attach_tokens.items.len, attach_pos);
+    switch (attach) {
+        .attach => |plan| {
+            try std.testing.expectEqualStrings("usage_events", plan.parent_table_name);
+            try std.testing.expectEqualStrings("usage_events_2026", plan.partition_table_name);
+            try std.testing.expectEqualStrings("\"2026-01-01\"", plan.bounds.lower_json);
+            try std.testing.expectEqualStrings("\"2027-01-01\"", plan.bounds.upper_json);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var detach_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_events DETACH PARTITION usage_events_2026;");
+    defer lexer.freeTokens(alloc, &detach_tokens);
+    var detach_pos: usize = 0;
+    var detach = try parseAlterTablePartitionCatalogTailAlloc(alloc, detach_tokens.items, &detach_pos);
+    defer detach.deinit(alloc);
+    try std.testing.expectEqual(detach_tokens.items.len, detach_pos);
+    switch (detach) {
+        .detach => |plan| {
+            try std.testing.expectEqualStrings("usage_events", plan.parent_table_name);
+            try std.testing.expectEqualStrings("usage_events_2026", plan.partition_table_name);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var if_not_exists_tokens = try lexer.tokenizeAlloc(alloc, "TABLE IF NOT EXISTS usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    defer lexer.freeTokens(alloc, &if_not_exists_tokens);
+    var if_not_exists_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTablePartitionCatalogTailAlloc(alloc, if_not_exists_tokens.items, &if_not_exists_pos));
+
+    var hash_tokens = try lexer.tokenizeAlloc(alloc, "PARTITION BY HASH (tenant_id);");
+    defer lexer.freeTokens(alloc, &hash_tokens);
+    var hash_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreatePartitionedTableCatalogTailAlloc(alloc, hash_tokens.items, &hash_pos));
 }
 
 test "sql adapter grammar parses view catalog tails" {
@@ -5178,6 +7913,36 @@ test "sql adapter grammar parses type system catalog tails" {
     try std.testing.expectEqualStrings("int", drop_cast.target_type);
 }
 
+test "sql adapter grammar parses relation lifetime prefixes" {
+    const alloc = std.testing.allocator;
+
+    var temporary_tokens = try lexer.tokenizeAlloc(alloc, "TEMPORARY TABLE usage_session_records (id uuid);");
+    defer lexer.freeTokens(alloc, &temporary_tokens);
+    var temporary_pos: usize = 0;
+    const temporary = try parseRelationLifetimePrefix(temporary_tokens.items, &temporary_pos);
+    try std.testing.expectEqual(RelationLifetimeKind.temporary, temporary.kind);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(temporary_tokens.items[temporary_pos].text, "table"));
+
+    var temp_tokens = try lexer.tokenizeAlloc(alloc, "TEMP TABLE usage_session_records (id uuid);");
+    defer lexer.freeTokens(alloc, &temp_tokens);
+    var temp_pos: usize = 0;
+    const temp = try parseRelationLifetimePrefix(temp_tokens.items, &temp_pos);
+    try std.testing.expectEqual(RelationLifetimeKind.temporary, temp.kind);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(temp_tokens.items[temp_pos].text, "table"));
+
+    var unlogged_tokens = try lexer.tokenizeAlloc(alloc, "UNLOGGED TABLE usage_ingest_records (id uuid);");
+    defer lexer.freeTokens(alloc, &unlogged_tokens);
+    var unlogged_pos: usize = 0;
+    const unlogged = try parseRelationLifetimePrefix(unlogged_tokens.items, &unlogged_pos);
+    try std.testing.expectEqual(RelationLifetimeKind.unlogged, unlogged.kind);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(unlogged_tokens.items[unlogged_pos].text, "table"));
+
+    var durable_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records (id uuid);");
+    defer lexer.freeTokens(alloc, &durable_tokens);
+    var durable_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseRelationLifetimePrefix(durable_tokens.items, &durable_pos));
+}
+
 test "sql adapter grammar parses bulk io tails" {
     const alloc = std.testing.allocator;
 
@@ -5254,6 +8019,43 @@ test "sql adapter grammar parses notification channel tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseListenNotificationTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses truncate mutation-source syntax" {
+    const alloc = std.testing.allocator;
+
+    var truncate_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE TABLE ONLY public.usage_records RESTRICT;");
+    defer lexer.freeTokens(alloc, &truncate_tokens);
+    var truncate_pos: usize = 0;
+    var truncate = try parseTruncateMutationSourceSqlAlloc(alloc, truncate_tokens.items, &truncate_pos);
+    defer truncate.deinit(alloc);
+    try std.testing.expectEqual(truncate_tokens.items.len, truncate_pos);
+    try std.testing.expectEqualStrings("usage_records", truncate.table_name);
+    try std.testing.expect(!truncate.restart_identity);
+
+    var restart_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records RESTART IDENTITY;");
+    defer lexer.freeTokens(alloc, &restart_tokens);
+    var restart_pos: usize = 0;
+    var restart = try parseTruncateMutationSourceSqlAlloc(alloc, restart_tokens.items, &restart_pos);
+    defer restart.deinit(alloc);
+    try std.testing.expectEqual(restart_tokens.items.len, restart_pos);
+    try std.testing.expectEqualStrings("usage_records", restart.table_name);
+    try std.testing.expect(restart.restart_identity);
+
+    var multi_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records, audit_records;");
+    defer lexer.freeTokens(alloc, &multi_tokens);
+    var multi_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseTruncateMutationSourceSqlAlloc(alloc, multi_tokens.items, &multi_pos));
+
+    var cascade_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records CASCADE;");
+    defer lexer.freeTokens(alloc, &cascade_tokens);
+    var cascade_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseTruncateMutationSourceSqlAlloc(alloc, cascade_tokens.items, &cascade_pos));
+
+    var identity_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records IDENTITY;");
+    defer lexer.freeTokens(alloc, &identity_tokens);
+    var identity_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseTruncateMutationSourceSqlAlloc(alloc, identity_tokens.items, &identity_pos));
 }
 
 test "sql adapter grammar parses savepoint transaction tails" {
@@ -5596,4 +8398,35 @@ test "sql adapter grammar parses owned identifiers and normalized object lists" 
     defer lexer.freeTokens(alloc, &invalid);
     var invalid_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseIdentifierListAlloc(alloc, invalid.items, &invalid_pos));
+}
+
+test "sql adapter grammar parses optional CTE column aliases" {
+    const alloc = std.testing.allocator;
+
+    var none = try lexer.tokenizeAlloc(alloc, "as");
+    defer lexer.freeTokens(alloc, &none);
+    var none_pos: usize = 0;
+    const no_aliases = try parseOptionalCteColumnAliasesAlloc(alloc, none.items, &none_pos);
+    try std.testing.expectEqual(@as(usize, 0), no_aliases.len);
+    try std.testing.expectEqual(@as(usize, 0), none_pos);
+
+    var aliases = try lexer.tokenizeAlloc(alloc, "(tenant_id, order_id) as");
+    defer lexer.freeTokens(alloc, &aliases);
+    var alias_pos: usize = 0;
+    const parsed = try parseOptionalCteColumnAliasesAlloc(alloc, aliases.items, &alias_pos);
+    defer freeStringSlice(alloc, parsed);
+    try std.testing.expectEqual(@as(usize, 5), alias_pos);
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqualStrings("tenant_id", parsed[0]);
+    try std.testing.expectEqualStrings("order_id", parsed[1]);
+
+    var duplicate = try lexer.tokenizeAlloc(alloc, "(tenant_id, TENANT_ID)");
+    defer lexer.freeTokens(alloc, &duplicate);
+    var duplicate_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalCteColumnAliasesAlloc(alloc, duplicate.items, &duplicate_pos));
+
+    var trailing = try lexer.tokenizeAlloc(alloc, "(tenant_id,)");
+    defer lexer.freeTokens(alloc, &trailing);
+    var trailing_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalCteColumnAliasesAlloc(alloc, trailing.items, &trailing_pos));
 }

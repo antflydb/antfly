@@ -11,11 +11,12 @@ pub const User = struct {
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
-/// Type of the resource, e.g., database, namespace, table, user, or global ('*').
+/// Type of the resource, e.g., database, namespace, table, tablespace, user, or global ('*').
 pub const ResourceType = enum {
     database,
     namespace,
     table,
+    tablespace,
     user,
     @"*",
 
@@ -24,6 +25,7 @@ pub const ResourceType = enum {
             .database => "database",
             .namespace => "namespace",
             .table => "table",
+            .tablespace => "tablespace",
             .user => "user",
             .@"*" => "*",
         };
@@ -39,6 +41,7 @@ pub const ResourceType = enum {
             .{ "database", .database },
             .{ "namespace", .namespace },
             .{ "table", .table },
+            .{ "tablespace", .tablespace },
             .{ "user", .user },
             .{ "*", .@"*" },
         });

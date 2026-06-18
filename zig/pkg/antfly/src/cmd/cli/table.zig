@@ -34,7 +34,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
 }
 
 fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, first_arg: []const u8, args: *std.process.Args.Iterator) !void {
-    var parsed = TableArgs{};
+    var parsed = TableArgs{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
     var current_arg: ?[]const u8 = first_arg;
 
     while (current_arg) |arg| : (current_arg = args.next()) {
@@ -48,7 +48,7 @@ fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
 }
 
 fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var parsed_args = TableArgs{};
+    var parsed_args = TableArgs{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
     var shards: ?i64 = null;
     var file_path: ?[]const u8 = null;
 
@@ -92,7 +92,7 @@ fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
 }
 
 fn dropTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var parsed_args = TableArgs{};
+    var parsed_args = TableArgs{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
     while (args.next()) |arg| {
         parseTableArg(&parsed_args, arg, args);
     }
@@ -108,12 +108,12 @@ fn dropTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
 }
 
 fn listTables(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var parsed_args = TableArgs{};
+    var parsed_args = TableArgs{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
     while (args.next()) |arg| parseTableArg(&parsed_args, arg, args);
     return listTablesWithCatalog(allocator, io, client, parsed_args.catalog);
 }
 
-fn listTablesWithCatalog(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: CatalogFlags) !void {
+fn listTablesWithCatalog(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags) !void {
     if (catalog.explicit()) |explicit| {
         var resp = try client.inner.listNamespaceTables(explicit.database, explicit.namespace, .{});
         defer resp.deinit();
@@ -130,7 +130,7 @@ fn listTablesWithCatalog(allocator: std.mem.Allocator, io: std.Io, client: *antf
 }
 
 fn getTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
-    var parsed_args = TableArgs{};
+    var parsed_args = TableArgs{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
     while (args.next()) |arg| {
         parseTableArg(&parsed_args, arg, args);
     }
@@ -138,7 +138,7 @@ fn getTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     return getTableByName(allocator, io, client, parsed_args.catalog, name);
 }
 
-fn getTableByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: CatalogFlags, name: []const u8) !void {
+fn getTableByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags, name: []const u8) !void {
     if (catalog.explicit()) |explicit| {
         var resp = try client.inner.getNamespaceTable(explicit.database, explicit.namespace, name);
         defer resp.deinit();
@@ -154,44 +154,19 @@ fn getTableByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     }
 }
 
-const CatalogFlags = struct {
-    database: ?[]const u8 = null,
-    namespace: ?[]const u8 = null,
-
-    const Explicit = struct {
-        database: []const u8,
-        namespace: []const u8,
-    };
-
-    fn explicit(self: CatalogFlags) ?Explicit {
-        if (self.database == null and self.namespace == null) return null;
-        return .{
-            .database = self.database orelse cli.fatal("--database is required when --namespace is set", .{}),
-            .namespace = self.namespace orelse cli.fatal("--namespace is required when --database is set", .{}),
-        };
-    }
-};
-
 const TableArgs = struct {
     table_name: ?[]const u8 = null,
-    catalog: CatalogFlags = .{},
+    catalog: cli.CatalogFlags = .{},
 };
 
 fn isTableCatalogArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--table") or
         std.mem.eql(u8, arg, "-t") or
-        std.mem.eql(u8, arg, "--database") or
-        std.mem.eql(u8, arg, "-d") or
-        std.mem.eql(u8, arg, "--namespace") or
-        std.mem.eql(u8, arg, "-n");
+        cli.isCatalogFlag(arg);
 }
 
 fn parseTableArg(parsed: *TableArgs, arg: []const u8, args: *std.process.Args.Iterator) void {
     if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
         parsed.table_name = args.next() orelse cli.fatal("--table requires a value", .{});
-    } else if (std.mem.eql(u8, arg, "--database") or std.mem.eql(u8, arg, "-d")) {
-        parsed.catalog.database = args.next() orelse cli.fatal("--database requires a value", .{});
-    } else if (std.mem.eql(u8, arg, "--namespace") or std.mem.eql(u8, arg, "-n")) {
-        parsed.catalog.namespace = args.next() orelse cli.fatal("--namespace requires a value", .{});
-    }
+    } else _ = cli.parseCatalogFlag(&parsed.catalog, arg, args);
 }

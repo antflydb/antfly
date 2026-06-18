@@ -87,6 +87,10 @@ pub const TransitionCommand = union(enum) {
     remove_namespace: struct {
         namespace_id: u64,
     },
+    upsert_tablespace: metadata.TablespaceRecord,
+    remove_tablespace: struct {
+        tablespace_id: u64,
+    },
     upsert_table: metadata.TableRecord,
     remove_table: struct {
         table_id: u64,
@@ -200,6 +204,9 @@ pub const TransitionCommand = union(enum) {
             },
             .upsert_namespace => |*record| {
                 metadata_table_manager.freeNamespace(alloc, record.*);
+            },
+            .upsert_tablespace => |*record| {
+                metadata_table_manager.freeTablespace(alloc, record.*);
             },
             .upsert_table => |*record| {
                 metadata_table_manager.freeTable(alloc, record.*);
@@ -845,6 +852,35 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    pub fn listTablespaces(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TablespaceRecord {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try tablespacePrefixForGroup(&prefix_buf, group_id);
+        const kvs = try self.store.scanPrefix(alloc, prefix);
+        defer {
+            for (kvs) |kv| {
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+            }
+            alloc.free(kvs);
+        }
+        const out = try alloc.alloc(metadata.TablespaceRecord, kvs.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |record| metadata_table_manager.freeTablespace(alloc, record);
+            alloc.free(out);
+        }
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeTablespaceRecord(alloc, kv.value);
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    pub fn freeTablespaces(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.TablespaceRecord) void {
+        for (records) |record| metadata_table_manager.freeTablespace(alloc, record);
+        alloc.free(records);
+    }
+
     pub fn listSchemaProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SchemaProgressRecord {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try schemaProgressPrefixForGroup(&prefix_buf, group_id);
@@ -1429,6 +1465,23 @@ pub const RaftApplyStore = struct {
             .remove_namespace => |record| {
                 var key_buf: [160]u8 = undefined;
                 const key = try namespaceKeyForGroup(&key_buf, group_id, record.namespace_id);
+                txn.delete(key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .upsert_tablespace => |record| {
+                var key_buf: [160]u8 = undefined;
+                const key = try tablespaceKeyForGroup(&key_buf, group_id, record.tablespace_id);
+                const value = try encodeTablespaceRecord(self.alloc, record);
+                defer self.alloc.free(value);
+                try txn.put(key, value);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
+            .remove_tablespace => |record| {
+                var key_buf: [160]u8 = undefined;
+                const key = try tablespaceKeyForGroup(&key_buf, group_id, record.tablespace_id);
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -3118,6 +3171,8 @@ const TransitionTag = enum(u8) {
     remove_database = 65,
     upsert_namespace = 66,
     remove_namespace = 67,
+    upsert_tablespace = 68,
+    remove_tablespace = 69,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -3186,6 +3241,14 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .remove_namespace => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_namespace));
             try appendInt(alloc, &out, u64, record.namespace_id);
+        },
+        .upsert_tablespace => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.upsert_tablespace));
+            try appendTablespaceRecord(alloc, &out, record);
+        },
+        .remove_tablespace => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_tablespace));
+            try appendInt(alloc, &out, u64, record.tablespace_id);
         },
         .upsert_table => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_table));
@@ -3472,6 +3535,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .remove_namespace => .{
             .remove_namespace = .{ .namespace_id = try readInt(encoded, &pos, u64) },
         },
+        .upsert_tablespace => .{
+            .upsert_tablespace = try readTablespaceRecord(alloc, encoded, &pos),
+        },
+        .remove_tablespace => .{
+            .remove_tablespace = .{ .tablespace_id = try readInt(encoded, &pos, u64) },
+        },
         .upsert_table => .{
             .upsert_table = try readTableRecord(alloc, encoded, &pos),
         },
@@ -3723,6 +3792,23 @@ fn decodeNamespaceRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadat
     const record = try readNamespaceRecord(alloc, encoded, &pos);
     if (pos != encoded.len) {
         metadata_table_manager.freeNamespace(alloc, record);
+        return error.InvalidMetadataTransitionEncoding;
+    }
+    return record;
+}
+
+fn encodeTablespaceRecord(alloc: std.mem.Allocator, record: metadata.TablespaceRecord) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendTablespaceRecord(alloc, &out, record);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeTablespaceRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.TablespaceRecord {
+    var pos: usize = 0;
+    const record = try readTablespaceRecord(alloc, encoded, &pos);
+    if (pos != encoded.len) {
+        metadata_table_manager.freeTablespace(alloc, record);
         return error.InvalidMetadataTransitionEncoding;
     }
     return record;
@@ -4549,6 +4635,7 @@ fn appendDatabaseRecord(
     try appendInt(alloc, out, u64, record.database_id);
     try appendRequiredString(alloc, out, record.name);
     try appendRequiredString(alloc, out, record.settings_json);
+    try appendRequiredString(alloc, out, record.tablespace_name);
 }
 
 fn readDatabaseRecord(
@@ -4561,10 +4648,13 @@ fn readDatabaseRecord(
     errdefer alloc.free(name);
     const settings_json = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(settings_json);
+    const tablespace_name = try readOptionalRequiredString(alloc, encoded, pos, "");
+    errdefer alloc.free(tablespace_name);
     return .{
         .database_id = database_id,
         .name = name,
         .settings_json = settings_json,
+        .tablespace_name = tablespace_name,
     };
 }
 
@@ -4576,6 +4666,7 @@ fn appendNamespaceRecord(
     try appendInt(alloc, out, u64, record.namespace_id);
     try appendInt(alloc, out, u64, record.database_id);
     try appendRequiredString(alloc, out, record.name);
+    try appendRequiredString(alloc, out, record.tablespace_name);
 }
 
 fn readNamespaceRecord(
@@ -4587,10 +4678,44 @@ fn readNamespaceRecord(
     const database_id = try readInt(encoded, pos, u64);
     const name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(name);
+    const tablespace_name = try readOptionalRequiredString(alloc, encoded, pos, "");
+    errdefer alloc.free(tablespace_name);
     return .{
         .namespace_id = namespace_id,
         .database_id = database_id,
         .name = name,
+        .tablespace_name = tablespace_name,
+    };
+}
+
+fn appendTablespaceRecord(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.TablespaceRecord,
+) !void {
+    try appendInt(alloc, out, u64, record.tablespace_id);
+    try appendRequiredString(alloc, out, record.name);
+    try appendRequiredString(alloc, out, record.location_json);
+    try appendRequiredString(alloc, out, record.placement_policy_json);
+}
+
+fn readTablespaceRecord(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+) !metadata.TablespaceRecord {
+    const tablespace_id = try readInt(encoded, pos, u64);
+    const name = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(name);
+    const location_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(location_json);
+    const placement_policy_json = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(placement_policy_json);
+    return .{
+        .tablespace_id = tablespace_id,
+        .name = name,
+        .location_json = location_json,
+        .placement_policy_json = placement_policy_json,
     };
 }
 
@@ -4626,6 +4751,7 @@ fn appendTableRecord(
     try out.appendSlice(alloc, record.restore_backup_id);
     try appendInt(alloc, out, u32, @intCast(record.restore_location.len));
     try out.appendSlice(alloc, record.restore_location);
+    try appendRequiredString(alloc, out, record.tablespace_name);
 }
 
 fn appendSchemaProgressRecord(
@@ -5191,6 +5317,8 @@ fn readTableRecordWithRestoreIntent(
     errdefer alloc.free(restore_backup_id);
     const restore_location = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(restore_location);
+    const tablespace_name = try readOptionalRequiredString(alloc, encoded, pos, "");
+    errdefer alloc.free(tablespace_name);
     const catalog_identity = try defaultTableCatalogIdentity(alloc);
     errdefer catalog_identity.deinit(alloc);
     return .{
@@ -5205,6 +5333,7 @@ fn readTableRecordWithRestoreIntent(
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
+        .tablespace_name = tablespace_name,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .desired_replica_count = desired_replica_count,
@@ -5322,6 +5451,16 @@ fn readRequiredString(
     const value = try alloc.dupe(u8, encoded[pos.* .. pos.* + value_len]);
     pos.* += value_len;
     return value;
+}
+
+fn readOptionalRequiredString(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    default_value: []const u8,
+) ![]u8 {
+    if (pos.* >= encoded.len) return try alloc.dupe(u8, default_value);
+    return try readRequiredString(alloc, encoded, pos);
 }
 
 fn readJsonRecord(comptime T: type, alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !T {
@@ -6075,6 +6214,10 @@ pub fn namespacePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_namespace:{d}:", .{group_id});
 }
 
+pub fn tablespacePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_tablespace:{d}:", .{group_id});
+}
+
 pub fn schemaProgressPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_schema_progress:{d}:", .{group_id});
 }
@@ -6157,6 +6300,10 @@ fn databaseKeyForGroup(buf: []u8, group_id: u64, database_id: u64) ![]const u8 {
 
 fn namespaceKeyForGroup(buf: []u8, group_id: u64, namespace_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_namespace:{d}:{d}", .{ group_id, namespace_id });
+}
+
+fn tablespaceKeyForGroup(buf: []u8, group_id: u64, tablespace_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_tablespace:{d}:{d}", .{ group_id, tablespace_id });
 }
 
 fn schemaProgressKeyForGroup(buf: []u8, group_id: u64, table_id: u64, node_id: u64) ![]const u8 {

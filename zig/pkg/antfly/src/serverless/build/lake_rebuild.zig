@@ -19,9 +19,17 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const algebraic_segment = @import("../algebraic_segment/mod.zig");
+const artifact_store = @import("../artifacts/store.zig");
 const manifest_artifact = @import("../manifest/artifact_ref.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
+const rowsource = @import("../../storage/rowsource/types.zig");
+const lake_sidecar_algebraic = @import("lake_sidecar_algebraic.zig");
+const lake_sidecar_graph = @import("lake_sidecar_graph.zig");
+const lake_sidecar_sparse = @import("lake_sidecar_sparse.zig");
+const lake_sidecar_text = @import("lake_sidecar_text.zig");
+const lake_sidecar_vector = @import("lake_sidecar_vector.zig");
 
 pub const Action = enum {
     reuse,
@@ -34,6 +42,7 @@ pub const DesiredArtifact = struct {
     binding: source_binding.Binding,
     kind: manifest_artifact.ArtifactKind,
     builder_kind: ?BuilderKind = null,
+    build_spec: ?BuildSpec = null,
 };
 
 pub const PublishedArtifact = struct {
@@ -90,18 +99,57 @@ pub const BuilderKind = enum {
     algebraic_expression,
 };
 
+pub const TextBuildSpec = struct {
+    text_column: []const u8 = &.{},
+    config_json: []const u8 = "{}",
+};
+
+pub const VectorBuildSpec = struct {
+    vector_column: []const u8 = &.{},
+    embedding_name: ?[]const u8 = null,
+};
+
+pub const SparseBuildSpec = struct {
+    sparse_column: []const u8 = &.{},
+};
+
+pub const GraphBuildSpec = struct {
+    graph_column: []const u8 = &.{},
+};
+
+pub const AlgebraicGroupByBuildSpec = struct {
+    group_column: []const u8,
+    value_column: []const u8 = &.{},
+    op: algebraic_segment.AggregateOp,
+};
+
+pub const AlgebraicExpressionBuildSpec = struct {
+    expressions: []const algebraic_segment.ExpressionSpec,
+};
+
+pub const BuildSpec = union(BuilderKind) {
+    text: TextBuildSpec,
+    vector: VectorBuildSpec,
+    sparse: SparseBuildSpec,
+    graph: GraphBuildSpec,
+    algebraic_group_by: AlgebraicGroupByBuildSpec,
+    algebraic_expression: AlgebraicExpressionBuildSpec,
+};
+
 pub const Operation = struct {
     name: []u8,
     action: Action,
     sidecar_kind: source_binding.SidecarKind,
     artifact_kind: manifest_artifact.ArtifactKind,
     builder_kind: ?BuilderKind = null,
+    build_spec: ?BuildSpec = null,
     binding: source_binding.Binding,
     reason: []u8,
     artifact_id: []u8 = &.{},
 
     pub fn deinit(self: *Operation, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.build_spec) |*build_spec| freeOwnedBuildSpec(alloc, build_spec);
         freeOwnedBinding(alloc, self.binding);
         alloc.free(self.reason);
         if (self.artifact_id.len != 0) alloc.free(self.artifact_id);
@@ -119,6 +167,46 @@ pub const OperationPlan = struct {
     }
 
     pub fn find(self: OperationPlan, name: []const u8) ?Operation {
+        for (self.operations) |operation| {
+            if (std.mem.eql(u8, operation.name, name)) return operation;
+        }
+        return null;
+    }
+};
+
+pub const RowSourceProvider = struct {
+    ptr: *anyopaque,
+    open_fn: *const fn (*anyopaque, Allocator, source_binding.Binding) anyerror!rowsource.Source,
+
+    pub fn open(self: RowSourceProvider, alloc: Allocator, binding: source_binding.Binding) !rowsource.Source {
+        return try self.open_fn(self.ptr, alloc, binding);
+    }
+};
+
+pub const ExecutedOperation = struct {
+    name: []u8,
+    action: Action,
+    declaration: ?sidecar_manifest.DeclaredArtifact = null,
+    artifact_id: []u8 = &.{},
+
+    pub fn deinit(self: *ExecutedOperation, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.declaration) |declaration| freeOwnedDeclaration(alloc, declaration);
+        if (self.artifact_id.len != 0) alloc.free(self.artifact_id);
+        self.* = undefined;
+    }
+};
+
+pub const ExecutionResult = struct {
+    operations: []ExecutedOperation,
+
+    pub fn deinit(self: *ExecutionResult, alloc: Allocator) void {
+        for (self.operations) |*operation| operation.deinit(alloc);
+        alloc.free(self.operations);
+        self.* = undefined;
+    }
+
+    pub fn find(self: ExecutionResult, name: []const u8) ?ExecutedOperation {
         for (self.operations) |operation| {
             if (std.mem.eql(u8, operation.name, name)) return operation;
         }
@@ -214,12 +302,15 @@ pub fn planOperationsAlloc(
             .reuse, .rebuild => blk: {
                 const want = findDesired(desired, decision.name) orelse return error.InvalidLakeRebuildPlan;
                 const builder_kind = if (decision.action == .rebuild) try builderKindForDesired(want) else null;
+                var build_spec = if (decision.action == .rebuild) try buildSpecForDesiredAlloc(alloc, want) else null;
+                errdefer if (build_spec) |*spec| freeOwnedBuildSpec(alloc, spec);
                 break :blk try makeOperation(
                     alloc,
                     decision,
                     want.binding,
                     want.kind,
                     builder_kind,
+                    build_spec,
                 );
             },
             .drop => blk: {
@@ -230,6 +321,7 @@ pub fn planOperationsAlloc(
                     got.binding,
                     got.artifact.kind,
                     null,
+                    null,
                 );
             },
         };
@@ -237,6 +329,41 @@ pub fn planOperationsAlloc(
     }
 
     return .{ .operations = operations };
+}
+
+pub fn executeOperationsAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source_provider: RowSourceProvider,
+    plan: OperationPlan,
+) !ExecutionResult {
+    const executed = try alloc.alloc(ExecutedOperation, plan.operations.len);
+    errdefer alloc.free(executed);
+    var initialized: usize = 0;
+    errdefer {
+        for (executed[0..initialized]) |*operation| operation.deinit(alloc);
+    }
+
+    for (plan.operations, executed) |operation, *out| {
+        out.* = switch (operation.action) {
+            .reuse => try makeExecutedOperation(alloc, operation, null, operation.artifact_id),
+            .drop => blk: {
+                if (operation.artifact_id.len == 0) return error.InvalidLakeRebuildExecution;
+                try artifacts.delete(operation.artifact_id);
+                break :blk try makeExecutedOperation(alloc, operation, null, operation.artifact_id);
+            },
+            .rebuild => blk: {
+                var source = try source_provider.open(alloc, operation.binding);
+                defer source.deinit(alloc);
+                const declaration = try executeRebuildOperationAlloc(alloc, artifacts, source, operation);
+                errdefer freeOwnedDeclaration(alloc, declaration);
+                break :blk try makeExecutedOperation(alloc, operation, declaration, declaration.artifact.artifact_id);
+            },
+        };
+        initialized += 1;
+    }
+
+    return .{ .operations = executed };
 }
 
 fn findPublished(published: []const PublishedArtifact, name: []const u8) ?PublishedArtifact {
@@ -258,6 +385,12 @@ fn validateDesiredArtifact(want: DesiredArtifact) !void {
         return error.SidecarArtifactKindMismatch;
     }
     if (want.builder_kind) |builder_kind| try validateBuilderKind(want.binding.sidecar_kind, builder_kind);
+    if (want.build_spec) |build_spec| {
+        try validateBuilderKind(want.binding.sidecar_kind, std.meta.activeTag(build_spec));
+        if (want.builder_kind) |builder_kind| {
+            if (builder_kind != std.meta.activeTag(build_spec)) return error.SidecarArtifactKindMismatch;
+        }
+    }
 }
 
 fn validatePublishedArtifact(got: PublishedArtifact) !void {
@@ -279,6 +412,7 @@ fn validateBuilderKind(sidecar_kind: source_binding.SidecarKind, builder_kind: B
 }
 
 fn builderKindForDesired(want: DesiredArtifact) !BuilderKind {
+    if (want.build_spec) |build_spec| return std.meta.activeTag(build_spec);
     if (want.builder_kind) |builder_kind| {
         try validateBuilderKind(want.binding.sidecar_kind, builder_kind);
         return builder_kind;
@@ -290,6 +424,24 @@ fn builderKindForDesired(want: DesiredArtifact) !BuilderKind {
         .graph => .graph,
         .algebraic => error.AmbiguousLakeRebuildBuilder,
     };
+}
+
+fn buildSpecForDesiredAlloc(alloc: Allocator, want: DesiredArtifact) !BuildSpec {
+    if (want.build_spec) |build_spec| return try cloneBuildSpecAlloc(alloc, build_spec);
+    return switch (want.binding.sidecar_kind) {
+        .text => .{ .text = .{ .text_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)), .config_json = try alloc.dupe(u8, "{}") } },
+        .vector => .{ .vector = .{ .vector_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
+        .sparse => .{ .sparse = .{ .sparse_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
+        .graph => .{ .graph = .{ .graph_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
+        .algebraic => error.MissingLakeRebuildBuildSpec,
+    };
+}
+
+fn defaultBoundColumn(binding: source_binding.Binding, idx: usize) ![]const u8 {
+    if (idx >= binding.column_bindings.len or binding.column_bindings[idx].len == 0) {
+        return error.MissingLakeRebuildBuildSpec;
+    }
+    return binding.column_bindings[idx];
 }
 
 fn makeDecision(
@@ -324,6 +476,7 @@ fn makeOperation(
     binding: source_binding.Binding,
     artifact_kind: manifest_artifact.ArtifactKind,
     builder_kind: ?BuilderKind,
+    build_spec: ?BuildSpec,
 ) !Operation {
     const name = try alloc.dupe(u8, decision.name);
     errdefer alloc.free(name);
@@ -333,6 +486,7 @@ fn makeOperation(
     errdefer alloc.free(reason);
     const artifact_id: []u8 = if (decision.artifact_id.len == 0) &.{} else try alloc.dupe(u8, decision.artifact_id);
     errdefer if (artifact_id.len != 0) alloc.free(artifact_id);
+    errdefer if (build_spec) |*spec| freeOwnedBuildSpec(alloc, spec);
 
     return .{
         .name = name,
@@ -340,9 +494,97 @@ fn makeOperation(
         .sidecar_kind = binding.sidecar_kind,
         .artifact_kind = artifact_kind,
         .builder_kind = builder_kind,
+        .build_spec = build_spec,
         .binding = owned_binding,
         .reason = reason,
         .artifact_id = artifact_id,
+    };
+}
+
+fn makeExecutedOperation(
+    alloc: Allocator,
+    operation: Operation,
+    declaration: ?sidecar_manifest.DeclaredArtifact,
+    artifact_id: []const u8,
+) !ExecutedOperation {
+    const name = try alloc.dupe(u8, operation.name);
+    errdefer alloc.free(name);
+    const artifact_id_owned: []u8 = if (artifact_id.len == 0) &.{} else try alloc.dupe(u8, artifact_id);
+    errdefer if (artifact_id_owned.len != 0) alloc.free(artifact_id_owned);
+    return .{
+        .name = name,
+        .action = operation.action,
+        .declaration = declaration,
+        .artifact_id = artifact_id_owned,
+    };
+}
+
+fn executeRebuildOperationAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source: rowsource.Source,
+    operation: Operation,
+) !sidecar_manifest.DeclaredArtifact {
+    const build_spec = operation.build_spec orelse return error.MissingLakeRebuildBuildSpec;
+    return switch (build_spec) {
+        .text => |spec| blk: {
+            var result = try lake_sidecar_text.publishTextSidecarFromRowSourceAlloc(alloc, artifacts, source, operation.binding, .{
+                .name = operation.name,
+                .text_column = spec.text_column,
+                .config_json = spec.config_json,
+            });
+            const declaration = result.declaration;
+            result = undefined;
+            break :blk declaration;
+        },
+        .vector => |spec| blk: {
+            var result = try lake_sidecar_vector.publishVectorSidecarFromRowSourceAlloc(alloc, artifacts, source, operation.binding, .{
+                .name = operation.name,
+                .vector_column = spec.vector_column,
+                .embedding_name = spec.embedding_name,
+            });
+            const declaration = result.declaration;
+            result = undefined;
+            break :blk declaration;
+        },
+        .sparse => |spec| blk: {
+            var result = try lake_sidecar_sparse.publishSparseSidecarFromRowSourceAlloc(alloc, artifacts, source, operation.binding, .{
+                .name = operation.name,
+                .sparse_column = spec.sparse_column,
+            });
+            const declaration = result.declaration;
+            result = undefined;
+            break :blk declaration;
+        },
+        .graph => |spec| blk: {
+            var result = try lake_sidecar_graph.publishGraphSidecarFromRowSourceAlloc(alloc, artifacts, source, operation.binding, .{
+                .name = operation.name,
+                .graph_column = spec.graph_column,
+            });
+            const declaration = result.declaration;
+            result = undefined;
+            break :blk declaration;
+        },
+        .algebraic_group_by => |spec| blk: {
+            var result = try lake_sidecar_algebraic.publishAlgebraicGroupBySidecarFromRowSourceAlloc(alloc, artifacts, source, operation.binding, .{
+                .name = operation.name,
+                .group_column = spec.group_column,
+                .value_column = spec.value_column,
+                .op = spec.op,
+            });
+            const declaration = result.declaration;
+            result = undefined;
+            break :blk declaration;
+        },
+        .algebraic_expression => |spec| blk: {
+            var result = try lake_sidecar_algebraic.publishAlgebraicExpressionSidecarFromRowSourceAlloc(alloc, artifacts, source, operation.binding, .{
+                .name = operation.name,
+                .expressions = spec.expressions,
+            });
+            const declaration = result.declaration;
+            result = undefined;
+            break :blk declaration;
+        },
     };
 }
 
@@ -404,6 +646,50 @@ fn cloneBindingAlloc(alloc: Allocator, binding: source_binding.Binding) !source_
     };
 }
 
+fn cloneBuildSpecAlloc(alloc: Allocator, build_spec: BuildSpec) !BuildSpec {
+    return switch (build_spec) {
+        .text => |spec| .{ .text = .{
+            .text_column = try alloc.dupe(u8, spec.text_column),
+            .config_json = try alloc.dupe(u8, spec.config_json),
+        } },
+        .vector => |spec| .{ .vector = .{
+            .vector_column = try alloc.dupe(u8, spec.vector_column),
+            .embedding_name = if (spec.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else null,
+        } },
+        .sparse => |spec| .{ .sparse = .{
+            .sparse_column = try alloc.dupe(u8, spec.sparse_column),
+        } },
+        .graph => |spec| .{ .graph = .{
+            .graph_column = try alloc.dupe(u8, spec.graph_column),
+        } },
+        .algebraic_group_by => |spec| .{ .algebraic_group_by = .{
+            .group_column = try alloc.dupe(u8, spec.group_column),
+            .value_column = if (spec.value_column.len == 0) &.{} else try alloc.dupe(u8, spec.value_column),
+            .op = spec.op,
+        } },
+        .algebraic_expression => |spec| blk: {
+            const expressions = try alloc.alloc(algebraic_segment.ExpressionSpec, spec.expressions.len);
+            errdefer alloc.free(expressions);
+            var initialized: usize = 0;
+            errdefer {
+                for (expressions[0..initialized]) |expression| {
+                    alloc.free(expression.name);
+                    if (expression.value_column.len != 0) alloc.free(expression.value_column);
+                }
+            }
+            for (spec.expressions, expressions) |expression, *out| {
+                out.* = .{
+                    .name = try alloc.dupe(u8, expression.name),
+                    .value_column = if (expression.value_column.len == 0) &.{} else try alloc.dupe(u8, expression.value_column),
+                    .op = expression.op,
+                };
+                initialized += 1;
+            }
+            break :blk .{ .algebraic_expression = .{ .expressions = expressions } };
+        },
+    };
+}
+
 fn freeOwnedBinding(alloc: Allocator, binding: source_binding.Binding) void {
     alloc.free(binding.source_id);
     alloc.free(binding.snapshot_id);
@@ -413,9 +699,203 @@ fn freeOwnedBinding(alloc: Allocator, binding: source_binding.Binding) void {
     alloc.free(binding.index_config_hash);
 }
 
+fn freeOwnedBuildSpec(alloc: Allocator, build_spec: *BuildSpec) void {
+    switch (build_spec.*) {
+        .text => |spec| {
+            alloc.free(spec.text_column);
+            alloc.free(spec.config_json);
+        },
+        .vector => |spec| {
+            alloc.free(spec.vector_column);
+            if (spec.embedding_name) |embedding_name| alloc.free(embedding_name);
+        },
+        .sparse => |spec| alloc.free(spec.sparse_column),
+        .graph => |spec| alloc.free(spec.graph_column),
+        .algebraic_group_by => |spec| {
+            alloc.free(spec.group_column);
+            if (spec.value_column.len != 0) alloc.free(spec.value_column);
+        },
+        .algebraic_expression => |spec| {
+            for (spec.expressions) |expression| {
+                alloc.free(expression.name);
+                if (expression.value_column.len != 0) alloc.free(expression.value_column);
+            }
+            alloc.free(spec.expressions);
+        },
+    }
+    build_spec.* = undefined;
+}
+
+fn freeOwnedDeclaration(alloc: Allocator, declaration: sidecar_manifest.DeclaredArtifact) void {
+    alloc.free(declaration.name);
+    freeOwnedBinding(alloc, declaration.binding);
+    if (declaration.artifact.name.len != 0) alloc.free(declaration.artifact.name);
+    alloc.free(declaration.artifact.artifact_id);
+    alloc.free(declaration.artifact.checksum);
+}
+
 fn compareDecision(_: void, lhs: Decision, rhs: Decision) bool {
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
+
+const TestRowSourceProvider = struct {
+    source_kind: rowsource.SourceKind,
+    batches: []const rowsource.ColumnBatch,
+
+    fn provider(self: *TestRowSourceProvider) RowSourceProvider {
+        return .{
+            .ptr = self,
+            .open_fn = open,
+        };
+    }
+
+    fn open(ptr: *anyopaque, alloc: Allocator, binding: source_binding.Binding) !rowsource.Source {
+        const self: *TestRowSourceProvider = @ptrCast(@alignCast(ptr));
+        if (binding.source_kind != self.source_kind) return error.SidecarSourceBindingMismatch;
+        const state = try alloc.create(TestRowSourceState);
+        state.* = .{
+            .source_kind = self.source_kind,
+            .batches = self.batches,
+        };
+        return .{
+            .kind = self.source_kind,
+            .ctx = state,
+            .next_batch = TestRowSourceState.next,
+            .deinit_fn = TestRowSourceState.deinit,
+        };
+    }
+};
+
+const TestRowSourceState = struct {
+    source_kind: rowsource.SourceKind,
+    batches: []const rowsource.ColumnBatch,
+    index: usize = 0,
+
+    fn next(ptr: *anyopaque, alloc: Allocator) !?rowsource.ColumnBatch {
+        _ = alloc;
+        const self: *TestRowSourceState = @ptrCast(@alignCast(ptr));
+        if (self.index >= self.batches.len) return null;
+        const batch = self.batches[self.index];
+        self.index += 1;
+        return batch;
+    }
+
+    fn deinit(ptr: *anyopaque, alloc: Allocator) void {
+        const self: *TestRowSourceState = @ptrCast(@alignCast(ptr));
+        alloc.destroy(self);
+    }
+};
+
+const MemoryArtifactStore = struct {
+    alloc: Allocator,
+    entries: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+    next_id: usize = 0,
+
+    fn init(alloc: Allocator) MemoryArtifactStore {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *MemoryArtifactStore) void {
+        for (self.entries.keys()) |key| self.alloc.free(key);
+        for (self.entries.values()) |bytes| self.alloc.free(bytes);
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn artifactStore(self: *MemoryArtifactStore) artifact_store.ArtifactStore {
+        return .{
+            .allocator = self.alloc,
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn put(self: *MemoryArtifactStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
+        const artifact_id = try std.fmt.allocPrint(alloc, "mem:{d}", .{self.next_id});
+        errdefer alloc.free(artifact_id);
+        self.next_id += 1;
+        const key = try self.alloc.dupe(u8, artifact_id);
+        errdefer self.alloc.free(key);
+        const bytes = try self.alloc.dupe(u8, contents);
+        errdefer self.alloc.free(bytes);
+        try self.entries.put(self.alloc, key, bytes);
+        return .{
+            .artifact_id = artifact_id,
+            .byte_len = @intCast(contents.len),
+            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{contents.len}),
+        };
+    }
+
+    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+        const bytes = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
+        return try alloc.dupe(u8, bytes);
+    }
+
+    fn getRangeAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
+        const bytes = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
+        if (offset > bytes.len) return error.InvalidRange;
+        const start: usize = @intCast(offset);
+        const end = @min(bytes.len, start + len);
+        return try alloc.dupe(u8, bytes[start..end]);
+    }
+
+    fn stat(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
+        const bytes = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
+        return .{
+            .artifact_id = try alloc.dupe(u8, artifact_id),
+            .byte_len = @intCast(bytes.len),
+            .checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{bytes.len}),
+        };
+    }
+
+    fn delete(self: *MemoryArtifactStore, artifact_id: []const u8) !void {
+        const index = self.entries.getIndex(artifact_id) orelse return error.ArtifactNotFound;
+        const key = self.entries.keys()[index];
+        const bytes = self.entries.values()[index];
+        self.entries.swapRemoveAt(index);
+        self.alloc.free(key);
+        self.alloc.free(bytes);
+    }
+
+    const vtable: artifact_store.ArtifactStore.VTable = .{
+        .deinit = erasedDeinit,
+        .put = erasedPut,
+        .get_alloc = erasedGetAlloc,
+        .get_range_alloc = erasedGetRangeAlloc,
+        .stat = erasedStat,
+        .delete = erasedDelete,
+    };
+
+    fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+
+    fn erasedPut(ptr: *anyopaque, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.put(alloc, contents);
+    }
+
+    fn erasedGetAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.getAlloc(alloc, artifact_id);
+    }
+
+    fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.getRangeAlloc(alloc, artifact_id, offset, len);
+    }
+
+    fn erasedStat(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        return try self.stat(alloc, artifact_id);
+    }
+
+    fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        try self.delete(artifact_id);
+    }
+};
 
 test "lake rebuild planner reuses matching source bindings" {
     const alloc = std.testing.allocator;
@@ -588,13 +1068,22 @@ test "lake rebuild operation planner emits executable builder operations" {
             .name = "events.amount_by_tenant",
             .binding = algebraic_group_binding,
             .kind = .algebraic_segment,
-            .builder_kind = .algebraic_group_by,
+            .build_spec = .{ .algebraic_group_by = .{
+                .group_column = "tenant",
+                .value_column = "amount",
+                .op = .sum_i64,
+            } },
         },
         .{
             .name = "events.amount_folds",
             .binding = algebraic_expression_binding,
             .kind = .algebraic_segment,
-            .builder_kind = .algebraic_expression,
+            .build_spec = .{ .algebraic_expression = .{
+                .expressions = &[_]algebraic_segment.ExpressionSpec{
+                    .{ .name = "row_count", .op = .count },
+                    .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+                },
+            } },
         },
     };
 
@@ -630,6 +1119,58 @@ test "lake rebuild operation planner fails closed for ambiguous algebraic rebuil
     }};
 
     try std.testing.expectError(error.AmbiguousLakeRebuildBuilder, planOperationsAlloc(alloc, &desired, &.{}));
+}
+
+test "lake rebuild operation executor publishes row-source sidecars" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    const binding = source_binding.Binding{
+        .sidecar_kind = .text,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "parquet-13",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &[_][]const u8{"body"},
+        .index_config_hash = "sha256:text",
+    };
+    const desired = [_]DesiredArtifact{.{
+        .name = "docs.body_text",
+        .binding = binding,
+        .kind = .text_segment,
+        .build_spec = .{ .text = .{ .text_column = "body", .config_json = "{\"case\":\"lower\"}" } },
+    }};
+    var plan = try planOperationsAlloc(alloc, &desired, &.{});
+    defer plan.deinit(alloc);
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{ .source_id = "docs", .snapshot_id = "parquet-13", .file_id = "file-a.parquet", .row_group_ordinal = 0, .row_ordinal = 0 } },
+        .{ .external = .{ .source_id = "docs", .snapshot_id = "parquet-13", .file_id = "file-a.parquet", .row_group_ordinal = 0, .row_ordinal = 1 } },
+    };
+    const bodies = [_][]const u8{ "hello lake", "hello sidecar" };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "body", .values = .{ .bytes = &bodies } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "docs", .snapshot_id = "parquet-13" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var source_provider = TestRowSourceProvider{ .source_kind = .external_parquet, .batches = &batches };
+
+    var result = try executeOperationsAlloc(alloc, &artifacts, source_provider.provider(), plan);
+    defer result.deinit(alloc);
+
+    const executed = result.find("docs.body_text").?;
+    try std.testing.expectEqual(Action.rebuild, executed.action);
+    try std.testing.expect(executed.declaration != null);
+    try std.testing.expectEqualStrings("mem:0", executed.artifact_id);
+    const stored = try artifacts.getAlloc(executed.artifact_id);
+    defer alloc.free(stored);
+    try std.testing.expect(stored.len > 0);
 }
 
 test "lake rebuild operation planner preserves reuse and drop artifacts" {

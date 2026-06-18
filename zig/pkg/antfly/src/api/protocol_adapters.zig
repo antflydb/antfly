@@ -77,9 +77,9 @@ const catalog_table_fields = [_]McpToolFieldSpec{
 };
 
 const a2a_catalog_scopes = [_][]const u8{
-    "database:" ++ catalog_resources.default_database_name,
-    "namespace:" ++ catalog_resources.default_database_name ++ "." ++ catalog_resources.default_namespace_name,
-    "table:" ++ catalog_resources.default_database_name ++ "." ++ catalog_resources.default_namespace_name ++ ".*",
+    "database:*",
+    "namespace:*",
+    "table:*",
 };
 
 const mcp_tool_specs = [_]McpToolSpec{
@@ -407,13 +407,15 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "backup_id", .{ .string = backup_id });
             try body.put(alloc, "location", .{ .string = location });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, operation });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, operation });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
@@ -430,11 +432,13 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn tableRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, table_arg: []const u8, suffix: ?[]const u8, body: []const u8) !mcp.CallToolResult {
             _ = table_arg;
-            const table_name = catalogTableNameArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
             const uri = if (suffix) |route_suffix|
-                try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, route_suffix })
+                try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, route_suffix })
             else
-                try std.fmt.allocPrint(alloc, "{s}/{s}", .{ routes.Routes.tables, table_name });
+                try alloc.dupe(u8, table_uri);
             return try ctx.simpleRoute(alloc, method, uri, body);
         }
 
@@ -674,33 +678,38 @@ fn ensureDefaultCatalogQueryTargets(args: std.json.Value) CatalogToolArgError!vo
     }
 }
 
+fn a2aCatalogTableNameFromObjectAlloc(alloc: std.mem.Allocator, object: anytype) !?[]const u8 {
+    const table_name = jsonStringObjectField(object, "table") orelse return null;
+    const target = catalog_resources.tableTargetFromOptional(
+        jsonStringObjectField(object, "database"),
+        jsonStringObjectField(object, "namespace"),
+        table_name,
+    ) catch return error.InvalidA2aCatalogTarget;
+    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
+
+fn a2aNormalizedQueriesAlloc(alloc: std.mem.Allocator, queries: std.json.Value) !std.json.Value {
+    if (queries != .array) return queries;
+    var out = std.json.Array.init(alloc);
+    for (queries.array.items) |query| {
+        var normalized = query;
+        if (normalized == .object) {
+            if (try a2aCatalogTableNameFromObjectAlloc(alloc, normalized.object)) |catalog_table_name| {
+                try normalized.object.put(alloc, "table", .{ .string = catalog_table_name });
+                _ = normalized.object.swapRemove("database");
+                _ = normalized.object.swapRemove("namespace");
+            }
+        }
+        try out.append(normalized);
+    }
+    return .{ .array = out };
+}
+
 fn catalogTableArgError(alloc: std.mem.Allocator, err: CatalogToolArgError) !mcp.CallToolResult {
     return switch (err) {
         error.MissingTableName => mcpError(alloc, "missing tableName"),
         error.ExplicitCatalogTableRouteUnsupported => mcpError(alloc, "invalid explicit database/namespace table target"),
     };
-}
-
-fn validateA2aDefaultCatalogTarget(
-    alloc: std.mem.Allocator,
-    data: std.json.Value,
-    request_ctx: a2a.RequestContext,
-    queue: *a2a.EventQueue,
-) !bool {
-    ensureDefaultCatalogQueryTargets(data) catch |err| switch (err) {
-        error.ExplicitCatalogTableRouteUnsupported => {
-            try queue.status(
-                alloc,
-                request_ctx.task_id,
-                request_ctx.context_id,
-                "failed",
-                "explicit database/namespace A2A table targets are not supported until explicit catalog table routes are available",
-            );
-            return false;
-        },
-        error.MissingTableName => unreachable,
-    };
-    return true;
 }
 
 fn identityCanListTables(permissions: []const usermgr.Permission) bool {
@@ -1300,8 +1309,16 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             try body.put(alloc, "intent", .{ .string = text });
             if (a2a.firstDataPart(request_ctx.message)) |data| {
                 if (data == .object) {
-                    if (!try validateA2aDefaultCatalogTarget(alloc, data, request_ctx, queue)) return;
-                    if (jsonStringObjectField(data.object, "table")) |table| try body.put(alloc, "table", .{ .string = table });
+                    const catalog_table_name = a2aCatalogTableNameFromObjectAlloc(alloc, data.object) catch |err| switch (err) {
+                        error.InvalidA2aCatalogTarget => {
+                            try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", "invalid explicit database/namespace table target");
+                            return;
+                        },
+                        else => return err,
+                    };
+                    if (catalog_table_name) |table| {
+                        try body.put(alloc, "table", .{ .string = table });
+                    }
                     if (data.object.get("context")) |context| try body.put(alloc, "context", context);
                 }
             }
@@ -1335,12 +1352,25 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             try body.put(alloc, "stream", .{ .bool = false });
             if (a2a.firstDataPart(request_ctx.message)) |data| {
                 if (data == .object) {
-                    if (!try validateA2aDefaultCatalogTarget(alloc, data, request_ctx, queue)) return;
                     if (data.object.get("queries")) |queries| {
-                        try body.put(alloc, "queries", queries);
+                        const normalized_queries = a2aNormalizedQueriesAlloc(alloc, queries) catch |err| switch (err) {
+                            error.InvalidA2aCatalogTarget => {
+                                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", "invalid explicit database/namespace table target");
+                                return;
+                            },
+                            else => return err,
+                        };
+                        try body.put(alloc, "queries", normalized_queries);
                     } else if (jsonStringObjectField(data.object, "table")) |table| {
                         var query_obj = std.json.ObjectMap.empty;
-                        try query_obj.put(alloc, "table", .{ .string = table });
+                        const catalog_table_name = (a2aCatalogTableNameFromObjectAlloc(alloc, data.object) catch |err| switch (err) {
+                            error.InvalidA2aCatalogTarget => {
+                                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", "invalid explicit database/namespace table target");
+                                return;
+                            },
+                            else => return err,
+                        }) orelse table;
+                        try query_obj.put(alloc, "table", .{ .string = catalog_table_name });
                         var full_text = std.json.ObjectMap.empty;
                         try full_text.put(alloc, "query", .{ .string = text });
                         try query_obj.put(alloc, "full_text_search", .{ .object = full_text });

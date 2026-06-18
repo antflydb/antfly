@@ -1895,11 +1895,14 @@ fn tableRecordsEqual(a: table_manager.TableRecord, b: table_manager.TableRecord)
         a.desired_replica_count == b.desired_replica_count and
         a.min_ranges == b.min_ranges and
         std.mem.eql(u8, a.description, b.description) and
+        std.mem.eql(u8, a.database_name, b.database_name) and
+        std.mem.eql(u8, a.namespace_name, b.namespace_name) and
         std.mem.eql(u8, a.schema_json, b.schema_json) and
         std.mem.eql(u8, a.read_schema_json, b.read_schema_json) and
         std.mem.eql(u8, a.indexes_json, b.indexes_json) and
         std.mem.eql(u8, a.replication_sources_json, b.replication_sources_json) and
         std.mem.eql(u8, a.placement_role, b.placement_role) and
+        std.mem.eql(u8, a.tablespace_name, b.tablespace_name) and
         std.mem.eql(u8, a.name, b.name);
 }
 

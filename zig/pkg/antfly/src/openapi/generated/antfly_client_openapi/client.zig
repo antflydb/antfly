@@ -54,6 +54,11 @@ pub const ListNamespaceTablesParams = struct {
     prefix: ?[]const u8 = null,
 };
 
+pub const LookupNamespaceTableDocumentParams = struct {
+    /// Comma-separated list of fields to include in the response.
+    fields: ?[]const u8 = null,
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -453,6 +458,44 @@ pub const Client = struct {
         return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
     }
 
+    /// List tablespaces
+    /// GET /db/v1/tablespaces
+    pub fn listTablespaces(self: *@This()) !ApiResponse([]const types.TablespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.TablespaceCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get tablespace
+    /// GET /db/v1/tablespaces/{tablespaceName}
+    pub fn getTablespace(self: *@This(), tablespace_name: []const u8) !ApiResponse(types.TablespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, tablespace_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TablespaceCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create tablespace
+    /// POST /db/v1/tablespaces/{tablespaceName}
+    pub fn createTablespace(self: *@This(), tablespace_name: []const u8, body: types.CreateTablespaceRequest) !ApiResponse(types.TablespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, tablespace_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TablespaceCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop tablespace
+    /// DELETE /db/v1/tablespaces/{tablespaceName}
+    pub fn dropTablespace(self: *@This(), tablespace_name: []const u8) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, tablespace_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
     /// List databases
     /// GET /db/v1/databases
     pub fn listDatabases(self: *@This()) !ApiResponse([]const types.DatabaseCatalogRecord) {
@@ -489,6 +532,26 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Set database tablespace
+    /// PUT /db/v1/databases/{databaseName}/tablespace
+    pub fn setDatabaseTablespace(self: *@This(), database_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(types.DatabaseCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, database_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Clear database tablespace
+    /// DELETE /db/v1/databases/{databaseName}/tablespace
+    pub fn clearDatabaseTablespace(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, database_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
     /// List namespaces
     /// GET /db/v1/databases/{databaseName}/namespaces
     pub fn listNamespaces(self: *@This(), database_name: []const u8) !ApiResponse([]const types.NamespaceCatalogRecord) {
@@ -514,6 +577,26 @@ pub const Client = struct {
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Set namespace tablespace
+    /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace
+    pub fn setNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(types.NamespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, database_name, namespace_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
+    }
+
+    /// Clear namespace tablespace
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace
+    pub fn clearNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(types.NamespaceCatalogRecord) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, database_name, namespace_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
     }
 
     /// List tables in namespace
@@ -563,6 +646,122 @@ pub const Client = struct {
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
     pub fn dropNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(std.json.Value) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Query an explicit namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query
+    pub fn queryNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.QueryRequest) !ApiResponse(types.QueryResponses) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/query", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.QueryResponses).fromResponse(self.allocator, &resp);
+    }
+
+    /// Perform batch inserts and deletes on an explicit namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch
+    pub fn batchNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.BatchRequest) !ApiResponse(types.BatchResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/batch", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Perform structured relational row writes on an explicit namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch
+    pub fn rowsBatchNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RowsBatchRequest) !ApiResponse(types.BatchResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/rows/batch", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Backup an explicit namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup
+    pub fn backupNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.BackupRequest) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/backup", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Restore an explicit namespace table from backup
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore
+    pub fn restoreNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RestoreRequest) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/restore", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retrieve a document by key from an explicit namespace table
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}
+    pub fn lookupNamespaceTableDocument(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !ApiResponse(std.json.Value) {
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/documents/{s}", .{ self.base_url, database_name, namespace_name, table_name, key });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.fields) |v| {
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "fields=");
+            try query_buf.appendSlice(self.allocator, v);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// List indexes for an explicit namespace table
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes
+    pub fn listNamespaceTableIndexes(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse([]const types.IndexStatus) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes", .{ self.base_url, database_name, namespace_name, table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.IndexStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get index details for an explicit namespace table
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
+    pub fn getNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !ApiResponse(types.IndexStatus) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, database_name, namespace_name, table_name, index_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.IndexStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// Add an index to an explicit namespace table
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
+    pub fn createNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, database_name, namespace_name, table_name, index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop an index from an explicit namespace table
+    /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
+    pub fn dropNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !ApiResponse(std.json.Value) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, database_name, namespace_name, table_name, index_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -649,9 +848,9 @@ pub const Client = struct {
     }
 
     /// Perform structured relational row writes by row identity
-    /// POST /db/v1/tables/{tableName}/rows:batch
+    /// POST /db/v1/tables/{tableName}/rows/batch
     pub fn rowsBatchWrite(self: *@This(), table_name: []const u8, body: types.RowsBatchRequest) !ApiResponse(types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:batch", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/batch", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -660,9 +859,9 @@ pub const Client = struct {
     }
 
     /// Stage typed relational update/delete operations from a claimed row source
-    /// POST /db/v1/tables/{tableName}/rows:mutation-source
+    /// POST /db/v1/tables/{tableName}/rows/mutation-source
     pub fn rowsMutationSource(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(types.RowsMutationSourceResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:mutation-source", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/mutation-source", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -671,9 +870,9 @@ pub const Client = struct {
     }
 
     /// Lookup relational rows by structured row identity
-    /// POST /db/v1/tables/{tableName}/rows:get
+    /// POST /db/v1/tables/{tableName}/rows/get
     pub fn rowsGet(self: *@This(), table_name: []const u8, body: types.RowsGetRequest) !ApiResponse(types.RowsGetResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:get", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/get", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -682,9 +881,9 @@ pub const Client = struct {
     }
 
     /// Execute a typed relational row read plan
-    /// POST /db/v1/tables/{tableName}/rows:plan
+    /// POST /db/v1/tables/{tableName}/rows/plan
     pub fn rowsPlan(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:plan", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/plan", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -693,9 +892,9 @@ pub const Client = struct {
     }
 
     /// Execute a typed relational row query plan
-    /// POST /db/v1/tables/{tableName}/rows:query
+    /// POST /db/v1/tables/{tableName}/rows/query
     pub fn rowsQuery(self: *@This(), table_name: []const u8, body: types.RowsQueryPlanRequest) !ApiResponse(types.RowsQueryResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:query", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/query", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -704,9 +903,9 @@ pub const Client = struct {
     }
 
     /// Execute a typed relational row aggregate plan
-    /// POST /db/v1/tables/{tableName}/rows:aggregate
+    /// POST /db/v1/tables/{tableName}/rows/aggregate
     pub fn rowsAggregate(self: *@This(), table_name: []const u8, body: types.RowsAggregatePlanRequest) !ApiResponse(types.RowsAggregateResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:aggregate", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/aggregate", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -715,9 +914,9 @@ pub const Client = struct {
     }
 
     /// Execute a typed relational row window plan
-    /// POST /db/v1/tables/{tableName}/rows:window
+    /// POST /db/v1/tables/{tableName}/rows/window
     pub fn rowsWindow(self: *@This(), table_name: []const u8, body: types.RowsWindowPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:window", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/window", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -726,9 +925,9 @@ pub const Client = struct {
     }
 
     /// Execute a typed relational row join plan
-    /// POST /db/v1/tables/{tableName}/rows:join
+    /// POST /db/v1/tables/{tableName}/rows/join
     pub fn rowsJoin(self: *@This(), table_name: []const u8, body: types.RowsJoinPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:join", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/join", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -737,9 +936,9 @@ pub const Client = struct {
     }
 
     /// Execute a typed relational row lateral plan
-    /// POST /db/v1/tables/{tableName}/rows:lateral
+    /// POST /db/v1/tables/{tableName}/rows/lateral
     pub fn rowsLateral(self: *@This(), table_name: []const u8, body: types.RowsLateralPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows:lateral", .{ self.base_url, table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/lateral", .{ self.base_url, table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);

@@ -100,7 +100,7 @@ fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
             index = (parser.findMatchingRParenIndex(tokens, index) orelse return null) + 1;
         }
         if (!parser.matchKeyword(tokens, &index, "as")) return null;
-        if (!consumeCteMaterializationHint(tokens, &index)) return null;
+        parser.consumeCteMaterializationHint(tokens, &index) catch return null;
         if (index >= tokens.len or tokens[index].kind != .lparen) return null;
         index = (parser.findMatchingRParenIndex(tokens, index) orelse return null) + 1;
         if (index < tokens.len and tokens[index].kind == .comma) {
@@ -117,14 +117,6 @@ fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
     if (std.ascii.eqlIgnoreCase(tokens[index].text, "merge")) return .merge;
     if (std.ascii.eqlIgnoreCase(tokens[index].text, "truncate")) return .truncate;
     return null;
-}
-
-fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) bool {
-    if (parser.matchKeyword(tokens, index, "materialized")) return true;
-    if (parser.matchKeyword(tokens, index, "not")) {
-        return parser.matchKeyword(tokens, index, "materialized");
-    }
-    return true;
 }
 
 fn firstIdentifier(tokens: []const Token) ?[]const u8 {

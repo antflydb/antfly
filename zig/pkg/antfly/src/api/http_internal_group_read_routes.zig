@@ -991,9 +991,9 @@ test "internal group read routes expose relational rows source group local" {
         },
     }, .{
         .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/rows:source",
+        .uri = "/internal/v1/groups/7/tables/docs/rows/source",
         .body = "{\"schema_json\":\"{\\\"type\\\":\\\"object\\\"}\",\"topology_epoch\":42,\"req\":{\"select_all\":true},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"}}",
-    }, "/internal/v1/groups/7/tables/docs/rows:source", "")).?;
+    }, "/internal/v1/groups/7/tables/docs/rows/source", "")).?;
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -1017,9 +1017,9 @@ test "internal group read routes expose relational rows source group local" {
         },
     }, .{
         .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/rows:source",
+        .uri = "/internal/v1/groups/7/tables/docs/rows/source",
         .body = "{\"schema_json\":\"{\\\"type\\\":\\\"object\\\"}\",\"topology_epoch\":99,\"req\":{\"select_all\":true},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"}}",
-    }, "/internal/v1/groups/7/tables/docs/rows:source", "")).?;
+    }, "/internal/v1/groups/7/tables/docs/rows/source", "")).?;
     defer stale_resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 409), stale_resp.status);

@@ -549,6 +549,8 @@ pub const DatabaseCatalogRecord = struct {
     name: []const u8,
     /// JSON-encoded database settings owned by the catalog.
     settings_json: []const u8,
+    /// Optional durable tablespace binding inherited by new namespace/table placement policy.
+    tablespace_name: ?[]const u8 = null,
 };
 
 /// Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
@@ -561,6 +563,33 @@ pub const NamespaceCatalogRecord = struct {
     database_name: []const u8,
     /// Namespace name.
     name: []const u8,
+    /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
+    tablespace_name: ?[]const u8 = null,
+};
+
+pub const CatalogTablespaceBindingRequest = struct {
+    /// Existing tablespace name to bind to the catalog object.
+    tablespace_name: []const u8,
+};
+
+/// Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.
+pub const TablespaceCatalogRecord = struct {
+    /// Stable tablespace catalog identifier.
+    tablespace_id: i64,
+    /// Tablespace name.
+    name: []const u8,
+    /// JSON-encoded location descriptor. String locations are encoded as JSON strings.
+    location_json: []const u8,
+    /// JSON-encoded placement policy reserved for native placement planning.
+    placement_policy_json: []const u8,
+};
+
+/// Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it.
+pub const CreateTablespaceRequest = struct {
+    /// JSON-encoded location descriptor. Defaults to `null`.
+    location_json: ?[]const u8 = null,
+    /// JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+    placement_policy_json: ?[]const u8 = null,
 };
 
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
@@ -1071,7 +1100,7 @@ pub const RowsQueryOrderField = struct {
     direction: ?[]const u8 = null,
 };
 
-/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows:mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
+/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows/mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
 pub const RowsRowClaim = struct {
     mode: ?[]const u8 = null,
     wait_policy: ?[]const u8 = null,
@@ -3068,12 +3097,16 @@ pub const CreateTableRequest = struct {
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     replication_sources: ?[]const ReplicationSource = null,
+    /// Optional tablespace binding for the table. When set, the named tablespace must exist and cannot be dropped while the table references it.
+    tablespace_name: ?[]const u8 = null,
 };
 
 pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
+    /// Optional durable tablespace binding for this table.
+    tablespace_name: ?[]const u8 = null,
     indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
@@ -3198,6 +3231,8 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
+    /// Optional durable tablespace binding for this table.
+    tablespace_name: ?[]const u8 = null,
     indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,

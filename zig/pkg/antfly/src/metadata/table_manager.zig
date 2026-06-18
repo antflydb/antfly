@@ -33,16 +33,30 @@ pub fn deriveNamespaceId(database_id: u64, namespace_name: []const u8) u64 {
     return if (id == 0) 1 else id;
 }
 
+pub fn deriveTablespaceId(tablespace_name: []const u8) u64 {
+    const id = std.hash.Wyhash.hash(0x54535041, tablespace_name);
+    return if (id == 0) 1 else id;
+}
+
 pub const DatabaseRecord = struct {
     database_id: u64,
     name: []const u8,
     settings_json: []const u8 = "{}",
+    tablespace_name: []const u8 = "",
 };
 
 pub const NamespaceRecord = struct {
     namespace_id: u64,
     database_id: u64,
     name: []const u8,
+    tablespace_name: []const u8 = "",
+};
+
+pub const TablespaceRecord = struct {
+    tablespace_id: u64,
+    name: []const u8,
+    location_json: []const u8 = "null",
+    placement_policy_json: []const u8 = "{}",
 };
 
 pub const PlacementClass = enum {
@@ -66,6 +80,7 @@ pub const TableRecord = struct {
     indexes_json: []const u8 = "{}",
     replication_sources_json: []const u8 = "[]",
     placement_role: []const u8 = "data",
+    tablespace_name: []const u8 = "",
     restore_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     desired_replica_count: u16 = 3,
@@ -503,6 +518,7 @@ pub const TableManager = struct {
     alloc: std.mem.Allocator,
     databases: std.AutoHashMapUnmanaged(u64, DatabaseRecord) = .empty,
     namespaces: std.AutoHashMapUnmanaged(u64, NamespaceRecord) = .empty,
+    tablespaces: std.AutoHashMapUnmanaged(u64, TablespaceRecord) = .empty,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
     foreign_key_ref_ranges: std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord) = .empty,
@@ -523,6 +539,10 @@ pub const TableManager = struct {
         var namespace_it = self.namespaces.valueIterator();
         while (namespace_it.next()) |namespace| freeNamespace(self.alloc, namespace.*);
         self.namespaces.deinit(self.alloc);
+
+        var tablespace_it = self.tablespaces.valueIterator();
+        while (tablespace_it.next()) |tablespace| freeTablespace(self.alloc, tablespace.*);
+        self.tablespaces.deinit(self.alloc);
 
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -586,6 +606,17 @@ pub const TableManager = struct {
             return;
         }
         try self.namespaces.put(self.alloc, record.namespace_id, owned);
+    }
+
+    pub fn upsertTablespace(self: *TableManager, record: TablespaceRecord) !void {
+        const owned = try cloneTablespace(self.alloc, record);
+        errdefer freeTablespace(self.alloc, owned);
+        if (self.tablespaces.getPtr(record.tablespace_id)) |existing| {
+            freeTablespace(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.tablespaces.put(self.alloc, record.tablespace_id, owned);
     }
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
@@ -889,6 +920,12 @@ pub const TableManager = struct {
         }
         const removed = self.databases.fetchRemove(database_id) orelse return false;
         freeDatabase(self.alloc, removed.value);
+        return true;
+    }
+
+    pub fn removeTablespace(self: *TableManager, tablespace_id: u64) !bool {
+        const removed = self.tablespaces.fetchRemove(tablespace_id) orelse return false;
+        freeTablespace(self.alloc, removed.value);
         return true;
     }
 
@@ -1428,6 +1465,22 @@ pub const TableManager = struct {
         alloc.free(records);
     }
 
+    pub fn listTablespaces(self: *TableManager, alloc: std.mem.Allocator) ![]TablespaceRecord {
+        var out = std.ArrayListUnmanaged(TablespaceRecord).empty;
+        errdefer {
+            for (out.items) |record| freeTablespace(alloc, record);
+            out.deinit(alloc);
+        }
+        var it = self.tablespaces.valueIterator();
+        while (it.next()) |record| try out.append(alloc, try cloneTablespace(alloc, record.*));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeTablespaces(_: *TableManager, alloc: std.mem.Allocator, records: []TablespaceRecord) void {
+        for (records) |record| freeTablespace(alloc, record);
+        alloc.free(records);
+    }
+
     pub fn listRanges(self: *TableManager, alloc: std.mem.Allocator) ![]RangeRecord {
         var out = std.ArrayListUnmanaged(RangeRecord).empty;
         errdefer {
@@ -1709,30 +1762,59 @@ pub fn cloneDatabase(alloc: std.mem.Allocator, record: DatabaseRecord) !Database
     errdefer alloc.free(name);
     const settings_json = try alloc.dupe(u8, record.settings_json);
     errdefer alloc.free(settings_json);
+    const tablespace_name = try alloc.dupe(u8, record.tablespace_name);
+    errdefer alloc.free(tablespace_name);
     return .{
         .database_id = record.database_id,
         .name = name,
         .settings_json = settings_json,
+        .tablespace_name = tablespace_name,
     };
 }
 
 pub fn freeDatabase(alloc: std.mem.Allocator, record: DatabaseRecord) void {
     alloc.free(record.name);
     alloc.free(record.settings_json);
+    alloc.free(record.tablespace_name);
 }
 
 pub fn cloneNamespace(alloc: std.mem.Allocator, record: NamespaceRecord) !NamespaceRecord {
     const name = try alloc.dupe(u8, record.name);
     errdefer alloc.free(name);
+    const tablespace_name = try alloc.dupe(u8, record.tablespace_name);
+    errdefer alloc.free(tablespace_name);
     return .{
         .namespace_id = record.namespace_id,
         .database_id = record.database_id,
         .name = name,
+        .tablespace_name = tablespace_name,
     };
 }
 
 pub fn freeNamespace(alloc: std.mem.Allocator, record: NamespaceRecord) void {
     alloc.free(record.name);
+    alloc.free(record.tablespace_name);
+}
+
+pub fn cloneTablespace(alloc: std.mem.Allocator, record: TablespaceRecord) !TablespaceRecord {
+    const name = try alloc.dupe(u8, record.name);
+    errdefer alloc.free(name);
+    const location_json = try alloc.dupe(u8, record.location_json);
+    errdefer alloc.free(location_json);
+    const placement_policy_json = try alloc.dupe(u8, record.placement_policy_json);
+    errdefer alloc.free(placement_policy_json);
+    return .{
+        .tablespace_id = record.tablespace_id,
+        .name = name,
+        .location_json = location_json,
+        .placement_policy_json = placement_policy_json,
+    };
+}
+
+pub fn freeTablespace(alloc: std.mem.Allocator, record: TablespaceRecord) void {
+    alloc.free(record.name);
+    alloc.free(record.location_json);
+    alloc.free(record.placement_policy_json);
 }
 
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
@@ -1756,6 +1838,8 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(replication_sources_json);
     const placement_role = try alloc.dupe(u8, record.placement_role);
     errdefer alloc.free(placement_role);
+    const tablespace_name = try alloc.dupe(u8, record.tablespace_name);
+    errdefer alloc.free(tablespace_name);
     const restore_backup_id = try alloc.dupe(u8, record.restore_backup_id);
     errdefer alloc.free(restore_backup_id);
     const restore_location = try alloc.dupe(u8, record.restore_location);
@@ -1772,6 +1856,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
+        .tablespace_name = tablespace_name,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .desired_replica_count = record.desired_replica_count,
@@ -1790,6 +1875,7 @@ pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
     alloc.free(record.indexes_json);
     alloc.free(record.replication_sources_json);
     alloc.free(record.placement_role);
+    alloc.free(record.tablespace_name);
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_location);
 }

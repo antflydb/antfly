@@ -40,16 +40,24 @@ The default namespace should be `public` for PostgreSQL compatibility. Product
 copy can call it the default namespace, but the persisted default name should
 stay `public` unless a future migration intentionally changes it.
 
-Explicit catalog APIs can be added later without breaking the simple path:
+Explicit catalog APIs expose the full catalog identity without breaking the
+simple path:
 
 ```text
 /databases/{database}/namespaces/{namespace}/tables/{table}
 ```
 
-Request-scoped defaults, such as an authenticated current database or an
-`X-Antfly-Database` header, can select the database for shorthand table APIs.
-Those defaults are API sugar; storage and metadata should carry fully qualified
-catalog identity.
+Shorthand table APIs resolve through a strict precedence order:
+
+1. explicit route or body catalog fields
+2. authenticated server-side session or principal defaults, once Antfly has a
+   durable native setting model
+3. `default.public`
+
+Client-supplied defaulting headers, such as `X-Antfly-Database`, must remain
+unsupported until they are part of the generated OpenAPI contract, authorization
+checks, and audit log. Storage and metadata should always carry fully qualified
+catalog identity after resolution.
 
 ## SQL Mapping
 
@@ -93,7 +101,30 @@ rewrite plan.
 ## Tablespaces
 
 Tablespaces should model placement and storage-class policy, not local
-filesystem paths. A tablespace can later select:
+filesystem paths. They should be first-class catalog resources:
+
+```text
+tablespace:fastspace
+```
+
+Lifecycle operations are admin operations on the `tablespace:<name>` resource.
+SQL `CREATE TABLESPACE`, `ALTER TABLESPACE ... RENAME TO`, `DROP TABLESPACE`,
+and REST `/db/v1/tablespaces` calls mutate the same metadata-backed catalog
+object. Table creation can durably bind `tablespace_name`; that binding
+validates the tablespace exists, is shown in table status responses, is updated
+on tablespace rename, and prevents tablespace drop while referenced.
+
+Database- and namespace-level bindings are public catalog operations through
+the explicit `/databases/{database}/tablespace` and
+`/databases/{database}/namespaces/{namespace}/tablespace` endpoints. Table
+creation resolves effective placement in this order:
+
+1. table `tablespace_name`
+2. namespace `tablespace_name`
+3. database `tablespace_name`
+4. no tablespace binding
+
+A tablespace can select:
 
 - placement role
 - replica policy
@@ -102,9 +133,14 @@ filesystem paths. A tablespace can later select:
 - retention class
 - encryption or compliance class
 
-SQL `CREATE TABLESPACE ... LOCATION` should stay a compatibility syntax that
-captures typed placement intent only after Antfly owns the corresponding
-catalog object. It must not silently redirect storage paths.
+SQL `CREATE TABLESPACE ... LOCATION` is compatibility syntax. The location is
+stored as catalog metadata and must not silently redirect local filesystem
+paths. Native REST creation may also carry `placement_policy_json`; that policy
+is durable catalog metadata. The current production policy bridge maps
+`placement_role`, `desired_replica_count` / `replica_count`, and `min_ranges`
+onto native table placement fields during table creation. Other storage, lake,
+retention, encryption, and compliance policy fields remain durable metadata
+until native schedulers consume them directly.
 
 ## Document Collections
 
@@ -171,16 +207,25 @@ and resolves to:
 default.public.{table}
 ```
 
-Explicit routes should be added when the backing catalog and authorization
-checks exist:
+Explicit catalog routes are public API when they are present in OpenAPI:
 
 ```text
 /db/v1/databases
 /db/v1/databases/{database}
+/db/v1/databases/{database}/tablespace
 /db/v1/databases/{database}/namespaces
 /db/v1/databases/{database}/namespaces/{namespace}
+/db/v1/databases/{database}/namespaces/{namespace}/tablespace
 /db/v1/databases/{database}/namespaces/{namespace}/tables
 /db/v1/databases/{database}/namespaces/{namespace}/tables/{table}
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}/query
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}/batch
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}/rows/batch
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}/documents/{key}
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}/indexes
+/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}/indexes/{index}
+/db/v1/tablespaces
+/db/v1/tablespaces/{tablespace}
 ```
 
 The generated API types should expose `database` and `namespace` as structured
@@ -190,6 +235,17 @@ authorization, audit, and routing. New explicit endpoints should not be
 implemented as string rewrites into old `/tables/{table}` handlers; they should
 share the handler core after target resolution so non-default namespaces remain
 real catalog identity.
+
+Explicit table I/O routes pass a typed catalog target through the REST and
+read/write API boundary. Provisioned and hosted table read/write sources expose
+native catalog-target vtable methods for query, batch, indexes, runtime status,
+table lifecycle, backup, and restore calls. Those methods resolve the catalog
+table first and use the qualified `database.namespace.table` resource as the
+backend table identity, including `default.public` when the explicit catalog
+route is used. Direct foreign-source query dispatch keys the source metadata by
+the same typed catalog target instead of a compatibility storage key. Legacy
+`/tables/{table}` shorthand still maps to `default.public.{table}` before
+authorization and routing.
 
 MCP tools should be catalog-aware wrappers over those OpenAPI operations:
 
@@ -237,22 +293,22 @@ The CLI should be a thin generated-client wrapper around the OpenAPI surface:
 ```sh
 antfly database create tenant_ops
 antfly namespace create analytics --database tenant_ops
-antfly table create events --database tenant_ops --namespace analytics
-antfly sql --database tenant_ops 'CREATE TABLE analytics.events (...)'
+antfly table create --table events --database tenant_ops --namespace analytics
 ```
 
-The CLI can carry local defaults for ergonomics:
+The CLI can carry process-local defaults for ergonomics:
 
 ```sh
-antfly config set current-database tenant_ops
-antfly config set current-namespace analytics
+export ANTFLY_DATABASE=tenant_ops
+export ANTFLY_NAMESPACE=analytics
 antfly table list
 ```
 
-Explicit flags always override local defaults.
+Explicit flags always override environment defaults.
 
-The CLI should persist defaults only in local client configuration. Server-side
-effects must always include the resolved database and namespace in the request
+The CLI should persist defaults only in local client configuration if a future
+config command is added. Server-side effects must always include the resolved
+database and namespace in the request
 or derive them from authenticated server-side defaults. Scripts should prefer
 explicit `--database` and `--namespace` flags so catalog intent survives moving
 between environments.
@@ -277,9 +333,12 @@ GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO app_reader;
 
 Unqualified grants remain compatibility sugar for the current database and
 `public` namespace. Role settings such as `app.tenant_id` remain useful for row
-security. Settings that imply native catalog behavior, such as `search_path` or
-`current_database`, should stay fail-closed until Antfly has real native
-semantics for them.
+security. SQL `SET search_path`, `RESET search_path`, `SHOW search_path`, and
+`DISCARD ALL` now lower to typed session catalog plans; applying those plans
+mutates an explicit SQL catalog session used by SQL catalog resolution rather
+than silently rewriting table names. `current_database` is still an explicit
+session input until Antfly owns a connection protocol with durable server-side
+session state.
 
 Authorization should be checked at the most specific resource needed by the
 operation and may require parent access where the operation depends on parent
@@ -313,19 +372,15 @@ CLI table commands emit the same OpenAPI requests as hand-written HTTP calls.
 Qualified table grants do not leak across databases or namespaces.
 ```
 
-Explicit REST subroutes and MCP table tools should resolve
-`database.namespace.table` before they delegate into legacy table storage paths.
-Until query/write/storage APIs accept native catalog targets end to end, that
-bridge must be fail-closed: delegation is allowed only when the qualified
-catalog table maps to a unique physical table name. Duplicate bare table names
-across catalogs must return an explicit unsupported/ambiguous error rather than
-falling back to `default.public`.
+Explicit REST subroutes and MCP table tools must resolve catalog targets through
+the shared resolver before table I/O. Read/write vtables expose catalog-target
+entry points, and provisioned/hosted backends implement those methods directly.
 
-A2A non-default table execution should remain fail-closed until its task
-handlers use the same catalog-aware table I/O path. Agent cards may advertise
-the default catalog scope, and task handlers must reject explicit non-default
-database or namespace targets rather than silently resolving them against
-`default.public`.
+A2A agent cards advertise wildcard catalog scopes as discovery metadata.
+Query-builder and retrieval task handlers normalize explicit
+`database`/`namespace`/`table` task data into a qualified catalog resource before
+dispatch, then rely on the same delegated principal and table authorization path
+as HTTP and MCP.
 
 ### Integration Contract by Surface
 
@@ -341,6 +396,7 @@ adapters:
 | A2A | Delegated-agent adapter | Advertises catalog-scoped skills as discovery metadata, then executes each task as a delegated Antfly principal against the same resolver and authorization checks. |
 | CLI | Ergonomic generated-client wrapper | Stores local defaults for convenience, sends explicit database/namespace fields when present, and never creates server-only semantics that cannot be expressed through OpenAPI. |
 | User/role system | Authorization authority | Stores qualified resources (`database:name`, `namespace:db.ns`, `table:db.ns.table`) and evaluates inherited role grants consistently for HTTP, SQL, MCP, A2A, and CLI callers. |
+| Tablespaces | Placement policy catalog | Stores named placement/storage policy resources, authorizes lifecycle through `tablespace:<name>`, exposes database/namespace/table bindings through OpenAPI, and maps supported policy keys into native table placement metadata. |
 
 This means MCP, A2A, and CLI should not each gain their own idea of "current
 database" or "current namespace" beyond client/session defaults that feed the
@@ -368,20 +424,61 @@ superuser mode.
 
 ## Migration Path
 
-1. Keep `/tables/{table}` as shorthand for the default database and `public`
-   namespace.
-2. Persist database and namespace metadata in table catalog records before
-   exposing explicit cross-namespace APIs.
-3. Add catalog objects for databases and namespaces with idempotent create,
-   rename, drop, dependency, and authorization semantics.
-4. Teach SQL object resolution to use current database plus namespace search
-   rules instead of stripping all non-`public` prefixes.
-5. Add explicit database/namespace OpenAPI routes only after the underlying catalog
-   identity and authorization checks exist.
-6. Bind MCP, A2A, CLI, and SDK helpers to the generated OpenAPI operations and
-   shared target-resolution helpers.
-7. Extend user and role permissions from bare table names to qualified
-   database/namespace/table resources, then teach SQL `GRANT`/`REVOKE` to emit
-   those qualified permissions.
-8. Add parity tests proving the same principal can or cannot access a qualified
-   table consistently through HTTP, SQL, MCP, A2A, and CLI paths.
+Completed baseline:
+
+1. Keep `/tables/{table}` as shorthand for `default.public.{table}`.
+2. Persist database and namespace metadata in table catalog records.
+3. Add catalog objects for databases and namespaces with create/drop,
+   dependency, and authorization checks.
+4. Expose explicit database, namespace, and table lifecycle routes through
+   OpenAPI.
+5. Extend user and role permissions from bare table names to qualified
+   database/namespace/table resources, while preserving default-public migration
+   compatibility.
+6. Add metadata-backed tablespace lifecycle through SQL and OpenAPI, including
+   `tablespace` role resources, durable table `tablespace_name` bindings,
+   database/namespace binding endpoints, placement policy metadata, native
+   placement-field projection, rename propagation, and drop dependency checks.
+7. Add SQL catalog session resolution for current database and search path in
+   the shared catalog DDL plan API.
+8. Add CLI helpers for database, namespace, table, index, query, document I/O,
+   tablespace lifecycle operations, and database/namespace tablespace bindings.
+
+Transitional bridge:
+
+1. Public explicit catalog table I/O routes (`query`, `batch`, `rows/batch`,
+   `documents/{key}`, `indexes`, `backup`, and `restore`) resolve typed catalog
+   targets first, then use catalog-aware read/write vtable methods. Physical
+   backup/restore still consumes the backend's native snapshot layout, but
+   explicit catalog dispatch no longer converts through compatibility storage
+   keys.
+2. MCP table tools call those same public routes and inherit the same typed
+   target resolution.
+3. A2A query-builder and retrieval task handlers normalize explicit
+   `database`/`namespace`/`table` task data into the same catalog-derived table
+   identity before dispatch and still authorize the concrete table resource at
+   execution time.
+
+Production hardening now in place:
+
+1. Explicit catalog table I/O requires native catalog-target vtables; missing
+   backend support fails closed instead of falling back to compatibility storage
+   keys. Backup and restore have catalog vtable coverage alongside query,
+   batch, document lookup, index, status, and table lifecycle operations.
+2. Tablespace placement policy validation and table-creation projection both
+   consume the same supported native policy keys (`placement_role`,
+   `desired_replica_count` / `replica_count`, and `min_ranges`). Unknown
+   placement keys fail closed until a scheduler implements their semantics.
+3. SQL `SET search_path`, `RESET search_path`, `SHOW search_path`, and
+   `DISCARD ALL` use typed session catalog plans and mutate an explicit SQL
+   catalog session for subsequent resolution.
+4. The in-repo parity gates cover SQL catalog/session fixtures, generated
+   OpenAPI freshness, explicit REST catalog routes, MCP route generation, A2A
+   catalog task normalization, CLI surface compilation, and qualified
+   role-resource checks.
+
+Future expansion:
+
+1. Teach placement/storage schedulers to consume future tablespace policy fields
+   for storage class, lake tier, retention, encryption, and compliance once
+   those native schedulers exist.

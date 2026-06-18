@@ -690,6 +690,379 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tablespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List tablespaces
+         * @description Lists tablespace catalog objects visible to the caller.
+         */
+        get: operations["listTablespaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tablespaces/{tablespaceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        /** Get tablespace */
+        get: operations["getTablespace"];
+        put?: never;
+        /**
+         * Create tablespace
+         * @description Creates a tablespace catalog object. The server applies the same lifecycle semantics as `CREATE TABLESPACE`.
+         */
+        post: operations["createTablespace"];
+        /**
+         * Drop tablespace
+         * @description Drops a tablespace catalog object. Table placement by tablespace is fail-closed until native placement planning consumes tablespace policy.
+         */
+        delete: operations["dropTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List databases
+         * @description Lists database catalog objects visible to the caller. Shorthand table APIs resolve through the caller's current/default database.
+         */
+        get: operations["listDatabases"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        /** Get database */
+        get: operations["getDatabase"];
+        put?: never;
+        /**
+         * Create database
+         * @description Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
+         */
+        post: operations["createDatabase"];
+        /**
+         * Drop database
+         * @description Drops an empty database catalog object. Non-empty databases fail with a conflict.
+         */
+        delete: operations["dropDatabase"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List namespaces
+         * @description Lists namespace catalog objects inside a database. PostgreSQL schemas map to these namespaces.
+         */
+        get: operations["listNamespaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create namespace
+         * @description Creates a namespace catalog object in a database. The server applies the same semantics as `CREATE SCHEMA` for the selected database.
+         */
+        post: operations["createNamespace"];
+        /**
+         * Drop namespace
+         * @description Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+         */
+        delete: operations["dropNamespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List tables in namespace
+         * @description Lists table catalog objects under an explicit database and namespace.
+         */
+        get: operations["listNamespaceTables"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get namespace table details
+         * @description Gets a table through an explicit database and namespace route.
+         */
+        get: operations["getNamespaceTable"];
+        put?: never;
+        /**
+         * Create namespace table
+         * @description Creates a table through an explicit database and namespace route.
+         */
+        post: operations["createNamespaceTable"];
+        /**
+         * Drop namespace table
+         * @description Drops a table through an explicit database and namespace route.
+         */
+        delete: operations["dropNamespaceTable"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query an explicit namespace table
+         * @description Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["queryNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform batch inserts and deletes on an explicit namespace table
+         * @description Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["batchNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform structured relational row writes on an explicit namespace table
+         * @description Relational row batch endpoint for an explicit database and namespace table. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["rowsBatchNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Key of the document to retrieve */
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Retrieve a document by key from an explicit namespace table
+         * @description Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        get: operations["lookupNamespaceTableDocument"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List indexes for an explicit namespace table
+         * @description Lists index metadata through an explicit database and namespace route.
+         */
+        get: operations["listNamespaceTableIndexes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /** Get index details for an explicit namespace table */
+        get: operations["getNamespaceTableIndex"];
+        put?: never;
+        /** Add an index to an explicit namespace table */
+        post: operations["createNamespaceTableIndex"];
+        /** Drop an index from an explicit namespace table */
+        delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables": {
         parameters: {
             query?: never;
@@ -873,7 +1246,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:batch": {
+    "/db/v1/tables/{tableName}/rows/batch": {
         parameters: {
             query?: never;
             header?: never;
@@ -901,7 +1274,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:mutation-source": {
+    "/db/v1/tables/{tableName}/rows/mutation-source": {
         parameters: {
             query?: never;
             header?: never;
@@ -933,7 +1306,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:get": {
+    "/db/v1/tables/{tableName}/rows/get": {
         parameters: {
             query?: never;
             header?: never;
@@ -961,7 +1334,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:plan": {
+    "/db/v1/tables/{tableName}/rows/plan": {
         parameters: {
             query?: never;
             header?: never;
@@ -987,7 +1360,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:query": {
+    "/db/v1/tables/{tableName}/rows/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -1007,7 +1380,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:aggregate": {
+    "/db/v1/tables/{tableName}/rows/aggregate": {
         parameters: {
             query?: never;
             header?: never;
@@ -1027,7 +1400,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:window": {
+    "/db/v1/tables/{tableName}/rows/window": {
         parameters: {
             query?: never;
             header?: never;
@@ -1047,7 +1420,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:join": {
+    "/db/v1/tables/{tableName}/rows/join": {
         parameters: {
             query?: never;
             header?: never;
@@ -1067,7 +1440,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/rows:lateral": {
+    "/db/v1/tables/{tableName}/rows/lateral": {
         parameters: {
             query?: never;
             header?: never;
@@ -3256,6 +3629,12 @@ export interface components {
              *     Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+            /**
+             * @description Optional tablespace binding for the table. When set, the named tablespace must exist and
+             *     cannot be dropped while the table references it.
+             * @example fastspace
+             */
+            tablespace_name?: string;
         };
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
@@ -3266,6 +3645,8 @@ export interface components {
              * @example Table for user data
              */
             description?: string;
+            /** @description Optional durable tablespace binding for this table. */
+            tablespace_name?: string;
             indexes: {
                 [key: string]: components["schemas"]["IndexConfig"];
             };
@@ -3277,6 +3658,87 @@ export interface components {
             migration?: components["schemas"]["TableMigration"];
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+        };
+        /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
+        DatabaseCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable database catalog identifier.
+             * @example 22
+             */
+            database_id: number;
+            /**
+             * @description Database name.
+             * @example tenant_ops
+             */
+            name: string;
+            /**
+             * @description JSON-encoded database settings owned by the catalog.
+             * @example {}
+             */
+            settings_json: string;
+        };
+        /** @description Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces. */
+        NamespaceCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable namespace catalog identifier.
+             * @example 222
+             */
+            namespace_id: number;
+            /**
+             * Format: uint64
+             * @description Parent database identifier.
+             * @example 22
+             */
+            database_id: number;
+            /**
+             * @description Parent database name.
+             * @example tenant_ops
+             */
+            database_name: string;
+            /**
+             * @description Namespace name.
+             * @example analytics
+             */
+            name: string;
+        };
+        /** @description Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface. */
+        TablespaceCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable tablespace catalog identifier.
+             * @example 42
+             */
+            tablespace_id: number;
+            /**
+             * @description Tablespace name.
+             * @example fastspace
+             */
+            name: string;
+            /**
+             * @description JSON-encoded location descriptor. String locations are encoded as JSON strings.
+             * @example "/var/lib/antfly/fastspace"
+             */
+            location_json: string;
+            /**
+             * @description JSON-encoded placement policy reserved for native placement planning.
+             * @example {}
+             */
+            placement_policy_json: string;
+        };
+        /** @description Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it. */
+        CreateTablespaceRequest: {
+            /**
+             * @description JSON-encoded location descriptor. Defaults to `null`.
+             * @example "/var/lib/antfly/fastspace"
+             */
+            location_json?: string;
+            /**
+             * @description JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+             * @example {}
+             */
+            placement_policy_json?: string;
         };
         /** @description Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema. */
         TableMigration: {
@@ -4317,7 +4779,7 @@ export interface components {
         };
         /**
          * @description Lockable base-row claim metadata. Public row-plan endpoints reject this
-         *     field; it is only accepted by `rows:mutation-source` lockable base-row
+         *     field; it is only accepted by `rows/mutation-source` lockable base-row
          *     sources and internal/coordinator execution paths. `transaction_id` is
          *     the canonical field name.
          */
@@ -4714,6 +5176,16 @@ export interface components {
             side: "left" | "right";
             field: string;
         };
+        /**
+         * @description Physical join strategy requested by the typed plan. `auto` lets Antfly choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the leading join keys.
+         * @enum {string}
+         */
+        RowsJoinStrategy: "auto" | "lookup" | "hash" | "merge";
+        /** @description Join strategy admission metadata returned by native join execution. */
+        RowsJoinStrategySelection: {
+            requested: components["schemas"]["RowsJoinStrategy"];
+            selected: components["schemas"]["RowsJoinStrategy"];
+        };
         /** @description Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`. */
         RowsJoinRequest: {
             left: components["schemas"]["RowsQueryRequest"];
@@ -4729,6 +5201,7 @@ export interface components {
             match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
             /** @enum {string} */
             join_type?: "inner" | "left";
+            strategy?: components["schemas"]["RowsJoinStrategy"];
             select?: components["schemas"]["RowsJoinProjection"][];
             order_by?: components["schemas"]["RowsQueryOrder"][];
             /** Format: int64 */
@@ -4841,6 +5314,7 @@ export interface components {
         RowsStreamResultSet: {
             /** Format: int64 */
             total_rows?: number;
+            join_strategy?: components["schemas"]["RowsJoinStrategySelection"];
             result_schema?: components["schemas"]["RowsResultColumn"][];
             rows?: {
                 [key: string]: unknown;
@@ -7374,11 +7848,11 @@ export interface components {
             } | null;
         };
         /**
-         * @description Type of the resource, e.g., table, user, or global ('*').
+         * @description Type of the resource, e.g., database, namespace, table, tablespace, user, or global ('*').
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "user" | "*";
+        ResourceType: "database" | "namespace" | "table" | "tablespace" | "user" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -13310,6 +13784,768 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Error"];
                 };
+            };
+        };
+    };
+    listTablespaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of tablespaces */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"][];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tablespace details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CreateTablespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Tablespace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Tablespace already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tablespace dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listDatabases: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of databases */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"][];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Database already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Database is not empty */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listNamespaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of namespaces in the database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    createNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Namespace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Namespace already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Namespace dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Namespace is not empty */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listNamespaceTables: {
+        parameters: {
+            query?: {
+                /** @description Filter tables by name prefix. */
+                prefix?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of tables in the namespace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Table details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTableRequest"];
+            };
+        };
+        responses: {
+            /** @description Table created */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Table dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryRequest"];
+                "application/x-ndjson": string;
+            };
+        };
+        responses: {
+            /** @description Query successful */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryResponses"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    batchNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    rowsBatchNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Row batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    lookupNamespaceTableDocument: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated list of fields to include in the response. */
+                fields?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Key of the document to retrieve */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record found */
+            200: {
+                headers: {
+                    /** @description Version token for this document. */
+                    "X-Antfly-Version"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listNamespaceTableIndexes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of indexes for the table */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexStatus"][];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexStatus"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexConfig"];
+            };
+        };
+        responses: {
+            /** @description Index added successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index dropped successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

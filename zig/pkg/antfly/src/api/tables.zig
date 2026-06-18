@@ -30,6 +30,7 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const full_text_indexes = @import("full_text_indexes.zig");
 const indexes_api = @import("indexes.zig");
 const json_helpers = @import("json_helpers.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const relational_sql = @import("relational_sql.zig");
 const table_reads = @import("table_reads.zig");
 
@@ -59,6 +60,9 @@ pub const AppliedRelationalSqlDdlRecord = struct {
     created_namespace: bool = false,
     renamed_namespace: bool = false,
     dropped_namespace: bool = false,
+    created_tablespace: bool = false,
+    renamed_tablespace: bool = false,
+    dropped_tablespace: bool = false,
     noop: bool = false,
     requires_rebuild: bool = false,
     validation_required: bool = false,
@@ -637,12 +641,14 @@ pub const CreateTableRequest = struct {
     indexes_json: ?[]u8 = null,
     schema_json: ?[]u8 = null,
     replication_sources_json: ?[]u8 = null,
+    tablespace_name: ?[]u8 = null,
 
     pub fn deinit(self: *CreateTableRequest, alloc: std.mem.Allocator) void {
         if (self.description) |value| alloc.free(value);
         if (self.indexes_json) |value| alloc.free(value);
         if (self.schema_json) |value| alloc.free(value);
         if (self.replication_sources_json) |value| alloc.free(value);
+        if (self.tablespace_name) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -695,6 +701,16 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
             const encoded_replication_sources = try stringifyJsonValue(alloc, value);
             defer alloc.free(encoded_replication_sources);
             req.replication_sources_json = try validateReplicationSourcesJson(alloc, encoded_replication_sources);
+        }
+    }
+    if (root.get("tablespace_name")) |value| {
+        req.tablespace_name = switch (value) {
+            .null => null,
+            .string => |str| try alloc.dupe(u8, str),
+            else => return error.InvalidCreateTableRequest,
+        };
+        if (req.tablespace_name) |name| {
+            if (name.len == 0 or std.mem.indexOfScalar(u8, name, '.') != null) return error.InvalidCreateTableRequest;
         }
     }
 
@@ -1058,6 +1074,7 @@ pub fn deriveQualifiedTableRecord(
         .indexes_json = req.indexes_json orelse default_indexes_json,
         .replication_sources_json = req.replication_sources_json orelse "[]",
         .placement_role = "data",
+        .tablespace_name = req.tablespace_name orelse "",
         .desired_replica_count = 3,
         .min_ranges = min_ranges,
     };
@@ -1911,6 +1928,7 @@ fn buildTableStatus(
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
+        .tablespace_name = if (table.tablespace_name.len > 0) table.tablespace_name else null,
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,
         .schema = try parseOptionalTableSchema(alloc, table.schema_json),
@@ -3078,7 +3096,33 @@ fn parseU32Field(value: std.json.Value) !u32 {
 }
 
 pub fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
+    if (qualifiedTableNameParts(table_name)) |parts| {
+        if (findTableByQualifiedName(snapshot, parts.database_name, parts.namespace_name, parts.table_name)) |table| return table;
+    }
     return findTableByQualifiedName(snapshot, default_database_name, default_namespace_name, table_name);
+}
+
+pub const QualifiedTableNameParts = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+pub fn qualifiedTableNameParts(table_name: []const u8) ?QualifiedTableNameParts {
+    const first_dot = std.mem.indexOfScalar(u8, table_name, '.') orelse return null;
+    if (first_dot == 0) return null;
+    const rest = table_name[first_dot + 1 ..];
+    const second_dot_rel = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    if (second_dot_rel == 0) return null;
+    const second_dot = first_dot + 1 + second_dot_rel;
+    if (second_dot + 1 >= table_name.len) return null;
+    const leaf = table_name[second_dot + 1 ..];
+    if (std.mem.indexOfScalar(u8, leaf, '.') != null) return null;
+    return .{
+        .database_name = table_name[0..first_dot],
+        .namespace_name = table_name[first_dot + 1 .. second_dot],
+        .table_name = leaf,
+    };
 }
 
 pub fn findDatabaseByName(snapshot: *const metadata_api.AdminSnapshot, database_name: []const u8) ?*const metadata_table_manager.DatabaseRecord {
@@ -3100,6 +3144,107 @@ pub fn findNamespaceByName(
         if (record.namespace_id == namespace_id and record.database_id == database_id and std.mem.eql(u8, record.name, namespace_name)) return record;
     }
     return null;
+}
+
+pub fn findTablespaceByName(snapshot: *const metadata_api.AdminSnapshot, tablespace_name: []const u8) ?*const metadata_table_manager.TablespaceRecord {
+    const tablespace_id = metadata_table_manager.deriveTablespaceId(tablespace_name);
+    for (snapshot.tablespaces) |*record| {
+        if (record.tablespace_id == tablespace_id and std.mem.eql(u8, record.name, tablespace_name)) return record;
+    }
+    return null;
+}
+
+pub fn effectiveTablespaceForTarget(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    explicit_tablespace_name: ?[]const u8,
+) ?*const metadata_table_manager.TablespaceRecord {
+    if (explicit_tablespace_name) |name| {
+        if (name.len > 0) return findTablespaceByName(snapshot, name);
+    }
+    if (findNamespaceByName(snapshot, database_name, namespace_name)) |namespace| {
+        if (namespace.tablespace_name.len > 0) return findTablespaceByName(snapshot, namespace.tablespace_name);
+    }
+    if (findDatabaseByName(snapshot, database_name)) |database| {
+        if (database.tablespace_name.len > 0) return findTablespaceByName(snapshot, database.tablespace_name);
+    }
+    return null;
+}
+
+pub fn applyTablespacePlacementPolicyAlloc(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    tablespace: *const metadata_table_manager.TablespaceRecord,
+) !metadata_table_manager.TableRecord {
+    var updated = try metadata_table_manager.cloneTable(alloc, table);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+    alloc.free(updated.tablespace_name);
+    updated.tablespace_name = try alloc.dupe(u8, tablespace.name);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, tablespace.placement_policy_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTablespacePlacementPolicy,
+    };
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (!tablespacePlacementPolicyKeySupported(entry.key_ptr.*)) return error.InvalidTablespacePlacementPolicy;
+    }
+    if (root.get("placement_role")) |value| {
+        const role = try parseTablespacePlacementRole(value);
+        alloc.free(updated.placement_role);
+        updated.placement_role = try alloc.dupe(u8, role);
+    }
+    if (root.get("desired_replica_count")) |value| {
+        updated.desired_replica_count = try parseTablespaceReplicaCount(value);
+    } else if (root.get("replica_count")) |value| {
+        updated.desired_replica_count = try parseTablespaceReplicaCount(value);
+    }
+    if (root.get("min_ranges")) |value| {
+        updated.min_ranges = try parseTablespaceMinRanges(value);
+    }
+    return updated;
+}
+
+fn tablespacePlacementPolicyKeySupported(key: []const u8) bool {
+    return std.mem.eql(u8, key, "placement_role") or
+        std.mem.eql(u8, key, "desired_replica_count") or
+        std.mem.eql(u8, key, "replica_count") or
+        std.mem.eql(u8, key, "min_ranges");
+}
+
+fn parseTablespacePlacementRole(value: std.json.Value) ![]const u8 {
+    const raw = switch (value) {
+        .string => |str| str,
+        else => return error.InvalidTablespacePlacementPolicy,
+    };
+    if (std.mem.eql(u8, raw, "data")) return "data";
+    if (std.mem.eql(u8, raw, "hot")) return "hot";
+    if (std.mem.eql(u8, raw, "cold")) return "cold";
+    if (std.mem.eql(u8, raw, "serving")) return "serving";
+    if (std.mem.eql(u8, raw, "bulk")) return "bulk";
+    if (std.mem.eql(u8, raw, "archive")) return "archive";
+    return error.InvalidTablespacePlacementPolicy;
+}
+
+fn parseTablespaceReplicaCount(value: std.json.Value) !u16 {
+    const int_value = switch (value) {
+        .integer => |integer| integer,
+        else => return error.InvalidTablespacePlacementPolicy,
+    };
+    if (int_value <= 0) return error.InvalidTablespacePlacementPolicy;
+    return std.math.cast(u16, int_value) orelse error.InvalidTablespacePlacementPolicy;
+}
+
+fn parseTablespaceMinRanges(value: std.json.Value) !u32 {
+    const int_value = switch (value) {
+        .integer => |integer| integer,
+        else => return error.InvalidTablespacePlacementPolicy,
+    };
+    if (int_value <= 0) return error.InvalidTablespacePlacementPolicy;
+    return std.math.cast(u32, int_value) orelse error.InvalidTablespacePlacementPolicy;
 }
 
 pub fn findTableByQualifiedName(
@@ -3155,6 +3300,16 @@ pub fn applyRelationalCatalogDdlOnServiceAlloc(
     snapshot: *const metadata_api.AdminSnapshot,
     sql: []const u8,
 ) !?AppliedRelationalSqlDdlRecord {
+    return try applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, svc, snapshot, sql, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn applyRelationalCatalogDdlOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !?AppliedRelationalSqlDdlRecord {
     const ServiceType = @TypeOf(svc);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -3163,7 +3318,9 @@ pub fn applyRelationalCatalogDdlOnServiceAlloc(
     if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
         @hasDecl(ServiceDeclType, "removeDatabase") and
         @hasDecl(ServiceDeclType, "upsertNamespace") and
-        @hasDecl(ServiceDeclType, "removeNamespace")))
+        @hasDecl(ServiceDeclType, "removeNamespace") and
+        @hasDecl(ServiceDeclType, "upsertTablespace") and
+        @hasDecl(ServiceDeclType, "removeTablespace")))
     {
         return null;
     }
@@ -3173,7 +3330,8 @@ pub fn applyRelationalCatalogDdlOnServiceAlloc(
 
     switch (plan) {
         .database_catalog => |database_plan| return try applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, snapshot, database_plan),
-        .schema_namespace_catalog => |namespace_plan| return try applyNamespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, namespace_plan),
+        .schema_namespace_catalog => |namespace_plan| return try applyNamespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, namespace_plan, session),
+        .tablespace_catalog => |tablespace_plan| return try applyTablespaceCatalogPlanOnServiceAlloc(alloc, svc, snapshot, tablespace_plan),
         else => return null,
     }
 }
@@ -3236,59 +3394,65 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
     plan: relational_sql.SchemaNamespaceCatalogPlan,
+    session: catalog_resources.SqlCatalogSession,
 ) !AppliedRelationalSqlDdlRecord {
     var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
     errdefer applied.deinit(alloc);
-    const database_id = metadata_table_manager.deriveDatabaseId(default_database_name);
+    const database_name = session.currentDatabase();
+    const database_id = metadata_table_manager.deriveDatabaseId(database_name);
     switch (plan) {
         .create => |create| {
-            if (findNamespaceByName(snapshot, default_database_name, create.schema_name) != null) {
+            const target = try session.namespaceTargetFromSchemaName(create.schema_name);
+            if (findNamespaceByName(snapshot, target.database_name, target.namespace_name) != null) {
                 if (create.if_not_exists) {
                     applied.noop = true;
                     return applied;
                 }
                 return error.NamespaceAlreadyExists;
             }
-            if (findDatabaseByName(snapshot, default_database_name) == null) {
+            if (findDatabaseByName(snapshot, target.database_name) == null) {
                 try svc.upsertDatabase(.{
                     .database_id = database_id,
-                    .name = default_database_name,
+                    .name = target.database_name,
                 });
             }
             try svc.upsertNamespace(.{
-                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, create.schema_name),
+                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, target.namespace_name),
                 .database_id = database_id,
-                .name = create.schema_name,
+                .name = target.namespace_name,
             });
             applied.created_namespace = true;
         },
         .rename => |rename| {
-            const existing = findNamespaceByName(snapshot, default_database_name, rename.schema_name) orelse return error.NamespaceNotFound;
-            if (findNamespaceByName(snapshot, default_database_name, rename.new_schema_name) != null) return error.NamespaceAlreadyExists;
+            const existing_target = try session.namespaceTargetFromSchemaName(rename.schema_name);
+            const new_target = try session.namespaceTargetFromSchemaName(rename.new_schema_name);
+            const existing = findNamespaceByName(snapshot, existing_target.database_name, existing_target.namespace_name) orelse return error.NamespaceNotFound;
+            if (findNamespaceByName(snapshot, new_target.database_name, new_target.namespace_name) != null) return error.NamespaceAlreadyExists;
             try svc.upsertNamespace(.{
-                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, rename.new_schema_name),
+                .namespace_id = metadata_table_manager.deriveNamespaceId(database_id, new_target.namespace_name),
                 .database_id = database_id,
-                .name = rename.new_schema_name,
+                .name = new_target.namespace_name,
             });
             for (snapshot.tables) |table| {
-                if (!std.mem.eql(u8, table.database_name, default_database_name)) continue;
-                if (!std.mem.eql(u8, table.namespace_name, rename.schema_name)) continue;
+                if (!std.mem.eql(u8, table.database_name, existing_target.database_name)) continue;
+                if (!std.mem.eql(u8, table.namespace_name, existing_target.namespace_name)) continue;
                 var renamed_table = table;
-                renamed_table.namespace_name = rename.new_schema_name;
+                renamed_table.namespace_name = new_target.namespace_name;
                 try svc.upsertTable(renamed_table);
             }
             try svc.removeNamespace(existing.namespace_id);
             applied.renamed_namespace = true;
         },
         .drop => |drop| {
-            const existing = findNamespaceByName(snapshot, default_database_name, drop.schema_name) orelse {
+            const target = try session.namespaceTargetFromSchemaName(drop.schema_name);
+            const existing = findNamespaceByName(snapshot, target.database_name, target.namespace_name) orelse {
                 if (drop.if_exists) {
                     applied.noop = true;
                     return applied;
                 }
                 return error.NamespaceNotFound;
             };
-            if (namespaceHasTables(snapshot, database_id, drop.schema_name)) {
+            if (namespaceHasTables(snapshot, database_id, target.namespace_name)) {
                 if (drop.cascade) return error.UnsupportedSqlShape;
                 return error.NamespaceNotEmpty;
             }
@@ -3297,6 +3461,121 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
         },
     }
     return applied;
+}
+
+pub fn applyTablespaceCatalogPlanOnServiceAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: relational_sql.TablespaceCatalogPlan,
+) !AppliedRelationalSqlDdlRecord {
+    var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
+    errdefer applied.deinit(alloc);
+    switch (plan) {
+        .create => |create| {
+            if (findTablespaceByName(snapshot, create.tablespace_name) != null) return error.TablespaceAlreadyExists;
+            try validateTablespaceLocationJson(alloc, create.location_json);
+            try validateTablespacePlacementPolicyJson(alloc, create.placement_policy_json);
+            try svc.upsertTablespace(.{
+                .tablespace_id = metadata_table_manager.deriveTablespaceId(create.tablespace_name),
+                .name = create.tablespace_name,
+                .location_json = create.location_json,
+                .placement_policy_json = create.placement_policy_json,
+            });
+            applied.created_tablespace = true;
+        },
+        .rename => |rename| {
+            const existing = findTablespaceByName(snapshot, rename.tablespace_name) orelse return error.TablespaceNotFound;
+            if (findTablespaceByName(snapshot, rename.new_tablespace_name) != null) return error.TablespaceAlreadyExists;
+            try svc.upsertTablespace(.{
+                .tablespace_id = metadata_table_manager.deriveTablespaceId(rename.new_tablespace_name),
+                .name = rename.new_tablespace_name,
+                .location_json = existing.location_json,
+                .placement_policy_json = existing.placement_policy_json,
+            });
+            try rewriteTablespaceReferencesOnService(svc, snapshot, rename.tablespace_name, rename.new_tablespace_name);
+            try svc.removeTablespace(existing.tablespace_id);
+            applied.renamed_tablespace = true;
+        },
+        .drop => |drop| {
+            const existing = findTablespaceByName(snapshot, drop.tablespace_name) orelse {
+                if (drop.if_exists) {
+                    applied.noop = true;
+                    return applied;
+                }
+                return error.TablespaceNotFound;
+            };
+            if (tablespaceHasReferences(snapshot, drop.tablespace_name)) return error.TablespaceInUse;
+            try svc.removeTablespace(existing.tablespace_id);
+            applied.dropped_tablespace = true;
+        },
+    }
+    return applied;
+}
+
+fn tablespaceHasReferences(snapshot: *const metadata_api.AdminSnapshot, tablespace_name: []const u8) bool {
+    for (snapshot.databases) |database| {
+        if (std.mem.eql(u8, database.tablespace_name, tablespace_name)) return true;
+    }
+    for (snapshot.namespaces) |namespace| {
+        if (std.mem.eql(u8, namespace.tablespace_name, tablespace_name)) return true;
+    }
+    for (snapshot.tables) |table| {
+        if (std.mem.eql(u8, table.tablespace_name, tablespace_name)) return true;
+    }
+    return false;
+}
+
+fn rewriteTablespaceReferencesOnService(
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    old_tablespace_name: []const u8,
+    new_tablespace_name: []const u8,
+) !void {
+    for (snapshot.databases) |database| {
+        if (!std.mem.eql(u8, database.tablespace_name, old_tablespace_name)) continue;
+        var updated = database;
+        updated.tablespace_name = new_tablespace_name;
+        try svc.upsertDatabase(updated);
+    }
+    for (snapshot.namespaces) |namespace| {
+        if (!std.mem.eql(u8, namespace.tablespace_name, old_tablespace_name)) continue;
+        var updated = namespace;
+        updated.tablespace_name = new_tablespace_name;
+        try svc.upsertNamespace(updated);
+    }
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.tablespace_name, old_tablespace_name)) continue;
+        var updated = table;
+        updated.tablespace_name = new_tablespace_name;
+        try svc.upsertTable(updated);
+    }
+}
+
+fn validateTablespaceLocationJson(alloc: std.mem.Allocator, location_json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, location_json, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .null, .string, .object => {},
+        else => return error.InvalidTablespaceLocation,
+    }
+}
+
+fn validateTablespacePlacementPolicyJson(alloc: std.mem.Allocator, placement_policy_json: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, placement_policy_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTablespacePlacementPolicy,
+    };
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (!tablespacePlacementPolicyKeySupported(entry.key_ptr.*)) return error.InvalidTablespacePlacementPolicy;
+    }
+    if (root.get("placement_role")) |value| _ = try parseTablespacePlacementRole(value);
+    if (root.get("desired_replica_count")) |value| _ = try parseTablespaceReplicaCount(value);
+    if (root.get("replica_count")) |value| _ = try parseTablespaceReplicaCount(value);
+    if (root.get("min_ranges")) |value| _ = try parseTablespaceMinRanges(value);
 }
 
 fn databaseHasTables(snapshot: *const metadata_api.AdminSnapshot, database_id: u64) bool {
@@ -3971,6 +4250,79 @@ test "create table parser preserves postgres exact cutover requirement metadata 
     );
 }
 
+test "create table parser accepts durable tablespace binding" {
+    var parsed = try parseCreateTableRequest(std.testing.allocator, "{\"tablespace_name\":\"fastspace\"}");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("fastspace", parsed.tablespace_name.?);
+    const record = deriveTableRecord("docs", parsed);
+    try std.testing.expectEqualStrings("fastspace", record.tablespace_name);
+    try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator, "{\"tablespace_name\":\"tenant.fast\"}"));
+}
+
+test "tablespace policy inherits through namespace and maps to native placement" {
+    var databases = [_]metadata_table_manager.DatabaseRecord{.{
+        .database_id = metadata_table_manager.deriveDatabaseId("tenant_ops"),
+        .name = "tenant_ops",
+        .tablespace_name = "coldspace",
+    }};
+    var namespaces = [_]metadata_table_manager.NamespaceRecord{.{
+        .namespace_id = metadata_table_manager.deriveNamespaceId(databases[0].database_id, "analytics"),
+        .database_id = databases[0].database_id,
+        .name = "analytics",
+        .tablespace_name = "hotspace",
+    }};
+    var tablespaces = [_]metadata_table_manager.TablespaceRecord{
+        .{
+            .tablespace_id = metadata_table_manager.deriveTablespaceId("hotspace"),
+            .name = "hotspace",
+            .placement_policy_json = "{\"placement_role\":\"hot\",\"desired_replica_count\":2,\"min_ranges\":4}",
+        },
+        .{
+            .tablespace_id = metadata_table_manager.deriveTablespaceId("coldspace"),
+            .name = "coldspace",
+            .placement_policy_json = "{\"placement_role\":\"cold\",\"replica_count\":1}",
+        },
+    };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .databases = databases[0..],
+        .namespaces = namespaces[0..],
+        .tablespaces = tablespaces[0..],
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    const inherited = effectiveTablespaceForTarget(&snapshot, "tenant_ops", "analytics", null).?;
+    try std.testing.expectEqualStrings("hotspace", inherited.name);
+    const base = deriveQualifiedTableRecord("tenant_ops", "analytics", "events", .{});
+    const applied = try applyTablespacePlacementPolicyAlloc(std.testing.allocator, base, inherited);
+    defer metadata_table_manager.freeTable(std.testing.allocator, applied);
+    try std.testing.expectEqualStrings("hotspace", applied.tablespace_name);
+    try std.testing.expectEqualStrings("hot", applied.placement_role);
+    try std.testing.expectEqual(@as(u16, 2), applied.desired_replica_count);
+    try std.testing.expectEqual(@as(u32, 4), applied.min_ranges);
+
+    const explicit = effectiveTablespaceForTarget(&snapshot, "tenant_ops", "analytics", "coldspace").?;
+    try std.testing.expectEqualStrings("coldspace", explicit.name);
+
+    try std.testing.expectError(
+        error.InvalidTablespacePlacementPolicy,
+        applyTablespacePlacementPolicyAlloc(std.testing.allocator, base, &.{
+            .tablespace_id = metadata_table_manager.deriveTablespaceId("badspace"),
+            .name = "badspace",
+            .placement_policy_json = "{\"placement_role\":\"unknown\"}",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidTablespacePlacementPolicy,
+        validateTablespacePlacementPolicyJson(std.testing.allocator, "{\"future_scheduler_knob\":true}"),
+    );
+}
+
 test "derive initial ranges honors shard count" {
     const table = deriveTableRecord("docs", .{ .num_shards = 4 });
     const ranges = try deriveInitialRanges(std.testing.allocator, table);
@@ -4043,6 +4395,7 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .databases = try self.manager.listDatabases(alloc),
                 .namespaces = try self.manager.listNamespaces(alloc),
+                .tablespaces = try self.manager.listTablespaces(alloc),
                 .tables = try self.manager.listTables(alloc),
                 .ranges = &.{},
                 .stores = &.{},
@@ -4055,6 +4408,7 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
         fn freeSnapshot(self: *@This(), alloc: std.mem.Allocator, snapshot_value: *metadata_api.AdminSnapshot) void {
             self.manager.freeDatabases(alloc, snapshot_value.databases);
             self.manager.freeNamespaces(alloc, snapshot_value.namespaces);
+            self.manager.freeTablespaces(alloc, snapshot_value.tablespaces);
             self.manager.freeTables(alloc, snapshot_value.tables);
             snapshot_value.* = undefined;
         }
@@ -4079,10 +4433,22 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
             try self.manager.upsertTable(record);
         }
 
+        pub fn upsertTablespace(self: *@This(), record: metadata_table_manager.TablespaceRecord) !void {
+            try self.manager.upsertTablespace(record);
+        }
+
+        pub fn removeTablespace(self: *@This(), tablespace_id: u64) !void {
+            _ = try self.manager.removeTablespace(tablespace_id);
+        }
+
         fn apply(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !AppliedRelationalSqlDdlRecord {
+            return try self.applyWithSession(alloc, sql, .{});
+        }
+
+        fn applyWithSession(self: *@This(), alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) !AppliedRelationalSqlDdlRecord {
             var snapshot_value = try self.snapshot(alloc);
             defer self.freeSnapshot(alloc, &snapshot_value);
-            return (try applyRelationalCatalogDdlOnServiceAlloc(alloc, self, &snapshot_value, sql)) orelse error.UnsupportedSqlShape;
+            return (try applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, self, &snapshot_value, sql, session)) orelse error.UnsupportedSqlShape;
         }
     };
 
@@ -4112,9 +4478,39 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
         try std.testing.expectEqualStrings("tenant-a", parsed_settings.value.object.get("app.tenant_id").?.string);
     }
 
+    var created_tablespace = try service.apply(std.testing.allocator, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
+    defer created_tablespace.deinit(std.testing.allocator);
+    try std.testing.expect(created_tablespace.created_tablespace);
+    try service.manager.upsertTable(.{
+        .table_id = deriveQualifiedTableId(default_database_name, default_namespace_name, "fast_docs"),
+        .name = "fast_docs",
+        .tablespace_name = "fastspace",
+    });
+    try std.testing.expectError(error.TablespaceInUse, service.apply(std.testing.allocator, "DROP TABLESPACE fastspace;"));
+    var renamed_tablespace = try service.apply(std.testing.allocator, "ALTER TABLESPACE fastspace RENAME TO archive_space;");
+    defer renamed_tablespace.deinit(std.testing.allocator);
+    try std.testing.expect(renamed_tablespace.renamed_tablespace);
+    {
+        const table = service.manager.tables.get(deriveQualifiedTableId(default_database_name, default_namespace_name, "fast_docs")).?;
+        try std.testing.expectEqualStrings("archive_space", table.tablespace_name);
+    }
+    try std.testing.expectError(error.TablespaceInUse, service.apply(std.testing.allocator, "DROP TABLESPACE archive_space;"));
+    _ = service.manager.removeTable(deriveQualifiedTableId(default_database_name, default_namespace_name, "fast_docs"));
+    var dropped_tablespace = try service.apply(std.testing.allocator, "DROP TABLESPACE archive_space;");
+    defer dropped_tablespace.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_tablespace.dropped_tablespace);
+
     var created_namespace = try service.apply(std.testing.allocator, "CREATE SCHEMA analytics;");
     defer created_namespace.deinit(std.testing.allocator);
     try std.testing.expect(created_namespace.created_namespace);
+    var tenant_namespace = try service.applyWithSession(std.testing.allocator, "CREATE SCHEMA private;", .{ .current_database_name = "tenant_ops" });
+    defer tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(tenant_namespace.created_namespace);
+    {
+        var snapshot_value = try service.snapshot(std.testing.allocator);
+        defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
+        try std.testing.expect(findNamespaceByName(&snapshot_value, "tenant_ops", "private") != null);
+    }
     {
         var snapshot_value = try service.snapshot(std.testing.allocator);
         defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
@@ -4147,6 +4543,10 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
     var dropped_namespace = try service.apply(std.testing.allocator, "DROP SCHEMA reporting;");
     defer dropped_namespace.deinit(std.testing.allocator);
     try std.testing.expect(dropped_namespace.dropped_namespace);
+
+    var dropped_tenant_namespace = try service.applyWithSession(std.testing.allocator, "DROP SCHEMA private;", .{ .current_database_name = "tenant_ops" });
+    defer dropped_tenant_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_tenant_namespace.dropped_namespace);
 
     var dropped_database = try service.apply(std.testing.allocator, "DROP DATABASE tenant_ops;");
     defer dropped_database.deinit(std.testing.allocator);

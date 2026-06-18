@@ -59,6 +59,7 @@ pub const CapturedCurrentState = state.CapturedCurrentState;
 pub const MetadataState = state.MetadataState;
 pub const DatabaseRecord = table_manager.DatabaseRecord;
 pub const NamespaceRecord = table_manager.NamespaceRecord;
+pub const TablespaceRecord = table_manager.TablespaceRecord;
 pub const TableRecord = table_manager.TableRecord;
 pub const PlacementClass = table_manager.PlacementClass;
 pub const RangeRecord = table_manager.RangeRecord;

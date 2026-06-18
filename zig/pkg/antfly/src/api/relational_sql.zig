@@ -148,6 +148,8 @@ pub const RelationPopulationMode = sql_adapter.RelationPopulationMode;
 
 pub const AdapterNoopDdlReason = sql_adapter.AdapterNoopDdlReason;
 pub const AdapterNoopDdlPlan = sql_adapter.AdapterNoopDdlPlan;
+pub const SessionCatalogPlan = sql_adapter.SessionCatalogPlan;
+pub const SetSearchPathPlan = sql_adapter.SetSearchPathPlan;
 pub const EnumTypeCatalogPlan = sql_adapter.EnumTypeCatalogPlan;
 pub const CreateEnumTypePlan = sql_adapter.CreateEnumTypePlan;
 pub const AddEnumValuePlan = sql_adapter.AddEnumValuePlan;
@@ -1812,6 +1814,77 @@ pub fn lowerDdlPlanAlloc(
     };
 }
 
+pub const OwnedSqlCatalogSession = struct {
+    current_database_name: []u8,
+    search_path: []const []const u8,
+
+    pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
+        const current_database_name = try alloc.dupe(u8, source_session.currentDatabase());
+        errdefer alloc.free(current_database_name);
+        const source_path = if (source_session.search_path.len == 0) &.{catalog_resources.default_namespace_name} else source_session.search_path;
+        const search_path = try alloc.alloc([]const u8, source_path.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (search_path[0..initialized]) |name| alloc.free(@constCast(name));
+            alloc.free(search_path);
+        }
+        for (source_path, 0..) |name, i| {
+            search_path[i] = try alloc.dupe(u8, name);
+            initialized += 1;
+        }
+        return .{ .current_database_name = current_database_name, .search_path = search_path };
+    }
+
+    pub fn session(self: OwnedSqlCatalogSession) catalog_resources.SqlCatalogSession {
+        return .{
+            .current_database_name = self.current_database_name,
+            .search_path = self.search_path,
+        };
+    }
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.current_database_name);
+        for (self.search_path) |name| alloc.free(@constCast(name));
+        if (self.search_path.len > 0) alloc.free(self.search_path);
+        self.* = undefined;
+    }
+};
+
+pub fn applySessionCatalogPlanAlloc(
+    alloc: std.mem.Allocator,
+    session: catalog_resources.SqlCatalogSession,
+    plan: SessionCatalogPlan,
+) !OwnedSqlCatalogSession {
+    switch (plan) {
+        .set_search_path => |set| {
+            if (set.local) return error.UnsupportedSqlShape;
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+            errdefer updated.deinit(alloc);
+            for (updated.search_path) |name| alloc.free(@constCast(name));
+            if (updated.search_path.len > 0) alloc.free(updated.search_path);
+            const search_path = try alloc.alloc([]const u8, set.namespaces.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (search_path[0..initialized]) |name| alloc.free(@constCast(name));
+                alloc.free(search_path);
+            }
+            for (set.namespaces, 0..) |name, i| {
+                search_path[i] = try alloc.dupe(u8, name);
+                initialized += 1;
+            }
+            updated.search_path = search_path;
+            return updated;
+        },
+        .reset_search_path, .discard_all => {
+            return try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+                .current_database_name = session.currentDatabase(),
+                .search_path = &.{catalog_resources.default_namespace_name},
+            });
+        },
+        .show_search_path => return try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session),
+    }
+}
+
 pub fn runtimeSchemaFromCreateTablePlanAlloc(
     alloc: std.mem.Allocator,
     plan: CreateTablePlan,
@@ -1857,7 +1930,7 @@ pub fn applyDdlPlanToRuntimeSchemaAlloc(
     plan: LoweredDdlPlan,
 ) !runtime_schema.TableSchema {
     return switch (plan) {
-        .adapter_noop => if (current.storage_mode == .relational)
+        .adapter_noop, .session_catalog => if (current.storage_mode == .relational)
             cloneRelationalRuntimeSchemaAlloc(alloc, current)
         else
             cloneEmptyRuntimeSchemaAlloc(alloc, current),
@@ -2020,7 +2093,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
     plan: LoweredDdlPlan,
 ) !AppliedDdlSchemaJson {
     switch (plan) {
-        .adapter_noop => return .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
+        .adapter_noop, .session_catalog => return .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
         .create_table => |create_table| {
             if (current_schema_json.len != 0) {
                 if (create_table.replace_existing) return .{
@@ -2076,7 +2149,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
 
     if (current_schema_json.len == 0) {
         return switch (plan) {
-            .adapter_noop => unreachable,
+            .adapter_noop, .session_catalog => unreachable,
             .drop_index => |drop_index| if (drop_index.if_exists) .{ .schema_json = try alloc.dupe(u8, current_schema_json) } else error.InvalidSqlCatalog,
             .alter_table => |alter_table| if (alter_table.if_exists) .{ .schema_json = try alloc.dupe(u8, current_schema_json) } else error.InvalidSqlCatalog,
             .create_table => unreachable,
@@ -2121,7 +2194,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
 
     var result: AppliedDdlSchemaJson = .{ .schema_json = &.{} };
     switch (plan) {
-        .adapter_noop => unreachable,
+        .adapter_noop, .session_catalog => unreachable,
         .create_table => unreachable,
         .table_clone => unreachable,
         .view_catalog => unreachable,
@@ -3030,20 +3103,41 @@ const Parser = struct {
         if (self.matchKeyword("set")) {
             if (self.peekKeyword("constraints")) return .{ .transaction_control = .{ .constraint_mode = try self.parseConstraintModeDdl() } };
             if (self.peekKeyword("transaction")) return .{ .transaction_control = .{ .transaction_mode = try self.parseTransactionModeDdl(.set_transaction) } };
+            if (self.peekKeyword("local") or self.peekKeyword("session") or self.peekKeyword("search_path")) {
+                const checkpoint = self.pos;
+                if (self.parseSetSearchPathDdl()) |plan| {
+                    return .{ .session_catalog = .{ .set_search_path = plan } };
+                } else |err| switch (err) {
+                    error.UnsupportedSqlShape => self.pos = checkpoint,
+                    else => return err,
+                }
+            }
             try self.parseAdapterNoopSetStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("reset")) {
+            if (self.peekKeyword("search_path")) {
+                try self.parseResetSearchPathDdl();
+                return .{ .session_catalog = .reset_search_path };
+            }
+            if (self.peekKeyword("all")) {
+                try self.parseAdapterNoopResetStatementTail();
+                return .{ .session_catalog = .discard_all };
+            }
             try self.parseAdapterNoopResetStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("show")) {
+            if (self.peekKeyword("search_path")) {
+                try self.parseShowSearchPathDdl();
+                return .{ .session_catalog = .show_search_path };
+            }
             try self.parseAdapterNoopShowStatementTail();
             return .{ .adapter_noop = .{ .reason = .session_setting } };
         }
         if (self.matchKeyword("discard")) {
-            try self.parseAdapterNoopDiscardStatementTail();
-            return .{ .adapter_noop = .{ .reason = .session_setting } };
+            try self.parseDiscardAllDdl();
+            return .{ .session_catalog = .discard_all };
         }
         if (self.matchKeyword("start")) {
             const checkpoint = self.pos;
@@ -3069,16 +3163,36 @@ const Parser = struct {
         try sql_adapter.parseAdapterNoopSetStatementTail(self.tokens, &self.pos);
     }
 
+    fn parseSetSearchPathDdl(self: *@This()) !SetSearchPathPlan {
+        var syntax = try sql_adapter.parseSetSearchPathTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const namespaces = syntax.namespaces;
+        syntax.namespaces = &.{};
+        return .{ .namespaces = namespaces, .local = syntax.local };
+    }
+
     fn parseAdapterNoopResetStatementTail(self: *@This()) !void {
         try sql_adapter.parseAdapterNoopResetStatementTail(self.tokens, &self.pos);
+    }
+
+    fn parseResetSearchPathDdl(self: *@This()) !void {
+        try sql_adapter.parseResetSearchPathTail(self.tokens, &self.pos);
     }
 
     fn parseAdapterNoopShowStatementTail(self: *@This()) !void {
         try sql_adapter.parseAdapterNoopShowStatementTail(self.tokens, &self.pos);
     }
 
+    fn parseShowSearchPathDdl(self: *@This()) !void {
+        try sql_adapter.parseShowSearchPathTail(self.tokens, &self.pos);
+    }
+
     fn parseAdapterNoopDiscardStatementTail(self: *@This()) !void {
         try sql_adapter.parseAdapterNoopDiscardStatementTail(self.tokens, &self.pos);
+    }
+
+    fn parseDiscardAllDdl(self: *@This()) !void {
+        try sql_adapter.parseDiscardAllTail(self.tokens, &self.pos);
     }
 
     fn matchAdapterNoopTransactionBoundaryTail(self: *@This(), options: sql_adapter.AdapterNoopTransactionBoundaryTail) !bool {
@@ -3086,11 +3200,9 @@ const Parser = struct {
     }
 
     fn parseCreateDomainDdl(self: *@This()) !CreateDomainPlan {
-        try self.expectKeyword("domain");
-        const domain_name = try self.parseSqlObjectIdentifierOwned();
-        var domain_transferred = false;
-        errdefer if (!domain_transferred) self.alloc.free(domain_name);
-        try self.expectKeyword("as");
+        var header = try sql_adapter.parseCreateDomainHeaderAlloc(self.alloc, self.tokens, &self.pos);
+        var header_transferred = false;
+        errdefer if (!header_transferred) header.deinit(self.alloc);
         const ddl_type = try self.parseDdlType();
         var not_null = false;
         var default_value: ?runtime_schema.RelationalDefaultValue = null;
@@ -3129,16 +3241,20 @@ const Parser = struct {
         }
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
+        const owned_checks = try checks.toOwnedSlice(self.alloc);
+        var checks_transferred = false;
+        errdefer if (!checks_transferred) freeDdlRelationalChecks(self.alloc, owned_checks);
         const out_default = default_value;
         default_value = null;
-        domain_transferred = true;
+        header_transferred = true;
+        checks_transferred = true;
         return .{
-            .domain_name = domain_name,
+            .domain_name = header.domain_name,
             .field_type = ddl_type.field_type,
             .array_item_type = ddl_type.array_item_type,
             .not_null = not_null,
             .default_value = out_default,
-            .checks = try checks.toOwnedSlice(self.alloc),
+            .checks = owned_checks,
         };
     }
 
@@ -3355,9 +3471,11 @@ const Parser = struct {
         errdefer syntax.deinit(self.alloc);
         const tablespace_name = syntax.tablespace_name;
         const location_json = syntax.location_json;
+        const placement_policy_json = syntax.placement_policy_json;
         syntax.tablespace_name = "";
         syntax.location_json = "";
-        return .{ .tablespace_name = tablespace_name, .location_json = location_json };
+        syntax.placement_policy_json = "";
+        return .{ .tablespace_name = tablespace_name, .location_json = location_json, .placement_policy_json = placement_policy_json };
     }
 
     fn parseRenameTablespaceDdl(self: *@This()) !RenameTablespacePlan {
@@ -3748,10 +3866,9 @@ const Parser = struct {
     }
 
     fn parseAlterDomainDdl(self: *@This()) !AlterDomainPlan {
-        try self.expectKeyword("domain");
-        const domain_name = try self.parseSqlObjectIdentifierOwned();
-        var domain_transferred = false;
-        errdefer if (!domain_transferred) self.alloc.free(domain_name);
+        var header = try sql_adapter.parseAlterDomainHeaderAlloc(self.alloc, self.tokens, &self.pos);
+        var header_transferred = false;
+        errdefer if (!header_transferred) header.deinit(self.alloc);
         var operations = std.ArrayListUnmanaged(DomainAlterOperation).empty;
         errdefer {
             clearDomainAlterOperations(self.alloc, operations.items);
@@ -3786,10 +3903,14 @@ const Parser = struct {
         if (operations.items.len == 0) return error.UnsupportedSqlShape;
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
-        domain_transferred = true;
+        const owned_operations = try operations.toOwnedSlice(self.alloc);
+        var operations_transferred = false;
+        errdefer if (!operations_transferred) freeDomainAlterOperations(self.alloc, owned_operations);
+        header_transferred = true;
+        operations_transferred = true;
         return .{
-            .domain_name = domain_name,
-            .operations = try operations.toOwnedSlice(self.alloc),
+            .domain_name = header.domain_name,
+            .operations = owned_operations,
         };
     }
 
@@ -3910,15 +4031,10 @@ const Parser = struct {
     }
 
     fn parseRelationLifetimeDdl(self: *@This()) !RelationLifetimePlan {
-        const kind: RelationLifetimeKind = if (self.matchKeyword("temporary") or self.matchKeyword("temp"))
-            .temporary
-        else if (self.matchKeyword("unlogged"))
-            .unlogged
-        else
-            return error.UnsupportedSqlShape;
+        const prefix = try sql_adapter.parseRelationLifetimePrefix(self.tokens, &self.pos);
         var create_table = try self.parseCreateTableDdl();
         errdefer create_table.deinit(self.alloc);
-        return .{ .kind = kind, .create_table = create_table };
+        return .{ .kind = prefix.kind, .create_table = create_table };
     }
 
     fn parseCreateMaterializedViewDdl(self: *@This(), replace_existing: bool) !CreateMaterializedViewPlan {
@@ -4095,16 +4211,9 @@ const Parser = struct {
     }
 
     fn parseAlterTableDdl(self: *@This()) !AlterTablePlan {
-        try self.expectKeyword("table");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        _ = self.matchKeyword("only");
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
+        var header = try sql_adapter.parseAlterTableHeaderAlloc(self.alloc, self.tokens, &self.pos);
+        var header_transferred = false;
+        errdefer if (!header_transferred) header.deinit(self.alloc);
 
         var operations = std.ArrayListUnmanaged(AlterTableOperation).empty;
         errdefer {
@@ -4124,11 +4233,11 @@ const Parser = struct {
             for (owned_operations) |operation| freeAlterTableOperation(self.alloc, operation);
             self.alloc.free(owned_operations);
         };
-        table_name_transferred = true;
+        header_transferred = true;
         operations_transferred = true;
         return .{
-            .table_name = table_name,
-            .if_exists = if_exists,
+            .table_name = header.table_name,
+            .if_exists = header.if_exists,
             .operations = owned_operations,
         };
     }
@@ -4137,204 +4246,160 @@ const Parser = struct {
         self: *@This(),
         operations: *std.ArrayListUnmanaged(AlterTableOperation),
     ) !void {
-        if (self.matchKeyword("validate")) {
-            try self.expectKeyword("constraint");
-            const constraint_name = try self.parseIdentifierOwned();
-            try self.appendAlterTableOperation(operations, .{ .validate_constraint = constraint_name });
+        if (self.peekKeyword("validate")) {
+            var syntax = try sql_adapter.parseAlterTableValidateConstraintOperationAlloc(self.alloc, self.tokens, &self.pos);
+            var syntax_transferred = false;
+            errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
+            try self.appendAlterTableOperation(operations, .{ .validate_constraint = syntax.constraint_name });
+            syntax_transferred = true;
             return;
         }
 
-        if (self.matchKeyword("rename")) {
-            const rename_constraint = self.matchKeyword("constraint");
-            if (!rename_constraint) _ = self.matchKeyword("column");
-            const old_name = try self.parseIdentifierOwned();
-            var old_name_transferred = false;
-            errdefer if (!old_name_transferred) self.alloc.free(old_name);
-            try self.expectKeyword("to");
-            const new_name = try self.parseIdentifierOwned();
-            var new_name_transferred = false;
-            errdefer if (!new_name_transferred) self.alloc.free(new_name);
-            if (rename_constraint) {
+        if (self.peekKeyword("rename")) {
+            var syntax = try sql_adapter.parseAlterTableRenameOperationAlloc(self.alloc, self.tokens, &self.pos);
+            var syntax_transferred = false;
+            errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
+            if (syntax.target == .constraint) {
                 try self.appendAlterTableOperation(operations, .{ .rename_constraint = .{
-                    .old_name = old_name,
-                    .new_name = new_name,
+                    .old_name = syntax.old_name,
+                    .new_name = syntax.new_name,
                 } });
             } else {
                 try self.appendAlterTableOperation(operations, .{ .rename_column = .{
-                    .old_name = old_name,
-                    .new_name = new_name,
+                    .old_name = syntax.old_name,
+                    .new_name = syntax.new_name,
                 } });
             }
-            old_name_transferred = true;
-            new_name_transferred = true;
+            syntax_transferred = true;
             return;
         }
 
-        if (self.matchKeyword("drop")) {
-            const drop_constraint = self.matchKeyword("constraint");
-            const drop_column = if (drop_constraint) false else self.matchKeyword("column");
-            _ = drop_column;
-            var if_exists = false;
-            if (self.matchKeyword("if")) {
-                try self.expectKeyword("exists");
-                if_exists = true;
-            }
-            const name = try self.parseIdentifierOwned();
-            var name_transferred = false;
-            errdefer if (!name_transferred) self.alloc.free(name);
-            var dependency_mode: DropDependencyMode = if (drop_constraint) .restrict else .cascade;
-            if (self.matchKeyword("cascade")) {
-                dependency_mode = .cascade;
-            } else if (self.matchKeyword("restrict")) {
-                dependency_mode = .restrict;
-            }
-            if (drop_constraint) {
+        if (self.peekKeyword("drop")) {
+            var syntax = try sql_adapter.parseAlterTableDropOperationAlloc(self.alloc, self.tokens, &self.pos);
+            var syntax_transferred = false;
+            errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
+            if (syntax.target == .constraint) {
                 try self.appendAlterTableOperation(operations, .{ .drop_constraint = .{
-                    .name = name,
-                    .if_exists = if_exists,
-                    .dependency_mode = dependency_mode,
+                    .name = syntax.name,
+                    .if_exists = syntax.if_exists,
+                    .dependency_mode = syntax.dependency_mode,
                 } });
             } else {
                 try self.appendAlterTableOperation(operations, .{ .drop_column = .{
-                    .name = name,
-                    .if_exists = if_exists,
-                    .dependency_mode = dependency_mode,
+                    .name = syntax.name,
+                    .if_exists = syntax.if_exists,
+                    .dependency_mode = syntax.dependency_mode,
                 } });
             }
-            name_transferred = true;
+            syntax_transferred = true;
             return;
         }
 
-        if (self.matchKeyword("alter")) {
-            _ = self.matchKeyword("column");
-            const column_name = try self.parseIdentifierOwned();
-            var column_name_transferred = false;
-            errdefer if (!column_name_transferred) self.alloc.free(column_name);
-            if (self.matchKeyword("set")) {
-                if (self.matchKeyword("default")) {
-                    const default_value = try self.parseDdlDefaultValueUntyped();
-                    var default_transferred = false;
-                    errdefer if (!default_transferred) self.alloc.free(default_value.value_json);
-                    try self.appendAlterTableOperation(operations, .{ .alter_column_default = .{
-                        .column_name = column_name,
-                        .default_value = default_value,
-                    } });
-                    default_transferred = true;
-                } else if (self.matchKeyword("data")) {
-                    try self.expectKeyword("type");
-                    const ddl_type = try self.parseDdlType();
-                    const collation = try self.parseOptionalDdlCollationAlloc(ddl_type.field_type);
-                    var collation_transferred = false;
-                    errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
-                    try self.consumeOptionalDdlAlterColumnUsingIdentity(column_name);
-                    try self.appendAlterTableOperation(operations, .{ .alter_column_type = .{
-                        .column_name = column_name,
-                        .field_type = ddl_type.field_type,
-                        .array_item_type = ddl_type.array_item_type,
-                        .collation = collation,
-                    } });
-                    collation_transferred = true;
-                } else {
-                    try self.expectKeyword("not");
-                    try self.expectKeyword("null");
-                    try self.appendAlterTableOperation(operations, .{ .alter_column_nullability = .{
-                        .column_name = column_name,
-                        .nullable = false,
-                    } });
-                }
-            } else if (self.matchKeyword("drop")) {
-                if (self.matchKeyword("default")) {
-                    try self.appendAlterTableOperation(operations, .{ .alter_column_default = .{
-                        .column_name = column_name,
-                        .default_value = null,
-                    } });
-                } else {
-                    try self.expectKeyword("not");
-                    try self.expectKeyword("null");
-                    try self.appendAlterTableOperation(operations, .{ .alter_column_nullability = .{
-                        .column_name = column_name,
-                        .nullable = true,
-                    } });
-                }
-            } else if (self.matchKeyword("type")) {
-                const ddl_type = try self.parseDdlType();
-                const collation = try self.parseOptionalDdlCollationAlloc(ddl_type.field_type);
-                var collation_transferred = false;
-                errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
-                try self.consumeOptionalDdlAlterColumnUsingIdentity(column_name);
-                try self.appendAlterTableOperation(operations, .{ .alter_column_type = .{
-                    .column_name = column_name,
-                    .field_type = ddl_type.field_type,
-                    .array_item_type = ddl_type.array_item_type,
-                    .collation = collation,
+        if (self.peekKeyword("alter")) {
+            const nullability_start = self.pos;
+            if (sql_adapter.parseAlterTableColumnNullabilityOperationAlloc(self.alloc, self.tokens, &self.pos)) |syntax_value| {
+                var syntax = syntax_value;
+                var syntax_transferred = false;
+                errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
+                try self.appendAlterTableOperation(operations, .{ .alter_column_nullability = .{
+                    .column_name = syntax.column_name,
+                    .nullable = syntax.nullable,
                 } });
-                collation_transferred = true;
-            } else return error.UnsupportedSqlShape;
-            column_name_transferred = true;
-            return;
-        }
-
-        try self.expectKeyword("add");
-        if (self.matchKeyword("column")) {
-            var if_not_exists = false;
-            if (self.matchKeyword("if")) {
-                try self.expectKeyword("not");
-                try self.expectKeyword("exists");
-                if_not_exists = true;
+                syntax_transferred = true;
+                return;
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => self.pos = nullability_start,
+                else => return err,
             }
-            try self.parseAlterTableAddColumnOperation(operations, if_not_exists);
+
+            const default_start = self.pos;
+            if (sql_adapter.parseAlterTableColumnDefaultOperationAlloc(self.alloc, self.tokens, &self.pos)) |syntax_value| {
+                var syntax = syntax_value;
+                var syntax_transferred = false;
+                errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
+                const default_value: ?runtime_schema.RelationalDefaultValue = if (syntax.action == .set) blk: {
+                    const value = try self.parseDdlDefaultValueUntyped();
+                    errdefer self.alloc.free(value.value_json);
+                    break :blk value;
+                } else null;
+                try self.appendAlterTableOperation(operations, .{ .alter_column_default = .{
+                    .column_name = syntax.column_name,
+                    .default_value = default_value,
+                } });
+                syntax_transferred = true;
+                return;
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => self.pos = default_start,
+                else => return err,
+            }
+
+            var type_header = try sql_adapter.parseAlterTableColumnTypeHeaderAlloc(self.alloc, self.tokens, &self.pos);
+            var type_header_transferred = false;
+            errdefer if (!type_header_transferred) type_header.deinit(self.alloc);
+            const ddl_type = try self.parseDdlType();
+            const collation = try self.parseOptionalDdlCollationAlloc(ddl_type.field_type);
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
+            try self.consumeOptionalDdlAlterColumnUsingIdentity(type_header.column_name);
+            try self.appendAlterTableOperation(operations, .{ .alter_column_type = .{
+                .column_name = type_header.column_name,
+                .field_type = ddl_type.field_type,
+                .array_item_type = ddl_type.array_item_type,
+                .collation = collation,
+            } });
+            type_header_transferred = true;
+            collation_transferred = true;
             return;
         }
 
-        if (self.matchKeyword("period")) {
+        const add_column_start = self.pos;
+        if (sql_adapter.parseAlterTableAddColumnHeader(self.tokens, &self.pos)) |syntax| {
+            try self.parseAlterTableAddColumnOperation(operations, syntax.if_not_exists);
+            return;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => self.pos = add_column_start,
+        }
+
+        var add_prefix = try sql_adapter.parseAlterTableAddOperationPrefixAlloc(self.alloc, self.tokens, &self.pos);
+        defer add_prefix.deinit(self.alloc);
+        const constraint_name = add_prefix.constraint_name;
+        if (add_prefix.kind == .period) {
             const period = try self.parseDdlPeriodConstraint();
             try self.appendAlterTableOperation(operations, .{ .add_period = period });
             return;
         }
-
-        const constraint_name = if (self.matchKeyword("constraint")) try self.parseIdentifierOwned() else null;
-        var constraint_name_transferred = false;
-        errdefer if (!constraint_name_transferred) if (constraint_name) |name| self.alloc.free(name);
-        if (self.matchKeyword("primary")) {
+        if (add_prefix.kind == .primary_key and self.matchKeyword("primary")) {
             try self.expectKeyword("key");
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try self.consumeOptionalDdlImmediateConstraintTiming();
+            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
             const primary_key = try self.makeDdlPrimaryKey(constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
-            if (constraint_name) |name| self.alloc.free(name);
-            constraint_name_transferred = true;
             try self.appendAlterTableOperation(operations, .{ .add_primary_key = primary_key });
             return;
         }
-        if (self.matchKeyword("unique")) {
-            const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
+        if (add_prefix.kind == .unique and self.matchKeyword("unique")) {
+            const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try self.consumeOptionalDdlImmediateConstraintTiming();
+            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
             var constraint = try self.makeDdlUniqueConstraint(constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct);
-            if (constraint_name) |name| self.alloc.free(name);
-            constraint_name_transferred = true;
             constraint.validation_state = .unvalidated;
             try self.appendAlterTableOperation(operations, .{ .add_unique_constraint = constraint });
             return;
         }
-        if (self.matchKeyword("foreign")) {
+        if (add_prefix.kind == .foreign_key and self.matchKeyword("foreign")) {
             var foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
-            if (constraint_name) |name| self.alloc.free(name);
-            constraint_name_transferred = true;
-            foreign_key.validation_state = if (self.consumeOptionalDdlNotValid()) .unvalidated else .unvalidated;
+            foreign_key.validation_state = if (sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos)) .unvalidated else .unvalidated;
             try self.appendAlterTableOperation(operations, .{ .add_foreign_key = foreign_key });
             return;
         }
-        if (self.matchKeyword("check")) {
+        if (add_prefix.kind == .check and self.matchKeyword("check")) {
             var check = try self.parseDdlCheckConstraint(constraint_name);
-            if (constraint_name) |name| self.alloc.free(name);
-            constraint_name_transferred = true;
-            _ = self.consumeOptionalDdlNotValid();
+            _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
             check.validation_state = .unvalidated;
             try self.appendAlterTableOperation(operations, .{ .add_check = check });
             return;
@@ -4344,12 +4409,8 @@ const Parser = struct {
     }
 
     fn consumeOptionalDdlAlterColumnUsingIdentity(self: *@This(), column_name: []const u8) !void {
-        if (!self.matchKeyword("using")) return;
-        const wrapped = self.match(.lparen) != null;
-        const using_column = try self.parseIdentifierOwned();
-        defer self.alloc.free(using_column);
-        if (!std.mem.eql(u8, using_column, column_name)) return error.UnsupportedSqlShape;
-        if (wrapped) try self.expect(.rparen);
+        const using = try sql_adapter.parseOptionalAlterTableColumnUsing(self.tokens, &self.pos) orelse return;
+        if (!std.mem.eql(u8, using.column_name, column_name)) return error.UnsupportedSqlShape;
     }
 
     fn parseAlterTableAddColumnOperation(
@@ -4378,55 +4439,38 @@ const Parser = struct {
         }
 
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.semicolon)) {
-            if (self.matchKeyword("unique")) {
-                const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
+            var constraint_prefix = try sql_adapter.parseCreateTableColumnConstraintPrefixAlloc(self.alloc, self.tokens, &self.pos);
+            defer constraint_prefix.deinit(self.alloc);
+            const constraint_name = constraint_prefix.constraint_name;
+            if (constraint_prefix.kind == .primary_key) {
+                return error.UnsupportedSqlShape;
+            } else if (constraint_prefix.kind == .unique and self.matchKeyword("unique")) {
+                const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
                 const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                 defer freeStringSlice(self.alloc, include_columns);
-                try self.consumeOptionalDdlImmediateConstraintTiming();
-                var constraint = try self.makeDdlUniqueConstraint(null, &.{column.name}, include_columns, null, nulls_not_distinct);
+                try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
+                var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
+                var constraint_transferred = false;
+                errdefer if (!constraint_transferred) freeDdlUniqueConstraint(self.alloc, constraint);
                 constraint.validation_state = .unvalidated;
                 try unique_constraints.append(self.alloc, constraint);
-            } else if (self.matchKeyword("check")) {
-                var check = try self.parseDdlCheckConstraint(null);
-                _ = self.consumeOptionalDdlNotValid();
+                constraint_transferred = true;
+            } else if (constraint_prefix.kind == .check and self.matchKeyword("check")) {
+                var check = try self.parseDdlCheckConstraint(constraint_name);
+                var check_transferred = false;
+                errdefer if (!check_transferred) freeDdlRelationalCheck(self.alloc, check);
+                _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
                 check.validation_state = .unvalidated;
                 try checks.append(self.alloc, check);
-            } else if (self.matchKeyword("references")) {
-                var foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, null);
-                _ = self.consumeOptionalDdlNotValid();
+                check_transferred = true;
+            } else if (constraint_prefix.kind == .references and self.matchKeyword("references")) {
+                var foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, constraint_name);
+                var foreign_key_transferred = false;
+                errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
+                _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
                 foreign_key.validation_state = .unvalidated;
                 try foreign_keys.append(self.alloc, foreign_key);
-            } else if (self.matchKeyword("constraint")) {
-                const constraint_name = try self.parseIdentifierOwned();
-                var constraint_name_transferred = false;
-                errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
-                if (self.matchKeyword("unique")) {
-                    const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
-                    const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
-                    defer freeStringSlice(self.alloc, include_columns);
-                    try self.consumeOptionalDdlImmediateConstraintTiming();
-                    var constraint = try self.makeDdlUniqueConstraint(constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
-                    constraint.validation_state = .unvalidated;
-                    try unique_constraints.append(self.alloc, constraint);
-                } else if (self.matchKeyword("check")) {
-                    var check = try self.parseDdlCheckConstraint(constraint_name);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
-                    _ = self.consumeOptionalDdlNotValid();
-                    check.validation_state = .unvalidated;
-                    try checks.append(self.alloc, check);
-                } else if (self.matchKeyword("references")) {
-                    var foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, constraint_name);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
-                    _ = self.consumeOptionalDdlNotValid();
-                    foreign_key.validation_state = .unvalidated;
-                    try foreign_keys.append(self.alloc, foreign_key);
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
+                foreign_key_transferred = true;
             } else {
                 return error.UnsupportedSqlShape;
             }
@@ -4467,30 +4511,10 @@ const Parser = struct {
     }
 
     fn parseCreateIndexDdl(self: *@This(), unique: bool) !CreateIndexPlan {
-        try self.expectKeyword("index");
-        _ = self.matchKeyword("concurrently");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const index_name = try self.parseSqlObjectIdentifierOwned();
-        var index_name_transferred = false;
-        errdefer if (!index_name_transferred) self.alloc.free(index_name);
-        try self.expectKeyword("on");
-        const table_name = try self.parseSqlTableReferenceIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        var method: DdlIndexMethod = .btree;
-        if (self.matchKeyword("using")) {
-            const method_token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-            if (std.ascii.eqlIgnoreCase(method_token.text, "btree")) {
-                method = .btree;
-            } else if (std.ascii.eqlIgnoreCase(method_token.text, "gin")) {
-                method = .gin;
-            } else return error.UnsupportedSqlShape;
-        }
+        var header = try sql_adapter.parseCreateIndexHeaderAlloc(self.alloc, self.tokens, &self.pos);
+        var header_transferred = false;
+        errdefer if (!header_transferred) header.deinit(self.alloc);
+        const method = header.method;
 
         var columns = std.ArrayListUnmanaged([]const u8).empty;
         var opclass: DdlIndexOpClass = .default;
@@ -4509,35 +4533,25 @@ const Parser = struct {
         errdefer if (without_overlaps_period) |period| self.alloc.free(period);
         try self.expect(.lparen);
         while (true) {
-            if (self.nextDdlIndexElementIsSupportedExpression()) {
-                const wrapper_count = self.consumeDdlIndexExpressionWrappers();
+            if (sql_adapter.peekDdlIndexElementExpression(self.tokens, self.pos, true)) {
+                const wrapper_count = sql_adapter.consumeDdlIndexExpressionWrappers(self.tokens, &self.pos);
                 if (unique) {
                     if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return error.UnsupportedSqlShape;
-                    const op: runtime_schema.UniqueExpressionOp = if (self.matchKeyword("lower"))
-                        .lower
-                    else if (self.matchKeyword("upper"))
-                        .upper
-                    else blk: {
-                        if (!self.matchMd5FunctionKeyword()) return error.UnsupportedSqlShape;
-                        break :blk .md5;
-                    };
-                    try self.expect(.lparen);
-                    const field = try self.parseIdentifierOwned();
-                    var field_transferred = false;
-                    errdefer if (!field_transferred) self.alloc.free(field);
-                    try self.expect(.rparen);
-                    try expressions.append(self.alloc, .{ .op = op, .field = field });
-                    field_transferred = true;
+                    const expression = try sql_adapter.parseDdlUniqueExpressionAlloc(self.alloc, self.tokens, &self.pos);
+                    var expression_transferred = false;
+                    errdefer if (!expression_transferred) self.alloc.free(expression.field);
+                    try expressions.append(self.alloc, expression);
+                    expression_transferred = true;
                 } else {
                     if (generated_expression != null) return error.UnsupportedSqlShape;
-                    const generated = try self.parseDdlGeneratedExpression();
+                    const generated = try sql_adapter.parseDdlGeneratedExpressionAlloc(self.alloc, self.tokens, &self.pos);
                     var generated_transferred = false;
                     errdefer if (!generated_transferred) freeDdlGeneratedValue(self.alloc, generated);
                     generated_expression = generated;
                     generated_transferred = true;
                 }
-                try self.closeDdlIndexExpressionWrappers(wrapper_count);
-                try self.parseDdlIndexElementOrderOptions();
+                try sql_adapter.closeDdlIndexExpressionWrappers(self.tokens, &self.pos, wrapper_count);
+                _ = try sql_adapter.parseCreateIndexElementSuffix(self.tokens, &self.pos, method, false);
             } else {
                 const column = try self.parseIdentifierOwned();
                 var column_transferred = false;
@@ -4550,16 +4564,8 @@ const Parser = struct {
                     if (self.match(.comma) == null) break;
                     continue;
                 }
-                if (method == .gin and self.peekKind(.identifier)) {
-                    const opclass_token = self.match(.identifier) orelse unreachable;
-                    if (std.ascii.eqlIgnoreCase(opclass_token.text, "jsonb_path_ops")) {
-                        opclass = .jsonb_path_ops;
-                    } else if (std.ascii.eqlIgnoreCase(opclass_token.text, "array_ops")) {
-                        opclass = .array_ops;
-                    } else return error.UnsupportedSqlShape;
-                }
-                if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
-                try self.parseDdlIndexElementOrderOptions();
+                const suffix = try sql_adapter.parseCreateIndexElementSuffix(self.tokens, &self.pos, method, true);
+                if (suffix.opclass != .default) opclass = suffix.opclass;
                 try columns.append(self.alloc, column);
                 column_transferred = true;
             }
@@ -4570,7 +4576,7 @@ const Parser = struct {
         try validateSqlIdentifierListUnique(columns.items);
         try validateSqlUniqueExpressionListUnique(expressions.items);
 
-        const nulls_policy = try self.parseOptionalDdlUniqueNullsDistinct();
+        const nulls_policy = try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos);
         if (nulls_policy != null and !unique) return error.UnsupportedSqlShape;
         const nulls_not_distinct = nulls_policy orelse false;
         if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
@@ -4622,15 +4628,14 @@ const Parser = struct {
         const period = without_overlaps_period;
         without_overlaps_period = null;
 
-        index_name_transferred = true;
-        table_name_transferred = true;
+        header_transferred = true;
         columns_transferred = true;
         include_columns_owned = false;
         expressions_transferred = true;
         return .{
-            .index_name = index_name,
-            .table_name = table_name,
-            .if_not_exists = if_not_exists,
+            .index_name = header.index_name,
+            .table_name = header.table_name,
+            .if_not_exists = header.if_not_exists,
             .unique = unique,
             .method = method,
             .opclass = opclass,
@@ -4645,50 +4650,12 @@ const Parser = struct {
         };
     }
 
-    fn nextDdlIndexElementIsSupportedExpression(self: *@This()) bool {
-        var pos = self.pos;
-        while (pos < self.tokens.len and self.tokens[pos].kind == .lparen) : (pos += 1) {}
-        if (pos >= self.tokens.len or self.tokens[pos].kind != .identifier) return false;
-        return std.ascii.eqlIgnoreCase(self.tokens[pos].text, "lower") or
-            std.ascii.eqlIgnoreCase(self.tokens[pos].text, "upper") or
-            std.ascii.eqlIgnoreCase(self.tokens[pos].text, "md5") or
-            std.ascii.eqlIgnoreCase(self.tokens[pos].text, "concat") or
-            std.ascii.eqlIgnoreCase(self.tokens[pos].text, "concat_ws");
-    }
-
-    fn consumeDdlIndexExpressionWrappers(self: *@This()) usize {
-        var count: usize = 0;
-        while (self.match(.lparen) != null) count += 1;
-        return count;
-    }
-
-    fn closeDdlIndexExpressionWrappers(self: *@This(), count: usize) !void {
-        var remaining = count;
-        while (remaining > 0) : (remaining -= 1) {
-            try self.expect(.rparen);
-        }
-    }
-
-    fn parseDdlIndexElementOrderOptions(self: *@This()) !void {
-        _ = self.matchKeyword("asc") or self.matchKeyword("desc");
-        if (self.matchKeyword("nulls")) {
-            if (!(self.matchKeyword("first") or self.matchKeyword("last"))) return error.UnsupportedSqlShape;
-        }
-    }
-
     fn parseIdentityAllocatorDdl(self: *@This()) !IdentityAllocatorPlan {
         if (self.matchKeyword("temporary") or self.matchKeyword("temp") or self.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
-        try self.expectKeyword("table");
-        if (self.matchKeyword("if")) return error.UnsupportedSqlShape;
-
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        try self.expect(.lparen);
-
-        const column_name = try self.parseIdentifierOwned();
-        var column_name_transferred = false;
-        errdefer if (!column_name_transferred) self.alloc.free(column_name);
+        var header = try sql_adapter.parseIdentityAllocatorTableHeaderAlloc(self.alloc, self.tokens, &self.pos);
+        var header_transferred = false;
+        errdefer if (!header_transferred) header.deinit(self.alloc);
+        const column_name = header.column_name;
         const path = try self.alloc.dupe(u8, column_name);
         var path_transferred = false;
         errdefer if (!path_transferred) self.alloc.free(path);
@@ -4734,14 +4701,13 @@ const Parser = struct {
             self.alloc.free(owned_additional_columns);
         };
 
-        table_name_transferred = true;
-        column_name_transferred = true;
+        header_transferred = true;
         path_transferred = true;
         column_transferred = true;
         identity_transferred = true;
         additional_columns_transferred = true;
         return .{
-            .table_name = table_name,
+            .table_name = header.table_name,
             .column = column,
             .kind = identity.kind,
             .options = identity.options,
@@ -4751,33 +4717,7 @@ const Parser = struct {
     }
 
     fn parseIdentityAllocatorSpec(self: *@This()) !IdentityAllocatorSpec {
-        if (self.matchKeyword("serial")) return .{ .kind = .serial };
-        if (self.matchKeyword("bigserial")) return .{ .kind = .bigserial };
-        const ddl_type = try self.parseDdlType();
-        if (ddl_type.field_type != .numeric) return error.UnsupportedSqlShape;
-        try self.expectKeyword("generated");
-        const kind: IdentityAllocatorKind = if (self.matchKeyword("always"))
-            .generated_always
-        else blk: {
-            try self.expectKeyword("by");
-            try self.expectKeyword("default");
-            break :blk .generated_by_default;
-        };
-        try self.expectKeyword("as");
-        try self.expectKeyword("identity");
-        var options: SequenceOptions = .{};
-        errdefer options.deinit(self.alloc);
-        if (self.match(.lparen) != null) {
-            while (!self.peekKind(.rparen)) {
-                try self.parseIdentitySequenceOption(&options);
-            }
-            try self.expect(.rparen);
-        }
-        return .{ .kind = kind, .options = options };
-    }
-
-    fn parseIdentitySequenceOption(self: *@This(), options: *SequenceOptions) !void {
-        try sql_adapter.parseIdentitySequenceOptionAlloc(self.alloc, self.tokens, &self.pos, options);
+        return sql_adapter.parseIdentityAllocatorSpecAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseCreateTableDdl(self: *@This()) !CreateTablePlan {
@@ -4789,18 +4729,9 @@ const Parser = struct {
     }
 
     fn parseCreateTableDefinitionDdl(self: *@This()) !CreateTablePlan {
-        if (self.matchKeyword("temporary") or self.matchKeyword("temp") or self.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
-        try self.expectKeyword("table");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        errdefer self.alloc.free(table_name);
-        try self.expect(.lparen);
+        var header = try sql_adapter.parseCreateTableDefinitionHeaderAlloc(self.alloc, self.tokens, &self.pos);
+        var header_transferred = false;
+        errdefer if (!header_transferred) header.deinit(self.alloc);
 
         var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
         errdefer {
@@ -4831,26 +4762,23 @@ const Parser = struct {
         }
 
         while (true) {
-            const constraint_name = if (self.matchKeyword("constraint")) try self.parseIdentifierOwned() else null;
-            var constraint_name_transferred = false;
-            errdefer if (!constraint_name_transferred) if (constraint_name) |name| self.alloc.free(name);
+            var element_prefix = try sql_adapter.parseCreateTableElementPrefixAlloc(self.alloc, self.tokens, &self.pos);
+            defer element_prefix.deinit(self.alloc);
 
-            if (self.peekKeyword("primary") or self.peekKeyword("unique") or self.peekKeyword("foreign") or self.peekKeyword("check") or self.peekKeyword("period")) {
-                try self.parseDdlTableConstraint(constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
-                if (constraint_name) |name| self.alloc.free(name);
-                constraint_name_transferred = true;
-            } else {
-                if (constraint_name != null) return error.UnsupportedSqlShape;
+            if (element_prefix.kind == .column) {
                 try self.parseDdlColumnDefinition(&columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
+            } else {
+                try self.parseDdlTableConstraint(element_prefix.constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
             }
 
             if (self.match(.comma) == null) break;
         }
         try self.expect(.rparen);
 
+        header_transferred = true;
         return .{
-            .table_name = table_name,
-            .if_not_exists = if_not_exists,
+            .table_name = header.table_name,
+            .if_not_exists = header.if_not_exists,
             .columns = try columns.toOwnedSlice(self.alloc),
             .primary_key = primary_key,
             .periods = try periods.toOwnedSlice(self.alloc),
@@ -4865,128 +4793,30 @@ const Parser = struct {
         var create_table_transferred = false;
         errdefer if (!create_table_transferred) create_table.deinit(self.alloc);
 
-        try self.expectKeyword("partition");
-        try self.expectKeyword("by");
-        const method = try self.parseTablePartitionMethod();
-        const keys = try self.parseDdlColumnListAlloc();
+        var tail = try sql_adapter.parseCreatePartitionedTableCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var tail_transferred = false;
+        errdefer if (!tail_transferred) tail.deinit(self.alloc);
+        const keys = tail.keys;
         var keys_transferred = false;
         errdefer if (!keys_transferred) freeStringSlice(self.alloc, keys);
-        try self.expectDdlEnd();
 
         create_table_transferred = true;
+        tail.keys = &.{};
+        tail_transferred = true;
         keys_transferred = true;
         return .{
             .create_table = create_table,
-            .method = method,
+            .method = tail.method,
             .keys = keys,
         };
     }
 
     fn parseCreateTablePartitionDdl(self: *@This()) !CreateTablePartitionPlan {
-        if (self.matchKeyword("temporary") or self.matchKeyword("temp") or self.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
-        try self.expectKeyword("table");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        try self.expectKeyword("partition");
-        try self.expectKeyword("of");
-        if (if_not_exists) return error.UnsupportedSqlShape;
-        const parent_table_name = try self.parseSqlObjectIdentifierOwned();
-        var parent_transferred = false;
-        errdefer if (!parent_transferred) self.alloc.free(parent_table_name);
-        const bounds = try self.parseTablePartitionBounds();
-        var bounds_transferred = false;
-        errdefer if (!bounds_transferred) {
-            var mutable_bounds = bounds;
-            mutable_bounds.deinit(self.alloc);
-        };
-        try self.expectDdlEnd();
-
-        table_name_transferred = true;
-        parent_transferred = true;
-        bounds_transferred = true;
-        return .{
-            .table_name = table_name,
-            .parent_table_name = parent_table_name,
-            .bounds = bounds,
-        };
+        return sql_adapter.parseCreateTablePartitionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseAlterTablePartitionDdl(self: *@This()) !TablePartitionCatalogPlan {
-        try self.expectKeyword("table");
-        const parent_table_name = try self.parseSqlObjectIdentifierOwned();
-        var parent_transferred = false;
-        errdefer if (!parent_transferred) self.alloc.free(parent_table_name);
-        if (self.matchKeyword("attach")) {
-            try self.expectKeyword("partition");
-            const partition_table_name = try self.parseSqlObjectIdentifierOwned();
-            var partition_transferred = false;
-            errdefer if (!partition_transferred) self.alloc.free(partition_table_name);
-            const bounds = try self.parseTablePartitionBounds();
-            var bounds_transferred = false;
-            errdefer if (!bounds_transferred) {
-                var mutable_bounds = bounds;
-                mutable_bounds.deinit(self.alloc);
-            };
-            try self.expectDdlEnd();
-            parent_transferred = true;
-            partition_transferred = true;
-            bounds_transferred = true;
-            return .{ .attach = .{
-                .parent_table_name = parent_table_name,
-                .partition_table_name = partition_table_name,
-                .bounds = bounds,
-            } };
-        }
-        if (self.matchKeyword("detach")) {
-            try self.expectKeyword("partition");
-            const partition_table_name = try self.parseSqlObjectIdentifierOwned();
-            var partition_transferred = false;
-            errdefer if (!partition_transferred) self.alloc.free(partition_table_name);
-            try self.expectDdlEnd();
-            parent_transferred = true;
-            partition_transferred = true;
-            return .{ .detach = .{
-                .parent_table_name = parent_table_name,
-                .partition_table_name = partition_table_name,
-            } };
-        }
-        return error.UnsupportedSqlShape;
-    }
-
-    fn parseTablePartitionMethod(self: *@This()) !TablePartitionMethod {
-        if (self.matchKeyword("range")) return .range;
-        return error.UnsupportedSqlShape;
-    }
-
-    fn parseTablePartitionBounds(self: *@This()) !TablePartitionBounds {
-        try self.expectKeyword("for");
-        try self.expectKeyword("values");
-        try self.expectKeyword("from");
-        try self.expect(.lparen);
-        const lower_json = try self.parseSqlUntypedValueJsonAlloc();
-        var lower_transferred = false;
-        errdefer if (!lower_transferred) self.alloc.free(lower_json);
-        try self.expect(.rparen);
-        try self.expectKeyword("to");
-        try self.expect(.lparen);
-        const upper_json = try self.parseSqlUntypedValueJsonAlloc();
-        var upper_transferred = false;
-        errdefer if (!upper_transferred) self.alloc.free(upper_json);
-        try self.expect(.rparen);
-
-        lower_transferred = true;
-        upper_transferred = true;
-        return .{
-            .lower_json = lower_json,
-            .upper_json = upper_json,
-        };
+        return sql_adapter.parseAlterTablePartitionCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn expectDdlEnd(self: *@This()) !void {
@@ -4997,11 +4827,6 @@ const Parser = struct {
     fn parseTableCloneDdl(self: *@This()) !TableClonePlan {
         return sql_adapter.parseCreateTableCloneCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
     }
-
-    const DdlType = struct {
-        field_type: runtime_schema.AntflyType,
-        array_item_type: ?runtime_schema.AntflyType = null,
-    };
 
     fn parseDdlColumnDefinition(
         self: *@This(),
@@ -5041,64 +4866,31 @@ const Parser = struct {
             } else if (self.matchKeyword("generated")) {
                 if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
                 column.generated = try self.parseDdlGeneratedValue();
-            } else if (self.matchKeyword("primary")) {
-                try self.expectKeyword("key");
-                column.nullable = false;
-                const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
-                defer freeStringSlice(self.alloc, include_columns);
-                try self.consumeOptionalDdlImmediateConstraintTiming();
-                try self.installDdlPrimaryKey(primary_key, null, &.{column.name}, include_columns, null);
-            } else if (self.matchKeyword("unique")) {
-                const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
-                const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
-                defer freeStringSlice(self.alloc, include_columns);
-                try self.consumeOptionalDdlImmediateConstraintTiming();
-                try self.appendDdlUniqueConstraint(unique_constraints, null, &.{column.name}, include_columns, null, nulls_not_distinct);
-            } else if (self.matchKeyword("check")) {
-                const check = try self.parseDdlCheckConstraint(null);
-                var check_transferred = false;
-                errdefer if (!check_transferred) freeDdlRelationalCheck(self.alloc, check);
-                try checks.append(self.alloc, check);
-                check_transferred = true;
-            } else if (self.matchKeyword("references")) {
-                const foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, null);
-                var foreign_key_transferred = false;
-                errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
-                try foreign_keys.append(self.alloc, foreign_key);
-                foreign_key_transferred = true;
-            } else if (self.matchKeyword("constraint")) {
-                const constraint_name = try self.parseIdentifierOwned();
-                var constraint_name_transferred = false;
-                errdefer if (!constraint_name_transferred) self.alloc.free(constraint_name);
-                if (self.matchKeyword("primary")) {
+            } else {
+                var constraint_prefix = try sql_adapter.parseCreateTableColumnConstraintPrefixAlloc(self.alloc, self.tokens, &self.pos);
+                defer constraint_prefix.deinit(self.alloc);
+                const constraint_name = constraint_prefix.constraint_name;
+                if (constraint_prefix.kind == .primary_key and self.matchKeyword("primary")) {
                     try self.expectKeyword("key");
                     column.nullable = false;
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
-                    try self.consumeOptionalDdlImmediateConstraintTiming();
+                    try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
                     try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, include_columns, null);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
-                } else if (self.matchKeyword("unique")) {
-                    const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
+                } else if (constraint_prefix.kind == .unique and self.matchKeyword("unique")) {
+                    const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
                     const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(&.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
-                    try self.consumeOptionalDdlImmediateConstraintTiming();
+                    try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
                     try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
-                } else if (self.matchKeyword("check")) {
+                } else if (constraint_prefix.kind == .check and self.matchKeyword("check")) {
                     const check = try self.parseDdlCheckConstraint(constraint_name);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
                     var check_transferred = false;
                     errdefer if (!check_transferred) freeDdlRelationalCheck(self.alloc, check);
                     try checks.append(self.alloc, check);
                     check_transferred = true;
-                } else if (self.matchKeyword("references")) {
+                } else if (constraint_prefix.kind == .references and self.matchKeyword("references")) {
                     const foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, constraint_name);
-                    self.alloc.free(constraint_name);
-                    constraint_name_transferred = true;
                     var foreign_key_transferred = false;
                     errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
                     try foreign_keys.append(self.alloc, foreign_key);
@@ -5106,8 +4898,6 @@ const Parser = struct {
                 } else {
                     return error.UnsupportedSqlShape;
                 }
-            } else {
-                return error.UnsupportedSqlShape;
             }
         }
 
@@ -5253,107 +5043,14 @@ const Parser = struct {
     }
 
     fn parseOptionalDdlCollationAlloc(self: *@This(), field_type: runtime_schema.AntflyType) !?[]const u8 {
-        if (!self.matchKeyword("collate")) return null;
+        const collation = try sql_adapter.parseOptionalDdlCollationAlloc(self.alloc, self.tokens, &self.pos) orelse return null;
+        errdefer self.alloc.free(collation);
         if (!relationalFieldTypeSupportsCollation(field_type)) return error.UnsupportedSqlShape;
-        const first = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        if (std.mem.endsWith(u8, first.text, ".")) {
-            const second = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-            return try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ first.text, second.text });
-        }
-        return try self.alloc.dupe(u8, first.text);
+        return collation;
     }
 
     fn parseDdlGeneratedValue(self: *@This()) !runtime_schema.RelationalGeneratedValue {
-        try self.expectKeyword("always");
-        try self.expectKeyword("as");
-        try self.expect(.lparen);
-        const generated = try self.parseDdlGeneratedExpression();
-        var generated_transferred = false;
-        errdefer if (!generated_transferred) freeDdlGeneratedValue(self.alloc, generated);
-        try self.expect(.rparen);
-        try self.expectKeyword("stored");
-        generated_transferred = true;
-        return generated;
-    }
-
-    fn parseDdlGeneratedExpression(self: *@This()) !runtime_schema.RelationalGeneratedValue {
-        if (self.peekKeyword("lower") or self.peekKeyword("upper") or self.peekMd5FunctionCall()) {
-            const op: runtime_schema.RelationalGeneratedOp = if (self.matchKeyword("lower"))
-                .lower
-            else if (self.matchKeyword("upper"))
-                .upper
-            else blk: {
-                if (!self.matchMd5FunctionKeyword()) return error.UnsupportedSqlShape;
-                break :blk .md5;
-            };
-            try self.expect(.lparen);
-            const field = try self.parseIdentifierOwned();
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            try self.expect(.rparen);
-            const separator = try self.alloc.dupe(u8, "");
-            var separator_transferred = false;
-            errdefer if (!separator_transferred) self.alloc.free(separator);
-            field_transferred = true;
-            separator_transferred = true;
-            return .{ .op = op, .field = field, .separator = separator };
-        }
-        if (self.matchKeyword("concat")) return try self.parseDdlGeneratedConcatExpression(.concat);
-        if (self.matchKeyword("concat_ws")) return try self.parseDdlGeneratedConcatExpression(.concat_ws);
-        return error.UnsupportedSqlShape;
-    }
-
-    fn parseDdlGeneratedConcatExpression(
-        self: *@This(),
-        op: runtime_schema.RelationalGeneratedOp,
-    ) !runtime_schema.RelationalGeneratedValue {
-        try self.expect(.lparen);
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| self.alloc.free(field);
-            fields.deinit(self.alloc);
-        }
-
-        var separator: ?[]const u8 = null;
-        errdefer if (separator) |value| self.alloc.free(value);
-        if (op == .concat_ws) {
-            const separator_token = self.match(.string) orelse return error.UnsupportedSqlShape;
-            separator = try self.alloc.dupe(u8, separator_token.text);
-            try self.expect(.comma);
-        }
-        const first = try self.parseIdentifierOwned();
-        var first_transferred = false;
-        errdefer if (!first_transferred) self.alloc.free(first);
-        try fields.append(self.alloc, first);
-        first_transferred = true;
-        while (self.match(.comma) != null) {
-            if (op == .concat) {
-                if (self.match(.string)) |token| {
-                    if (separator) |existing| {
-                        if (!std.mem.eql(u8, existing, token.text)) return error.UnsupportedSqlShape;
-                    } else {
-                        separator = try self.alloc.dupe(u8, token.text);
-                    }
-                    try self.expect(.comma);
-                }
-            } else if (separator == null) {
-                separator = try self.alloc.dupe(u8, "");
-            }
-            const field = try self.parseIdentifierOwned();
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            try fields.append(self.alloc, field);
-            field_transferred = true;
-        }
-        try self.expect(.rparen);
-        if (fields.items.len < 2) return error.UnsupportedSqlShape;
-        const owned_fields = try fields.toOwnedSlice(self.alloc);
-        var fields_transferred = false;
-        errdefer if (!fields_transferred) freeStringSlice(self.alloc, owned_fields);
-        const owned_separator = separator orelse try self.alloc.dupe(u8, "");
-        separator = null;
-        fields_transferred = true;
-        return .{ .op = op, .fields = owned_fields, .separator = owned_separator };
+        return sql_adapter.parseDdlStoredGeneratedValueAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseDdlTableConstraint(
@@ -5371,15 +5068,15 @@ const Parser = struct {
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try self.consumeOptionalDdlImmediateConstraintTiming();
+            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
             try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period);
         } else if (self.matchKeyword("unique")) {
-            const nulls_not_distinct = (try self.parseOptionalDdlUniqueNullsDistinct()) orelse false;
+            const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
             const columns = try self.parseDdlTemporalColumnListAlloc();
             defer columns.deinit(self.alloc);
             const include_columns = try self.parseOptionalDdlConstraintIncludeAlloc(columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
-            try self.consumeOptionalDdlImmediateConstraintTiming();
+            try sql_adapter.consumeOptionalDdlImmediateConstraintTiming(self.tokens, &self.pos);
             try self.appendDdlUniqueConstraint(unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct);
         } else if (self.matchKeyword("foreign")) {
             const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
@@ -5405,119 +5102,64 @@ const Parser = struct {
         }
     }
 
-    fn parseDdlType(self: *@This()) !DdlType {
-        const first = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        const base = ddlBaseTypeForName(first.text) orelse blk: {
-            if (std.ascii.eqlIgnoreCase(first.text, "character")) {
-                try self.expectKeyword("varying");
-                break :blk runtime_schema.AntflyType.keyword;
-            }
-            if (std.ascii.eqlIgnoreCase(first.text, "double")) {
-                try self.expectKeyword("precision");
-                break :blk runtime_schema.AntflyType.numeric;
-            }
-            if (std.ascii.eqlIgnoreCase(first.text, "timestamp")) {
-                if (self.matchKeyword("with")) {
-                    try self.expectKeyword("time");
-                    try self.expectKeyword("zone");
-                } else if (self.matchKeyword("without")) {
-                    try self.expectKeyword("time");
-                    try self.expectKeyword("zone");
-                }
-                break :blk runtime_schema.AntflyType.datetime;
-            }
-            return error.UnsupportedSqlShape;
-        };
-
-        if (self.peekKind(.lparen)) try self.skipParenthesizedTokens();
-        const is_array = if (self.match(.lbracket) != null) blk: {
-            try self.expect(.rbracket);
-            break :blk true;
-        } else false;
-        if (!is_array) return .{ .field_type = base };
-        if (base == .json or base == .array or base == .blob) return error.UnsupportedSqlShape;
-        return .{ .field_type = .array, .array_item_type = base };
+    fn parseDdlType(self: *@This()) !sql_adapter.DdlTypeSyntax {
+        return sql_adapter.parseDdlType(self.tokens, &self.pos);
     }
 
     fn parseDdlPeriodConstraint(self: *@This()) !runtime_schema.RelationalPeriod {
-        try self.expectKeyword("for");
-        const name = try self.parseIdentifierOwned();
-        var name_transferred = false;
-        errdefer if (!name_transferred) self.alloc.free(name);
-        try self.expect(.lparen);
-        const start_column = try self.parseIdentifierOwned();
-        var start_transferred = false;
-        errdefer if (!start_transferred) self.alloc.free(start_column);
-        try self.expect(.comma);
-        const end_column = try self.parseIdentifierOwned();
-        var end_transferred = false;
-        errdefer if (!end_transferred) self.alloc.free(end_column);
-        try self.expect(.rparen);
-        name_transferred = true;
-        start_transferred = true;
-        end_transferred = true;
-        return .{ .name = name, .start_column = start_column, .end_column = end_column };
+        const syntax = try sql_adapter.parseDdlPeriodConstraintAlloc(self.alloc, self.tokens, &self.pos);
+        return .{
+            .name = syntax.name,
+            .start_column = syntax.start_column,
+            .end_column = syntax.end_column,
+        };
     }
 
     fn parseDdlDefaultValue(self: *@This(), field_type: runtime_schema.AntflyType) !runtime_schema.RelationalDefaultValue {
-        if (self.matchKeyword("null")) {
-            return .{ .kind = .literal, .value_json = try self.alloc.dupe(u8, "null") };
-        }
-        if (self.matchKeyword("gen_random_uuid") or self.matchKeyword("uuid_generate_v4")) {
-            try self.expect(.lparen);
-            try self.expect(.rparen);
-            if (field_type != .keyword and field_type != .text and field_type != .link) return error.UnsupportedSqlShape;
-            return .{ .kind = .uuid_v4, .value_json = try self.alloc.dupe(u8, "") };
-        }
-        if (self.matchKeyword("now")) {
-            try self.expect(.lparen);
-            try self.expect(.rparen);
-            if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
-            return .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
-        }
-        if (self.matchKeyword("current_timestamp")) {
-            try self.parseOptionalCurrentTimestampPrecision();
-            if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
-            return .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
-        }
-        if (self.matchKeyword("current_date")) {
-            if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
-            return .{ .kind = .current_date_ns, .value_json = try self.alloc.dupe(u8, "") };
+        if (try sql_adapter.parseOptionalDdlKnownDefault(self.tokens, &self.pos)) |known| {
+            return try self.ddlDefaultValueFromKnownSyntax(known, field_type);
         }
         const value = try self.parseSqlColumnValueAlloc(.{ .name = "", .path = "", .field_type = field_type });
         return .{ .kind = .literal, .value_json = value };
     }
 
     fn parseDdlDefaultValueUntyped(self: *@This()) !runtime_schema.RelationalDefaultValue {
-        if (self.matchKeyword("null")) {
-            return .{ .kind = .literal, .value_json = try self.alloc.dupe(u8, "null") };
-        }
-        if (self.matchKeyword("gen_random_uuid") or self.matchKeyword("uuid_generate_v4")) {
-            try self.expect(.lparen);
-            try self.expect(.rparen);
-            return .{ .kind = .uuid_v4, .value_json = try self.alloc.dupe(u8, "") };
-        }
-        if (self.matchKeyword("now")) {
-            try self.expect(.lparen);
-            try self.expect(.rparen);
-            return .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
-        }
-        if (self.matchKeyword("current_timestamp")) {
-            try self.parseOptionalCurrentTimestampPrecision();
-            return .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
-        }
-        if (self.matchKeyword("current_date")) {
-            return .{ .kind = .current_date_ns, .value_json = try self.alloc.dupe(u8, "") };
+        if (try sql_adapter.parseOptionalDdlKnownDefault(self.tokens, &self.pos)) |known| {
+            return try self.ddlDefaultValueFromKnownSyntax(known, null);
         }
         return .{ .kind = .literal, .value_json = try self.parseSqlUntypedValueJsonAlloc() };
     }
 
+    fn ddlDefaultValueFromKnownSyntax(
+        self: *@This(),
+        known: sql_adapter.DdlKnownDefaultSyntax,
+        field_type: ?runtime_schema.AntflyType,
+    ) !runtime_schema.RelationalDefaultValue {
+        return switch (known) {
+            .null_literal => .{ .kind = .literal, .value_json = try self.alloc.dupe(u8, "null") },
+            .uuid_v4 => blk: {
+                if (field_type) |ty| {
+                    if (ty != .keyword and ty != .text and ty != .link) return error.UnsupportedSqlShape;
+                }
+                break :blk .{ .kind = .uuid_v4, .value_json = try self.alloc.dupe(u8, "") };
+            },
+            .now_ns => blk: {
+                if (field_type) |ty| {
+                    if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
+                }
+                break :blk .{ .kind = .now_ns, .value_json = try self.alloc.dupe(u8, "") };
+            },
+            .current_date_ns => blk: {
+                if (field_type) |ty| {
+                    if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
+                }
+                break :blk .{ .kind = .current_date_ns, .value_json = try self.alloc.dupe(u8, "") };
+            },
+        };
+    }
+
     fn parseOptionalCurrentTimestampPrecision(self: *@This()) !void {
-        if (self.match(.lparen) == null) return;
-        const token = self.match(.number) orelse return error.UnsupportedSqlShape;
-        const precision = std.fmt.parseUnsigned(u8, token.text, 10) catch return error.UnsupportedSqlShape;
-        if (precision > 6) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
+        return sql_adapter.parseOptionalCurrentTimestampPrecision(self.tokens, &self.pos);
     }
 
     fn parseDdlCheckConstraint(self: *@This(), constraint_name: ?[]const u8) !runtime_schema.RelationalCheck {
@@ -5918,46 +5560,11 @@ const Parser = struct {
         };
     }
 
-    const DdlForeignKeyColumnList = struct {
-        columns: []const []const u8,
-        period: ?[]const u8 = null,
-
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
-            freeStringSlice(alloc, self.columns);
-            if (self.period) |period| alloc.free(period);
-        }
-    };
-
-    fn parseDdlForeignKeyColumnListAlloc(self: *@This()) !DdlForeignKeyColumnList {
-        try self.expect(.lparen);
-        var columns = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (columns.items) |column| self.alloc.free(column);
-            columns.deinit(self.alloc);
-        }
-        var period: ?[]const u8 = null;
-        errdefer if (period) |value| self.alloc.free(value);
-        while (true) {
-            if (self.matchKeyword("period")) {
-                if (period != null) return error.UnsupportedSqlShape;
-                period = try self.parseIdentifierOwned();
-            } else {
-                const column = try self.parseIdentifierOwned();
-                var transferred = false;
-                errdefer if (!transferred) self.alloc.free(column);
-                try columns.append(self.alloc, column);
-                transferred = true;
-            }
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        if (columns.items.len == 0) return error.UnsupportedSqlShape;
-        try validateSqlIdentifierListUnique(columns.items);
-        const owned_columns = try columns.toOwnedSlice(self.alloc);
-        errdefer freeStringSlice(self.alloc, owned_columns);
-        const owned_period = period;
-        period = null;
-        return .{ .columns = owned_columns, .period = owned_period };
+    fn parseDdlForeignKeyColumnListAlloc(self: *@This()) !sql_adapter.DdlForeignKeyColumnListSyntax {
+        const columns = try sql_adapter.parseDdlForeignKeyColumnListAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer columns.deinit(self.alloc);
+        try validateSqlIdentifierListUnique(columns.columns);
+        return columns;
     }
 
     fn parseDdlInlineForeignKeyConstraint(
@@ -6013,161 +5620,51 @@ const Parser = struct {
     };
 
     fn parseDdlForeignKeyOptions(self: *@This()) !DdlForeignKeyOptions {
-        var options: DdlForeignKeyOptions = .{};
-        while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon)) {
-            if (self.peekDdlNotValid()) break;
-            if (self.matchKeyword("on")) {
-                if (self.matchKeyword("delete")) {
-                    options.on_delete = try self.parseDdlForeignKeyAction();
-                } else if (self.matchKeyword("update")) {
-                    options.on_update = try self.parseDdlForeignKeyAction();
-                } else {
-                    return error.UnsupportedSqlShape;
-                }
-            } else if (self.matchKeyword("deferrable")) {
-                options.deferrable = true;
-            } else if (self.matchKeyword("not")) {
-                try self.expectKeyword("deferrable");
-                options.deferrable = false;
-            } else if (self.matchKeyword("initially")) {
-                if (self.matchKeyword("deferred")) {
-                    options.timing = .deferred;
-                    options.deferrable = true;
-                } else {
-                    try self.expectKeyword("immediate");
-                    options.timing = .immediate;
-                }
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        }
-        return options;
+        const options = try sql_adapter.parseDdlForeignKeyOptions(self.tokens, &self.pos);
+        return .{
+            .on_delete = ddlForeignKeyActionFromSyntax(options.on_delete),
+            .on_update = ddlForeignKeyActionFromSyntax(options.on_update),
+            .deferrable = options.deferrable,
+            .timing = ddlForeignKeyTimingFromSyntax(options.timing),
+        };
     }
 
-    fn consumeOptionalDdlNotValid(self: *@This()) bool {
-        if (!self.peekDdlNotValid()) return false;
-        self.pos += 2;
-        return true;
+    fn ddlForeignKeyActionFromSyntax(action: sql_adapter.DdlForeignKeyActionSyntax) runtime_schema.ForeignKeyAction {
+        return switch (action) {
+            .restrict => .restrict,
+            .cascade => .cascade,
+            .no_action => .no_action,
+            .set_null => .set_null,
+        };
     }
 
-    fn parseOptionalDdlUniqueNullsDistinct(self: *@This()) !?bool {
-        if (!self.matchKeyword("nulls")) return null;
-        const not_distinct = self.matchKeyword("not");
-        try self.expectKeyword("distinct");
-        return not_distinct;
-    }
-
-    fn consumeOptionalDdlImmediateConstraintTiming(self: *@This()) !void {
-        if (self.matchKeyword("deferrable")) return error.UnsupportedSqlShape;
-        if (self.pos + 1 >= self.tokens.len) return;
-        const not_token = self.tokens[self.pos];
-        const deferrable_token = self.tokens[self.pos + 1];
-        if (not_token.kind != .identifier or deferrable_token.kind != .identifier or
-            !std.ascii.eqlIgnoreCase(not_token.text, "not") or
-            !std.ascii.eqlIgnoreCase(deferrable_token.text, "deferrable"))
-        {
-            return;
-        }
-        self.pos += 2;
-        if (self.matchKeyword("initially")) {
-            if (self.matchKeyword("deferred")) return error.UnsupportedSqlShape;
-            try self.expectKeyword("immediate");
-        }
-    }
-
-    fn peekDdlNotValid(self: *@This()) bool {
-        if (self.pos + 1 >= self.tokens.len) return false;
-        const not_token = self.tokens[self.pos];
-        const valid_token = self.tokens[self.pos + 1];
-        return not_token.kind == .identifier and valid_token.kind == .identifier and
-            std.ascii.eqlIgnoreCase(not_token.text, "not") and
-            std.ascii.eqlIgnoreCase(valid_token.text, "valid");
-    }
-
-    fn parseDdlForeignKeyAction(self: *@This()) !runtime_schema.ForeignKeyAction {
-        if (self.matchKeyword("cascade")) return .cascade;
-        if (self.matchKeyword("restrict")) return .restrict;
-        if (self.matchKeyword("no")) {
-            try self.expectKeyword("action");
-            return .no_action;
-        }
-        if (self.matchKeyword("set")) {
-            try self.expectKeyword("null");
-            return .set_null;
-        }
-        return error.UnsupportedSqlShape;
+    fn ddlForeignKeyTimingFromSyntax(timing: sql_adapter.DdlForeignKeyTimingSyntax) runtime_schema.ForeignKeyTiming {
+        return switch (timing) {
+            .immediate => .immediate,
+            .deferred => .deferred,
+        };
     }
 
     fn parseDdlColumnListAlloc(self: *@This()) ![]const []const u8 {
-        try self.expect(.lparen);
-        var columns = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (columns.items) |column| self.alloc.free(column);
-            columns.deinit(self.alloc);
-        }
-        while (true) {
-            const column = try self.parseIdentifierOwned();
-            var transferred = false;
-            errdefer if (!transferred) self.alloc.free(column);
-            try columns.append(self.alloc, column);
-            transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        try validateSqlIdentifierListUnique(columns.items);
-        return try columns.toOwnedSlice(self.alloc);
+        const columns = try sql_adapter.parseDdlColumnListAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer freeStringSlice(self.alloc, columns);
+        try validateSqlIdentifierListUnique(columns);
+        return columns;
     }
 
     fn parseOptionalDdlConstraintIncludeAlloc(self: *@This(), key_columns: []const []const u8) ![]const []const u8 {
-        if (!self.matchKeyword("include")) return &.{};
-        const include_columns = try self.parseDdlColumnListAlloc();
+        const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeAlloc(self.alloc, self.tokens, &self.pos);
         errdefer freeStringSlice(self.alloc, include_columns);
+        try validateSqlIdentifierListUnique(include_columns);
         try validateSqlIdentifierListsDisjoint(key_columns, include_columns);
         return include_columns;
     }
 
-    const DdlTemporalColumnList = struct {
-        columns: []const []const u8,
-        without_overlaps_period: ?[]const u8 = null,
-
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
-            freeStringSlice(alloc, self.columns);
-            if (self.without_overlaps_period) |period| alloc.free(period);
-        }
-    };
-
-    fn parseDdlTemporalColumnListAlloc(self: *@This()) !DdlTemporalColumnList {
-        try self.expect(.lparen);
-        var columns = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (columns.items) |column| self.alloc.free(column);
-            columns.deinit(self.alloc);
-        }
-        var without_overlaps_period: ?[]const u8 = null;
-        errdefer if (without_overlaps_period) |period| self.alloc.free(period);
-        while (true) {
-            const column = try self.parseIdentifierOwned();
-            var column_transferred = false;
-            errdefer if (!column_transferred) self.alloc.free(column);
-            if (self.matchKeyword("without")) {
-                try self.expectKeyword("overlaps");
-                if (without_overlaps_period != null) return error.UnsupportedSqlShape;
-                without_overlaps_period = column;
-                column_transferred = true;
-            } else {
-                try columns.append(self.alloc, column);
-                column_transferred = true;
-            }
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        if (columns.items.len == 0) return error.UnsupportedSqlShape;
-        try validateSqlIdentifierListUnique(columns.items);
-        const owned_columns = try columns.toOwnedSlice(self.alloc);
-        errdefer freeStringSlice(self.alloc, owned_columns);
-        const period = without_overlaps_period;
-        without_overlaps_period = null;
-        return .{ .columns = owned_columns, .without_overlaps_period = period };
+    fn parseDdlTemporalColumnListAlloc(self: *@This()) !sql_adapter.DdlTemporalColumnListSyntax {
+        const columns = try sql_adapter.parseDdlTemporalColumnListAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer columns.deinit(self.alloc);
+        try validateSqlIdentifierListUnique(columns.columns);
+        return columns;
     }
 
     fn parseDdlUniquePredicatesAlloc(self: *@This()) ![]const runtime_schema.UniquePredicate {
@@ -6380,21 +5877,6 @@ const Parser = struct {
         return try std.fmt.allocPrint(self.alloc, "-{s}", .{token.text});
     }
 
-    fn skipParenthesizedTokens(self: *@This()) !void {
-        try self.expect(.lparen);
-        var depth: usize = 1;
-        while (self.pos < self.tokens.len and depth > 0) {
-            if (self.match(.lparen) != null) {
-                depth += 1;
-            } else if (self.match(.rparen) != null) {
-                depth -= 1;
-            } else {
-                self.pos += 1;
-            }
-        }
-        if (depth != 0) return error.UnsupportedSqlShape;
-    }
-
     fn parseCtesForPlanAlloc(
         self: *@This(),
         base_table_name: *?[]const u8,
@@ -6453,25 +5935,7 @@ const Parser = struct {
     }
 
     fn parseOptionalCteColumnAliasesAlloc(self: *@This()) ![]const []const u8 {
-        if (self.match(.lparen) == null) return &.{};
-        var aliases = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (aliases.items) |alias| self.alloc.free(alias);
-            aliases.deinit(self.alloc);
-        }
-        while (true) {
-            const alias = try self.parseIdentifierOwned();
-            var alias_transferred = false;
-            errdefer if (!alias_transferred) self.alloc.free(alias);
-            for (aliases.items) |existing| {
-                if (std.ascii.eqlIgnoreCase(existing, alias)) return error.UnsupportedSqlShape;
-            }
-            try aliases.append(self.alloc, alias);
-            alias_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        return try aliases.toOwnedSlice(self.alloc);
+        return try sql_adapter.parseOptionalCteColumnAliasesAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn applyCteColumnAliases(
@@ -10069,24 +9533,8 @@ const Parser = struct {
     }
 
     fn parseTruncateMutationSource(self: *@This()) !LoweredMutationSource {
-        try self.expectKeyword("truncate");
-        _ = self.matchKeyword("table");
-        const table_name = try self.parseSqlTableReferenceIdentifierOwned();
-        errdefer self.alloc.free(table_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        var restart_identity = false;
-        if (self.matchKeyword("restart")) {
-            try self.expectKeyword("identity");
-            restart_identity = true;
-        } else if (self.matchKeyword("continue")) {
-            try self.expectKeyword("identity");
-        } else if (self.matchKeyword("identity")) {
-            return error.UnsupportedSqlShape;
-        }
-        if (self.matchKeyword("cascade")) return error.UnsupportedSqlShape;
-        _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseTruncateMutationSourceSqlAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
 
         var row_claim = try self.mutationRowClaimAlloc(false);
         errdefer if (row_claim.owner_id.len > 0) self.alloc.free(row_claim.owner_id);
@@ -10101,12 +9549,14 @@ const Parser = struct {
         defer self.alloc.free(body_json);
         var mutation = try relational_rows.parseRowsMutationSourceRequest(self.alloc, body_json, self.schema);
         errdefer mutation.deinit(self.alloc);
-        mutation.req.restart_identity = restart_identity;
+        mutation.req.restart_identity = syntax.restart_identity;
 
+        const table_name = syntax.table_name;
+        syntax.table_name = "";
         return .{
             .table_name = table_name,
             .mutation = mutation,
-            .restart_identity = restart_identity,
+            .restart_identity = syntax.restart_identity,
         };
     }
 
@@ -17168,13 +16618,13 @@ const Parser = struct {
         }
         while (true) {
             if (self.nextConflictTargetElementIsUniqueExpression()) {
-                const wrapper_count = self.consumeDdlIndexExpressionWrappers();
+                const wrapper_count = sql_adapter.consumeDdlIndexExpressionWrappers(self.tokens, &self.pos);
                 const expression = try self.parseConflictTargetUniqueExpressionAlloc();
                 var expression_transferred = false;
                 errdefer if (!expression_transferred) self.alloc.free(expression.field);
                 try expressions.append(self.alloc, expression);
                 expression_transferred = true;
-                try self.closeDdlIndexExpressionWrappers(wrapper_count);
+                try sql_adapter.closeDdlIndexExpressionWrappers(self.tokens, &self.pos, wrapper_count);
             } else {
                 const column = try self.parseIdentifierOwned();
                 var column_transferred = false;
@@ -17265,31 +16715,14 @@ const Parser = struct {
     }
 
     fn nextConflictTargetElementIsUniqueExpression(self: *@This()) bool {
-        var pos = self.pos;
-        while (pos < self.tokens.len and self.tokens[pos].kind == .lparen) : (pos += 1) {}
-        if (pos >= self.tokens.len or self.tokens[pos].kind != .identifier) return false;
-        return std.ascii.eqlIgnoreCase(self.tokens[pos].text, "lower") or
-            std.ascii.eqlIgnoreCase(self.tokens[pos].text, "upper") or
-            std.ascii.eqlIgnoreCase(self.tokens[pos].text, "md5");
+        return sql_adapter.peekDdlIndexElementExpression(self.tokens, self.pos, false);
     }
 
     fn parseConflictTargetUniqueExpressionAlloc(self: *@This()) !runtime_schema.UniqueExpression {
-        const op: runtime_schema.UniqueExpressionOp = if (self.matchKeyword("lower"))
-            .lower
-        else if (self.matchKeyword("upper"))
-            .upper
-        else blk: {
-            if (!self.matchMd5FunctionKeyword()) return error.UnsupportedSqlShape;
-            break :blk .md5;
-        };
-        try self.expect(.lparen);
-        const field = try self.parseIdentifierOwned();
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-        if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
-        try self.expect(.rparen);
-        field_transferred = true;
-        return .{ .op = op, .field = field };
+        const expression = try sql_adapter.parseDdlUniqueExpressionAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer self.alloc.free(expression.field);
+        if (relationalColumnForField(self.schema, expression.field, null) == null) return error.InvalidSqlCatalog;
+        return expression;
     }
 
     fn conflictTargetForNamedConstraintAlloc(
@@ -34779,32 +34212,6 @@ fn findDdlColumn(columns: []const runtime_schema.RelationalColumn, name: []const
     return null;
 }
 
-fn ddlBaseTypeForName(name: []const u8) ?runtime_schema.AntflyType {
-    if (std.ascii.eqlIgnoreCase(name, "uuid")) return .keyword;
-    if (std.ascii.eqlIgnoreCase(name, "text")) return .keyword;
-    if (std.ascii.eqlIgnoreCase(name, "varchar")) return .keyword;
-    if (std.ascii.eqlIgnoreCase(name, "citext")) return .keyword;
-    if (std.ascii.eqlIgnoreCase(name, "integer")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "int")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "int4")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "bigint")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "int8")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "smallint")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "numeric")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "decimal")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "real")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "float4")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "float8")) return .numeric;
-    if (std.ascii.eqlIgnoreCase(name, "boolean")) return .boolean;
-    if (std.ascii.eqlIgnoreCase(name, "bool")) return .boolean;
-    if (std.ascii.eqlIgnoreCase(name, "date")) return .datetime;
-    if (std.ascii.eqlIgnoreCase(name, "timestamptz")) return .datetime;
-    if (std.ascii.eqlIgnoreCase(name, "json")) return .json;
-    if (std.ascii.eqlIgnoreCase(name, "jsonb")) return .json;
-    if (std.ascii.eqlIgnoreCase(name, "bytea")) return .blob;
-    return null;
-}
-
 fn ddlRangeBoundTypeForName(name: []const u8) ?runtime_schema.AntflyType {
     if (std.ascii.eqlIgnoreCase(name, "daterange")) return .datetime;
     if (std.ascii.eqlIgnoreCase(name, "tsrange")) return .datetime;
@@ -45660,13 +45067,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer set_public_search_path.deinit(alloc);
     const set_public_search_path_fingerprint = try ddlFingerprintAlloc(alloc, set_public_search_path);
     defer alloc.free(set_public_search_path_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", set_public_search_path_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:set_search_path:namespaces=1:local=false", set_public_search_path_fingerprint);
+
+    var set_tenant_search_path = try lowerDdlPlanAlloc(alloc, "SET search_path TO tenant_schema, public;");
+    defer set_tenant_search_path.deinit(alloc);
+    const set_tenant_search_path_plan = switch (set_tenant_search_path) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var tenant_session = try applySessionCatalogPlanAlloc(alloc, catalog_resources.SqlCatalogSession.default(), set_tenant_search_path_plan);
+    defer tenant_session.deinit(alloc);
+    try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
+    try std.testing.expectEqualStrings("tenant_schema", tenant_session.session().primarySearchPathNamespace());
 
     var reset_session = try lowerDdlPlanAlloc(alloc, "RESET ALL;");
     defer reset_session.deinit(alloc);
     const reset_session_fingerprint = try ddlFingerprintAlloc(alloc, reset_session);
     defer alloc.free(reset_session_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", reset_session_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:discard_all", reset_session_fingerprint);
 
     var reset_client_min_messages = try lowerDdlPlanAlloc(alloc, "RESET client_min_messages;");
     defer reset_client_min_messages.deinit(alloc);
@@ -45678,15 +45096,14 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer show_session.deinit(alloc);
     const show_session_fingerprint = try ddlFingerprintAlloc(alloc, show_session);
     defer alloc.free(show_session_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", show_session_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:show_search_path", show_session_fingerprint);
 
     var discard_session = try lowerDdlPlanAlloc(alloc, "DISCARD ALL;");
     defer discard_session.deinit(alloc);
     const discard_session_fingerprint = try ddlFingerprintAlloc(alloc, discard_session);
     defer alloc.free(discard_session_fingerprint);
-    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=session_setting", discard_session_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:discard_all", discard_session_fingerprint);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET search_path TO tenant_schema;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET ROLE app_user;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET row_security = off;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "SET LOCAL lock_timeout = '5s';"));
@@ -55027,19 +54444,6 @@ fn expectAppParityReturningRows(expected: []const []const u8, actual: []const []
     }
 }
 
-fn unsupportedFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    family: []const u8,
-    reason: []const u8,
-) ![]u8 {
-    const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
-    const unsupported_family = std.meta.stringToEnum(sql_adapter.UnsupportedPlanFamily, family) orelse return error.TestUnexpectedResult;
-    return sql_adapter.unsupportedFingerprintAlloc(alloc, unsupported_family, diagnostic_reason) catch |err| switch (err) {
-        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
-        else => return err,
-    };
-}
-
 fn adapterNoopFingerprintAlloc(
     alloc: std.mem.Allocator,
     family: []const u8,
@@ -55803,6 +55207,12 @@ fn transactionDeferrableName(deferrable: ?bool) []const u8 {
 fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 {
     return switch (lowered) {
         .adapter_noop => |plan| try adapterNoopFingerprintAlloc(alloc, "ddl", @tagName(plan.reason)),
+        .session_catalog => |plan| switch (plan) {
+            .set_search_path => |set| try std.fmt.allocPrint(alloc, "ddl:session:set_search_path:namespaces={d}:local={}", .{ set.namespaces.len, set.local }),
+            .reset_search_path => try alloc.dupe(u8, "ddl:session:reset_search_path"),
+            .show_search_path => try alloc.dupe(u8, "ddl:session:show_search_path"),
+            .discard_all => try alloc.dupe(u8, "ddl:session:discard_all"),
+        },
         .create_table => |plan| blk: {
             var fingerprint = if (plan.periods.len > 0) temporal: {
                 break :temporal try std.fmt.allocPrint(
@@ -56733,7 +56143,7 @@ fn expectAppliedDdlCorpusPlan(
 ) !void {
     if (entry.applied_plan.len == 0) return;
 
-    var current_schema_json: []const u8 = if (try appParityDdlFixtureAppliesFromEmptyCatalog(entry)) "" else base_schema_json;
+    var current_schema_json: []const u8 = if (try sql_adapter.corpusDdlFixtureAppliesFromEmptyCatalog(entry)) "" else base_schema_json;
     var owned_current_schema_json: ?[]u8 = null;
     defer if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
 
@@ -56851,6 +56261,12 @@ fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !voi
     const expected = summary.ddl_tag orelse return;
     switch (lowered) {
         .adapter_noop => return error.TestUnexpectedResult,
+        .session_catalog => |plan| switch (plan) {
+            .set_search_path => try std.testing.expectEqual(AppParityDdlTag.set_search_path, expected),
+            .reset_search_path => try std.testing.expectEqual(AppParityDdlTag.reset_search_path, expected),
+            .show_search_path => try std.testing.expectEqual(AppParityDdlTag.show_search_path, expected),
+            .discard_all => try std.testing.expectEqual(AppParityDdlTag.discard_all, expected),
+        },
         .create_table => |plan| {
             try std.testing.expectEqual(AppParityDdlTag.create_table, expected);
             try expectOptionalTableName(summary.table_name, plan.table_name);
@@ -58611,27 +58027,6 @@ fn appParityPlanFamilyIsSupportedWrite(family: AppParityCorpusPlanFamily) bool {
     };
 }
 
-fn appParityUnsupportedFingerprintFamily(family: AppParityCorpusPlanFamily) ?[]const u8 {
-    return switch (family) {
-        .unsupported => "query",
-        .unsupported_read => "read",
-        .unsupported_ddl => "ddl",
-        .unsupported_write => "write",
-        .unsupported_insert => "insert",
-        .unsupported_update => "update",
-        .unsupported_update_source => "update_source",
-        .unsupported_delete => "delete",
-        .unsupported_update_joined_source => "update_joined_source",
-        .unsupported_delete_joined_source => "delete_joined_source",
-        .unsupported_merge_mutation => "merge_mutation",
-        else => null,
-    };
-}
-
-fn appParityPlanFamilyIsUnsupported(family: AppParityCorpusPlanFamily) bool {
-    return appParityUnsupportedFingerprintFamily(family) != null;
-}
-
 fn expectAppParityUnsupportedPlanEntry(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
@@ -58654,8 +58049,12 @@ fn expectAppParityUnsupportedPlanEntry(
         else => return error.TestUnexpectedResult,
     }
 
-    const fingerprint_family = appParityUnsupportedFingerprintFamily(entry.family) orelse return error.TestUnexpectedResult;
-    const fingerprint = try unsupportedFingerprintAlloc(alloc, fingerprint_family, entry.classification_reason);
+    const fingerprint_family = sql_adapter.corpusUnsupportedPlanFamily(entry.family) orelse return error.TestUnexpectedResult;
+    const diagnostic_reason = sql_adapter.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
+    const fingerprint = sql_adapter.unsupportedFingerprintAlloc(alloc, fingerprint_family, diagnostic_reason) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
+        else => return err,
+    };
     defer alloc.free(fingerprint);
     try expectAppParityPlan(entry.plan, fingerprint);
 }
@@ -58695,7 +58094,7 @@ fn expectAppParityCorpusEntry(
     if (appParityPlanFamilyIsSupportedWrite(entry.family)) {
         return try expectAppParityWritePlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
     }
-    if (appParityPlanFamilyIsUnsupported(entry.family)) {
+    if (sql_adapter.corpusPlanFamilyIsUnsupported(entry.family)) {
         return try expectAppParityUnsupportedPlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
     }
 
@@ -58792,403 +58191,12 @@ fn expectAppParityCorpusEntry(
     }
 }
 
-fn appParityJsonObject(value: std.json.Value) !std.json.ObjectMap {
-    return switch (value) {
-        .object => |object| object,
-        else => error.TestUnexpectedResult,
-    };
-}
-
-fn appParityStringIn(field: []const u8, allowed: []const []const u8) bool {
-    for (allowed) |item| {
-        if (std.mem.eql(u8, field, item)) return true;
-    }
-    return false;
-}
-
-fn appParityRequireOnlyKeys(object: std.json.ObjectMap, allowed: []const []const u8) !void {
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        if (!appParityStringIn(entry.key_ptr.*, allowed)) return error.TestUnexpectedResult;
-    }
-}
-
-fn appParityJsonString(value: std.json.Value) ![]const u8 {
-    return switch (value) {
-        .string => |text| text,
-        else => error.TestUnexpectedResult,
-    };
-}
-
-fn appParityJsonOptionalString(object: std.json.ObjectMap, field: []const u8, default: []const u8) ![]const u8 {
-    return if (object.get(field)) |value| try appParityJsonString(value) else default;
-}
-
-fn appParityJsonOptionalStringField(object: std.json.ObjectMap, field: []const u8) !?[]const u8 {
-    return if (object.get(field)) |value| try appParityJsonString(value) else null;
-}
-
-fn appParityJsonOptionalBool(object: std.json.ObjectMap, field: []const u8) !?bool {
-    const value = object.get(field) orelse return null;
-    return switch (value) {
-        .bool => |flag| flag,
-        else => error.TestUnexpectedResult,
-    };
-}
-
-fn appParityJsonOptionalUsize(object: std.json.ObjectMap, field: []const u8) !?usize {
-    const value = object.get(field) orelse return null;
-    return switch (value) {
-        .integer => |number| if (number >= 0) @intCast(number) else error.TestUnexpectedResult,
-        else => error.TestUnexpectedResult,
-    };
-}
-
-fn appParityJsonOptionalU32(object: std.json.ObjectMap, field: []const u8) !?u32 {
-    const value = object.get(field) orelse return null;
-    return switch (value) {
-        .integer => |number| if (number >= 0 and number <= std.math.maxInt(u32)) @intCast(number) else error.TestUnexpectedResult,
-        else => error.TestUnexpectedResult,
-    };
-}
-
-fn appParityJsonOptionalU64(object: std.json.ObjectMap, field: []const u8, default: u64) !u64 {
-    const value = object.get(field) orelse return default;
-    return switch (value) {
-        .integer => |number| if (number >= 0) @intCast(number) else error.TestUnexpectedResult,
-        else => error.TestUnexpectedResult,
-    };
-}
-
-fn parseAppParityFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
-    if (value == null) return .{};
-    const object = try appParityJsonObject(value.?);
-    try appParityRequireOnlyKeys(object, &.{
-        "ddl_tag",
-        "table_name",
-        "ctes",
-        "predicates",
-        "array_any",
-        "in_predicates",
-        "json_path_eq",
-        "json_contains",
-        "json_path_exists",
-        "array_contains",
-        "array_eq",
-        "text_patterns",
-        "access_or_predicates",
-        "access_not_predicates",
-        "expression_predicates",
-        "expression_or_predicates",
-        "expression_not_predicates",
-        "expression_array_contains",
-        "select",
-        "select_all",
-        "distinct_on",
-        "order_by",
-        "limit",
-        "offset",
-        "right_offset",
-        "group_by",
-        "group_expressions",
-        "aggregations",
-        "filter_groups",
-        "having",
-        "having_expressions",
-        "having_any",
-        "having_not",
-        "operations",
-        "source_assignments",
-        "patch_expressions",
-        "increment_expressions",
-        "json_set_expressions",
-        "returning",
-        "returning_all",
-        "conflict_where",
-        "join_on",
-        "matched_predicates",
-        "matched_delete",
-        "matched_do_nothing",
-        "not_matched_predicates",
-        "not_matched_do_nothing",
-        "join_select",
-        "lateral_correlations",
-        "windows",
-        "row_claim_skip_locked",
-        "temporal_periods",
-        "temporal_primary_key",
-        "temporal_unique",
-        "temporal_foreign_keys",
-    });
-    return .{
-        .ddl_tag = if (object.get("ddl_tag")) |tag_value| std.meta.stringToEnum(AppParityDdlTag, try appParityJsonString(tag_value)) orelse return error.TestUnexpectedResult else null,
-        .table_name = try appParityJsonOptionalStringField(object, "table_name"),
-        .ctes = try appParityJsonOptionalUsize(object, "ctes"),
-        .predicates = try appParityJsonOptionalUsize(object, "predicates"),
-        .array_any = try appParityJsonOptionalUsize(object, "array_any"),
-        .in_predicates = try appParityJsonOptionalUsize(object, "in_predicates"),
-        .json_path_eq = try appParityJsonOptionalUsize(object, "json_path_eq"),
-        .json_contains = try appParityJsonOptionalUsize(object, "json_contains"),
-        .json_path_exists = try appParityJsonOptionalUsize(object, "json_path_exists"),
-        .array_contains = try appParityJsonOptionalUsize(object, "array_contains"),
-        .array_eq = try appParityJsonOptionalUsize(object, "array_eq"),
-        .text_patterns = try appParityJsonOptionalUsize(object, "text_patterns"),
-        .access_or_predicates = try appParityJsonOptionalUsize(object, "access_or_predicates"),
-        .access_not_predicates = try appParityJsonOptionalUsize(object, "access_not_predicates"),
-        .expression_predicates = try appParityJsonOptionalUsize(object, "expression_predicates"),
-        .expression_or_predicates = try appParityJsonOptionalUsize(object, "expression_or_predicates"),
-        .expression_not_predicates = try appParityJsonOptionalUsize(object, "expression_not_predicates"),
-        .expression_array_contains = try appParityJsonOptionalUsize(object, "expression_array_contains"),
-        .select = try appParityJsonOptionalUsize(object, "select"),
-        .select_all = try appParityJsonOptionalBool(object, "select_all"),
-        .distinct_on = try appParityJsonOptionalUsize(object, "distinct_on"),
-        .order_by = try appParityJsonOptionalUsize(object, "order_by"),
-        .limit = try appParityJsonOptionalU32(object, "limit"),
-        .offset = try appParityJsonOptionalU32(object, "offset"),
-        .right_offset = try appParityJsonOptionalU32(object, "right_offset"),
-        .group_by = try appParityJsonOptionalUsize(object, "group_by"),
-        .group_expressions = try appParityJsonOptionalUsize(object, "group_expressions"),
-        .aggregations = try appParityJsonOptionalUsize(object, "aggregations"),
-        .filter_groups = try appParityJsonOptionalUsize(object, "filter_groups"),
-        .having = try appParityJsonOptionalUsize(object, "having"),
-        .having_expressions = try appParityJsonOptionalUsize(object, "having_expressions"),
-        .having_any = try appParityJsonOptionalUsize(object, "having_any"),
-        .having_not = try appParityJsonOptionalUsize(object, "having_not"),
-        .operations = try appParityJsonOptionalUsize(object, "operations"),
-        .source_assignments = try appParityJsonOptionalUsize(object, "source_assignments"),
-        .patch_expressions = try appParityJsonOptionalUsize(object, "patch_expressions"),
-        .increment_expressions = try appParityJsonOptionalUsize(object, "increment_expressions"),
-        .json_set_expressions = try appParityJsonOptionalUsize(object, "json_set_expressions"),
-        .returning = try appParityJsonOptionalUsize(object, "returning"),
-        .returning_all = try appParityJsonOptionalBool(object, "returning_all"),
-        .conflict_where = try appParityJsonOptionalBool(object, "conflict_where"),
-        .join_on = try appParityJsonOptionalUsize(object, "join_on"),
-        .matched_predicates = try appParityJsonOptionalUsize(object, "matched_predicates"),
-        .matched_delete = try appParityJsonOptionalBool(object, "matched_delete"),
-        .matched_do_nothing = try appParityJsonOptionalBool(object, "matched_do_nothing"),
-        .not_matched_predicates = try appParityJsonOptionalUsize(object, "not_matched_predicates"),
-        .not_matched_do_nothing = try appParityJsonOptionalBool(object, "not_matched_do_nothing"),
-        .join_select = try appParityJsonOptionalUsize(object, "join_select"),
-        .lateral_correlations = try appParityJsonOptionalUsize(object, "lateral_correlations"),
-        .windows = try appParityJsonOptionalUsize(object, "windows"),
-        .row_claim_skip_locked = try appParityJsonOptionalBool(object, "row_claim_skip_locked"),
-        .temporal_periods = try appParityJsonOptionalUsize(object, "temporal_periods"),
-        .temporal_primary_key = try appParityJsonOptionalBool(object, "temporal_primary_key"),
-        .temporal_unique = try appParityJsonOptionalUsize(object, "temporal_unique"),
-        .temporal_foreign_keys = try appParityJsonOptionalUsize(object, "temporal_foreign_keys"),
-    };
-}
-
-fn appParitySummaryHasFields(summary: AppParityPlanSummary) bool {
-    return summary.ddl_tag != null or
-        summary.table_name != null or
-        summary.ctes != null or
-        summary.predicates != null or
-        summary.array_any != null or
-        summary.in_predicates != null or
-        summary.json_path_eq != null or
-        summary.json_contains != null or
-        summary.json_path_exists != null or
-        summary.array_contains != null or
-        summary.array_eq != null or
-        summary.text_patterns != null or
-        summary.access_or_predicates != null or
-        summary.access_not_predicates != null or
-        summary.expression_predicates != null or
-        summary.expression_or_predicates != null or
-        summary.expression_not_predicates != null or
-        summary.expression_array_contains != null or
-        summary.select != null or
-        summary.select_all != null or
-        summary.distinct_on != null or
-        summary.order_by != null or
-        summary.limit != null or
-        summary.offset != null or
-        summary.right_offset != null or
-        summary.group_by != null or
-        summary.group_expressions != null or
-        summary.aggregations != null or
-        summary.filter_groups != null or
-        summary.having != null or
-        summary.having_expressions != null or
-        summary.having_any != null or
-        summary.having_not != null or
-        summary.operations != null or
-        summary.source_assignments != null or
-        summary.patch_expressions != null or
-        summary.increment_expressions != null or
-        summary.json_set_expressions != null or
-        summary.returning != null or
-        summary.returning_all != null or
-        summary.conflict_where != null or
-        summary.join_on != null or
-        summary.matched_predicates != null or
-        summary.matched_delete != null or
-        summary.matched_do_nothing != null or
-        summary.not_matched_predicates != null or
-        summary.not_matched_do_nothing != null or
-        summary.join_select != null or
-        summary.lateral_correlations != null or
-        summary.windows != null or
-        summary.row_claim_skip_locked != null or
-        summary.temporal_periods != null or
-        summary.temporal_primary_key != null or
-        summary.temporal_unique != null or
-        summary.temporal_foreign_keys != null;
-}
-
-fn appParitySummaryHasNonTableFields(summary: AppParityPlanSummary) bool {
-    var without_table = summary;
-    without_table.table_name = null;
-    return appParitySummaryHasFields(without_table);
-}
-
-fn appParityWriteObjectComma(writer: anytype, first: *bool) !void {
-    if (first.*) {
-        first.* = false;
-    } else {
-        try writer.writeAll(",\n");
-    }
-}
-
-fn appParityWriteStringField(writer: anytype, first: *bool, indent: []const u8, name: []const u8, value: []const u8) !void {
-    try appParityWriteObjectComma(writer, first);
-    try writer.print("{s}{f}: {f}", .{ indent, std.json.fmt(name, .{}), std.json.fmt(value, .{}) });
-}
-
-fn appParityWriteBoolField(writer: anytype, first: *bool, indent: []const u8, name: []const u8, value: bool) !void {
-    try appParityWriteObjectComma(writer, first);
-    try writer.print("{s}{f}: {}", .{ indent, std.json.fmt(name, .{}), value });
-}
-
-fn appParityWriteU64Field(writer: anytype, first: *bool, indent: []const u8, name: []const u8, value: u64) !void {
-    try appParityWriteObjectComma(writer, first);
-    try writer.print("{s}{f}: {d}", .{ indent, std.json.fmt(name, .{}), value });
-}
-
-fn appParityWriteUsizeSummaryField(writer: anytype, first: *bool, name: []const u8, value: ?usize) !void {
-    if (value) |actual| {
-        try appParityWriteObjectComma(writer, first);
-        try writer.print("        {f}: {d}", .{ std.json.fmt(name, .{}), actual });
-    }
-}
-
-fn appParityWriteU32SummaryField(writer: anytype, first: *bool, name: []const u8, value: ?u32) !void {
-    if (value) |actual| {
-        try appParityWriteObjectComma(writer, first);
-        try writer.print("        {f}: {d}", .{ std.json.fmt(name, .{}), actual });
-    }
-}
-
-fn appParityWriteBoolSummaryField(writer: anytype, first: *bool, name: []const u8, value: ?bool) !void {
-    if (value) |actual| {
-        try appParityWriteObjectComma(writer, first);
-        try writer.print("        {f}: {}", .{ std.json.fmt(name, .{}), actual });
-    }
-}
-
-fn appParityWriteStringListField(writer: anytype, first: *bool, indent: []const u8, name: []const u8, values: []const []const u8) !void {
-    if (values.len == 0) return;
-    try appParityWriteObjectComma(writer, first);
-    try writer.print("{s}{f}: [", .{ indent, std.json.fmt(name, .{}) });
-    for (values, 0..) |value, i| {
-        if (i > 0) try writer.writeAll(", ");
-        try writer.print("{f}", .{std.json.fmt(value, .{})});
-    }
-    try writer.writeByte(']');
-}
-
-fn appParityWriteSqlValue(writer: anytype, value: SqlValue) !void {
-    switch (value) {
-        .null => try writer.writeAll("{\"null\": true}"),
-        .bool => |actual| try writer.print("{{\"bool\": {}}}", .{actual}),
-        .integer => |actual| try writer.print("{{\"integer\": {d}}}", .{actual}),
-        .float => |actual| try writer.print("{{\"float\": {d}}}", .{actual}),
-        .string => |actual| try writer.print("{{\"string\": {f}}}", .{std.json.fmt(actual, .{})}),
-        .json => |actual| try writer.print("{{\"json\": {f}}}", .{std.json.fmt(actual, .{})}),
-    }
-}
-
-fn appParityWriteParamsField(writer: anytype, first: *bool, indent: []const u8, params: []const SqlValue) !void {
-    if (params.len == 0) return;
-    try appParityWriteObjectComma(writer, first);
-    try writer.print("{s}\"params\": [", .{indent});
-    for (params, 0..) |param, i| {
-        if (i > 0) try writer.writeAll(", ");
-        try appParityWriteSqlValue(writer, param);
-    }
-    try writer.writeByte(']');
-}
-
-fn appParityWriteSummaryField(writer: anytype, first: *bool, summary: AppParityPlanSummary) !void {
-    if (!appParitySummaryHasFields(summary)) return;
-    try appParityWriteObjectComma(writer, first);
-    try writer.writeAll("      \"summary\": {\n");
-    var summary_first = true;
-    if (summary.ddl_tag) |tag| try appParityWriteStringField(writer, &summary_first, "        ", "ddl_tag", @tagName(tag));
-    if (summary.table_name) |table_name| try appParityWriteStringField(writer, &summary_first, "        ", "table_name", table_name);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "ctes", summary.ctes);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "predicates", summary.predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "array_any", summary.array_any);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "in_predicates", summary.in_predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "json_path_eq", summary.json_path_eq);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "json_contains", summary.json_contains);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "json_path_exists", summary.json_path_exists);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "array_contains", summary.array_contains);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "array_eq", summary.array_eq);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "text_patterns", summary.text_patterns);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "access_or_predicates", summary.access_or_predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "access_not_predicates", summary.access_not_predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "expression_predicates", summary.expression_predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "expression_or_predicates", summary.expression_or_predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "expression_not_predicates", summary.expression_not_predicates);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "expression_array_contains", summary.expression_array_contains);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "select", summary.select);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "select_all", summary.select_all);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "distinct_on", summary.distinct_on);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "order_by", summary.order_by);
-    try appParityWriteU32SummaryField(writer, &summary_first, "limit", summary.limit);
-    try appParityWriteU32SummaryField(writer, &summary_first, "offset", summary.offset);
-    try appParityWriteU32SummaryField(writer, &summary_first, "right_offset", summary.right_offset);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "group_by", summary.group_by);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "group_expressions", summary.group_expressions);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "aggregations", summary.aggregations);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "filter_groups", summary.filter_groups);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "having", summary.having);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "having_expressions", summary.having_expressions);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "having_any", summary.having_any);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "having_not", summary.having_not);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "operations", summary.operations);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "source_assignments", summary.source_assignments);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "patch_expressions", summary.patch_expressions);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "increment_expressions", summary.increment_expressions);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "json_set_expressions", summary.json_set_expressions);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "returning", summary.returning);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "returning_all", summary.returning_all);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "conflict_where", summary.conflict_where);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "join_on", summary.join_on);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "matched_predicates", summary.matched_predicates);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "matched_delete", summary.matched_delete);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "matched_do_nothing", summary.matched_do_nothing);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "not_matched_predicates", summary.not_matched_predicates);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "not_matched_do_nothing", summary.not_matched_do_nothing);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "join_select", summary.join_select);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "lateral_correlations", summary.lateral_correlations);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "windows", summary.windows);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "row_claim_skip_locked", summary.row_claim_skip_locked);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "temporal_periods", summary.temporal_periods);
-    try appParityWriteBoolSummaryField(writer, &summary_first, "temporal_primary_key", summary.temporal_primary_key);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "temporal_unique", summary.temporal_unique);
-    try appParityWriteUsizeSummaryField(writer, &summary_first, "temporal_foreign_keys", summary.temporal_foreign_keys);
-    try writer.writeAll("\n      }");
-}
-
 fn appParityAppliedDdlPlanAlloc(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
     entry: AppParityCorpusEntry,
 ) ![]u8 {
-    var current_schema_json: []const u8 = if (try appParityDdlFixtureAppliesFromEmptyCatalog(entry)) "" else base_schema_json;
+    var current_schema_json: []const u8 = if (try sql_adapter.corpusDdlFixtureAppliesFromEmptyCatalog(entry)) "" else base_schema_json;
     var owned_current_schema_json: ?[]u8 = null;
     defer if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
 
@@ -59209,90 +58217,41 @@ fn appParityAppliedDdlPlanAlloc(
     return try ddlAppliedFingerprintAlloc(alloc, applied);
 }
 
-const app_parity_fixture_format: u64 = 1;
-
 fn appParityFixtureJsonAlloc(
     alloc: std.mem.Allocator,
     schema_json: []const u8,
     corpus: []const AppParityCorpusEntry,
 ) ![]u8 {
-    var entries_out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer entries_out.deinit();
-    const entries_writer = &entries_out.writer;
-    var skipped_out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer skipped_out.deinit();
-    const skipped_writer = &skipped_out.writer;
-    var written_entries: usize = 0;
-    var skipped_entries: usize = 0;
+    var entries = std.ArrayListUnmanaged(sql_adapter.AppParityFixtureEncodedEntry).empty;
+    defer entries.deinit(alloc);
+    var skipped_entries = std.ArrayListUnmanaged([]const u8).empty;
+    defer skipped_entries.deinit(alloc);
+    var owned_applied_plans = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_applied_plans.items) |applied_plan| alloc.free(applied_plan);
+        owned_applied_plans.deinit(alloc);
+    }
+
     for (corpus) |entry| {
-        var derived_applied_plan: ?[]u8 = null;
-        defer if (derived_applied_plan) |applied_plan| alloc.free(applied_plan);
-        const applied_plan = if (entry.applied_plan.len > 0)
-            entry.applied_plan
-        else if (try appParityDdlFixtureRequiresAppliedPlan(entry)) applied: {
-            derived_applied_plan = appParityAppliedDdlPlanAlloc(alloc, schema_json, entry) catch |err| switch (err) {
+        var applied_plan = entry.applied_plan;
+        if (applied_plan.len == 0 and try sql_adapter.corpusDdlFixtureRequiresAppliedPlan(entry)) {
+            const derived_applied_plan = appParityAppliedDdlPlanAlloc(alloc, schema_json, entry) catch |err| switch (err) {
                 error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
-                    if (skipped_entries > 0) try skipped_writer.writeByte(',');
-                    skipped_entries += 1;
-                    try skipped_writer.writeAll("\n    ");
-                    try skipped_writer.print("{f}", .{std.json.fmt(entry.name, .{})});
+                    try skipped_entries.append(alloc, entry.name);
                     continue;
                 },
                 else => return err,
             };
-            break :applied derived_applied_plan.?;
-        } else "";
+            try owned_applied_plans.append(alloc, derived_applied_plan);
+            applied_plan = derived_applied_plan;
+        }
 
-        if (written_entries > 0) try entries_writer.writeByte(',');
-        written_entries += 1;
-        try entries_writer.writeAll("\n    {\n");
-        var first = true;
-        try appParityWriteStringField(entries_writer, &first, "      ", "name", entry.name);
-        try appParityWriteStringField(entries_writer, &first, "      ", "family", @tagName(entry.family));
-        try appParityWriteSummaryField(entries_writer, &first, entry.summary);
-        try appParityWriteStringField(entries_writer, &first, "      ", "plan", entry.plan);
-        if (entry.classification_reason.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "classification_reason", entry.classification_reason);
-        try appParityWriteStringListField(entries_writer, &first, "      ", "apply_setup_sql", entry.apply_setup_sql);
-        try appParityWriteStringListField(entries_writer, &first, "      ", "returning_rows", entry.returning_rows);
-        if (applied_plan.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "applied_plan", applied_plan);
-        if (entry.resolver_row_json.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "resolver_row_json", entry.resolver_row_json);
-        if (entry.resolver_version != 0) try appParityWriteU64Field(entries_writer, &first, "      ", "resolver_version", entry.resolver_version);
-        if (entry.resolver_exists) |exists| try appParityWriteBoolField(entries_writer, &first, "      ", "resolver_exists", exists);
-        if (entry.source_schema_json.len > 0) try appParityWriteStringField(entries_writer, &first, "      ", "source_schema_json", entry.source_schema_json);
-        try appParityWriteParamsField(entries_writer, &first, "      ", entry.params);
-        try appParityWriteStringField(entries_writer, &first, "      ", "sql", entry.sql);
-        try entries_writer.writeAll("\n    }");
+        try entries.append(alloc, .{
+            .entry = entry,
+            .applied_plan = applied_plan,
+        });
     }
-    const entries_json = try entries_out.toOwnedSlice();
-    defer alloc.free(entries_json);
-    const skipped_json = try skipped_out.toOwnedSlice();
-    defer alloc.free(skipped_json);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.print(
-        "{{\n  \"fixture_format\": {},\n  \"source_entry_count\": {},\n  \"entry_count\": {},\n  \"skipped_entries\": [",
-        .{ app_parity_fixture_format, corpus.len, written_entries },
-    );
-    try writer.writeAll(skipped_json);
-    try writer.print(
-        "\n  ],\n  \"schema_json\": {f},\n  \"entries\": [",
-        .{std.json.fmt(schema_json, .{})},
-    );
-    try writer.writeAll(entries_json);
-    try writer.writeAll("\n  ]\n}\n");
-    return try out.toOwnedSlice();
-}
-
-fn appParityFixtureEnvPath(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
-    const view = std.testing.environ.block.view();
-    for (view.slice) |entry| {
-        const text = std.mem.span(entry);
-        const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
-        if (std.mem.eql(u8, text[0..eq], name)) return try alloc.dupe(u8, text[eq + 1 ..]);
-    }
-    return null;
+    return try sql_adapter.fixtureJsonAlloc(alloc, schema_json, corpus.len, entries.items, skipped_entries.items);
 }
 
 fn maybeCheckOrPromoteAppParityFixture(
@@ -59300,1313 +58259,13 @@ fn maybeCheckOrPromoteAppParityFixture(
     schema_json: []const u8,
     corpus: []const AppParityCorpusEntry,
 ) !void {
-    const promote_path = try appParityFixtureEnvPath(alloc, "ANTFLY_SQL_API_PARITY_FIXTURE_PROMOTE");
-    defer if (promote_path) |path| alloc.free(path);
-    const check_path = try appParityFixtureEnvPath(alloc, "ANTFLY_SQL_API_PARITY_FIXTURE_CHECK");
-    defer if (check_path) |path| alloc.free(path);
-    if (promote_path != null and check_path != null) return error.TestUnexpectedResult;
-    const path = promote_path orelse check_path orelse return;
+    const mode = try sql_adapter.fixtureGateModeFromEnvAlloc(alloc);
+    defer sql_adapter.freeFixtureGateMode(alloc, mode);
+    if (mode == .none) return;
 
     const encoded = try appParityFixtureJsonAlloc(alloc, schema_json, corpus);
     defer alloc.free(encoded);
-
-    if (check_path != null) {
-        const existing = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(encoded.len + 1));
-        defer alloc.free(existing);
-        if (!std.mem.eql(u8, existing, encoded)) {
-            std.debug.print("SQL/API parity fixture is stale: {s}\nrun `zig build sql-api-parity-fixture-promote` from zig/\n", .{path});
-            return error.TestUnexpectedResult;
-        }
-        return;
-    }
-
-    var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
-    defer file.close(std.testing.io);
-
-    var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &file_buf);
-    try writer.interface.writeAll(encoded);
-    try writer.end();
-}
-
-fn parseAppParityFixtureStringListAlloc(
-    alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-    field: []const u8,
-) ![]const []const u8 {
-    const value = object.get(field) orelse return &.{};
-    const array = switch (value) {
-        .array => |items| items,
-        else => return error.TestUnexpectedResult,
-    };
-    var strings = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer strings.deinit(alloc);
-    for (array.items) |item| {
-        try strings.append(alloc, try appParityJsonString(item));
-    }
-    return try strings.toOwnedSlice(alloc);
-}
-
-fn parseAppParityFixtureSqlValue(value: std.json.Value) !SqlValue {
-    const object = try appParityJsonObject(value);
-    try appParityRequireOnlyKeys(object, &.{ "null", "bool", "integer", "float", "string", "json" });
-    var it = object.iterator();
-    const entry = it.next() orelse return error.TestUnexpectedResult;
-    if (it.next() != null) return error.TestUnexpectedResult;
-    if (std.mem.eql(u8, entry.key_ptr.*, "null")) return .null;
-    if (std.mem.eql(u8, entry.key_ptr.*, "bool")) {
-        return switch (entry.value_ptr.*) {
-            .bool => |flag| .{ .bool = flag },
-            else => error.TestUnexpectedResult,
-        };
-    }
-    if (std.mem.eql(u8, entry.key_ptr.*, "integer")) {
-        return switch (entry.value_ptr.*) {
-            .integer => |number| .{ .integer = number },
-            else => error.TestUnexpectedResult,
-        };
-    }
-    if (std.mem.eql(u8, entry.key_ptr.*, "float")) {
-        return switch (entry.value_ptr.*) {
-            .integer => |number| .{ .float = @floatFromInt(number) },
-            .float => |number| .{ .float = number },
-            else => error.TestUnexpectedResult,
-        };
-    }
-    if (std.mem.eql(u8, entry.key_ptr.*, "string")) {
-        return .{ .string = try appParityJsonString(entry.value_ptr.*) };
-    }
-    if (std.mem.eql(u8, entry.key_ptr.*, "json")) {
-        return .{ .json = try appParityJsonString(entry.value_ptr.*) };
-    }
-    return error.TestUnexpectedResult;
-}
-
-fn parseAppParityFixtureSqlValuesAlloc(
-    alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-) ![]const SqlValue {
-    const value = object.get("params") orelse return &.{};
-    const array = switch (value) {
-        .array => |items| items,
-        else => return error.TestUnexpectedResult,
-    };
-    var params = std.ArrayListUnmanaged(SqlValue).empty;
-    errdefer params.deinit(alloc);
-    for (array.items) |item| {
-        try params.append(alloc, try parseAppParityFixtureSqlValue(item));
-    }
-    return try params.toOwnedSlice(alloc);
-}
-
-fn parseAppParityFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !AppParityCorpusEntry {
-    const object = try appParityJsonObject(value);
-    try appParityRequireOnlyKeys(object, &.{
-        "name",
-        "sql",
-        "family",
-        "params",
-        "summary",
-        "plan",
-        "classification_reason",
-        "apply_setup_sql",
-        "returning_rows",
-        "applied_plan",
-        "resolver_row_json",
-        "resolver_version",
-        "resolver_exists",
-        "source_schema_json",
-    });
-    const family_text = try appParityJsonString(object.get("family") orelse return error.TestUnexpectedResult);
-    const family = std.meta.stringToEnum(AppParityCorpusPlanFamily, family_text) orelse return error.TestUnexpectedResult;
-    const plan = try appParityJsonOptionalString(object, "plan", "");
-    const summary = normalizeAppParityFixtureSummary(
-        family,
-        plan,
-        try parseAppParityFixtureSummary(object.get("summary")),
-    );
-    return .{
-        .name = try appParityJsonString(object.get("name") orelse return error.TestUnexpectedResult),
-        .sql = try appParityJsonString(object.get("sql") orelse return error.TestUnexpectedResult),
-        .family = family,
-        .params = try parseAppParityFixtureSqlValuesAlloc(alloc, object),
-        .summary = summary,
-        .plan = plan,
-        .classification_reason = try appParityJsonOptionalString(object, "classification_reason", ""),
-        .apply_setup_sql = try parseAppParityFixtureStringListAlloc(alloc, object, "apply_setup_sql"),
-        .returning_rows = try parseAppParityFixtureStringListAlloc(alloc, object, "returning_rows"),
-        .applied_plan = try appParityJsonOptionalString(object, "applied_plan", ""),
-        .resolver_row_json = try appParityJsonOptionalString(object, "resolver_row_json", ""),
-        .resolver_version = try appParityJsonOptionalU64(object, "resolver_version", 0),
-        .resolver_exists = try appParityJsonOptionalBool(object, "resolver_exists"),
-        .source_schema_json = try appParityJsonOptionalString(object, "source_schema_json", ""),
-    };
-}
-
-fn normalizeAppParityFixtureSummary(
-    family: AppParityCorpusPlanFamily,
-    plan: []const u8,
-    summary: AppParityPlanSummary,
-) AppParityPlanSummary {
-    var normalized = summary;
-    if (family == .update_joined_source and
-        normalized.source_assignments == null and
-        normalized.patch_expressions != null and
-        appParityPlanHasNonZeroToken(plan, ":source_assignments=") and
-        !appParityPlanHasNonZeroToken(plan, ":patch_expr="))
-    {
-        normalized.source_assignments = normalized.patch_expressions;
-        normalized.patch_expressions = null;
-    }
-    return normalized;
-}
-
-fn freeAppParityFixtureEntry(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) void {
-    if (entry.params.len > 0) alloc.free(entry.params);
-    if (entry.apply_setup_sql.len > 0) alloc.free(entry.apply_setup_sql);
-    if (entry.returning_rows.len > 0) alloc.free(entry.returning_rows);
-}
-
-fn appParityFixtureFamilyNeedsReason(family: AppParityCorpusPlanFamily) bool {
-    return family == .adapter_noop_ddl or appParityPlanFamilyIsUnsupported(family);
-}
-
-fn appParityStableReasonToken(reason: []const u8) bool {
-    return sql_adapter.classificationReasonTokenIsKnown(reason);
-}
-
-fn appParityPlanMatchesReason(
-    family: AppParityCorpusPlanFamily,
-    plan: []const u8,
-    reason: []const u8,
-) bool {
-    const diagnostic_reason = sql_adapter.classificationReasonFromToken(reason) orelse return false;
-    switch (family) {
-        .adapter_noop_ddl => return sql_adapter.adapterNoopPlanMatchesReason(plan, "ddl", diagnostic_reason),
-        else => if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
-            const unsupported = std.meta.stringToEnum(sql_adapter.UnsupportedPlanFamily, unsupported_family) orelse return false;
-            return sql_adapter.unsupportedPlanMatchesReason(plan, unsupported, diagnostic_reason);
-        } else return true,
-    }
-}
-
-fn appParityPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const u8) bool {
-    if (appParityUnsupportedFingerprintFamily(family)) |unsupported_family| {
-        const unsupported = std.meta.stringToEnum(sql_adapter.UnsupportedPlanFamily, unsupported_family) orelse return false;
-        return sql_adapter.unsupportedPlanMatchesFamily(plan, unsupported);
-    }
-
-    const prefix = switch (family) {
-        .ddl => "ddl:",
-        .read => "read:",
-        .query => "query:",
-        .aggregate => "aggregate:",
-        .join => "join:",
-        .lateral => "lateral:",
-        .window => "window:",
-        .explain => "explain:",
-        .relation_population => "relation_population:",
-        .insert => "insert:",
-        .insert_source => "insert_source:",
-        .update => "update:",
-        .delete => "delete:",
-        .update_source => "update_source:",
-        .delete_source => "delete_source:",
-        .truncate_source => "truncate_source:",
-        .update_joined_source => "update_joined_source:",
-        .delete_joined_source => "delete_joined_source:",
-        .merge_mutation => "merge_mutation:",
-        .adapter_noop_ddl => "adapter_noop:ddl:",
-        .unsupported,
-        .unsupported_read,
-        .unsupported_ddl,
-        .unsupported_write,
-        .unsupported_insert,
-        .unsupported_update,
-        .unsupported_update_source,
-        .unsupported_delete,
-        .unsupported_update_joined_source,
-        .unsupported_delete_joined_source,
-        .unsupported_merge_mutation,
-        => unreachable,
-    };
-    return std.mem.startsWith(u8, plan, prefix);
-}
-
-fn appParityFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .query,
-        .aggregate,
-        .join,
-        .lateral,
-        .window,
-        .explain,
-        .relation_population,
-        .insert,
-        .insert_source,
-        .update,
-        .delete,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => true,
-        else => false,
-    };
-}
-
-fn appParityFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .ddl,
-        .read,
-        .query,
-        .aggregate,
-        .join,
-        .lateral,
-        .window,
-        .explain,
-        .relation_population,
-        .insert,
-        .insert_source,
-        .update,
-        .delete,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => true,
-        else => false,
-    };
-}
-
-fn appParityFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .read,
-        .join,
-        .lateral,
-        .insert_source,
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => true,
-        else => false,
-    };
-}
-
-fn appParityFixtureFamilyAllowsSetupSql(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .unsupported_ddl,
-        .adapter_noop_ddl,
-        => false,
-        else => true,
-    };
-}
-
-fn appParityFixtureFamilyAllowsReturningRows(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .insert,
-        .update,
-        .delete,
-        => true,
-        else => false,
-    };
-}
-
-fn appParityFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .insert,
-        .update,
-        .delete,
-        .unsupported_insert,
-        .unsupported_update,
-        .unsupported_delete,
-        => true,
-        else => false,
-    };
-}
-
-fn appParityFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFamily) bool {
-    return switch (family) {
-        .ddl,
-        .insert,
-        .insert_source,
-        .update,
-        .update_source,
-        .update_joined_source,
-        .merge_mutation,
-        => true,
-        else => false,
-    };
-}
-
-fn appParityPlanNonNoneStringTokenUsize(plan: []const u8, token: []const u8) ?usize {
-    return sql_adapter.planNonNoneStringTokenUsize(plan, token);
-}
-
-fn appParityPlanNonNoneStringTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    return sql_adapter.planNonNoneStringTokenSumMatches(plan, tokens, expected);
-}
-
-fn appParityPlanBoolTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    return sql_adapter.planBoolTokenSumMatches(plan, tokens, expected);
-}
-
-fn appParityFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    if (entry.family != .ddl) return true;
-    return switch (entry.summary.ddl_tag orelse return false) {
-        .create_table,
-        .relation_lifetime,
-        => appParityPlanUsizeOptionalTokenSumMatches(entry.plan, &.{ ":unique=", ":fk=", ":checks=" }, expected),
-        .alter_table,
-        .alter_domain,
-        .alter_database,
-        .alter_sequence,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":ops=", expected),
-        .create_sequence => appParityPlanHasExactUsizeToken(entry.plan, ":options=", expected),
-        .identity_allocator => (appParityPlanBoolTokenUsize(entry.plan, ":primary=") orelse return false) == expected,
-        .create_function,
-        .create_procedure,
-        .drop_function,
-        .drop_procedure,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        .alter_role => (appParityPlanNonNoneStringTokenUsize(entry.plan, ":setting=") orelse return false) == expected,
-        .grant_privilege,
-        .revoke_privilege,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":privileges=", expected),
-        .copy_from,
-        .copy_to,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":columns=", expected),
-        .create_partitioned_table => appParityPlanHasExactUsizeToken(entry.plan, ":keys=", expected),
-        .create_table_partition,
-        .attach_table_partition,
-        .detach_table_partition,
-        => expected == 0,
-        .enable_row_security,
-        .disable_row_security,
-        .create_row_policy,
-        .drop_row_policy,
-        .create_update_policy,
-        => expected == 1,
-        .create_database,
-        .drop_database,
-        .create_tablespace,
-        .rename_tablespace,
-        .drop_tablespace,
-        .listen_notification,
-        .unlisten_notification,
-        .alter_subscription,
-        .drop_subscription,
-        .drop_publication,
-        .create_schema_namespace,
-        .rename_schema_namespace,
-        .drop_schema_namespace,
-        .create_extension,
-        .alter_extension_update,
-        .drop_extension,
-        .create_cast,
-        .drop_cast,
-        .deallocate_statement,
-        .declare_cursor,
-        .close_cursor,
-        .savepoint_transaction,
-        .release_savepoint,
-        .rollback_to_savepoint,
-        => expected == 0,
-        .create_publication => appParityPlanHasExactUsizeToken(entry.plan, ":tables=", expected),
-        .alter_publication => appParityPlanHasExactUsizeToken(entry.plan, ":add_tables=", expected),
-        .create_subscription => appParityPlanHasExactUsizeToken(entry.plan, ":publications=", expected),
-        .notify_notification => (appParityPlanBoolTokenUsize(entry.plan, ":payload=") orelse return false) == expected,
-        .create_collation,
-        .create_operator,
-        .create_aggregate,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":options=", expected),
-        .drop_operator,
-        .drop_aggregate,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        .vacuum_maintenance => appParityPlanBoolTokenSumMatches(entry.plan, &.{ ":full=", ":freeze=", ":verbose=", ":analyze=" }, expected),
-        .analyze_maintenance => (appParityPlanUsizeTokenValue(entry.plan, ":columns=") orelse return false) +
-            (appParityPlanBoolTokenUsize(entry.plan, ":verbose=") orelse return false) == expected,
-        .reindex_maintenance => (appParityPlanBoolTokenUsize(entry.plan, ":concurrently=") orelse return false) == expected,
-        .cluster_maintenance => (appParityPlanNonNoneStringTokenUsize(entry.plan, ":index=") orelse return false) == expected,
-        .prepare_statement => appParityPlanHasExactUsizeToken(entry.plan, ":params=", expected),
-        .execute_statement => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        .comment_metadata => (appParityPlanBoolTokenUsize(entry.plan, ":comment=") orelse return false) == expected,
-        .table_lock => appParityPlanHasExactUsizeToken(entry.plan, ":tables=", expected),
-        .constraint_mode => (appParityPlanUsizeTokenValue(entry.plan, ":constraints=") orelse return false) +
-            (appParityPlanBoolTokenUsize(entry.plan, ":all=") orelse return false) == expected,
-        .transaction_mode => appParityPlanNonNoneStringTokenSumMatches(entry.plan, &.{ ":isolation=", ":access=", ":deferrable=" }, expected),
-        .advisory_lock => appParityPlanHasExactUsizeToken(entry.plan, ":keys=", expected),
-        .fetch_cursor => appParityPlanHasExactUsizeToken(entry.plan, ":count=", expected) or expected == 0,
-        .create_index,
-        .drop_index,
-        .drop_table,
-        .create_view,
-        .rename_view,
-        .drop_view,
-        .create_materialized_view,
-        .refresh_materialized_view,
-        .drop_materialized_view,
-        .table_clone,
-        .create_enum_type,
-        .add_enum_value,
-        .drop_enum_type,
-        .create_domain,
-        .drop_domain,
-        .drop_sequence,
-        .create_role,
-        .drop_role,
-        .rename_collation,
-        .drop_collation,
-        => false,
-    };
-}
-
-fn appParityFixtureOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    return switch (entry.family) {
-        .ddl => appParityFixtureDdlOperationsSummaryMatchesPlan(entry, expected),
-        .insert,
-        .update,
-        .update_source,
-        .update_joined_source,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":ops=", expected),
-        .insert_source => appParityPlanHasExactUsizeToken(entry.plan, ":assignments=", expected),
-        .merge_mutation => appParityPlanHasExactUsizeToken(entry.plan, ":matched_update=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .insert,
-        .insert_source,
-        .update,
-        .delete,
-        .update_source,
-        .delete_source,
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => true,
-        .explain => appParityExplainPlanHasKind(entry.plan, "write"),
-        else => false,
-    };
-}
-
-fn appParityFixtureReturningSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    return switch (entry.family) {
-        .insert,
-        .update,
-        .delete,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", expected),
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":returning=", expected),
-        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", expected) or
-            appParityPlanHasExactUsizeToken(entry.plan, ":returning=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureReturningAllSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
-    return appParityFixtureOptionalBool01SummaryMatchesPlan(entry.plan, ":returning_all=", expected);
-}
-
-fn appParityFixtureAllowsConflictWhereSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .insert,
-        .insert_source,
-        => true,
-        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=insert:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureConflictWhereSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: bool) bool {
-    return appParityFixtureOptionalBool01SummaryMatchesPlan(entry.plan, ":conflict_where=", expected);
-}
-
-fn appParityExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
-    const inner_token = ":inner=";
-    if (!std.mem.startsWith(u8, inner_prefix, inner_token)) return false;
-    return entry.family == .explain and
-        appParityExplainPlanHasKind(entry.plan, "write") and
-        appParityExplainPlanInnerStartsWith(entry.plan, inner_prefix[inner_token.len..]);
-}
-
-fn appParityReadPlanHasPrefix(entry: AppParityCorpusEntry, read_prefix: []const u8) bool {
-    return (entry.family == .read and std.mem.startsWith(u8, entry.plan, read_prefix)) or
-        (entry.family == .explain and
-            appParityExplainPlanHasKind(entry.plan, "read") and
-            appParityExplainPlanInnerStartsWith(entry.plan, read_prefix));
-}
-
-fn appParityFixtureAllowsMutationTransformSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .insert_source,
-        .update_source,
-        .update_joined_source,
-        => true,
-        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .update_joined_source => true,
-        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureSourceAssignmentsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    return switch (entry.family) {
-        .update_joined_source,
-        .explain,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":source_assignments=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureTransformSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    if (entry.summary.patch_expressions) |patch_expressions| {
-        const token = if (entry.family == .insert_source or appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"))
-            ":conflict_patch_expr="
-        else
-            ":patch_expr=";
-        if (!appParityPlanHasExactUsizeToken(entry.plan, token, patch_expressions)) return false;
-    }
-    if (entry.summary.increment_expressions) |increment_expressions| {
-        const token = if (entry.family == .insert_source or appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"))
-            ":conflict_increment_expr="
-        else
-            ":increment_expr=";
-        if (!appParityPlanHasExactUsizeToken(entry.plan, token, increment_expressions)) return false;
-    }
-    if (entry.summary.json_set_expressions) |json_set_expressions| {
-        const token = if (entry.family == .insert_source or appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:"))
-            ":conflict_json_set_expr="
-        else
-            ":json_set_expr=";
-        if (!appParityPlanHasExactUsizeToken(entry.plan, token, json_set_expressions)) return false;
-    }
-    return true;
-}
-
-fn appParityFixtureAllowsMergeArmSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .merge_mutation => true,
-        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureMergeArmSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    if (entry.summary.matched_predicates) |matched_predicates| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":matched_pred=", matched_predicates)) return false;
-    }
-    if (entry.summary.matched_delete) |matched_delete| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":matched_delete=", @intFromBool(matched_delete))) return false;
-    }
-    if (entry.summary.matched_do_nothing) |matched_do_nothing| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":matched_noop=", @intFromBool(matched_do_nothing))) return false;
-    }
-    if (entry.summary.not_matched_predicates) |not_matched_predicates| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_pred=", not_matched_predicates)) return false;
-    }
-    if (entry.summary.not_matched_do_nothing) |not_matched_do_nothing| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_noop=", @intFromBool(not_matched_do_nothing))) return false;
-    }
-    return true;
-}
-
-fn appParityFixtureAllowsAggregateSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .aggregate => true,
-        .read, .explain => appParityReadPlanHasPrefix(entry, "read:aggregate:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureOptionalZeroSummaryMatchesPlan(plan: []const u8, token: []const u8, expected: usize) bool {
-    return switch (appParityPlanScanUsizeToken(plan, token)) {
-        .value => |value| value == expected,
-        .absent => expected == 0,
-        .invalid => false,
-    };
-}
-
-fn appParityFixtureOptionalBool01SummaryMatchesPlan(plan: []const u8, token: []const u8, expected: bool) bool {
-    const value = appParityPlanUsizeTokenValue(plan, token) orelse return !expected;
-    return value == @intFromBool(expected);
-}
-
-fn appParityFixtureAggregateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    if (entry.summary.group_by) |group_by| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":group=", group_by)) return false;
-    }
-    if (entry.summary.group_expressions) |group_expressions| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":group_expr=", group_expressions)) return false;
-    }
-    if (entry.summary.aggregations) |aggregations| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":aggs=", aggregations)) return false;
-    }
-    if (entry.summary.filter_groups) |filter_groups| {
-        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":filter_groups=", filter_groups)) return false;
-    }
-    if (entry.summary.having) |having| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":having=", having)) return false;
-    }
-    if (entry.summary.having_expressions) |having_expressions| {
-        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":having_expr=", having_expressions)) return false;
-    }
-    if (entry.summary.having_any) |having_any| {
-        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":having_any=", having_any)) return false;
-    }
-    if (entry.summary.having_not) |having_not| {
-        if (!appParityFixtureOptionalZeroSummaryMatchesPlan(entry.plan, ":having_not=", having_not)) return false;
-    }
-    return true;
-}
-
-fn appParityPlanBoolTokenValue(plan: []const u8, token: []const u8) ?bool {
-    return sql_adapter.planBoolTokenValue(plan, token);
-}
-
-fn appParityPlanBoolTokenUsize(plan: []const u8, token: []const u8) ?usize {
-    return sql_adapter.planBoolTokenUsize(plan, token);
-}
-
-fn appParityFixtureDdlSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const expected = entry.summary.select orelse return true;
-    if (entry.family != .ddl) return true;
-    return switch (entry.summary.ddl_tag orelse return false) {
-        .create_table,
-        .relation_lifetime,
-        .create_partitioned_table,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":columns=", expected),
-        .identity_allocator => (appParityPlanUsizeTokenValue(entry.plan, ":columns=") orelse return false) +
-            (appParityPlanBoolTokenUsize(entry.plan, ":primary=") orelse return false) == expected,
-        .create_index => appParityPlanUsizeOptionalTokenSumMatches(entry.plan, &.{ ":columns=", ":expr=", ":generated_expr=" }, expected),
-        .create_view,
-        .create_materialized_view,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":fields=", expected),
-        .create_enum_type => appParityPlanHasExactUsizeToken(entry.plan, ":values=", expected),
-        .create_aggregate => appParityPlanHasExactUsizeToken(entry.plan, ":args=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureDdlPredicateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const expected = entry.summary.predicates orelse return true;
-    if (entry.family != .ddl) return true;
-    return switch (entry.summary.ddl_tag orelse return false) {
-        .create_index => appParityPlanHasExactUsizeToken(entry.plan, ":where=", expected),
-        .create_domain => appParityPlanHasExactUsizeToken(entry.plan, ":checks=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureAllowsPredicateSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .ddl,
-        .query,
-        .aggregate,
-        .join,
-        .lateral,
-        .window,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        => true,
-        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityReadPlanHasPrefix(entry, "read:window:"),
-        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityReadPlanHasPrefix(entry, "read:window:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureSidePredicateSummaryMatchesPlan(plan: []const u8, expected: usize) bool {
-    return appParityPlanUsizeTokenSumMatches(plan, &.{ ":left_pred=", ":right_pred=" }, expected);
-}
-
-fn appParityFixturePredicateSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const expected = entry.summary.predicates orelse return true;
-    return switch (entry.family) {
-        .ddl => true,
-        .query => appParityPlanHasExactUsizeToken(entry.plan, ":pred=", expected),
-        .aggregate,
-        .window,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":source_pred=", expected),
-        .join,
-        .lateral,
-        .update_joined_source,
-        .delete_joined_source,
-        => appParityFixtureSidePredicateSummaryMatchesPlan(entry.plan, expected),
-        .read => if (appParityReadPlanHasPrefix(entry, "read:query:"))
-            appParityPlanHasExactUsizeToken(entry.plan, ":pred=", expected)
-        else if (appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:window:"))
-            appParityPlanHasExactUsizeToken(entry.plan, ":source_pred=", expected)
-        else if (appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:"))
-            appParityFixtureSidePredicateSummaryMatchesPlan(entry.plan, expected)
-        else
-            false,
-        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":pred=", expected) or
-            appParityPlanHasExactUsizeToken(entry.plan, ":source_pred=", expected) or
-            appParityFixtureSidePredicateSummaryMatchesPlan(entry.plan, expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureHasAccessSummary(summary: AppParityPlanSummary) bool {
-    return summary.array_any != null or
-        summary.in_predicates != null or
-        summary.json_path_eq != null or
-        summary.json_contains != null or
-        summary.json_path_exists != null or
-        summary.array_contains != null or
-        summary.array_eq != null or
-        summary.text_patterns != null or
-        summary.access_or_predicates != null or
-        summary.access_not_predicates != null or
-        summary.expression_predicates != null or
-        summary.expression_or_predicates != null or
-        summary.expression_not_predicates != null or
-        summary.expression_array_contains != null;
-}
-
-fn appParityFixtureAllowsAccessSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .query,
-        .aggregate,
-        .join,
-        .lateral,
-        .window,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        => true,
-        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityReadPlanHasPrefix(entry, "read:window:"),
-        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityReadPlanHasPrefix(entry, "read:window:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureSideAccessSummaryMatchesPlan(
-    plan: []const u8,
-    left_token: []const u8,
-    right_token: []const u8,
-    expected: usize,
-) bool {
-    return appParityPlanUsizeOptionalTokenSumMatches(plan, &.{ left_token, right_token }, expected);
-}
-
-fn appParityFixtureSideTextPatternSummaryMatchesPlan(plan: []const u8, expected: usize) bool {
-    return appParityPlanUsizeOptionalTokenSumMatches(plan, &.{ ":left_text=", ":right_text=" }, expected) or
-        appParityPlanUsizeOptionalTokenSumMatches(plan, &.{ ":left_text_pattern=", ":right_text_pattern=" }, expected);
-}
-
-fn appParityFixtureAccessSummaryFieldMatchesPlan(
-    entry: AppParityCorpusEntry,
-    expected: ?usize,
-    row_token: []const u8,
-    source_token: []const u8,
-    left_token: []const u8,
-    right_token: []const u8,
-) bool {
-    const value = expected orelse return true;
-    return switch (entry.family) {
-        .query => appParityPlanHasExactUsizeToken(entry.plan, row_token, value),
-        .aggregate,
-        .window,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        => appParityPlanHasExactUsizeToken(entry.plan, source_token, value),
-        .join,
-        .lateral,
-        .update_joined_source,
-        .delete_joined_source,
-        => appParityFixtureSideAccessSummaryMatchesPlan(entry.plan, left_token, right_token, value),
-        .read => if (appParityReadPlanHasPrefix(entry, "read:query:"))
-            appParityPlanHasExactUsizeToken(entry.plan, row_token, value)
-        else if (appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:window:"))
-            appParityPlanHasExactUsizeToken(entry.plan, source_token, value)
-        else if (appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:"))
-            appParityFixtureSideAccessSummaryMatchesPlan(entry.plan, left_token, right_token, value)
-        else
-            false,
-        .explain => appParityPlanHasExactUsizeToken(entry.plan, row_token, value) or
-            appParityPlanHasExactUsizeToken(entry.plan, source_token, value) or
-            appParityFixtureSideAccessSummaryMatchesPlan(entry.plan, left_token, right_token, value),
-        else => false,
-    };
-}
-
-fn appParityFixtureTextPatternSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const value = entry.summary.text_patterns orelse return true;
-    return switch (entry.family) {
-        .query => appParityPlanHasExactUsizeToken(entry.plan, ":text_pattern=", value),
-        .aggregate,
-        .window,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":source_text_pattern=", value),
-        .join,
-        .lateral,
-        .update_joined_source,
-        .delete_joined_source,
-        => appParityFixtureSideTextPatternSummaryMatchesPlan(entry.plan, value),
-        .read => if (appParityReadPlanHasPrefix(entry, "read:query:"))
-            appParityPlanHasExactUsizeToken(entry.plan, ":text_pattern=", value)
-        else if (appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:window:"))
-            appParityPlanHasExactUsizeToken(entry.plan, ":source_text_pattern=", value)
-        else if (appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:"))
-            appParityFixtureSideTextPatternSummaryMatchesPlan(entry.plan, value)
-        else
-            false,
-        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":text_pattern=", value) or
-            appParityPlanHasExactUsizeToken(entry.plan, ":source_text_pattern=", value) or
-            appParityFixtureSideTextPatternSummaryMatchesPlan(entry.plan, value),
-        else => false,
-    };
-}
-
-fn appParityFixtureAccessSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const summary = entry.summary;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.array_any, ":array_any=", ":source_array_any=", ":left_array_any=", ":right_array_any=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.in_predicates, ":in=", ":source_in=", ":left_in=", ":right_in=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.json_path_eq, ":json_eq=", ":source_json_eq=", ":left_json_eq=", ":right_json_eq=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.json_contains, ":json_contains=", ":source_json_contains=", ":left_json_contains=", ":right_json_contains=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.json_path_exists, ":json_exists=", ":source_json_exists=", ":left_json_exists=", ":right_json_exists=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.array_contains, ":array_contains=", ":source_array_contains=", ":left_array_contains=", ":right_array_contains=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.array_eq, ":array_eq=", ":source_array_eq=", ":left_array_eq=", ":right_array_eq=")) return false;
-    if (!appParityFixtureTextPatternSummaryMatchesPlan(entry)) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.access_or_predicates, ":access_or=", ":source_access_or=", ":left_access_or=", ":right_access_or=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.access_not_predicates, ":access_not=", ":source_access_not=", ":left_access_not=", ":right_access_not=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.expression_predicates, ":expr_pred=", ":source_expr_pred=", ":left_expr_pred=", ":right_expr_pred=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.expression_or_predicates, ":expr_or=", ":source_expr_or=", ":left_expr_or=", ":right_expr_or=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.expression_not_predicates, ":expr_not=", ":source_expr_not=", ":left_expr_not=", ":right_expr_not=")) return false;
-    if (!appParityFixtureAccessSummaryFieldMatchesPlan(entry, summary.expression_array_contains, ":expr_array=", ":source_expr_array=", ":left_expr_array=", ":right_expr_array=")) return false;
-    return true;
-}
-
-fn appParityFixtureSelectSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const expected = entry.summary.select orelse return true;
-    return switch (entry.family) {
-        .ddl => true,
-        .query,
-        .read,
-        .window,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":select=", expected),
-        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":select=", expected) or
-            appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_insert=", expected),
-        .merge_mutation => appParityPlanHasExactUsizeToken(entry.plan, ":not_matched_insert=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureAllowsJoinSelectSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .join,
-        .lateral,
-        => true,
-        .read, .explain => appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureJoinSelectSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    return appParityPlanHasExactUsizeToken(entry.plan, ":select=", expected);
-}
-
-fn appParityFixtureAllowsJoinOnSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .join,
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => true,
-        .read => appParityReadPlanHasPrefix(entry, "read:join:"),
-        .explain => appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureJoinOnSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    return switch (entry.family) {
-        .merge_mutation => appParityPlanHasExactUsizeToken(entry.plan, ":match=", expected),
-        .join,
-        .update_joined_source,
-        .delete_joined_source,
-        .read,
-        => appParityPlanHasExactUsizeToken(entry.plan, ":on=", expected),
-        .explain => appParityPlanHasExactUsizeToken(entry.plan, ":on=", expected) or
-            appParityPlanHasExactUsizeToken(entry.plan, ":match=", expected),
-        else => false,
-    };
-}
-
-fn appParityFixtureAllowsLateralSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .lateral => true,
-        .read, .explain => appParityReadPlanHasPrefix(entry, "read:lateral:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureLateralSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    if (entry.summary.lateral_correlations) |correlations| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":corr=", correlations)) return false;
-    }
-    if (entry.summary.right_offset) |right_offset| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":right_offset=", @intCast(right_offset))) return false;
-    }
-    return true;
-}
-
-fn appParityFixtureAllowsWindowSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .window => true,
-        .read, .explain => appParityReadPlanHasPrefix(entry, "read:window:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureWindowSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
-    return appParityPlanHasExactUsizeToken(entry.plan, ":windows=", expected);
-}
-
-fn appParityFixtureAllowsFullQueryOutputSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .query,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        => true,
-        .read => appParityReadPlanHasPrefix(entry, "read:query:"),
-        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureFullQueryOutputSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    if (entry.summary.select_all) |select_all| {
-        if (!appParityFixtureOptionalBool01SummaryMatchesPlan(entry.plan, ":select_all=", select_all)) return false;
-    }
-    if (entry.summary.distinct_on) |distinct_on| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":distinct_on=", distinct_on)) return false;
-    }
-    return true;
-}
-
-fn appParityFixtureAllowsPaginationSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .query,
-        .aggregate,
-        .join,
-        .lateral,
-        .window,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        => true,
-        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityReadPlanHasPrefix(entry, "read:window:"),
-        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:aggregate:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityReadPlanHasPrefix(entry, "read:window:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureUsesSourcePagination(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        => true,
-        .explain => appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixturePaginationSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const source_pagination = appParityFixtureUsesSourcePagination(entry);
-    if (entry.summary.order_by) |order_by| {
-        const token = if (source_pagination) ":source_order=" else ":order=";
-        if (!appParityPlanHasExactUsizeToken(entry.plan, token, order_by)) return false;
-    }
-    if (entry.summary.limit) |limit| {
-        const token = if (source_pagination) ":source_limit=" else ":limit=";
-        if (!appParityPlanHasExactUsizeToken(entry.plan, token, limit)) return false;
-    }
-    if (entry.summary.offset) |offset| {
-        const token = if (source_pagination) ":source_offset=" else ":offset=";
-        if (!appParityPlanHasExactUsizeToken(entry.plan, token, offset)) return false;
-    }
-    return true;
-}
-
-fn appParityFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
-    return switch (entry.family) {
-        .query,
-        .join,
-        .lateral,
-        .insert_source,
-        .update_source,
-        .delete_source,
-        .truncate_source,
-        .update_joined_source,
-        .delete_joined_source,
-        => true,
-        .read => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:"),
-        .explain => appParityReadPlanHasPrefix(entry, "read:query:") or
-            appParityReadPlanHasPrefix(entry, "read:join:") or
-            appParityReadPlanHasPrefix(entry, "read:lateral:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=truncate_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
-            appParityExplainWriteInnerHasPrefix(entry, ":inner=delete_joined_source:"),
-        else => false,
-    };
-}
-
-fn appParityFixtureRowClaimSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
-    const skip_locked = entry.summary.row_claim_skip_locked orelse return true;
-    if (skip_locked) {
-        return appParityPlanHasExactStringToken(entry.plan, ":claim=", "skip_locked") or
-            appParityPlanHasExactStringToken(entry.plan, ":claim=", "no_key_update_skip_locked");
-    }
-    return appParityPlanHasExactStringToken(entry.plan, ":claim=", "locked") or
-        appParityPlanHasExactStringToken(entry.plan, ":claim=", "nowait") or
-        appParityPlanHasExactStringToken(entry.plan, ":claim=", "no_key_update") or
-        appParityPlanHasExactStringToken(entry.plan, ":claim=", "no_key_update_nowait");
-}
-
-fn appParityFixtureHasTemporalDdlSummary(entry: AppParityCorpusEntry) bool {
-    return entry.summary.temporal_periods != null or
-        entry.summary.temporal_primary_key != null or
-        entry.summary.temporal_unique != null or
-        entry.summary.temporal_foreign_keys != null;
-}
-
-fn appParityFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_table_name: []const u8) bool {
-    return switch (entry.family) {
-        .insert_source => appParityPlanHasExactStringToken(entry.plan, ":source_table=", source_table_name),
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => appParityPlanHasExactStringToken(entry.plan, ":source=", source_table_name),
-        .read,
-        .join,
-        .lateral,
-        => appParityPlanHasExactStringToken(entry.plan, ":right=", source_table_name),
-        else => false,
-    };
-}
-
-fn appParityFixtureSqlParameterCoverageMatches(entry: AppParityCorpusEntry) bool {
-    if (entry.family == .ddl and entry.summary.ddl_tag == .prepare_statement) {
-        if (entry.params.len != 0) return false;
-        const prepared_params = appParityPlanUsizeTokenValue(entry.plan, ":params=") orelse return false;
-        return sql_adapter.sqlParameterCoverageMatches(entry.sql, prepared_params);
-    }
-    return sql_adapter.sqlParameterCoverageMatches(entry.sql, entry.params.len);
-}
-
-fn appParityDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
-    if (entry.family != .ddl) return false;
-    return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
-        .drop_table => true,
-        .create_view, .rename_view, .drop_view => false,
-        .create_materialized_view, .refresh_materialized_view, .drop_materialized_view => false,
-        .relation_lifetime => false,
-        .create_enum_type, .add_enum_value, .drop_enum_type => false,
-        .create_domain, .alter_domain, .drop_domain => false,
-        .create_sequence, .alter_sequence, .drop_sequence => false,
-        .identity_allocator => false,
-        .create_schema_namespace, .rename_schema_namespace, .drop_schema_namespace => false,
-        .create_extension, .alter_extension_update, .drop_extension => false,
-        .create_function, .drop_function, .create_procedure, .drop_procedure => false,
-        .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
-        .copy_from, .copy_to => false,
-        .create_partitioned_table, .create_table_partition, .attach_table_partition, .detach_table_partition => false,
-        .enable_row_security, .disable_row_security, .create_row_policy, .drop_row_policy => false,
-        .create_database, .alter_database, .drop_database => false,
-        .create_tablespace, .rename_tablespace, .drop_tablespace => false,
-        .listen_notification, .notify_notification, .unlisten_notification => false,
-        .create_publication, .alter_publication, .drop_publication => false,
-        .create_subscription, .alter_subscription, .drop_subscription => false,
-        .create_collation, .rename_collation, .drop_collation => false,
-        .create_operator, .drop_operator => false,
-        .create_aggregate, .drop_aggregate => false,
-        .create_cast, .drop_cast => false,
-        .vacuum_maintenance, .analyze_maintenance, .reindex_maintenance, .cluster_maintenance => false,
-        .prepare_statement, .execute_statement, .deallocate_statement => false,
-        .declare_cursor, .fetch_cursor, .close_cursor => false,
-        .savepoint_transaction, .release_savepoint, .rollback_to_savepoint => false,
-        .comment_metadata => true,
-        .table_lock, .constraint_mode, .transaction_mode, .advisory_lock => false,
-        .create_table,
-        .table_clone,
-        .create_index,
-        .drop_index,
-        .alter_table,
-        .create_update_policy,
-        => true,
-    };
-}
-
-fn appParityDdlFixtureAppliesFromEmptyCatalog(entry: AppParityCorpusEntry) !bool {
-    if (entry.family != .ddl) return false;
-    return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
-        .create_table => !appParityPlanHasExactBoolToken(entry.plan, ":if_not_exists=", true) and
-            !appParityPlanHasExactBoolToken(entry.plan, ":replace=", true),
-        else => false,
-    };
-}
-
-fn appParityConsumeLiteral(text: []const u8, index: *usize, literal: []const u8) bool {
-    if (index.* + literal.len > text.len) return false;
-    if (!std.mem.eql(u8, text[index.* .. index.* + literal.len], literal)) return false;
-    index.* += literal.len;
-    return true;
-}
-
-fn appParityConsumeBool(text: []const u8, index: *usize) bool {
-    if (appParityConsumeLiteral(text, index, "true")) return true;
-    if (appParityConsumeLiteral(text, index, "false")) return true;
-    return false;
-}
-
-fn appParityConsumeUsize(text: []const u8, index: *usize) bool {
-    const start = index.*;
-    while (index.* < text.len and text[index.*] >= '0' and text[index.*] <= '9') : (index.* += 1) {}
-    return index.* > start;
-}
-
-fn appParityAppliedPlanIsStructured(plan: []const u8) bool {
-    var index: usize = 0;
-    if (appParityConsumeLiteral(plan, &index, "applied:drop_table:rebuild=")) {
-        if (!appParityConsumeBool(plan, &index)) return false;
-        if (!appParityConsumeLiteral(plan, &index, ":validation=")) return false;
-        if (!appParityConsumeBool(plan, &index)) return false;
-        if (!appParityConsumeLiteral(plan, &index, ":rewrite=")) return false;
-        if (!appParityConsumeBool(plan, &index)) return false;
-        return index == plan.len;
-    }
-
-    index = 0;
-    if (!appParityConsumeLiteral(plan, &index, "applied:rebuild=")) return false;
-    if (!appParityConsumeBool(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":validation=")) return false;
-    if (!appParityConsumeBool(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":rewrite=")) return false;
-    if (!appParityConsumeBool(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":building_indexes=")) return false;
-    if (!appParityConsumeUsize(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":unvalidated_unique=")) return false;
-    if (!appParityConsumeUsize(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":unvalidated_fk=")) return false;
-    if (!appParityConsumeUsize(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":unvalidated_check=")) return false;
-    if (!appParityConsumeUsize(plan, &index)) return false;
-    if (!appParityConsumeLiteral(plan, &index, ":update_policy=")) return false;
-    if (!appParityConsumeUsize(plan, &index)) return false;
-    if (index == plan.len) return true;
-    if (!appParityConsumeLiteral(plan, &index, ":comments=")) return false;
-    if (!appParityConsumeUsize(plan, &index)) return false;
-    return index == plan.len;
+    try sql_adapter.checkOrPromoteFixtureJson(alloc, mode, encoded);
 }
 
 fn appParityJsonTextIsObject(alloc: std.mem.Allocator, text: []const u8) !bool {
@@ -60656,235 +58315,11 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
     seen_names: *std.StringHashMapUnmanaged(void),
     alloc: std.mem.Allocator,
 ) !void {
-    if (entry.name.len == 0 or entry.sql.len == 0 or entry.plan.len == 0) return error.TestUnexpectedResult;
-    if (!appParityPlanMatchesFamily(entry.family, entry.plan)) return error.TestUnexpectedResult;
-    if (appParityFixtureFamilyNeedsReason(entry.family) and entry.classification_reason.len == 0) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureFamilyNeedsReason(entry.family) and entry.classification_reason.len > 0) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.classification_reason.len > 0 and !appParityStableReasonToken(entry.classification_reason)) {
-        return error.TestUnexpectedResult;
-    }
-    if (appParityFixtureFamilyNeedsReason(entry.family) and
-        !appParityPlanMatchesReason(entry.family, entry.plan, entry.classification_reason))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.family == .ddl and entry.summary.ddl_tag == null) return error.TestUnexpectedResult;
-    if (entry.summary.ddl_tag != null and entry.family != .ddl) return error.TestUnexpectedResult;
-    if (appParityFixtureFamilyNeedsTableSummary(entry.family) and entry.summary.table_name == null) {
-        return error.TestUnexpectedResult;
-    }
-    if (appParitySummaryHasFields(entry.summary) and !appParityFixtureFamilyAllowsSummary(entry.family)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.family == .relation_population and appParitySummaryHasNonTableFields(entry.summary)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.ctes) |ctes| {
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", ctes)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.summary.operations != null and !appParityFixtureFamilyAllowsOperationsSummary(entry.family)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.operations) |operations| {
-        if (!appParityFixtureOperationsSummaryMatchesPlan(entry, operations)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if ((entry.summary.returning != null or entry.summary.returning_all != null) and
-        !appParityFixtureAllowsReturningSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.returning) |returning| {
-        if (!appParityFixtureReturningSummaryMatchesPlan(entry, returning)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.summary.returning_all) |returning_all| {
-        if (!appParityFixtureReturningAllSummaryMatchesPlan(entry, returning_all)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.summary.conflict_where != null and !appParityFixtureAllowsConflictWhereSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.conflict_where) |conflict_where| {
-        if (!appParityFixtureConflictWhereSummaryMatchesPlan(entry, conflict_where)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if ((entry.summary.patch_expressions != null or
-        entry.summary.increment_expressions != null or
-        entry.summary.json_set_expressions != null) and
-        !appParityFixtureAllowsMutationTransformSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureTransformSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.source_assignments != null and !appParityFixtureAllowsSourceAssignmentsSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.source_assignments) |source_assignments| {
-        if (!appParityFixtureSourceAssignmentsSummaryMatchesPlan(entry, source_assignments)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if ((entry.summary.matched_predicates != null or
-        entry.summary.matched_delete != null or
-        entry.summary.matched_do_nothing != null or
-        entry.summary.not_matched_predicates != null or
-        entry.summary.not_matched_do_nothing != null) and
-        !appParityFixtureAllowsMergeArmSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureMergeArmSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if ((entry.summary.group_by != null or
-        entry.summary.group_expressions != null or
-        entry.summary.aggregations != null or
-        entry.summary.filter_groups != null or
-        entry.summary.having != null or
-        entry.summary.having_expressions != null or
-        entry.summary.having_any != null or
-        entry.summary.having_not != null) and
-        !appParityFixtureAllowsAggregateSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureAggregateSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureDdlSelectSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureDdlPredicateSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.predicates != null and !appParityFixtureAllowsPredicateSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixturePredicateSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (appParityFixtureHasAccessSummary(entry.summary) and !appParityFixtureAllowsAccessSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureAccessSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureSelectSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.join_select != null and !appParityFixtureAllowsJoinSelectSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.join_select) |join_select| {
-        if (!appParityFixtureJoinSelectSummaryMatchesPlan(entry, join_select)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.summary.join_on != null and !appParityFixtureAllowsJoinOnSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.join_on) |join_on| {
-        if (!appParityFixtureJoinOnSummaryMatchesPlan(entry, join_on)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if ((entry.summary.lateral_correlations != null or entry.summary.right_offset != null) and
-        !appParityFixtureAllowsLateralSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureLateralSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.windows != null and !appParityFixtureAllowsWindowSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.windows) |windows| {
-        if (!appParityFixtureWindowSummaryMatchesPlan(entry, windows)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if ((entry.summary.select_all != null or entry.summary.distinct_on != null) and
-        !appParityFixtureAllowsFullQueryOutputSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureFullQueryOutputSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if ((entry.summary.order_by != null or entry.summary.limit != null or entry.summary.offset != null) and
-        !appParityFixtureAllowsPaginationSummary(entry))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixturePaginationSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.summary.row_claim_skip_locked != null and !appParityFixtureAllowsRowClaimSummary(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (!appParityFixtureRowClaimSummaryMatchesPlan(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    if (appParityFixtureHasTemporalDdlSummary(entry)) {
-        if (entry.family != .ddl) return error.TestUnexpectedResult;
-        if (entry.summary.temporal_periods) |periods| {
-            if (!appParityPlanHasExactUsizeToken(entry.plan, ":periods=", periods) and
-                !appParityPlanHasExactUsizeToken(entry.plan, ":add_period=", periods))
-            {
-                return error.TestUnexpectedResult;
-            }
-        }
-        if (entry.summary.temporal_primary_key) |has_temporal_primary_key| {
-            if (!appParityPlanHasExactBoolToken(entry.plan, ":temporal_pk=", has_temporal_primary_key)) {
-                return error.TestUnexpectedResult;
-            }
-        }
-        if (entry.summary.temporal_unique) |temporal_unique| {
-            if (!appParityPlanHasExactUsizeToken(entry.plan, ":temporal_unique=", temporal_unique) and
-                !(temporal_unique == 1 and appParityPlanHasExactBoolToken(entry.plan, ":temporal_unique=", true)))
-            {
-                return error.TestUnexpectedResult;
-            }
-        }
-        if (entry.summary.temporal_foreign_keys) |temporal_foreign_keys| {
-            if (!appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", temporal_foreign_keys)) {
-                return error.TestUnexpectedResult;
-            }
-        }
-    }
-    if (entry.applied_plan.len > 0 and entry.family != .ddl) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.applied_plan.len > 0 and !appParityAppliedPlanIsStructured(entry.applied_plan)) {
-        return error.TestUnexpectedResult;
-    }
+    try sql_adapter.validateFixtureMetadataCore(entry);
     if (entry.applied_plan.len > 0 and !(try appParityFixtureAppliedPlanMatchesDerived(alloc, base_schema_json, entry))) {
         return error.TestUnexpectedResult;
     }
     if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.apply_setup_sql.len > 0 and !appParityFixtureFamilyAllowsSetupSql(entry.family)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.family == .ddl and entry.apply_setup_sql.len > 0 and entry.applied_plan.len == 0) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.source_schema_json.len > 0 and !appParityFixtureFamilyAllowsSourceSchema(entry.family)) {
         return error.TestUnexpectedResult;
     }
     if (entry.source_schema_json.len > 0 and !(try appParitySourceSchemaJsonIsValid(alloc, entry.source_schema_json))) {
@@ -60897,58 +58332,15 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
         if (entry.summary.table_name) |target_table_name| {
             if (std.mem.eql(u8, source_table_name, target_table_name)) return error.TestUnexpectedResult;
         }
-        if (!appParityFixturePlanMatchesSourceTable(entry, source_table_name)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.returning_rows.len > 0 and !appParityFixtureFamilyAllowsReturningRows(entry.family)) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.returning_rows.len > 0) {
-        if (entry.summary.returning == null or entry.summary.returning.? != entry.returning_rows.len) {
-            return error.TestUnexpectedResult;
-        }
-        if (!appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", entry.returning_rows.len)) {
+        if (!sql_adapter.corpusFixturePlanMatchesSourceTable(entry, source_table_name)) {
             return error.TestUnexpectedResult;
         }
     }
     for (entry.returning_rows) |returning_row| {
         if (!(try appParityJsonTextIsObject(alloc, returning_row))) return error.TestUnexpectedResult;
     }
-    if (!appParityFixtureSqlParameterCoverageMatches(entry)) {
-        return error.TestUnexpectedResult;
-    }
-    const has_resolver_hint = entry.resolver_row_json.len > 0 or
-        entry.resolver_version != 0 or
-        entry.resolver_exists != null;
-    if (has_resolver_hint and !appParityFixtureFamilyAllowsResolverHint(entry.family)) {
-        return error.TestUnexpectedResult;
-    }
-    if (has_resolver_hint and
-        (entry.family == .insert or entry.family == .unsupported_insert) and
-        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") == null)
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.resolver_row_json.len > 0 and entry.resolver_version == 0) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.resolver_row_json.len == 0 and entry.resolver_version != 0) {
-        return error.TestUnexpectedResult;
-    }
     if (entry.resolver_row_json.len > 0 and !(try appParityJsonTextIsObject(alloc, entry.resolver_row_json))) {
         return error.TestUnexpectedResult;
-    }
-    if (entry.resolver_exists == false and
-        (entry.resolver_row_json.len > 0 or entry.resolver_version != 0))
-    {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.resolver_exists == true and entry.resolver_row_json.len == 0) {
-        return error.TestUnexpectedResult;
-    }
-    if (try appParityDdlFixtureRequiresAppliedPlan(entry)) {
-        if (entry.applied_plan.len == 0) return error.TestUnexpectedResult;
     }
     if (seen_names.contains(entry.name)) return error.TestUnexpectedResult;
     try seen_names.put(alloc, entry.name, {});
@@ -62429,512 +59821,6 @@ test "app parity fixture metadata requires typed summary anchors" {
     }, &seen, alloc);
 }
 
-fn appParityPlanScanUsizeToken(plan: []const u8, token: []const u8) sql_adapter.PlanUsizeTokenScan {
-    return sql_adapter.scanUsizeToken(plan, token);
-}
-
-fn appParityPlanUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
-    return sql_adapter.planUsizeTokenValue(plan, token);
-}
-
-fn appParityPlanHasNonZeroToken(plan: []const u8, token: []const u8) bool {
-    return sql_adapter.planHasNonZeroToken(plan, token);
-}
-
-fn appParityPlanHasNonZeroUsizeTokenNamePrefix(plan: []const u8, name_prefix: []const u8) bool {
-    return sql_adapter.planHasNonZeroUsizeTokenNamePrefix(plan, name_prefix);
-}
-
-fn appParityPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
-    return sql_adapter.planHasExactUsizeToken(plan, token, expected);
-}
-
-fn appParityPlanUsizeOptionalTokenValue(plan: []const u8, token: []const u8) ?usize {
-    return sql_adapter.planUsizeOptionalTokenValue(plan, token);
-}
-
-fn appParityPlanUsizeTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    return sql_adapter.planUsizeTokenSumMatches(plan, tokens, expected);
-}
-
-fn appParityPlanUsizeOptionalTokenSumMatches(plan: []const u8, tokens: []const []const u8, expected: usize) bool {
-    return sql_adapter.planUsizeOptionalTokenSumMatches(plan, tokens, expected);
-}
-
-fn appParityPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
-    return sql_adapter.planHasExactBoolToken(plan, token, expected);
-}
-
-fn appParityPlanScanStringToken(plan: []const u8, token: []const u8) sql_adapter.PlanStringTokenScan {
-    return sql_adapter.scanStringToken(plan, token);
-}
-
-fn appParityPlanHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
-    return sql_adapter.planHasExactStringToken(plan, token, expected);
-}
-
-fn appParityPlanHasStringToken(plan: []const u8, token: []const u8) bool {
-    return sql_adapter.planHasStringToken(plan, token);
-}
-
-fn appParityPlanTokenAbsent(plan: []const u8, token: []const u8) bool {
-    return sql_adapter.planTokenAbsent(plan, token);
-}
-
-fn appParityPlanHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_values: []const []const u8) bool {
-    return sql_adapter.planHasAnyExactStringToken(plan, token, expected_values);
-}
-
-fn appParityExplainPlanHasKind(plan: []const u8, expected: []const u8) bool {
-    return appParityPlanHasExactStringToken(plan, "explain:kind=", expected);
-}
-
-fn appParityExplainPlanInnerStartsWith(plan: []const u8, inner_prefix: []const u8) bool {
-    const inner_token = ":inner=";
-    const inner_index = std.mem.indexOf(u8, plan, inner_token) orelse return false;
-    if (std.mem.indexOfPos(u8, plan, inner_index + inner_token.len, inner_token) != null) return false;
-    return std.mem.startsWith(u8, plan[inner_index + inner_token.len ..], inner_prefix);
-}
-
-fn appParityJoinedSourcePlanHasCounts(plan: []const u8, right_predicates: usize, join_keys: usize) bool {
-    return appParityPlanHasExactUsizeToken(plan, ":right_pred=", right_predicates) and
-        appParityPlanHasExactUsizeToken(plan, ":on=", join_keys);
-}
-
-fn appParityWritePlanHasCounts(plan: []const u8, writes: usize, transforms: usize) bool {
-    return appParityPlanHasExactUsizeToken(plan, ":writes=", writes) and
-        appParityPlanHasExactUsizeToken(plan, ":transforms=", transforms);
-}
-
-fn appParityAppliedPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
-    return appParityAppliedPlanIsStructured(plan) and
-        appParityPlanHasExactBoolToken(plan, token, expected);
-}
-
-fn appParityAppliedPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
-    return appParityAppliedPlanIsStructured(plan) and
-        appParityPlanHasExactUsizeToken(plan, token, expected);
-}
-
-fn appParityPlanHasAnyNonZeroToken(plan: []const u8, tokens: []const []const u8) bool {
-    return sql_adapter.planHasAnyNonZeroToken(plan, tokens);
-}
-
-fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| {
-        if (std.mem.indexOf(u8, value, needle) != null) return true;
-    }
-    return false;
-}
-
-test "app parity applied plan coverage tokens are exact" {
-    const plan = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=10:unvalidated_fk=1:unvalidated_check=0:update_policy=0";
-    try std.testing.expect(appParityAppliedPlanHasExactBoolToken(plan, "rebuild=", true));
-    try std.testing.expect(appParityAppliedPlanHasExactBoolToken(plan, "validation=", false));
-    try std.testing.expect(appParityAppliedPlanHasExactUsizeToken(plan, "unvalidated_unique=", 10));
-    try std.testing.expect(!appParityAppliedPlanHasExactUsizeToken(plan, "unvalidated_unique=", 1));
-    try std.testing.expect(!appParityAppliedPlanHasExactBoolToken("applied:rebuild=true:rewrite=false", "rebuild=", true));
-}
-
-test "app parity claim coverage tokens are exact" {
-    const no_key_nowait = "query:table=usage_records:claim=no_key_update_nowait:pred=0:select=1:order=0:limit=none";
-    try std.testing.expect(appParityPlanHasExactStringToken(no_key_nowait, ":claim=", "no_key_update_nowait"));
-    try std.testing.expect(!appParityPlanHasExactStringToken(no_key_nowait, ":claim=", "no_key_update"));
-    try std.testing.expect(appParityPlanHasAnyExactStringToken(no_key_nowait, ":claim=", &.{
-        "no_key_update",
-        "no_key_update_nowait",
-    }));
-}
-
-test "app parity create table empty-catalog detection uses exact bool tokens" {
-    try std.testing.expect(try appParityDdlFixtureAppliesFromEmptyCatalog(.{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:pk=1",
-    }));
-    try std.testing.expect(!try appParityDdlFixtureAppliesFromEmptyCatalog(.{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=true:pk=1",
-    }));
-    try std.testing.expect(!try appParityDdlFixtureAppliesFromEmptyCatalog(.{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
-    }));
-    try std.testing.expect(try appParityDdlFixtureAppliesFromEmptyCatalog(.{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=true_extra:pk=1",
-    }));
-}
-
-test "app parity ddl submode coverage tokens are exact" {
-    const comment = "ddl:comment:kind=table_extra:object=users:comment=true";
-    try std.testing.expect(!appParityPlanHasExactStringToken(comment, ":kind=", "table"));
-    try std.testing.expect(appParityPlanHasExactStringToken(comment, ":kind=", "table_extra"));
-
-    const transaction = "ddl:transaction_control:kind=transaction_mode:starter=start_transaction_extra:isolation=serializable:access=none:deferrable=none";
-    try std.testing.expect(!appParityPlanHasExactStringToken(transaction, ":starter=", "start_transaction"));
-    try std.testing.expect(appParityPlanHasExactStringToken(transaction, ":starter=", "start_transaction_extra"));
-
-    const population = "relation_population:mode=create_table_as_extra:target=usage_archive:lifetime=durable:if_not_exists=false:source=read:query:query:table=usage_records";
-    try std.testing.expect(!appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as"));
-    try std.testing.expect(appParityPlanHasExactStringToken(population, "relation_population:mode=", "create_table_as_extra"));
-}
-
-test "app parity ddl boolean coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true_extra",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_function },
-        .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true_extra:returns=trigger:language=plpgsql",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .drop_table },
-        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true_extra",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=10",
-        .sql = "TRUNCATE usage_records RESTART IDENTITY",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records_extra:source_pred=0:source_order=0:source_limit=-1:claim=locked",
-        .sql = "TRUNCATE usage_records CONTINUE IDENTITY",
-    });
-
-    try std.testing.expect(!coverage.ddl_replace_table);
-    try std.testing.expect(!coverage.ddl_function_replace);
-    try std.testing.expect(!coverage.ddl_drop_table_cascade);
-    try std.testing.expect(!coverage.truncate_restart_identity);
-    try std.testing.expect(!coverage.truncate_continue_identity);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_function },
-        .plan = "ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .drop_table },
-        .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=true",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=1",
-        .sql = "TRUNCATE usage_records RESTART IDENTITY",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .truncate_source,
-        .plan = "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked",
-        .sql = "TRUNCATE usage_records CONTINUE IDENTITY",
-    });
-
-    try std.testing.expect(coverage.ddl_replace_table);
-    try std.testing.expect(coverage.ddl_function_replace);
-    try std.testing.expect(coverage.ddl_drop_table_cascade);
-    try std.testing.expect(coverage.truncate_restart_identity);
-    try std.testing.expect(coverage.truncate_continue_identity);
-}
-
-test "app parity count coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .aggregate,
-        .plan = "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0x:agg_expr=0:filter_expr=0:having=0:order=0:limit=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
-        .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1x",
-    });
-
-    try std.testing.expect(!coverage.aggregate_distinct_group_projection);
-    try std.testing.expect(!coverage.ddl_temporal_fk_delete_set_null_action);
-    try std.testing.expect(!coverage.ddl_temporal_fk_delete_cascade_action);
-    try std.testing.expect(!coverage.ddl_temporal_table);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .aggregate,
-        .plan = "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0:agg_expr=0:filter_expr=0:having=0:order=0:limit=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
-        .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .ddl,
-        .summary = .{ .ddl_tag = .create_table },
-        .sql = "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
-        .plan = "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1",
-    });
-
-    try std.testing.expect(coverage.aggregate_distinct_group_projection);
-    try std.testing.expect(coverage.ddl_temporal_fk_delete_set_null_action);
-    try std.testing.expect(coverage.ddl_temporal_fk_delete_cascade_action);
-    try std.testing.expect(coverage.ddl_temporal_table);
-}
-
-test "app parity table coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
-        .plan = "insert:table=products_extra:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
-        .apply_setup_sql = &.{"CREATE TABLE products (id text PRIMARY KEY)"},
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert_source,
-        .source_schema_json = "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}",
-        .plan = "insert_source:table=usage_records:source_table=archived_records_extra:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(!coverage.schema_temporal_open_daterange_insert);
-    try std.testing.expect(!coverage.insert_source_cross_table_source_schema);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert,
-        .sql = "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
-        .plan = "insert:table=products:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
-        .apply_setup_sql = &.{"CREATE TABLE products (id text PRIMARY KEY)"},
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .insert_source,
-        .source_schema_json = "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}",
-        .plan = "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(coverage.schema_temporal_open_daterange_insert);
-    try std.testing.expect(coverage.insert_source_cross_table_source_schema);
-}
-
-test "app parity pagination coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .query,
-        .sql = "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
-        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=50:claim=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .query,
-        .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
-        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=10:claim=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_source,
-        .sql = "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
-        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-10:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(!coverage.query_set_operation_order_limit);
-    try std.testing.expect(!coverage.set_operation_fetch_tail);
-    try std.testing.expect(!coverage.update_source_nullable_pagination);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .query,
-        .sql = "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
-        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .query,
-        .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
-        .plan = "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=1:claim=none",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_source,
-        .sql = "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
-        .plan = "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(coverage.query_set_operation_order_limit);
-    try std.testing.expect(coverage.set_operation_fetch_tail);
-    try std.testing.expect(coverage.update_source_nullable_pagination);
-}
-
-test "app parity joined source count coverage tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_joined_source,
-        .sql = "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
-        .plan = "update_joined_source:table=usage_records:source=archived_records:right_pred=0x:on=1:ops=1:returning=0:returning_expr=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .delete_joined_source,
-        .sql = "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
-        .plan = "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=20:returning=0:returning_expr=0",
-    });
-
-    try std.testing.expect(!coverage.update_joined_source_non_primary_semijoin);
-    try std.testing.expect(!coverage.delete_joined_source_correlated_semijoin);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_joined_source,
-        .sql = "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
-        .plan = "update_joined_source:table=usage_records:source=archived_records:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .delete_joined_source,
-        .sql = "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
-        .plan = "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=2:returning=0:returning_expr=0",
-    });
-
-    try std.testing.expect(coverage.update_joined_source_non_primary_semijoin);
-    try std.testing.expect(coverage.delete_joined_source_correlated_semijoin);
-}
-
-test "app parity CTE chain coverage count tokens are exact" {
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .query,
-        .sql = "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
-        .plan = "query:table=usage_records:ctes=20:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none",
-    });
-
-    try std.testing.expect(!coverage.query_cte_chain);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .query,
-        .sql = "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
-        .plan = "query:table=usage_records:ctes=2:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none",
-    });
-
-    try std.testing.expect(coverage.query_cte_chain);
-}
-
-test "app parity cross-table source schema table tokens are exact" {
-    const source_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_joined_source,
-        .source_schema_json = source_schema,
-        .plan = "update_joined_source:target=usage_records:source=source_records_extra:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .join,
-        .source_schema_json = source_schema,
-        .plan = "join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .lateral,
-        .source_schema_json = source_schema,
-        .plan = "lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .merge_mutation,
-        .source_schema_json = source_schema,
-        .plan = "merge_mutation:target=usage_records:source=archived_records_extra:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(!coverage.joined_source_cross_table_source_schema);
-    try std.testing.expect(!coverage.read_join_cross_table_source_schema);
-    try std.testing.expect(!coverage.read_lateral_cross_table_source_schema);
-    try std.testing.expect(!coverage.merge_cross_table_source_schema);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .update_joined_source,
-        .source_schema_json = source_schema,
-        .plan = "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .join,
-        .source_schema_json = source_schema,
-        .plan = "join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .lateral,
-        .source_schema_json = source_schema,
-        .plan = "lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .merge_mutation,
-        .source_schema_json = source_schema,
-        .plan = "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
-    });
-
-    try std.testing.expect(coverage.joined_source_cross_table_source_schema);
-    try std.testing.expect(coverage.read_join_cross_table_source_schema);
-    try std.testing.expect(coverage.read_lateral_cross_table_source_schema);
-    try std.testing.expect(coverage.merge_cross_table_source_schema);
-}
-
-test "app parity read cross-table source schema table tokens are exact" {
-    const source_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var coverage = AppParityCorpusCoverage{};
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:join:join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:lateral:lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-
-    try std.testing.expect(!coverage.read_join_cross_table_source_schema_classifier);
-    try std.testing.expect(!coverage.read_lateral_cross_table_source_schema_classifier);
-
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:join:join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
-    });
-    try coverage.observe(std.testing.allocator, .{
-        .family = .read,
-        .source_schema_json = source_schema,
-        .plan = "read:lateral:lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
-    });
-
-    try std.testing.expect(coverage.read_join_cross_table_source_schema_classifier);
-    try std.testing.expect(coverage.read_lateral_cross_table_source_schema_classifier);
-}
-
 test "app parity structured side-access coverage tokens are exact" {
     var coverage = AppParityCorpusCoverage{};
 
@@ -62983,10 +59869,10 @@ test "app parity insert-source assignment expression coverage tokens are exact" 
 
 test "app parity cte coverage tokens are exact" {
     const malformed = "query:table=usage_records:ctes=1:cte0_expr_pred=2x";
-    try std.testing.expect(!appParityPlanHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_"));
-    try std.testing.expect(!appParityPlanHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_expr_"));
-    try std.testing.expect(!appParityPlanHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=0", "cte0_expr_"));
-    try std.testing.expect(appParityPlanHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=2", "cte0_expr_"));
+    try std.testing.expect(!sql_adapter.planHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_"));
+    try std.testing.expect(!sql_adapter.planHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_expr_"));
+    try std.testing.expect(!sql_adapter.planHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=0", "cte0_expr_"));
+    try std.testing.expect(sql_adapter.planHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=2", "cte0_expr_"));
 
     var coverage = AppParityCorpusCoverage{};
     try coverage.observe(std.testing.allocator, .{
@@ -63098,2682 +59984,7 @@ test "app parity temporal conflict transform count coverage tokens are exact" {
     try std.testing.expect(coverage.schema_temporal_unique_conflict_upsert);
 }
 
-test "app parity explain coverage tokens are exact" {
-    const write_suffix = AppParityCorpusEntry{
-        .family = .explain,
-        .summary = .{ .returning = 1 },
-        .plan = "explain:kind=write_extra:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
-    };
-    try std.testing.expect(!appParityExplainPlanHasKind(write_suffix.plan, "write"));
-    try std.testing.expect(!appParityFixtureAllowsReturningSummary(write_suffix));
-    try std.testing.expect(!appParityExplainWriteInnerHasPrefix(write_suffix, ":inner=insert:"));
-
-    const duplicate_inner = AppParityCorpusEntry{
-        .family = .explain,
-        .summary = .{ .returning = 1 },
-        .plan = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:inner=update_source:table=usage_records",
-    };
-    try std.testing.expect(!appParityExplainWriteInnerHasPrefix(duplicate_inner, ":inner=insert:"));
-
-    const read_suffix = AppParityCorpusEntry{
-        .family = .explain,
-        .plan = "explain:kind=read_extra:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=0:select=1:order=0:limit=none:claim=none",
-    };
-    try std.testing.expect(!appParityReadPlanHasPrefix(read_suffix, "read:query:"));
-
-    const read_stray_prefix = AppParityCorpusEntry{
-        .family = .explain,
-        .plan = "explain:kind=read:analyze=false:detail=read:query:inner=read:join:join:type=inner:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=none",
-    };
-    try std.testing.expect(!appParityReadPlanHasPrefix(read_stray_prefix, "read:query:"));
-
-    const options = "explain:kind=read:analyze=true_extra:inner=read:query:query:table=usage_records:format=:verbose=1:costs=0";
-    try std.testing.expect(appParityExplainPlanHasKind(options, "read"));
-    try std.testing.expect(!appParityPlanHasExactBoolToken(options, ":analyze=", true));
-    try std.testing.expect(!appParityPlanHasStringToken(options, ":format="));
-    try std.testing.expect(appParityPlanUsizeTokenValue(options, ":verbose=") != null);
-    try std.testing.expect(appParityPlanUsizeTokenValue(options, ":costs=") != null);
-}
-
-fn appParitySqlHasComputedPattern(sql: []const u8) bool {
-    return std.mem.indexOf(u8, sql, "lower(") != null and
-        (std.mem.indexOf(u8, sql, " LIKE ") != null or std.mem.indexOf(u8, sql, " ILIKE ") != null);
-}
-
-const AppParityCorpusCoverage = struct {
-    ddl: bool = false,
-    ddl_table_clone: bool = false,
-    ddl_view_create: bool = false,
-    ddl_view_rename: bool = false,
-    ddl_view_drop: bool = false,
-    ddl_materialized_view_create: bool = false,
-    ddl_materialized_view_refresh: bool = false,
-    ddl_materialized_view_drop: bool = false,
-    ddl_relation_lifetime_temporary: bool = false,
-    ddl_relation_lifetime_unlogged: bool = false,
-    ddl_enum_type_create: bool = false,
-    ddl_enum_type_add_value: bool = false,
-    ddl_enum_type_drop: bool = false,
-    ddl_domain_create: bool = false,
-    ddl_domain_alter: bool = false,
-    ddl_domain_drop: bool = false,
-    ddl_sequence_create: bool = false,
-    ddl_sequence_create_typed_owned: bool = false,
-    ddl_sequence_alter: bool = false,
-    ddl_sequence_alter_typed_owned: bool = false,
-    ddl_sequence_drop: bool = false,
-    ddl_identity_allocator_serial: bool = false,
-    ddl_identity_allocator_generated: bool = false,
-    ddl_identity_allocator_generated_options: bool = false,
-    ddl_schema_namespace_create: bool = false,
-    ddl_schema_namespace_rename: bool = false,
-    ddl_schema_namespace_drop: bool = false,
-    ddl_extension_create: bool = false,
-    ddl_function_create: bool = false,
-    ddl_function_replace: bool = false,
-    ddl_function_drop: bool = false,
-    ddl_procedure_create: bool = false,
-    ddl_procedure_drop: bool = false,
-    ddl_role_create: bool = false,
-    ddl_role_alter: bool = false,
-    ddl_role_drop: bool = false,
-    ddl_privilege_grant: bool = false,
-    ddl_privilege_revoke: bool = false,
-    ddl_copy_from: bool = false,
-    ddl_copy_to: bool = false,
-    ddl_partition_create_parent: bool = false,
-    ddl_partition_create_child: bool = false,
-    ddl_partition_attach: bool = false,
-    ddl_partition_detach: bool = false,
-    ddl_row_security_enable: bool = false,
-    ddl_row_security_disable: bool = false,
-    ddl_row_security_create_policy: bool = false,
-    ddl_row_security_drop_policy: bool = false,
-    ddl_database_create: bool = false,
-    ddl_database_alter: bool = false,
-    ddl_database_drop: bool = false,
-    ddl_tablespace_create: bool = false,
-    ddl_tablespace_rename: bool = false,
-    ddl_tablespace_drop: bool = false,
-    ddl_notification_listen: bool = false,
-    ddl_notification_notify: bool = false,
-    ddl_notification_unlisten: bool = false,
-    ddl_publication_create: bool = false,
-    ddl_publication_alter: bool = false,
-    ddl_publication_drop: bool = false,
-    ddl_subscription_create: bool = false,
-    ddl_subscription_alter: bool = false,
-    ddl_subscription_drop: bool = false,
-    ddl_collation_create: bool = false,
-    ddl_collation_rename: bool = false,
-    ddl_collation_drop: bool = false,
-    ddl_operator_create: bool = false,
-    ddl_operator_drop: bool = false,
-    ddl_aggregate_create: bool = false,
-    ddl_aggregate_drop: bool = false,
-    ddl_cast_create: bool = false,
-    ddl_cast_drop: bool = false,
-    ddl_vacuum_maintenance: bool = false,
-    ddl_analyze_maintenance: bool = false,
-    ddl_reindex_maintenance: bool = false,
-    ddl_cluster_maintenance: bool = false,
-    ddl_prepare_statement: bool = false,
-    ddl_execute_statement: bool = false,
-    ddl_deallocate_statement: bool = false,
-    ddl_declare_cursor: bool = false,
-    ddl_fetch_cursor: bool = false,
-    ddl_close_cursor: bool = false,
-    ddl_savepoint_transaction: bool = false,
-    ddl_release_savepoint: bool = false,
-    ddl_rollback_to_savepoint: bool = false,
-    ddl_comment_table: bool = false,
-    ddl_comment_column: bool = false,
-    ddl_comment_index: bool = false,
-    ddl_comment_constraint: bool = false,
-    ddl_table_lock: bool = false,
-    ddl_constraint_mode: bool = false,
-    ddl_set_transaction_mode: bool = false,
-    ddl_start_transaction_mode: bool = false,
-    ddl_begin_transaction_mode: bool = false,
-    ddl_advisory_lock: bool = false,
-    ddl_advisory_unlock: bool = false,
-    read: bool = false,
-    read_query: bool = false,
-    read_aggregate: bool = false,
-    read_join: bool = false,
-    read_lateral: bool = false,
-    read_window: bool = false,
-    read_cte_query_expression: bool = false,
-    read_cte_aggregate_expression: bool = false,
-    read_cte_window_expression: bool = false,
-    read_join_cross_table_source_schema_classifier: bool = false,
-    read_lateral_cross_table_source_schema_classifier: bool = false,
-    query: bool = false,
-    aggregate: bool = false,
-    join: bool = false,
-    lateral: bool = false,
-    window: bool = false,
-    explain: bool = false,
-    explain_options: bool = false,
-    explain_analyze: bool = false,
-    explain_write: bool = false,
-    relation_population_select_into: bool = false,
-    relation_population_create_table_as: bool = false,
-    insert: bool = false,
-    insert_source: bool = false,
-    insert_source_expression_assignment: bool = false,
-    insert_source_regexp_expression_assignment: bool = false,
-    insert_source_computed_pattern_source: bool = false,
-    insert_source_expression_or_source: bool = false,
-    insert_source_expression_not_source: bool = false,
-    insert_source_returning_all_expression: bool = false,
-    insert_source_conflict_default_update: bool = false,
-    insert_source_conflict_json_set_expression: bool = false,
-    insert_source_conflict_regexp_expression: bool = false,
-    insert_source_conflict_boolean_is_not_guard: bool = false,
-    update: bool = false,
-    delete: bool = false,
-    update_source: bool = false,
-    delete_source: bool = false,
-    truncate_source: bool = false,
-    update_joined_source: bool = false,
-    update_joined_source_cte_mutation: bool = false,
-    delete_joined_source: bool = false,
-    delete_joined_source_cte_mutation: bool = false,
-    adapter_noop_ddl: bool = false,
-    unsupported_query: bool = false,
-    unsupported_read: bool = false,
-    unsupported_ddl: bool = false,
-    ddl_temporal_fk_delete_set_null_action: bool = false,
-    ddl_temporal_fk_delete_cascade_action: bool = false,
-    unsupported_ddl_temporal_fk_update_action: bool = false,
-    unsupported_write: bool = false,
-    unsupported_insert: bool = false,
-    unsupported_update: bool = false,
-    unsupported_update_source: bool = false,
-    unsupported_delete: bool = false,
-    unsupported_update_joined_source: bool = false,
-    unsupported_delete_joined_source: bool = false,
-    unsupported_merge_mutation: bool = false,
-    unsupported_query_recursive_cte_stream_plan: bool = false,
-    unsupported_query_set_operation_plan: bool = false,
-    query_calendar_interval_expression: bool = false,
-    unsupported_read_recursive_cte_stream_plan: bool = false,
-    unsupported_read_duplicate_output_name: bool = false,
-    unsupported_read_aggregate_duplicate_output_name: bool = false,
-    unsupported_read_set_operation_union: bool = false,
-    unsupported_read_set_operation_intersect: bool = false,
-    unsupported_read_set_operation_except: bool = false,
-    read_row_lock_nowait: bool = false,
-    read_row_lock_share: bool = false,
-    read_row_lock_key_share: bool = false,
-    query_row_lock_no_key_update: bool = false,
-    merge_mutation_typed_plan: bool = false,
-    merge_mutation_default_expressions: bool = false,
-    unsupported_write_truncate_multi_table: bool = false,
-    unsupported_write_truncate_cascade: bool = false,
-    truncate_continue_identity: bool = false,
-    truncate_restart_identity: bool = false,
-    update_source_claim_nowait: bool = false,
-    update_source_claim_no_key_update: bool = false,
-    unsupported_read_row_lock_target: bool = false,
-    unsupported_update_source_row_lock_target: bool = false,
-    unsupported_update_joined_source_row_lock_target: bool = false,
-    unsupported_merge_mutation_cte: bool = false,
-    update_identity_rewrite: bool = false,
-    unsupported_update_non_unique_point_selector: bool = false,
-    unsupported_delete_non_unique_point_selector: bool = false,
-    unsupported_delete_multi_output_subquery_selector: bool = false,
-    unsupported_update_joined_multi_output_subquery_selector: bool = false,
-    unsupported_delete_joined_multi_output_subquery_selector: bool = false,
-    insert_source_cross_table_source_schema: bool = false,
-    joined_source_cross_table_source_schema: bool = false,
-    read_join_cross_table_source_schema: bool = false,
-    read_lateral_cross_table_source_schema: bool = false,
-    merge_cross_table_source_schema: bool = false,
-    scalar_membership: bool = false,
-    boolean_is_predicate: bool = false,
-    boolean_is_not_predicate: bool = false,
-    boolean_unknown_predicate: bool = false,
-    postfix_null_test_predicate: bool = false,
-    expression_postfix_null_test_predicate: bool = false,
-    json_access_path: bool = false,
-    array_access_path: bool = false,
-    text_pattern: bool = false,
-    query_access_or_predicates: bool = false,
-    query_array_overlap_access_or: bool = false,
-    query_access_not_predicates: bool = false,
-    expression_predicate: bool = false,
-    query_computed_pattern_predicate: bool = false,
-    mixed_scalar_expression_or: bool = false,
-    expression_order: bool = false,
-    query_order_using_operator: bool = false,
-    aggregate_order_using_operator: bool = false,
-    join_order_using_operator: bool = false,
-    lateral_order_using_operator: bool = false,
-    window_order_using_operator: bool = false,
-    update_source_order_using_operator: bool = false,
-    delete_source_order_using_operator: bool = false,
-    query_fixed_interval_expression: bool = false,
-    query_mixed_interval_expression: bool = false,
-    query_now_expression: bool = false,
-    query_current_timestamp_expression: bool = false,
-    query_current_timestamp_precision_expression: bool = false,
-    query_current_date_expression: bool = false,
-    query_uuid_generation_expression: bool = false,
-    query_uuid_generate_v4_expression: bool = false,
-    cte_stream: bool = false,
-    cte_query: bool = false,
-    cte_aggregate: bool = false,
-    cte_window: bool = false,
-    catalog_setup_sql: bool = false,
-    applied_catalog_plan: bool = false,
-    applied_catalog_rebuild: bool = false,
-    applied_catalog_validation: bool = false,
-    applied_catalog_rewrite: bool = false,
-    deterministic_returning_rows: usize = 0,
-    deterministic_insert_returning_rows: bool = false,
-    deterministic_update_returning_rows: bool = false,
-    deterministic_delete_returning_rows: bool = false,
-    insert_typed_datetime_literal: bool = false,
-    returning_all_insert: bool = false,
-    returning_all_update: bool = false,
-    returning_all_delete: bool = false,
-    returning_all_update_source: bool = false,
-    returning_all_delete_source: bool = false,
-    returning_all_update_joined_source: bool = false,
-    returning_all_delete_joined_source: bool = false,
-    conflict_do_nothing_returning_all: bool = false,
-    conflict_do_update: bool = false,
-    conflict_default_update: bool = false,
-    conflict_coalesce_existing_update: bool = false,
-    conflict_numeric_expression_update: bool = false,
-    conflict_case_expression_update: bool = false,
-    conflict_current_timestamp_precision: bool = false,
-    conflict_current_date_update: bool = false,
-    conflict_uuid_generation_update: bool = false,
-    conflict_text_expression_update: bool = false,
-    conflict_octet_length_expression_update: bool = false,
-    conflict_bit_length_expression_update: bool = false,
-    conflict_regexp_replace_expression_update: bool = false,
-    conflict_regexp_match_expression_update: bool = false,
-    conflict_regexp_count_expression_update: bool = false,
-    conflict_regexp_instr_expression_update: bool = false,
-    conflict_regexp_substr_expression_update: bool = false,
-    conflict_jsonb_update: bool = false,
-    conflict_jsonb_concat_update: bool = false,
-    conflict_guard_where: bool = false,
-    conflict_guard_where_skip: bool = false,
-    conflict_returning_expression: bool = false,
-    conflict_interval_update: bool = false,
-    conflict_mixed_interval_update: bool = false,
-    conflict_row_assignment: bool = false,
-    conflict_row_assignment_default: bool = false,
-    conflict_row_assignment_constructor: bool = false,
-    conflict_boolean_expression_update: bool = false,
-    update_source_boolean_expression_update: bool = false,
-    update_joined_source_boolean_expression_update: bool = false,
-    multi_row_insert: bool = false,
-    multi_row_conflict_do_nothing: bool = false,
-    multi_row_conflict_do_nothing_duplicate_target: bool = false,
-    write_plan_insert_op_set: bool = false,
-    write_plan_insert_op_inc: bool = false,
-    write_plan_update_op_set: bool = false,
-    write_plan_update_op_push: bool = false,
-    write_plan_update_op_pull: bool = false,
-    point_update_jsonb: bool = false,
-    point_update_jsonb_concat: bool = false,
-    point_update_array: bool = false,
-    point_update_uuid_generation: bool = false,
-    point_update_patch_expression: bool = false,
-    update_source_claim_skip_locked: bool = false,
-    update_source_pagination: bool = false,
-    update_source_nullable_pagination: bool = false,
-    update_source_boolean_is_not_predicate: bool = false,
-    update_source_returning_expression: bool = false,
-    point_update_expression_partial_unique_selector: bool = false,
-    point_delete_expression_partial_unique_selector: bool = false,
-    delete_source_fetch_pagination: bool = false,
-    delete_source_nullable_pagination: bool = false,
-    delete_source_boolean_unknown_predicate: bool = false,
-    delete_source_returning_expression: bool = false,
-    joined_source_ordered_pagination: bool = false,
-    joined_source_expression_predicate: bool = false,
-    joined_source_expression_group: bool = false,
-    joined_source_expression_array: bool = false,
-    joined_source_returning_expression: bool = false,
-    joined_source_returning_source_field: bool = false,
-    joined_source_returning_source_expression: bool = false,
-    update_joined_source_returning_source_expression: bool = false,
-    delete_joined_source_returning_source_expression: bool = false,
-    update_joined_source_non_primary_semijoin: bool = false,
-    delete_joined_source_non_primary_semijoin: bool = false,
-    update_joined_source_correlated_semijoin: bool = false,
-    delete_joined_source_correlated_semijoin: bool = false,
-    update_joined_source_correlated_filtered_semijoin: bool = false,
-    delete_joined_source_correlated_filtered_semijoin: bool = false,
-    update_joined_source_semijoin_match_expression: bool = false,
-    delete_joined_source_semijoin_match_expression: bool = false,
-    update_joined_source_exists_semijoin: bool = false,
-    delete_joined_source_exists_semijoin: bool = false,
-    update_joined_source_exists_match_expression: bool = false,
-    delete_joined_source_exists_match_expression: bool = false,
-    update_joined_source_row_value_semijoin: bool = false,
-    delete_joined_source_row_value_semijoin: bool = false,
-    update_joined_source_modulo_expression: bool = false,
-    update_joined_source_regexp_expression: bool = false,
-    delete_joined_source_regexp_expression: bool = false,
-    update_joined_source_array_expression: bool = false,
-    delete_joined_source_array_expression: bool = false,
-    update_joined_source_json_expression: bool = false,
-    delete_joined_source_json_expression: bool = false,
-    update_joined_source_row_assignment: bool = false,
-    update_joined_source_row_assignment_default: bool = false,
-    update_joined_source_row_assignment_constructor: bool = false,
-    update_source_patch_expression: bool = false,
-    update_source_increment_expression: bool = false,
-    update_source_modulo_expression: bool = false,
-    update_source_regexp_replace_expression: bool = false,
-    update_source_regexp_match_expression: bool = false,
-    update_source_regexp_count_expression: bool = false,
-    update_source_regexp_instr_expression: bool = false,
-    update_source_regexp_substr_expression: bool = false,
-    update_source_row_assignment: bool = false,
-    update_source_row_assignment_default: bool = false,
-    update_source_row_assignment_constructor: bool = false,
-    schema_default_primary_named_conflict_target: bool = false,
-    schema_custom_primary_named_conflict_target: bool = false,
-    schema_unique_conflict_target: bool = false,
-    schema_partial_unique_conflict_target: bool = false,
-    schema_expression_unique_conflict_target: bool = false,
-    schema_mixed_expression_unique_conflict_target: bool = false,
-    schema_nulls_not_distinct_unique: bool = false,
-    schema_temporal_numrange_insert: bool = false,
-    schema_temporal_daterange_insert: bool = false,
-    schema_temporal_open_daterange_insert: bool = false,
-    schema_temporal_lower_open_daterange_insert: bool = false,
-    schema_temporal_numrange_constructor_insert: bool = false,
-    schema_temporal_daterange_constructor_insert: bool = false,
-    schema_temporal_inclusive_daterange_constructor_insert: bool = false,
-    schema_temporal_inclusive_daterange_literal_insert: bool = false,
-    schema_temporal_lower_exclusive_daterange_constructor_insert: bool = false,
-    schema_temporal_lower_exclusive_daterange_literal_insert: bool = false,
-    schema_temporal_tsrange_insert: bool = false,
-    schema_temporal_tsrange_constructor_insert: bool = false,
-    schema_temporal_tstzrange_insert: bool = false,
-    schema_temporal_tstzrange_constructor_insert: bool = false,
-    schema_temporal_range_bound_query: bool = false,
-    schema_temporal_range_contains_query: bool = false,
-    schema_temporal_range_overlap_query: bool = false,
-    schema_temporal_inclusive_daterange_overlap_query: bool = false,
-    schema_temporal_unique_conflict_upsert: bool = false,
-    schema_temporal_fk_ddl: bool = false,
-    schema_temporal_portion_update: bool = false,
-    schema_temporal_portion_delete: bool = false,
-    schema_temporal_range_column_portion_update: bool = false,
-    schema_temporal_range_column_portion_delete: bool = false,
-    unsupported_ddl_system_time_temporal_table: bool = false,
-    unsupported_duplicate_row_batch_target: bool = false,
-    unsupported_duplicate_conflict_update_target: bool = false,
-    unsupported_invalid_expression_conflict_target: bool = false,
-    unsupported_invalid_named_conflict_target: bool = false,
-    unsupported_unvalidated_unique_conflict_target: bool = false,
-    to_jsonb_value_wrapper: bool = false,
-    to_jsonb_dynamic_expression: bool = false,
-    update_source_json_set_expression: bool = false,
-    update_joined_source_json_set_expression: bool = false,
-    query_substring_expression: bool = false,
-    query_overlay_expression: bool = false,
-    query_translate_expression: bool = false,
-    query_split_part_expression: bool = false,
-    query_strpos_expression: bool = false,
-    query_left_right_expression: bool = false,
-    query_trim_variant_expression: bool = false,
-    query_regexp_replace_expression: bool = false,
-    query_regexp_substr_expression: bool = false,
-    query_regexp_match_expression: bool = false,
-    query_regexp_count_expression: bool = false,
-    query_regexp_instr_expression: bool = false,
-    query_pad_expression: bool = false,
-    query_repeat_expression: bool = false,
-    query_reverse_expression: bool = false,
-    query_initcap_expression: bool = false,
-    query_text_length_expression: bool = false,
-    query_bit_length_expression: bool = false,
-    query_md5_expression: bool = false,
-    query_concat_ws_expression: bool = false,
-    query_nullif_expression: bool = false,
-    query_extremum_expression: bool = false,
-    query_nullable_pagination: bool = false,
-    query_json_build_object_expression: bool = false,
-    query_to_jsonb_expression: bool = false,
-    query_convert_from_jsonb_expression: bool = false,
-    query_cardinality_expression: bool = false,
-    query_array_position_expression: bool = false,
-    query_array_positions_expression: bool = false,
-    query_array_element_transform_expression: bool = false,
-    query_array_to_string_expression: bool = false,
-    query_string_to_array_expression: bool = false,
-    query_starts_with_expression: bool = false,
-    query_ends_with_expression: bool = false,
-    query_ascii_chr_expression: bool = false,
-    query_modulo_expression: bool = false,
-    aggregate_modulo_expression: bool = false,
-    aggregate_octet_length_expression: bool = false,
-    aggregate_bit_length_expression: bool = false,
-    aggregate_scalar_minmax: bool = false,
-    aggregate_regexp_numeric_expression: bool = false,
-    aggregate_regexp_text_expression: bool = false,
-    query_date_trunc_expression: bool = false,
-    query_date_bin_expression: bool = false,
-    query_typed_datetime_literal_expression: bool = false,
-    query_date_part_expression: bool = false,
-    query_date_part_epoch_expression: bool = false,
-    conflict_date_bin_update: bool = false,
-    conflict_typed_datetime_literal_update: bool = false,
-    query_nested_case_fold_text_expression: bool = false,
-    conflict_nested_text_expression_update: bool = false,
-    ddl_create_table: bool = false,
-    ddl_temporal_table: bool = false,
-    ddl_replace_table: bool = false,
-    ddl_create_index: bool = false,
-    ddl_create_covering_index: bool = false,
-    ddl_drop_index: bool = false,
-    ddl_drop_table: bool = false,
-    ddl_drop_table_cascade: bool = false,
-    ddl_alter_table: bool = false,
-    ddl_add_column_default_rewrite: bool = false,
-    ddl_create_update_policy: bool = false,
-    ddl_drop_update_policy: bool = false,
-    ddl_add_unvalidated_unique: bool = false,
-    ddl_add_unvalidated_fk: bool = false,
-    ddl_add_unvalidated_check: bool = false,
-    ddl_validate_constraint: bool = false,
-    ddl_drop_constraint: bool = false,
-    ddl_drop_column: bool = false,
-    ddl_alter_column_default: bool = false,
-    ddl_drop_column_default: bool = false,
-    ddl_alter_column_not_null: bool = false,
-    ddl_drop_column_not_null: bool = false,
-    ddl_alter_column_type: bool = false,
-    ddl_rename_column: bool = false,
-    ddl_rename_constraint: bool = false,
-    adapter_noop_transaction: bool = false,
-    adapter_noop_transaction_commit: bool = false,
-    adapter_noop_transaction_rollback: bool = false,
-    adapter_noop_session: bool = false,
-    adapter_noop_session_probe: bool = false,
-    adapter_noop_schema_namespace: bool = false,
-    adapter_noop_extension: bool = false,
-    adapter_noop_session_discard: bool = false,
-    query_distinct_on: bool = false,
-    query_cte_chain: bool = false,
-    query_cte_structured_access: bool = false,
-    query_cte_expression_access: bool = false,
-    query_set_operation_order_limit: bool = false,
-    read_set_operation_order_limit: bool = false,
-    set_operation_fetch_tail: bool = false,
-    set_operation_null_pagination_tail: bool = false,
-    cte_set_operation_tail: bool = false,
-    set_operation_numeric_range_disjoint: bool = false,
-    set_operation_expression_numeric_range_disjoint: bool = false,
-    aggregate_offset: bool = false,
-    aggregate_input_expression: bool = false,
-    aggregate_group_expression: bool = false,
-    aggregate_group_expression_alias: bool = false,
-    aggregate_having_expression: bool = false,
-    aggregate_having_any: bool = false,
-    aggregate_boolean_having_predicate: bool = false,
-    aggregate_boolean_is_not_having: bool = false,
-    aggregate_filter_expression: bool = false,
-    aggregate_computed_pattern_filter: bool = false,
-    aggregate_filter_groups: bool = false,
-    aggregate_boolean_is_not_filter: bool = false,
-    aggregate_boolean_unknown_filter: bool = false,
-    aggregate_distinct_json_array_expression: bool = false,
-    aggregate_distinct_group_projection: bool = false,
-    aggregate_cte_expression_access: bool = false,
-    join_structured_side_access: bool = false,
-    join_on_side_predicate: bool = false,
-    join_on_preserved_side_predicate: bool = false,
-    join_on_computed_predicate: bool = false,
-    join_computed_pattern_side_filter: bool = false,
-    join_expression_order: bool = false,
-    join_offset: bool = false,
-    lateral_structured_side_access: bool = false,
-    lateral_computed_pattern_side_filter: bool = false,
-    lateral_subquery_match_expression: bool = false,
-    lateral_subquery_match_expression_or: bool = false,
-    lateral_subquery_function_match_expression_or: bool = false,
-    lateral_subquery_match_expression_not: bool = false,
-    lateral_subquery_match_expression_array: bool = false,
-    lateral_expression_order: bool = false,
-    lateral_right_offset: bool = false,
-    window_rich_functions: bool = false,
-    window_source_membership: bool = false,
-    window_mixed_order: bool = false,
-    window_expression_order: bool = false,
-    window_boolean_aggregate_functions: bool = false,
-    window_cte: bool = false,
-    window_cte_expression_access: bool = false,
-    window_offset: bool = false,
-    window_frame_signature: bool = false,
-    window_aggregate_filter: bool = false,
-    window_computed_pattern_filter: bool = false,
-    window_scalar_minmax: bool = false,
-    window_modulo_expression: bool = false,
-    joined_source_computed_pattern_filter: bool = false,
-    parameterized_query: bool = false,
-    parameterized_aggregate: bool = false,
-    parameterized_join: bool = false,
-    parameterized_lateral: bool = false,
-    parameterized_window: bool = false,
-    parameterized_insert: bool = false,
-    parameterized_update: bool = false,
-    parameterized_delete: bool = false,
-    parameterized_update_source: bool = false,
-    parameterized_delete_source: bool = false,
-    parameterized_update_joined_source: bool = false,
-    parameterized_delete_joined_source: bool = false,
-
-    fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
-        const uses_cte_stream = appParityPlanHasNonZeroToken(entry.plan, ":ctes=") or appParityPlanHasNonZeroToken(entry.plan, ":source_cte=");
-        const uses_returning_all = appParityPlanHasNonZeroToken(entry.plan, ":returning_all=");
-        const uses_conflict_where = appParityPlanHasNonZeroToken(entry.plan, ":conflict_where=");
-        const uses_insert_conflict = entry.family == .insert and std.mem.indexOf(u8, entry.sql, "ON CONFLICT") != null;
-        const uses_multi_row_insert = entry.family == .insert and std.mem.indexOf(u8, entry.sql, "), (") != null;
-        const uses_computed_pattern = appParitySqlHasComputedPattern(entry.sql);
-        const is_update_joined_source = entry.family == .update_joined_source;
-        const is_delete_joined_source = entry.family == .delete_joined_source;
-        const is_joined_source = is_update_joined_source or is_delete_joined_source;
-        if (entry.params.len > 0) {
-            switch (entry.family) {
-                .query => self.parameterized_query = true,
-                .aggregate => self.parameterized_aggregate = true,
-                .join => self.parameterized_join = true,
-                .lateral => self.parameterized_lateral = true,
-                .window => self.parameterized_window = true,
-                .insert => self.parameterized_insert = true,
-                .update => self.parameterized_update = true,
-                .delete => self.parameterized_delete = true,
-                .update_source => self.parameterized_update_source = true,
-                .delete_source => self.parameterized_delete_source = true,
-                .update_joined_source => self.parameterized_update_joined_source = true,
-                .delete_joined_source => self.parameterized_delete_joined_source = true,
-                else => {},
-            }
-        }
-        self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or std.mem.indexOf(u8, entry.sql, "to_jsonb(") != null;
-        self.to_jsonb_dynamic_expression = self.to_jsonb_dynamic_expression or
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(lower(") != null or
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(excluded.") != null;
-        self.update_source_json_set_expression = self.update_source_json_set_expression or
-            (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":json_set_expr="));
-        self.update_joined_source_json_set_expression = self.update_joined_source_json_set_expression or
-            (entry.family == .update_joined_source and appParityPlanHasNonZeroToken(entry.plan, ":json_set_expr="));
-        self.point_update_jsonb = self.point_update_jsonb or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "jsonb_") != null);
-        self.point_update_jsonb_concat = self.point_update_jsonb_concat or (entry.family == .update and
-            std.mem.indexOf(u8, entry.sql, "metadata ||") != null and
-            std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.point_update_array = self.point_update_array or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "array_") != null);
-        self.write_plan_insert_op_set = self.write_plan_insert_op_set or (entry.family == .insert and appParityPlanHasNonZeroToken(entry.plan, ":op_set="));
-        self.write_plan_insert_op_inc = self.write_plan_insert_op_inc or (entry.family == .insert and appParityPlanHasNonZeroToken(entry.plan, ":op_inc="));
-        self.write_plan_update_op_set = self.write_plan_update_op_set or (entry.family == .update and appParityPlanHasNonZeroToken(entry.plan, ":op_set="));
-        self.write_plan_update_op_push = self.write_plan_update_op_push or (entry.family == .update and appParityPlanHasNonZeroToken(entry.plan, ":op_push="));
-        self.write_plan_update_op_pull = self.write_plan_update_op_pull or (entry.family == .update and appParityPlanHasNonZeroToken(entry.plan, ":op_pull="));
-        self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null);
-        self.point_update_patch_expression = self.point_update_patch_expression or
-            (entry.family == .update and std.mem.eql(u8, entry.name, "point update expression assignment"));
-        self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and
-            appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "skip_locked", "no_key_update_skip_locked" }));
-        self.update_source_claim_nowait = self.update_source_claim_nowait or (entry.family == .update_source and
-            appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "nowait", "no_key_update_nowait" }));
-        self.update_source_claim_no_key_update = self.update_source_claim_no_key_update or (entry.family == .update_source and
-            appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
-        self.update_source_pagination = self.update_source_pagination or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":source_offset="));
-        self.update_source_nullable_pagination = self.update_source_nullable_pagination or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
-            std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
-            appParityPlanHasExactStringToken(entry.plan, ":source_limit=", "-1") and
-            appParityPlanTokenAbsent(entry.plan, ":source_offset="));
-        self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.schema_temporal_numrange_insert = self.schema_temporal_numrange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::numrange") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_daterange_insert = self.schema_temporal_daterange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            std.mem.indexOf(u8, entry.sql, ",)'") == null and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_open_daterange_insert = self.schema_temporal_open_daterange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            std.mem.indexOf(u8, entry.sql, ",)'") != null and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_lower_open_daterange_insert = self.schema_temporal_lower_open_daterange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            std.mem.indexOf(u8, entry.sql, "'(,") != null and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_numrange_constructor_insert = self.schema_temporal_numrange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "numrange(") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_daterange_constructor_insert = self.schema_temporal_daterange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_inclusive_daterange_constructor_insert = self.schema_temporal_inclusive_daterange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
-            std.mem.indexOf(u8, entry.sql, "'[]'") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_inclusive_daterange_literal_insert = self.schema_temporal_inclusive_daterange_literal_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.sql, "2025-02-01]'") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_lower_exclusive_daterange_constructor_insert = self.schema_temporal_lower_exclusive_daterange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
-            std.mem.indexOf(u8, entry.sql, "'(]'") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_lower_exclusive_daterange_literal_insert = self.schema_temporal_lower_exclusive_daterange_literal_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.sql, "(2025-01-01,") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "products") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_tsrange_insert = self.schema_temporal_tsrange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::tsrange") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_tsrange_constructor_insert = self.schema_temporal_tsrange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "tsrange(") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_tstzrange_insert = self.schema_temporal_tstzrange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::tstzrange") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_tstzrange_constructor_insert = self.schema_temporal_tstzrange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "tstzrange(") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_range_bound_query = self.schema_temporal_range_bound_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "lower(") != null and
-            std.mem.indexOf(u8, entry.sql, "upper(") != null and
-            appParityPlanHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred="));
-        self.schema_temporal_range_contains_query = self.schema_temporal_range_contains_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " @> ") != null and
-            appParityPlanHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
-            appParityPlanHasNonZeroToken(entry.plan, ":or="));
-        self.schema_temporal_range_overlap_query = self.schema_temporal_range_overlap_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " && ") != null and
-            appParityPlanHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
-            appParityPlanHasNonZeroToken(entry.plan, ":or="));
-        self.schema_temporal_inclusive_daterange_overlap_query = self.schema_temporal_inclusive_daterange_overlap_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " && ") != null and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
-            std.mem.indexOf(u8, entry.sql, "'[]'") != null and
-            appParityPlanHasExactStringToken(entry.plan, "query:table=", "products") and
-            appParityPlanHasNonZeroToken(entry.plan, ":or="));
-        self.schema_temporal_unique_conflict_upsert = self.schema_temporal_unique_conflict_upsert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT prices_sku_time_key") != null and
-            appParityPlanHasExactStringToken(entry.plan, "insert:table=", "prices") and
-            appParityPlanHasExactUsizeToken(entry.plan, ":transforms=", 1) and
-            entry.apply_setup_sql.len > 0 and
-            entry.resolver_row_json.len > 0);
-        self.query_set_operation_order_limit = self.query_set_operation_order_limit or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " UNION ") != null and
-            std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":or=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order=") and
-            appParityPlanHasExactStringToken(entry.plan, ":limit=", "5"));
-        self.read_set_operation_order_limit = self.read_set_operation_order_limit or (entry.family == .read and
-            std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null and
-            std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order=") and
-            appParityPlanHasExactStringToken(entry.plan, ":limit=", "5"));
-        self.set_operation_fetch_tail = self.set_operation_fetch_tail or
-            ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                std.mem.indexOf(u8, entry.sql, " FETCH FIRST ROW ONLY") != null and
-                appParityPlanHasExactStringToken(entry.plan, ":limit=", "1"));
-        self.set_operation_null_pagination_tail = self.set_operation_null_pagination_tail or
-            ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                std.mem.indexOf(u8, entry.sql, " LIMIT NULL OFFSET NULL") != null and
-                appParityPlanHasExactStringToken(entry.plan, ":limit=", "none") and
-                appParityPlanTokenAbsent(entry.plan, ":offset="));
-        self.cte_set_operation_tail = self.cte_set_operation_tail or
-            ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, "WITH scoped AS") != null and
-                std.mem.indexOf(u8, entry.sql, " UNION ") != null and
-                appParityPlanHasNonZeroToken(entry.plan, ":ctes=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":or=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":order="));
-        self.set_operation_numeric_range_disjoint = self.set_operation_numeric_range_disjoint or
-            ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                (std.mem.indexOf(u8, entry.sql, "amount < 5") != null or std.mem.indexOf(u8, entry.sql, "amount <= 5") != null) and
-                (std.mem.indexOf(u8, entry.sql, "amount >= 5") != null or std.mem.indexOf(u8, entry.sql, "amount > 5") != null) and
-                appParityPlanHasNonZeroToken(entry.plan, ":or="));
-        self.set_operation_expression_numeric_range_disjoint = self.set_operation_expression_numeric_range_disjoint or
-            ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                std.mem.indexOf(u8, entry.sql, "amount + quantity") != null and
-                (std.mem.indexOf(u8, entry.sql, "< 5") != null or std.mem.indexOf(u8, entry.sql, "<= 5") != null) and
-                (std.mem.indexOf(u8, entry.sql, ">= 5") != null or std.mem.indexOf(u8, entry.sql, "> 5") != null) and
-                appParityPlanHasNonZeroToken(entry.plan, ":expr_or="));
-        self.schema_temporal_fk_ddl = self.schema_temporal_fk_ddl or (entry.family == .ddl and
-            appParityPlanHasNonZeroToken(entry.plan, ":temporal_fk=") and
-            std.mem.indexOf(u8, entry.sql, "PERIOD ") != null and
-            std.mem.indexOf(u8, entry.sql, "FOREIGN KEY") != null);
-        self.schema_nulls_not_distinct_unique = self.schema_nulls_not_distinct_unique or (entry.family == .ddl and
-            std.mem.indexOf(u8, entry.sql, "UNIQUE ") != null and
-            std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
-        self.schema_temporal_portion_update = self.schema_temporal_portion_update or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
-            appParityPlanHasExactStringToken(entry.plan, "update_source:table=", "prices") and
-            appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_portion_delete = self.schema_temporal_portion_delete or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
-            appParityPlanHasExactStringToken(entry.plan, "delete_source:table=", "prices") and
-            appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_range_column_portion_update = self.schema_temporal_range_column_portion_update or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF valid_at") != null and
-            appParityPlanHasExactStringToken(entry.plan, "update_source:table=", "products") and
-            appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
-            entry.apply_setup_sql.len > 0);
-        self.schema_temporal_range_column_portion_delete = self.schema_temporal_range_column_portion_delete or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF valid_at") != null and
-            appParityPlanHasExactStringToken(entry.plan, "delete_source:table=", "products") and
-            appParityPlanHasNonZeroToken(entry.plan, ":temporal=") and
-            entry.apply_setup_sql.len > 0);
-        self.update_source_row_assignment = self.update_source_row_assignment or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.update_source_row_assignment_default = self.update_source_row_assignment_default or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
-            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.update_source_row_assignment_constructor = self.update_source_row_assignment_constructor or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
-            std.mem.indexOf(u8, entry.sql, " = ROW(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.update_source_boolean_is_not_predicate = self.update_source_boolean_is_not_predicate or (entry.family == .update_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_or=") and
-            (std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null or
-                std.mem.indexOf(u8, entry.sql, " IS NOT FALSE") != null));
-        self.delete_source_fetch_pagination = self.delete_source_fetch_pagination or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "FETCH") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_offset="));
-        self.delete_source_nullable_pagination = self.delete_source_nullable_pagination or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
-            std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
-            appParityPlanHasExactStringToken(entry.plan, ":source_limit=", "-1") and
-            appParityPlanTokenAbsent(entry.plan, ":source_offset="));
-        self.delete_source_boolean_unknown_predicate = self.delete_source_boolean_unknown_predicate or (entry.family == .delete_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_pred=") and
-            (std.mem.indexOf(u8, entry.sql, " IS UNKNOWN") != null or
-                std.mem.indexOf(u8, entry.sql, " IS NOT UNKNOWN") != null));
-        self.delete_source_returning_expression = self.delete_source_returning_expression or (entry.family == .delete_source and appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.joined_source_ordered_pagination = self.joined_source_ordered_pagination or (is_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":order=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":limit=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":offset="));
-        self.joined_source_expression_predicate = self.joined_source_expression_predicate or (is_joined_source and
-            (appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") or
-                appParityPlanHasNonZeroToken(entry.plan, "_expr_or=") or
-                appParityPlanHasNonZeroToken(entry.plan, "_expr_not=") or
-                appParityPlanHasNonZeroToken(entry.plan, "_expr_array=")));
-        self.joined_source_computed_pattern_filter = self.joined_source_computed_pattern_filter or (is_joined_source and
-            uses_computed_pattern and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred="));
-        self.joined_source_expression_group = self.joined_source_expression_group or (is_joined_source and
-            (appParityPlanHasNonZeroToken(entry.plan, "_expr_or=") or
-                appParityPlanHasNonZeroToken(entry.plan, "_expr_not=")));
-        self.joined_source_expression_array = self.joined_source_expression_array or (is_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_array="));
-        self.joined_source_returning_expression = self.joined_source_returning_expression or (is_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.joined_source_returning_source_field = self.joined_source_returning_source_field or (is_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "source.") != null);
-        self.joined_source_returning_source_expression = self.joined_source_returning_source_expression or (is_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
-        self.update_joined_source_returning_source_expression = self.update_joined_source_returning_source_expression or (entry.family == .update_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
-        self.delete_joined_source_returning_source_expression = self.delete_joined_source_returning_source_expression or (entry.family == .delete_joined_source and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
-        self.update_joined_source_non_primary_semijoin = self.update_joined_source_non_primary_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 1));
-        self.delete_joined_source_non_primary_semijoin = self.delete_joined_source_non_primary_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 1));
-        self.update_joined_source_correlated_semijoin = self.update_joined_source_correlated_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
-        self.delete_joined_source_correlated_semijoin = self.delete_joined_source_correlated_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
-        self.update_joined_source_correlated_filtered_semijoin = self.update_joined_source_correlated_filtered_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = 'o1'") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 2));
-        self.delete_joined_source_correlated_filtered_semijoin = self.delete_joined_source_correlated_filtered_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = 'o1'") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 2));
-        self.update_joined_source_semijoin_match_expression = self.update_joined_source_semijoin_match_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
-        self.delete_joined_source_semijoin_match_expression = self.delete_joined_source_semijoin_match_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
-        self.update_joined_source_exists_semijoin = self.update_joined_source_exists_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = usage_records.id") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 1));
-        self.delete_joined_source_exists_semijoin = self.delete_joined_source_exists_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = usage_records.id") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 1, 1));
-        self.update_joined_source_exists_match_expression = self.update_joined_source_exists_match_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
-        self.delete_joined_source_exists_match_expression = self.delete_joined_source_exists_match_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
-        self.update_joined_source_row_value_semijoin = self.update_joined_source_row_value_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
-        self.delete_joined_source_row_value_semijoin = self.delete_joined_source_row_value_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
-            appParityJoinedSourcePlanHasCounts(entry.plan, 0, 2));
-        self.update_joined_source_modulo_expression = self.update_joined_source_modulo_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "MOD(source.quantity + usage_records.quantity, 7)") != null and
-            std.mem.indexOf(u8, entry.sql, "quantity % 2") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.update_joined_source_regexp_expression = self.update_joined_source_regexp_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_count(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_instr(source.status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.delete_joined_source_regexp_expression = self.delete_joined_source_regexp_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.update_joined_source_array_expression = self.update_joined_source_array_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "array_append(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.delete_joined_source_array_expression = self.delete_joined_source_array_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.update_joined_source_json_expression = self.update_joined_source_json_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "jsonb_build_object('status', source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "jsonb_extract_path_text(source.metadata") != null and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.delete_joined_source_json_expression = self.delete_joined_source_json_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "jsonb_build_object('source'") != null and
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "jsonb_extract_path_text(source.metadata") != null and
-            appParityPlanHasNonZeroToken(entry.plan, "_expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_assignments=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.update_joined_source_row_assignment_default = self.update_joined_source_row_assignment_default or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
-            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_assignments=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.update_joined_source_row_assignment_constructor = self.update_joined_source_row_assignment_constructor or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
-            std.mem.indexOf(u8, entry.sql, " = ROW(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_assignments=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":ops="));
-        self.update_joined_source_boolean_expression_update = self.update_joined_source_boolean_expression_update or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET enabled = usage_records.enabled OR source.enabled") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_patch_expression = self.update_source_patch_expression or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_boolean_expression_update = self.update_source_boolean_expression_update or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET enabled = enabled OR false") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_increment_expression = self.update_source_increment_expression or (entry.family == .update_source and appParityPlanHasNonZeroToken(entry.plan, ":increment_expr="));
-        self.update_source_modulo_expression = self.update_source_modulo_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "MOD(priority + 9, 7)") != null and
-            std.mem.indexOf(u8, entry.sql, "priority % 2") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.update_source_regexp_replace_expression = self.update_source_regexp_replace_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_replace(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_regexp_match_expression = self.update_source_regexp_match_expression or (entry.family == .update_source and
-            (std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null or
-                std.mem.indexOf(u8, entry.sql, "regexp_match(status") != null) and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_regexp_count_expression = self.update_source_regexp_count_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_regexp_instr_expression = self.update_source_regexp_instr_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.update_source_regexp_substr_expression = self.update_source_regexp_substr_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":patch_expr="));
-        self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
-        if (entry.applied_plan.len > 0) {
-            self.applied_catalog_plan = true;
-            self.applied_catalog_rebuild = self.applied_catalog_rebuild or appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true);
-            self.applied_catalog_validation = self.applied_catalog_validation or appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
-            self.applied_catalog_rewrite = self.applied_catalog_rewrite or appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
-        }
-        switch (entry.family) {
-            .ddl => self.ddl = true,
-            .query => {
-                self.query = true;
-                self.cte_query = self.cte_query or uses_cte_stream;
-                self.query_distinct_on = self.query_distinct_on or appParityPlanHasNonZeroToken(entry.plan, ":distinct_on=");
-                self.query_cte_chain = self.query_cte_chain or appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 2);
-                self.query_cte_structured_access = self.query_cte_structured_access or
-                    appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_");
-                self.query_cte_expression_access = self.query_cte_expression_access or
-                    (appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
-                        (appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
-                            (appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":expr_or=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":expr_not=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":expr_array="))));
-                self.query_computed_pattern_predicate = self.query_computed_pattern_predicate or
-                    uses_computed_pattern and appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=");
-            },
-            .aggregate => {
-                self.aggregate = true;
-                self.cte_aggregate = self.cte_aggregate or uses_cte_stream;
-                self.aggregate_offset = self.aggregate_offset or appParityPlanHasNonZeroToken(entry.plan, ":offset=");
-                self.aggregate_input_expression = self.aggregate_input_expression or appParityPlanHasNonZeroToken(entry.plan, ":agg_expr=");
-                self.aggregate_modulo_expression = self.aggregate_modulo_expression or (std.mem.indexOf(u8, entry.sql, "SUM(quantity % 7)") != null and
-                    std.mem.indexOf(u8, entry.sql, "SUM(MOD(amount + quantity") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(octet_length(status))") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(bit_length(status))") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_scalar_minmax = self.aggregate_scalar_minmax or (std.mem.indexOf(u8, entry.sql, "MIN(status)") != null and
-                    std.mem.indexOf(u8, entry.sql, "MAX(lower(status))") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_regexp_numeric_expression = self.aggregate_regexp_numeric_expression or (std.mem.indexOf(u8, entry.sql, "SUM(regexp_count(status,") != null and
-                    std.mem.indexOf(u8, entry.sql, "SUM(regexp_instr(status,") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_regexp_text_expression = self.aggregate_regexp_text_expression or (std.mem.indexOf(u8, entry.sql, "COUNT(DISTINCT regexp_substr(status,") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_group_expression = self.aggregate_group_expression or appParityPlanHasNonZeroToken(entry.plan, ":group_expr=");
-                self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (appParityPlanHasNonZeroToken(entry.plan, ":group_expr=") and
-                    std.mem.indexOf(u8, entry.sql, "GROUP BY status_key") != null);
-                self.aggregate_having_expression = self.aggregate_having_expression or appParityPlanHasNonZeroToken(entry.plan, ":having_expr=");
-                self.aggregate_having_any = self.aggregate_having_any or appParityPlanHasNonZeroToken(entry.plan, ":having_any=");
-                self.aggregate_boolean_having_predicate = self.aggregate_boolean_having_predicate or
-                    appParityPlanHasNonZeroToken(entry.plan, ":having=") and
-                        (std.mem.indexOf(u8, entry.sql, "HAVING enabled IS TRUE") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS FALSE") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS UNKNOWN") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS NOT UNKNOWN") != null);
-                self.aggregate_boolean_is_not_having = self.aggregate_boolean_is_not_having or
-                    appParityPlanHasNonZeroToken(entry.plan, ":having_any=") and
-                        (std.mem.indexOf(u8, entry.sql, "HAVING enabled IS NOT TRUE") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS NOT FALSE") != null);
-                self.aggregate_filter_expression = self.aggregate_filter_expression or appParityPlanHasNonZeroToken(entry.plan, ":filter_expr=");
-                self.aggregate_computed_pattern_filter = self.aggregate_computed_pattern_filter or
-                    uses_computed_pattern and appParityPlanHasNonZeroToken(entry.plan, ":filter_expr=");
-                self.aggregate_filter_groups = self.aggregate_filter_groups or appParityPlanHasNonZeroToken(entry.plan, ":filter_groups=");
-                self.aggregate_boolean_is_not_filter = self.aggregate_boolean_is_not_filter or
-                    appParityPlanHasNonZeroToken(entry.plan, ":filter_groups=") and
-                        (std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS NOT TRUE") != null or
-                            std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS NOT FALSE") != null);
-                self.aggregate_boolean_unknown_filter = self.aggregate_boolean_unknown_filter or
-                    (appParityPlanHasNonZeroToken(entry.plan, ":filter_groups=") or appParityPlanHasNonZeroToken(entry.plan, ":aggs=")) and
-                        (std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS UNKNOWN") != null or
-                            std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS NOT UNKNOWN") != null);
-                self.aggregate_distinct_json_array_expression = self.aggregate_distinct_json_array_expression or
-                    std.mem.indexOf(u8, entry.sql, "array_agg(DISTINCT metadata->'flags')") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":agg_expr=");
-                self.aggregate_distinct_group_projection = self.aggregate_distinct_group_projection or
-                    (appParityPlanHasNonZeroToken(entry.plan, ":group=") and
-                        appParityPlanHasExactUsizeToken(entry.plan, ":aggs=", 0));
-                self.aggregate_cte_expression_access = self.aggregate_cte_expression_access or
-                    (appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
-                        (appParityPlanHasNonZeroToken(entry.plan, ":ctes=") and
-                            (appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_or=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_not=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_array="))));
-            },
-            .join => {
-                self.join = true;
-                self.join_structured_side_access = self.join_structured_side_access or
-                    appParityPlanHasNonZeroToken(entry.plan, ":left_json_contains=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":right_json_exists=");
-                self.join_on_side_predicate = self.join_on_side_predicate or
-                    std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND c.kind = 'customer'") != null;
-                self.join_on_preserved_side_predicate = self.join_on_preserved_side_predicate or
-                    std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND o.kind = 'order'") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":on_expr_pred=");
-                self.join_on_computed_predicate = self.join_on_computed_predicate or
-                    std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND lower(o.kind) = lower(c.kind)") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":on_expr_pred=");
-                self.join_computed_pattern_side_filter = self.join_computed_pattern_side_filter or
-                    uses_computed_pattern and
-                        (appParityPlanHasNonZeroToken(entry.plan, ":left_expr_pred=") or
-                            appParityPlanHasNonZeroToken(entry.plan, ":right_expr_pred="));
-                self.join_expression_order = self.join_expression_order or appParityPlanHasNonZeroToken(entry.plan, ":order_expr=");
-                self.join_offset = self.join_offset or appParityPlanHasNonZeroToken(entry.plan, ":offset=");
-            },
-            .lateral => {
-                self.lateral = true;
-                self.lateral_structured_side_access = self.lateral_structured_side_access or
-                    appParityPlanHasNonZeroToken(entry.plan, ":left_json_contains=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":right_json_exists=");
-                self.lateral_computed_pattern_side_filter = self.lateral_computed_pattern_side_filter or
-                    uses_computed_pattern and
-                        (appParityPlanHasNonZeroToken(entry.plan, ":left_expr_pred=") or
-                            appParityPlanHasNonZeroToken(entry.plan, ":right_expr_pred="));
-                self.lateral_subquery_match_expression = self.lateral_subquery_match_expression or
-                    (std.mem.indexOf(u8, entry.sql, "bal.amount + org.amount") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":match_expr_pred="));
-                self.lateral_subquery_match_expression_or = self.lateral_subquery_match_expression_or or
-                    (std.mem.indexOf(u8, entry.sql, "bal.amount + org.amount < 100") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":match_expr_or="));
-                self.lateral_subquery_function_match_expression_or = self.lateral_subquery_function_match_expression_or or
-                    (std.mem.indexOf(u8, entry.sql, "lower(bal.kind) = lower(org.kind)") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":match_expr_or="));
-                self.lateral_subquery_match_expression_not = self.lateral_subquery_match_expression_not or
-                    (std.mem.indexOf(u8, entry.sql, "NOT (bal.amount + org.amount > 100)") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":match_expr_not="));
-                self.lateral_subquery_match_expression_array = self.lateral_subquery_match_expression_array or
-                    (std.mem.indexOf(u8, entry.sql, "string_to_array(bal.status || ' ' || org.status") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":match_expr_array="));
-                self.lateral_expression_order = self.lateral_expression_order or appParityPlanHasNonZeroToken(entry.plan, ":order_expr=");
-                self.lateral_right_offset = self.lateral_right_offset or appParityPlanHasNonZeroToken(entry.plan, ":right_offset=");
-            },
-            .window => {
-                self.window = true;
-                self.cte_window = self.cte_window or uses_cte_stream;
-                self.window_rich_functions = self.window_rich_functions or appParityPlanHasNonZeroToken(entry.plan, ":windows=");
-                self.window_source_membership = self.window_source_membership or appParityPlanHasNonZeroToken(entry.plan, ":source_in=");
-                self.window_mixed_order = self.window_mixed_order or
-                    (std.mem.indexOf(u8, entry.sql, "AS amount_row_num") != null and
-                        std.mem.indexOf(u8, entry.sql, "AS id_row_num") != null and
-                        appParityPlanHasNonZeroToken(entry.plan, ":windows="));
-                self.window_expression_order = self.window_expression_order or appParityPlanHasNonZeroToken(entry.plan, ":order_expr=");
-                self.window_modulo_expression = self.window_modulo_expression or (std.mem.indexOf(u8, entry.sql, "sum(amount % quantity)") != null and
-                    std.mem.indexOf(u8, entry.sql, "avg(MOD(amount + quantity") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_expr="));
-                self.window_scalar_minmax = self.window_scalar_minmax or (std.mem.indexOf(u8, entry.sql, "min(status) OVER") != null and
-                    std.mem.indexOf(u8, entry.sql, "max(lower(status)) OVER") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_expr="));
-                self.window_boolean_aggregate_functions = self.window_boolean_aggregate_functions or (std.mem.indexOf(u8, entry.sql, "bool_or(") != null and
-                    std.mem.indexOf(u8, entry.sql, "bool_and(") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":windows=") and
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_filter=") and
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_filter_expr="));
-                self.window_cte = self.window_cte or uses_cte_stream;
-                self.window_cte_expression_access = self.window_cte_expression_access or
-                    (appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
-                        (appParityPlanHasNonZeroToken(entry.plan, ":source_cte=") and
-                            (appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_or=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_not=") or
-                                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_array="))));
-                self.window_offset = self.window_offset or appParityPlanHasNonZeroToken(entry.plan, ":offset=");
-                self.window_frame_signature = self.window_frame_signature or appParityPlanHasNonZeroToken(entry.plan, ":window_frame_sig=");
-                self.window_aggregate_filter = self.window_aggregate_filter or
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_filter=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_filter_expr=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_filter_access=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":window_filter_groups=");
-                self.window_computed_pattern_filter = self.window_computed_pattern_filter or
-                    uses_computed_pattern and appParityPlanHasNonZeroToken(entry.plan, ":window_filter_expr=");
-            },
-            .explain => {
-                self.explain = true;
-                self.explain_write = self.explain_write or appParityExplainPlanHasKind(entry.plan, "write");
-                self.explain_options = self.explain_options or
-                    appParityPlanHasStringToken(entry.plan, ":format=") or
-                    appParityPlanUsizeTokenValue(entry.plan, ":verbose=") != null or
-                    appParityPlanUsizeTokenValue(entry.plan, ":costs=") != null;
-                self.explain_analyze = self.explain_analyze or appParityPlanHasExactBoolToken(entry.plan, ":analyze=", true);
-            },
-            .relation_population => {
-                self.relation_population_select_into = self.relation_population_select_into or
-                    appParityPlanHasExactStringToken(entry.plan, "relation_population:mode=", "select_into");
-                self.relation_population_create_table_as = self.relation_population_create_table_as or
-                    appParityPlanHasExactStringToken(entry.plan, "relation_population:mode=", "create_table_as");
-            },
-            .insert => self.insert = true,
-            .insert_source => self.insert_source = true,
-            .update => {
-                self.update = true;
-                self.update_identity_rewrite = self.update_identity_rewrite or
-                    appParityPlanHasNonZeroToken(entry.plan, ":identity_rewrites=");
-            },
-            .delete => self.delete = true,
-            .update_source => self.update_source = true,
-            .delete_source => self.delete_source = true,
-            .truncate_source => self.truncate_source = true,
-            .update_joined_source => {
-                self.update_joined_source = true;
-                self.update_joined_source_cte_mutation = self.update_joined_source_cte_mutation or
-                    (std.mem.startsWith(u8, entry.sql, "WITH ") and
-                        appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 1));
-            },
-            .delete_joined_source => {
-                self.delete_joined_source = true;
-                self.delete_joined_source_cte_mutation = self.delete_joined_source_cte_mutation or
-                    (std.mem.startsWith(u8, entry.sql, "WITH ") and
-                        appParityPlanHasExactUsizeToken(entry.plan, ":ctes=", 1));
-            },
-            .merge_mutation => self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.startsWith(u8, entry.plan, "merge_mutation:"),
-            .adapter_noop_ddl => self.adapter_noop_ddl = true,
-            .unsupported => self.unsupported_query = true,
-            .unsupported_read => self.unsupported_read = true,
-            .unsupported_ddl => self.unsupported_ddl = true,
-            .unsupported_write => self.unsupported_write = true,
-            .unsupported_insert => self.unsupported_insert = true,
-            .unsupported_update => self.unsupported_update = true,
-            .unsupported_update_source => self.unsupported_update_source = true,
-            .unsupported_delete => self.unsupported_delete = true,
-            .unsupported_update_joined_source => self.unsupported_update_joined_source = true,
-            .unsupported_delete_joined_source => self.unsupported_delete_joined_source = true,
-            .unsupported_merge_mutation => self.unsupported_merge_mutation = true,
-            .read => {
-                const is_read_query = std.mem.startsWith(u8, entry.plan, "read:query:");
-                const is_read_aggregate = std.mem.startsWith(u8, entry.plan, "read:aggregate:");
-                const is_read_window = std.mem.startsWith(u8, entry.plan, "read:window:");
-                const has_cte_expression =
-                    appParityPlanHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
-                const has_read_query_expression =
-                    has_cte_expression or
-                    appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":expr_or=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":expr_not=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":expr_array=");
-                const has_read_source_expression =
-                    has_cte_expression or
-                    appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":source_expr_or=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":source_expr_not=") or
-                    appParityPlanHasNonZeroToken(entry.plan, ":source_expr_array=");
-                self.read = true;
-                self.read_query = self.read_query or is_read_query;
-                self.read_aggregate = self.read_aggregate or is_read_aggregate;
-                self.read_join = self.read_join or std.mem.startsWith(u8, entry.plan, "read:join:");
-                self.read_lateral = self.read_lateral or std.mem.startsWith(u8, entry.plan, "read:lateral:");
-                self.read_window = self.read_window or is_read_window;
-                self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:join:") and
-                        entry.source_schema_json.len > 0 and
-                        appParityPlanHasExactStringToken(entry.plan, ":right=", "customer_records"));
-                self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:lateral:") and
-                        entry.source_schema_json.len > 0 and
-                        appParityPlanHasExactStringToken(entry.plan, ":right=", "balance_records"));
-                self.read_cte_query_expression = self.read_cte_query_expression or
-                    (is_read_query and has_read_query_expression);
-                self.read_cte_aggregate_expression = self.read_cte_aggregate_expression or
-                    (is_read_aggregate and has_read_source_expression);
-                self.read_cte_window_expression = self.read_cte_window_expression or
-                    (is_read_window and has_read_source_expression);
-            },
-        }
-        if (entry.family == .unsupported) {
-            self.unsupported_query_recursive_cte_stream_plan = self.unsupported_query_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
-            self.unsupported_query_set_operation_plan = self.unsupported_query_set_operation_plan or std.mem.eql(u8, entry.classification_reason, "set_operation_plan");
-        } else if (entry.family == .unsupported_read) {
-            self.unsupported_read_recursive_cte_stream_plan = self.unsupported_read_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
-            self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
-            self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
-                std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
-            self.unsupported_read_set_operation_union = self.unsupported_read_set_operation_union or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
-                    std.mem.indexOf(u8, entry.sql, " UNION ") != null);
-            self.unsupported_read_set_operation_intersect = self.unsupported_read_set_operation_intersect or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
-                    std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);
-            self.unsupported_read_set_operation_except = self.unsupported_read_set_operation_except or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
-                    std.mem.indexOf(u8, entry.sql, " EXCEPT ") != null);
-            self.unsupported_read_row_lock_target = self.unsupported_read_row_lock_target or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
-        } else if (entry.family == .merge_mutation) {
-            self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
-                (std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":matched_update_expr=") and
-                    appParityPlanHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
-        } else if (entry.family == .unsupported_write) {
-            self.unsupported_write_truncate_multi_table = self.unsupported_write_truncate_multi_table or
-                (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
-                    std.mem.indexOf(u8, entry.sql, ", archived_records") != null);
-            self.unsupported_write_truncate_cascade = self.unsupported_write_truncate_cascade or
-                (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
-                    std.mem.indexOf(u8, entry.sql, " CASCADE") != null);
-        } else if (entry.family == .truncate_source) {
-            self.truncate_continue_identity = self.truncate_continue_identity or
-                (std.mem.indexOf(u8, entry.sql, "CONTINUE IDENTITY") != null and
-                    appParityPlanHasExactStringToken(entry.plan, "truncate_source:table=", "usage_records"));
-            self.truncate_restart_identity = self.truncate_restart_identity or
-                (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
-                    appParityPlanHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
-        } else if (entry.family == .unsupported_ddl) {
-            self.unsupported_ddl_temporal_fk_update_action = self.unsupported_ddl_temporal_fk_update_action or
-                (std.mem.eql(u8, entry.classification_reason, "temporal_fk_action") and
-                    std.mem.indexOf(u8, entry.sql, " ON UPDATE ") != null);
-            self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
-                (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
-                    std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
-        } else if (entry.family == .unsupported_update) {
-            self.unsupported_update_non_unique_point_selector = self.unsupported_update_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
-        } else if (entry.family == .unsupported_update_source) {
-            self.unsupported_update_source_row_lock_target = self.unsupported_update_source_row_lock_target or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
-        } else if (entry.family == .unsupported_delete) {
-            self.unsupported_delete_non_unique_point_selector = self.unsupported_delete_non_unique_point_selector or std.mem.eql(u8, entry.classification_reason, "non_unique_point_selector");
-            self.unsupported_delete_multi_output_subquery_selector = self.unsupported_delete_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
-        } else if (entry.family == .unsupported_update_joined_source) {
-            self.unsupported_update_joined_multi_output_subquery_selector = self.unsupported_update_joined_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_update_selector");
-            self.unsupported_update_joined_source_row_lock_target = self.unsupported_update_joined_source_row_lock_target or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
-        } else if (entry.family == .unsupported_delete_joined_source) {
-            self.unsupported_delete_joined_multi_output_subquery_selector = self.unsupported_delete_joined_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
-        } else if (entry.family == .unsupported_merge_mutation) {
-            self.unsupported_merge_mutation_cte = self.unsupported_merge_mutation_cte or
-                (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH ") and
-                    std.mem.indexOf(u8, entry.sql, " MERGE ") != null);
-        }
-        if (entry.family == .ddl) {
-            switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
-                .create_table => {
-                    self.ddl_create_table = true;
-                    self.ddl_temporal_table = self.ddl_temporal_table or appParityPlanHasNonZeroToken(entry.plan, ":periods=");
-                    self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
-                        (appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            std.mem.indexOf(u8, entry.sql, " ON DELETE SET NULL") != null);
-                    self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
-                        (appParityPlanHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            std.mem.indexOf(u8, entry.sql, " ON DELETE CASCADE") != null);
-                    self.ddl_replace_table = self.ddl_replace_table or appParityPlanHasExactBoolToken(entry.plan, ":replace=", true);
-                },
-                .table_clone => self.ddl_table_clone = true,
-                .create_view => self.ddl_view_create = true,
-                .rename_view => self.ddl_view_rename = true,
-                .drop_view => self.ddl_view_drop = true,
-                .create_materialized_view => self.ddl_materialized_view_create = true,
-                .refresh_materialized_view => self.ddl_materialized_view_refresh = true,
-                .drop_materialized_view => self.ddl_materialized_view_drop = true,
-                .relation_lifetime => {
-                    self.ddl_relation_lifetime_temporary = self.ddl_relation_lifetime_temporary or appParityPlanHasExactStringToken(entry.plan, ":kind=", "temporary");
-                    self.ddl_relation_lifetime_unlogged = self.ddl_relation_lifetime_unlogged or appParityPlanHasExactStringToken(entry.plan, ":kind=", "unlogged");
-                },
-                .create_enum_type => self.ddl_enum_type_create = true,
-                .add_enum_value => self.ddl_enum_type_add_value = true,
-                .drop_enum_type => self.ddl_enum_type_drop = true,
-                .create_domain => self.ddl_domain_create = true,
-                .alter_domain => self.ddl_domain_alter = true,
-                .drop_domain => self.ddl_domain_drop = true,
-                .create_sequence => {
-                    self.ddl_sequence_create = true;
-                    self.ddl_sequence_create_typed_owned = self.ddl_sequence_create_typed_owned or
-                        (std.mem.indexOf(u8, entry.sql, " AS bigint ") != null and
-                            std.mem.indexOf(u8, entry.sql, " OWNED BY ") != null);
-                },
-                .alter_sequence => {
-                    self.ddl_sequence_alter = true;
-                    self.ddl_sequence_alter_typed_owned = self.ddl_sequence_alter_typed_owned or
-                        (std.mem.indexOf(u8, entry.sql, " AS integer ") != null and
-                            std.mem.indexOf(u8, entry.sql, " OWNED BY NONE") != null);
-                },
-                .drop_sequence => self.ddl_sequence_drop = true,
-                .identity_allocator => {
-                    self.ddl_identity_allocator_serial = self.ddl_identity_allocator_serial or appParityPlanHasAnyExactStringToken(entry.plan, ":kind=", &.{ "serial", "bigserial" });
-                    self.ddl_identity_allocator_generated = self.ddl_identity_allocator_generated or appParityPlanHasAnyExactStringToken(entry.plan, ":kind=", &.{ "generated_by_default", "generated_always" });
-                    self.ddl_identity_allocator_generated_options = self.ddl_identity_allocator_generated_options or
-                        (appParityPlanHasExactStringToken(entry.plan, ":kind=", "generated_always") and
-                            appParityPlanHasNonZeroToken(entry.plan, ":options="));
-                },
-                .create_schema_namespace => self.ddl_schema_namespace_create = true,
-                .rename_schema_namespace => self.ddl_schema_namespace_rename = true,
-                .drop_schema_namespace => self.ddl_schema_namespace_drop = true,
-                .create_extension => self.ddl_extension_create = true,
-                .alter_extension_update, .drop_extension => {},
-                .create_function => {
-                    self.ddl_function_create = true;
-                    self.ddl_function_replace = self.ddl_function_replace or appParityPlanHasExactBoolToken(entry.plan, ":replace=", true);
-                },
-                .drop_function => self.ddl_function_drop = true,
-                .create_procedure => self.ddl_procedure_create = true,
-                .drop_procedure => self.ddl_procedure_drop = true,
-                .create_role => self.ddl_role_create = true,
-                .alter_role => self.ddl_role_alter = true,
-                .drop_role => self.ddl_role_drop = true,
-                .grant_privilege => self.ddl_privilege_grant = true,
-                .revoke_privilege => self.ddl_privilege_revoke = true,
-                .copy_from => self.ddl_copy_from = true,
-                .copy_to => self.ddl_copy_to = true,
-                .create_partitioned_table => self.ddl_partition_create_parent = true,
-                .create_table_partition => self.ddl_partition_create_child = true,
-                .attach_table_partition => self.ddl_partition_attach = true,
-                .detach_table_partition => self.ddl_partition_detach = true,
-                .enable_row_security => self.ddl_row_security_enable = true,
-                .disable_row_security => self.ddl_row_security_disable = true,
-                .create_row_policy => self.ddl_row_security_create_policy = true,
-                .drop_row_policy => self.ddl_row_security_drop_policy = true,
-                .create_database => self.ddl_database_create = true,
-                .alter_database => self.ddl_database_alter = true,
-                .drop_database => self.ddl_database_drop = true,
-                .create_tablespace => self.ddl_tablespace_create = true,
-                .rename_tablespace => self.ddl_tablespace_rename = true,
-                .drop_tablespace => self.ddl_tablespace_drop = true,
-                .listen_notification => self.ddl_notification_listen = true,
-                .notify_notification => self.ddl_notification_notify = true,
-                .unlisten_notification => self.ddl_notification_unlisten = true,
-                .create_publication => self.ddl_publication_create = true,
-                .alter_publication => self.ddl_publication_alter = true,
-                .drop_publication => self.ddl_publication_drop = true,
-                .create_subscription => self.ddl_subscription_create = true,
-                .alter_subscription => self.ddl_subscription_alter = true,
-                .drop_subscription => self.ddl_subscription_drop = true,
-                .create_collation => self.ddl_collation_create = true,
-                .rename_collation => self.ddl_collation_rename = true,
-                .drop_collation => self.ddl_collation_drop = true,
-                .create_operator => self.ddl_operator_create = true,
-                .drop_operator => self.ddl_operator_drop = true,
-                .create_aggregate => self.ddl_aggregate_create = true,
-                .drop_aggregate => self.ddl_aggregate_drop = true,
-                .create_cast => self.ddl_cast_create = true,
-                .drop_cast => self.ddl_cast_drop = true,
-                .vacuum_maintenance => self.ddl_vacuum_maintenance = true,
-                .analyze_maintenance => self.ddl_analyze_maintenance = true,
-                .reindex_maintenance => self.ddl_reindex_maintenance = true,
-                .cluster_maintenance => self.ddl_cluster_maintenance = true,
-                .prepare_statement => self.ddl_prepare_statement = true,
-                .execute_statement => self.ddl_execute_statement = true,
-                .deallocate_statement => self.ddl_deallocate_statement = true,
-                .declare_cursor => self.ddl_declare_cursor = true,
-                .fetch_cursor => self.ddl_fetch_cursor = true,
-                .close_cursor => self.ddl_close_cursor = true,
-                .savepoint_transaction => self.ddl_savepoint_transaction = true,
-                .release_savepoint => self.ddl_release_savepoint = true,
-                .rollback_to_savepoint => self.ddl_rollback_to_savepoint = true,
-                .comment_metadata => {
-                    self.ddl_comment_table = self.ddl_comment_table or appParityPlanHasExactStringToken(entry.plan, ":kind=", "table");
-                    self.ddl_comment_column = self.ddl_comment_column or appParityPlanHasExactStringToken(entry.plan, ":kind=", "column");
-                    self.ddl_comment_index = self.ddl_comment_index or appParityPlanHasExactStringToken(entry.plan, ":kind=", "index");
-                    self.ddl_comment_constraint = self.ddl_comment_constraint or appParityPlanHasExactStringToken(entry.plan, ":kind=", "constraint");
-                },
-                .table_lock => self.ddl_table_lock = true,
-                .constraint_mode => self.ddl_constraint_mode = true,
-                .transaction_mode => {
-                    self.ddl_set_transaction_mode = self.ddl_set_transaction_mode or appParityPlanHasExactStringToken(entry.plan, ":starter=", "set_transaction");
-                    self.ddl_start_transaction_mode = self.ddl_start_transaction_mode or appParityPlanHasExactStringToken(entry.plan, ":starter=", "start_transaction");
-                    self.ddl_begin_transaction_mode = self.ddl_begin_transaction_mode or appParityPlanHasExactStringToken(entry.plan, ":starter=", "begin");
-                },
-                .advisory_lock => {
-                    self.ddl_advisory_lock = self.ddl_advisory_lock or appParityPlanHasExactStringToken(entry.plan, ":action=", "lock");
-                    self.ddl_advisory_unlock = self.ddl_advisory_unlock or appParityPlanHasExactStringToken(entry.plan, ":action=", "unlock");
-                },
-                .create_index => {
-                    self.ddl_create_index = true;
-                    self.ddl_create_covering_index = self.ddl_create_covering_index or appParityPlanHasNonZeroToken(entry.plan, ":include=");
-                },
-                .drop_index => self.ddl_drop_index = true,
-                .drop_table => {
-                    self.ddl_drop_table = true;
-                    self.ddl_drop_table_cascade = self.ddl_drop_table_cascade or appParityPlanHasExactBoolToken(entry.plan, ":cascade=", true);
-                },
-                .alter_table => {
-                    self.ddl_alter_table = true;
-                    self.ddl_add_column_default_rewrite = self.ddl_add_column_default_rewrite or
-                        std.mem.indexOf(u8, entry.sql, "ADD COLUMN") != null and
-                            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true) and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true) and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
-                    self.ddl_add_unvalidated_unique = self.ddl_add_unvalidated_unique or appParityAppliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_unique=", 1);
-                    self.ddl_add_unvalidated_fk = self.ddl_add_unvalidated_fk or appParityAppliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_fk=", 1);
-                    self.ddl_add_unvalidated_check = self.ddl_add_unvalidated_check or appParityAppliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_check=", 1);
-                    self.ddl_validate_constraint = self.ddl_validate_constraint or std.mem.indexOf(u8, entry.sql, "VALIDATE CONSTRAINT") != null;
-                    self.ddl_drop_constraint = self.ddl_drop_constraint or std.mem.indexOf(u8, entry.sql, "DROP CONSTRAINT") != null;
-                    self.ddl_drop_column = self.ddl_drop_column or std.mem.indexOf(u8, entry.sql, "DROP COLUMN") != null;
-                    self.ddl_alter_column_default = self.ddl_alter_column_default or std.mem.indexOf(u8, entry.sql, "SET DEFAULT") != null or std.mem.indexOf(u8, entry.sql, "DROP DEFAULT") != null;
-                    self.ddl_drop_column_default = self.ddl_drop_column_default or
-                        std.mem.indexOf(u8, entry.sql, "DROP DEFAULT") != null and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
-                    self.ddl_alter_column_not_null = self.ddl_alter_column_not_null or std.mem.indexOf(u8, entry.sql, "SET NOT NULL") != null or std.mem.indexOf(u8, entry.sql, "DROP NOT NULL") != null;
-                    self.ddl_drop_column_not_null = self.ddl_drop_column_not_null or
-                        std.mem.indexOf(u8, entry.sql, "DROP NOT NULL") != null and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
-                            appParityAppliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
-                    self.ddl_alter_column_type = self.ddl_alter_column_type or std.mem.indexOf(u8, entry.sql, " TYPE ") != null or std.mem.indexOf(u8, entry.sql, " SET DATA TYPE ") != null;
-                    self.ddl_rename_column = self.ddl_rename_column or std.mem.indexOf(u8, entry.sql, "RENAME COLUMN") != null;
-                    self.ddl_rename_constraint = self.ddl_rename_constraint or std.mem.indexOf(u8, entry.sql, "RENAME CONSTRAINT") != null;
-                    self.ddl_drop_update_policy = self.ddl_drop_update_policy or std.mem.indexOf(u8, entry.sql, "DROP TRIGGER") != null;
-                },
-                .create_update_policy => self.ddl_create_update_policy = true,
-            }
-        } else if (entry.family == .adapter_noop_ddl) {
-            self.adapter_noop_transaction = self.adapter_noop_transaction or std.mem.eql(u8, entry.classification_reason, "transaction_control");
-            self.adapter_noop_transaction_commit = self.adapter_noop_transaction_commit or
-                std.mem.eql(u8, entry.classification_reason, "transaction_control") and
-                    std.ascii.startsWithIgnoreCase(entry.sql, "COMMIT");
-            self.adapter_noop_transaction_rollback = self.adapter_noop_transaction_rollback or
-                std.mem.eql(u8, entry.classification_reason, "transaction_control") and
-                    std.ascii.startsWithIgnoreCase(entry.sql, "ROLLBACK");
-            self.adapter_noop_session = self.adapter_noop_session or std.mem.eql(u8, entry.classification_reason, "session_setting");
-            self.adapter_noop_session_probe = self.adapter_noop_session_probe or
-                std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    (std.ascii.startsWithIgnoreCase(entry.sql, "RESET") or std.ascii.startsWithIgnoreCase(entry.sql, "SHOW"));
-            self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or std.mem.eql(u8, entry.classification_reason, "schema_namespace");
-            self.adapter_noop_extension = self.adapter_noop_extension or std.mem.eql(u8, entry.classification_reason, "extension");
-            self.adapter_noop_session_discard = self.adapter_noop_session_discard or
-                std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    std.ascii.startsWithIgnoreCase(entry.sql, "DISCARD");
-        }
-
-        self.scalar_membership = self.scalar_membership or appParityPlanHasAnyNonZeroToken(entry.plan, &.{
-            ":in=",
-            "_in=",
-            ":source_in=",
-            "_source_in=",
-            ":array_any=",
-            "_array_any=",
-        });
-        self.boolean_is_predicate = self.boolean_is_predicate or
-            appParityPlanHasNonZeroToken(entry.plan, ":pred=") and
-                (std.mem.indexOf(u8, entry.sql, " IS TRUE") != null or
-                    std.mem.indexOf(u8, entry.sql, " IS FALSE") != null);
-        self.boolean_is_not_predicate = self.boolean_is_not_predicate or
-            appParityPlanHasNonZeroToken(entry.plan, ":or=") and
-                (std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null or
-                    std.mem.indexOf(u8, entry.sql, " IS NOT FALSE") != null);
-        self.boolean_unknown_predicate = self.boolean_unknown_predicate or
-            appParityPlanHasNonZeroToken(entry.plan, ":pred=") and
-                (std.mem.indexOf(u8, entry.sql, " IS UNKNOWN") != null or
-                    std.mem.indexOf(u8, entry.sql, " IS NOT UNKNOWN") != null);
-        self.postfix_null_test_predicate = self.postfix_null_test_predicate or
-            appParityPlanHasNonZeroToken(entry.plan, ":pred=") and
-                (std.mem.indexOf(u8, entry.sql, " ISNULL") != null or
-                    std.mem.indexOf(u8, entry.sql, " NOTNULL") != null);
-        self.expression_postfix_null_test_predicate = self.expression_postfix_null_test_predicate or
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-                (std.mem.indexOf(u8, entry.sql, " ISNULL") != null or
-                    std.mem.indexOf(u8, entry.sql, " NOTNULL") != null);
-        self.json_access_path = self.json_access_path or appParityPlanHasAnyNonZeroToken(entry.plan, &.{
-            ":json_eq=",
-            "_json_eq=",
-            ":json_contains=",
-            "_json_contains=",
-            ":json_exists=",
-            "_json_exists=",
-            ":source_json_eq=",
-            ":source_json_contains=",
-            ":source_json_exists=",
-        });
-        self.array_access_path = self.array_access_path or appParityPlanHasAnyNonZeroToken(entry.plan, &.{
-            ":array_contains=",
-            "_array_contains=",
-            ":array_eq=",
-            "_array_eq=",
-            ":source_array_contains=",
-            ":source_array_eq=",
-        });
-        self.text_pattern = self.text_pattern or appParityPlanHasAnyNonZeroToken(entry.plan, &.{
-            ":text_pattern=",
-            "_text_pattern=",
-            ":source_text_pattern=",
-        });
-        self.query_access_or_predicates = self.query_access_or_predicates or
-            entry.family == .query and appParityPlanHasNonZeroToken(entry.plan, ":access_or=");
-        self.query_array_overlap_access_or = self.query_array_overlap_access_or or
-            entry.family == .query and
-                std.mem.indexOf(u8, entry.sql, "tags && ARRAY") != null and
-                appParityPlanHasNonZeroToken(entry.plan, ":access_or=");
-        self.query_access_not_predicates = self.query_access_not_predicates or
-            entry.family == .query and appParityPlanHasNonZeroToken(entry.plan, ":access_not=");
-        self.read_row_lock_nowait = self.read_row_lock_nowait or
-            (entry.family == .query and
-                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "nowait", "no_key_update_nowait", "share_nowait", "key_share_nowait" }));
-        self.read_row_lock_share = self.read_row_lock_share or
-            (entry.family == .query and
-                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "share", "share_nowait", "share_skip_locked" }));
-        self.read_row_lock_key_share = self.read_row_lock_key_share or
-            (entry.family == .query and
-                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "key_share", "key_share_nowait", "key_share_skip_locked" }));
-        self.query_row_lock_no_key_update = self.query_row_lock_no_key_update or
-            (entry.family == .query and
-                appParityPlanHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
-        self.expression_predicate = self.expression_predicate or appParityPlanHasAnyNonZeroToken(entry.plan, &.{
-            ":expr_pred=",
-            "_expr_pred=",
-            ":source_expr_pred=",
-            ":expr_or=",
-            "_expr_or=",
-            ":source_expr_or=",
-            ":expr_not=",
-            "_expr_not=",
-            ":source_expr_not=",
-            ":expr_array=",
-            "_expr_array=",
-            ":source_expr_array=",
-            ":having_expr=",
-            ":having_any=",
-            ":having_not=",
-            ":filter_expr=",
-            ":filter_groups=",
-        });
-        self.mixed_scalar_expression_or = self.mixed_scalar_expression_or or
-            entry.family == .query and
-                appParityPlanHasNonZeroToken(entry.plan, ":expr_or=") and
-                std.mem.indexOf(u8, entry.sql, "id = 'u1' OR lower(email)") != null;
-        self.expression_order = self.expression_order or appParityPlanHasNonZeroToken(entry.plan, ":order_expr=") or appParityPlanHasNonZeroToken(entry.plan, "_order_expr=");
-        self.query_order_using_operator = self.query_order_using_operator or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":order="));
-        self.aggregate_order_using_operator = self.aggregate_order_using_operator or (entry.family == .aggregate and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":order="));
-        self.join_order_using_operator = self.join_order_using_operator or (entry.family == .join and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":order="));
-        self.lateral_order_using_operator = self.lateral_order_using_operator or (entry.family == .lateral and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":order="));
-        self.window_order_using_operator = self.window_order_using_operator or (entry.family == .window and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":order="));
-        self.update_source_order_using_operator = self.update_source_order_using_operator or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_order="));
-        self.delete_source_order_using_operator = self.delete_source_order_using_operator or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":source_order="));
-        self.query_fixed_interval_expression = self.query_fixed_interval_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "INTERVAL '1 hour'") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_calendar_interval_expression = self.query_calendar_interval_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month'") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_mixed_interval_expression = self.query_mixed_interval_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month 1 day'") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_now_expression = self.query_now_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "now()") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_current_timestamp_expression = self.query_current_timestamp_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "CURRENT_TIMESTAMP AS") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_current_timestamp_precision_expression = self.query_current_timestamp_precision_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "CURRENT_TIMESTAMP(6)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_current_date_expression = self.query_current_date_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "CURRENT_DATE") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_uuid_generation_expression = self.query_uuid_generation_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_uuid_generate_v4_expression = self.query_uuid_generate_v4_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "uuid_generate_v4()") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_substring_expression = self.query_substring_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "substring(status") != null and
-            std.mem.indexOf(u8, entry.sql, "substr(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_overlay_expression = self.query_overlay_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "overlay(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_translate_expression = self.query_translate_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "translate(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_split_part_expression = self.query_split_part_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "split_part(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_strpos_expression = self.query_strpos_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "strpos(status") != null and
-            std.mem.indexOf(u8, entry.sql, "position(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_left_right_expression = self.query_left_right_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "left(status") != null and
-            std.mem.indexOf(u8, entry.sql, "right(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_trim_variant_expression = self.query_trim_variant_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "btrim(status") != null and
-            std.mem.indexOf(u8, entry.sql, "ltrim(status") != null and
-            std.mem.indexOf(u8, entry.sql, "rtrim(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_regexp_replace_expression = self.query_regexp_replace_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_replace(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_regexp_substr_expression = self.query_regexp_substr_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_regexp_match_expression = self.query_regexp_match_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "status ~") != null and
-            std.mem.indexOf(u8, entry.sql, "email !~*") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred="));
-        self.query_regexp_count_expression = self.query_regexp_count_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_regexp_instr_expression = self.query_regexp_instr_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_pad_expression = self.query_pad_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "lpad(status") != null and
-            std.mem.indexOf(u8, entry.sql, "rpad(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_repeat_expression = self.query_repeat_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "repeat(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_reverse_expression = self.query_reverse_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "reverse(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_initcap_expression = self.query_initcap_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "initcap(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_text_length_expression = self.query_text_length_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "char_length(status") != null and
-            std.mem.indexOf(u8, entry.sql, "character_length(status") != null and
-            std.mem.indexOf(u8, entry.sql, "octet_length(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_bit_length_expression = self.query_bit_length_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "bit_length(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_md5_expression = self.query_md5_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "md5(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_concat_ws_expression = self.query_concat_ws_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "concat_ws(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_nullif_expression = self.query_nullif_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "nullif(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_extremum_expression = self.query_extremum_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "greatest(") != null and
-            std.mem.indexOf(u8, entry.sql, "least(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_nullable_pagination = self.query_nullable_pagination or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
-            std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
-            appParityPlanHasExactStringToken(entry.plan, ":limit=", "none") and
-            appParityPlanTokenAbsent(entry.plan, ":offset="));
-        self.query_json_build_object_expression = self.query_json_build_object_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "jsonb_build_object(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_to_jsonb_expression = self.query_to_jsonb_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_convert_from_jsonb_expression = self.query_convert_from_jsonb_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "convert_from(") != null and
-            std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_cardinality_expression = self.query_cardinality_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "cardinality(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred="));
-        self.query_array_position_expression = self.query_array_position_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_position(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred="));
-        self.query_array_positions_expression = self.query_array_positions_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_positions(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_array_element_transform_expression = self.query_array_element_transform_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_append(") != null and
-            std.mem.indexOf(u8, entry.sql, "array_cat(") != null and
-            std.mem.indexOf(u8, entry.sql, "array_remove(") != null and
-            std.mem.indexOf(u8, entry.sql, "array_replace(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_array_to_string_expression = self.query_array_to_string_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_to_string(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred="));
-        self.query_string_to_array_expression = self.query_string_to_array_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "string_to_array(") != null and
-            (appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") or appParityPlanHasNonZeroToken(entry.plan, ":expr_arr=")));
-        self.query_starts_with_expression = self.query_starts_with_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "starts_with(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_ends_with_expression = self.query_ends_with_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "ends_with(status") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_ascii_chr_expression = self.query_ascii_chr_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "ascii(status") != null and
-            std.mem.indexOf(u8, entry.sql, "chr(amount") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_modulo_expression = self.query_modulo_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "amount % quantity") != null and
-            std.mem.indexOf(u8, entry.sql, "MOD(amount + quantity") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_date_trunc_expression = self.query_date_trunc_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_trunc('hour'") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_date_bin_expression = self.query_date_bin_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_bin(") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_typed_datetime_literal_expression = self.query_typed_datetime_literal_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "TIMESTAMPTZ ") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr="));
-        self.query_date_part_expression = self.query_date_part_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_part('hour'") != null and
-            std.mem.indexOf(u8, entry.sql, "EXTRACT(dow") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_date_part_epoch_expression = self.query_date_part_epoch_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_part('epoch'") != null and
-            std.mem.indexOf(u8, entry.sql, "EXTRACT(epoch") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.query_nested_case_fold_text_expression = self.query_nested_case_fold_text_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "lower(status || ':' || id)") != null and
-            std.mem.indexOf(u8, entry.sql, "upper(status || ':' || id)") != null and
-            appParityPlanHasNonZeroToken(entry.plan, ":expr_pred=") and
-            appParityPlanHasNonZeroToken(entry.plan, ":order_expr="));
-        self.cte_stream = self.cte_stream or uses_cte_stream;
-
-        for (entry.returning_rows) |row_json| {
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
-            parsed.deinit();
-            self.deterministic_returning_rows += 1;
-        }
-        if (entry.returning_rows.len > 0) {
-            switch (entry.family) {
-                .insert => self.deterministic_insert_returning_rows = true,
-                .update => self.deterministic_update_returning_rows = true,
-                .delete => self.deterministic_delete_returning_rows = true,
-                else => {},
-            }
-        }
-        if (uses_returning_all) {
-            switch (entry.family) {
-                .insert => self.returning_all_insert = true,
-                .update => self.returning_all_update = true,
-                .delete => self.returning_all_delete = true,
-                .update_source => self.returning_all_update_source = true,
-                .delete_source => self.returning_all_delete_source = true,
-                .update_joined_source => self.returning_all_update_joined_source = true,
-                .delete_joined_source => self.returning_all_delete_joined_source = true,
-                else => {},
-            }
-        }
-        if (uses_insert_conflict) {
-            self.conflict_do_update = self.conflict_do_update or (std.mem.indexOf(u8, entry.sql, "DO UPDATE") != null and appParityPlanHasNonZeroToken(entry.plan, "transforms="));
-            self.conflict_default_update = self.conflict_default_update or std.mem.indexOf(u8, entry.sql, "SET status = DEFAULT") != null;
-            self.conflict_coalesce_existing_update = self.conflict_coalesce_existing_update or
-                std.mem.indexOf(u8, entry.sql, "coalesce(excluded.") != null;
-            self.conflict_numeric_expression_update = self.conflict_numeric_expression_update or
-                std.mem.indexOf(u8, entry.sql, "greatest(amount, excluded.amount") != null;
-            self.conflict_case_expression_update = self.conflict_case_expression_update or
-                std.mem.indexOf(u8, entry.sql, "CASE WHEN excluded.amount > amount") != null;
-            self.conflict_current_timestamp_precision = self.conflict_current_timestamp_precision or
-                std.mem.indexOf(u8, entry.sql, "CURRENT_TIMESTAMP(6)") != null;
-            self.conflict_current_date_update = self.conflict_current_date_update or
-                std.mem.indexOf(u8, entry.sql, "CURRENT_DATE") != null;
-            self.conflict_uuid_generation_update = self.conflict_uuid_generation_update or
-                std.mem.indexOf(u8, entry.sql, "uuid_generate_v4()") != null or
-                std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null;
-            self.conflict_text_expression_update = self.conflict_text_expression_update or
-                std.mem.indexOf(u8, entry.sql, "length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "char_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "character_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "octet_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "bit_length(excluded.next_status)") != null;
-            self.conflict_octet_length_expression_update = self.conflict_octet_length_expression_update or
-                std.mem.indexOf(u8, entry.sql, "octet_length(excluded.next_status)") != null;
-            self.conflict_bit_length_expression_update = self.conflict_bit_length_expression_update or
-                std.mem.indexOf(u8, entry.sql, "bit_length(excluded.next_status)") != null;
-            self.conflict_regexp_replace_expression_update = self.conflict_regexp_replace_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_replace(excluded.status") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
-            self.conflict_regexp_match_expression_update = self.conflict_regexp_match_expression_update or
-                (std.mem.indexOf(u8, entry.sql, "regexp_like(excluded.status") != null or
-                    std.mem.indexOf(u8, entry.sql, "regexp_match(excluded.status") != null) and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
-            self.conflict_regexp_count_expression_update = self.conflict_regexp_count_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_count(excluded.status") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
-            self.conflict_regexp_instr_expression_update = self.conflict_regexp_instr_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_instr(excluded.status") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
-            self.conflict_regexp_substr_expression_update = self.conflict_regexp_substr_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_substr(excluded.status") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms=");
-            self.conflict_nested_text_expression_update = self.conflict_nested_text_expression_update or
-                std.mem.indexOf(u8, entry.sql, "length(lower(excluded.next_status || '-' || status))") != null or
-                std.mem.indexOf(u8, entry.sql, "char_length(lower(excluded.next_status || '-' || status))") != null or
-                std.mem.indexOf(u8, entry.sql, "character_length(lower(excluded.next_status || '-' || status))") != null;
-            self.conflict_jsonb_update = self.conflict_jsonb_update or std.mem.indexOf(u8, entry.sql, "jsonb") != null;
-            self.conflict_jsonb_concat_update = self.conflict_jsonb_concat_update or
-                std.mem.indexOf(u8, entry.sql, "metadata ||") != null and
-                    std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, ":ops=");
-            self.multi_row_conflict_do_nothing = self.multi_row_conflict_do_nothing or (uses_multi_row_insert and std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null);
-            self.multi_row_conflict_do_nothing_duplicate_target = self.multi_row_conflict_do_nothing_duplicate_target or (uses_multi_row_insert and
-                entry.resolver_exists == false and
-                std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null and
-                appParityWritePlanHasCounts(entry.plan, 1, 0));
-            self.conflict_returning_expression = self.conflict_returning_expression or appParityPlanHasNonZeroToken(entry.plan, ":returning_expr=");
-            self.conflict_do_nothing_returning_all = self.conflict_do_nothing_returning_all or (uses_returning_all and
-                appParityWritePlanHasCounts(entry.plan, 0, 0) and
-                std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null);
-            self.conflict_guard_where = self.conflict_guard_where or uses_conflict_where;
-            self.conflict_guard_where_skip = self.conflict_guard_where_skip or (uses_conflict_where and
-                appParityWritePlanHasCounts(entry.plan, 0, 0) and
-                appParityPlanHasExactUsizeToken(entry.plan, ":returning_rows=", 0));
-            self.conflict_interval_update = self.conflict_interval_update or
-                std.mem.indexOf(u8, entry.sql, "INTERVAL '1 second'") != null;
-            self.conflict_mixed_interval_update = self.conflict_mixed_interval_update or
-                std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month 1 day'") != null;
-            self.conflict_date_bin_update = self.conflict_date_bin_update or
-                (std.mem.indexOf(u8, entry.sql, "date_bin(") != null and
-                    std.mem.indexOf(u8, entry.sql, "DO UPDATE SET") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms="));
-            self.conflict_typed_datetime_literal_update = self.conflict_typed_datetime_literal_update or
-                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET updated_at_ns = TIMESTAMPTZ ") != null and
-                    appParityPlanHasNonZeroToken(entry.plan, "transforms="));
-            self.conflict_row_assignment = self.conflict_row_assignment or
-                std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null;
-            self.conflict_row_assignment_default = self.conflict_row_assignment_default or
-                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null and
-                    std.mem.indexOf(u8, entry.sql, "DEFAULT") != null);
-            self.conflict_row_assignment_constructor = self.conflict_row_assignment_constructor or
-                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null and
-                    std.mem.indexOf(u8, entry.sql, " = ROW(") != null);
-            self.conflict_boolean_expression_update = self.conflict_boolean_expression_update or
-                std.mem.indexOf(u8, entry.sql, "SET enabled = excluded.enabled OR false") != null;
-            self.schema_default_primary_named_conflict_target = self.schema_default_primary_named_conflict_target or
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT usage_records_pkey") != null;
-            self.schema_custom_primary_named_conflict_target = self.schema_custom_primary_named_conflict_target or
-                (appParityAnyStringContains(entry.apply_setup_sql, "RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk") and
-                    std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT usage_records_id_pk") != null);
-            self.schema_unique_conflict_target = self.schema_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "email text UNIQUE") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email)") != null);
-            self.schema_partial_unique_conflict_target = self.schema_partial_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
-                appParityAnyStringContains(entry.apply_setup_sql, " WHERE ") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email) WHERE") != null);
-            self.schema_expression_unique_conflict_target = self.schema_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
-                (appParityAnyStringContains(entry.apply_setup_sql, "lower(") or appParityAnyStringContains(entry.apply_setup_sql, "upper(")) and
-                (std.mem.indexOf(u8, entry.sql, "ON CONFLICT (lower(") != null or std.mem.indexOf(u8, entry.sql, "ON CONFLICT (upper(") != null));
-            self.schema_mixed_expression_unique_conflict_target = self.schema_mixed_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
-                appParityAnyStringContains(entry.apply_setup_sql, "tenant_id, lower(") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (tenant_id, lower(") != null);
-        } else if (entry.family == .unsupported_insert) {
-            self.unsupported_duplicate_row_batch_target = self.unsupported_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
-            self.unsupported_duplicate_conflict_update_target = self.unsupported_duplicate_conflict_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_conflict_update_target");
-            self.unsupported_invalid_expression_conflict_target = self.unsupported_invalid_expression_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_expression_conflict_target");
-            self.unsupported_invalid_named_conflict_target = self.unsupported_invalid_named_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_named_conflict_target");
-            self.unsupported_unvalidated_unique_conflict_target = self.unsupported_unvalidated_unique_conflict_target or std.mem.eql(u8, entry.classification_reason, "enforced_unique_conflict_target");
-        }
-        if (entry.family == .insert and !uses_insert_conflict) {
-            self.multi_row_insert = self.multi_row_insert or uses_multi_row_insert;
-            self.insert_typed_datetime_literal = self.insert_typed_datetime_literal or
-                std.mem.indexOf(u8, entry.sql, "TIMESTAMPTZ ") != null;
-        }
-        self.point_update_expression_partial_unique_selector = self.point_update_expression_partial_unique_selector or
-            (entry.family == .update and std.mem.indexOf(u8, entry.name, "expression partial unique selector") != null);
-        self.point_delete_expression_partial_unique_selector = self.point_delete_expression_partial_unique_selector or
-            (entry.family == .delete and std.mem.indexOf(u8, entry.name, "expression partial unique selector") != null);
-        self.insert_source_cross_table_source_schema = self.insert_source_cross_table_source_schema or
-            (entry.family == .insert_source and
-                entry.source_schema_json.len > 0 and
-                appParityPlanHasExactStringToken(entry.plan, ":source_table=", "archived_records"));
-        self.insert_source_expression_assignment = self.insert_source_expression_assignment or
-            (entry.family == .insert_source and
-                appParityPlanHasNonZeroToken(entry.plan, ":assignment_expr="));
-        self.insert_source_regexp_expression_assignment = self.insert_source_regexp_expression_assignment or
-            (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
-                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":assignment_expr=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.insert_source_computed_pattern_source = self.insert_source_computed_pattern_source or
-            (entry.family == .insert_source and
-                uses_computed_pattern and
-                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_pred="));
-        self.insert_source_expression_or_source = self.insert_source_expression_or_source or
-            (entry.family == .insert_source and
-                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_or="));
-        self.insert_source_expression_not_source = self.insert_source_expression_not_source or
-            (entry.family == .insert_source and
-                appParityPlanHasNonZeroToken(entry.plan, ":source_expr_not="));
-        self.insert_source_returning_all_expression = self.insert_source_returning_all_expression or
-            (entry.family == .insert_source and
-                appParityPlanHasNonZeroToken(entry.plan, ":returning_all=") and
-                appParityPlanHasNonZeroToken(entry.plan, ":returning_expr="));
-        self.insert_source_conflict_default_update = self.insert_source_conflict_default_update or
-            (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.sql, "SET status = DEFAULT") != null and
-                appParityPlanHasNonZeroToken(entry.plan, ":conflict_ops="));
-        self.insert_source_conflict_json_set_expression = self.insert_source_conflict_json_set_expression or
-            (entry.family == .insert_source and
-                appParityPlanHasNonZeroToken(entry.plan, ":conflict_json_set_expr="));
-        self.insert_source_conflict_regexp_expression = self.insert_source_conflict_regexp_expression or
-            (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.sql, "regexp_substr(excluded.status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_count(excluded.status") != null and
-                appParityPlanHasNonZeroToken(entry.plan, ":conflict_patch_expr="));
-        self.insert_source_conflict_boolean_is_not_guard = self.insert_source_conflict_boolean_is_not_guard or
-            (entry.family == .insert_source and
-                appParityPlanHasNonZeroToken(entry.plan, ":conflict_where_any=") and
-                std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null);
-        self.joined_source_cross_table_source_schema = self.joined_source_cross_table_source_schema or
-            ((entry.family == .update_joined_source or entry.family == .delete_joined_source) and
-                entry.source_schema_json.len > 0 and
-                appParityPlanHasExactStringToken(entry.plan, ":source=", "source_records"));
-        self.read_join_cross_table_source_schema = self.read_join_cross_table_source_schema or
-            (entry.family == .join and
-                entry.source_schema_json.len > 0 and
-                appParityPlanHasExactStringToken(entry.plan, ":right=", "customer_records"));
-        self.read_lateral_cross_table_source_schema = self.read_lateral_cross_table_source_schema or
-            (entry.family == .lateral and
-                entry.source_schema_json.len > 0 and
-                appParityPlanHasExactStringToken(entry.plan, ":right=", "balance_records"));
-        self.merge_cross_table_source_schema = self.merge_cross_table_source_schema or
-            (entry.family == .merge_mutation and
-                entry.source_schema_json.len > 0 and
-                appParityPlanHasExactStringToken(entry.plan, ":source=", "archived_records"));
-    }
-
-    fn expectComplete(self: @This()) !void {
-        try std.testing.expect(self.ddl);
-        try std.testing.expect(self.ddl_table_clone);
-        try std.testing.expect(self.read);
-        try std.testing.expect(self.read_query);
-        try std.testing.expect(self.read_aggregate);
-        try std.testing.expect(self.read_join);
-        try std.testing.expect(self.read_lateral);
-        try std.testing.expect(self.read_window);
-        try std.testing.expect(self.read_cte_query_expression);
-        try std.testing.expect(self.read_cte_aggregate_expression);
-        try std.testing.expect(self.read_cte_window_expression);
-        try std.testing.expect(self.read_join_cross_table_source_schema_classifier);
-        try std.testing.expect(self.read_lateral_cross_table_source_schema_classifier);
-        try std.testing.expect(self.query);
-        try std.testing.expect(self.aggregate);
-        try std.testing.expect(self.join);
-        try std.testing.expect(self.lateral);
-        try std.testing.expect(self.window);
-        try std.testing.expect(self.explain);
-        try std.testing.expect(self.explain_options);
-        try std.testing.expect(self.explain_analyze);
-        try std.testing.expect(self.explain_write);
-        try std.testing.expect(self.relation_population_select_into);
-        try std.testing.expect(self.relation_population_create_table_as);
-        try std.testing.expect(self.insert);
-        try std.testing.expect(self.insert_source);
-        try std.testing.expect(self.insert_source_expression_assignment);
-        try std.testing.expect(self.insert_source_regexp_expression_assignment);
-        try std.testing.expect(self.insert_source_computed_pattern_source);
-        try std.testing.expect(self.insert_source_expression_or_source);
-        try std.testing.expect(self.insert_source_expression_not_source);
-        try std.testing.expect(self.insert_source_returning_all_expression);
-        try std.testing.expect(self.insert_source_conflict_default_update);
-        try std.testing.expect(self.insert_source_conflict_regexp_expression);
-        try std.testing.expect(self.insert_source_cross_table_source_schema);
-        try std.testing.expect(self.joined_source_cross_table_source_schema);
-        try std.testing.expect(self.read_join_cross_table_source_schema);
-        try std.testing.expect(self.read_lateral_cross_table_source_schema);
-        try std.testing.expect(self.merge_cross_table_source_schema);
-        try std.testing.expect(self.update);
-        try std.testing.expect(self.delete);
-        try std.testing.expect(self.update_source);
-        try std.testing.expect(self.delete_source);
-        try std.testing.expect(self.truncate_source);
-        try std.testing.expect(self.update_joined_source);
-        try std.testing.expect(self.update_joined_source_cte_mutation);
-        try std.testing.expect(self.delete_joined_source);
-        try std.testing.expect(self.delete_joined_source_cte_mutation);
-        try std.testing.expect(self.adapter_noop_ddl);
-        try std.testing.expect(self.unsupported_query);
-        try std.testing.expect(self.unsupported_read);
-        try std.testing.expect(self.unsupported_ddl);
-        try std.testing.expect(self.unsupported_write);
-        try std.testing.expect(self.unsupported_insert);
-        try std.testing.expect(self.unsupported_update);
-        try std.testing.expect(self.unsupported_update_source);
-        try std.testing.expect(self.unsupported_delete);
-        try std.testing.expect(self.unsupported_update_joined_source);
-        try std.testing.expect(self.unsupported_delete_joined_source);
-        try std.testing.expect(self.unsupported_merge_mutation);
-        try std.testing.expect(self.ddl_view_create);
-        try std.testing.expect(self.ddl_view_rename);
-        try std.testing.expect(self.ddl_view_drop);
-        try std.testing.expect(self.ddl_materialized_view_create);
-        try std.testing.expect(self.ddl_materialized_view_refresh);
-        try std.testing.expect(self.ddl_materialized_view_drop);
-        try std.testing.expect(self.ddl_relation_lifetime_temporary);
-        try std.testing.expect(self.ddl_relation_lifetime_unlogged);
-        try std.testing.expect(self.ddl_enum_type_create);
-        try std.testing.expect(self.ddl_enum_type_add_value);
-        try std.testing.expect(self.ddl_enum_type_drop);
-        try std.testing.expect(self.ddl_domain_create);
-        try std.testing.expect(self.ddl_domain_alter);
-        try std.testing.expect(self.ddl_domain_drop);
-        try std.testing.expect(self.ddl_sequence_create);
-        try std.testing.expect(self.ddl_sequence_create_typed_owned);
-        try std.testing.expect(self.ddl_sequence_alter);
-        try std.testing.expect(self.ddl_sequence_alter_typed_owned);
-        try std.testing.expect(self.ddl_sequence_drop);
-        try std.testing.expect(self.ddl_schema_namespace_create);
-        try std.testing.expect(self.ddl_schema_namespace_rename);
-        try std.testing.expect(self.ddl_schema_namespace_drop);
-        try std.testing.expect(self.ddl_extension_create);
-        try std.testing.expect(self.ddl_function_create);
-        try std.testing.expect(self.ddl_function_replace);
-        try std.testing.expect(self.ddl_function_drop);
-        try std.testing.expect(self.ddl_procedure_create);
-        try std.testing.expect(self.ddl_procedure_drop);
-        try std.testing.expect(self.ddl_role_create);
-        try std.testing.expect(self.ddl_role_alter);
-        try std.testing.expect(self.ddl_role_drop);
-        try std.testing.expect(self.ddl_privilege_grant);
-        try std.testing.expect(self.ddl_privilege_revoke);
-        try std.testing.expect(self.ddl_copy_from);
-        try std.testing.expect(self.ddl_copy_to);
-        try std.testing.expect(self.ddl_partition_create_parent);
-        try std.testing.expect(self.ddl_partition_create_child);
-        try std.testing.expect(self.ddl_partition_attach);
-        try std.testing.expect(self.ddl_partition_detach);
-        try std.testing.expect(self.ddl_row_security_enable);
-        try std.testing.expect(self.ddl_row_security_disable);
-        try std.testing.expect(self.ddl_row_security_create_policy);
-        try std.testing.expect(self.ddl_row_security_drop_policy);
-        try std.testing.expect(self.ddl_database_create);
-        try std.testing.expect(self.ddl_database_alter);
-        try std.testing.expect(self.ddl_database_drop);
-        try std.testing.expect(self.ddl_tablespace_create);
-        try std.testing.expect(self.ddl_tablespace_rename);
-        try std.testing.expect(self.ddl_tablespace_drop);
-        try std.testing.expect(self.ddl_notification_listen);
-        try std.testing.expect(self.ddl_notification_notify);
-        try std.testing.expect(self.ddl_notification_unlisten);
-        try std.testing.expect(self.ddl_publication_create);
-        try std.testing.expect(self.ddl_publication_alter);
-        try std.testing.expect(self.ddl_publication_drop);
-        try std.testing.expect(self.ddl_subscription_create);
-        try std.testing.expect(self.ddl_subscription_alter);
-        try std.testing.expect(self.ddl_subscription_drop);
-        try std.testing.expect(self.ddl_collation_create);
-        try std.testing.expect(self.ddl_collation_rename);
-        try std.testing.expect(self.ddl_collation_drop);
-        try std.testing.expect(self.ddl_operator_create);
-        try std.testing.expect(self.ddl_operator_drop);
-        try std.testing.expect(self.ddl_aggregate_create);
-        try std.testing.expect(self.ddl_aggregate_drop);
-        try std.testing.expect(self.ddl_cast_create);
-        try std.testing.expect(self.ddl_cast_drop);
-        try std.testing.expect(self.ddl_vacuum_maintenance);
-        try std.testing.expect(self.ddl_analyze_maintenance);
-        try std.testing.expect(self.ddl_reindex_maintenance);
-        try std.testing.expect(self.ddl_cluster_maintenance);
-        try std.testing.expect(self.ddl_prepare_statement);
-        try std.testing.expect(self.ddl_execute_statement);
-        try std.testing.expect(self.ddl_deallocate_statement);
-        try std.testing.expect(self.ddl_declare_cursor);
-        try std.testing.expect(self.ddl_fetch_cursor);
-        try std.testing.expect(self.ddl_close_cursor);
-        try std.testing.expect(self.ddl_savepoint_transaction);
-        try std.testing.expect(self.ddl_release_savepoint);
-        try std.testing.expect(self.ddl_rollback_to_savepoint);
-        try std.testing.expect(self.ddl_identity_allocator_serial);
-        try std.testing.expect(self.ddl_identity_allocator_generated);
-        try std.testing.expect(self.ddl_identity_allocator_generated_options);
-        try std.testing.expect(self.ddl_table_lock);
-        try std.testing.expect(self.ddl_constraint_mode);
-        try std.testing.expect(self.ddl_set_transaction_mode);
-        try std.testing.expect(self.ddl_start_transaction_mode);
-        try std.testing.expect(self.ddl_begin_transaction_mode);
-        try std.testing.expect(self.ddl_advisory_lock);
-        try std.testing.expect(self.ddl_advisory_unlock);
-        try std.testing.expect(self.unsupported_query_recursive_cte_stream_plan);
-        try std.testing.expect(self.unsupported_query_set_operation_plan);
-        try std.testing.expect(self.query_calendar_interval_expression);
-        try std.testing.expect(self.unsupported_read_recursive_cte_stream_plan);
-        try std.testing.expect(self.unsupported_read_duplicate_output_name);
-        try std.testing.expect(self.unsupported_read_aggregate_duplicate_output_name);
-        try std.testing.expect(self.unsupported_read_set_operation_union);
-        try std.testing.expect(self.unsupported_read_set_operation_intersect);
-        try std.testing.expect(self.unsupported_read_set_operation_except);
-        try std.testing.expect(self.ddl_temporal_fk_delete_set_null_action);
-        try std.testing.expect(self.ddl_temporal_fk_delete_cascade_action);
-        try std.testing.expect(self.unsupported_ddl_temporal_fk_update_action);
-        try std.testing.expect(self.read_row_lock_nowait);
-        try std.testing.expect(self.read_row_lock_share);
-        try std.testing.expect(self.read_row_lock_key_share);
-        try std.testing.expect(self.query_row_lock_no_key_update);
-        try std.testing.expect(self.merge_mutation_typed_plan);
-        try std.testing.expect(self.merge_mutation_default_expressions);
-        try std.testing.expect(self.unsupported_write_truncate_multi_table);
-        try std.testing.expect(self.unsupported_write_truncate_cascade);
-        try std.testing.expect(self.truncate_continue_identity);
-        try std.testing.expect(self.truncate_restart_identity);
-        try std.testing.expect(self.update_source_claim_nowait);
-        try std.testing.expect(self.update_source_claim_no_key_update);
-        try std.testing.expect(self.unsupported_read_row_lock_target);
-        try std.testing.expect(self.unsupported_update_source_row_lock_target);
-        try std.testing.expect(self.unsupported_update_joined_source_row_lock_target);
-        try std.testing.expect(self.unsupported_merge_mutation_cte);
-        try std.testing.expect(self.update_identity_rewrite);
-        try std.testing.expect(self.unsupported_update_non_unique_point_selector);
-        try std.testing.expect(self.unsupported_delete_non_unique_point_selector);
-        try std.testing.expect(self.unsupported_delete_multi_output_subquery_selector);
-        try std.testing.expect(self.unsupported_update_joined_multi_output_subquery_selector);
-        try std.testing.expect(self.unsupported_delete_joined_multi_output_subquery_selector);
-        try std.testing.expect(self.scalar_membership);
-        try std.testing.expect(self.boolean_is_predicate);
-        try std.testing.expect(self.boolean_is_not_predicate);
-        try std.testing.expect(self.boolean_unknown_predicate);
-        try std.testing.expect(self.postfix_null_test_predicate);
-        try std.testing.expect(self.expression_postfix_null_test_predicate);
-        try std.testing.expect(self.json_access_path);
-        try std.testing.expect(self.array_access_path);
-        try std.testing.expect(self.text_pattern);
-        try std.testing.expect(self.query_access_or_predicates);
-        try std.testing.expect(self.query_array_overlap_access_or);
-        try std.testing.expect(self.query_access_not_predicates);
-        try std.testing.expect(self.expression_predicate);
-        try std.testing.expect(self.mixed_scalar_expression_or);
-        try std.testing.expect(self.expression_order);
-        try std.testing.expect(self.query_order_using_operator);
-        try std.testing.expect(self.aggregate_order_using_operator);
-        try std.testing.expect(self.join_order_using_operator);
-        try std.testing.expect(self.lateral_order_using_operator);
-        try std.testing.expect(self.window_order_using_operator);
-        try std.testing.expect(self.update_source_order_using_operator);
-        try std.testing.expect(self.delete_source_order_using_operator);
-        try std.testing.expect(self.query_fixed_interval_expression);
-        try std.testing.expect(self.query_now_expression);
-        try std.testing.expect(self.query_current_timestamp_expression);
-        try std.testing.expect(self.query_uuid_generation_expression);
-        try std.testing.expect(self.query_uuid_generate_v4_expression);
-        try std.testing.expect(self.query_substring_expression);
-        try std.testing.expect(self.query_overlay_expression);
-        try std.testing.expect(self.query_translate_expression);
-        try std.testing.expect(self.query_split_part_expression);
-        try std.testing.expect(self.query_strpos_expression);
-        try std.testing.expect(self.query_left_right_expression);
-        try std.testing.expect(self.query_trim_variant_expression);
-        try std.testing.expect(self.query_regexp_replace_expression);
-        try std.testing.expect(self.query_regexp_substr_expression);
-        try std.testing.expect(self.query_regexp_match_expression);
-        try std.testing.expect(self.query_regexp_count_expression);
-        try std.testing.expect(self.query_regexp_instr_expression);
-        try std.testing.expect(self.query_pad_expression);
-        try std.testing.expect(self.query_repeat_expression);
-        try std.testing.expect(self.query_reverse_expression);
-        try std.testing.expect(self.query_initcap_expression);
-        try std.testing.expect(self.query_text_length_expression);
-        try std.testing.expect(self.query_bit_length_expression);
-        try std.testing.expect(self.query_md5_expression);
-        try std.testing.expect(self.query_concat_ws_expression);
-        try std.testing.expect(self.query_nullif_expression);
-        try std.testing.expect(self.query_extremum_expression);
-        try std.testing.expect(self.query_nullable_pagination);
-        try std.testing.expect(self.query_json_build_object_expression);
-        try std.testing.expect(self.query_to_jsonb_expression);
-        try std.testing.expect(self.query_convert_from_jsonb_expression);
-        try std.testing.expect(self.query_cardinality_expression);
-        try std.testing.expect(self.query_array_position_expression);
-        try std.testing.expect(self.query_array_positions_expression);
-        try std.testing.expect(self.query_array_element_transform_expression);
-        try std.testing.expect(self.query_array_to_string_expression);
-        try std.testing.expect(self.query_string_to_array_expression);
-        try std.testing.expect(self.query_starts_with_expression);
-        try std.testing.expect(self.query_ends_with_expression);
-        try std.testing.expect(self.query_ascii_chr_expression);
-        try std.testing.expect(self.query_date_trunc_expression);
-        try std.testing.expect(self.query_date_bin_expression);
-        try std.testing.expect(self.query_typed_datetime_literal_expression);
-        try std.testing.expect(self.query_date_part_expression);
-        try std.testing.expect(self.query_date_part_epoch_expression);
-        try std.testing.expect(self.conflict_date_bin_update);
-        try std.testing.expect(self.conflict_typed_datetime_literal_update);
-        try std.testing.expect(self.query_nested_case_fold_text_expression);
-        try std.testing.expect(self.cte_stream);
-        try std.testing.expect(self.cte_query);
-        try std.testing.expect(self.cte_aggregate);
-        try std.testing.expect(self.cte_window);
-        try std.testing.expect(self.catalog_setup_sql);
-        try std.testing.expect(self.applied_catalog_plan);
-        try std.testing.expect(self.applied_catalog_rebuild);
-        try std.testing.expect(self.applied_catalog_validation);
-        try std.testing.expect(self.applied_catalog_rewrite);
-        try std.testing.expect(self.deterministic_returning_rows > 0);
-        try std.testing.expect(self.deterministic_insert_returning_rows);
-        try std.testing.expect(self.deterministic_update_returning_rows);
-        try std.testing.expect(self.deterministic_delete_returning_rows);
-        try std.testing.expect(self.insert_typed_datetime_literal);
-        try std.testing.expect(self.returning_all_insert);
-        try std.testing.expect(self.returning_all_update);
-        try std.testing.expect(self.returning_all_delete);
-        try std.testing.expect(self.returning_all_update_source);
-        try std.testing.expect(self.returning_all_delete_source);
-        try std.testing.expect(self.returning_all_update_joined_source);
-        try std.testing.expect(self.returning_all_delete_joined_source);
-        try std.testing.expect(self.conflict_do_nothing_returning_all);
-        try std.testing.expect(self.conflict_do_update);
-        try std.testing.expect(self.conflict_default_update);
-        try std.testing.expect(self.conflict_coalesce_existing_update);
-        try std.testing.expect(self.conflict_numeric_expression_update);
-        try std.testing.expect(self.conflict_case_expression_update);
-        try std.testing.expect(self.conflict_uuid_generation_update);
-        try std.testing.expect(self.conflict_text_expression_update);
-        try std.testing.expect(self.conflict_octet_length_expression_update);
-        try std.testing.expect(self.conflict_bit_length_expression_update);
-        try std.testing.expect(self.conflict_regexp_replace_expression_update);
-        try std.testing.expect(self.conflict_regexp_match_expression_update);
-        try std.testing.expect(self.conflict_regexp_count_expression_update);
-        try std.testing.expect(self.conflict_regexp_instr_expression_update);
-        try std.testing.expect(self.conflict_regexp_substr_expression_update);
-        try std.testing.expect(self.conflict_nested_text_expression_update);
-        try std.testing.expect(self.conflict_jsonb_update);
-        try std.testing.expect(self.conflict_jsonb_concat_update);
-        try std.testing.expect(self.conflict_guard_where);
-        try std.testing.expect(self.conflict_guard_where_skip);
-        try std.testing.expect(self.conflict_returning_expression);
-        try std.testing.expect(self.conflict_interval_update);
-        try std.testing.expect(self.multi_row_insert);
-        try std.testing.expect(self.multi_row_conflict_do_nothing);
-        try std.testing.expect(self.multi_row_conflict_do_nothing_duplicate_target);
-        try self.expectRowBatchTransformOpCoverage();
-        try std.testing.expect(self.point_update_jsonb);
-        try std.testing.expect(self.point_update_jsonb_concat);
-        try std.testing.expect(self.point_update_array);
-        try std.testing.expect(self.point_update_uuid_generation);
-        try std.testing.expect(self.point_update_patch_expression);
-        try std.testing.expect(self.update_source_claim_skip_locked);
-        try std.testing.expect(self.update_source_pagination);
-        try std.testing.expect(self.update_source_nullable_pagination);
-        try std.testing.expect(self.update_source_boolean_is_not_predicate);
-        try std.testing.expect(self.update_source_returning_expression);
-        try std.testing.expect(self.point_update_expression_partial_unique_selector);
-        try std.testing.expect(self.point_delete_expression_partial_unique_selector);
-        try std.testing.expect(self.delete_source_fetch_pagination);
-        try std.testing.expect(self.delete_source_nullable_pagination);
-        try std.testing.expect(self.delete_source_boolean_unknown_predicate);
-        try std.testing.expect(self.delete_source_returning_expression);
-        try std.testing.expect(self.joined_source_ordered_pagination);
-        try std.testing.expect(self.joined_source_expression_predicate);
-        try std.testing.expect(self.joined_source_expression_group);
-        try std.testing.expect(self.joined_source_expression_array);
-        try std.testing.expect(self.joined_source_returning_expression);
-        try std.testing.expect(self.joined_source_returning_source_field);
-        try std.testing.expect(self.joined_source_returning_source_expression);
-        try std.testing.expect(self.update_joined_source_returning_source_expression);
-        try std.testing.expect(self.delete_joined_source_returning_source_expression);
-        try std.testing.expect(self.update_joined_source_non_primary_semijoin);
-        try std.testing.expect(self.delete_joined_source_non_primary_semijoin);
-        try std.testing.expect(self.update_joined_source_correlated_semijoin);
-        try std.testing.expect(self.delete_joined_source_correlated_semijoin);
-        try std.testing.expect(self.update_joined_source_correlated_filtered_semijoin);
-        try std.testing.expect(self.delete_joined_source_correlated_filtered_semijoin);
-        try std.testing.expect(self.update_joined_source_semijoin_match_expression);
-        try std.testing.expect(self.delete_joined_source_semijoin_match_expression);
-        try std.testing.expect(self.update_joined_source_exists_semijoin);
-        try std.testing.expect(self.delete_joined_source_exists_semijoin);
-        try std.testing.expect(self.update_joined_source_exists_match_expression);
-        try std.testing.expect(self.delete_joined_source_exists_match_expression);
-        try std.testing.expect(self.update_joined_source_row_value_semijoin);
-        try std.testing.expect(self.delete_joined_source_row_value_semijoin);
-        try std.testing.expect(self.update_source_patch_expression);
-        try std.testing.expect(self.update_source_increment_expression);
-        try std.testing.expect(self.update_source_regexp_replace_expression);
-        try std.testing.expect(self.update_source_regexp_match_expression);
-        try std.testing.expect(self.update_source_regexp_count_expression);
-        try std.testing.expect(self.update_source_regexp_instr_expression);
-        try std.testing.expect(self.update_source_regexp_substr_expression);
-        try std.testing.expect(self.schema_default_primary_named_conflict_target);
-        try std.testing.expect(self.schema_custom_primary_named_conflict_target);
-        try std.testing.expect(self.schema_unique_conflict_target);
-        try std.testing.expect(self.schema_partial_unique_conflict_target);
-        try std.testing.expect(self.schema_expression_unique_conflict_target);
-        try std.testing.expect(self.schema_mixed_expression_unique_conflict_target);
-        try self.expectTemporalRangeColumnDmlCoverage();
-        try std.testing.expect(self.unsupported_duplicate_row_batch_target);
-        try std.testing.expect(self.unsupported_duplicate_conflict_update_target);
-        try std.testing.expect(self.unsupported_invalid_expression_conflict_target);
-        try std.testing.expect(self.unsupported_invalid_named_conflict_target);
-        try std.testing.expect(self.unsupported_unvalidated_unique_conflict_target);
-        try std.testing.expect(self.to_jsonb_value_wrapper);
-        try std.testing.expect(self.to_jsonb_dynamic_expression);
-        try std.testing.expect(self.update_source_json_set_expression);
-        try std.testing.expect(self.ddl_create_table);
-        try std.testing.expect(self.ddl_temporal_table);
-        try std.testing.expect(self.ddl_replace_table);
-        try std.testing.expect(self.ddl_create_index);
-        try std.testing.expect(self.ddl_create_covering_index);
-        try std.testing.expect(self.ddl_drop_index);
-        try std.testing.expect(self.ddl_drop_table);
-        try std.testing.expect(self.ddl_drop_table_cascade);
-        try std.testing.expect(self.ddl_alter_table);
-        try std.testing.expect(self.ddl_add_column_default_rewrite);
-        try std.testing.expect(self.ddl_create_update_policy);
-        try std.testing.expect(self.ddl_drop_update_policy);
-        try std.testing.expect(self.ddl_add_unvalidated_unique);
-        try std.testing.expect(self.ddl_add_unvalidated_fk);
-        try std.testing.expect(self.ddl_add_unvalidated_check);
-        try std.testing.expect(self.ddl_validate_constraint);
-        try std.testing.expect(self.ddl_drop_constraint);
-        try std.testing.expect(self.ddl_drop_column);
-        try std.testing.expect(self.ddl_alter_column_default);
-        try std.testing.expect(self.ddl_drop_column_default);
-        try std.testing.expect(self.ddl_alter_column_not_null);
-        try std.testing.expect(self.ddl_drop_column_not_null);
-        try std.testing.expect(self.ddl_alter_column_type);
-        try std.testing.expect(self.ddl_rename_column);
-        try std.testing.expect(self.ddl_rename_constraint);
-        try std.testing.expect(self.adapter_noop_transaction);
-        try std.testing.expect(self.adapter_noop_transaction_commit);
-        try std.testing.expect(self.adapter_noop_transaction_rollback);
-        try std.testing.expect(self.adapter_noop_session);
-        try std.testing.expect(self.adapter_noop_session_probe);
-        try std.testing.expect(self.adapter_noop_schema_namespace);
-        try std.testing.expect(self.adapter_noop_extension);
-        try std.testing.expect(self.ddl_comment_table);
-        try std.testing.expect(self.ddl_comment_column);
-        try std.testing.expect(self.ddl_comment_index);
-        try std.testing.expect(self.ddl_comment_constraint);
-        try std.testing.expect(self.adapter_noop_session_discard);
-        try std.testing.expect(self.query_distinct_on);
-        try std.testing.expect(self.query_cte_chain);
-        try std.testing.expect(self.query_cte_structured_access);
-        try std.testing.expect(self.query_cte_expression_access);
-        try std.testing.expect(self.query_set_operation_order_limit);
-        try std.testing.expect(self.read_set_operation_order_limit);
-        try std.testing.expect(self.set_operation_fetch_tail);
-        try std.testing.expect(self.set_operation_null_pagination_tail);
-        try std.testing.expect(self.cte_set_operation_tail);
-        try std.testing.expect(self.set_operation_numeric_range_disjoint);
-        try std.testing.expect(self.set_operation_expression_numeric_range_disjoint);
-        try std.testing.expect(self.aggregate_offset);
-        try std.testing.expect(self.aggregate_input_expression);
-        try std.testing.expect(self.aggregate_octet_length_expression);
-        try std.testing.expect(self.aggregate_bit_length_expression);
-        try std.testing.expect(self.aggregate_scalar_minmax);
-        try std.testing.expect(self.aggregate_group_expression);
-        try std.testing.expect(self.aggregate_group_expression_alias);
-        try std.testing.expect(self.aggregate_having_expression);
-        try std.testing.expect(self.aggregate_having_any);
-        try std.testing.expect(self.aggregate_boolean_having_predicate);
-        try std.testing.expect(self.aggregate_boolean_is_not_having);
-        try std.testing.expect(self.aggregate_filter_expression);
-        try std.testing.expect(self.aggregate_filter_groups);
-        try std.testing.expect(self.aggregate_boolean_is_not_filter);
-        try std.testing.expect(self.aggregate_boolean_unknown_filter);
-        try std.testing.expect(self.aggregate_distinct_json_array_expression);
-        try std.testing.expect(self.aggregate_distinct_group_projection);
-        try std.testing.expect(self.aggregate_cte_expression_access);
-        try std.testing.expect(self.join_structured_side_access);
-        try std.testing.expect(self.join_on_side_predicate);
-        try std.testing.expect(self.join_on_preserved_side_predicate);
-        try std.testing.expect(self.join_on_computed_predicate);
-        try std.testing.expect(self.join_expression_order);
-        try std.testing.expect(self.join_offset);
-        try std.testing.expect(self.lateral_structured_side_access);
-        try std.testing.expect(self.lateral_subquery_match_expression);
-        try std.testing.expect(self.lateral_subquery_match_expression_or);
-        try std.testing.expect(self.lateral_subquery_function_match_expression_or);
-        try std.testing.expect(self.lateral_subquery_match_expression_not);
-        try std.testing.expect(self.lateral_subquery_match_expression_array);
-        try std.testing.expect(self.lateral_expression_order);
-        try std.testing.expect(self.lateral_right_offset);
-        try std.testing.expect(self.window_rich_functions);
-        try std.testing.expect(self.window_source_membership);
-        try std.testing.expect(self.window_mixed_order);
-        try std.testing.expect(self.window_expression_order);
-        try std.testing.expect(self.window_boolean_aggregate_functions);
-        try std.testing.expect(self.window_cte);
-        try std.testing.expect(self.window_cte_expression_access);
-        try std.testing.expect(self.window_offset);
-        try std.testing.expect(self.window_frame_signature);
-        try std.testing.expect(self.window_scalar_minmax);
-        try self.expectParameterizedCoverage();
-    }
-
-    fn expectParameterizedCoverage(self: @This()) !void {
-        try std.testing.expect(self.parameterized_query);
-        try std.testing.expect(self.parameterized_aggregate);
-        try std.testing.expect(self.parameterized_join);
-        try std.testing.expect(self.parameterized_lateral);
-        try std.testing.expect(self.parameterized_window);
-        try std.testing.expect(self.parameterized_insert);
-        try std.testing.expect(self.parameterized_update);
-        try std.testing.expect(self.parameterized_delete);
-        try std.testing.expect(self.parameterized_update_source);
-        try std.testing.expect(self.parameterized_delete_source);
-        try std.testing.expect(self.parameterized_update_joined_source);
-        try std.testing.expect(self.parameterized_delete_joined_source);
-    }
-
-    fn expectComputedPatternCoverage(self: @This()) !void {
-        try std.testing.expect(self.query_computed_pattern_predicate);
-        try std.testing.expect(self.aggregate_computed_pattern_filter);
-        try std.testing.expect(self.join_computed_pattern_side_filter);
-        try std.testing.expect(self.lateral_computed_pattern_side_filter);
-        try std.testing.expect(self.window_computed_pattern_filter);
-        try std.testing.expect(self.joined_source_computed_pattern_filter);
-    }
-
-    fn expectModuloCoverage(self: @This()) !void {
-        try std.testing.expect(self.query_modulo_expression);
-        try std.testing.expect(self.aggregate_modulo_expression);
-        try std.testing.expect(self.window_modulo_expression);
-        try std.testing.expect(self.update_source_modulo_expression);
-        try std.testing.expect(self.update_joined_source_modulo_expression);
-    }
-
-    fn expectRegexpCoverage(self: @This()) !void {
-        try std.testing.expect(self.query_regexp_replace_expression);
-        try std.testing.expect(self.query_regexp_substr_expression);
-        try std.testing.expect(self.query_regexp_match_expression);
-        try std.testing.expect(self.query_regexp_count_expression);
-        try std.testing.expect(self.query_regexp_instr_expression);
-        try std.testing.expect(self.aggregate_regexp_numeric_expression);
-        try std.testing.expect(self.aggregate_regexp_text_expression);
-        try std.testing.expect(self.conflict_regexp_replace_expression_update);
-        try std.testing.expect(self.conflict_regexp_match_expression_update);
-        try std.testing.expect(self.conflict_regexp_count_expression_update);
-        try std.testing.expect(self.conflict_regexp_instr_expression_update);
-        try std.testing.expect(self.conflict_regexp_substr_expression_update);
-        try std.testing.expect(self.insert_source_conflict_regexp_expression);
-        try std.testing.expect(self.update_source_regexp_replace_expression);
-        try std.testing.expect(self.update_source_regexp_match_expression);
-        try std.testing.expect(self.update_source_regexp_count_expression);
-        try std.testing.expect(self.update_source_regexp_instr_expression);
-        try std.testing.expect(self.update_source_regexp_substr_expression);
-        try std.testing.expect(self.update_joined_source_regexp_expression);
-        try std.testing.expect(self.delete_joined_source_regexp_expression);
-    }
-
-    fn expectArrayCoverage(self: @This()) !void {
-        try std.testing.expect(self.query_cardinality_expression);
-        try std.testing.expect(self.query_array_position_expression);
-        try std.testing.expect(self.query_array_positions_expression);
-        try std.testing.expect(self.query_array_element_transform_expression);
-        try std.testing.expect(self.query_array_to_string_expression);
-        try std.testing.expect(self.query_string_to_array_expression);
-        try std.testing.expect(self.point_update_array);
-        try std.testing.expect(self.update_joined_source_array_expression);
-        try std.testing.expect(self.delete_joined_source_array_expression);
-    }
-
-    fn expectRowBatchTransformOpCoverage(self: @This()) !void {
-        try std.testing.expect(self.write_plan_insert_op_set);
-        try std.testing.expect(self.write_plan_insert_op_inc);
-        try std.testing.expect(self.write_plan_update_op_set);
-        try std.testing.expect(self.write_plan_update_op_push);
-        try std.testing.expect(self.write_plan_update_op_pull);
-    }
-
-    fn expectRowAssignmentCoverage(self: @This()) !void {
-        try std.testing.expect(self.conflict_row_assignment);
-        try std.testing.expect(self.conflict_row_assignment_default);
-        try std.testing.expect(self.conflict_row_assignment_constructor);
-        try std.testing.expect(self.update_source_row_assignment);
-        try std.testing.expect(self.update_source_row_assignment_default);
-        try std.testing.expect(self.update_source_row_assignment_constructor);
-        try std.testing.expect(self.update_joined_source_row_assignment);
-        try std.testing.expect(self.update_joined_source_row_assignment_default);
-        try std.testing.expect(self.update_joined_source_row_assignment_constructor);
-    }
-
-    fn expectSeededBooleanAssignmentCoverage(self: @This()) !void {
-        try std.testing.expect(self.conflict_boolean_expression_update);
-        try std.testing.expect(self.update_source_boolean_expression_update);
-        try std.testing.expect(self.update_joined_source_boolean_expression_update);
-    }
-
-    fn expectJsonSetCoverage(self: @This()) !void {
-        try std.testing.expect(self.insert_source_conflict_json_set_expression);
-        try std.testing.expect(self.update_source_json_set_expression);
-        try std.testing.expect(self.update_joined_source_json_set_expression);
-    }
-
-    fn expectJsonExpressionCoverage(self: @This()) !void {
-        try std.testing.expect(self.query_json_build_object_expression);
-        try std.testing.expect(self.query_to_jsonb_expression);
-        try std.testing.expect(self.to_jsonb_value_wrapper);
-        try std.testing.expect(self.to_jsonb_dynamic_expression);
-        try std.testing.expect(self.update_joined_source_json_expression);
-        try std.testing.expect(self.delete_joined_source_json_expression);
-    }
-
-    fn expectConflictBooleanGuardCoverage(self: @This()) !void {
-        try std.testing.expect(self.insert_source_conflict_boolean_is_not_guard);
-    }
-
-    fn expectWindowAggregateFilter(self: @This()) !void {
-        try std.testing.expect(self.window_aggregate_filter);
-    }
-
-    fn expectMixedIntervalExpression(self: @This()) !void {
-        try std.testing.expect(self.query_mixed_interval_expression);
-        try std.testing.expect(self.conflict_mixed_interval_update);
-    }
-
-    fn expectCurrentTimestampPrecision(self: @This()) !void {
-        try std.testing.expect(self.query_current_timestamp_precision_expression);
-        try std.testing.expect(self.conflict_current_timestamp_precision);
-    }
-
-    fn expectCurrentDateExpression(self: @This()) !void {
-        try std.testing.expect(self.query_current_date_expression);
-        try std.testing.expect(self.conflict_current_date_update);
-    }
-
-    fn expectTemporalRangeColumnDmlCoverage(self: @This()) !void {
-        try std.testing.expect(self.schema_temporal_numrange_insert);
-        try std.testing.expect(self.schema_temporal_daterange_insert);
-        try std.testing.expect(self.schema_temporal_open_daterange_insert);
-        try std.testing.expect(self.schema_temporal_lower_open_daterange_insert);
-        try std.testing.expect(self.schema_temporal_numrange_constructor_insert);
-        try std.testing.expect(self.schema_temporal_daterange_constructor_insert);
-        try std.testing.expect(self.schema_temporal_inclusive_daterange_constructor_insert);
-        try std.testing.expect(self.schema_temporal_inclusive_daterange_literal_insert);
-        try std.testing.expect(self.schema_temporal_lower_exclusive_daterange_constructor_insert);
-        try std.testing.expect(self.schema_temporal_lower_exclusive_daterange_literal_insert);
-        try std.testing.expect(self.schema_temporal_tsrange_insert);
-        try std.testing.expect(self.schema_temporal_tsrange_constructor_insert);
-        try std.testing.expect(self.schema_temporal_tstzrange_insert);
-        try std.testing.expect(self.schema_temporal_tstzrange_constructor_insert);
-        try std.testing.expect(self.schema_temporal_range_bound_query);
-        try std.testing.expect(self.schema_temporal_range_contains_query);
-        try std.testing.expect(self.schema_temporal_range_overlap_query);
-        try std.testing.expect(self.schema_temporal_inclusive_daterange_overlap_query);
-        try std.testing.expect(self.schema_temporal_unique_conflict_upsert);
-        try std.testing.expect(self.schema_temporal_fk_ddl);
-        try std.testing.expect(self.schema_temporal_portion_update);
-        try std.testing.expect(self.schema_temporal_portion_delete);
-        try std.testing.expect(self.schema_temporal_range_column_portion_update);
-        try std.testing.expect(self.schema_temporal_range_column_portion_delete);
-        try std.testing.expect(self.schema_nulls_not_distinct_unique);
-        try std.testing.expect(self.unsupported_ddl_system_time_temporal_table);
-    }
-};
+const AppParityCorpusCoverage = sql_adapter.AppParityCorpusCoverage;
 
 test "postgres sql adapter classifies application parity corpus" {
     const alloc = std.testing.allocator;
@@ -65813,6 +60024,21 @@ test "postgres sql adapter classifies application parity corpus" {
             \\  tenant_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,
             \\  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),
             \\  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE
+            \\);
+            ,
+        },
+        .{
+            .name = "schema create table inline named constraints",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .create_table, .table_name = "inline_constraints", .select = 4, .operations = 3 },
+            .plan = "ddl:create_table:table=inline_constraints:columns=4:unique=1:fk=1:checks=1:if_not_exists=false:pk=1",
+            .applied_plan = "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0",
+            .sql =
+            \\CREATE TABLE inline_constraints (
+            \\  id uuid CONSTRAINT inline_constraints_pk PRIMARY KEY,
+            \\  tenant_id text CONSTRAINT inline_constraints_tenant_fkey REFERENCES tenants (id) ON DELETE RESTRICT,
+            \\  email text CONSTRAINT inline_constraints_email_key UNIQUE,
+            \\  amount numeric CONSTRAINT inline_constraints_amount_check CHECK (amount >= 0)
             \\);
             ,
         },
@@ -66666,6 +60892,13 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SET LOCAL client_min_messages = warning;",
         },
         .{
+            .name = "adapter-only reset session setting syntax",
+            .family = .adapter_noop_ddl,
+            .plan = "adapter_noop:ddl:reason=session_setting",
+            .classification_reason = "session_setting",
+            .sql = "RESET client_min_messages;",
+        },
+        .{
             .name = "adapter-only client encoding session setting syntax",
             .family = .adapter_noop_ddl,
             .plan = "adapter_noop:ddl:reason=session_setting",
@@ -66673,31 +60906,31 @@ test "postgres sql adapter classifies application parity corpus" {
             .sql = "SET client_encoding = 'UTF8';",
         },
         .{
-            .name = "adapter-only public search path session setting syntax",
-            .family = .adapter_noop_ddl,
-            .plan = "adapter_noop:ddl:reason=session_setting",
-            .classification_reason = "session_setting",
+            .name = "public search path session catalog syntax",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .set_search_path },
+            .plan = "ddl:session:set_search_path:namespaces=1:local=false",
             .sql = "SET search_path TO public;",
         },
         .{
-            .name = "adapter-only reset session setting syntax",
-            .family = .adapter_noop_ddl,
-            .plan = "adapter_noop:ddl:reason=session_setting",
-            .classification_reason = "session_setting",
+            .name = "reset all session catalog syntax",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .discard_all },
+            .plan = "ddl:session:discard_all",
             .sql = "RESET ALL;",
         },
         .{
-            .name = "adapter-only show session setting syntax",
-            .family = .adapter_noop_ddl,
-            .plan = "adapter_noop:ddl:reason=session_setting",
-            .classification_reason = "session_setting",
+            .name = "show search path session catalog syntax",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .show_search_path },
+            .plan = "ddl:session:show_search_path",
             .sql = "SHOW search_path;",
         },
         .{
-            .name = "adapter-only discard session cleanup syntax",
-            .family = .adapter_noop_ddl,
-            .plan = "adapter_noop:ddl:reason=session_setting",
-            .classification_reason = "session_setting",
+            .name = "discard all session catalog syntax",
+            .family = .ddl,
+            .summary = .{ .ddl_tag = .discard_all },
+            .plan = "ddl:session:discard_all",
             .sql = "DISCARD ALL;",
         },
         .{
@@ -72888,24 +67121,11 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     var parsed_fixture = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed_fixture.deinit();
 
-    const root = try appParityJsonObject(parsed_fixture.value);
-    try appParityRequireOnlyKeys(root, &.{ "fixture_format", "source_entry_count", "entry_count", "skipped_entries", "schema_json", "entries" });
-    const fixture_format = try appParityJsonOptionalU64(root, "fixture_format", 0);
-    if (fixture_format != app_parity_fixture_format) return error.TestUnexpectedResult;
-    const source_entry_count = try appParityJsonOptionalUsize(root, "source_entry_count") orelse return error.TestUnexpectedResult;
-    const expected_entry_count = try appParityJsonOptionalUsize(root, "entry_count") orelse return error.TestUnexpectedResult;
-    const skipped_entries = try parseAppParityFixtureStringListAlloc(alloc, root, "skipped_entries");
-    defer alloc.free(skipped_entries);
-    const schema_json = try appParityJsonString(root.get("schema_json") orelse return error.TestUnexpectedResult);
-    const entries_value = root.get("entries") orelse return error.TestUnexpectedResult;
-    const entries = switch (entries_value) {
-        .array => |array| array,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(entries.items.len > 0);
-    try std.testing.expectEqual(expected_entry_count, entries.items.len);
+    const fixture_root = try sql_adapter.parseFixtureRootAlloc(alloc, parsed_fixture.value);
+    defer sql_adapter.freeFixtureRoot(alloc, fixture_root);
+    const skipped_entries = fixture_root.skipped_entries;
+    const schema_json = fixture_root.schema_json;
     try std.testing.expectEqual(@as(usize, 0), skipped_entries.len);
-    try std.testing.expectEqual(source_entry_count, entries.items.len + skipped_entries.len);
 
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -72932,9 +67152,9 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     }
     var coverage = AppParityCorpusCoverage{};
 
-    for (entries.items) |entry_value| {
-        const entry = try parseAppParityFixtureEntryAlloc(alloc, entry_value);
-        defer freeAppParityFixtureEntry(alloc, entry);
+    for (fixture_root.entries) |entry_value| {
+        const entry = try sql_adapter.parseFixtureEntryAlloc(alloc, entry_value);
+        defer sql_adapter.freeFixtureEntry(alloc, entry);
         errdefer std.debug.print("fixture parity corpus entry failed: {s}\n", .{entry.name});
         if (seen_skipped_names.contains(entry.name)) return error.TestUnexpectedResult;
         try validateAppParityFixtureMetadataWithBaseSchema(entry, schema_json, &seen_names, alloc);

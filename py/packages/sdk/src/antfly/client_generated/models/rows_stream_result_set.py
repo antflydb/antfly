@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.rows_join_strategy_selection import RowsJoinStrategySelection
     from ..models.rows_result_column import RowsResultColumn
     from ..models.rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
 
@@ -21,17 +22,24 @@ class RowsStreamResultSet:
     """
     Attributes:
         total_rows (int | Unset):
+        join_strategy (RowsJoinStrategySelection | Unset): Join strategy admission metadata returned by native join
+            execution.
         result_schema (list[RowsResultColumn] | Unset):
         rows (list[RowsStreamResultSetRowsItem] | Unset):
     """
 
     total_rows: int | Unset = UNSET
+    join_strategy: RowsJoinStrategySelection | Unset = UNSET
     result_schema: list[RowsResultColumn] | Unset = UNSET
     rows: list[RowsStreamResultSetRowsItem] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         total_rows = self.total_rows
+
+        join_strategy: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.join_strategy, Unset):
+            join_strategy = self.join_strategy.to_dict()
 
         result_schema: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.result_schema, Unset):
@@ -52,6 +60,8 @@ class RowsStreamResultSet:
         field_dict.update({})
         if total_rows is not UNSET:
             field_dict["total_rows"] = total_rows
+        if join_strategy is not UNSET:
+            field_dict["join_strategy"] = join_strategy
         if result_schema is not UNSET:
             field_dict["result_schema"] = result_schema
         if rows is not UNSET:
@@ -61,11 +71,19 @@ class RowsStreamResultSet:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.rows_join_strategy_selection import RowsJoinStrategySelection
         from ..models.rows_result_column import RowsResultColumn
         from ..models.rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
 
         d = dict(src_dict)
         total_rows = d.pop("total_rows", UNSET)
+
+        _join_strategy = d.pop("join_strategy", UNSET)
+        join_strategy: RowsJoinStrategySelection | Unset
+        if isinstance(_join_strategy, Unset):
+            join_strategy = UNSET
+        else:
+            join_strategy = RowsJoinStrategySelection.from_dict(_join_strategy)
 
         _result_schema = d.pop("result_schema", UNSET)
         result_schema: list[RowsResultColumn] | Unset = UNSET
@@ -87,6 +105,7 @@ class RowsStreamResultSet:
 
         rows_stream_result_set = cls(
             total_rows=total_rows,
+            join_strategy=join_strategy,
             result_schema=result_schema,
             rows=rows,
         )

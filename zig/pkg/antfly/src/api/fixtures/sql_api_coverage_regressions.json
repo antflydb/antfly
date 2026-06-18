@@ -1,0 +1,173 @@
+{
+  "coverage_format": 1,
+  "cases": [
+    {
+      "name": "stale table tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale temporal table token",
+          "family": "insert",
+          "sql": "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+          "plan": "insert:table=products_extra:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+          "apply_setup_sql": ["CREATE TABLE products (id text PRIMARY KEY)"]
+        },
+        {
+          "name": "stale insert source table token",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_table=archived_records_extra:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+          "source_schema_json": "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}"
+        }
+      ],
+      "expect_false": [
+        "schema_temporal_open_daterange_insert",
+        "insert_source_cross_table_source_schema"
+      ]
+    },
+    {
+      "name": "exact table tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact temporal table token",
+          "family": "insert",
+          "sql": "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+          "plan": "insert:table=products:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+          "apply_setup_sql": ["CREATE TABLE products (id text PRIMARY KEY)"]
+        },
+        {
+          "name": "exact insert source table token",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+          "source_schema_json": "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}"
+        }
+      ],
+      "expect_true": [
+        "schema_temporal_open_daterange_insert",
+        "insert_source_cross_table_source_schema"
+      ]
+    },
+    {
+      "name": "stale pagination tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale set operation limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=50:claim=none"
+        },
+        {
+          "name": "stale fetch limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=10:claim=none"
+        },
+        {
+          "name": "stale nullable mutation-source pagination",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-10:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_false": [
+        "query_set_operation_order_limit",
+        "set_operation_fetch_tail",
+        "update_source_nullable_pagination"
+      ]
+    },
+    {
+      "name": "exact pagination tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact set operation limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none"
+        },
+        {
+          "name": "exact fetch limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=1:claim=none"
+        },
+        {
+          "name": "exact nullable mutation-source pagination",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_true": [
+        "query_set_operation_order_limit",
+        "set_operation_fetch_tail",
+        "update_source_nullable_pagination"
+      ]
+    },
+    {
+      "name": "stale joined-source count tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale joined update right predicate count",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
+          "plan": "update_joined_source:table=usage_records:source=archived_records:right_pred=0x:on=1:ops=1:returning=0:returning_expr=0"
+        },
+        {
+          "name": "stale joined delete join count",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
+          "plan": "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=20:returning=0:returning_expr=0"
+        }
+      ],
+      "expect_false": [
+        "update_joined_source_non_primary_semijoin",
+        "delete_joined_source_correlated_semijoin"
+      ]
+    },
+    {
+      "name": "exact joined-source count tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact joined update right predicate count",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
+          "plan": "update_joined_source:table=usage_records:source=archived_records:right_pred=0:on=1:ops=1:returning=0:returning_expr=0"
+        },
+        {
+          "name": "exact joined delete join count",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
+          "plan": "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=2:returning=0:returning_expr=0"
+        }
+      ],
+      "expect_true": [
+        "update_joined_source_non_primary_semijoin",
+        "delete_joined_source_correlated_semijoin"
+      ]
+    },
+    {
+      "name": "stale cte chain count token does not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale cte chain count",
+          "family": "query",
+          "sql": "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
+          "plan": "query:table=usage_records:ctes=20:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none"
+        }
+      ],
+      "expect_false": ["query_cte_chain"]
+    },
+    {
+      "name": "exact cte chain count token satisfies coverage",
+      "entries": [
+        {
+          "name": "exact cte chain count",
+          "family": "query",
+          "sql": "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
+          "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none"
+        }
+      ],
+      "expect_true": ["query_cte_chain"]
+    }
+  ]
+}

@@ -2807,6 +2807,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lake_scaffold_test_mod.addImport("objectstore", objectstore_mod);
+    lake_scaffold_test_mod.addImport("antfly_vector", vector_mod);
     const lake_scaffold_tests = b.addTest(.{
         .root_module = lake_scaffold_test_mod,
     });
@@ -3822,14 +3823,21 @@ pub fn build(b: *std.Build) void {
             "sql adapter grammar parses authorization catalog tails",
             "sql adapter grammar parses logical replication catalog tails",
             "sql adapter grammar parses type system catalog tails",
+            "sql adapter grammar parses relation lifetime prefixes",
             "sql adapter grammar parses routine catalog tails",
             "sql adapter grammar parses sequence catalog tails",
             "sql adapter grammar parses enum type catalog tails",
             "sql adapter grammar parses domain catalog tails",
             "sql adapter grammar parses comment metadata catalog tails",
             "sql adapter grammar parses drop table and index catalog tails",
+            "sql adapter grammar parses create index headers",
+            "sql adapter grammar parses alter table headers",
+            "sql adapter grammar parses identity allocator table headers",
+            "sql adapter grammar parses create table definition headers",
             "sql adapter grammar parses table clone catalog tails",
+            "sql adapter grammar parses table partition catalog tails",
             "sql adapter grammar parses view catalog tails",
+            "sql adapter grammar parses truncate mutation-source syntax",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.

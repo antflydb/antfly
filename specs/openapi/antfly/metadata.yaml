@@ -2606,6 +2606,12 @@ components:
             Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`).
             Each source uses `on_update`/`on_delete` transforms to control how PG events map to
             Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
+        tablespace_name:
+          type: string
+          description: |
+            Optional tablespace binding for the table. When set, the named tablespace must exist and
+            cannot be dropped while the table references it.
+          example: fastspace
     AntflyType:
       rules:
         no-unused-components: off
@@ -2624,6 +2630,9 @@ components:
           maxLength: 500
           description: Optional description of the table.
           example: "Table for user data"
+        tablespace_name:
+          type: string
+          description: Optional durable tablespace binding for this table.
         indexes:
           type: object
           additionalProperties:
@@ -2665,6 +2674,11 @@ components:
           type: string
           description: JSON-encoded database settings owned by the catalog.
           example: "{}"
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new namespace/table placement policy.
+          example: fastspace
     NamespaceCatalogRecord:
       type: object
       required:
@@ -2692,6 +2706,58 @@ components:
           type: string
           description: Namespace name.
           example: analytics
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new table placement policy in this namespace.
+          example: fastspace
+    CatalogTablespaceBindingRequest:
+      type: object
+      required:
+        - tablespace_name
+      properties:
+        tablespace_name:
+          type: string
+          description: Existing tablespace name to bind to the catalog object.
+          example: fastspace
+    TablespaceCatalogRecord:
+      type: object
+      required:
+        - tablespace_id
+        - name
+        - location_json
+        - placement_policy_json
+      description: Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.
+      properties:
+        tablespace_id:
+          type: integer
+          format: uint64
+          description: Stable tablespace catalog identifier.
+          example: 42
+        name:
+          type: string
+          description: Tablespace name.
+          example: fastspace
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. String locations are encoded as JSON strings.
+          example: "\"/var/lib/antfly/fastspace\""
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy reserved for native placement planning.
+          example: "{}"
+    CreateTablespaceRequest:
+      type: object
+      description: Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it.
+      properties:
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. Defaults to `null`.
+          example: "\"/var/lib/antfly/fastspace\""
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+          example: "{}"
     TableMigration:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -4268,7 +4334,7 @@ components:
       additionalProperties: false
       description: |
         Lockable base-row claim metadata. Public row-plan endpoints reject this
-        field; it is only accepted by `rows:mutation-source` lockable base-row
+        field; it is only accepted by `rows/mutation-source` lockable base-row
         sources and internal/coordinator execution paths. `transaction_id` is
         the canonical field name.
       properties:
@@ -9711,6 +9777,89 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /tablespaces:
+    get:
+      summary: List tablespaces
+      description: Lists tablespace catalog objects visible to the caller.
+      tags:
+        - table_management
+      operationId: listTablespaces
+      responses:
+        "200":
+          description: A list of tablespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tablespaces/{tablespaceName}:
+    parameters:
+      - name: tablespaceName
+        in: path
+        required: true
+        description: Tablespace name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get tablespace
+      tags:
+        - table_management
+      operationId: getTablespace
+      responses:
+        "200":
+          description: Tablespace details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create tablespace
+      description: Creates a tablespace catalog object. The server applies the same lifecycle semantics as `CREATE TABLESPACE`.
+      tags:
+        - table_management
+      operationId: createTablespace
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTablespaceRequest"
+      responses:
+        "201":
+          description: Tablespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Tablespace already exists
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop tablespace
+      description: Drops a tablespace catalog object. Table placement by tablespace is fail-closed until native placement planning consumes tablespace policy.
+      tags:
+        - table_management
+      operationId: dropTablespace
+      responses:
+        "204":
+          description: Tablespace dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /databases:
     get:
       summary: List databases
@@ -9788,6 +9937,59 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Database is not empty
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+    put:
+      summary: Set database tablespace
+      description: Binds the database catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setDatabaseTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "200":
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear database tablespace
+      description: Clears the database catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearDatabaseTablespace
+      responses:
+        "200":
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /databases/{databaseName}/namespaces:
@@ -9872,6 +10074,66 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Namespace is not empty
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+    put:
+      summary: Set namespace tablespace
+      description: Binds the namespace catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setNamespaceTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "200":
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear namespace tablespace
+      description: Clears the namespace catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearNamespaceTablespace
+      responses:
+        "200":
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /databases/{databaseName}/namespaces/{namespaceName}/tables:
@@ -9997,6 +10259,447 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Query an explicit namespace table
+      description: Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - query_operations
+      operationId: queryNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+          application/x-ndjson:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: Query successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponses"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Perform batch inserts and deletes on an explicit namespace table
+      description: Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: batchNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchRequest"
+      responses:
+        "201":
+          description: Batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Perform structured relational row writes on an explicit namespace table
+      description: Relational row batch endpoint for an explicit database and namespace table. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: rowsBatchNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsBatchRequest"
+      responses:
+        "201":
+          description: Row batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Backup an explicit namespace table
+      tags:
+        - data_operations
+      operationId: backupNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupRequest"
+      responses:
+        "201":
+          description: Backup process initiated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup:
+                    type: string
+                    example: successful
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Restore an explicit namespace table from backup
+      tags:
+        - data_operations
+      operationId: restoreNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreRequest"
+      responses:
+        "202":
+          description: Restore process triggered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  restore:
+                    type: string
+                    example: triggered
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: key
+        in: path
+        required: true
+        description: Key of the document to retrieve
+        schema:
+          type: string
+    get:
+      summary: Retrieve a document by key from an explicit namespace table
+      description: Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: lookupNamespaceTableDocument
+      parameters:
+        - name: fields
+          in: query
+          required: false
+          description: Comma-separated list of fields to include in the response.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Record found
+          headers:
+            X-Antfly-Version:
+              description: Version token for this document.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List indexes for an explicit namespace table
+      description: Lists index metadata through an explicit database and namespace route.
+      tags:
+        - index_management
+      operationId: listNamespaceTableIndexes
+      responses:
+        "200":
+          description: A list of indexes for the table
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the index
+        schema:
+          type: string
+    get:
+      summary: Get index details for an explicit namespace table
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndex
+      responses:
+        "200":
+          description: Index details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+    post:
+      summary: Add an index to an explicit namespace table
+      tags:
+        - index_management
+      operationId: createNamespaceTableIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexConfig"
+      responses:
+        "201":
+          description: Index added successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+    delete:
+      summary: Drop an index from an explicit namespace table
+      tags:
+        - index_management
+      operationId: dropNamespaceTableIndex
+      responses:
+        "201":
+          description: Index dropped successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
   /tables:
     get:
       summary: List all tables
@@ -10258,7 +10961,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:batch:
+  /tables/{tableName}/rows/batch:
     parameters:
       - name: tableName
         in: path
@@ -10297,7 +11000,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:mutation-source:
+  /tables/{tableName}/rows/mutation-source:
     parameters:
       - name: tableName
         in: path
@@ -10347,7 +11050,7 @@ paths:
           $ref: "#/components/responses/Conflict"
         "501":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:get:
+  /tables/{tableName}/rows/get:
     parameters:
       - name: tableName
         in: path
@@ -10386,7 +11089,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:plan:
+  /tables/{tableName}/rows/plan:
     parameters:
       - name: tableName
         in: path
@@ -10428,7 +11131,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:query:
+  /tables/{tableName}/rows/query:
     parameters:
       - name: tableName
         in: path
@@ -10462,7 +11165,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:aggregate:
+  /tables/{tableName}/rows/aggregate:
     parameters:
       - name: tableName
         in: path
@@ -10496,7 +11199,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:window:
+  /tables/{tableName}/rows/window:
     parameters:
       - name: tableName
         in: path
@@ -10530,7 +11233,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:join:
+  /tables/{tableName}/rows/join:
     parameters:
       - name: tableName
         in: path
@@ -10564,7 +11267,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/rows:lateral:
+  /tables/{tableName}/rows/lateral:
     parameters:
       - name: tableName
         in: path

@@ -15,7 +15,7 @@ T = TypeVar("T", bound="RowsRowClaim")
 @_attrs_define
 class RowsRowClaim:
     """Lockable base-row claim metadata. Public row-plan endpoints reject this
-    field; it is only accepted by `rows:mutation-source` lockable base-row
+    field; it is only accepted by `rows/mutation-source` lockable base-row
     sources and internal/coordinator execution paths. `transaction_id` is
     the canonical field name.
 

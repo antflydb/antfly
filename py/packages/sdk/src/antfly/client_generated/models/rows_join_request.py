@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.rows_join_request_join_type import RowsJoinRequestJoinType
+from ..models.rows_join_strategy import RowsJoinStrategy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -43,6 +44,9 @@ class RowsJoinRequest:
         match_expression_array_contains (list[RowsExpressionArrayContainsPredicate] | Unset): Post-match computed array-
             containment predicates over the joined rows.
         join_type (RowsJoinRequestJoinType | Unset):
+        strategy (RowsJoinStrategy | Unset): Physical join strategy requested by the typed plan. `auto` lets Antfly
+            choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the
+            leading join keys.
         select (list[RowsJoinProjection] | Unset):
         order_by (list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset):
         limit (int | Unset):
@@ -57,6 +61,7 @@ class RowsJoinRequest:
     match_expression_not: list[RowsExpressionConditionGroup] | Unset = UNSET
     match_expression_array_contains: list[RowsExpressionArrayContainsPredicate] | Unset = UNSET
     join_type: RowsJoinRequestJoinType | Unset = UNSET
+    strategy: RowsJoinStrategy | Unset = UNSET
     select: list[RowsJoinProjection] | Unset = UNSET
     order_by: list[RowsQueryOrderExpression | RowsQueryOrderField] | Unset = UNSET
     limit: int | Unset = UNSET
@@ -106,6 +111,10 @@ class RowsJoinRequest:
         if not isinstance(self.join_type, Unset):
             join_type = self.join_type.value
 
+        strategy: str | Unset = UNSET
+        if not isinstance(self.strategy, Unset):
+            strategy = self.strategy.value
+
         select: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.select, Unset):
             select = []
@@ -148,6 +157,8 @@ class RowsJoinRequest:
             field_dict["match_expression_array_contains"] = match_expression_array_contains
         if join_type is not UNSET:
             field_dict["join_type"] = join_type
+        if strategy is not UNSET:
+            field_dict["strategy"] = strategy
         if select is not UNSET:
             field_dict["select"] = select
         if order_by is not UNSET:
@@ -227,6 +238,13 @@ class RowsJoinRequest:
         else:
             join_type = RowsJoinRequestJoinType(_join_type)
 
+        _strategy = d.pop("strategy", UNSET)
+        strategy: RowsJoinStrategy | Unset
+        if isinstance(_strategy, Unset):
+            strategy = UNSET
+        else:
+            strategy = RowsJoinStrategy(_strategy)
+
         _select = d.pop("select", UNSET)
         select: list[RowsJoinProjection] | Unset = UNSET
         if _select is not UNSET:
@@ -274,6 +292,7 @@ class RowsJoinRequest:
             match_expression_not=match_expression_not,
             match_expression_array_contains=match_expression_array_contains,
             join_type=join_type,
+            strategy=strategy,
             select=select,
             order_by=order_by,
             limit=limit,

@@ -101,11 +101,13 @@ from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
+from .create_tablespace_request import CreateTablespaceRequest
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
+from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
@@ -422,6 +424,7 @@ from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_response_200 import LookupKeyResponse200
+from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
@@ -444,6 +447,7 @@ from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
 from .multi_phrase_query import MultiPhraseQuery
+from .namespace_catalog_record import NamespaceCatalogRecord
 from .node_filter import NodeFilter
 from .node_filter_filter_query import NodeFilterFilterQuery
 from .numeric_range_query import NumericRangeQuery
@@ -571,6 +575,8 @@ from .rows_join_projection import RowsJoinProjection
 from .rows_join_projection_side import RowsJoinProjectionSide
 from .rows_join_request import RowsJoinRequest
 from .rows_join_request_join_type import RowsJoinRequestJoinType
+from .rows_join_strategy import RowsJoinStrategy
+from .rows_join_strategy_selection import RowsJoinStrategySelection
 from .rows_joined_mutation_source_assignment import RowsJoinedMutationSourceAssignment
 from .rows_joined_mutation_source_assignment_side import RowsJoinedMutationSourceAssignmentSide
 from .rows_joined_mutation_source_request import RowsJoinedMutationSourceRequest
@@ -662,6 +668,7 @@ from .table_schema_document_schemas import TableSchemaDocumentSchemas
 from .table_schema_storage_mode import TableSchemaStorageMode
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .tablespace_catalog_record import TablespaceCatalogRecord
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
@@ -827,9 +834,11 @@ __all__ = (
     "ConnectionStatus",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
+    "CreateTablespaceRequest",
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "DatabaseCatalogRecord",
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
@@ -1146,6 +1155,7 @@ __all__ = (
     "ListDocumentArtifactManifestsDetail",
     "ListUsersResponse200Item",
     "LookupKeyResponse200",
+    "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
@@ -1168,6 +1178,7 @@ __all__ = (
     "MultiMatchBodyType",
     "MultiMatchQuery",
     "MultiPhraseQuery",
+    "NamespaceCatalogRecord",
     "NodeFilter",
     "NodeFilterFilterQuery",
     "NumericRangeQuery",
@@ -1298,6 +1309,8 @@ __all__ = (
     "RowsJoinProjectionSide",
     "RowsJoinRequest",
     "RowsJoinRequestJoinType",
+    "RowsJoinStrategy",
+    "RowsJoinStrategySelection",
     "RowsJsonExtractProjection",
     "RowsJsonSetTransform",
     "RowsLateralCorrelation",
@@ -1384,6 +1397,7 @@ __all__ = (
     "TableSchema",
     "TableSchemaDocumentSchemas",
     "TableSchemaStorageMode",
+    "TablespaceCatalogRecord",
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TavilySearchConfig",

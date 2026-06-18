@@ -2097,7 +2097,7 @@ fn applyRelationalSqlDdlOnMetadataService(
     var snapshot = try service_impl.adminSnapshot();
     defer service_impl.freeAdminSnapshot(&snapshot);
 
-    if (try tables_api.applyRelationalCatalogDdlOnServiceAlloc(alloc, service_impl, &snapshot, sql)) |applied| {
+    if (try tables_api.applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, service_impl, &snapshot, sql, .{})) |applied| {
         return applied;
     }
 

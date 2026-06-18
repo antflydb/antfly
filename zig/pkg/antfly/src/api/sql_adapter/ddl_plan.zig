@@ -29,6 +29,31 @@ pub const AdapterNoopDdlPlan = struct {
     reason: AdapterNoopDdlReason,
 };
 
+pub const SessionCatalogPlan = union(enum) {
+    set_search_path: SetSearchPathPlan,
+    reset_search_path,
+    show_search_path,
+    discard_all,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .set_search_path => |*plan| plan.deinit(alloc),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const SetSearchPathPlan = struct {
+    namespaces: []const []const u8 = &.{},
+    local: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.namespaces);
+        self.* = undefined;
+    }
+};
+
 pub const EnumTypeCatalogPlan = union(enum) {
     create: CreateEnumTypePlan,
     add_value: AddEnumValuePlan,
@@ -192,6 +217,7 @@ pub const IdentityAllocatorSpec = struct {
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
+    session_catalog: SessionCatalogPlan,
     create_table: CreateTablePlan,
     table_clone: TableClonePlan,
     view_catalog: ViewCatalogPlan,
@@ -228,6 +254,7 @@ pub const LoweredDdlPlan = union(enum) {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .adapter_noop => {},
+            .session_catalog => |*plan| plan.deinit(alloc),
             .create_table => |*plan| plan.deinit(alloc),
             .table_clone => |*plan| plan.deinit(alloc),
             .view_catalog => |*plan| plan.deinit(alloc),
@@ -1153,10 +1180,12 @@ pub const TablespaceCatalogPlan = union(enum) {
 pub const CreateTablespacePlan = struct {
     tablespace_name: []const u8,
     location_json: []const u8,
+    placement_policy_json: []const u8,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.tablespace_name);
         alloc.free(self.location_json);
+        alloc.free(self.placement_policy_json);
         self.* = undefined;
     }
 };
@@ -2435,6 +2464,7 @@ test "SQL adapter DDL database tablespace and notification plans own strings" {
     var tablespace: TablespaceCatalogPlan = .{ .create = .{
         .tablespace_name = try alloc.dupe(u8, "fastspace"),
         .location_json = try alloc.dupe(u8, "\"s3://bucket/tablespaces/fastspace\""),
+        .placement_policy_json = try alloc.dupe(u8, "{}"),
     } };
     tablespace.deinit(alloc);
 

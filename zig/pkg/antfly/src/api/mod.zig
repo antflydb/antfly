@@ -55,6 +55,7 @@ pub const http_internal_group_write_routes = @import("http_internal_group_write_
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const openapi_contract = @import("openapi_contract.zig");
 pub const protocol_adapters = @import("protocol_adapters.zig");
 pub const connections = @import("connections.zig");
 
@@ -84,6 +85,17 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test {
     _ = auth_sql_adapter;
+    _ = openapi_contract.metadata_generated.server.ServerRouter(httpx_handler.AntflyApiHandler);
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "queryNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "batchNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "rowsBatchNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "backupNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "restoreNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "lookupNamespaceTableDocument"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "listNamespaceTableIndexes"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "getNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "createNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "dropNamespaceTableIndex"));
     _ = protocol_adapters;
 }
 

@@ -142,7 +142,7 @@ Public API shape:
   declared unique-key selectors, for example
   `{ "unique": { "name": "customers_email_key", "values": { "tenant_id": "t1", "email": "a@example.test" } } }`.
   They do not address rows by the hidden physical row key.
-- `POST /tables/{table}/rows:batch` accepts `insert`, `upsert`, `update`, and
+- `POST /tables/{table}/rows/batch` accepts `insert`, `upsert`, `update`, and
   `delete` operations. `insert` compiles to the existing batch write path with a
   non-existence version predicate on the derived row identity; `upsert` uses the
   existing overwrite-or-create batch semantics; `update` compiles to a
@@ -150,7 +150,7 @@ Public API shape:
   primary-key component patches; `delete` compiles to a normal batch delete
   after resolving a primary or unique selector. Missing unique selectors fail
   write requests rather than becoming scans or silent no-ops.
-- `POST /tables/{table}/rows:get` accepts primary-key and unique-key selectors
+- `POST /tables/{table}/rows/get` accepts primary-key and unique-key selectors
   and returns the structured identity, row JSON, version, and optional physical
   key for diagnostics. Missing unique selectors return `found: false`.
 - The public physical key, when requested, is diagnostic only. It is derived

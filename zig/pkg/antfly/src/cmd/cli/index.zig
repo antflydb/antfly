@@ -20,10 +20,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     var table_name: ?[]const u8 = null;
     var index_name: ?[]const u8 = null;
     var subcommand: ?[]const u8 = null;
+    var catalog = cli.CatalogFlags.defaultsFromEnv();
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             table_name = args.next();
+        } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
+            continue;
         } else if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
             index_name = args.next();
         } else if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "drop") or
@@ -37,19 +40,19 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     const tbl = table_name orelse cli.fatal("--table is required for index commands", .{});
 
     if (subcommand) |cmd| {
-        if (std.mem.eql(u8, cmd, "create")) return createIndex(allocator, client, tbl, args);
-        if (std.mem.eql(u8, cmd, "drop")) return dropIndex(client, tbl, index_name, args);
-        if (std.mem.eql(u8, cmd, "list")) return listIndexes(allocator, io, client, tbl);
-        if (std.mem.eql(u8, cmd, "get")) return getIndex(allocator, io, client, tbl, index_name, args);
+        if (std.mem.eql(u8, cmd, "create")) return createIndex(allocator, client, catalog, tbl, args);
+        if (std.mem.eql(u8, cmd, "drop")) return dropIndex(client, catalog, tbl, index_name, args);
+        if (std.mem.eql(u8, cmd, "list")) return listIndexes(allocator, io, client, catalog, tbl);
+        if (std.mem.eql(u8, cmd, "get")) return getIndex(allocator, io, client, catalog, tbl, index_name, args);
     }
 
     if (index_name) |idx| {
-        return getIndexByName(allocator, io, client, tbl, idx);
+        return getIndexByName(allocator, io, client, catalog, tbl, idx);
     }
-    return listIndexes(allocator, io, client, tbl);
+    return listIndexes(allocator, io, client, catalog, tbl);
 }
 
-fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient, table_name: []const u8, args: *std.process.Args.Iterator) !void {
+fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags, table_name: []const u8, args: *std.process.Args.Iterator) !void {
     var idx_name: ?[]const u8 = null;
     var idx_type: ?[]const u8 = null;
     var field: ?[]const u8 = null;
@@ -73,7 +76,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
             generator_json = args.next();
         } else if (std.mem.eql(u8, arg, "--chunker")) {
             chunker_json = args.next();
-        } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
+        } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t") or cli.isCatalogFlag(arg)) {
             _ = args.next(); // already parsed
         }
     }
@@ -100,11 +103,16 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     };
     defer parsed.deinit();
 
-    try client.createIndex(table_name, name, parsed.value);
+    if (catalog.explicit()) |explicit| {
+        var resp = try client.inner.createNamespaceTableIndex(explicit.database, explicit.namespace, table_name, name, parsed.value);
+        defer resp.deinit();
+    } else {
+        try client.createIndex(table_name, name, parsed.value);
+    }
     std.debug.print("Create index command successful.\n", .{});
 }
 
-fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
+fn dropIndex(client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
     var idx_name = pre_index;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
@@ -112,19 +120,27 @@ fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_in
         }
     }
     const name = idx_name orelse cli.fatal("--index is required", .{});
-    try client.dropIndex(table_name, name);
+    if (catalog.explicit()) |explicit| {
+        var resp = try client.inner.dropNamespaceTableIndex(explicit.database, explicit.namespace, table_name, name);
+        defer resp.deinit();
+    } else {
+        try client.dropIndex(table_name, name);
+    }
     std.debug.print("Drop index command successful.\n", .{});
 }
 
-fn listIndexes(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8) !void {
-    var resp = try client.listIndexes(table_name);
+fn listIndexes(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags, table_name: []const u8) !void {
+    var resp = if (catalog.explicit()) |explicit|
+        try client.inner.listNamespaceTableIndexes(explicit.database, explicit.namespace, table_name)
+    else
+        try client.listIndexes(table_name);
     defer resp.deinit();
     if (resp.data) |parsed| {
         try cli.writeJson(allocator, io, parsed.value);
     }
 }
 
-fn getIndex(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
+fn getIndex(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
     var idx_name = pre_index;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
@@ -132,11 +148,14 @@ fn getIndex(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         }
     }
     const name = idx_name orelse cli.fatal("--index is required", .{});
-    return getIndexByName(allocator, io, client, table_name, name);
+    return getIndexByName(allocator, io, client, catalog, table_name, name);
 }
 
-fn getIndexByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8, index_name: []const u8) !void {
-    var resp = try client.getIndex(table_name, index_name);
+fn getIndexByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, catalog: cli.CatalogFlags, table_name: []const u8, index_name: []const u8) !void {
+    var resp = if (catalog.explicit()) |explicit|
+        try client.inner.getNamespaceTableIndex(explicit.database, explicit.namespace, table_name, index_name)
+    else
+        try client.getIndex(table_name, index_name);
     defer resp.deinit();
     if (resp.data) |parsed| {
         try cli.writeJson(allocator, io, parsed.value);

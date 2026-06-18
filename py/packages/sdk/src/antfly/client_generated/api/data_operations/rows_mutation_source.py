@@ -23,7 +23,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/db/v1/tables/{table_name}/rows:mutation-source".format(
+        "url": "/db/v1/tables/{table_name}/rows/mutation-source".format(
             table_name=quote(str(table_name), safe=""),
         ),
     }

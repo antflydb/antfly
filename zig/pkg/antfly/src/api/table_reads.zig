@@ -33,6 +33,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
@@ -46,6 +47,7 @@ const reranking_runtime = @import("../reranking/mod.zig");
 const template_mod = @import("../template.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
+const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const relational_rows_api = @import("relational_rows.zig");
@@ -67,6 +69,17 @@ const regex_mod = @import("../search/regex.zig");
 const httpx = @import("httpx");
 const Io = std.Io;
 const json_helpers = @import("json_helpers.zig");
+
+fn nativeCatalogTableNameAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    target: catalog_resources.TableTarget,
+) ![]u8 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
@@ -1206,6 +1219,14 @@ pub const TableReadSource = struct {
             opts: db_mod.types.LookupOptions,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?LookupResponse,
+        lookup_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            key: []const u8,
+            opts: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?LookupResponse = null,
         scan: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1222,6 +1243,13 @@ pub const TableReadSource = struct {
             req: db_mod.types.SearchRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?query_api.QueryResponse,
+        query_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse = null,
         preflight_query: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1459,6 +1487,11 @@ pub const TableReadSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        local_runtime_statuses_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+        ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
         lsm_storage_stats: ?*const fn (
             ptr: *anyopaque,
             table_name: []const u8,
@@ -1506,6 +1539,18 @@ pub const TableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         return try self.vtable.lookup(self.ptr, alloc, table_name, key, opts, consistency);
+    }
+
+    pub fn lookupCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?LookupResponse {
+        if (self.vtable.lookup_catalog) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, key, opts, consistency);
+        return error.UnsupportedOperation;
     }
 
     pub fn scan(
@@ -1564,6 +1609,17 @@ pub const TableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         return try self.vtable.query(self.ptr, alloc, table_name, req, consistency);
+    }
+
+    pub fn queryCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        if (self.vtable.query_catalog) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, req, consistency);
+        return error.UnsupportedOperation;
     }
 
     pub fn preflightQuery(
@@ -1929,6 +1985,15 @@ pub const TableReadSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn localRuntimeStatusesCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        if (self.vtable.local_runtime_statuses_catalog) |fn_ptr| return try fn_ptr(self.ptr, alloc, target);
+        return error.UnsupportedOperation;
     }
 
     pub fn lsmStorageStats(
@@ -2784,8 +2849,10 @@ pub const ProvisionedTableReadSource = struct {
             .ptr = self,
             .vtable = &.{
                 .lookup = lookup,
+                .lookup_catalog = lookupCatalogNative,
                 .scan = scan,
                 .query = query,
+                .query_catalog = queryCatalogNative,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -2812,6 +2879,7 @@ pub const ProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .local_runtime_statuses_catalog = localRuntimeStatusesCatalogNative,
             },
         };
     }
@@ -2853,6 +2921,20 @@ pub const ProvisionedTableReadSource = struct {
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+    }
+
+    fn lookupCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?LookupResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try lookup(ptr, alloc, table_name, key, opts, consistency);
     }
 
     fn scan(
@@ -2953,6 +3035,19 @@ pub const ProvisionedTableReadSource = struct {
         try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
+    }
+
+    fn queryCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: db_mod.types.SearchRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try query(ptr, alloc, table_name, req, consistency);
     }
 
     fn preflightQuery(
@@ -3395,6 +3490,17 @@ pub const ProvisionedTableReadSource = struct {
         }
         return null;
     }
+
+    fn localRuntimeStatusesCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try localRuntimeStatuses(ptr, alloc, table_name);
+    }
 };
 
 pub const HostedProvisionedTableReadSource = struct {
@@ -3476,6 +3582,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .local_runtime_statuses_catalog = HostedProvisionedTableReadSource.localRuntimeStatusesCatalogNative,
             },
         };
     }
@@ -3499,6 +3606,20 @@ pub const HostedProvisionedTableReadSource = struct {
 
         if (try lookupViaRoute(self, alloc, route, group_id, table_name, key, opts, consistency)) |result| return result;
         return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, opts, consistency, route);
+    }
+
+    fn lookupCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        key: []const u8,
+        opts: db_mod.types.LookupOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?LookupResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try lookup(ptr, alloc, table_name, key, opts, consistency);
     }
 
     fn lookupViaRoute(
@@ -4185,6 +4306,17 @@ pub const HostedProvisionedTableReadSource = struct {
         _: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatuses {
         return null;
+    }
+
+    fn localRuntimeStatusesCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try localRuntimeStatuses(ptr, alloc, table_name);
     }
 
     fn graphExpandGroupLocal(

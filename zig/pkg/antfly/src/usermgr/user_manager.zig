@@ -40,6 +40,7 @@ pub const ResourceType = enum {
     database,
     namespace,
     table,
+    tablespace,
     user,
     @"*",
 
@@ -47,6 +48,7 @@ pub const ResourceType = enum {
         if (std.mem.eql(u8, raw, "database")) return .database;
         if (std.mem.eql(u8, raw, "namespace")) return .namespace;
         if (std.mem.eql(u8, raw, "table")) return .table;
+        if (std.mem.eql(u8, raw, "tablespace")) return .tablespace;
         if (std.mem.eql(u8, raw, "user")) return .user;
         if (std.mem.eql(u8, raw, "*")) return .@"*";
         return error.InvalidResourceType;
@@ -57,6 +59,7 @@ pub const ResourceType = enum {
             .database => "database",
             .namespace => "namespace",
             .table => "table",
+            .tablespace => "tablespace",
             .user => "user",
             .@"*" => "*",
         };

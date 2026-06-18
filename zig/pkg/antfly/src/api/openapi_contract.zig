@@ -28,6 +28,7 @@ pub const embeddings_generated = @import("antfly_embeddings_openapi");
 pub const common_generated = @import("antfly_common_openapi");
 pub const generating_generated = @import("antfly_generating_openapi");
 pub const reranking_generated = @import("antfly_reranking_openapi");
+const httpx_handler = @import("httpx_handler.zig");
 
 test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "CreateTableRequest"));
@@ -210,6 +211,14 @@ test "indexes openapi rejects stats without discriminator" {
 
 test "generated extractors: path param structs exist" {
     const server = generated.server;
+    try std.testing.expect(@hasField(server.GetNamespaceTablePathParams, "database_name"));
+    try std.testing.expect(@hasField(server.GetNamespaceTablePathParams, "namespace_name"));
+    try std.testing.expect(@hasField(server.GetNamespaceTablePathParams, "table_name"));
+    try std.testing.expect(@hasField(server.QueryNamespaceTablePathParams, "database_name"));
+    try std.testing.expect(@hasField(server.QueryNamespaceTablePathParams, "namespace_name"));
+    try std.testing.expect(@hasField(server.QueryNamespaceTablePathParams, "table_name"));
+    try std.testing.expect(@hasField(server.LookupNamespaceTableDocumentPathParams, "key"));
+    try std.testing.expect(@hasField(server.GetNamespaceTableIndexPathParams, "index_name"));
     try std.testing.expect(@hasField(server.GetTablePathParams, "table_name"));
     try std.testing.expect(@hasField(server.CreateTablePathParams, "table_name"));
     try std.testing.expect(@hasField(server.LookupKeyPathParams, "table_name"));
@@ -222,6 +231,18 @@ test "generated extractors: route table covers public API" {
     const server = generated.server;
     try std.testing.expect(server.routes.len >= 33);
     var found_get_status = false;
+    var found_list_databases = false;
+    var found_get_namespace_table = false;
+    var found_query_namespace_table = false;
+    var found_batch_namespace_table = false;
+    var found_rows_batch_namespace_table = false;
+    var found_backup_namespace_table = false;
+    var found_restore_namespace_table = false;
+    var found_lookup_namespace_table_document = false;
+    var found_list_namespace_table_indexes = false;
+    var found_get_namespace_table_index = false;
+    var found_create_namespace_table_index = false;
+    var found_drop_namespace_table_index = false;
     var found_create_table = false;
     var found_lookup_key = false;
     var found_batch_write = false;
@@ -233,6 +254,18 @@ test "generated extractors: route table covers public API" {
     var found_remove_row_filter = false;
     for (server.routes) |route| {
         if (std.mem.eql(u8, route.operation_id, "getStatus")) found_get_status = true;
+        if (std.mem.eql(u8, route.operation_id, "listDatabases")) found_list_databases = true;
+        if (std.mem.eql(u8, route.operation_id, "getNamespaceTable")) found_get_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "queryNamespaceTable")) found_query_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "batchNamespaceTable")) found_batch_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "rowsBatchNamespaceTable")) found_rows_batch_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "backupNamespaceTable")) found_backup_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "restoreNamespaceTable")) found_restore_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "lookupNamespaceTableDocument")) found_lookup_namespace_table_document = true;
+        if (std.mem.eql(u8, route.operation_id, "listNamespaceTableIndexes")) found_list_namespace_table_indexes = true;
+        if (std.mem.eql(u8, route.operation_id, "getNamespaceTableIndex")) found_get_namespace_table_index = true;
+        if (std.mem.eql(u8, route.operation_id, "createNamespaceTableIndex")) found_create_namespace_table_index = true;
+        if (std.mem.eql(u8, route.operation_id, "dropNamespaceTableIndex")) found_drop_namespace_table_index = true;
         if (std.mem.eql(u8, route.operation_id, "createTable")) found_create_table = true;
         if (std.mem.eql(u8, route.operation_id, "lookupKey")) found_lookup_key = true;
         if (std.mem.eql(u8, route.operation_id, "batchWrite")) found_batch_write = true;
@@ -244,6 +277,18 @@ test "generated extractors: route table covers public API" {
         if (std.mem.eql(u8, route.operation_id, "removeRowFilter")) found_remove_row_filter = true;
     }
     try std.testing.expect(found_get_status);
+    try std.testing.expect(found_list_databases);
+    try std.testing.expect(found_get_namespace_table);
+    try std.testing.expect(found_query_namespace_table);
+    try std.testing.expect(found_batch_namespace_table);
+    try std.testing.expect(found_rows_batch_namespace_table);
+    try std.testing.expect(found_backup_namespace_table);
+    try std.testing.expect(found_restore_namespace_table);
+    try std.testing.expect(found_lookup_namespace_table_document);
+    try std.testing.expect(found_list_namespace_table_indexes);
+    try std.testing.expect(found_get_namespace_table_index);
+    try std.testing.expect(found_create_namespace_table_index);
+    try std.testing.expect(found_drop_namespace_table_index);
     try std.testing.expect(found_create_table);
     try std.testing.expect(found_lookup_key);
     try std.testing.expect(found_batch_write);
@@ -253,6 +298,10 @@ test "generated extractors: route table covers public API" {
     try std.testing.expect(found_get_row_filter);
     try std.testing.expect(found_set_row_filter);
     try std.testing.expect(found_remove_row_filter);
+}
+
+test "metadata generated router accepts AntflyApiHandler implementation" {
+    _ = metadata_generated.server.ServerRouter(httpx_handler.AntflyApiHandler);
 }
 
 test "bleve and metadata openapi modules are generated and wired" {
@@ -637,6 +686,18 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "backup"));
     try std.testing.expect(@hasDecl(client_generated.Client, "restore"));
     try std.testing.expect(@hasDecl(client_generated.Client, "listBackups"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "listDatabases"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "getNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "queryNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "batchNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "rowsBatchNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "backupNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "restoreNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "lookupNamespaceTableDocument"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "listNamespaceTableIndexes"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "getNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "createNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "dropNamespaceTableIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "listTables"));
     try std.testing.expect(@hasDecl(client_generated.Client, "createTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "getTable"));

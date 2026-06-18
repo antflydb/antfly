@@ -63,9 +63,10 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table",  "index",   "query",    "lookup",
-        "load",   "insert",  "delete",   "agents",
-        "backup", "restore", "internal",
+        "table",   "database", "namespace", "tablespace",
+        "index",   "query",    "lookup",    "load",
+        "insert",  "delete",   "agents",    "backup",
+        "restore", "auth",     "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
@@ -148,6 +149,7 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
     if (std.mem.eql(u8, subcommand, "table")) return cmd.cli.table.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "database")) return cmd.cli.database_cmd.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "namespace")) return cmd.cli.namespace_cmd.run(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "tablespace")) return cmd.cli.tablespace.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
@@ -174,6 +176,9 @@ fn printUsage(argv0: []const u8) void {
         \\  serverless
         \\
         \\client subcommands:
+        \\  database       Manage databases (create, drop, list, get, tablespace binding)
+        \\  namespace      Manage namespaces (create, drop, list, tablespace binding)
+        \\  tablespace     Manage tablespaces (create, drop, list, get)
         \\  table          Manage tables (create, drop, list, get)
         \\  index          Manage indexes (create, drop, list, get)
         \\  query          Query data from a table

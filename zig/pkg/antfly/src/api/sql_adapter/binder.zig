@@ -299,7 +299,7 @@ fn readSourceTableNamesFromWithAlloc(
             index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
         }
         if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
-        try consumeCteMaterializationHint(tokens, &index);
+        try parser.consumeCteMaterializationHint(tokens, &index);
         if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
         if (index + 1 >= close_index) return error.UnsupportedSqlShape;
@@ -400,7 +400,7 @@ fn insertSourceTableNamesFromWithAlloc(
             index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
         }
         if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
-        try consumeCteMaterializationHint(tokens, &index);
+        try parser.consumeCteMaterializationHint(tokens, &index);
         if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
         const from_index = findTopLevelKeyword(tokens[index + 1 .. close_index], "from") orelse return error.UnsupportedSqlShape;
@@ -478,13 +478,6 @@ fn cteBindingIndex(bindings: []const CteSourceBinding, name: []const u8) ?usize 
 
 fn consumeKeyword(tokens: []const Token, index: *usize, keyword: []const u8) bool {
     return parser.matchKeyword(tokens, index, keyword);
-}
-
-fn consumeCteMaterializationHint(tokens: []const Token, index: *usize) !void {
-    if (consumeKeyword(tokens, index, "materialized")) return;
-    if (consumeKeyword(tokens, index, "not") and !consumeKeyword(tokens, index, "materialized")) {
-        return error.UnsupportedSqlShape;
-    }
 }
 
 fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {

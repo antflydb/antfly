@@ -53,6 +53,8 @@ pub const Routes = struct {
     pub const backup = "/backup";
     pub const restore = "/restore";
     pub const backups = "/backups";
+    pub const tablespaces = "/tablespaces";
+    pub const tablespaces_prefix = "/tablespaces/";
     pub const databases = "/databases";
     pub const databases_prefix = "/databases/";
     pub const namespaces_segment = "/namespaces";
@@ -77,15 +79,15 @@ pub const Routes = struct {
     pub const internal_groups_prefix = "/internal/v1/groups/";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const batch_suffix = "/batch";
-    pub const rows_batch_suffix = "/rows:batch";
-    pub const rows_get_suffix = "/rows:get";
-    pub const rows_query_suffix = "/rows:query";
-    pub const rows_aggregate_suffix = "/rows:aggregate";
-    pub const rows_window_suffix = "/rows:window";
-    pub const rows_join_suffix = "/rows:join";
-    pub const rows_lateral_suffix = "/rows:lateral";
-    pub const rows_mutation_source_suffix = "/rows:mutation-source";
-    pub const rows_source_suffix = "/rows:source";
+    pub const rows_batch_suffix = "/rows/batch";
+    pub const rows_get_suffix = "/rows/get";
+    pub const rows_query_suffix = "/rows/query";
+    pub const rows_aggregate_suffix = "/rows/aggregate";
+    pub const rows_window_suffix = "/rows/window";
+    pub const rows_join_suffix = "/rows/join";
+    pub const rows_lateral_suffix = "/rows/lateral";
+    pub const rows_mutation_source_suffix = "/rows/mutation-source";
+    pub const rows_source_suffix = "/rows/source";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
@@ -129,6 +131,7 @@ pub const Routes = struct {
     pub const artifacts_suffix = "/artifacts";
     pub const reprocess_suffix = "/reprocess";
     pub const placement_update_suffix = ":placement";
+    pub const tablespace_binding_suffix = "/tablespace";
     pub const child_range_batch_suffix = ":child-range-batch";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
@@ -160,6 +163,10 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const TablespacePath = struct {
+        tablespace_name: []const u8,
+    };
+
     pub const TableMerge = struct {
         table_name: []const u8,
     };
@@ -173,6 +180,15 @@ pub const Routes = struct {
     };
 
     pub const NamespacePath = struct {
+        database_name: []const u8,
+        namespace_name: []const u8,
+    };
+
+    pub const DatabaseTablespacePath = struct {
+        database_name: []const u8,
+    };
+
+    pub const NamespaceTablespacePath = struct {
         database_name: []const u8,
         namespace_name: []const u8,
     };
@@ -600,6 +616,21 @@ pub const Routes = struct {
         return .{ .database_name = database_name };
     }
 
+    pub fn matchDatabaseTablespace(path: []const u8) ?DatabaseTablespacePath {
+        if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, tablespace_binding_suffix)) return null;
+        const database_name = path[databases_prefix.len .. path.len - tablespace_binding_suffix.len];
+        if (database_name.len == 0 or std.mem.indexOfScalar(u8, database_name, '/') != null) return null;
+        return .{ .database_name = database_name };
+    }
+
+    pub fn matchTablespacePath(path: []const u8) ?TablespacePath {
+        if (!std.mem.startsWith(u8, path, tablespaces_prefix)) return null;
+        const tablespace_name = path[tablespaces_prefix.len..];
+        if (tablespace_name.len == 0 or std.mem.indexOfScalar(u8, tablespace_name, '/') != null) return null;
+        return .{ .tablespace_name = tablespace_name };
+    }
+
     pub fn matchDatabaseNamespaces(path: []const u8) ?DatabasePath {
         if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
         if (!std.mem.endsWith(u8, path, namespaces_segment)) return null;
@@ -611,6 +642,18 @@ pub const Routes = struct {
     pub fn matchDatabaseNamespacePath(path: []const u8) ?NamespacePath {
         if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
         const rest = path[databases_prefix.len..];
+        const marker = std.mem.indexOf(u8, rest, namespaces_segment_prefix) orelse return null;
+        if (marker == 0) return null;
+        const database_name = rest[0..marker];
+        const namespace_name = rest[marker + namespaces_segment_prefix.len ..];
+        if (namespace_name.len == 0 or std.mem.indexOfScalar(u8, namespace_name, '/') != null) return null;
+        return .{ .database_name = database_name, .namespace_name = namespace_name };
+    }
+
+    pub fn matchDatabaseNamespaceTablespace(path: []const u8) ?NamespaceTablespacePath {
+        if (!std.mem.startsWith(u8, path, databases_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, tablespace_binding_suffix)) return null;
+        const rest = path[databases_prefix.len .. path.len - tablespace_binding_suffix.len];
         const marker = std.mem.indexOf(u8, rest, namespaces_segment_prefix) orelse return null;
         if (marker == 0) return null;
         const database_name = rest[0..marker];

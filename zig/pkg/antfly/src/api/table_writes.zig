@@ -31,6 +31,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
 const backend_types = @import("../storage/backend_types.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -58,6 +59,24 @@ const tracing = @import("../tracing/mod.zig");
 const platform_time = @import("../platform/time.zig");
 const platform_clock = @import("../platform/clock.zig");
 const Io = std.Io;
+
+fn nativeCatalogTableNameAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    target: catalog_resources.TableTarget,
+) ![]u8 {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
+    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
+
+fn nativeCatalogTableNameForCreateAlloc(
+    alloc: std.mem.Allocator,
+    target: catalog_resources.TableTarget,
+) ![]u8 {
+    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
 
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);
 const local_schema_json_key = db_mod.local_schema_json_key;
@@ -2881,6 +2900,12 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: tables_api.CreateTableRequest,
         ) anyerror!?void = null,
+        create_catalog_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: tables_api.CreateTableRequest,
+        ) anyerror!?void = null,
         update_schema: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2894,10 +2919,23 @@ pub const TableWriteSource = struct {
             index_name: []const u8,
             index_json: []const u8,
         ) anyerror!?void = null,
+        create_catalog_index: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            index_name: []const u8,
+            index_json: []const u8,
+        ) anyerror!?void = null,
         drop_index: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
+            index_name: []const u8,
+        ) anyerror!?void = null,
+        drop_catalog_index: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
             index_name: []const u8,
         ) anyerror!?void = null,
         graph_metric_action: ?*const fn (
@@ -2921,16 +2959,34 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             group_ids: []const u64,
         ) anyerror!?void = null,
+        drop_catalog_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            group_ids: []const u64,
+        ) anyerror!?void = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
             plan: backups_api.TableBackupPlan,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
+        backup_catalog_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            plan: backups_api.TableBackupPlan,
+        ) anyerror!?[]backups_api.ShardSnapshot = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
+            plan: backups_api.TableRestorePlan,
+        ) anyerror!?void = null,
+        restore_catalog_table: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
             plan: backups_api.TableRestorePlan,
         ) anyerror!?void = null,
         commit_transaction: ?*const fn (
@@ -2953,6 +3009,12 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!?void,
+        batch_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: db_mod.types.BatchRequest,
+        ) anyerror!?void = null,
         mutate_rows_from_source: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3028,6 +3090,11 @@ pub const TableWriteSource = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
+        ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
+        local_runtime_statuses_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
         ) anyerror!?runtime_status.LocalTableRuntimeStatuses = null,
         foreign_key_integrity: ?*const fn (
             ptr: *anyopaque,
@@ -3326,6 +3393,16 @@ pub const TableWriteSource = struct {
         return try self.vtable.batch(self.ptr, alloc, table_name, req);
     }
 
+    pub fn batchCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: db_mod.types.BatchRequest,
+    ) !?void {
+        if (self.vtable.batch_catalog) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, req);
+        return error.UnsupportedOperation;
+    }
+
     pub fn mutateRowsFromSource(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -3367,6 +3444,16 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
 
+    pub fn createCatalogTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: tables_api.CreateTableRequest,
+    ) !?void {
+        if (self.vtable.create_catalog_table) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, req);
+        return error.UnsupportedOperation;
+    }
+
     pub fn updateSchema(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -3388,6 +3475,17 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, index_name, index_json);
     }
 
+    pub fn createCatalogIndex(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !?void {
+        if (self.vtable.create_catalog_index) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, index_name, index_json);
+        return error.UnsupportedOperation;
+    }
+
     pub fn dropIndex(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -3396,6 +3494,16 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.drop_index orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn dropCatalogIndex(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        index_name: []const u8,
+    ) !?void {
+        if (self.vtable.drop_catalog_index) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, index_name);
+        return error.UnsupportedOperation;
     }
 
     pub fn graphMetricAction(
@@ -3431,6 +3539,16 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, group_ids);
     }
 
+    pub fn dropCatalogTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        group_ids: []const u64,
+    ) !?void {
+        if (self.vtable.drop_catalog_table) |fn_ptr| return try fn_ptr(self.ptr, alloc, target, group_ids);
+        return error.UnsupportedOperation;
+    }
+
     pub fn backupTable(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -3441,6 +3559,16 @@ pub const TableWriteSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, plan);
     }
 
+    pub fn backupCatalogTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        plan: backups_api.TableBackupPlan,
+    ) !?[]backups_api.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_catalog_table orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, plan);
+    }
+
     pub fn restoreTable(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -3449,6 +3577,16 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.restore_table orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn restoreCatalogTable(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const fn_ptr = self.vtable.restore_catalog_table orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, plan);
     }
 
     pub fn commitTransaction(
@@ -3553,6 +3691,15 @@ pub const TableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const fn_ptr = self.vtable.local_runtime_statuses orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn localRuntimeStatusesCatalog(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        if (self.vtable.local_runtime_statuses_catalog) |fn_ptr| return try fn_ptr(self.ptr, alloc, target);
+        return error.UnsupportedOperation;
     }
 
     pub fn foreignKeyIntegrity(
@@ -10679,16 +10826,23 @@ pub const ProvisionedTableWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .create_table = createTable,
+                .create_catalog_table = createCatalogTableNative,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
+                .create_catalog_index = createCatalogIndexNative,
                 .drop_index = dropIndex,
+                .drop_catalog_index = dropCatalogIndexNative,
                 .drop_table = dropTable,
+                .drop_catalog_table = dropCatalogTableNative,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
+                .backup_catalog_table = backupCatalogTableNative,
                 .restore_table = restoreTable,
+                .restore_catalog_table = restoreCatalogTableNative,
                 .batch = batch,
+                .batch_catalog = batchCatalogNative,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
@@ -10699,6 +10853,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .local_runtime_statuses_catalog = ProvisionedTableWriteSource.localRuntimeStatusesCatalogNative,
                 .foreign_key_integrity = foreignKeyIntegrity,
                 .foreign_key_integrity_worker_pass = foreignKeyIntegrityWorkerPass,
                 .foreign_key_integrity_schema_controller_pass = foreignKeyIntegritySchemaControllerPass,
@@ -10886,6 +11041,17 @@ pub const ProvisionedTableWriteSource = struct {
         std.log.info("provisioned create table local done table={s}", .{table_name});
     }
 
+    fn createCatalogTableNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: tables_api.CreateTableRequest,
+    ) !?void {
+        const table_name = try nativeCatalogTableNameForCreateAlloc(alloc, target);
+        defer alloc.free(table_name);
+        return try createTable(ptr, alloc, table_name, req);
+    }
+
     fn updateSchema(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -10946,6 +11112,19 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn createCatalogIndexNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try createIndex(ptr, alloc, table_name, index_name, index_json);
+    }
+
     fn dropIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -10959,6 +11138,18 @@ pub const ProvisionedTableWriteSource = struct {
         try dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name);
         self.finishLocalStructuralMutation(table_name);
         self.notifyLocalChange(table_name, .structural);
+    }
+
+    fn dropCatalogIndexNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        index_name: []const u8,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try dropIndex(ptr, alloc, table_name, index_name);
     }
 
     fn dropTable(
@@ -10981,6 +11172,18 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.finishLocalStructuralMutation(table_name);
         self.notifyLocalChange(table_name, .structural);
+    }
+
+    fn dropCatalogTableNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        group_ids: []const u64,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try dropTable(ptr, alloc, table_name, group_ids);
     }
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
@@ -11395,6 +11598,18 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .data);
     }
 
+    fn batchCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: db_mod.types.BatchRequest,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try batch(ptr, alloc, table_name, req);
+    }
+
     fn backupTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -11436,6 +11651,18 @@ pub const ProvisionedTableWriteSource = struct {
             .snapshot_path = rel_path,
         };
         return shards;
+    }
+
+    fn backupCatalogTableNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        plan: backups_api.TableBackupPlan,
+    ) !?[]backups_api.ShardSnapshot {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try backupTable(ptr, alloc, table_name, plan);
     }
 
     fn restoreTable(
@@ -11499,6 +11726,18 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
         self.notifyLocalChange(table_name, .data);
         self.requestRestoreRepairCatchUp(table_name, group_id);
+    }
+
+    fn restoreCatalogTableNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try restoreTable(ptr, alloc, table_name, plan);
     }
 
     fn commitTransaction(
@@ -11812,6 +12051,17 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?runtime_status.LocalTableRuntimeStatuses {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try self.snapshotRuntimeStatusesBestEffort(alloc, table_name);
+    }
+
+    fn localRuntimeStatusesCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try localRuntimeStatuses(ptr, alloc, table_name);
     }
 
     fn foreignKeyIntegrity(
@@ -14192,12 +14442,17 @@ pub const HostedProvisionedTableWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .create_index = createIndex,
+                .create_catalog_index = createCatalogIndexNative,
                 .drop_index = dropIndex,
+                .drop_catalog_index = dropCatalogIndexNative,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
+                .backup_catalog_table = HostedProvisionedTableWriteSource.backupCatalogTableNative,
                 .restore_table = restoreTable,
+                .restore_catalog_table = HostedProvisionedTableWriteSource.restoreCatalogTableNative,
                 .batch = batch,
+                .batch_catalog = HostedProvisionedTableWriteSource.batchCatalogNative,
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
@@ -14206,6 +14461,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_status_group_local = txnStatusGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .local_runtime_statuses = localRuntimeStatuses,
+                .local_runtime_statuses_catalog = HostedProvisionedTableWriteSource.localRuntimeStatusesCatalogNative,
                 .foreign_key_integrity = foreignKeyIntegrity,
                 .foreign_key_integrity_worker_pass = foreignKeyIntegrityWorkerPass,
                 .foreign_key_integrity_schema_controller_pass = foreignKeyIntegritySchemaControllerPass,
@@ -14398,6 +14654,31 @@ pub const HostedProvisionedTableWriteSource = struct {
         self.invalidateManagedCache(table_name);
     }
 
+    fn createCatalogIndexNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        index_name: []const u8,
+        index_json: []const u8,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try createIndex(ptr, alloc, table_name, index_name, index_json);
+    }
+
+    fn dropCatalogIndexNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        index_name: []const u8,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try dropIndex(ptr, alloc, table_name, index_name);
+    }
+
     fn batch(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -14514,6 +14795,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
     }
 
+    fn batchCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: db_mod.types.BatchRequest,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try batch(ptr, alloc, table_name, req);
+    }
+
     fn mutateRowsFromSource(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -14625,6 +14918,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         return error.UnsupportedOperation;
     }
 
+    fn backupCatalogTableNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        plan: backups_api.TableBackupPlan,
+    ) !?[]backups_api.ShardSnapshot {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try backupTable(ptr, alloc, table_name, plan);
+    }
+
     fn restoreTable(
         _: *anyopaque,
         _: std.mem.Allocator,
@@ -14632,6 +14937,18 @@ pub const HostedProvisionedTableWriteSource = struct {
         _: backups_api.TableRestorePlan,
     ) !?void {
         return error.UnsupportedOperation;
+    }
+
+    fn restoreCatalogTableNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        plan: backups_api.TableRestorePlan,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try restoreTable(ptr, alloc, table_name, plan);
     }
 
     fn batchGroupLocal(
@@ -14748,6 +15065,17 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (statuses) |owned| return owned;
         }
         return try snapshotLocalTableRuntimeStatusesUncached(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name);
+    }
+
+    fn localRuntimeStatusesCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+    ) !?runtime_status.LocalTableRuntimeStatuses {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try localRuntimeStatuses(ptr, alloc, table_name);
     }
 
     fn foreignKeyIntegrity(

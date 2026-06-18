@@ -13,10 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const tables_api = @import("tables.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
 
-pub const default_database_name = tables_api.default_database_name;
-pub const default_namespace_name = tables_api.default_namespace_name;
+pub const default_database_name = metadata_table_manager.default_database_name;
+pub const default_namespace_name = metadata_table_manager.default_namespace_name;
 
 pub fn databaseResourceNameAlloc(alloc: std.mem.Allocator, database_name: []const u8) ![]u8 {
     if (database_name.len == 0 or std.mem.indexOfScalar(u8, database_name, '.') != null) return error.UnsupportedSqlShape;
@@ -47,6 +47,11 @@ pub fn tableResourceNameAlloc(
         return error.UnsupportedSqlShape;
     }
     return try std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ database_name, namespace_name, table_name });
+}
+
+pub fn tablespaceResourceNameAlloc(alloc: std.mem.Allocator, tablespace_name: []const u8) ![]u8 {
+    if (tablespace_name.len == 0 or std.mem.indexOfScalar(u8, tablespace_name, '.') != null) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tablespace_name);
 }
 
 pub fn defaultPublicTableResourceNameAlloc(alloc: std.mem.Allocator, table_name: []const u8) ![]u8 {
@@ -101,25 +106,65 @@ pub fn tableIsDefaultPublic(target: TableTarget) bool {
     return isDefaultPublicNamespace(target.database_name, target.namespace_name);
 }
 
-pub fn sqlTableTargetFromObjectName(object_name: []const u8, current_database_name: []const u8) !TableTarget {
-    if (object_name.len == 0) return error.UnsupportedSqlShape;
-    if (std.mem.indexOfScalar(u8, object_name, '.')) |dot| {
-        if (dot == 0) return error.UnsupportedSqlShape;
-        const namespace_name = object_name[0..dot];
-        const table_name = object_name[dot + 1 ..];
-        if (namespace_name.len == 0 or table_name.len == 0) return error.UnsupportedSqlShape;
-        if (std.mem.indexOfScalar(u8, table_name, '.') != null) return error.UnsupportedSqlShape;
+pub fn storageTableNameForTargetAlloc(alloc: std.mem.Allocator, target: TableTarget) ![]u8 {
+    if (tableIsDefaultPublic(target)) return try alloc.dupe(u8, target.table_name);
+    return try tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
+
+pub const SqlCatalogSession = struct {
+    current_database_name: []const u8 = default_database_name,
+    search_path: []const []const u8 = &.{default_namespace_name},
+
+    pub fn default() SqlCatalogSession {
+        return .{};
+    }
+
+    pub fn primarySearchPathNamespace(self: SqlCatalogSession) []const u8 {
+        if (self.search_path.len == 0) return default_namespace_name;
+        return self.search_path[0];
+    }
+
+    pub fn currentDatabase(self: SqlCatalogSession) []const u8 {
+        if (self.current_database_name.len == 0) return default_database_name;
+        return self.current_database_name;
+    }
+
+    pub fn tableTargetFromObjectName(self: SqlCatalogSession, object_name: []const u8) !TableTarget {
+        if (object_name.len == 0) return error.UnsupportedSqlShape;
+        if (std.mem.indexOfScalar(u8, object_name, '.')) |dot| {
+            if (dot == 0) return error.UnsupportedSqlShape;
+            const namespace_name = object_name[0..dot];
+            const table_name = object_name[dot + 1 ..];
+            if (namespace_name.len == 0 or table_name.len == 0) return error.UnsupportedSqlShape;
+            if (std.mem.indexOfScalar(u8, table_name, '.') != null) return error.UnsupportedSqlShape;
+            return .{
+                .database_name = self.currentDatabase(),
+                .namespace_name = namespace_name,
+                .table_name = table_name,
+            };
+        }
         return .{
-            .database_name = current_database_name,
-            .namespace_name = namespace_name,
-            .table_name = table_name,
+            .database_name = self.currentDatabase(),
+            .namespace_name = self.primarySearchPathNamespace(),
+            .table_name = object_name,
         };
     }
-    return .{
-        .database_name = current_database_name,
-        .namespace_name = default_namespace_name,
-        .table_name = object_name,
-    };
+
+    pub fn namespaceTargetFromSchemaName(self: SqlCatalogSession, schema_name: []const u8) !NamespaceTarget {
+        if (schema_name.len == 0 or std.mem.indexOfScalar(u8, schema_name, '.') != null) return error.UnsupportedSqlShape;
+        return .{
+            .database_name = self.currentDatabase(),
+            .namespace_name = schema_name,
+        };
+    }
+};
+
+pub fn sqlTableTargetFromObjectNameWithSession(object_name: []const u8, session: SqlCatalogSession) !TableTarget {
+    return try session.tableTargetFromObjectName(object_name);
+}
+
+pub fn sqlTableTargetFromObjectName(object_name: []const u8, current_database_name: []const u8) !TableTarget {
+    return try sqlTableTargetFromObjectNameWithSession(object_name, .{ .current_database_name = current_database_name });
 }
 
 pub fn tableResourceNameFromSqlObjectAlloc(
@@ -175,4 +220,28 @@ test "catalog resource names and migration table matching" {
     try std.testing.expectEqualStrings("default", default_target.database_name);
     try std.testing.expectEqualStrings("public", default_target.namespace_name);
     try std.testing.expectEqualStrings("docs", default_target.table_name);
+}
+
+test "sql catalog session maps current database and search path" {
+    const default_target = try SqlCatalogSession.default().tableTargetFromObjectName("events");
+    try std.testing.expectEqualStrings("default", default_target.database_name);
+    try std.testing.expectEqualStrings("public", default_target.namespace_name);
+    try std.testing.expectEqualStrings("events", default_target.table_name);
+
+    const search_path = [_][]const u8{"analytics"};
+    const tenant_session: SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = &search_path,
+    };
+    const search_path_target = try tenant_session.tableTargetFromObjectName("events");
+    try std.testing.expectEqualStrings("tenant_ops", search_path_target.database_name);
+    try std.testing.expectEqualStrings("analytics", search_path_target.namespace_name);
+    try std.testing.expectEqualStrings("events", search_path_target.table_name);
+
+    const explicit_namespace_target = try tenant_session.tableTargetFromObjectName("public.events");
+    try std.testing.expectEqualStrings("tenant_ops", explicit_namespace_target.database_name);
+    try std.testing.expectEqualStrings("public", explicit_namespace_target.namespace_name);
+    try std.testing.expectEqualStrings("events", explicit_namespace_target.table_name);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, tenant_session.tableTargetFromObjectName("tenant_ops.analytics.events"));
 }

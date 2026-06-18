@@ -32,6 +32,7 @@ const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const tables_api = @import("tables.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const table_contract = @import("table_contract.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
@@ -306,6 +307,23 @@ pub const AntflyApiHandler = struct {
             }
         }
         return null;
+    }
+
+    fn catalogTableTarget(database_name: []const u8, namespace_name: []const u8, table_name: []const u8) catalog_resources.TableTarget {
+        return .{
+            .database_name = database_name,
+            .namespace_name = namespace_name,
+            .table_name = table_name,
+        };
+    }
+
+    fn catalogStorageResolveErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.TableNotFound => textResponse(ctx, 404, "not found"),
+            error.CatalogTableStorageAliasAmbiguous => textResponse(ctx, 501, "catalog table storage name is ambiguous until table I/O APIs are catalog-aware"),
+            error.UnsupportedOperation => textResponse(ctx, 405, "method not allowed"),
+            else => err,
+        };
     }
 
     // ---------------------------------------------------------------
@@ -1450,6 +1468,178 @@ pub const AntflyApiHandler = struct {
         return ctx.json(response);
     }
 
+    pub fn listDatabases(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicListDatabases();
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getDatabase(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicGetDatabase(database_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn createDatabase(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicCreateDatabase(database_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn dropDatabase(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicDropDatabase(database_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn setDatabaseTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicSetDatabaseTablespace(database_name, body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn clearDatabaseTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicClearDatabaseTablespace(database_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn listTablespaces(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicListTablespaces();
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicGetTablespace(tablespace_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn createTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse "";
+        var resp = try self.api_server.handlePublicCreateTablespace(tablespace_name, body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn dropTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, tablespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicDropTablespace(tablespace_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn listNamespaces(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicListNamespaces(database_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn createNamespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicCreateNamespace(database_name, namespace_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn dropNamespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicDropNamespace(database_name, namespace_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn setNamespaceTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicSetNamespaceTablespace(database_name, namespace_name, body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn clearNamespaceTablespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicClearNamespaceTablespace(database_name, namespace_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn listNamespaceTables(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        params: metadata_openapi.server.ListNamespaceTablesParams,
+    ) !httpx.Response {
+        _ = params;
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicListNamespaceTables(database_name, namespace_name, ctx.request.uri.query orelse "");
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicGetCatalogTable(catalogTableTarget(database_name, namespace_name, table_name));
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn createNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("invalid create table request");
+        };
+        var resp = try self.api_server.handlePublicCreateCatalogTable(catalogTableTarget(database_name, namespace_name, table_name), body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn dropNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicDropCatalogTable(catalogTableTarget(database_name, namespace_name, table_name));
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
     pub fn listTables(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_openapi.server.ListTablesParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -1673,6 +1863,123 @@ pub const AntflyApiHandler = struct {
         };
         _ = ctx.status(204);
         return ctx.text("");
+    }
+
+    pub fn queryNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicCatalogTableQueryWithContentType(
+            catalogTableTarget(database_name, namespace_name, table_name),
+            body_data,
+            ctx.header("content-type"),
+            authenticated_identity,
+        );
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn batchNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicCatalogTableBatch(catalogTableTarget(database_name, namespace_name, table_name), body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn rowsBatchNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicCatalogTableRowsBatch(catalogTableTarget(database_name, namespace_name, table_name), body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn backupNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicCatalogTableBackup(catalogTableTarget(database_name, namespace_name, table_name), body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn restoreNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicCatalogTableRestore(catalogTableTarget(database_name, namespace_name, table_name), body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn lookupNamespaceTableDocument(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        key: []const u8,
+        params: metadata_openapi.server.LookupNamespaceTableDocumentParams,
+    ) !httpx.Response {
+        _ = params;
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicCatalogTableDocumentLookup(catalogTableTarget(database_name, namespace_name, table_name), key, ctx.request.uri.query orelse "", authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn listNamespaceTableIndexes(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const target = catalogTableTarget(database_name, namespace_name, table_name);
+        var resp = try self.api_server.handlePublicCatalogTableListIndexes(target);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn getNamespaceTableIndex(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const target = catalogTableTarget(database_name, namespace_name, table_name);
+        var resp = try self.api_server.handlePublicCatalogTableGetIndex(target, index_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn createNamespaceTableIndex(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse "";
+        var resp = try self.api_server.handlePublicCatalogTableCreateIndex(catalogTableTarget(database_name, namespace_name, table_name), index_name, body_data);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
+    }
+
+    pub fn dropNamespaceTableIndex(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try self.api_server.handlePublicCatalogTableDeleteIndex(catalogTableTarget(database_name, namespace_name, table_name), index_name);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn queryTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
