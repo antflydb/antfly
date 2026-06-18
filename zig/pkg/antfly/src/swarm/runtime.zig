@@ -2151,11 +2151,13 @@ fn haSyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPol
     const names = try alloc.alloc([]const u8, cli.ha_sync_standby_names.items.len);
     errdefer alloc.free(names);
     @memcpy(names, cli.ha_sync_standby_names.items);
+    const selection = cli.ha_sync_selection orelse .any;
+    if (selection == .all and cli.ha_sync_required != null) return error.InvalidHASyncPolicy;
 
     const policy = antfly.ha.primary.SyncPolicy{
         .mode = cli.ha_sync_mode orelse .remote_write,
-        .selection = cli.ha_sync_selection orelse .any,
-        .required = cli.ha_sync_required orelse 1,
+        .selection = selection,
+        .required = if (selection == .all) names.len else cli.ha_sync_required orelse 1,
         .standby_names = names,
         .failure_policy = cli.ha_sync_failure_policy orelse .block,
     };
@@ -2761,6 +2763,40 @@ test "parse cli accepts HA primary sync policy flags" {
     try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
     try std.testing.expectEqualStrings("standby-a", sync_policy.policy.standby_names[0]);
     try std.testing.expectEqualStrings("standby-b", sync_policy.policy.standby_names[1]);
+}
+
+test "parse cli treats ALL HA sync policy as all named standbys" {
+    var argv = [_][*:0]const u8{
+        "--ha-primary-log",
+        "/tmp/ha-primary.log",
+        "--ha-primary-slots",
+        "/tmp/ha-primary.slots",
+        "--ha-fence-wal",
+        "/tmp/ha-fence.wal",
+        "--ha-sync-mode",
+        "remote-apply",
+        "--ha-sync-selection",
+        "all",
+        "--ha-sync-standby",
+        "standby-a",
+        "--ha-sync-standby",
+        "standby-b",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+
+    try validateHARole(cfg);
+    var sync_policy = try haSyncPolicyFromCli(std.testing.allocator, cfg);
+    defer sync_policy.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(antfly.ha.primary.DurabilityMode.remote_apply, sync_policy.policy.mode);
+    try std.testing.expectEqual(antfly.ha.primary.StandbySelection.all, sync_policy.policy.selection);
+    try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.required);
+    try std.testing.expectEqual(@as(usize, 2), sync_policy.policy.standby_names.len);
+
+    cfg.ha_sync_required = 1;
+    try std.testing.expectError(error.InvalidHASyncPolicy, haSyncPolicyFromCli(std.testing.allocator, cfg));
 }
 
 test "parse cli accepts HA primary retention policy flags" {

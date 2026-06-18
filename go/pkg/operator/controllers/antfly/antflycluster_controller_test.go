@@ -8730,6 +8730,35 @@ func TestReconcileSwarmStatefulSetAddsHARuntimeArgs(t *testing.T) {
 	}))
 }
 
+func TestSwarmHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
+	g := NewWithT(t)
+
+	args := swarmHAArgs(&antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			TimelineID:       1,
+			Epoch:            2,
+			CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role:   antflyv1.HARuntimeRolePrimary,
+			NodeID: "primary-a",
+		},
+		SyncPolicy: &antflyv1.HASyncPolicy{
+			Mode:         antflyv1.HADurabilityModeRemoteApply,
+			Selection:    antflyv1.HAStandbySelectionAll,
+			StandbyNames: []string{"standby-a", "standby-b"},
+		},
+	})
+
+	g.Expect(args).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
+	g.Expect(args).To(ContainSubstring(`--ha-sync-selection 'all'`))
+	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-a'`))
+	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-b'`))
+	g.Expect(args).NotTo(ContainSubstring(`--ha-sync-required`))
+}
+
 func TestSwarmHAArgsShellQuotesRuntimeValues(t *testing.T) {
 	g := NewWithT(t)
 
