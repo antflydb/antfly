@@ -106,6 +106,7 @@ pub const ProjectedRow = struct {
 
 pub const HydrateResult = struct {
     rows: []ProjectedRow,
+    total: u32 = 0,
 
     pub fn deinit(self: *HydrateResult, alloc: Allocator) void {
         for (self.rows) |*row| row.deinit(alloc);
@@ -165,9 +166,10 @@ pub fn scanRowsAlloc(
     }
 
     if (request.limit != null and request.limit.? == 0) {
-        return .{ .rows = try rows.toOwnedSlice(alloc) };
+        return .{ .rows = try rows.toOwnedSlice(alloc), .total = 0 };
     }
 
+    var total: u32 = 0;
     while (try source.next(alloc)) |batch| {
         const predicate_column = if (request.predicate) |predicate|
             batch.findColumn(predicate.column) orelse return error.RowSourceColumnNotFound
@@ -178,13 +180,14 @@ pub fn scanRowsAlloc(
             if (request.predicate) |predicate| {
                 if (!try predicateMatches(predicate, predicate_column.?, row_idx)) continue;
             }
-            try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, request.projected_columns));
-            if (limitReached(rows.items.len, request.limit)) break;
+            total += 1;
+            if (!limitReached(rows.items.len, request.limit)) {
+                try rows.append(alloc, try projectRowAlloc(alloc, batch, row_idx, request.projected_columns));
+            }
         }
-        if (limitReached(rows.items.len, request.limit)) break;
     }
 
-    return .{ .rows = try rows.toOwnedSlice(alloc) };
+    return .{ .rows = try rows.toOwnedSlice(alloc), .total = total };
 }
 
 pub fn hydrateRowsAlloc(
@@ -193,7 +196,7 @@ pub fn hydrateRowsAlloc(
     wanted_refs: []const rowsource.RowRef,
     projected_columns: []const []const u8,
 ) !HydrateResult {
-    if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0) };
+    if (wanted_refs.len == 0) return .{ .rows = try alloc.alloc(ProjectedRow, 0), .total = 0 };
     if (projected_columns.len == 0) return error.InvalidLakeRowsQuery;
 
     var rows = std.ArrayListUnmanaged(ProjectedRow).empty;
@@ -211,7 +214,7 @@ pub fn hydrateRowsAlloc(
         if (rows.items.len == wanted_refs.len) break;
     }
 
-    return .{ .rows = try rows.toOwnedSlice(alloc) };
+    return .{ .rows = try rows.toOwnedSlice(alloc), .total = @intCast(rows.items.len) };
 }
 
 fn validateRequest(request: GroupByRequest) !void {

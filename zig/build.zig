@@ -4201,6 +4201,7 @@ pub fn build(b: *std.Build) void {
             "relational rows query contract projects date_trunc",
             "relational rows query contract projects string_to_array",
             "relational rows query contract supports scalar or",
+            "relational rows lake bridge",
             "postgres sql adapter",
             "api http server resolves relational rows by unique selector",
             "api http server executes public relational row plan endpoints",

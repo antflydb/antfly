@@ -16,6 +16,7 @@ const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
 const json_helpers = @import("json_helpers.zig");
+const lake_rows = @import("../serverless/query/lake_rows.zig");
 const platform_time = @import("../platform/time.zig");
 const regex_mod = @import("antfly_regex");
 const runtime_schema = @import("../storage/schema.zig");
@@ -95,6 +96,19 @@ pub const OwnedRowsLateralRequest = db_mod.types.RelationalRowsLateralRequest;
 pub const OwnedRowsLateralPlan = db_mod.types.RelationalRowsLateralPlan;
 pub const OwnedRowsInsertSourcePlan = db_mod.types.RelationalRowsInsertSourcePlan;
 pub const OwnedRowsMutationSourceResult = db_mod.types.RelationalRowsMutationSourceResult;
+
+pub const OwnedRowsLakeScanRequest = struct {
+    request: lake_rows.ScanRequest,
+    projected_columns: []const []const u8 = &.{},
+    predicate_bytes_value: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.projected_columns) |column| alloc.free(@constCast(column));
+        if (self.projected_columns.len > 0) alloc.free(self.projected_columns);
+        if (self.predicate_bytes_value) |value| alloc.free(@constCast(value));
+        self.* = undefined;
+    }
+};
 
 pub const OwnedRowsPlan = union(enum) {
     query: OwnedRowsQueryPlan,
@@ -2989,6 +3003,210 @@ pub fn executeRowsQueryOnJsonRowsAlloc(
         .rows = try out_rows.toOwnedSlice(alloc),
         .total = total,
     };
+}
+
+pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    request: OwnedRowsQueryRequest,
+) !OwnedRowsLakeScanRequest {
+    if (schema.storage_mode != .relational) return error.InvalidRowsRequest;
+    if (request.source_cte.len != 0) return error.UnsupportedRowsQuery;
+    if (request.row_claim != null) return error.UnsupportedRowsQuery;
+    if (request.doc_key_range != null) return error.UnsupportedRowsQuery;
+    if (request.offset != 0) return error.UnsupportedRowsQuery;
+    if (request.order_by.len != 0) return error.UnsupportedRowsQuery;
+    if (request.distinct_on.len != 0 or request.distinct_on_expressions.len != 0) return error.UnsupportedRowsQuery;
+    if (request.json_extract.len != 0 or request.array_length.len != 0 or request.coalesce.len != 0 or request.field_aliases.len != 0 or request.expressions.len != 0) return error.UnsupportedRowsQuery;
+    if (request.array_any.len != 0 or request.array_contains.len != 0 or request.array_eq.len != 0 or request.in_predicates.len != 0) return error.UnsupportedRowsQuery;
+    if (request.json_contains.len != 0 or request.json_path_eq.len != 0 or request.json_path_exists.len != 0 or request.text_patterns.len != 0) return error.UnsupportedRowsQuery;
+    if (request.or_predicates.len != 0 or request.not_predicates.len != 0 or request.access_or_predicates.len != 0 or request.access_not_predicates.len != 0) return error.UnsupportedRowsQuery;
+    if (request.expression_predicates.len != 0 or request.expression_or_predicates.len != 0 or request.expression_not_predicates.len != 0 or request.expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
+    if (request.predicates.len > 1) return error.UnsupportedRowsQuery;
+
+    const projected_columns = try lakeRowsProjectedColumnsAlloc(alloc, schema, request);
+    errdefer {
+        for (projected_columns) |column| alloc.free(@constCast(column));
+        if (projected_columns.len > 0) alloc.free(projected_columns);
+    }
+
+    var predicate_bytes_value: ?[]const u8 = null;
+    errdefer if (predicate_bytes_value) |value| alloc.free(@constCast(value));
+    const predicate: ?lake_rows.Predicate = if (request.predicates.len == 0) null else pred_blk: {
+        const source = request.predicates[0];
+        if (source.op != .eq) return error.UnsupportedRowsQuery;
+        const value_json = source.value_json orelse return error.InvalidRowsRequest;
+        const column = findRelationalColumn(schema.relational_columns, source.field) orelse return error.InvalidRowsRequest;
+        break :pred_blk try lakeRowsPredicateFromRowsPredicateAlloc(alloc, column, source.field, value_json, &predicate_bytes_value);
+    };
+
+    const scan = lake_rows.ScanRequest{
+        .projected_columns = projected_columns,
+        .predicate = predicate,
+        .limit = if (request.limit) |limit| @as(usize, limit) else null,
+    };
+    return .{
+        .request = scan,
+        .projected_columns = projected_columns,
+        .predicate_bytes_value = predicate_bytes_value,
+    };
+}
+
+pub fn buildRowsQueryResultFromLakeRowsAlloc(
+    alloc: std.mem.Allocator,
+    result: lake_rows.ScanResult,
+) !OwnedRowsQueryResult {
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    try rows.ensureUnusedCapacity(alloc, result.rows.len);
+    for (result.rows) |row| {
+        const encoded = try lakeProjectedRowJsonAlloc(alloc, row);
+        rows.appendAssumeCapacity(encoded);
+    }
+
+    return .{
+        .rows = try rows.toOwnedSlice(alloc),
+        .total = result.total,
+    };
+}
+
+fn lakeRowsProjectedColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    request: OwnedRowsQueryRequest,
+) ![]const []const u8 {
+    if (request.select_all) {
+        if (schema.relational_columns.len == 0) return error.InvalidRowsRequest;
+        const out = try alloc.alloc([]const u8, schema.relational_columns.len);
+        errdefer alloc.free(out);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |column| alloc.free(@constCast(column));
+        }
+        for (schema.relational_columns, out) |column, *slot| {
+            slot.* = try alloc.dupe(u8, column.name);
+            initialized += 1;
+        }
+        return out;
+    }
+    if (request.select.len == 0) return error.InvalidRowsRequest;
+    const out = try alloc.alloc([]const u8, request.select.len);
+    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |column| alloc.free(@constCast(column));
+    }
+    for (request.select, out) |field, *slot| {
+        const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+        slot.* = try alloc.dupe(u8, column.name);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn lakeRowsPredicateFromRowsPredicateAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    field: []const u8,
+    value_json: []const u8,
+    predicate_bytes_value: *?[]const u8,
+) !lake_rows.Predicate {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    return switch (column.field_type) {
+        .numeric, .datetime => .{
+            .column = field,
+            .op = .eq_i64,
+            .i64_value = try jsonValueAsI64(parsed.value),
+        },
+        .boolean => .{
+            .column = field,
+            .op = .eq_bool,
+            .bool_value = switch (parsed.value) {
+                .bool => |value| value,
+                else => return error.InvalidRowsRequest,
+            },
+        },
+        .keyword, .text, .blob, .html, .search_as_you_type => pred_blk: {
+            const value = switch (parsed.value) {
+                .string => |text| try alloc.dupe(u8, text),
+                else => return error.InvalidRowsRequest,
+            };
+            predicate_bytes_value.* = value;
+            break :pred_blk .{
+                .column = field,
+                .op = .eq_bytes,
+                .bytes_value = value,
+            };
+        },
+        .json => pred_blk: {
+            const value = try alloc.dupe(u8, value_json);
+            predicate_bytes_value.* = value;
+            break :pred_blk .{
+                .column = field,
+                .op = .eq_bytes,
+                .bytes_value = value,
+            };
+        },
+        else => return error.UnsupportedRowsQuery,
+    };
+}
+
+fn jsonValueAsI64(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |number| number,
+        .float => |number| if (@trunc(number) == number and number >= @as(f64, @floatFromInt(std.math.minInt(i64))) and number <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+            @intFromFloat(number)
+        else
+            error.InvalidRowsRequest,
+        else => error.InvalidRowsRequest,
+    };
+}
+
+fn lakeProjectedRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (row.cells, 0..) |cell, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(cell.name, .{})});
+        try writeLakeRowsCellJson(writer, cell.value);
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn writeLakeRowsCellJson(
+    writer: *std.Io.Writer,
+    maybe_value: ?lake_rows.CellValue,
+) !void {
+    const value = maybe_value orelse {
+        try writer.writeAll("null");
+        return;
+    };
+    switch (value) {
+        .bytes => |bytes| try writer.print("{f}", .{std.json.fmt(bytes, .{})}),
+        .json => |json| try writer.writeAll(json),
+        .i64 => |number| try writer.print("{d}", .{number}),
+        .f64 => |number| try std.json.Stringify.value(number, .{}, writer),
+        .bool => |value_bool| try writer.writeAll(if (value_bool) "true" else "false"),
+        .vector_f32 => |values| {
+            try writer.writeByte('[');
+            for (values, 0..) |number, i| {
+                if (i != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(number, .{}, writer);
+            }
+            try writer.writeByte(']');
+        },
+    }
 }
 
 fn executeRowsQueryOnJsonRowsAcrossRangesAlloc(
@@ -15761,6 +15979,70 @@ fn freeTransforms(alloc: std.mem.Allocator, transforms: []const db_mod.types.Doc
 
 fn freePredicates(alloc: std.mem.Allocator, predicates: []const db_mod.types.TransactionVersionPredicate) void {
     for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+}
+
+test "relational rows lake bridge lowers supported query to scan request" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "tenant", .path = "tenant", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "active", .path = "active", .field_type = .boolean },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const select = [_][]const u8{"amount"};
+    const predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "tenant",
+        .op = .eq,
+        .value_json = "\"t2\"",
+    }};
+    const request = OwnedRowsQueryRequest{
+        .select_all = false,
+        .select = &select,
+        .predicates = &predicates,
+        .limit = 7,
+    };
+
+    var lake_request = try buildLakeRowsScanRequestForRowsQueryAlloc(alloc, schema, request);
+    defer lake_request.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lake_request.request.projected_columns.len);
+    try std.testing.expectEqualStrings("amount", lake_request.request.projected_columns[0]);
+    try std.testing.expectEqual(@as(usize, 7), lake_request.request.limit.?);
+    try std.testing.expect(lake_request.request.predicate != null);
+    try std.testing.expectEqual(lake_rows.PredicateOp.eq_bytes, lake_request.request.predicate.?.op);
+    try std.testing.expectEqualStrings("tenant", lake_request.request.predicate.?.column);
+    try std.testing.expectEqualStrings("t2", lake_request.request.predicate.?.bytes_value);
+}
+
+test "relational rows lake bridge formats projected cells as public rows result" {
+    const alloc = std.testing.allocator;
+    const amount_name = @constCast("amount"[0..]);
+    const active_name = @constCast("active"[0..]);
+    const attrs_name = @constCast("attrs"[0..]);
+    const attrs_json = @constCast("{\"tier\":\"gold\"}"[0..]);
+    var cells = [_]lake_rows.ProjectedCell{
+        .{ .name = amount_name, .value = .{ .i64 = 20 } },
+        .{ .name = active_name, .value = .{ .bool = true } },
+        .{ .name = attrs_name, .value = .{ .json = attrs_json } },
+    };
+    var projected = [_]lake_rows.ProjectedRow{.{
+        .row_ref = .{ .relational_key = "row:1" },
+        .cells = &cells,
+    }};
+
+    var result = try buildRowsQueryResultFromLakeRowsAlloc(alloc, .{
+        .rows = &projected,
+        .total = 3,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 3), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":20,\"active\":true,\"attrs\":{\"tier\":\"gold\"}}", result.rows[0]);
 }
 
 test "relational rows batch derives deterministic physical primary keys" {

@@ -109,52 +109,9 @@ pub const LoweredSelect = sql_adapter.LoweredSelect;
 pub const LoweredQueryPlan = sql_adapter.LoweredQueryPlan;
 pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
 
-pub const LoweredInsert = struct {
-    table_name: []const u8,
-    batch: relational_rows.OwnedRowsBatchRequest,
-    returning_expression_count: usize = 0,
-    returning_all: bool = false,
-    conflict_where: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.batch.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredInsertSource = struct {
-    table_name: []const u8,
-    ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    insert_source: relational_rows.OwnedRowsInsertSourceRequest,
-    returning_expression_count: usize = 0,
-    returning_all: bool = false,
-    conflict_where: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        for (self.ctes) |cte| {
-            var owned = cte;
-            owned.deinit(alloc);
-        }
-        if (self.ctes.len > 0) alloc.free(self.ctes);
-        self.insert_source.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredMutation = struct {
-    table_name: []const u8,
-    batch: relational_rows.OwnedRowsBatchRequest,
-    returning_expression_count: usize = 0,
-    returning_all: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.batch.deinit(alloc);
-        self.* = undefined;
-    }
-};
+pub const LoweredInsert = sql_adapter.LoweredInsert;
+pub const LoweredInsertSource = sql_adapter.LoweredInsertSource;
+pub const LoweredMutation = sql_adapter.LoweredMutation;
 
 const ReturningProjection = struct {
     fields: []const []const u8 = &.{},
@@ -174,30 +131,8 @@ const ReturningProjection = struct {
     }
 };
 
-pub const LoweredMutationSource = struct {
-    table_name: []const u8,
-    mutation: relational_rows.OwnedRowsMutationSourceRequest,
-    restart_identity: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        self.mutation.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const LoweredJoinedMutationSource = struct {
-    target_table_name: []const u8,
-    source_table_name: []const u8,
-    mutation: relational_rows.OwnedRowsJoinedMutationSourceRequest,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.target_table_name);
-        alloc.free(self.source_table_name);
-        self.mutation.deinit(alloc);
-        self.* = undefined;
-    }
-};
+pub const LoweredMutationSource = sql_adapter.LoweredMutationSource;
+pub const LoweredJoinedMutationSource = sql_adapter.LoweredJoinedMutationSource;
 
 pub const MergeFieldMapping = struct {
     target_field: []const u8,
@@ -295,12 +230,7 @@ pub const LoweredWritePlan = union(enum) {
     }
 };
 
-pub const LowerWritePlanOptions = struct {
-    unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
-    row_claim: ?db_mod.types.RowClaimRequest = null,
-    joined_source_schema: ?runtime_schema.TableSchema = null,
-    insert_source_schema: ?runtime_schema.TableSchema = null,
-};
+pub const LowerWritePlanOptions = sql_adapter.LowerWritePlanOptions;
 
 pub const LoweredAggregate = sql_adapter.LoweredAggregate;
 pub const LoweredAggregatePlan = sql_adapter.LoweredAggregatePlan;

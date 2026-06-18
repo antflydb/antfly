@@ -18,6 +18,7 @@ const ast = @import("ast.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
 const relational_rows = @import("../relational_rows.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
 pub const RelationPopulationMode = grammar.RelationPopulationMode;
@@ -67,6 +68,85 @@ pub const LoweredWindowPlan = struct {
         self.plan.deinit(alloc);
         self.* = undefined;
     }
+};
+
+pub const LoweredInsert = struct {
+    table_name: []const u8,
+    batch: relational_rows.OwnedRowsBatchRequest,
+    returning_expression_count: usize = 0,
+    returning_all: bool = false,
+    conflict_where: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.batch.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredInsertSource = struct {
+    table_name: []const u8,
+    ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    insert_source: relational_rows.OwnedRowsInsertSourceRequest,
+    returning_expression_count: usize = 0,
+    returning_all: bool = false,
+    conflict_where: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.insert_source.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredMutation = struct {
+    table_name: []const u8,
+    batch: relational_rows.OwnedRowsBatchRequest,
+    returning_expression_count: usize = 0,
+    returning_all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.batch.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredMutationSource = struct {
+    table_name: []const u8,
+    mutation: relational_rows.OwnedRowsMutationSourceRequest,
+    restart_identity: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.mutation.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredJoinedMutationSource = struct {
+    target_table_name: []const u8,
+    source_table_name: []const u8,
+    mutation: relational_rows.OwnedRowsJoinedMutationSourceRequest,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.target_table_name);
+        alloc.free(self.source_table_name);
+        self.mutation.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LowerWritePlanOptions = struct {
+    unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
+    row_claim: ?db_mod.types.RowClaimRequest = null,
+    joined_source_schema: ?runtime_schema.TableSchema = null,
+    insert_source_schema: ?runtime_schema.TableSchema = null,
 };
 
 pub const LoweredAggregate = struct {
@@ -179,4 +259,25 @@ test "sql adapter lowered read plans own nested storage plan memory" {
         },
     };
     lowered.deinit(alloc);
+}
+
+test "sql adapter lowered write containers own nested request memory" {
+    const alloc = std.testing.allocator;
+
+    var insert = LoweredInsert{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .batch = .{
+            .writes = try alloc.dupe(db_mod.types.BatchWrite, &[_]db_mod.types.BatchWrite{.{
+                .key = try alloc.dupe(u8, "pk"),
+                .value = try alloc.dupe(u8, "{\"id\":\"u1\"}"),
+            }}),
+        },
+    };
+    insert.deinit(alloc);
+
+    var mutation_source = LoweredMutationSource{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .mutation = .{ .req = .{ .kind = .delete } },
+    };
+    mutation_source.deinit(alloc);
 }
