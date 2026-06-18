@@ -305,9 +305,10 @@ fn readSourceTableNamesFromWithAlloc(
 
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return try alloc.dupe(u8, identifier);
-    if (!std.ascii.eqlIgnoreCase(identifier[0..dot], "public")) return error.UnsupportedSqlShape;
+    if (dot == 0) return error.UnsupportedSqlShape;
     const object_name = identifier[dot + 1 ..];
     if (object_name.len == 0 or std.mem.indexOfScalar(u8, object_name, '.') != null) return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(identifier[0..dot], "public")) return try alloc.dupe(u8, identifier);
     return try alloc.dupe(u8, object_name);
 }
 

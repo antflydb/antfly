@@ -838,20 +838,10 @@ fn applyRelationalSqlDdlOnService(
     var target = try tables_api.relationalSqlDdlTargetAlloc(alloc, sql);
     defer target.deinit(alloc);
 
-    if (target.creates_table) {
-        if (tables_api.findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
-        const base_table: metadata_table_manager.TableRecord = .{
-            .table_id = tables_api.deriveTableId(target.table_name),
-            .name = target.table_name,
-            .database_name = tables_api.default_database_name,
-            .namespace_name = tables_api.default_namespace_name,
-            .schema_json = "",
-            .indexes_json = "{}",
-            .replication_sources_json = "[]",
-            .placement_role = "data",
-            .desired_replica_count = 3,
-            .min_ranges = 1,
-        };
+    if (target.createsTable()) {
+        try tables_api.validateRelationalSqlDdlNamespace(&snapshot, target);
+        if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
+        const base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
         var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
@@ -868,12 +858,55 @@ fn applyRelationalSqlDdlOnService(
         return applied;
     }
 
-    const table = tables_api.findTableByName(&snapshot, target.table_name) orelse return error.TableNotFound;
+    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
+        if (target.dropsTable() and target.if_exists) {
+            return try tables_api.missingQualifiedDropTableIfExistsNoopAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+        }
+        return error.TableNotFound;
+    };
+    if (target.dropsTable()) {
+        if (target.cascade) {
+            try applyRelationalDropTableCascadeReferences(svc, alloc, &snapshot, table.*);
+        } else {
+            try tables_api.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+        }
+        const dropped = try metadata_table_manager.cloneTable(alloc, table.*);
+        errdefer metadata_table_manager.freeTable(alloc, dropped);
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.dropTable(svc, table.table_id);
+        try svc.runRound();
+        return .{
+            .table = dropped,
+            .dropped_table = true,
+        };
+    }
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, table, sql);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
     try svc.runRound();
     return applied;
+}
+
+fn applyRelationalDropTableCascadeReferences(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    target_table: metadata_table_manager.TableRecord,
+) !void {
+    for (snapshot.tables) |candidate_table| {
+        if (candidate_table.table_id == target_table.table_id) continue;
+        const next_schema_json = (try tables_api.schemaWithoutForeignKeysReferencingTableAlloc(
+            alloc,
+            candidate_table.schema_json,
+            target_table.name,
+        )) orelse continue;
+        defer alloc.free(next_schema_json);
+
+        const updated = try tables_api.applySchemaUpdateRecord(alloc, &candidate_table, next_schema_json);
+        defer metadata_table_manager.freeTable(alloc, updated);
+        try svc.upsertTable(updated);
+    }
 }
 
 fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

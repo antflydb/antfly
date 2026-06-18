@@ -86,12 +86,16 @@ pub const RelationalSqlDdlAction = enum {
 };
 
 pub const RelationalSqlDdlTarget = struct {
+    database_name: []u8,
+    namespace_name: []u8,
     table_name: []u8,
     action: RelationalSqlDdlAction = .update_table,
     if_exists: bool = false,
     cascade: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.database_name);
+        alloc.free(self.namespace_name);
         alloc.free(self.table_name);
         self.* = undefined;
     }
@@ -102,6 +106,19 @@ pub const RelationalSqlDdlTarget = struct {
 
     pub fn dropsTable(self: @This()) bool {
         return self.action == .drop_table;
+    }
+};
+
+const RelationalSqlDdlTableRef = struct {
+    database_name: []u8,
+    namespace_name: []u8,
+    table_name: []u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.database_name);
+        alloc.free(self.namespace_name);
+        alloc.free(self.table_name);
+        self.* = undefined;
     }
 };
 pub const LsmStorageStatus = struct {
@@ -1236,8 +1253,10 @@ pub fn applyRelationalSqlDdlToTableRecordAlloc(
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
-    if (relationalSqlDdlPlanTableName(plan)) |table_name| {
-        if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidSchemaUpdateRequest;
+    if (try relationalSqlDdlPlanTableRefAlloc(alloc, plan)) |*table_ref| {
+        defer table_ref.deinit(alloc);
+        if (!tableCatalogIdentityMatches(table.*, table_ref.database_name, table_ref.namespace_name, table_ref.table_name)) return error.InvalidSchemaUpdateRequest;
+        try retargetRelationalSqlDdlPlanTableNameAlloc(alloc, &plan, table.name);
     }
 
     const current_schema_json: []const u8 = switch (plan) {
@@ -1268,9 +1287,12 @@ pub fn relationalSqlDdlTargetAlloc(
     var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
-    const table_name = relationalSqlDdlPlanTableName(plan) orelse return error.UnsupportedSqlShape;
+    var table_ref = (try relationalSqlDdlPlanTableRefAlloc(alloc, plan)) orelse return error.UnsupportedSqlShape;
+    errdefer table_ref.deinit(alloc);
     return .{
-        .table_name = try alloc.dupe(u8, table_name),
+        .database_name = table_ref.database_name,
+        .namespace_name = table_ref.namespace_name,
+        .table_name = table_ref.table_name,
         .action = switch (plan) {
             .create_table => .create_table,
             .drop_table => .drop_table,
@@ -1288,6 +1310,14 @@ pub fn relationalSqlDdlTargetAlloc(
     };
 }
 
+fn relationalSqlDdlPlanTableRefAlloc(
+    alloc: std.mem.Allocator,
+    plan: relational_sql.LoweredDdlPlan,
+) !?RelationalSqlDdlTableRef {
+    const table_name = relationalSqlDdlPlanTableName(plan) orelse return null;
+    return try parseRelationalSqlDdlTableRefAlloc(alloc, table_name);
+}
+
 fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u8 {
     return switch (plan) {
         .create_table => |create_table| create_table.table_name,
@@ -1297,6 +1327,98 @@ fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u
         .alter_table => |alter_table| alter_table.table_name,
         .create_update_policy => |update_policy| update_policy.table_name,
         else => null,
+    };
+}
+
+fn parseRelationalSqlDdlTableRefAlloc(
+    alloc: std.mem.Allocator,
+    raw_table_name: []const u8,
+) !RelationalSqlDdlTableRef {
+    if (std.mem.indexOfScalar(u8, raw_table_name, '.')) |dot| {
+        if (dot == 0) return error.UnsupportedSqlShape;
+        const namespace_name = raw_table_name[0..dot];
+        const table_name = raw_table_name[dot + 1 ..];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '.') != null) return error.UnsupportedSqlShape;
+        const owned_database_name = try alloc.dupe(u8, default_database_name);
+        errdefer alloc.free(owned_database_name);
+        const owned_namespace_name = try alloc.dupe(u8, namespace_name);
+        errdefer alloc.free(owned_namespace_name);
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        errdefer alloc.free(owned_table_name);
+        return .{
+            .database_name = owned_database_name,
+            .namespace_name = owned_namespace_name,
+            .table_name = owned_table_name,
+        };
+    }
+    if (raw_table_name.len == 0) return error.UnsupportedSqlShape;
+    const owned_database_name = try alloc.dupe(u8, default_database_name);
+    errdefer alloc.free(owned_database_name);
+    const owned_namespace_name = try alloc.dupe(u8, default_namespace_name);
+    errdefer alloc.free(owned_namespace_name);
+    const owned_table_name = try alloc.dupe(u8, raw_table_name);
+    errdefer alloc.free(owned_table_name);
+    return .{
+        .database_name = owned_database_name,
+        .namespace_name = owned_namespace_name,
+        .table_name = owned_table_name,
+    };
+}
+
+fn retargetRelationalSqlDdlPlanTableNameAlloc(
+    alloc: std.mem.Allocator,
+    plan: *relational_sql.LoweredDdlPlan,
+    table_name: []const u8,
+) !void {
+    const owned = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned);
+    switch (plan.*) {
+        .create_table => |*create_table| {
+            alloc.free(create_table.table_name);
+            create_table.table_name = owned;
+        },
+        .create_index => |*create_index| {
+            alloc.free(create_index.table_name);
+            create_index.table_name = owned;
+        },
+        .alter_table => |*alter_table| {
+            alloc.free(alter_table.table_name);
+            alter_table.table_name = owned;
+        },
+        .create_update_policy => |*update_policy| {
+            alloc.free(update_policy.table_name);
+            update_policy.table_name = owned;
+        },
+        .drop_table => |*drop_table| {
+            alloc.free(drop_table.table_name);
+            drop_table.table_name = owned;
+        },
+        else => {
+            alloc.free(owned);
+        },
+    }
+}
+
+pub fn validateRelationalSqlDdlNamespace(
+    snapshot: *const metadata_api.AdminSnapshot,
+    target: RelationalSqlDdlTarget,
+) !void {
+    if (findDatabaseByName(snapshot, target.database_name) == null) return error.DatabaseNotFound;
+    if (findNamespaceByName(snapshot, target.database_name, target.namespace_name) == null) return error.NamespaceNotFound;
+}
+
+pub fn deriveRelationalSqlDdlTargetTableRecord(target: RelationalSqlDdlTarget) metadata_table_manager.TableRecord {
+    return .{
+        .table_id = deriveQualifiedTableId(target.database_name, target.namespace_name, target.table_name),
+        .name = target.table_name,
+        .database_name = target.database_name,
+        .namespace_name = target.namespace_name,
+        .schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+        .desired_replica_count = 3,
+        .min_ranges = 1,
     };
 }
 
@@ -2978,10 +3100,21 @@ pub fn missingDropTableIfExistsNoopAlloc(
     alloc: std.mem.Allocator,
     table_name: []const u8,
 ) !AppliedRelationalSqlDdlRecord {
+    return try missingQualifiedDropTableIfExistsNoopAlloc(alloc, default_database_name, default_namespace_name, table_name);
+}
+
+pub fn missingQualifiedDropTableIfExistsNoopAlloc(
+    alloc: std.mem.Allocator,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) !AppliedRelationalSqlDdlRecord {
     return .{
         .table = try metadata_table_manager.cloneTable(alloc, .{
-            .table_id = deriveTableId(table_name),
+            .table_id = deriveQualifiedTableId(database_name, namespace_name, table_name),
             .name = table_name,
+            .database_name = database_name,
+            .namespace_name = namespace_name,
         }),
         .noop = true,
     };
@@ -3165,7 +3298,7 @@ fn databaseSettingsJsonAfterAlterAlloc(
         switch (operation) {
             .set_parameter => |set| {
                 const value = try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), set.value_json, .{});
-                try parsed.value.object.put(try parsed.arena.allocator().dupe(u8, set.name), value);
+                try parsed.value.object.put(parsed.arena.allocator(), try parsed.arena.allocator().dupe(u8, set.name), value);
             },
         }
     }
@@ -3864,6 +3997,133 @@ test "table catalog identity scopes lookup and derived ids" {
     try std.testing.expect(findTableByQualifiedName(&snapshot, "tenant_ops", default_namespace_name, "docs") == null);
 }
 
+test "table catalog identity applies SQL database and namespace catalog lifecycle" {
+    const CatalogService = struct {
+        manager: metadata_table_manager.TableManager,
+
+        fn init(alloc: std.mem.Allocator) @This() {
+            return .{ .manager = metadata_table_manager.TableManager.init(alloc) };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.manager.deinit();
+        }
+
+        fn snapshot(self: *@This(), alloc: std.mem.Allocator) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .databases = try self.manager.listDatabases(alloc),
+                .namespaces = try self.manager.listNamespaces(alloc),
+                .tables = try self.manager.listTables(alloc),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeSnapshot(self: *@This(), alloc: std.mem.Allocator, snapshot_value: *metadata_api.AdminSnapshot) void {
+            self.manager.freeDatabases(alloc, snapshot_value.databases);
+            self.manager.freeNamespaces(alloc, snapshot_value.namespaces);
+            self.manager.freeTables(alloc, snapshot_value.tables);
+            snapshot_value.* = undefined;
+        }
+
+        pub fn upsertDatabase(self: *@This(), record: metadata_table_manager.DatabaseRecord) !void {
+            try self.manager.upsertDatabase(record);
+        }
+
+        pub fn removeDatabase(self: *@This(), database_id: u64) !void {
+            _ = try self.manager.removeDatabase(database_id);
+        }
+
+        pub fn upsertNamespace(self: *@This(), record: metadata_table_manager.NamespaceRecord) !void {
+            try self.manager.upsertNamespace(record);
+        }
+
+        pub fn removeNamespace(self: *@This(), namespace_id: u64) !void {
+            _ = try self.manager.removeNamespace(namespace_id);
+        }
+
+        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            try self.manager.upsertTable(record);
+        }
+
+        fn apply(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !AppliedRelationalSqlDdlRecord {
+            var snapshot_value = try self.snapshot(alloc);
+            defer self.freeSnapshot(alloc, &snapshot_value);
+            return (try applyRelationalCatalogDdlOnServiceAlloc(alloc, self, &snapshot_value, sql)) orelse error.UnsupportedSqlShape;
+        }
+    };
+
+    var service = CatalogService.init(std.testing.allocator);
+    defer service.deinit();
+
+    var created_database = try service.apply(std.testing.allocator, "CREATE DATABASE tenant_ops;");
+    defer created_database.deinit(std.testing.allocator);
+    try std.testing.expect(created_database.created_database);
+
+    const tenant_database_id = metadata_table_manager.deriveDatabaseId("tenant_ops");
+    {
+        const databases = try service.manager.listDatabases(std.testing.allocator);
+        defer service.manager.freeDatabases(std.testing.allocator, databases);
+        try std.testing.expectEqual(@as(usize, 1), databases.len);
+        try std.testing.expectEqual(tenant_database_id, databases[0].database_id);
+        try std.testing.expectEqualStrings("tenant_ops", databases[0].name);
+    }
+
+    var altered_database = try service.apply(std.testing.allocator, "ALTER DATABASE tenant_ops SET app.tenant_id TO 'tenant-a';");
+    defer altered_database.deinit(std.testing.allocator);
+    {
+        const databases = try service.manager.listDatabases(std.testing.allocator);
+        defer service.manager.freeDatabases(std.testing.allocator, databases);
+        var parsed_settings = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, databases[0].settings_json, .{});
+        defer parsed_settings.deinit();
+        try std.testing.expectEqualStrings("tenant-a", parsed_settings.value.object.get("app.tenant_id").?.string);
+    }
+
+    var created_namespace = try service.apply(std.testing.allocator, "CREATE SCHEMA analytics;");
+    defer created_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(created_namespace.created_namespace);
+    {
+        var snapshot_value = try service.snapshot(std.testing.allocator);
+        defer service.freeSnapshot(std.testing.allocator, &snapshot_value);
+
+        var analytics_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE analytics.events (id uuid PRIMARY KEY);");
+        defer analytics_target.deinit(std.testing.allocator);
+        try validateRelationalSqlDdlNamespace(&snapshot_value, analytics_target);
+
+        var missing_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE missing.events (id uuid PRIMARY KEY);");
+        defer missing_target.deinit(std.testing.allocator);
+        try std.testing.expectError(error.NamespaceNotFound, validateRelationalSqlDdlNamespace(&snapshot_value, missing_target));
+    }
+    try service.manager.upsertTable(.{
+        .table_id = deriveQualifiedTableId(default_database_name, "analytics", "events"),
+        .name = "events",
+        .database_name = default_database_name,
+        .namespace_name = "analytics",
+    });
+
+    try std.testing.expectError(error.NamespaceNotEmpty, service.apply(std.testing.allocator, "DROP SCHEMA analytics;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, service.apply(std.testing.allocator, "DROP SCHEMA analytics CASCADE;"));
+
+    var renamed_namespace = try service.apply(std.testing.allocator, "ALTER SCHEMA analytics RENAME TO reporting;");
+    defer renamed_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(renamed_namespace.renamed_namespace);
+    const table = service.manager.tables.get(deriveQualifiedTableId(default_database_name, "analytics", "events")).?;
+    try std.testing.expectEqualStrings("reporting", table.namespace_name);
+
+    _ = service.manager.removeTable(table.table_id);
+    var dropped_namespace = try service.apply(std.testing.allocator, "DROP SCHEMA reporting;");
+    defer dropped_namespace.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_namespace.dropped_namespace);
+
+    var dropped_database = try service.apply(std.testing.allocator, "DROP DATABASE tenant_ops;");
+    defer dropped_database.deinit(std.testing.allocator);
+    try std.testing.expect(dropped_database.dropped_database);
+}
+
 test "create table parser rejects zero shards" {
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
@@ -4125,13 +4385,31 @@ test "metadata.schema update sql ddl creates relational table record schema and 
 test "metadata.schema update sql ddl exposes catalog target and create intent" {
     var create_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE users (id uuid PRIMARY KEY);");
     defer create_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_database_name, create_target.database_name);
+    try std.testing.expectEqualStrings(default_namespace_name, create_target.namespace_name);
     try std.testing.expectEqualStrings("users", create_target.table_name);
     try std.testing.expect(create_target.createsTable());
 
+    var schema_create_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE analytics.users (id uuid PRIMARY KEY);");
+    defer schema_create_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_database_name, schema_create_target.database_name);
+    try std.testing.expectEqualStrings("analytics", schema_create_target.namespace_name);
+    try std.testing.expectEqualStrings("users", schema_create_target.table_name);
+    try std.testing.expect(schema_create_target.createsTable());
+
     var alter_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "ALTER TABLE users ADD COLUMN status text;");
     defer alter_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_database_name, alter_target.database_name);
+    try std.testing.expectEqualStrings(default_namespace_name, alter_target.namespace_name);
     try std.testing.expectEqualStrings("users", alter_target.table_name);
     try std.testing.expect(!alter_target.createsTable());
+
+    var schema_alter_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "ALTER TABLE analytics.users ADD COLUMN status text;");
+    defer schema_alter_target.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_database_name, schema_alter_target.database_name);
+    try std.testing.expectEqualStrings("analytics", schema_alter_target.namespace_name);
+    try std.testing.expectEqualStrings("users", schema_alter_target.table_name);
+    try std.testing.expect(!schema_alter_target.createsTable());
 
     var drop_target = try relationalSqlDdlTargetAlloc(std.testing.allocator, "DROP TABLE users;");
     defer drop_target.deinit(std.testing.allocator);
@@ -4153,6 +4431,8 @@ test "metadata.schema update sql ddl exposes catalog target and create intent" {
     try std.testing.expect(drop_cascade_target.dropsTable());
     try std.testing.expect(!drop_cascade_target.if_exists);
     try std.testing.expect(drop_cascade_target.cascade);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, relationalSqlDdlTargetAlloc(std.testing.allocator, "CREATE TABLE tenant_ops.analytics.users (id uuid PRIMARY KEY);"));
 }
 
 test "metadata.schema update sql ddl applies relational catalog changes through table record path" {
@@ -4171,6 +4451,32 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
         "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, updated_at_ns bigint);",
     );
     defer created.deinit(std.testing.allocator);
+
+    const qualified_table: metadata_table_manager.TableRecord = .{
+        .table_id = deriveQualifiedTableId(default_database_name, "analytics", "users"),
+        .name = "users",
+        .database_name = default_database_name,
+        .namespace_name = "analytics",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+    var qualified_created = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &qualified_table,
+        "CREATE TABLE analytics.users (id uuid PRIMARY KEY);",
+    );
+    defer qualified_created.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("users", qualified_created.table.name);
+    try std.testing.expectEqualStrings("analytics", qualified_created.table.namespace_name);
+    try std.testing.expect(std.mem.indexOf(u8, qualified_created.table.schema_json, "\"users_pkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qualified_created.table.schema_json, "\"analytics.users_pkey\"") == null);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applyRelationalSqlDdlToTableRecordAlloc(std.testing.allocator, &qualified_table, "ALTER TABLE public.users ADD COLUMN status text;"),
+    );
 
     var altered = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,

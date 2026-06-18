@@ -2105,19 +2105,9 @@ fn applyRelationalSqlDdlOnMetadataService(
     defer target.deinit(alloc);
 
     if (target.createsTable()) {
-        if (findTableByName(&snapshot, target.table_name) != null) return error.TableAlreadyExists;
-        const base_table: metadata_table_manager.TableRecord = .{
-            .table_id = tables_api.deriveTableId(target.table_name),
-            .name = target.table_name,
-            .database_name = tables_api.default_database_name,
-            .namespace_name = tables_api.default_namespace_name,
-            .schema_json = "",
-            .indexes_json = "{}",
-            .replication_sources_json = "[]",
-            .placement_role = "data",
-            .desired_replica_count = 3,
-            .min_ranges = 1,
-        };
+        try tables_api.validateRelationalSqlDdlNamespace(&snapshot, target);
+        if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
+        const base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
         var applied = try tables_api.applyRelationalSqlDdlToTableRecordAlloc(alloc, &base_table, sql);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
@@ -2134,9 +2124,9 @@ fn applyRelationalSqlDdlOnMetadataService(
         return applied;
     }
 
-    const table = findTableByName(&snapshot, target.table_name) orelse {
+    const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
         if (target.dropsTable() and target.if_exists) {
-            return try tables_api.missingDropTableIfExistsNoopAlloc(alloc, target.table_name);
+            return try tables_api.missingQualifiedDropTableIfExistsNoopAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
         }
         return error.TableNotFound;
     };

@@ -4304,11 +4304,15 @@ idempotence flag, rename target, and cascade/drop metadata. Metadata now has
 first-class database and namespace records, table records carry
 `database_name` and `namespace_name`, default table APIs resolve through
 `default/public/<table>`, and non-default table identity derives separate table
-and range ids instead of flattening namespaces into table-name strings. Full
-schema-namespace DDL application still needs object-name resolution rules,
-dependency tracking, authorization boundaries, and catalog promotion behavior.
-`public.` qualification can keep lowering away at the adapter boundary, but
-non-public namespaces must not be flattened into table-name strings. The durable
+and range ids instead of flattening namespaces into table-name strings. Basic
+schema-namespace DDL application creates, renames, and drops default-database
+namespace records through typed catalog operations, rewrites table namespace
+identity on namespace rename, rejects non-empty restrict drops, and fails closed
+for cascade drops until dependent-object cleanup is durable. Richer object-name
+resolution rules, dependency tracking, authorization boundaries, and catalog
+promotion behavior remain production work. `public.` qualification can keep
+lowering away at the adapter boundary, but non-public namespaces must not be
+flattened into table-name strings. The durable
 product/catalog model is described in `DATABASES.md`: Antfly uses
 `database / namespace / table`, with existing `/tables/{table}` APIs resolving
 to the current/default database, the `public` namespace, and the requested
@@ -4321,11 +4325,14 @@ catalog plans so API parity can track database identity and settings without
 flattening them into table names or schema JSON. Basic `CREATE TABLESPACE ...
 LOCATION`, `ALTER TABLESPACE ... RENAME TO`, and `DROP TABLESPACE` statements
 produce tablespace catalog plans so placement/storage-class intent is explicit
-but cannot silently change table storage paths. Applying those plans still fails
-closed until Antfly deployment and catalog management owns tenant binding,
-placement policy, storage-class selection, backup/restore scope, authorization
-boundaries, and catalog promotion around those explicit typed objects.
-PostgreSQL syntax can later become an administrative
+but cannot silently change table storage paths. Database catalog DDL now applies
+basic create, alter-settings, and empty-drop operations through durable typed
+database and namespace records, including automatic `public` namespace creation
+for a new database. Tablespace application still fails closed, and database
+catalog production hardening still needs tenant binding, placement policy,
+storage-class selection, backup/restore scope, authorization boundaries, and
+catalog promotion around those explicit typed objects. PostgreSQL syntax can
+later become an administrative
 adapter for those objects, but SQL database or tablespace names should not
 silently change table storage paths or routing behavior.
 

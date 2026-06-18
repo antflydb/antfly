@@ -3809,6 +3809,9 @@ pub fn build(b: *std.Build) void {
             "metadata.query routing",
             "api query contract parses typed row claim request",
             "api query contract parses typed json filters",
+            "sql adapter value parses timestamp literals",
+            "sql adapter value parses interval literals",
+            "sql adapter grammar parses relation population syntax",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.
