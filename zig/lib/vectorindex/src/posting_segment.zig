@@ -314,6 +314,7 @@ pub const OwnedManifestEntry = struct {
 pub const OwnedManifest = struct {
     next_segment_id: u64,
     segments: []OwnedManifestEntry,
+    segments_sorted_by_segment_id: bool,
 
     pub fn deinit(self: *OwnedManifest, alloc: Allocator) void {
         for (self.segments) |entry| alloc.free(entry.path);
@@ -321,6 +322,7 @@ pub const OwnedManifest = struct {
         self.* = .{
             .next_segment_id = 0,
             .segments = &.{},
+            .segments_sorted_by_segment_id = true,
         };
     }
 };
@@ -339,6 +341,7 @@ pub const OwnedSegmentStore = struct {
             .manifest = .{
                 .next_segment_id = 0,
                 .segments = &.{},
+                .segments_sorted_by_segment_id = true,
             },
             .owned_data = &.{},
             .segments = &.{},
@@ -1090,7 +1093,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestPointValueWithSegmentAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?LatestPointValue {
-        const sorted_by_segment_id = ownedManifestEntriesSortedBySegmentId(self.manifest.segments);
+        const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
@@ -1124,7 +1127,7 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
-        const sorted_by_segment_id = ownedManifestEntriesSortedBySegmentId(self.manifest.segments);
+        const sorted_by_segment_id = self.manifest.segments_sorted_by_segment_id;
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
@@ -1331,6 +1334,7 @@ pub fn decodeManifestAlloc(alloc: Allocator, data: []const u8) !OwnedManifest {
     return .{
         .next_segment_id = next_segment_id,
         .segments = entries,
+        .segments_sorted_by_segment_id = true,
     };
 }
 
@@ -2193,6 +2197,7 @@ fn emptyManifestAlloc(alloc: Allocator, next_segment_id: u64) !OwnedManifest {
     return .{
         .next_segment_id = next_segment_id,
         .segments = try alloc.alloc(OwnedManifestEntry, 0),
+        .segments_sorted_by_segment_id = true,
     };
 }
 
@@ -4011,14 +4016,6 @@ fn sortManifestEntriesIfNeeded(entries: []ManifestEntry) void {
             return;
         }
     }
-}
-
-fn ownedManifestEntriesSortedBySegmentId(entries: []const OwnedManifestEntry) bool {
-    var index: usize = 1;
-    while (index < entries.len) : (index += 1) {
-        if (entries[index].meta.segment_id < entries[index - 1].meta.segment_id) return false;
-    }
-    return true;
 }
 
 fn segmentBlobsSortedBySegmentId(segments: []const SegmentBlob) bool {
@@ -6401,6 +6398,7 @@ pub fn testLazyDirectoryStoreUsesNewestPointRecordsBySegmentId() !void {
     defer lazy.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 3), lazy.manifest.segments.len);
     std.mem.swap(OwnedManifestEntry, &lazy.manifest.segments[0], &lazy.manifest.segments[1]);
+    lazy.manifest.segments_sorted_by_segment_id = false;
 
     const snapshot = lazy.snapshot();
     const header = (try snapshot.loadBaseHeader(alloc, 7)).?;
