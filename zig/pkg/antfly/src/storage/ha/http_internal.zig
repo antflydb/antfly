@@ -87,7 +87,7 @@ pub const Server = struct {
     fn handleCreateReplicationSlot(self: *Server, req: http_common.HttpRequest) !http_common.HttpResponse {
         const primary = self.primary orelse return try textResponse(self.alloc, 409, "primary unavailable");
         if (req.body.len == 0) return try textResponse(self.alloc, 400, "empty HA replication slot request");
-        var parsed = internal_api.openapi.server.parseCreateHAReplicationSlotBody(
+        var parsed = internal_api.openapi.server.parseCreateHAReplicationStreamingSlotBody(
             self.alloc,
             req.body,
         ) catch return try textResponse(self.alloc, 400, "invalid HA replication slot request");

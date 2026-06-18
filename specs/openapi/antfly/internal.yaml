@@ -34,7 +34,7 @@ paths:
   /ha/replication/slots:
     post:
       tags: [ha-replication]
-      operationId: createHAReplicationSlot
+      operationId: createHAReplicationStreamingSlot
       summary: Create or reserve a runtime replication slot
       requestBody:
         required: true

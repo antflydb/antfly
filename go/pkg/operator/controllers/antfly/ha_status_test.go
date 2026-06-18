@@ -1071,6 +1071,56 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 	}
 }
 
+func TestHAAdminOpenAPIContractIsNotDuplicatedInOtherSpecs(t *testing.T) {
+	adminOperations := loadAdminOpenAPIOperations(t)
+	adminOperationIDs := map[string]bool{}
+	for _, operationID := range adminOperations {
+		adminOperationIDs[operationID] = true
+	}
+
+	_, adminSpecPath := readAdminOpenAPISpec(t)
+	specDir := filepath.Dir(adminSpecPath)
+	entries, err := os.ReadDir(specDir)
+	if err != nil {
+		t.Fatalf("read OpenAPI spec dir %s: %v", specDir, err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || name == "admin.yaml" || (!strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml")) {
+			continue
+		}
+
+		specPath := filepath.Join(specDir, name)
+		raw, err := os.ReadFile(specPath)
+		if err != nil {
+			t.Fatalf("read OpenAPI spec %s: %v", specPath, err)
+		}
+		var spec struct {
+			Paths map[string]map[string]any `json:"paths"`
+		}
+		if err := yaml.Unmarshal(raw, &spec); err != nil {
+			t.Fatalf("parse OpenAPI spec %s: %v", specPath, err)
+		}
+
+		for path, pathItem := range spec.Paths {
+			for method, operationValue := range pathItem {
+				operation, ok := operationValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				operationID, _ := operation["operationId"].(string)
+				if adminOperationIDs[operationID] {
+					t.Errorf("%s duplicates admin OpenAPI operationId %q at %s %s", specPath, operationID, strings.ToUpper(method), path)
+				}
+				if strings.HasPrefix(path, "/ha/") && !(name == "internal.yaml" && strings.HasPrefix(path, "/ha/replication/")) {
+					t.Errorf("%s defines HA operator/control-plane path %s %s outside specs/openapi/antfly/admin.yaml", specPath, strings.ToUpper(method), path)
+				}
+			}
+		}
+	}
+}
+
 func TestAdminOpenAPISpecDocumentsBearerAuth(t *testing.T) {
 	raw, specPath := readAdminOpenAPISpec(t)
 	var spec struct {

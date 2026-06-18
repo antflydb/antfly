@@ -45,7 +45,7 @@ const ExpectedRoute = struct {
 
 const expected_ha_replication_routes = [_]ExpectedRoute{
     .{ .operation_id = "identifyHAReplicationSystem", .method = "GET", .full_path = ha_replication_identify },
-    .{ .operation_id = "createHAReplicationSlot", .method = "POST", .full_path = ha_replication_slots },
+    .{ .operation_id = "createHAReplicationStreamingSlot", .method = "POST", .full_path = ha_replication_slots },
     .{ .operation_id = "startHAReplication", .method = "POST", .full_path = ha_replication_start },
     .{ .operation_id = "updateHAStandbyStatus", .method = "POST", .full_path = ha_replication_status },
 };

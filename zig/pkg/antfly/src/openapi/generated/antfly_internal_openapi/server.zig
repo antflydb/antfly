@@ -6,8 +6,8 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
-/// Parse the JSON request body for createHAReplicationSlot.
-pub fn parseCreateHAReplicationSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.HACreateReplicationSlotRequest) {
+/// Parse the JSON request body for createHAReplicationStreamingSlot.
+pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.HACreateReplicationSlotRequest) {
     return std.json.parseFromSlice(types.HACreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
@@ -30,7 +30,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "GET", .path = "/ha/replication/identify", .operation_id = "identifyHAReplicationSystem" },
-    .{ .method = "POST", .path = "/ha/replication/slots", .operation_id = "createHAReplicationSlot" },
+    .{ .method = "POST", .path = "/ha/replication/slots", .operation_id = "createHAReplicationStreamingSlot" },
     .{ .method = "POST", .path = "/ha/replication/start", .operation_id = "startHAReplication" },
     .{ .method = "POST", .path = "/ha/replication/status", .operation_id = "updateHAStandbyStatus" },
 };
@@ -47,7 +47,7 @@ pub const routes = [_]Route{
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "identifyHAReplicationSystem")) @compileError("ServerRouter: Impl missing required method 'identifyHAReplicationSystem'");
-        if (!@hasDecl(Impl, "createHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationSlot'");
+        if (!@hasDecl(Impl, "createHAReplicationStreamingSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationStreamingSlot'");
         if (!@hasDecl(Impl, "startHAReplication")) @compileError("ServerRouter: Impl missing required method 'startHAReplication'");
         if (!@hasDecl(Impl, "updateHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'updateHAStandbyStatus'");
     }
@@ -65,7 +65,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             active_impl = self.impl;
             try server.get("/ha/replication/identify", identifyHAReplicationSystem);
-            try server.post("/ha/replication/slots", createHAReplicationSlot);
+            try server.post("/ha/replication/slots", createHAReplicationStreamingSlot);
             try server.post("/ha/replication/start", startHAReplication);
             try server.post("/ha/replication/status", updateHAStandbyStatus);
         }
@@ -79,9 +79,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Create or reserve a runtime replication slot
         /// POST /ha/replication/slots
-        fn createHAReplicationSlot(ctx: *httpx.Context) anyerror!httpx.Response {
+        fn createHAReplicationStreamingSlot(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.createHAReplicationSlot(ctx);
+            return impl.createHAReplicationStreamingSlot(ctx);
         }
 
         /// Pull ordered HA replication records from a slot
@@ -103,6 +103,6 @@ pub fn ServerRouter(comptime Impl: type) type {
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn identifyHAReplicationSystem(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn createHAReplicationSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn createHAReplicationStreamingSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startHAReplication(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn updateHAStandbyStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
