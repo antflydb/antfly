@@ -105,6 +105,7 @@ pub const ObjectRangeCacheLaneStats = struct {
     hits: usize = 0,
     misses: usize = 0,
     stored_bytes: usize = 0,
+    evicted_bytes: usize = 0,
     rejected_bytes: usize = 0,
 };
 
@@ -112,6 +113,7 @@ pub const ObjectRangeCacheStats = struct {
     hits: usize = 0,
     misses: usize = 0,
     stored_bytes: usize = 0,
+    evicted_bytes: usize = 0,
     rejected_bytes: usize = 0,
     lanes: [object_range_cache_lane_count]ObjectRangeCacheLaneStats = [_]ObjectRangeCacheLaneStats{.{}} ** object_range_cache_lane_count,
 
@@ -129,9 +131,12 @@ pub const ObjectRangeCachePolicy = struct {
         return policy;
     }
 
-    pub fn admits(self: ObjectRangeCachePolicy, cache_lane: range_io.CacheLane, current_bytes: usize, new_bytes: usize) bool {
-        const limit = self.max_bytes_by_lane[@intFromEnum(cache_lane)] orelse return true;
-        return current_bytes <= limit and new_bytes <= limit - current_bytes;
+    pub fn setLaneLimit(self: *ObjectRangeCachePolicy, cache_lane: range_io.CacheLane, max_bytes: usize) void {
+        self.max_bytes_by_lane[@intFromEnum(cache_lane)] = max_bytes;
+    }
+
+    pub fn laneLimit(self: ObjectRangeCachePolicy, cache_lane: range_io.CacheLane) ?usize {
+        return self.max_bytes_by_lane[@intFromEnum(cache_lane)];
     }
 };
 
@@ -157,6 +162,39 @@ pub const ObjectRangeCache = struct {
     fn currentBytesForLane(self: ObjectRangeCache, cache_lane: range_io.CacheLane) usize {
         const lane_stats = self.stats.lane(cache_lane);
         return lane_stats.stored_bytes;
+    }
+
+    fn ensureLaneCapacity(self: *ObjectRangeCache, alloc: Allocator, cache_lane: range_io.CacheLane, new_bytes: usize) void {
+        const limit = self.policy.laneLimit(cache_lane) orelse return;
+        if (new_bytes > limit) return;
+        while (self.currentBytesForLane(cache_lane) > limit - new_bytes) {
+            if (!self.evictOneEntryForLane(alloc, cache_lane)) return;
+        }
+    }
+
+    fn admitsLaneBytes(self: ObjectRangeCache, cache_lane: range_io.CacheLane, new_bytes: usize) bool {
+        const limit = self.policy.laneLimit(cache_lane) orelse return true;
+        return self.currentBytesForLane(cache_lane) <= limit and new_bytes <= limit - self.currentBytesForLane(cache_lane);
+    }
+
+    fn evictOneEntryForLane(self: *ObjectRangeCache, alloc: Allocator, cache_lane: range_io.CacheLane) bool {
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            const entry_lane = cacheLaneFromObjectRangeCacheKey(entry.key_ptr.*) orelse continue;
+            if (entry_lane != cache_lane) continue;
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            const byte_len = value.len;
+            if (!self.entries.remove(key)) return false;
+            alloc.free(key);
+            alloc.free(value);
+            decrementSaturating(&self.stats.stored_bytes, byte_len);
+            decrementSaturating(&self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes, byte_len);
+            self.stats.evicted_bytes += byte_len;
+            self.stats.lanes[@intFromEnum(cache_lane)].evicted_bytes += byte_len;
+            return true;
+        }
+        return false;
     }
 
     pub fn readAlloc(
@@ -186,7 +224,8 @@ pub const ObjectRangeCache = struct {
         self.stats.lanes[@intFromEnum(cache_lane)].misses += 1;
         const bytes = try readObjectRangeAlloc(alloc, reader, read);
         errdefer alloc.free(bytes);
-        if (!self.policy.admits(cache_lane, self.currentBytesForLane(cache_lane), bytes.len)) {
+        self.ensureLaneCapacity(alloc, cache_lane, bytes.len);
+        if (!self.admitsLaneBytes(cache_lane, bytes.len)) {
             self.stats.rejected_bytes += bytes.len;
             self.stats.lanes[@intFromEnum(cache_lane)].rejected_bytes += bytes.len;
             alloc.free(cache_key);
@@ -203,6 +242,20 @@ pub const ObjectRangeCache = struct {
         return bytes;
     }
 };
+
+fn decrementSaturating(value: *usize, amount: usize) void {
+    value.* = if (value.* >= amount) value.* - amount else 0;
+}
+
+fn cacheLaneFromObjectRangeCacheKey(cache_key: []const u8) ?range_io.CacheLane {
+    const marker = ":purpose=";
+    const marker_index = std.mem.indexOf(u8, cache_key, marker) orelse return null;
+    const purpose_start = marker_index + marker.len;
+    const purpose_end = std.mem.indexOfScalarPos(u8, cache_key, purpose_start, ':') orelse cache_key.len;
+    const purpose_name = cache_key[purpose_start..purpose_end];
+    const purpose = std.meta.stringToEnum(range_io.RangePurpose, purpose_name) orelse return null;
+    return purpose.cacheLane();
+}
 
 pub const ObjectRangeRowGroupInput = struct {
     file_id: []const u8,
@@ -4873,6 +4926,90 @@ test "parquet object range cache applies lane admission limits independently" {
     try std.testing.expectEqual(@as(usize, 2), stats.lane(.broad_scan_scratch).misses);
     try std.testing.expectEqual(@as(usize, 4), stats.lane(.metadata).stored_bytes);
     try std.testing.expectEqual(@as(usize, 1), stats.lane(.metadata).hits);
+}
+
+test "parquet object range cache evicts within one lane without evicting metadata" {
+    const alloc = std.testing.allocator;
+    var policy = ObjectRangeCachePolicy{};
+    policy.setLaneLimit(.compressed_range, 6);
+    var cache = ObjectRangeCache{ .policy = policy };
+    defer cache.deinit(alloc);
+
+    const CountingReader = struct {
+        body: []const u8,
+        read_count: usize = 0,
+
+        fn reader(self: *@This()) ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            _ = bucket;
+            _ = key;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > self.body.len or len > self.body.len - start) return error.InvalidLakeRangeRead;
+            self.read_count += 1;
+            return try a.dupe(u8, self.body[start..][0..len]);
+        }
+    };
+    var reader = CountingReader{ .body = "abcdefghijklmnopqrstuvwxyz" };
+    const object = range_io.ObjectRef{
+        .bucket = "bucket",
+        .key = "events/part-a.parquet",
+        .byte_len = 26,
+        .version = .{ .etag = "etag-a" },
+    };
+    const metadata_read = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+    const chunk_a = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 4, .len = 6 },
+        .purpose = .parquet_column_chunk,
+        .decoded_column_id = "amount",
+    };
+    const chunk_b = range_io.RangeRead{
+        .object = object,
+        .range = .{ .offset = 10, .len = 6 },
+        .purpose = .parquet_column_chunk,
+        .decoded_column_id = "tenant",
+    };
+
+    const metadata_first = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_first);
+    const chunk_a_first = try cache.readAlloc(alloc, reader.reader(), chunk_a);
+    defer alloc.free(chunk_a_first);
+    const chunk_b_first = try cache.readAlloc(alloc, reader.reader(), chunk_b);
+    defer alloc.free(chunk_b_first);
+    const metadata_second = try cache.readAlloc(alloc, reader.reader(), metadata_read);
+    defer alloc.free(metadata_second);
+    const chunk_a_second = try cache.readAlloc(alloc, reader.reader(), chunk_a);
+    defer alloc.free(chunk_a_second);
+
+    const stats = cache.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 4), reader.read_count);
+    try std.testing.expectEqual(@as(usize, 4), stats.misses);
+    try std.testing.expectEqual(@as(usize, 1), stats.hits);
+    try std.testing.expectEqual(@as(usize, 10), stats.stored_bytes);
+    try std.testing.expectEqual(@as(usize, 12), stats.evicted_bytes);
+    try std.testing.expectEqual(@as(usize, 4), stats.lane(.metadata).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 0), stats.lane(.metadata).evicted_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.lane(.metadata).hits);
+    try std.testing.expectEqual(@as(usize, 6), stats.lane(.compressed_range).stored_bytes);
+    try std.testing.expectEqual(@as(usize, 12), stats.lane(.compressed_range).evicted_bytes);
 }
 
 test "parquet object range rows query filters on unprojected column" {
