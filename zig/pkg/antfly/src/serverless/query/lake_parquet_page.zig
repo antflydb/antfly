@@ -134,6 +134,17 @@ pub const NullableF64Values = struct {
     }
 };
 
+pub const NullableBoolValues = struct {
+    values: []bool,
+    nulls: []u8,
+
+    pub fn deinit(self: *NullableBoolValues, alloc: Allocator) void {
+        alloc.free(self.values);
+        alloc.free(self.nulls);
+        self.* = undefined;
+    }
+};
+
 pub const NullableByteArrayValues = struct {
     values: [][]u8,
     nulls: []u8,
@@ -242,6 +253,49 @@ pub fn decodePlainF32AsF64Alloc(alloc: Allocator, header: Header, page_payload: 
 
 pub fn scanUncompressedPlainF32AsF64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]f64 {
     return try scanPlainF32AsF64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn decodePlainBoolAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]bool {
+    try header.validatePlainRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    const count: usize = @intCast(header.value_count);
+    const needed = (count + 7) / 8;
+    if (payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(bool, count);
+    for (values, 0..) |*value, idx| {
+        value.* = readBitPackedBool(payload, idx);
+    }
+    return values;
+}
+
+pub fn scanUncompressedPlainBoolColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]bool {
+    return try scanPlainBoolColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanPlainBoolColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) ![]bool {
+    var values = std.ArrayListUnmanaged(bool).empty;
+    errdefer values.deinit(alloc);
+    var cursor: usize = 0;
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validatePlainRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        const page_values = try decodePlainBoolAlloc(alloc, parsed.header, payload.bytes);
+        defer alloc.free(page_values);
+        try values.appendSlice(alloc, page_values);
+    }
+    return try values.toOwnedSlice(alloc);
 }
 
 pub fn scanPlainF32AsF64ColumnChunkAlloc(
@@ -1381,6 +1435,59 @@ pub fn decodeOptionalPlainF32V2HybridLevelsAsF64Alloc(
     };
 }
 
+pub fn decodeOptionalPlainBoolV2HybridLevelsAlloc(
+    alloc: Allocator,
+    header: Header,
+    page_payload: []const u8,
+) !NullableBoolValues {
+    try header.validatePlainRequired();
+    if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
+    if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
+    const row_count: usize = @intCast(header.value_count);
+    if (header.definition_level_bytes == 0) return error.UnsupportedParquetPage;
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    if (header.definition_level_bytes > page_payload.len) return error.InvalidParquetPage;
+
+    const definition_levels = try decodeHybridLevelsAlloc(alloc, page_payload[0..header.definition_level_bytes], 1, row_count);
+    defer alloc.free(definition_levels);
+
+    var present_count: usize = 0;
+    for (definition_levels) |definition_level| {
+        if (definition_level > 1) return error.InvalidParquetPage;
+        if (definition_level == 1) present_count += 1;
+    }
+
+    const payload = page_payload[header.data_payload_offset..];
+    const needed = (present_count + 7) / 8;
+    if (payload.len < needed) return error.InvalidParquetPage;
+
+    const values = try alloc.alloc(bool, row_count);
+    errdefer alloc.free(values);
+    const nulls = try alloc.alloc(u8, row_count);
+    errdefer alloc.free(nulls);
+
+    var present_idx: usize = 0;
+    for (definition_levels, 0..) |definition_level, idx| {
+        switch (definition_level) {
+            0 => {
+                values[idx] = false;
+                nulls[idx] = 1;
+            },
+            1 => {
+                values[idx] = readBitPackedBool(payload, present_idx);
+                present_idx += 1;
+                nulls[idx] = 0;
+            },
+            else => return error.InvalidParquetPage,
+        }
+    }
+
+    return .{
+        .values = values,
+        .nulls = nulls,
+    };
+}
+
 pub fn scanUncompressedOptionalPlainF64ColumnChunkAlloc(
     alloc: Allocator,
     column_chunk_bytes: []const u8,
@@ -1393,6 +1500,50 @@ pub fn scanUncompressedOptionalPlainF32AsF64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
 ) !NullableF64Values {
     return try scanOptionalPlainF32AsF64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanUncompressedOptionalPlainBoolColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+) !NullableBoolValues {
+    return try scanOptionalPlainBoolColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
+}
+
+pub fn scanOptionalPlainBoolColumnChunkAlloc(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+) !NullableBoolValues {
+    var values = std.ArrayListUnmanaged(bool).empty;
+    errdefer values.deinit(alloc);
+    var nulls = std.ArrayListUnmanaged(u8).empty;
+    errdefer nulls.deinit(alloc);
+
+    var cursor: usize = 0;
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validatePlainRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+        const payload = try decodePagePayloadAlloc(alloc, parsed.header, compression, compressed_payload);
+        defer payload.deinit(alloc);
+
+        var page_values = try decodeOptionalPlainBoolV2HybridLevelsAlloc(alloc, parsed.header, payload.bytes);
+        defer page_values.deinit(alloc);
+        try values.appendSlice(alloc, page_values.values);
+        try nulls.appendSlice(alloc, page_values.nulls);
+    }
+
+    const out_values = try values.toOwnedSlice(alloc);
+    errdefer alloc.free(out_values);
+    const out_nulls = try nulls.toOwnedSlice(alloc);
+    errdefer alloc.free(out_nulls);
+    return .{
+        .values = out_values,
+        .nulls = out_nulls,
+    };
 }
 
 pub fn scanOptionalPlainF32AsF64ColumnChunkAlloc(
@@ -2345,6 +2496,11 @@ fn readPackedValueU32(packed_bytes: []const u8, value_idx: usize, bit_width: u6)
     return value;
 }
 
+fn readBitPackedBool(packed_bytes: []const u8, value_idx: usize) bool {
+    const bit_idx: u3 = @intCast(value_idx % 8);
+    return ((packed_bytes[value_idx / 8] >> bit_idx) & 1) != 0;
+}
+
 fn zigzagDecode(raw: u64) i64 {
     return @as(i64, @bitCast(raw >> 1)) ^ -@as(i64, @intCast(raw & 1));
 }
@@ -2700,6 +2856,22 @@ test "parquet page parser decodes optional plain f64 v2 hybrid definition levels
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, decoded.nulls);
 }
 
+test "parquet page parser decodes optional plain boolean v2 hybrid definition levels" {
+    const alloc = std.testing.allocator;
+    var header_bytes = try buildDataPageV2HeaderFixtureWithLevels(alloc, 4, 3, 2, 0);
+    defer header_bytes.deinit(alloc);
+    const parsed = try parsePageHeader(header_bytes.items);
+
+    const payload = [_]u8{
+        3,          0b00001101,
+        0b00000110,
+    };
+    var decoded = try decodeOptionalPlainBoolV2HybridLevelsAlloc(alloc, parsed.header, &payload);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(bool, &[_]bool{ false, false, true, true }, decoded.values);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0, 0 }, decoded.nulls);
+}
+
 test "parquet page scanner concatenates uncompressed plain i64 pages" {
     const alloc = std.testing.allocator;
     var header_a = try buildDataPageHeaderFixture(alloc, 2, 16);
@@ -2780,6 +2952,21 @@ test "parquet page scanner decodes plain f32 pages as f64" {
     try std.testing.expectEqualSlices(f64, &[_]f64{ 1.25, 2.5 }, values);
 }
 
+test "parquet page scanner decodes plain boolean pages" {
+    const alloc = std.testing.allocator;
+    var header = try buildDataPageHeaderFixture(alloc, 5, 1);
+    defer header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, header.items);
+    try chunk.append(alloc, 0b00001101);
+
+    const values = try scanUncompressedPlainBoolColumnChunkAlloc(alloc, chunk.items);
+    defer alloc.free(values);
+    try std.testing.expectEqualSlices(bool, &[_]bool{ true, false, true, true, false }, values);
+}
+
 test "parquet page scanner decodes optional int96 timestamp v2 pages as ns" {
     const alloc = std.testing.allocator;
     var header = try buildDataPageV2HeaderFixtureWithLevels(alloc, 3, 26, 2, 0);
@@ -2822,6 +3009,25 @@ test "parquet page scanner decodes optional plain f32 v2 pages as f64" {
     defer values.deinit(alloc);
     try std.testing.expectEqualSlices(f64, &[_]f64{ 1.25, 0, 2.5 }, values.values);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, values.nulls);
+}
+
+test "parquet page scanner decodes optional plain boolean v2 pages" {
+    const alloc = std.testing.allocator;
+    var header = try buildDataPageV2HeaderFixtureWithLevels(alloc, 4, 3, 2, 0);
+    defer header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        3,          0b00001101,
+        0b00000110,
+    });
+
+    var values = try scanUncompressedOptionalPlainBoolColumnChunkAlloc(alloc, chunk.items);
+    defer values.deinit(alloc);
+    try std.testing.expectEqualSlices(bool, &[_]bool{ false, false, true, true }, values.values);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0, 0 }, values.nulls);
 }
 
 test "parquet page scanner decodes snappy plain i64 pages" {
