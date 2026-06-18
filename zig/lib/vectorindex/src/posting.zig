@@ -1945,6 +1945,29 @@ pub const PostingFormat = struct {
         return result;
     }
 
+    pub fn applyDeltaTailAllRecordsIntoScratch(
+        alloc: std.mem.Allocator,
+        scratch: anytype,
+        member_count: *usize,
+        data: []const u8,
+    ) !DeltaReplayResult {
+        var iterator = try DeltaTailIterator.init(data);
+        var result = DeltaReplayResult{};
+        while (try iterator.next()) |record| {
+            switch (record.op) {
+                .insert, .replace => if (member_count.* + 1 > scratch.member_ids.len) {
+                    const doubled = scratch.member_ids.len *| 2;
+                    try scratch.ensureMemberIdCapacity(alloc, @max(member_count.* + 1, @max(doubled, @as(usize, 8))));
+                },
+                .tombstone => {},
+            }
+            applyDeltaRecordToScratch(scratch, member_count, record);
+            result.records += 1;
+            result.max_sequence = @max(result.max_sequence, record.sequence);
+        }
+        return result;
+    }
+
     fn baseSequenceForDeltaTail(records: []const PostingDeltaRecord) u64 {
         if (records.len == 0) return 0;
         var base_sequence = records[0].sequence;
@@ -2314,6 +2337,11 @@ pub const PostingBacklogStats = struct {
 fn postingDeltaKeySequence(key: []const u8) ?u64 {
     if (key.len != 18 or key[0] != 'P' or key[1] != 'D') return null;
     return std.mem.readInt(u64, key[10..18], .big);
+}
+
+fn postingDeltaKeyAllRecordsAfterGeneration(key: []const u8, base_generation: u64) !bool {
+    const key_sequence = postingDeltaKeySequence(key) orelse return error.Corrupted;
+    return PostingFormat.deltaSequenceGeneration(key_sequence) > base_generation;
 }
 
 pub const PostingStore = struct {
@@ -3107,8 +3135,7 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
-            const key_sequence = postingDeltaKeySequence(entry.key) orelse return error.Corrupted;
-            const stats = if (PostingFormat.deltaSequenceGeneration(key_sequence) > base_generation)
+            const stats = if (try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation))
                 try PostingFormat.deltaTailStatsAllRecords(entry.value)
             else
                 try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
@@ -3148,10 +3175,11 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
                 if (record.vector_id != vector_id) continue;
-                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 if (best_op == null or record.sequence >= best_sequence) {
                     best_sequence = record.sequence;
                     best_op = record.op;
@@ -3191,12 +3219,13 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             out.stats.records += iterator.recordCount();
             out.stats.encoded_key_bytes += entry.key.len;
             out.stats.encoded_value_bytes += entry.value.len;
             while (try iterator.next()) |record| {
-                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 out.stats.records_after_generation += 1;
                 if (record.op == .tombstone) out.stats.tombstones_after_generation += 1;
                 out.stats.max_sequence_after_generation = @max(out.stats.max_sequence_after_generation, record.sequence);
@@ -3365,13 +3394,21 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
-            const entry_result = try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(
-                alloc,
-                scratch,
-                member_count,
-                entry.value,
-                base_generation,
-            );
+            const entry_result = if (try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation))
+                try PostingFormat.applyDeltaTailAllRecordsIntoScratch(
+                    alloc,
+                    scratch,
+                    member_count,
+                    entry.value,
+                )
+            else
+                try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(
+                    alloc,
+                    scratch,
+                    member_count,
+                    entry.value,
+                    base_generation,
+                );
             result.records += entry_result.records;
             result.max_sequence = @max(result.max_sequence, entry_result.max_sequence);
             maybe_entry = try cursor.next();
@@ -3424,12 +3461,13 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
                 if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
                     try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
                 }
-                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 result.records += 1;
                 result.max_sequence = @max(result.max_sequence, record.sequence);
                 if (use_overlay_plan) {
@@ -3515,12 +3553,13 @@ pub const PostingStore = struct {
         var maybe_entry = try cursor.seekAtOrAfter(prefix);
         while (maybe_entry) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) break;
+            const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
                 if (comptime @hasDecl(Scratch, "appendPostingDeltaTailCacheRecord")) {
                     try scratch.appendPostingDeltaTailCacheRecord(alloc, record.sequence, record.vector_id, @intFromEnum(record.op));
                 }
-                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 result.records += 1;
                 result.max_sequence = @max(result.max_sequence, record.sequence);
                 if (use_overlay_plan) {
@@ -5403,6 +5442,29 @@ test "posting delta tail replay skips stale records without growing member scrat
     try std.testing.expectEqual(@as(VectorId, 10), scratch.member_ids[0]);
 }
 
+test "posting delta tail all-record replay applies without generation filter" {
+    const alloc = std.testing.allocator;
+    const records = [_]PostingDeltaRecord{
+        .{ .sequence = (@as(u64, 3) << 32) | 1, .op = .insert, .vector_id = 40 },
+        .{ .sequence = (@as(u64, 3) << 32) | 2, .op = .replace, .vector_id = 50 },
+        .{ .sequence = (@as(u64, 3) << 32) | 3, .op = .tombstone, .vector_id = 10 },
+    };
+
+    const encoded = try PostingFormat.encodeDeltaTail(alloc, records[0..]);
+    defer alloc.free(encoded);
+
+    var scratch = PostingQueryMaterializeTestScratch{};
+    defer scratch.deinit(alloc);
+    try scratch.ensureMemberIdCapacity(alloc, 1);
+    scratch.member_ids[0] = 10;
+    var member_count: usize = 1;
+
+    const result = try PostingFormat.applyDeltaTailAllRecordsIntoScratch(alloc, &scratch, &member_count, encoded);
+    try std.testing.expectEqual(records.len, result.records);
+    try std.testing.expectEqual(records[2].sequence, result.max_sequence);
+    try std.testing.expectEqualSlices(VectorId, &.{ 40, 50 }, scratch.member_ids[0..member_count]);
+}
+
 test "posting delta tail scan skips stale records without growing delta scratch" {
     const alloc = std.testing.allocator;
     const records = [_]PostingDeltaRecord{
@@ -5835,8 +5897,7 @@ const PostingPersistenceTestIndex = struct {
         var out = PostingDeltaTailStats{};
         for (self.delta_entries.items) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
-            const key_sequence = postingDeltaKeySequence(entry.key) orelse return error.Corrupted;
-            const stats = if (PostingFormat.deltaSequenceGeneration(key_sequence) > base_generation)
+            const stats = if (try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation))
                 try PostingFormat.deltaTailStatsAllRecords(entry.value)
             else
                 try PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
@@ -5862,10 +5923,11 @@ const PostingPersistenceTestIndex = struct {
         var best_op: ?PostingDeltaOp = null;
         for (self.delta_entries.items) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
+            const entry_all_live = try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation);
             var iterator = try PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
                 if (record.vector_id != vector_id) continue;
-                if (PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!entry_all_live and PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 if (best_op == null or record.sequence >= best_sequence) {
                     best_sequence = record.sequence;
                     best_op = record.op;
@@ -5888,7 +5950,10 @@ const PostingPersistenceTestIndex = struct {
         var result = DeltaReplayResult{};
         for (self.delta_entries.items) |entry| {
             if (!hbc.postingDeltaKeyMatchesPosting(entry.key, posting_id)) continue;
-            const entry_result = try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(alloc, scratch, member_count, entry.value, base_generation);
+            const entry_result = if (try postingDeltaKeyAllRecordsAfterGeneration(entry.key, base_generation))
+                try PostingFormat.applyDeltaTailAllRecordsIntoScratch(alloc, scratch, member_count, entry.value)
+            else
+                try PostingFormat.applyDeltaTailAfterGenerationIntoScratch(alloc, scratch, member_count, entry.value, base_generation);
             result.records += entry_result.records;
             result.max_sequence = @max(result.max_sequence, entry_result.max_sequence);
         }

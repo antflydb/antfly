@@ -108,7 +108,9 @@ Current status:
   for stale folded LSM tail values. LSM delta-tail stats now use the ordered
   posting-delta key sequence to skip per-record generation checks when the whole
   value is newer than the base generation while still validating every encoded
-  record.
+  record. The same key-boundary fast path is now used by LSM delta replay for
+  fold/materialization and latest-op scans, so all-live tail values do not pay a
+  generation test on every decoded record.
   Unsorted materialization and fold fallback paths likewise reserve member
   output capacity from surviving insert/replace records rather than total delta
   records. Large unsorted materialization tails now build a latest-op map and
@@ -853,7 +855,8 @@ implementations cleanly:
    member. LSM delta-tail stats also use an all-record decoder when the
    posting-delta key sequence proves the whole value is newer than the base
    generation, avoiding a per-record generation branch without weakening value
-   validation.
+   validation. LSM replay paths use the same all-live key boundary for fold and
+   materialization scans.
 
    Expected win: fold decisions, backlog stats, and membership checks can avoid
    decoding or allocating full member arrays.
