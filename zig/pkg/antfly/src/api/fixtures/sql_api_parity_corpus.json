@@ -1076,144 +1076,6 @@
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
     {
-      "name": "single table date_trunc predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 86400000000000}],
-      "sql": "SELECT date_trunc('hour', amount) AS amount_hour FROM usage_records WHERE date_trunc('day', amount) = $1 ORDER BY date_trunc('month', amount) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_trunc quarter predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 0}],
-      "sql": "SELECT date_trunc('quarter', amount) AS amount_quarter FROM usage_records WHERE date_trunc('quarter', amount) = $1 ORDER BY date_trunc('year', amount) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_trunc large calendar unit query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 978307200000000000}],
-      "sql": "SELECT date_trunc('decade', amount) AS amount_decade, date_trunc('century', amount) AS amount_century FROM usage_records WHERE date_trunc('millennium', amount) = $1 ORDER BY date_trunc('decade', amount) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_bin predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 86400000000000}],
-      "sql": "SELECT date_bin(3600000000000, amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(86400000000000, amount, 0) = $1 ORDER BY date_bin(60000000000, amount, 0) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_bin interval predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 86400000000000}],
-      "sql": "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1 ORDER BY date_bin(INTERVAL '1 minute', amount, 0) ASC LIMIT 5"
-    },
-    {
-      "name": "single table typed datetime literal expression query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "predicates": 1,
-        "select": 0
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
-      "params": [{"string": "u1"}],
-      "sql": "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMPTZ '2025-01-01T00:00:00Z') AS planned_bucket FROM usage_records WHERE id = $1"
-    },
-    {
-      "name": "single table date_part predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 5}],
-      "sql": "SELECT date_part('hour', amount) AS amount_hour, EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(dow FROM amount) = $1 ORDER BY date_part('month', amount) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_part epoch predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 0}],
-      "sql": "SELECT date_part('epoch', amount) AS amount_epoch, EXTRACT(epoch FROM amount) AS amount_epoch_extract FROM usage_records WHERE EXTRACT(epoch FROM amount) >= $1 ORDER BY date_part('epoch', amount) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_part calendar predicate query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=3:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 5}],
-      "sql": "SELECT date_part('isoyear', amount) AS amount_isoyear, EXTRACT(week FROM amount) AS amount_week, date_part('quarter', amount) AS amount_quarter FROM usage_records WHERE EXTRACT(isodow FROM amount) = $1 ORDER BY date_part('doy', amount) ASC LIMIT 5"
-    },
-    {
-      "name": "single table date_part large calendar unit query",
-      "family": "query",
-      "summary": {
-        "table_name": "usage_records",
-        "expression_predicates": 1,
-        "select": 0,
-        "order_by": 1,
-        "limit": 5
-      },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=3:alias=0:order=1:order_expr=1:limit=5:claim=none",
-      "params": [{"integer": 21}],
-      "sql": "SELECT date_part('decade', amount) AS amount_decade, EXTRACT(century FROM amount) AS amount_century, date_part('millennium', amount) AS amount_millennium FROM usage_records WHERE date_part('century', amount) = $1 ORDER BY date_part('decade', amount) ASC LIMIT 5"
-    },
-    {
       "name": "single table nested case-fold text expression query",
       "family": "query",
       "summary": {
@@ -10745,6 +10607,144 @@
       "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
       "params": [{"integer": 64}],
       "sql": "SELECT ascii(status) AS first_code, chr(amount) AS amount_char FROM usage_records WHERE ascii(status) > $1 ORDER BY chr(amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_trunc predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 86400000000000}],
+      "sql": "SELECT date_trunc('hour', amount) AS amount_hour FROM usage_records WHERE date_trunc('day', amount) = $1 ORDER BY date_trunc('month', amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_trunc quarter predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 0}],
+      "sql": "SELECT date_trunc('quarter', amount) AS amount_quarter FROM usage_records WHERE date_trunc('quarter', amount) = $1 ORDER BY date_trunc('year', amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_trunc large calendar unit query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 978307200000000000}],
+      "sql": "SELECT date_trunc('decade', amount) AS amount_decade, date_trunc('century', amount) AS amount_century FROM usage_records WHERE date_trunc('millennium', amount) = $1 ORDER BY date_trunc('decade', amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_bin predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 86400000000000}],
+      "sql": "SELECT date_bin(3600000000000, amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(86400000000000, amount, 0) = $1 ORDER BY date_bin(60000000000, amount, 0) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_bin interval predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 86400000000000}],
+      "sql": "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1 ORDER BY date_bin(INTERVAL '1 minute', amount, 0) ASC LIMIT 5"
+    },
+    {
+      "name": "single table typed datetime literal expression query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "select": 0
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "params": [{"string": "u1"}],
+      "sql": "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMPTZ '2025-01-01T00:00:00Z') AS planned_bucket FROM usage_records WHERE id = $1"
+    },
+    {
+      "name": "single table date_part predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 5}],
+      "sql": "SELECT date_part('hour', amount) AS amount_hour, EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(dow FROM amount) = $1 ORDER BY date_part('month', amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_part epoch predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 0}],
+      "sql": "SELECT date_part('epoch', amount) AS amount_epoch, EXTRACT(epoch FROM amount) AS amount_epoch_extract FROM usage_records WHERE EXTRACT(epoch FROM amount) >= $1 ORDER BY date_part('epoch', amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_part calendar predicate query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=3:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 5}],
+      "sql": "SELECT date_part('isoyear', amount) AS amount_isoyear, EXTRACT(week FROM amount) AS amount_week, date_part('quarter', amount) AS amount_quarter FROM usage_records WHERE EXTRACT(isodow FROM amount) = $1 ORDER BY date_part('doy', amount) ASC LIMIT 5"
+    },
+    {
+      "name": "single table date_part large calendar unit query",
+      "family": "query",
+      "summary": {
+        "table_name": "usage_records",
+        "expression_predicates": 1,
+        "select": 0,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=1:json_eq=0:or=0:not=0:select=0:expr=3:alias=0:order=1:order_expr=1:limit=5:claim=none",
+      "params": [{"integer": 21}],
+      "sql": "SELECT date_part('decade', amount) AS amount_decade, EXTRACT(century FROM amount) AS amount_century, date_part('millennium', amount) AS amount_millennium FROM usage_records WHERE date_part('century', amount) = $1 ORDER BY date_part('decade', amount) ASC LIMIT 5"
     }
   ]
 }
