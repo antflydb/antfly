@@ -106,6 +106,51 @@
       "sql": "DEALLOCATE ALL"
     },
     {
+      "name": "public search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "set_search_path"
+      },
+      "plan": "ddl:session:set_search_path:namespaces=1:local=false",
+      "sql": "SET search_path TO public;"
+    },
+    {
+      "name": "reset search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "reset_search_path"
+      },
+      "plan": "ddl:session:reset_search_path",
+      "sql": "RESET search_path;"
+    },
+    {
+      "name": "reset all session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "discard_all"
+      },
+      "plan": "ddl:session:discard_all",
+      "sql": "RESET ALL;"
+    },
+    {
+      "name": "show search path session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "show_search_path"
+      },
+      "plan": "ddl:session:show_search_path",
+      "sql": "SHOW search_path;"
+    },
+    {
+      "name": "discard all session catalog syntax",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "discard_all"
+      },
+      "plan": "ddl:session:discard_all",
+      "sql": "DISCARD ALL;"
+    },
+    {
       "name": "declare cursor portal protocol plan",
       "family": "ddl",
       "summary": {

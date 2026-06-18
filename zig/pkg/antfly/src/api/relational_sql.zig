@@ -1821,7 +1821,8 @@ pub const OwnedSqlCatalogSession = struct {
     pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
         const current_database_name = try alloc.dupe(u8, source_session.currentDatabase());
         errdefer alloc.free(current_database_name);
-        const source_path = if (source_session.search_path.len == 0) &.{catalog_resources.default_namespace_name} else source_session.search_path;
+        const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+        const source_path = if (source_session.search_path.len == 0) default_search_path else source_session.search_path;
         const search_path = try alloc.alloc([]const u8, source_path.len);
         var initialized: usize = 0;
         errdefer {
@@ -45080,11 +45081,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
     try std.testing.expectEqualStrings("tenant_schema", tenant_session.session().primarySearchPathNamespace());
 
+    var empty_path_session = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{},
+    });
+    defer empty_path_session.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_ops", empty_path_session.session().currentDatabase());
+    try std.testing.expectEqual(@as(usize, 1), empty_path_session.search_path.len);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, empty_path_session.session().primarySearchPathNamespace());
+
     var reset_session = try lowerDdlPlanAlloc(alloc, "RESET ALL;");
     defer reset_session.deinit(alloc);
     const reset_session_fingerprint = try ddlFingerprintAlloc(alloc, reset_session);
     defer alloc.free(reset_session_fingerprint);
     try std.testing.expectEqualStrings("ddl:session:discard_all", reset_session_fingerprint);
+
+    var reset_search_path = try lowerDdlPlanAlloc(alloc, "RESET search_path;");
+    defer reset_search_path.deinit(alloc);
+    const reset_search_path_fingerprint = try ddlFingerprintAlloc(alloc, reset_search_path);
+    defer alloc.free(reset_search_path_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:reset_search_path", reset_search_path_fingerprint);
 
     var reset_client_min_messages = try lowerDdlPlanAlloc(alloc, "RESET client_min_messages;");
     defer reset_client_min_messages.deinit(alloc);
@@ -60838,34 +60854,6 @@ test "postgres sql adapter classifies application parity corpus" {
             .plan = "adapter_noop:ddl:reason=session_setting",
             .classification_reason = "session_setting",
             .sql = "SET client_encoding = 'UTF8';",
-        },
-        .{
-            .name = "public search path session catalog syntax",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .set_search_path },
-            .plan = "ddl:session:set_search_path:namespaces=1:local=false",
-            .sql = "SET search_path TO public;",
-        },
-        .{
-            .name = "reset all session catalog syntax",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .discard_all },
-            .plan = "ddl:session:discard_all",
-            .sql = "RESET ALL;",
-        },
-        .{
-            .name = "show search path session catalog syntax",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .show_search_path },
-            .plan = "ddl:session:show_search_path",
-            .sql = "SHOW search_path;",
-        },
-        .{
-            .name = "discard all session catalog syntax",
-            .family = .ddl,
-            .summary = .{ .ddl_tag = .discard_all },
-            .plan = "ddl:session:discard_all",
-            .sql = "DISCARD ALL;",
         },
         .{
             .name = "schema drop column rewrite work",
