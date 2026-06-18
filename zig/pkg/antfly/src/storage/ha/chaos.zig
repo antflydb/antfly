@@ -350,6 +350,81 @@ test "storage.ha chaos crash during apply preserves remote write and blocks remo
     try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
 }
 
+test "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "primary-sync-ack-crash");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    const names = [_][]const u8{"standby-a"};
+
+    {
+        var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+        defer primary.close();
+        try primary.createSlot("standby-a", 0);
+        _ = try primary.append(.{ .payload = "one" });
+
+        const decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_write,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, decision.status);
+    }
+
+    {
+        var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+        defer primary.close();
+        var decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_write,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, decision.status);
+
+        try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 0);
+        decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_write,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+        decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_apply,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, decision.status);
+    }
+
+    {
+        var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+        defer primary.close();
+        var decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_write,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+        decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_apply,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.would_block, decision.status);
+
+        try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 1);
+        decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_apply,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+    }
+
+    {
+        var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+        defer primary.close();
+        const decision = try primary.evaluateDurability(1, .{
+            .mode = .remote_apply,
+            .standby_names = &names,
+        });
+        try std.testing.expectEqual(primary_mod.DurabilityStatus.satisfied, decision.status);
+    }
+}
+
 test "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL" {
     const alloc = std.testing.allocator;
     const paths = try testPaths(alloc, "retention-rejoin");

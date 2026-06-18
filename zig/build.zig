@@ -2802,6 +2802,7 @@ pub fn build(b: *std.Build) void {
         "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
         "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
         "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
+        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
         "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
         "storage.ha chaos network partition requires fence before standby promotion",
     };
