@@ -1116,6 +1116,7 @@ fn compressionCodecForColumnChunk(chunk: external_source.ColumnChunk) !parquet_p
         return .uncompressed;
     }
     if (std.ascii.eqlIgnoreCase(chunk.compression_codec, "snappy")) return .snappy;
+    if (std.ascii.eqlIgnoreCase(chunk.compression_codec, "gzip")) return .gzip;
     return error.UnsupportedParquetPage;
 }
 
@@ -1237,6 +1238,26 @@ fn appendSnappyPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocat
 
     const compressed = try snappy.encode(alloc, payload.items);
     defer alloc.free(compressed);
+    try appendPlainI64DataPageHeader(out, alloc, values.len, payload.items.len, compressed.len);
+    try out.appendSlice(alloc, compressed);
+}
+
+fn appendGzipPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const i64) !void {
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    defer payload.deinit(alloc);
+    for (values) |value| {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &buf, value, .little);
+        try payload.appendSlice(alloc, &buf);
+    }
+
+    var out_buf: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    var hist: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&writer, hist[0..], .gzip, .default);
+    try compressor.writer.writeAll(payload.items);
+    try compressor.finish();
+    const compressed = writer.buffered();
     try appendPlainI64DataPageHeader(out, alloc, values.len, payload.items.len, compressed.len);
     try out.appendSlice(alloc, compressed);
 }
@@ -2474,32 +2495,52 @@ test "parquet row group batch dispatches supported compression from inventory" {
             .row_count = 3,
             .file_offset = 100,
             .total_byte_len = 96,
-            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
-                .column_id = try alloc.dupe(u8, "amount"),
-                .file_offset = 100,
-                .compressed_len = 96,
-                .uncompressed_len = 96,
-                .compression_codec = try alloc.dupe(u8, "snappy"),
-                .encoding = try alloc.dupe(u8, "plain"),
-            }}),
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 100,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .compression_codec = try alloc.dupe(u8, "snappy"),
+                    .encoding = try alloc.dupe(u8, "plain"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "count"),
+                    .file_offset = 196,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .compression_codec = try alloc.dupe(u8, "gzip"),
+                    .encoding = try alloc.dupe(u8, "plain"),
+                },
+            }),
         }}),
     };
     try inventory.validate();
 
-    var chunk = std.ArrayListUnmanaged(u8).empty;
-    defer chunk.deinit(alloc);
-    try appendSnappyPlainI64DataPage(&chunk, alloc, &[_]i64{ 10, 20, 30 });
+    var amount_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer amount_chunk.deinit(alloc);
+    try appendSnappyPlainI64DataPage(&amount_chunk, alloc, &[_]i64{ 10, 20, 30 });
+    var count_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer count_chunk.deinit(alloc);
+    try appendGzipPlainI64DataPage(&count_chunk, alloc, &[_]i64{ 1, 2, 3 });
 
-    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
-        .column_id = "amount",
-        .bytes = chunk.items,
-    }});
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{
+            .column_id = "amount",
+            .bytes = amount_chunk.items,
+        },
+        .{
+            .column_id = "count",
+            .bytes = count_chunk.items,
+        },
+    });
     defer owned.deinit(alloc);
 
     try owned.batch.validate();
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, owned.batch.columns[1].values.i64);
 
-    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"amount"});
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "amount", "count" });
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 
@@ -2507,7 +2548,7 @@ test "parquet row group batch dispatches supported compression from inventory" {
     try std.testing.expectError(error.UnsupportedParquetPage, planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{"amount"}));
     try std.testing.expectError(error.UnsupportedParquetPage, buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{.{
         .column_id = "amount",
-        .bytes = chunk.items,
+        .bytes = amount_chunk.items,
     }}));
 }
 
