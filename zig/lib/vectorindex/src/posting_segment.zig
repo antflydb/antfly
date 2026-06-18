@@ -784,28 +784,14 @@ pub const Catalog = struct {
     }
 
     fn getLatestExact(self: Catalog, posting_id: PostingId, kind: EntryKind) !?[]const u8 {
-        if (entriesSortedBySegmentId(self.segments)) {
-            var segment_index = self.segments.len;
-            while (segment_index > 0) {
-                segment_index -= 1;
-                const segment = self.segments[segment_index];
-                if (!segment.meta.mayContainPosting(posting_id)) continue;
-                var reader = try Reader.init(segment.data);
-                const value = switch (kind) {
-                    .base => try reader.getBase(posting_id),
-                    .centroid_directory => try reader.getCentroidDirectory(posting_id),
-                    .delta => null,
-                };
-                if (value) |found| return found;
-            }
-            return null;
-        }
-
         var best_segment_id: u64 = 0;
         var best: ?[]const u8 = null;
-        for (self.segments) |segment| {
-            if (!segment.meta.mayContainPosting(posting_id)) continue;
+        var segment_index = self.segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            const segment = self.segments[segment_index];
             if (best != null and segment.meta.segment_id <= best_segment_id) continue;
+            if (!segment.meta.mayContainPosting(posting_id)) continue;
             var reader = try Reader.init(segment.data);
             const value = switch (kind) {
                 .base => try reader.getBase(posting_id),
@@ -1104,28 +1090,16 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestPointValueAlloc(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId, kind: EntryKind) !?[]u8 {
-        if (entriesSortedBySegmentId(self.manifest.segments)) {
-            var segment_index = self.manifest.segments.len;
-            while (segment_index > 0) {
-                segment_index -= 1;
-                const entry = self.manifest.segments[segment_index];
-                if (!entry.meta.mayContainPosting(posting_id)) continue;
-                if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-
-                const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
-                const found = (try readSegmentPointIndexEntryAlloc(alloc, self.io, self.dir, manifest_entry, posting_id, kind)) orelse continue;
-                return try readSegmentEntryValueAlloc(alloc, self.io, self.dir, manifest_entry, found);
-            }
-            return null;
-        }
-
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
 
-        for (self.manifest.segments) |entry| {
+        var segment_index = self.manifest.segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            const entry = self.manifest.segments[segment_index];
+            if (best_manifest_entry != null and entry.meta.segment_id <= best_segment_id) continue;
             if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.segment_id <= best_segment_id) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
@@ -1140,32 +1114,16 @@ pub const LazyDirectorySnapshot = struct {
     }
 
     fn readLatestBaseHeader(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) !?posting.PostingBaseHeader {
-        if (entriesSortedBySegmentId(self.manifest.segments)) {
-            var segment_index = self.manifest.segments.len;
-            while (segment_index > 0) {
-                segment_index -= 1;
-                const entry = self.manifest.segments[segment_index];
-                if (!entry.meta.mayContainPosting(posting_id)) continue;
-                if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
-
-                const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
-                const found = (try readSegmentPointIndexEntryAlloc(alloc, self.io, self.dir, manifest_entry, posting_id, .base)) orelse continue;
-                var header_data: [posting.PostingFormat.encoded_base_header_size]u8 = undefined;
-                try readSegmentEntryValuePrefixInto(self.io, self.dir, manifest_entry, found, &header_data);
-                const header = try posting.PostingFormat.decodeBaseHeader(&header_data);
-                if (header.posting_id != posting_id) return error.CorruptedPostingSegment;
-                return header;
-            }
-            return null;
-        }
-
         var best_segment_id: u64 = 0;
         var best_manifest_entry: ?ManifestEntry = null;
         var best_index_entry: IndexEntry = undefined;
 
-        for (self.manifest.segments) |entry| {
+        var segment_index = self.manifest.segments.len;
+        while (segment_index > 0) {
+            segment_index -= 1;
+            const entry = self.manifest.segments[segment_index];
+            if (best_manifest_entry != null and entry.meta.segment_id <= best_segment_id) continue;
             if (!entry.meta.mayContainPosting(posting_id)) continue;
-            if (entry.meta.segment_id <= best_segment_id) continue;
             if (entry.meta.byte_len > self.options.max_segment_bytes) return error.PostingSegmentTooLarge;
 
             const manifest_entry = ManifestEntry{ .meta = entry.meta, .path = entry.path };
@@ -3792,14 +3750,6 @@ fn pendingEntryLessThan(_: void, lhs: PendingEntry, rhs: PendingEntry) bool {
 
 fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
     return lhs.meta.segment_id < rhs.meta.segment_id;
-}
-
-fn entriesSortedBySegmentId(entries: anytype) bool {
-    var index: usize = 1;
-    while (index < entries.len) : (index += 1) {
-        if (entries[index].meta.segment_id < entries[index - 1].meta.segment_id) return false;
-    }
-    return true;
 }
 
 fn sortManifestEntriesIfNeeded(entries: []ManifestEntry) void {
