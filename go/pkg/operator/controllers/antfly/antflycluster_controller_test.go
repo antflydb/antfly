@@ -4343,6 +4343,9 @@ func TestParseHAPromotionAPIResultAcceptsOpenAPIAndLegacyShapes(t *testing.T) {
 	_, ok = parseHAPromotionAPIResult([]byte(`{"schema_version":1,"action":{"action_id":"promotion:standby-a","action_kind":"promotion","target":"standby-a","state":"applied","node_id":"standby-a"},"assessment":{"required_lsn":12,"received_lsn":12,"applied_lsn":11,"has_required_lsn":true,"caught_up_to_received":true,"fencing_confirmed":true,"force":false,"mode":"safe","data_loss_possible":false,"safe":true,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":13,"old_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":4,"epoch":6},"new_identity":{"cluster_id":100,"shard_id":10,"table_id":20,"timeline_id":5,"epoch":7},"forced":false,"data_loss_possible":false},"fence_generation":3,"fence_token":"ha-fence-token","forced":false}`))
 	g.Expect(ok).To(BeFalse())
 
+	_, ok = parseHAPromotionAPIResult([]byte(strings.ReplaceAll(haPromotionResponseJSON(), `"required_lsn":12`, `"required_lsn":0`)))
+	g.Expect(ok).To(BeFalse())
+
 	legacyResult, ok := parseHAPromotionAPIResult([]byte(`{"schema_version":1,"result":{"promote_current_fence":{"assessment":{"required_lsn":15,"received_lsn":14,"applied_lsn":14,"has_required_lsn":false,"caught_up_to_received":true,"fencing_confirmed":true,"force":true,"mode":"lossy","data_loss_possible":true,"safe":false,"requires_fencing":false,"requires_force":false,"can_promote":true},"promotion":{"node_id":"standby-a","switch_lsn":15,"old_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":5,"epoch":7},"new_identity":{"cluster_id":100,"shard_id":0,"table_id":0,"timeline_id":6,"epoch":8},"forced":true,"data_loss_possible":true},"fence_generation":4,"fence_token":"legacy-token","forced":true}}}`))
 	g.Expect(ok).To(BeTrue())
 	g.Expect(legacyResult.SchemaVersion).To(Equal(uint32(1)))
