@@ -576,6 +576,36 @@ should not become the only production automation path. The operator should move
 toward typed `/admin/v1/ha` calls for idempotent actions and reserve CLI Jobs
 for explicitly local file-transfer or recovery steps.
 
+### Implementation Guardrails
+
+The first runtime implementation should keep validation reusable without making
+it vague. `paddedHAString` should become a shared classifier such as
+`classifyHAString(value) -> ok | missing | padded`, not a generic validator that
+trims or rewrites operator input. Field-specific validators should translate
+that classifier into field-specific errors and then add type-specific checks for
+paths, node ids, slot names, environment-variable names, and URLs.
+
+The first `test_standby.py` should be a real process e2e once the runtime and
+admin surfaces are usable. It should start a primary and standby, create a slot
+or seed workflow, write data through the primary, wait for standby catch-up,
+verify read-only standby behavior, restart the standby, and verify replay
+resumes. Argument-validation coverage belongs in unit tests; this e2e should
+prove the supported Postgres-style user path.
+
+The Zig simulation layer should carry the deeper correctness burden. It should
+model crash, restart, partition, duplicate/gap/out-of-order WAL, promotion,
+old-primary rejoin, rewind/reseed, retained-WAL expiry, and timeline switch
+interleavings before the project relies on black-box e2e as evidence that the
+state machine is correct.
+
+The production-grade bar is feature and failure-case parity, not merely "records
+stream." Before Antfly treats this mode as production ready, the implementation
+needs runtime primary/standby wiring, generated Zig and Go admin clients, operator
+integration through the Go SDK wrapper, base backup, sync commit, fencing,
+promotion, timelines, former-primary repair, standby read freshness, retention
+pressure handling, auth, metrics, runbooks, format compatibility, crash tests,
+real process e2e, and operator e2e.
+
 ## Test Strategy
 
 HA needs both black-box e2e coverage and deterministic simulation coverage. The
