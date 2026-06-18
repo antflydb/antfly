@@ -8597,8 +8597,18 @@ pub fn buildBulkKmeansFromInputs(
     }, points, self.rng.intN(inputs.len), centroids, next_centroids, assignments, distances, counts, entries);
     recordKmeansRunStats(self, stats);
 
+    var leaf_group_count: usize = 0;
+    var leaf_count_cluster_start: usize = 0;
+    while (leaf_count_cluster_start < entries.len) {
+        const cluster = entries[leaf_count_cluster_start].cluster;
+        var cluster_end = leaf_count_cluster_start + 1;
+        while (cluster_end < entries.len and entries[cluster_end].cluster == cluster) : (cluster_end += 1) {}
+        leaf_group_count += std.math.divCeil(usize, cluster_end - leaf_count_cluster_start, leaf_size) catch unreachable;
+        leaf_count_cluster_start = cluster_end;
+    }
+
     var current_count: usize = 0;
-    var current = try self.alloc.alloc(BuiltBulkNode, inputs.len);
+    var current = try self.alloc.alloc(BuiltBulkNode, leaf_group_count);
     defer {
         for (current[0..current_count]) |*node| node.deinit(self.alloc);
         self.alloc.free(current);
