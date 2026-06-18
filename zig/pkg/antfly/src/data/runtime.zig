@@ -13901,6 +13901,18 @@ test "data server propagates standby HA write gate into provisioned write source
             .sync_level = .write,
         }),
     );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().createTable(alloc, "docs", .{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().beginBulkIngest(alloc, "docs"),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        server.write_source.source().reprocessDocumentArtifactGroupLocal(alloc, 10, "docs", "doc:local", "embedding"),
+    );
     try std.testing.expect(!server.haOwnerJobCanRun(.compaction_publish));
     try server.runLsmMaintenanceForegroundRound();
     try server.requestLsmMaintenanceBackground();

@@ -5987,6 +5987,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return null;
@@ -6000,6 +6001,7 @@ pub const ProvisionedTableWriteSource = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return null;
@@ -6057,6 +6059,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: tables_api.CreateTableRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
@@ -6132,6 +6135,7 @@ pub const ProvisionedTableWriteSource = struct {
         schema_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
             self.catalog,
@@ -6174,6 +6178,7 @@ pub const ProvisionedTableWriteSource = struct {
         _: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
         const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
@@ -6192,6 +6197,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
         runTestBeforeDropIndexWorkHook();
@@ -6207,6 +6213,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_ids: []const u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (group_ids.len == 0) return null;
 
         self.beginLocalStructuralMutation(table_name);
@@ -6520,6 +6527,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         lockAtomic(&self.local_db_mutex);
@@ -6646,6 +6654,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableRestorePlan,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
@@ -6723,6 +6732,7 @@ pub const ProvisionedTableWriteSource = struct {
         _: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommit(
@@ -6928,6 +6938,7 @@ pub const ProvisionedTableWriteSource = struct {
         participants: []const []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
@@ -6950,6 +6961,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
@@ -6973,6 +6985,7 @@ pub const ProvisionedTableWriteSource = struct {
         commit_version: u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         if (status == .committed) {
@@ -7209,6 +7222,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         lockAtomic(&self.local_db_mutex);
@@ -7365,6 +7379,7 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7428,6 +7443,7 @@ pub const ProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7491,6 +7507,7 @@ pub const ProvisionedTableWriteSource = struct {
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7553,6 +7570,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
