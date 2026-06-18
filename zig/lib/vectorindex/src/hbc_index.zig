@@ -9811,10 +9811,10 @@ fn splitVectorSetKmeans(
     errdefer self.alloc.free(left_centroid);
     const right_centroid = try self.alloc.alloc(f32, dims);
     errdefer self.alloc.free(right_centroid);
-    const new_left = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(new_left);
-    const new_right = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(new_right);
+    const centroid_scratch = try self.alloc.alloc(f32, dims * 2);
+    defer self.alloc.free(centroid_scratch);
+    const new_left = centroid_scratch[0..dims];
+    const new_right = centroid_scratch[dims .. dims * 2];
     const assignments = try self.alloc.alloc(u64, count);
     defer self.alloc.free(assignments);
     const temp_dists = try self.alloc.alloc(f32, count);
