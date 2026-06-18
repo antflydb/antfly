@@ -37675,6 +37675,91 @@ test "storage.ha db primary progress sync wait returns would block without repor
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
 }
 
+test "storage.ha db primary progress sync wait survives primary restart before ack" {
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    const identity = ha_primary_mod.Identity{
+        .cluster_id = 261,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    const standby_names = [_][]const u8{"standby-a"};
+    const policy = ha_primary_mod.SyncPolicy{
+        .mode = .remote_apply,
+        .standby_names = &standby_names,
+        .failure_policy = .block,
+    };
+
+    var target_lsn: u64 = 0;
+    {
+        var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+        defer primary.close();
+        try primary.createSlot("standby-a", 0);
+
+        var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
+        var gate_lsn = std.atomic.Value(u64).init(0);
+        var gate_action = std.atomic.Value(u8).init(255);
+        var waits = std.atomic.Value(u64).init(0);
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .ha_async_batch_mirror = .{
+                .primary = &primary,
+                .sync_policy = policy,
+                .sync_wait_ctx = &wait_state,
+                .sync_wait_fn = HAPrimaryProgressSyncWait.wait,
+                .last_gate_lsn = &gate_lsn,
+                .last_gate_action = &gate_action,
+                .sync_wait_count = &waits,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try std.testing.expectError(error.HASyncCommitWouldBlock, db.batch(.{
+            .writes = &.{.{ .key = "doc:restart-before-ack", .value = "{\"title\":\"restart-before-ack\"}" }},
+            .sync_level = .write,
+        }));
+        target_lsn = primary.lastLsn();
+        try std.testing.expectEqual(@as(u64, 1), target_lsn);
+        try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+        try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+
+        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+        try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+    }
+
+    {
+        var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+        defer primary.close();
+        try std.testing.expectEqual(target_lsn, primary.lastLsn());
+
+        var wait_state = HAPrimaryProgressSyncWait{ .max_rounds = 1 };
+        try std.testing.expectError(
+            error.HASyncCommitWouldBlock,
+            HAPrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, policy),
+        );
+
+        try primary.standbyStatusUpdate("standby-a", identity.timeline_id, target_lsn, target_lsn);
+        try HAPrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, policy);
+
+        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(target_lsn, slot.received_lsn);
+        try std.testing.expectEqual(target_lsn, slot.applied_lsn);
+    }
+}
+
 test "storage.ha db block sync policy surfaces wait provider errors" {
     const alloc = std.testing.allocator;
 
