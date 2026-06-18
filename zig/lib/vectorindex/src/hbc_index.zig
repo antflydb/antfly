@@ -73,6 +73,13 @@ pub const BuiltBulkNode = struct {
     level: u16,
     member_count: usize,
 
+    pub fn take(self: *BuiltBulkNode) BuiltBulkNode {
+        const out = self.*;
+        self.centroid = &.{};
+        self.range = null;
+        return out;
+    }
+
     pub fn deinit(self: *BuiltBulkNode, alloc: Allocator) void {
         alloc.free(self.centroid);
         if (self.range) |*range| range.deinit(alloc);
@@ -8216,18 +8223,11 @@ pub fn bulkBuildExternalSequentialTxnOptions(
     }
 
     var built = if (current_count == 1) blk: {
-        const root = current[0];
-        const cloned = BuiltBulkNode{
-            .node_id = root.node_id,
-            .centroid = try self.alloc.dupe(f32, root.centroid),
-            .range = if (root.range) |range| try range.clone(self.alloc) else null,
-            .level = root.level,
-            .member_count = root.member_count,
-        };
+        const root = current[0].take();
         for (current[0..current_count]) |*node| node.deinit(self.alloc);
         self.alloc.free(current);
         current_owned = false;
-        break :blk cloned;
+        break :blk root;
     } else blk: {
         current_owned = false;
         break :blk try buildBulkParentLevels(self, txn, current, current_count);
@@ -8440,13 +8440,7 @@ pub fn buildBulkHilbertSeeded(
         current_count = next_count;
     }
 
-    return .{
-        .node_id = current[0].node_id,
-        .centroid = try self.alloc.dupe(f32, current[0].centroid),
-        .range = if (current[0].range) |range| try range.clone(self.alloc) else null,
-        .level = current[0].level,
-        .member_count = current[0].member_count,
-    };
+    return current[0].take();
 }
 
 pub fn buildBulkDocKeySeeded(
@@ -9454,6 +9448,7 @@ fn buildBulkParentLevels(
         owns_current = true;
     }
 
+    if (owns_current) return current[0].take();
     return .{
         .node_id = current[0].node_id,
         .centroid = try self.alloc.dupe(f32, current[0].centroid),
@@ -9501,6 +9496,7 @@ fn buildBulkKmeansParentLevels(
         owns_current = true;
     }
 
+    if (owns_current) return current[0].take();
     return .{
         .node_id = current[0].node_id,
         .centroid = try self.alloc.dupe(f32, current[0].centroid),
