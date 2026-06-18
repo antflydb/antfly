@@ -4655,6 +4655,9 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     request: OwnedRowsQueryRequest,
     row: lake_rows.ProjectedRow,
 ) !bool {
+    if (!try lakeRowsRelationalChecksPassAlloc(alloc, row, request.predicates)) return false;
+    if (!try lakeRowsPredicateGroupsPassAlloc(alloc, row, request.or_predicates)) return false;
+    if (!try lakeRowsNotPredicateGroupsPassAlloc(alloc, row, request.not_predicates)) return false;
     for (request.expression_predicates) |condition| {
         if (!try lakeRowsExpressionConditionMatchesAlloc(alloc, row, condition)) return false;
     }
@@ -4666,9 +4669,6 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
     defer alloc.free(row_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
-    if (!try queryPredicatesPass(alloc, parsed.value, request.predicates)) return false;
-    if (!try queryOrPredicateGroupsPass(alloc, parsed.value, request.or_predicates)) return false;
-    if (!try queryNotPredicateGroupsPass(alloc, parsed.value, request.not_predicates)) return false;
     if (!try queryAccessOrPredicateGroupsPass(alloc, parsed.value, request.access_or_predicates)) return false;
     if (!try queryAccessNotPredicateGroupsPass(alloc, parsed.value, request.access_not_predicates)) return false;
     for (request.array_any) |predicate| {
@@ -4702,10 +4702,7 @@ fn lakeRowsQueryResidualPredicatesMatchAlloc(
 }
 
 fn lakeRowsQueryResidualNeedsJson(request: OwnedRowsQueryRequest) bool {
-    return request.predicates.len != 0 or
-        request.or_predicates.len != 0 or
-        request.not_predicates.len != 0 or
-        request.access_or_predicates.len != 0 or
+    return request.access_or_predicates.len != 0 or
         request.access_not_predicates.len != 0 or
         request.array_any.len != 0 or
         request.array_contains.len != 0 or
@@ -4716,6 +4713,40 @@ fn lakeRowsQueryResidualNeedsJson(request: OwnedRowsQueryRequest) bool {
         request.json_path_exists.len != 0 or
         request.text_patterns.len != 0 or
         request.expression_array_contains.len != 0;
+}
+
+fn lakeRowsRelationalChecksPassAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    checks: []const runtime_schema.RelationalCheck,
+) !bool {
+    for (checks) |check| {
+        if (!try lakeRowsRelationalCheckMatchesAlloc(alloc, row, check)) return false;
+    }
+    return true;
+}
+
+fn lakeRowsPredicateGroupsPassAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    groups: []const db_mod.types.RelationalRowsPredicateGroup,
+) !bool {
+    if (groups.len == 0) return true;
+    for (groups) |group| {
+        if (try lakeRowsRelationalChecksPassAlloc(alloc, row, group.predicates)) return true;
+    }
+    return false;
+}
+
+fn lakeRowsNotPredicateGroupsPassAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    groups: []const db_mod.types.RelationalRowsPredicateGroup,
+) !bool {
+    for (groups) |group| {
+        if (try lakeRowsRelationalChecksPassAlloc(alloc, row, group.predicates)) return false;
+    }
+    return true;
 }
 
 fn lakeRowsExpressionOrPredicateGroupsPassAlloc(

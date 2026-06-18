@@ -17304,14 +17304,15 @@ test "external lake rows query and aggregate plans route through lake scan hook"
             try std.testing.expectEqualStrings("events", table_name);
             try std.testing.expect(runtime_schema.external_base_source != null);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            try std.testing.expect(request.predicate != null);
-            if (std.mem.eql(u8, request.predicate.?.column, "tenant")) {
-                try std.testing.expectEqual(serverless_query.LakeRowsPredicateOp.eq_bytes, request.predicate.?.op);
-                try std.testing.expectEqualStrings("t2", request.predicate.?.bytes_value);
-            } else if (std.mem.eql(u8, request.predicate.?.column, "amount")) {
-                try std.testing.expectEqual(serverless_query.LakeRowsPredicateOp.eq_f64, request.predicate.?.op);
-                try std.testing.expectEqual(@as(f64, 20.5), request.predicate.?.f64_value);
-            } else return error.UnexpectedLakePredicate;
+            if (request.predicate) |predicate| {
+                if (std.mem.eql(u8, predicate.column, "tenant")) {
+                    try std.testing.expectEqual(serverless_query.LakeRowsPredicateOp.eq_bytes, predicate.op);
+                    try std.testing.expectEqualStrings("t2", predicate.bytes_value);
+                } else if (std.mem.eql(u8, predicate.column, "amount")) {
+                    try std.testing.expectEqual(serverless_query.LakeRowsPredicateOp.eq_f64, predicate.op);
+                    try std.testing.expectEqual(@as(f64, 20.5), predicate.f64_value);
+                } else return error.UnexpectedLakePredicate;
+            }
             self.lake_scan_calls += 1;
             return try buildRows(scan_alloc, request.projected_columns);
         }
@@ -17406,6 +17407,65 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 2), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
 
+    const residual_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .op = .gt,
+        .value_json = "20",
+    }};
+    var residual_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .predicates = residual_predicates[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer residual_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), residual_query_result.total);
+    try std.testing.expectEqual(@as(usize, 1), residual_query_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", residual_query_result.rows[0]);
+
+    const or_amount_ten = [_]storage_schema.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .value_json = "10",
+    }};
+    const or_amount_thirty = [_]storage_schema.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .value_json = "30",
+    }};
+    const not_amount_twenty = [_]storage_schema.RelationalCheck{.{
+        .name = "",
+        .field = "amount",
+        .value_json = "20",
+    }};
+    const or_groups = [_]db_mod.types.RelationalRowsPredicateGroup{
+        .{ .predicates = or_amount_ten[0..] },
+        .{ .predicates = or_amount_thirty[0..] },
+    };
+    const not_groups = [_]db_mod.types.RelationalRowsPredicateGroup{.{
+        .predicates = not_amount_twenty[0..],
+    }};
+    var group_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .or_predicates = or_groups[0..],
+            .not_predicates = not_groups[0..],
+            .limit = 5,
+        },
+    }, .read_index)).?;
+    defer group_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), group_query_result.total);
+    try std.testing.expectEqual(@as(usize, 1), group_query_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", group_query_result.rows[0]);
+
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "count_all", .op = .count },
         .{ .name = "sum_amount", .op = .sum, .field = "amount" },
@@ -17417,7 +17477,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
         },
     }, .read_index)).?;
     defer aggregate_result.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 5), fake.lake_scan_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
     try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
     try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
