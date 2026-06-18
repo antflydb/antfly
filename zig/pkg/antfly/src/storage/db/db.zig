@@ -22488,8 +22488,8 @@ pub const DB = struct {
             types.relationalRowsJoinInputsSortedOnJoinKeys(req),
         ) orelse return error.UnsupportedQueryRequest;
         return switch (selection.selected) {
-            .lookup, .hash => try joinRelationalRowsFromSourceRowsHashAlloc(alloc, req, left_rows, right_rows),
-            .merge => try joinRelationalRowsFromSourceRowsMergeAlloc(alloc, req, left_rows, right_rows),
+            .lookup, .hash => try joinRelationalRowsFromSourceRowsHashAlloc(alloc, req, left_rows, right_rows, selection),
+            .merge => try joinRelationalRowsFromSourceRowsMergeAlloc(alloc, req, left_rows, right_rows, selection),
             .auto => unreachable,
         };
     }
@@ -22499,6 +22499,7 @@ pub const DB = struct {
         req: types.RelationalRowsJoinRequest,
         left_rows: []const []const u8,
         right_rows: []const []const u8,
+        strategy_selection: types.RelationalRowsJoinStrategySelection,
     ) !types.RelationalRowsJoinResult {
         var right_index = std.StringArrayHashMapUnmanaged(RelationalRowsJoinRightList).empty;
         defer deinitRelationalRowsJoinRightIndex(alloc, &right_index);
@@ -22557,7 +22558,7 @@ pub const DB = struct {
             }
         }
 
-        return try relationalRowsFinalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset);
+        return try relationalRowsFinalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset, strategy_selection);
     }
 
     fn joinRelationalRowsFromSourceRowsMergeAlloc(
@@ -22565,6 +22566,7 @@ pub const DB = struct {
         req: types.RelationalRowsJoinRequest,
         left_rows: []const []const u8,
         right_rows: []const []const u8,
+        strategy_selection: types.RelationalRowsJoinStrategySelection,
     ) !types.RelationalRowsJoinResult {
         var joined = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
@@ -22652,7 +22654,7 @@ pub const DB = struct {
             left_index = left_group_end;
         }
 
-        return try relationalRowsFinalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset);
+        return try relationalRowsFinalizeJoinResultAlloc(alloc, &joined, req.order_by, req.limit, req.offset, strategy_selection);
     }
 
     const RelationalRowsJoinOrderKeySet = struct {
@@ -22736,6 +22738,7 @@ pub const DB = struct {
         order_by: []const types.RelationalRowsQueryOrder,
         limit: ?u32,
         offset: u32,
+        strategy_selection: ?types.RelationalRowsJoinStrategySelection,
     ) !types.RelationalRowsJoinResult {
         try sortRelationalRowsOutputRowsAlloc(alloc, joined.items, order_by);
 
@@ -22750,12 +22753,13 @@ pub const DB = struct {
             for (joined.items[start + limited_len ..]) |row| alloc.free(@constCast(row));
             const kept = try alloc.dupe([]const u8, joined.items[start .. start + limited_len]);
             joined.deinit(alloc);
-            return .{ .rows = kept, .total_rows = total_rows };
+            return .{ .rows = kept, .total_rows = total_rows, .strategy_selection = strategy_selection };
         }
 
         return .{
             .rows = try joined.toOwnedSlice(alloc),
             .total_rows = total_rows,
+            .strategy_selection = strategy_selection,
         };
     }
 

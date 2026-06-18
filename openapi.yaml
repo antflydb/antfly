@@ -11063,6 +11063,28 @@ components:
         - as
         - side
         - field
+    RowsJoinStrategy:
+      type: string
+      description: Physical join strategy requested by the typed plan. `auto` lets Antfly choose from
+        proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the
+        leading join keys.
+      enum:
+        - auto
+        - lookup
+        - hash
+        - merge
+    RowsJoinStrategySelection:
+      type: object
+      additionalProperties: false
+      description: Join strategy admission metadata returned by native join execution.
+      properties:
+        requested:
+          $ref: '#/components/schemas/RowsJoinStrategy'
+        selected:
+          $ref: '#/components/schemas/RowsJoinStrategy'
+      required:
+        - requested
+        - selected
     RowsJoinRequest:
       type: object
       additionalProperties: false
@@ -11104,6 +11126,8 @@ components:
           enum:
             - inner
             - left
+        strategy:
+          $ref: '#/components/schemas/RowsJoinStrategy'
         select:
           type: array
           items:
@@ -11387,6 +11411,8 @@ components:
         total_rows:
           type: integer
           format: int64
+        join_strategy:
+          $ref: '#/components/schemas/RowsJoinStrategySelection'
         result_schema:
           type: array
           items:

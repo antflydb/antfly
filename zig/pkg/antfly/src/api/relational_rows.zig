@@ -3256,7 +3256,27 @@ pub fn encodeRowsJoinResponseWithSchemaAlloc(
     result: db_mod.types.RelationalRowsJoinResult,
     result_schema: []const runtime_schema.RelationalColumn,
 ) ![]u8 {
-    return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_rows", result.total_rows, result.rows, result_schema);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"total_rows\":{d}", .{result.total_rows});
+    if (result.strategy_selection) |selection| {
+        try writer.print(
+            ",\"join_strategy\":{{\"requested\":{f},\"selected\":{f}}}",
+            .{
+                std.json.fmt(@tagName(selection.requested), .{}),
+                std.json.fmt(@tagName(selection.selected), .{}),
+            },
+        );
+    }
+    try appendRowsResultSchemaJson(writer, result_schema);
+    try writer.writeAll(",\"rows\":[");
+    for (result.rows, 0..) |row, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.writeAll(row);
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
 }
 
 fn appendRowsResultSchemaJson(
@@ -19087,6 +19107,14 @@ test "relational rows cte plan contract executes derived outputs across read sta
     var join_result = try executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, join_plan, rows[0..], rows[0..], rows[0..]);
     defer join_result.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), join_result.total_rows);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.auto, join_result.strategy_selection.?.requested);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.lookup, join_result.strategy_selection.?.selected);
+    const encoded_join_result = try encodeRowsJoinResponseAlloc(alloc, join_result);
+    defer alloc.free(encoded_join_result);
+    var parsed_join_response = try std.json.parseFromSlice(std.json.Value, alloc, encoded_join_result, .{ .allocate = .alloc_always });
+    defer parsed_join_response.deinit();
+    try std.testing.expectEqualStrings("auto", parsed_join_response.value.object.get("join_strategy").?.object.get("requested").?.string);
+    try std.testing.expectEqualStrings("lookup", parsed_join_response.value.object.get("join_strategy").?.object.get("selected").?.string);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"b\"}", join_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_id\":\"b\",\"right_id\":\"b\"}", join_result.rows[1]);
 
@@ -19127,6 +19155,8 @@ test "relational rows cte plan contract executes derived outputs across read sta
     var sorted_merge_join_result = try executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, sorted_merge_join_plan, rows[0..], rows[0..], rows[0..]);
     defer sorted_merge_join_result.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 8), sorted_merge_join_result.total_rows);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.merge, sorted_merge_join_result.strategy_selection.?.requested);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.merge, sorted_merge_join_result.strategy_selection.?.selected);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", sorted_merge_join_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_id\":\"b\",\"right_id\":\"b\"}", sorted_merge_join_result.rows[3]);
     try std.testing.expectEqualStrings("{\"left_id\":\"d\",\"right_id\":\"d\"}", sorted_merge_join_result.rows[7]);

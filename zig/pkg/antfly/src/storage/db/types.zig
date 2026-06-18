@@ -2436,6 +2436,7 @@ fn freeRelationalRowsDocKeyRanges(alloc: Allocator, ranges: []const RelationalRo
 pub const RelationalRowsJoinResult = struct {
     rows: [][]const u8 = &.{},
     total_rows: u32 = 0,
+    strategy_selection: ?RelationalRowsJoinStrategySelection = null,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.rows) |row| alloc.free(@constCast(row));

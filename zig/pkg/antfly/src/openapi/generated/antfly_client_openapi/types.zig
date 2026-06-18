@@ -1198,6 +1198,38 @@ pub const RowsJoinProjection = struct {
     field: []const u8,
 };
 
+/// Physical join strategy requested by the typed plan. `auto` lets Antfly choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the leading join keys.
+pub const RowsJoinStrategy = enum {
+    auto,
+    lookup,
+    hash,
+    merge,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .lookup => "lookup",
+            .hash => "hash",
+            .merge => "merge",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "lookup", .lookup },
+            .{ "hash", .hash },
+            .{ "merge", .merge },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsLateralCorrelation = struct {
     left_field: []const u8,
     right_field: []const u8,
@@ -4522,6 +4554,12 @@ pub const RowsAggregateHaving = struct {
     all: []const RowsAggregateHavingPredicate,
 };
 
+/// Join strategy admission metadata returned by native join execution.
+pub const RowsJoinStrategySelection = struct {
+    requested: RowsJoinStrategy,
+    selected: RowsJoinStrategy,
+};
+
 pub const RowsQueryResultSet = struct {
     total: ?i64 = null,
     result_schema: ?[]const RowsResultColumn = null,
@@ -4530,12 +4568,6 @@ pub const RowsQueryResultSet = struct {
 
 pub const RowsAggregateResultSet = struct {
     total_groups: ?i64 = null,
-    result_schema: ?[]const RowsResultColumn = null,
-    rows: ?[]const std.json.Value = null,
-};
-
-pub const RowsStreamResultSet = struct {
-    total_rows: ?i64 = null,
     result_schema: ?[]const RowsResultColumn = null,
     rows: ?[]const std.json.Value = null,
 };
@@ -5805,6 +5837,13 @@ pub const RowsWhereBranch = union(enum) {
             .rows_where_branch_all => |v| try jw.write(v.*),
         }
     }
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    join_strategy: ?RowsJoinStrategySelection = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
 };
 
 pub const SSEStepCompleted = AgentStep;
@@ -7792,6 +7831,7 @@ pub const RowsJoinRequest = struct {
     /// Post-match computed array-containment predicates over the joined rows.
     match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
     join_type: ?[]const u8 = null,
+    strategy: ?RowsJoinStrategy = null,
     select: ?[]const RowsJoinProjection = null,
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
