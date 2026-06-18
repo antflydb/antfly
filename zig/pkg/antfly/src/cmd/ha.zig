@@ -65,8 +65,8 @@ const IdentityOptions = struct {
     fn finish(self: IdentityOptions) !ha.standby.Identity {
         return .{
             .cluster_id = self.cluster_id orelse return error.ClusterIdMissing,
-            .shard_id = self.shard_id orelse return error.ShardIdMissing,
-            .table_id = self.table_id orelse return error.TableIdMissing,
+            .shard_id = self.shard_id orelse 0,
+            .table_id = self.table_id orelse 0,
             .timeline_id = self.timeline_id orelse return error.TimelineIdMissing,
             .epoch = self.epoch orelse return error.EpochMissing,
         };
@@ -1052,6 +1052,38 @@ test "ha cmd parses local handles before admin command" {
 
     const identity = try parsed.options.primaryIdentity();
     try std.testing.expectEqual(@as(u64, 30), identity.table_id);
+}
+
+test "ha cmd local handles default shard and table identity to whole instance" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseLocalArgs(alloc, &.{
+        "--primary-log",    "p.wal",
+        "--primary-slots",  "slots.wal",
+        "--ha-cluster-id",  "10",
+        "--ha-timeline-id", "1",
+        "--ha-epoch",       "2",
+        "--",               "slot",
+        "list",
+    });
+    defer parsed.deinit(alloc);
+
+    const primary_identity = try parsed.options.primaryIdentity();
+    try std.testing.expectEqual(@as(u64, 10), primary_identity.cluster_id);
+    try std.testing.expectEqual(@as(u64, 0), primary_identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), primary_identity.table_id);
+    try std.testing.expectEqual(@as(u64, 1), primary_identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), primary_identity.epoch);
+
+    parsed.options.primary_log = null;
+    parsed.options.primary_slots = null;
+    parsed.options.standby_log = "standby.wal";
+    parsed.options.standby_progress = "progress.wal";
+    const standby_identity = try parsed.options.standbyIdentity();
+    try std.testing.expectEqual(@as(u64, 10), standby_identity.cluster_id);
+    try std.testing.expectEqual(@as(u64, 0), standby_identity.shard_id);
+    try std.testing.expectEqual(@as(u64, 0), standby_identity.table_id);
+    try std.testing.expectEqual(@as(u64, 1), standby_identity.timeline_id);
+    try std.testing.expectEqual(@as(u64, 2), standby_identity.epoch);
 }
 
 test "ha cmd parses remote admin URL before command" {
