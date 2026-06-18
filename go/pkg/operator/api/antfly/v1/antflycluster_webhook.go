@@ -1211,6 +1211,9 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 			if strings.TrimSpace(admin.PrimaryURL) == "" {
 				errors = append(errors, "spec.highAvailability.admin.primaryURL is required when executePlannedActions is true")
 			}
+			if ha.Identity == nil {
+				errors = append(errors, "spec.highAvailability.admin.executePlannedActions requires spec.highAvailability.identity")
+			}
 		}
 	}
 

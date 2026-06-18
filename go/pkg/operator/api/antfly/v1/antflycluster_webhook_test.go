@@ -1897,10 +1897,40 @@ func TestValidateCreate_HighAvailabilityAllowsExecutableActionsWithoutEveryStand
 			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
 			{Name: "standby-b"},
 		},
+		Identity: &HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       1,
+			Epoch:            1,
+			CurrentPrimaryID: "primary-a",
+		},
 	}
 
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected partial HA admin endpoint configuration to be valid without automatic failover, got: %v", err)
+	}
+}
+
+func TestValidateCreate_HighAvailabilityRejectsAdminExecutionWithoutIdentity(t *testing.T) {
+	cluster := baseSwarmCluster()
+	cluster.Spec.HighAvailability = &HighAvailabilitySpec{
+		Mode: HAModeHotStandby,
+		Admin: &HAAdminSpec{
+			PrimaryURL:            "http://primary-ha.default.svc:8081",
+			ExecutePlannedActions: true,
+		},
+		Standbys: []HAStandbySpec{
+			{Name: "standby-a", AdminURL: "http://standby-a-ha.default.svc:8081"},
+		},
+	}
+
+	err := cluster.ValidateCreate()
+	if err == nil {
+		t.Fatal("expected HA admin execution without identity to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin.executePlannedActions requires spec.highAvailability.identity") {
+		t.Fatalf("expected HA admin execution identity validation error, got: %v", err)
 	}
 }
 
