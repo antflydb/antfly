@@ -250,16 +250,17 @@ pub fn scanRowsWithSidecarsAlloc(
         .not_requested_count = selection.not_requested_count,
     };
 
-    if (try firstUsableCandidateSet(request.sidecars, selection, request.candidates)) |usable| {
+    if (try usableCandidateRefsAlloc(alloc, request.sidecars, selection, request.candidates)) |usable| {
+        defer alloc.free(usable.row_refs);
         var hydrated = try hydrateRowsForBindingAlloc(
             alloc,
             source,
-            usable.declaration.binding,
-            usable.candidates.row_refs,
+            usable.binding,
+            usable.row_refs,
             request.scan.projected_columns,
         );
         errdefer hydrated.deinit(alloc);
-        if (@as(usize, @intCast(hydrated.total)) != usable.candidates.row_refs.len) {
+        if (@as(usize, @intCast(hydrated.total)) != usable.row_refs.len) {
             return error.LakeSidecarCandidateHydrationMismatch;
         }
         return .{
@@ -377,9 +378,9 @@ fn hydrateRowsInternalAlloc(
     return .{ .rows = try rows.toOwnedSlice(alloc), .total = total };
 }
 
-const UsableCandidateSet = struct {
-    declaration: sidecar_manifest.DeclaredArtifact,
-    candidates: SidecarCandidateSet,
+const UsableCandidateRefs = struct {
+    binding: source_binding.Binding,
+    row_refs: []rowsource.RowRef,
 };
 
 fn validateRequest(request: GroupByRequest) !void {
@@ -449,21 +450,45 @@ fn desiredContainsName(desired: []const lake_sidecar_selection.DesiredSidecar, n
     return false;
 }
 
-fn firstUsableCandidateSet(
+fn usableCandidateRefsAlloc(
+    alloc: Allocator,
     declarations: []const sidecar_manifest.DeclaredArtifact,
     selection: lake_sidecar_selection.Plan,
     candidates: []const SidecarCandidateSet,
-) !?UsableCandidateSet {
+) !?UsableCandidateRefs {
+    var refs = std.ArrayListUnmanaged(rowsource.RowRef).empty;
+    errdefer refs.deinit(alloc);
+    var binding: ?source_binding.Binding = null;
+    var found_candidate_set = false;
+
     for (selection.decisions) |decision| {
         if (decision.action != .use) continue;
         const candidate_set = findCandidateSet(candidates, decision.name) orelse continue;
         const declaration = findSidecarDeclaration(declarations, decision.name) orelse return error.InvalidLakeSidecarSelection;
-        return .{
-            .declaration = declaration,
-            .candidates = candidate_set,
-        };
+        try source_binding.validateCandidateRowRefsAgainstBinding(declaration.binding, candidate_set.row_refs);
+        if (!found_candidate_set) {
+            binding = declaration.binding;
+            for (candidate_set.row_refs) |row_ref| {
+                if (!containsRowRef(refs.items, row_ref)) try refs.append(alloc, row_ref);
+            }
+            found_candidate_set = true;
+            continue;
+        }
+
+        var out_idx: usize = 0;
+        for (refs.items) |row_ref| {
+            if (containsRowRef(candidate_set.row_refs, row_ref)) {
+                refs.items[out_idx] = row_ref;
+                out_idx += 1;
+            }
+        }
+        refs.shrinkRetainingCapacity(out_idx);
     }
-    return null;
+    if (!found_candidate_set) return null;
+    return .{
+        .binding = binding.?,
+        .row_refs = try refs.toOwnedSlice(alloc),
+    };
 }
 
 fn findCandidateSet(
@@ -1083,6 +1108,110 @@ test "lake rows sidecar scan hydrates selected external candidates" {
     try std.testing.expect(rowRefsEqual(row_refs[2], result.rows[1].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqual(@as(i64, 30), result.rows[1].find("amount").?.value.?.i64);
+}
+
+test "lake rows sidecar scan intersects multiple selected candidate sets" {
+    const alloc = std.testing.allocator;
+    const external = @import("../../storage/rowsource/external.zig");
+    const artifact_ref = @import("../manifest/artifact_ref.zig");
+
+    const external_binding = external.Binding{
+        .format = .iceberg,
+        .source_id = "events",
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+        try external.makeRowRef(external_binding, "file-a.parquet", 0, 1),
+        try external.makeRowRef(external_binding, "file-b.parquet", 1, 0),
+    };
+    const amounts = [_]i64{ 10, 20, 30 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = external_binding.snapshot(),
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var batch_source = try external.BatchSource.init(external_binding, &batches);
+
+    const vector_declaration = sidecar_manifest.DeclaredArtifact{
+        .name = "events.embedding.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_iceberg,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "iceberg-9",
+            .schema_fingerprint = "schema-v2",
+            .column_bindings = &[_][]const u8{"embedding"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = artifact_ref.ArtifactKind.vector_segment,
+            .name = "events.embedding.vector",
+            .artifact_id = "vector-1",
+            .byte_len = 128,
+            .checksum = "len:128",
+        },
+    };
+    const text_declaration = sidecar_manifest.DeclaredArtifact{
+        .name = "events.body.text",
+        .binding = .{
+            .sidecar_kind = .text,
+            .source_kind = .external_iceberg,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "iceberg-9",
+            .schema_fingerprint = "schema-v2",
+            .column_bindings = &[_][]const u8{"body"},
+            .index_config_hash = "sha256:text",
+        },
+        .artifact = .{
+            .kind = artifact_ref.ArtifactKind.text_segment,
+            .name = "events.body.text",
+            .artifact_id = "text-1",
+            .byte_len = 64,
+            .checksum = "len:64",
+        },
+    };
+    const sidecars = [_]sidecar_manifest.DeclaredArtifact{ vector_declaration, text_declaration };
+    const vector_refs = [_]rowsource.RowRef{ row_refs[2], row_refs[1] };
+    const text_refs = [_]rowsource.RowRef{ row_refs[1], row_refs[0] };
+    const candidates = [_]SidecarCandidateSet{
+        .{ .sidecar_name = "events.embedding.vector", .row_refs = &vector_refs },
+        .{ .sidecar_name = "events.body.text", .row_refs = &text_refs },
+    };
+    const desired = [_]lake_sidecar_selection.DesiredSidecar{
+        .{ .name = "events.embedding.vector" },
+        .{ .name = "events.body.text" },
+    };
+    const projection = [_][]const u8{"amount"};
+
+    var result = try scanRowsWithSidecarsAlloc(alloc, batch_source.rowSource(), .{
+        .scan = .{ .projected_columns = &projection },
+        .base_source = .{ .external_iceberg = .{
+            .format = .iceberg,
+            .source_uri = "s3://bucket/warehouse/events",
+            .snapshot_id = "iceberg-9",
+            .schema_fingerprint = "schema-v2",
+        } },
+        .sidecars = &sidecars,
+        .desired_sidecars = &desired,
+        .sidecar_policy = .{ .require_requested = true },
+        .candidates = &candidates,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(SidecarScanSource.sidecar_hydration, result.source);
+    try std.testing.expectEqual(@as(u32, 2), result.sidecar_selection.selected_count);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
+    try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
 }
 
 test "lake rows automatic sidecar scan requests candidate sidecars" {
