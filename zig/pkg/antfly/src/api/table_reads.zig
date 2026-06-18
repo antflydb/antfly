@@ -4889,6 +4889,7 @@ pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
     cache: ?*serverless_query.LakeParquetObjectRangeCache = null,
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
     file_bucket: []const u8 = "external-lake",
+    object_uri_base: ?[]const u8 = null,
 };
 
 pub const OwnedExternalObjectStorageLakeRowsSource = struct {
@@ -4915,6 +4916,7 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
             .prefix = prefix,
             .source_id = binding.table_id,
             .source_uri = binding.source_uri,
+            .object_uri_base = options.object_uri_base,
             .schema_fingerprint = binding.schema_fingerprint,
         });
         errdefer inventory.deinit(alloc);
@@ -4971,13 +4973,21 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
         var store = opened_store;
         errdefer store.deinit();
 
+        var source_options = options;
+        var owned_object_uri_base: ?[]u8 = null;
+        defer if (owned_object_uri_base) |value| alloc.free(value);
+        if (store.fs_client != null and source_options.object_uri_base == null) {
+            owned_object_uri_base = try objectStoreUriBaseAlloc(alloc, store.bucket, store.prefix);
+            source_options.object_uri_base = owned_object_uri_base.?;
+        }
+
         var owned_source = try OwnedExternalObjectStorageLakeRowsSource.initParquetPrefixAlloc(
             alloc,
             runtime_schema,
             store.client,
             store.bucket,
             store.prefix,
-            options,
+            source_options,
         );
         errdefer owned_source.deinit();
 
@@ -4995,6 +5005,11 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
         self.owned_source.deinit();
         self.opened_store.deinit();
         self.* = undefined;
+    }
+
+    fn objectStoreUriBaseAlloc(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8) ![]u8 {
+        if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "object://{s}", .{bucket});
+        return try std.fmt.allocPrint(alloc, "object://{s}/{s}", .{ bucket, prefix });
     }
 };
 

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const plan_mod = @import("plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 
 pub const AdapterNoopDdlReason = enum {
@@ -80,6 +81,74 @@ pub const DropEnumTypePlan = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.type_name);
+        self.* = undefined;
+    }
+};
+
+pub const DomainCatalogPlan = union(enum) {
+    create: CreateDomainPlan,
+    alter: AlterDomainPlan,
+    drop: DropDomainPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .alter => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateDomainPlan = struct {
+    domain_name: []const u8,
+    field_type: runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType = null,
+    not_null: bool = false,
+    default_value: ?runtime_schema.RelationalDefaultValue = null,
+    checks: []const runtime_schema.RelationalCheck = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.domain_name);
+        if (self.default_value) |default| alloc.free(default.value_json);
+        freeDdlRelationalChecks(alloc, self.checks);
+        self.* = undefined;
+    }
+};
+
+pub const AlterDomainPlan = struct {
+    domain_name: []const u8,
+    operations: []const DomainAlterOperation = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.domain_name);
+        freeDomainAlterOperations(alloc, self.operations);
+        self.* = undefined;
+    }
+};
+
+pub const DomainAlterOperation = union(enum) {
+    set_not_null,
+    drop_not_null,
+    set_default: runtime_schema.RelationalDefaultValue,
+    drop_default,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .set_default => |default| alloc.free(default.value_json),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const DropDomainPlan = struct {
+    domain_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.domain_name);
         self.* = undefined;
     }
 };
@@ -1462,6 +1531,26 @@ fn freeDatabaseAlterOperations(alloc: std.mem.Allocator, operations: []const Dat
     if (operations.len > 0) alloc.free(operations);
 }
 
+fn freeDdlRelationalCheck(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) void {
+    alloc.free(check.name);
+    alloc.free(check.field);
+    if (check.value_json) |value| alloc.free(value);
+    if (check.expression) |expression| plan_mod.freeExpressionCondition(alloc, expression);
+}
+
+fn freeDdlRelationalChecks(alloc: std.mem.Allocator, checks: []const runtime_schema.RelationalCheck) void {
+    for (checks) |check| freeDdlRelationalCheck(alloc, check);
+    if (checks.len > 0) alloc.free(checks);
+}
+
+fn freeDomainAlterOperations(alloc: std.mem.Allocator, operations: []const DomainAlterOperation) void {
+    for (operations) |operation_const| {
+        var operation = operation_const;
+        operation.deinit(alloc);
+    }
+    if (operations.len > 0) alloc.free(operations);
+}
+
 test "SQL adapter DDL enum plans own nested values" {
     const alloc = std.testing.allocator;
 
@@ -1485,6 +1574,54 @@ test "SQL adapter DDL enum plans own nested values" {
 
     var drop: EnumTypeCatalogPlan = .{ .drop = .{
         .type_name = try alloc.dupe(u8, "job_state"),
+        .if_exists = true,
+        .cascade = true,
+    } };
+    drop.deinit(alloc);
+}
+
+test "SQL adapter DDL domain plans own nested defaults and checks" {
+    const alloc = std.testing.allocator;
+
+    var checks = try alloc.alloc(runtime_schema.RelationalCheck, 1);
+    checks[0] = .{
+        .name = try alloc.dupe(u8, "status_present"),
+        .field = try alloc.dupe(u8, "value"),
+        .op = .is_not_null,
+        .expression = .{
+            .lhs = .{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "value"),
+            },
+            .op = .is_not_null,
+        },
+    };
+    var create: DomainCatalogPlan = .{ .create = .{
+        .domain_name = try alloc.dupe(u8, "status_text"),
+        .field_type = .string,
+        .not_null = true,
+        .default_value = .{
+            .kind = .literal,
+            .value_json = try alloc.dupe(u8, "\"queued\""),
+        },
+        .checks = checks,
+    } };
+    create.deinit(alloc);
+
+    var operations = try alloc.alloc(DomainAlterOperation, 2);
+    operations[0] = .set_not_null;
+    operations[1] = .{ .set_default = .{
+        .kind = .literal,
+        .value_json = try alloc.dupe(u8, "\"ready\""),
+    } };
+    var alter: DomainCatalogPlan = .{ .alter = .{
+        .domain_name = try alloc.dupe(u8, "status_text"),
+        .operations = operations,
+    } };
+    alter.deinit(alloc);
+
+    var drop: DomainCatalogPlan = .{ .drop = .{
+        .domain_name = try alloc.dupe(u8, "status_text"),
         .if_exists = true,
         .cascade = true,
     } };

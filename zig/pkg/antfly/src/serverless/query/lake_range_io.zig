@@ -244,6 +244,7 @@ const ObjectLocation = struct {
 fn parseObjectUri(uri: []const u8) !ObjectLocation {
     if (std.mem.startsWith(u8, uri, "s3://")) return parseBucketKey(uri["s3://".len..]);
     if (std.mem.startsWith(u8, uri, "gs://")) return parseBucketKey(uri["gs://".len..]);
+    if (std.mem.startsWith(u8, uri, "object://")) return parseBucketKey(uri["object://".len..]);
     if (std.mem.startsWith(u8, uri, "file://")) {
         const key = uri["file://".len..];
         if (key.len == 0) return error.InvalidLakeRangeRead;
@@ -310,6 +311,12 @@ test "lake range planner derives object refs from external file uris" {
     const file_object = try objectRefForExternalFileUri(file);
     try std.testing.expectEqualStrings("file", file_object.bucket);
     try std.testing.expectEqualStrings("/tmp/events/part-a.parquet", file_object.key);
+
+    alloc.free(file.object_uri);
+    file.object_uri = try alloc.dupe(u8, "object://external-lake/part-a.parquet");
+    const object_store_object = try objectRefForExternalFileUri(file);
+    try std.testing.expectEqualStrings("external-lake", object_store_object.bucket);
+    try std.testing.expectEqualStrings("part-a.parquet", object_store_object.key);
 }
 
 test "lake range planner coalesces adjacent column chunks by object version" {

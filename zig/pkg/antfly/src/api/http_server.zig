@@ -17374,7 +17374,7 @@ test "api http server routes public external lake row queries through configured
 test "api http server resolves credentialed external lake rows from node config" {
     const alloc = std.testing.allocator;
     const schema_template =
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{{"kind":"external","table_id":"events","format":"parquet","uri":"file://{s}","credentials":{{"ref":"prod-lake-read","scope":"events"}},"schema_fingerprint":"schema-v1"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"keyword"}},"amount":{{"type":"numeric"}}}},"required":["id"],"additionalProperties":false}}}}}},"primary_key":{{"columns":["id"]}}}}
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{{"kind":"external","table_id":"events","format":"parquet","uri":"file://{s}","credentials":{{"ref":"prod-lake-read","scope":"events"}},"schema_fingerprint":"schema-v1"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"numeric"}},"tenant":{{"type":"numeric"}}}},"required":["amount","tenant"],"additionalProperties":false}}}}}},"primary_key":{{"columns":["amount"]}}}}
     ;
 
     var tmp = std.testing.tmpDir(.{});
@@ -17383,12 +17383,17 @@ test "api http server resolves credentialed external lake rows from node config"
     defer alloc.free(lake_root);
     const events_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lake/events", .{tmp.sub_path});
     defer alloc.free(events_path);
-    const bucket_path = try std.fmt.allocPrint(alloc, "{s}/external-lake", .{events_path});
-    defer alloc.free(bucket_path);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, bucket_path);
-    const part_path = try std.fmt.allocPrint(alloc, "{s}/part-a.parquet", .{bucket_path});
-    defer alloc.free(part_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = part_path, .data = "not-a-real-parquet-file" });
+    const parquet_columns = [_]serverless_query.LakeParquetTestPlainI64Column{
+        .{ .column_id = "amount", .values = &[_]i64{ 40, 50, 60 } },
+        .{ .column_id = "tenant", .values = &[_]i64{ 1, 2, 2 } },
+    };
+    const parquet_object = try serverless_query.buildLakeParquetTestPlainI64ObjectAlloc(alloc, &parquet_columns);
+    defer alloc.free(parquet_object);
+    var fs_store = try object_storage_api.FilesystemObjectStorage.init(alloc, events_path);
+    defer fs_store.deinit();
+    var fs_client = fs_store.client();
+    var put = try fs_client.putObject("external-lake", "part-a.parquet", parquet_object, .{});
+    defer put.deinit(alloc);
 
     const schema_json = try std.fmt.allocPrint(alloc, schema_template, .{events_path});
     defer alloc.free(schema_json);
@@ -17494,10 +17499,19 @@ test "api http server resolves credentialed external lake rows from node config"
     );
     defer server.deinit();
 
-    var response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"]}}", null);
+    var response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"],\"where\":{\"field\":\"tenant\",\"op\":\"eq\",\"value\":2}}}", null);
     defer response.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), response.status);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("total").?.integer);
+    const rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 50), rows[0].object.get("amount").?.integer);
+    try std.testing.expectEqual(@as(i64, 60), rows[1].object.get("amount").?.integer);
+    try std.testing.expect(rows[0].object.get("tenant") == null);
 }
 
 test "api http server serves public transaction commit route" {

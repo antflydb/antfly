@@ -268,6 +268,11 @@ pub const CreateRowSecurityPolicyPlan = sql_adapter.CreateRowSecurityPolicyPlan;
 pub const DropRowSecurityPolicyPlan = sql_adapter.DropRowSecurityPolicyPlan;
 pub const RowSecurityPolicyPredicate = sql_adapter.RowSecurityPolicyPredicate;
 pub const RowSecurityCurrentSettingPredicate = sql_adapter.RowSecurityCurrentSettingPredicate;
+pub const DomainCatalogPlan = sql_adapter.DomainCatalogPlan;
+pub const CreateDomainPlan = sql_adapter.CreateDomainPlan;
+pub const AlterDomainPlan = sql_adapter.AlterDomainPlan;
+pub const DomainAlterOperation = sql_adapter.DomainAlterOperation;
+pub const DropDomainPlan = sql_adapter.DropDomainPlan;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -355,74 +360,6 @@ pub const RelationLifetimePlan = struct {
 };
 
 pub const RelationLifetimeKind = sql_adapter.RelationLifetimeKind;
-
-pub const DomainCatalogPlan = union(enum) {
-    create: CreateDomainPlan,
-    alter: AlterDomainPlan,
-    drop: DropDomainPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .alter => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateDomainPlan = struct {
-    domain_name: []const u8,
-    field_type: runtime_schema.AntflyType,
-    array_item_type: ?runtime_schema.AntflyType = null,
-    not_null: bool = false,
-    default_value: ?runtime_schema.RelationalDefaultValue = null,
-    checks: []const runtime_schema.RelationalCheck = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.domain_name);
-        if (self.default_value) |default| alloc.free(default.value_json);
-        freeDdlRelationalChecks(alloc, self.checks);
-        self.* = undefined;
-    }
-};
-
-pub const AlterDomainPlan = struct {
-    domain_name: []const u8,
-    operations: []const DomainAlterOperation = &.{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.domain_name);
-        freeDomainAlterOperations(alloc, self.operations);
-        self.* = undefined;
-    }
-};
-
-pub const DomainAlterOperation = union(enum) {
-    set_not_null,
-    drop_not_null,
-    set_default: runtime_schema.RelationalDefaultValue,
-    drop_default,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .set_default => |default| alloc.free(default.value_json),
-            else => {},
-        }
-        self.* = undefined;
-    }
-};
-
-pub const DropDomainPlan = struct {
-    domain_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.domain_name);
-        self.* = undefined;
-    }
-};
 
 pub const IdentityAllocatorPlan = struct {
     table_name: []const u8,

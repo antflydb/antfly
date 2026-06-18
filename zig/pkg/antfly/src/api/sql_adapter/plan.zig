@@ -402,7 +402,7 @@ fn freeExpressionCaseBranch(alloc: std.mem.Allocator, value: db_mod.types.Relati
     freeExpression(alloc, value.then);
 }
 
-fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCondition) void {
+pub fn freeExpressionCondition(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpressionCondition) void {
     freeExpression(alloc, value.lhs);
     for (value.rhs) |rhs| freeExpression(alloc, rhs);
     if (value.rhs.len > 0) alloc.free(value.rhs);

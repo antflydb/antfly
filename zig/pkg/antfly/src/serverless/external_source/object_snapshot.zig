@@ -44,6 +44,7 @@ pub const ObjectStorageSnapshotRequest = struct {
     prefix: []const u8 = &.{},
     source_id: []const u8,
     source_uri: []const u8,
+    object_uri_base: ?[]const u8 = null,
     schema_fingerprint: []const u8,
     max_keys: u32 = 1000,
 
@@ -119,10 +120,11 @@ pub fn planParquetPrefixInventoryFromObjectStorageAlloc(
         } else break;
     }
 
-    return try planParquetPrefixInventoryAlloc(
+    return try planParquetPrefixInventoryWithObjectUriBaseAlloc(
         alloc,
         request.source_id,
         request.source_uri,
+        request.object_uri_base orelse request.source_uri,
         request.schema_fingerprint,
         listed_objects.items,
     );
@@ -135,8 +137,27 @@ pub fn planParquetPrefixInventoryAlloc(
     schema_fingerprint: []const u8,
     objects: []const ListedObject,
 ) !external_source.Inventory {
+    return try planParquetPrefixInventoryWithObjectUriBaseAlloc(
+        alloc,
+        source_id,
+        source_uri,
+        source_uri,
+        schema_fingerprint,
+        objects,
+    );
+}
+
+fn planParquetPrefixInventoryWithObjectUriBaseAlloc(
+    alloc: Allocator,
+    source_id: []const u8,
+    source_uri: []const u8,
+    object_uri_base: []const u8,
+    schema_fingerprint: []const u8,
+    objects: []const ListedObject,
+) !external_source.Inventory {
     if (source_id.len == 0) return error.InvalidExternalSourceSnapshot;
     if (source_uri.len == 0) return error.InvalidExternalSourceSnapshot;
+    if (object_uri_base.len == 0) return error.InvalidExternalSourceSnapshot;
     if (schema_fingerprint.len == 0) return error.InvalidExternalSourceSnapshot;
 
     var parquet_count: usize = 0;
@@ -182,7 +203,7 @@ pub fn planParquetPrefixInventoryAlloc(
         const object = objects[object_idx];
         const file_id = try alloc.dupe(u8, object.key);
         errdefer alloc.free(file_id);
-        const object_uri = try objectUriAlloc(alloc, source_uri, object.key);
+        const object_uri = try objectUriAlloc(alloc, object_uri_base, object.key);
         errdefer alloc.free(object_uri);
         const etag: []u8 = if (object.etag.len == 0) &.{} else try alloc.dupe(u8, object.etag);
         errdefer if (etag.len != 0) alloc.free(etag);
