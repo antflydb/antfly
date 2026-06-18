@@ -410,6 +410,8 @@ const PlainI64Mode = enum {
     optional,
     dictionary_required,
     dictionary_optional,
+    int96_timestamp_required,
+    int96_timestamp_optional,
 };
 
 const SupportedColumnMode = union(enum) {
@@ -518,6 +520,16 @@ fn buildPlainI64RowGroupBatchAlloc(
                 },
                 .dictionary_optional => {
                     var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .i64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
+                },
+                .int96_timestamp_required => {
+                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanPlainInt96TimestampNsColumnChunkAlloc(alloc, input.bytes, compression) };
+                    null_bitmaps[idx] = &.{};
+                },
+                .int96_timestamp_optional => {
+                    var decoded = try parquet_page.scanOptionalPlainInt96TimestampNsColumnChunkAlloc(alloc, input.bytes, compression);
                     decoded_columns[idx] = .{ .i64 = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
@@ -1137,6 +1149,9 @@ fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !Suppor
             return .{ .i32 = if (chunk.nullable) .dictionary_optional else .dictionary_required };
         }
     }
+    if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int96")) {
+        if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .i64 = if (chunk.nullable) .int96_timestamp_optional else .int96_timestamp_required };
+    }
     if (std.ascii.eqlIgnoreCase(chunk.physical_type, "double")) {
         if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) return .{ .f64 = if (chunk.nullable) .optional else .required };
         if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
@@ -1261,6 +1276,23 @@ fn appendPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, va
     for (values) |value| {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(i64, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
+const TestInt96Timestamp = struct {
+    nanos_of_day: u64,
+    julian_day: u32,
+};
+
+fn appendPlainInt96TimestampDataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const TestInt96Timestamp) !void {
+    const byte_len: usize = values.len * 12;
+    try appendPlainI64DataPageHeader(out, alloc, values.len, byte_len, byte_len);
+
+    for (values) |value| {
+        var buf: [12]u8 = undefined;
+        std.mem.writeInt(u64, buf[0..8], value.nanos_of_day, .little);
+        std.mem.writeInt(u32, buf[8..12], value.julian_day, .little);
         try out.appendSlice(alloc, &buf);
     }
 }
@@ -1781,6 +1813,57 @@ fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: All
         const value = maybe orelse continue;
         var buf: [8]u8 = undefined;
         std.mem.writeInt(i64, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
+fn appendOptionalPlainInt96TimestampDataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?TestInt96Timestamp) !void {
+    var present_count: usize = 0;
+    for (values) |maybe| {
+        if (maybe != null) present_count += 1;
+    }
+    const level_group_count = (values.len + 7) / 8;
+    const definition_level_bytes: i32 = @intCast(1 + level_group_count);
+    const byte_len: i32 = @intCast(@as(usize, @intCast(definition_level_bytes)) + present_count * 12);
+    const null_count: i32 = @intCast(values.len - present_count);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 3);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 8, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, null_count);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 0);
+    try appendField(out, alloc, &data_prev, 5, .i32);
+    try appendI32(out, alloc, definition_level_bytes);
+    try appendField(out, alloc, &data_prev, 6, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try appendVarint(out, alloc, (@as(u64, @intCast(level_group_count)) << 1) | 1);
+    var packed_levels = try alloc.alloc(u8, level_group_count);
+    defer alloc.free(packed_levels);
+    @memset(packed_levels, 0);
+    for (values, 0..) |maybe, idx| {
+        if (maybe != null) packed_levels[idx / 8] |= @as(u8, 1) << @intCast(idx % 8);
+    }
+    try out.appendSlice(alloc, packed_levels);
+    for (values) |maybe| {
+        const value = maybe orelse continue;
+        var buf: [12]u8 = undefined;
+        std.mem.writeInt(u64, buf[0..8], value.nanos_of_day, .little);
+        std.mem.writeInt(u32, buf[8..12], value.julian_day, .little);
         try out.appendSlice(alloc, &buf);
     }
 }
@@ -2623,6 +2706,83 @@ test "parquet row group batch dispatches double columns from inventory" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[3].nulls.bytes);
 
     var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "score", "ratio", "weight", "confidence" });
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+}
+
+test "parquet row group batch dispatches int96 timestamp columns from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = 100,
+            .total_byte_len = 192,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "created_at"),
+                    .file_offset = 100,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int96"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "processed_at"),
+                    .file_offset = 196,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int96"),
+                    .nullable = true,
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var created_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer created_chunk.deinit(alloc);
+    try appendPlainInt96TimestampDataPage(&created_chunk, alloc, &[_]TestInt96Timestamp{
+        .{ .nanos_of_day = 1_000_000_000, .julian_day = 2_440_588 },
+        .{ .nanos_of_day = 2_000_000_000, .julian_day = 2_440_589 },
+        .{ .nanos_of_day = 3_000_000_000, .julian_day = 2_440_590 },
+    });
+
+    var processed_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer processed_chunk.deinit(alloc);
+    try appendOptionalPlainInt96TimestampDataPageV2(&processed_chunk, alloc, &[_]?TestInt96Timestamp{
+        .{ .nanos_of_day = 4_000_000_000, .julian_day = 2_440_588 },
+        null,
+        .{ .nanos_of_day = 5_000_000_000, .julian_day = 2_440_589 },
+    });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "created_at", .bytes = created_chunk.items },
+        .{ .column_id = "processed_at", .bytes = processed_chunk.items },
+    });
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1_000_000_000, 86_402_000_000_000, 172_803_000_000_000 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 4_000_000_000, 0, 86_405_000_000_000 }, owned.batch.columns[1].values.i64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[1].nulls.bytes);
+
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "created_at", "processed_at" });
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 }
