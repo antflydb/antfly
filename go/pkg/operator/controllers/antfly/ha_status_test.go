@@ -1074,7 +1074,12 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 func TestAdminOpenAPISpecDocumentsBearerAuth(t *testing.T) {
 	raw, specPath := readAdminOpenAPISpec(t)
 	var spec struct {
-		Security   []map[string][]string `json:"security"`
+		Security []map[string][]string `json:"security"`
+		Paths    map[string]map[string]struct {
+			Responses map[string]struct {
+				Ref string `json:"$ref"`
+			} `json:"responses"`
+		} `json:"paths"`
 		Components struct {
 			SecuritySchemes map[string]struct {
 				Type   string `json:"type"`
@@ -1095,6 +1100,20 @@ func TestAdminOpenAPISpecDocumentsBearerAuth(t *testing.T) {
 	}
 	for _, requirement := range spec.Security {
 		if _, ok := requirement["BearerAuth"]; ok {
+			for path, methods := range spec.Paths {
+				if !strings.HasPrefix(path, "/ha/") {
+					continue
+				}
+				for method, operation := range methods {
+					unauthorized, ok := operation.Responses["401"]
+					if !ok {
+						t.Fatalf("admin OpenAPI HA route %s %s must document 401 Unauthorized", strings.ToUpper(method), path)
+					}
+					if unauthorized.Ref != "#/components/responses/Unauthorized" {
+						t.Fatalf("admin OpenAPI HA route %s %s 401 response = %q, want Unauthorized ref", strings.ToUpper(method), path, unauthorized.Ref)
+					}
+				}
+			}
 			return
 		}
 	}

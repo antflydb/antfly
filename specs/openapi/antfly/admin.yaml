@@ -79,6 +79,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HAPrimaryStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/standby/status:
@@ -102,6 +104,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HAStandbyStatusResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/commit/check:
@@ -124,6 +128,8 @@ paths:
                 $ref: "#/components/schemas/HACommitCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/commit/append:
@@ -146,6 +152,8 @@ paths:
                 $ref: "#/components/schemas/HACommitAppendResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/read/check:
@@ -168,6 +176,8 @@ paths:
                 $ref: "#/components/schemas/HAReadCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/write/check:
@@ -190,6 +200,8 @@ paths:
                 $ref: "#/components/schemas/HAWriteCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/owner-jobs/check:
@@ -212,6 +224,8 @@ paths:
                 $ref: "#/components/schemas/HAOwnerJobCheckResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/replication-slots:
@@ -226,6 +240,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HAReplicationSlotListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
     post:
@@ -247,6 +263,8 @@ paths:
                 $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/replication-slots/{slot_name}:
@@ -265,6 +283,8 @@ paths:
                 $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/replication-slots/{slot_name}/pause:
@@ -283,6 +303,8 @@ paths:
                 $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/replication-slots/{slot_name}/resume:
@@ -301,6 +323,8 @@ paths:
                 $ref: "#/components/schemas/HAReplicationSlotActionResponse"
         "404":
           $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/base-backups:
@@ -323,6 +347,8 @@ paths:
                 $ref: "#/components/schemas/HABaseBackupBeginResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/base-backups/finish:
@@ -345,6 +371,8 @@ paths:
                 $ref: "#/components/schemas/HABaseBackupFinishResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/standby/bootstrap:
@@ -367,6 +395,8 @@ paths:
                 $ref: "#/components/schemas/HAStandbyBootstrapResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/fence:
@@ -389,6 +419,8 @@ paths:
                 $ref: "#/components/schemas/HAFenceResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/fence/current:
@@ -403,6 +435,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HACurrentFenceResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/promotion/assess:
@@ -425,6 +459,8 @@ paths:
                 $ref: "#/components/schemas/HAPromotionAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/promotion/current-fence:
@@ -439,6 +475,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HAPromotionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/promotion:
@@ -461,6 +499,8 @@ paths:
                 $ref: "#/components/schemas/HAPromotionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/rejoin/assess:
@@ -483,6 +523,8 @@ paths:
                 $ref: "#/components/schemas/HARejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /ha/rejoin/rewind:
     post:
       tags: [ha]
@@ -503,6 +545,8 @@ paths:
                 $ref: "#/components/schemas/HARejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
   /ha/rejoin/reseed:
@@ -525,6 +569,8 @@ paths:
                 $ref: "#/components/schemas/HARejoinAssessResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "409":
           $ref: "#/components/responses/Conflict"
 components:
