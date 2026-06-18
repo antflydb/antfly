@@ -13602,6 +13602,7 @@ test "data server wires configured HA executors into API server" {
                 .primary = &primary,
                 .primary_node_id = "primary-a",
             },
+            .admin_bearer_token = "runtime-secret-token",
             .primary_retention_policy = .{ .max_lag_lsn = 1 },
         },
     }, FakeCatalog.iface(), FakeStatus.iface());
@@ -13612,9 +13613,17 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(server.ha_internal_server != null);
     try std.testing.expect(server.haOwnerJobCanRun(.compaction_publish));
 
+    var admin_unauthorized = try server.http_server.?.handle(.{
+        .method = .GET,
+        .uri = antfly.admin.routes.ha_primary_status,
+    });
+    defer admin_unauthorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), admin_unauthorized.status);
+
     var admin_resp = try server.http_server.?.handle(.{
         .method = .GET,
         .uri = antfly.admin.routes.ha_primary_status,
+        .authorization = "Bearer runtime-secret-token",
     });
     defer admin_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
