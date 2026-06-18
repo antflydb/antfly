@@ -1206,6 +1206,59 @@ func TestOperatorUsesAdminSDKWrapperOnly(t *testing.T) {
 	}
 }
 
+func TestOperatorCRDExposesHAAdminRuntimeFields(t *testing.T) {
+	crd := readOperatorCRD(t)
+	schema := crdVersionSchema(t, crd, "v1")
+
+	ha := crdSchemaProperty(t, schema, "spec", "highAvailability")
+	haProperties := crdSchemaProperties(t, ha)
+	for _, field := range []string{"admin", "automaticFailover", "identity", "retention", "runtime", "standbys", "syncPolicy"} {
+		if _, ok := haProperties[field]; !ok {
+			t.Fatalf("operator CRD spec.highAvailability is missing %q", field)
+		}
+	}
+
+	admin := crdSchemaProperty(t, ha, "admin")
+	adminProperties := crdSchemaProperties(t, admin)
+	for _, field := range []string{"primaryURL", "executePlannedActions", "tokenEnvVar", "jobBackoffLimit", "volumes", "volumeMounts"} {
+		if _, ok := adminProperties[field]; !ok {
+			t.Fatalf("operator CRD spec.highAvailability.admin is missing %q", field)
+		}
+	}
+
+	runtime := crdSchemaProperty(t, ha, "runtime")
+	runtimeProperties := crdSchemaProperties(t, runtime)
+	for _, field := range []string{"role", "nodeID", "fencePath", "formerPrimaryLogPath", "adminTokenEnvVar", "adminTokenSecretRef", "primary", "standby"} {
+		if _, ok := runtimeProperties[field]; !ok {
+			t.Fatalf("operator CRD spec.highAvailability.runtime is missing %q", field)
+		}
+	}
+
+	primary := crdSchemaProperty(t, runtime, "primary")
+	primaryProperties := crdSchemaProperties(t, primary)
+	for _, field := range []string{"logPath", "slotsPath"} {
+		if _, ok := primaryProperties[field]; !ok {
+			t.Fatalf("operator CRD spec.highAvailability.runtime.primary is missing %q", field)
+		}
+	}
+
+	standby := crdSchemaProperty(t, runtime, "standby")
+	standbyProperties := crdSchemaProperties(t, standby)
+	for _, field := range []string{"logPath", "progressPath", "slotName", "upstreamURL"} {
+		if _, ok := standbyProperties[field]; !ok {
+			t.Fatalf("operator CRD spec.highAvailability.runtime.standby is missing %q", field)
+		}
+	}
+
+	failover := crdSchemaProperty(t, ha, "automaticFailover")
+	failoverProperties := crdSchemaProperties(t, failover)
+	for _, field := range []string{"enabled", "fencingAuthority", "maximumLagLSN", "requireRemoteApply"} {
+		if _, ok := failoverProperties[field]; !ok {
+			t.Fatalf("operator CRD spec.highAvailability.automaticFailover is missing %q", field)
+		}
+	}
+}
+
 func TestOperatorProductionDoesNotHardCodeHAAdminPaths(t *testing.T) {
 	_, file, _, ok := goruntime.Caller(0)
 	if !ok {
@@ -1703,6 +1756,77 @@ func readAdminOpenAPISpec(t *testing.T) ([]byte, string) {
 		t.Fatalf("read admin OpenAPI spec %s: %v", specPath, err)
 	}
 	return raw, specPath
+}
+
+func readOperatorCRD(t *testing.T) map[string]any {
+	t.Helper()
+	_, file, _, ok := goruntime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test file path")
+	}
+	crdPath := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", "manifests", "crd", "antfly.io_antflyclusters.yaml"))
+	raw, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("read operator CRD %s: %v", crdPath, err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(raw, &crd); err != nil {
+		t.Fatalf("parse operator CRD %s: %v", crdPath, err)
+	}
+	return crd
+}
+
+func crdVersionSchema(t *testing.T, crd map[string]any, versionName string) map[string]any {
+	t.Helper()
+	spec := crdMap(t, crd["spec"], "spec")
+	versions := crdSlice(t, spec["versions"], "spec.versions")
+	for _, versionValue := range versions {
+		version := crdMap(t, versionValue, "spec.versions[]")
+		if name, _ := version["name"].(string); name == versionName {
+			return crdMap(t, crdMap(t, version["schema"], "schema")["openAPIV3Schema"], "openAPIV3Schema")
+		}
+	}
+	t.Fatalf("operator CRD is missing version %q", versionName)
+	return nil
+}
+
+func crdSchemaProperty(t *testing.T, schema map[string]any, path ...string) map[string]any {
+	t.Helper()
+	current := schema
+	fullPath := "schema"
+	for _, name := range path {
+		properties := crdSchemaProperties(t, current)
+		fullPath += ".properties." + name
+		next, ok := properties[name]
+		if !ok {
+			t.Fatalf("operator CRD is missing %s", fullPath)
+		}
+		current = crdMap(t, next, fullPath)
+	}
+	return current
+}
+
+func crdSchemaProperties(t *testing.T, schema map[string]any) map[string]any {
+	t.Helper()
+	return crdMap(t, schema["properties"], "properties")
+}
+
+func crdMap(t *testing.T, value any, name string) map[string]any {
+	t.Helper()
+	m, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("operator CRD %s has type %T, want object", name, value)
+	}
+	return m
+}
+
+func crdSlice(t *testing.T, value any, name string) []any {
+	t.Helper()
+	s, ok := value.([]any)
+	if !ok {
+		t.Fatalf("operator CRD %s has type %T, want array", name, value)
+	}
+	return s
 }
 
 func TestPlanHALeavesUndesiredSlotPausedUnlessDropIsExplicit(t *testing.T) {
