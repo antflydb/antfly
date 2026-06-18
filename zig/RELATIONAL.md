@@ -1077,7 +1077,9 @@ direction/count tails, transaction-control grammar for `LOCK TABLE`,
 `SET CONSTRAINTS`, `SET TRANSACTION`, `START TRANSACTION`, and `BEGIN`
 mode clauses, maintenance-job grammar for `VACUUM`, `ANALYZE`, `REINDEX`, and
 `CLUSTER`, notification-channel grammar for `LISTEN`, `NOTIFY`, and
-`UNLISTEN`, prepared-statement subject classification for read, write, and DDL
+`UNLISTEN`, database/tablespace catalog grammar for `CREATE DATABASE`, `ALTER
+DATABASE ... SET`, `DROP DATABASE`, `CREATE TABLESPACE`, `ALTER TABLESPACE ...
+RENAME TO`, and `DROP TABLESPACE`, prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
 `CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
@@ -4411,7 +4413,10 @@ catalog plans so API parity can track database identity and settings without
 flattening them into table names or schema JSON. Basic `CREATE TABLESPACE ...
 LOCATION`, `ALTER TABLESPACE ... RENAME TO`, and `DROP TABLESPACE` statements
 produce tablespace catalog plans so placement/storage-class intent is explicit
-but cannot silently change table storage paths. Database catalog DDL now applies
+but cannot silently change table storage paths. These database/tablespace SQL
+tails parse in `api/sql_adapter/grammar.zig`; `relational_sql.zig` maps the
+syntax into typed catalog plans and owns only plan allocation/ownership transfer.
+Database catalog DDL now applies
 basic create, alter-settings, and empty-drop operations through durable typed
 database and namespace records, including automatic `public` namespace creation
 for a new database. Tablespace application still fails closed, and database

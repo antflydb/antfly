@@ -171,6 +171,71 @@ pub const ClusterMaintenanceSyntax = struct {
     }
 };
 
+pub const CreateDatabaseSyntax = struct {
+    database_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.database_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterDatabaseSyntax = struct {
+    database_name: []const u8,
+    setting_name: []const u8,
+    value_json: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.database_name));
+        alloc.free(@constCast(self.setting_name));
+        alloc.free(@constCast(self.value_json));
+        self.* = undefined;
+    }
+};
+
+pub const DropDatabaseSyntax = struct {
+    database_name: []const u8,
+    if_exists: bool = false,
+    force: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.database_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateTablespaceSyntax = struct {
+    tablespace_name: []const u8,
+    location_json: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.tablespace_name));
+        alloc.free(@constCast(self.location_json));
+        self.* = undefined;
+    }
+};
+
+pub const RenameTablespaceSyntax = struct {
+    tablespace_name: []const u8,
+    new_tablespace_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.tablespace_name));
+        alloc.free(@constCast(self.new_tablespace_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropTablespaceSyntax = struct {
+    tablespace_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.tablespace_name));
+        self.* = undefined;
+    }
+};
+
 pub const ListenNotificationSyntax = struct {
     channel_name: []const u8,
 
@@ -854,6 +919,153 @@ pub fn parseClusterMaintenanceTailAlloc(
     table_transferred = true;
     index_transferred = true;
     return .{ .table_name = table_name, .index_name = index_name, .verbose = verbose };
+}
+
+pub fn parseCreateDatabaseCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateDatabaseSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("database");
+    const database_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var database_transferred = false;
+    errdefer if (!database_transferred) alloc.free(database_name);
+    if (cursor.matchKeyword("with") or
+        cursor.peekKeyword("owner") or
+        cursor.peekKeyword("template") or
+        cursor.peekKeyword("encoding") or
+        cursor.peekKeyword("locale") or
+        cursor.peekKeyword("tablespace") or
+        cursor.peekKeyword("connection"))
+        return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    database_transferred = true;
+    return .{ .database_name = database_name };
+}
+
+pub fn parseAlterDatabaseCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterDatabaseSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("database");
+    const database_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var database_transferred = false;
+    errdefer if (!database_transferred) alloc.free(database_name);
+    if (cursor.matchKeyword("rename") or
+        cursor.matchKeyword("owner") or
+        cursor.matchKeyword("refresh") or
+        cursor.matchKeyword("reset"))
+        return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("set");
+    const setting_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var setting_transferred = false;
+    errdefer if (!setting_transferred) alloc.free(setting_name);
+    if (cursor.matchKeyword("to") == false and cursor.matchToken(.eq) == null) return error.UnsupportedSqlShape;
+    const value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(@constCast(value_json));
+    try parseAdapterNoopStatementEnd(cursor);
+    database_transferred = true;
+    setting_transferred = true;
+    value_transferred = true;
+    return .{
+        .database_name = database_name,
+        .setting_name = setting_name,
+        .value_json = value_json,
+    };
+}
+
+pub fn parseDropDatabaseCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropDatabaseSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("database");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const database_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var database_transferred = false;
+    errdefer if (!database_transferred) alloc.free(database_name);
+    var force = false;
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectKeyword("force");
+        try cursor.expectToken(.rparen);
+        force = true;
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    database_transferred = true;
+    return .{ .database_name = database_name, .if_exists = if_exists, .force = force };
+}
+
+pub fn parseCreateTablespaceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateTablespaceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("tablespace");
+    const tablespace_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var tablespace_transferred = false;
+    errdefer if (!tablespace_transferred) alloc.free(tablespace_name);
+    if (cursor.peekKeyword("owner")) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("location");
+    const location_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var location_transferred = false;
+    errdefer if (!location_transferred) alloc.free(@constCast(location_json));
+    if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    tablespace_transferred = true;
+    location_transferred = true;
+    return .{ .tablespace_name = tablespace_name, .location_json = location_json };
+}
+
+pub fn parseRenameTablespaceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !RenameTablespaceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("tablespace");
+    const tablespace_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var tablespace_transferred = false;
+    errdefer if (!tablespace_transferred) alloc.free(tablespace_name);
+    try cursor.expectKeyword("rename");
+    try cursor.expectKeyword("to");
+    const new_tablespace_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var new_tablespace_transferred = false;
+    errdefer if (!new_tablespace_transferred) alloc.free(new_tablespace_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    tablespace_transferred = true;
+    new_tablespace_transferred = true;
+    return .{ .tablespace_name = tablespace_name, .new_tablespace_name = new_tablespace_name };
+}
+
+pub fn parseDropTablespaceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropTablespaceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("tablespace");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const tablespace_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var tablespace_transferred = false;
+    errdefer if (!tablespace_transferred) alloc.free(tablespace_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    tablespace_transferred = true;
+    return .{ .tablespace_name = tablespace_name, .if_exists = if_exists };
 }
 
 pub fn parseListenNotificationTailAlloc(
@@ -1590,6 +1802,75 @@ test "sql adapter grammar parses maintenance job tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseVacuumMaintenanceTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses database and tablespace catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_database_tokens = try lexer.tokenizeAlloc(alloc, "DATABASE tenant_ops;");
+    defer lexer.freeTokens(alloc, &create_database_tokens);
+    var create_database_pos: usize = 0;
+    var create_database = try parseCreateDatabaseCatalogTailAlloc(alloc, create_database_tokens.items, &create_database_pos);
+    defer create_database.deinit(alloc);
+    try std.testing.expectEqual(create_database_tokens.items.len, create_database_pos);
+    try std.testing.expectEqualStrings("tenant_ops", create_database.database_name);
+
+    var alter_database_tokens = try lexer.tokenizeAlloc(alloc, "DATABASE tenant_ops SET timezone TO 'UTC';");
+    defer lexer.freeTokens(alloc, &alter_database_tokens);
+    var alter_database_pos: usize = 0;
+    var alter_database = try parseAlterDatabaseCatalogTailAlloc(alloc, alter_database_tokens.items, &alter_database_pos);
+    defer alter_database.deinit(alloc);
+    try std.testing.expectEqual(alter_database_tokens.items.len, alter_database_pos);
+    try std.testing.expectEqualStrings("tenant_ops", alter_database.database_name);
+    try std.testing.expectEqualStrings("timezone", alter_database.setting_name);
+    try std.testing.expectEqualStrings("\"UTC\"", alter_database.value_json);
+
+    var drop_database_tokens = try lexer.tokenizeAlloc(alloc, "DATABASE IF EXISTS tenant_ops WITH (FORCE);");
+    defer lexer.freeTokens(alloc, &drop_database_tokens);
+    var drop_database_pos: usize = 0;
+    var drop_database = try parseDropDatabaseCatalogTailAlloc(alloc, drop_database_tokens.items, &drop_database_pos);
+    defer drop_database.deinit(alloc);
+    try std.testing.expectEqual(drop_database_tokens.items.len, drop_database_pos);
+    try std.testing.expectEqualStrings("tenant_ops", drop_database.database_name);
+    try std.testing.expect(drop_database.if_exists);
+    try std.testing.expect(drop_database.force);
+
+    var create_tablespace_tokens = try lexer.tokenizeAlloc(alloc, "TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
+    defer lexer.freeTokens(alloc, &create_tablespace_tokens);
+    var create_tablespace_pos: usize = 0;
+    var create_tablespace = try parseCreateTablespaceCatalogTailAlloc(alloc, create_tablespace_tokens.items, &create_tablespace_pos);
+    defer create_tablespace.deinit(alloc);
+    try std.testing.expectEqual(create_tablespace_tokens.items.len, create_tablespace_pos);
+    try std.testing.expectEqualStrings("fastspace", create_tablespace.tablespace_name);
+    try std.testing.expectEqualStrings("\"/var/lib/antfly/fastspace\"", create_tablespace.location_json);
+
+    var rename_tablespace_tokens = try lexer.tokenizeAlloc(alloc, "TABLESPACE fastspace RENAME TO fastspace_archive;");
+    defer lexer.freeTokens(alloc, &rename_tablespace_tokens);
+    var rename_tablespace_pos: usize = 0;
+    var rename_tablespace = try parseRenameTablespaceCatalogTailAlloc(alloc, rename_tablespace_tokens.items, &rename_tablespace_pos);
+    defer rename_tablespace.deinit(alloc);
+    try std.testing.expectEqual(rename_tablespace_tokens.items.len, rename_tablespace_pos);
+    try std.testing.expectEqualStrings("fastspace", rename_tablespace.tablespace_name);
+    try std.testing.expectEqualStrings("fastspace_archive", rename_tablespace.new_tablespace_name);
+
+    var drop_tablespace_tokens = try lexer.tokenizeAlloc(alloc, "TABLESPACE IF EXISTS fastspace_archive;");
+    defer lexer.freeTokens(alloc, &drop_tablespace_tokens);
+    var drop_tablespace_pos: usize = 0;
+    var drop_tablespace = try parseDropTablespaceCatalogTailAlloc(alloc, drop_tablespace_tokens.items, &drop_tablespace_pos);
+    defer drop_tablespace.deinit(alloc);
+    try std.testing.expectEqual(drop_tablespace_tokens.items.len, drop_tablespace_pos);
+    try std.testing.expectEqualStrings("fastspace_archive", drop_tablespace.tablespace_name);
+    try std.testing.expect(drop_tablespace.if_exists);
+
+    var unsupported_database_tokens = try lexer.tokenizeAlloc(alloc, "DATABASE tenant_ops WITH OWNER app;");
+    defer lexer.freeTokens(alloc, &unsupported_database_tokens);
+    var unsupported_database_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateDatabaseCatalogTailAlloc(alloc, unsupported_database_tokens.items, &unsupported_database_pos));
+
+    var unsupported_tablespace_tokens = try lexer.tokenizeAlloc(alloc, "TABLESPACE fastspace OWNER app LOCATION '/tmp';");
+    defer lexer.freeTokens(alloc, &unsupported_tablespace_tokens);
+    var unsupported_tablespace_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateTablespaceCatalogTailAlloc(alloc, unsupported_tablespace_tokens.items, &unsupported_tablespace_pos));
 }
 
 test "sql adapter grammar parses notification channel tails" {

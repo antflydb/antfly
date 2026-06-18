@@ -3500,117 +3500,63 @@ const Parser = struct {
     }
 
     fn parseCreateDatabaseDdl(self: *@This()) !CreateDatabasePlan {
-        try self.expectKeyword("database");
-        const database_name = try self.parseIdentifierOwned();
-        var database_transferred = false;
-        errdefer if (!database_transferred) self.alloc.free(database_name);
-        if (self.matchKeyword("with") or self.peekKeyword("owner") or self.peekKeyword("template") or self.peekKeyword("encoding") or self.peekKeyword("locale") or self.peekKeyword("tablespace") or self.peekKeyword("connection")) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        database_transferred = true;
+        var syntax = try sql_adapter.parseCreateDatabaseCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const database_name = syntax.database_name;
+        syntax.database_name = "";
         return .{ .database_name = database_name };
     }
 
     fn parseAlterDatabaseDdl(self: *@This()) !AlterDatabasePlan {
-        try self.expectKeyword("database");
-        const database_name = try self.parseIdentifierOwned();
-        var database_transferred = false;
-        errdefer if (!database_transferred) self.alloc.free(database_name);
-        if (self.matchKeyword("rename") or self.matchKeyword("owner") or self.matchKeyword("refresh") or self.matchKeyword("reset")) return error.UnsupportedSqlShape;
-        try self.expectKeyword("set");
-        const setting_name = try self.parseIdentifierOwned();
-        var setting_transferred = false;
-        errdefer if (!setting_transferred) self.alloc.free(setting_name);
-        if (self.matchKeyword("to") == false and self.match(.eq) == null) return error.UnsupportedSqlShape;
-        const value_json = try self.parseSqlUntypedValueJsonAlloc();
-        var value_transferred = false;
-        errdefer if (!value_transferred) self.alloc.free(value_json);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        var syntax = try sql_adapter.parseAlterDatabaseCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
         const operations = try self.alloc.alloc(DatabaseAlterOperation, 1);
         errdefer self.alloc.free(operations);
         operations[0] = .{ .set_parameter = .{
-            .name = setting_name,
-            .value_json = value_json,
+            .name = syntax.setting_name,
+            .value_json = syntax.value_json,
         } };
-        database_transferred = true;
-        setting_transferred = true;
-        value_transferred = true;
+        const database_name = syntax.database_name;
+        syntax.database_name = "";
+        syntax.setting_name = "";
+        syntax.value_json = "";
         return .{ .database_name = database_name, .operations = operations };
     }
 
     fn parseDropDatabaseDdl(self: *@This()) !DropDatabasePlan {
-        try self.expectKeyword("database");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const database_name = try self.parseIdentifierOwned();
-        var database_transferred = false;
-        errdefer if (!database_transferred) self.alloc.free(database_name);
-        var force = false;
-        if (self.matchKeyword("with")) {
-            try self.expect(.lparen);
-            try self.expectKeyword("force");
-            try self.expect(.rparen);
-            force = true;
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        database_transferred = true;
-        return .{ .database_name = database_name, .if_exists = if_exists, .force = force };
+        var syntax = try sql_adapter.parseDropDatabaseCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const database_name = syntax.database_name;
+        syntax.database_name = "";
+        return .{ .database_name = database_name, .if_exists = syntax.if_exists, .force = syntax.force };
     }
 
     fn parseCreateTablespaceDdl(self: *@This()) !CreateTablespacePlan {
-        try self.expectKeyword("tablespace");
-        const tablespace_name = try self.parseIdentifierOwned();
-        var tablespace_transferred = false;
-        errdefer if (!tablespace_transferred) self.alloc.free(tablespace_name);
-        if (self.peekKeyword("owner")) return error.UnsupportedSqlShape;
-        try self.expectKeyword("location");
-        const location_json = try self.parseSqlUntypedValueJsonAlloc();
-        var location_transferred = false;
-        errdefer if (!location_transferred) self.alloc.free(location_json);
-        if (self.peekKeyword("with")) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        tablespace_transferred = true;
-        location_transferred = true;
+        var syntax = try sql_adapter.parseCreateTablespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const tablespace_name = syntax.tablespace_name;
+        const location_json = syntax.location_json;
+        syntax.tablespace_name = "";
+        syntax.location_json = "";
         return .{ .tablespace_name = tablespace_name, .location_json = location_json };
     }
 
     fn parseRenameTablespaceDdl(self: *@This()) !RenameTablespacePlan {
-        try self.expectKeyword("tablespace");
-        const tablespace_name = try self.parseIdentifierOwned();
-        var tablespace_transferred = false;
-        errdefer if (!tablespace_transferred) self.alloc.free(tablespace_name);
-        try self.expectKeyword("rename");
-        try self.expectKeyword("to");
-        const new_tablespace_name = try self.parseIdentifierOwned();
-        var new_tablespace_transferred = false;
-        errdefer if (!new_tablespace_transferred) self.alloc.free(new_tablespace_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        tablespace_transferred = true;
-        new_tablespace_transferred = true;
+        var syntax = try sql_adapter.parseRenameTablespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const tablespace_name = syntax.tablespace_name;
+        const new_tablespace_name = syntax.new_tablespace_name;
+        syntax.tablespace_name = "";
+        syntax.new_tablespace_name = "";
         return .{ .tablespace_name = tablespace_name, .new_tablespace_name = new_tablespace_name };
     }
 
     fn parseDropTablespaceDdl(self: *@This()) !DropTablespacePlan {
-        try self.expectKeyword("tablespace");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const tablespace_name = try self.parseIdentifierOwned();
-        var tablespace_transferred = false;
-        errdefer if (!tablespace_transferred) self.alloc.free(tablespace_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        tablespace_transferred = true;
-        return .{ .tablespace_name = tablespace_name, .if_exists = if_exists };
+        var syntax = try sql_adapter.parseDropTablespaceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        errdefer syntax.deinit(self.alloc);
+        const tablespace_name = syntax.tablespace_name;
+        syntax.tablespace_name = "";
+        return .{ .tablespace_name = tablespace_name, .if_exists = syntax.if_exists };
     }
 
     fn parseListenNotificationDdl(self: *@This()) !ListenNotificationPlan {
