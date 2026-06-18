@@ -21,7 +21,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const artifact_store = @import("../artifacts/store.zig");
+const external_source = @import("../external_source/types.zig");
 const manifest_artifact = @import("../manifest/artifact_ref.zig");
+const manifest_base_source = @import("../manifest/base_source.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
@@ -459,6 +461,16 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
     return .{ .artifacts = try artifacts.toOwnedSlice(alloc) };
 }
 
+pub fn desiredArtifactsFromResolvedExternalSourceAlloc(
+    alloc: Allocator,
+    base_source: manifest_base_source.BaseSourceDescriptor,
+    inventory: external_source.Inventory,
+    table: TableIndexDefinition,
+) !DesiredArtifactSet {
+    const source = try sourceSnapshotFromResolvedExternalSource(base_source, inventory);
+    return try desiredArtifactsFromTableDefinitionAlloc(alloc, source, table);
+}
+
 pub fn planOperationsAlloc(
     alloc: Allocator,
     desired: []const DesiredArtifact,
@@ -613,6 +625,51 @@ fn findDesired(desired: []const DesiredArtifact, name: []const u8) ?DesiredArtif
         if (std.mem.eql(u8, artifact.name, name)) return artifact;
     }
     return null;
+}
+
+fn sourceSnapshotFromResolvedExternalSource(
+    base_source: manifest_base_source.BaseSourceDescriptor,
+    inventory: external_source.Inventory,
+) !LakeSourceSnapshot {
+    try base_source.validate();
+    try inventory.validate();
+
+    const ResolvedExternalBase = struct {
+        expected_format: external_source.Format,
+        source_kind: rowsource.SourceKind,
+        source: manifest_base_source.ExternalBaseSource,
+    };
+    const resolved: ResolvedExternalBase = switch (base_source) {
+        .external_parquet => |source| .{
+            .expected_format = external_source.Format.parquet,
+            .source_kind = rowsource.SourceKind.external_parquet,
+            .source = source,
+        },
+        .external_iceberg => |source| .{
+            .expected_format = external_source.Format.iceberg,
+            .source_kind = rowsource.SourceKind.external_iceberg,
+            .source = source,
+        },
+        .external_lance => |source| .{
+            .expected_format = external_source.Format.lance,
+            .source_kind = rowsource.SourceKind.external_lance,
+            .source = source,
+        },
+        else => return error.InvalidLakeRebuildDesiredArtifacts,
+    };
+
+    if (resolved.source.file_inventory_artifact == null) return error.InvalidLakeRebuildDesiredArtifacts;
+    if (inventory.format != resolved.expected_format) return error.ExternalSourceInventoryMismatch;
+    if (!std.mem.eql(u8, resolved.source.source_uri, inventory.source_uri)) return error.ExternalSourceInventoryMismatch;
+    if (!std.mem.eql(u8, resolved.source.snapshot_id, inventory.snapshot_id)) return error.ExternalSourceInventoryMismatch;
+    if (!std.mem.eql(u8, resolved.source.schema_fingerprint, inventory.schema_fingerprint)) return error.ExternalSourceInventoryMismatch;
+
+    return .{
+        .source_kind = resolved.source_kind,
+        .source_id = inventory.source_id,
+        .snapshot_id = inventory.snapshot_id,
+        .schema_fingerprint = inventory.schema_fingerprint,
+    };
 }
 
 const DesiredArtifactInput = struct {
@@ -1681,6 +1738,64 @@ test "lake rebuild desired artifacts derive from table index metadata" {
     try std.testing.expectEqual(BuilderKind.vector, operations.find("semantic_idx").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.sparse, operations.find("sparse_idx").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.graph, operations.find("graph_idx").?.builder_kind.?);
+}
+
+test "lake rebuild desired artifacts bind resolved external inventory identity" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events-source"),
+        .source_uri = try alloc.dupe(u8, "s3://warehouse/events"),
+        .snapshot_id = try alloc.dupe(u8, "iceberg-99"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v9"),
+        .files = try alloc.alloc(external_source.FileEntry, 0),
+    };
+    defer inventory.deinit(alloc);
+
+    const base_source = manifest_base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://warehouse/events",
+        .snapshot_id = "iceberg-99",
+        .schema_fingerprint = "schema-v9",
+        .file_inventory_artifact = "inventory-artifact",
+    } };
+
+    var desired = try desiredArtifactsFromResolvedExternalSourceAlloc(alloc, base_source, inventory, .{
+        .table_name = "events",
+        .indexes_json =
+        \\{
+        \\  "body_text":{"type":"full_text","field":"body"},
+        \\  "semantic_idx":{"type":"embeddings","field":"embedding","dimension":3}
+        \\}
+        ,
+    });
+    defer desired.deinit(alloc);
+
+    const text = desired.find("body_text").?;
+    try std.testing.expectEqual(rowsource.SourceKind.external_iceberg, text.binding.source_kind);
+    try std.testing.expectEqualStrings("events-source", text.binding.source_id);
+    try std.testing.expectEqualStrings("iceberg-99", text.binding.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v9", text.binding.schema_fingerprint);
+    try std.testing.expectEqual(source_binding.RowRefKind.external, text.binding.row_ref_kind);
+
+    const vector = desired.find("semantic_idx").?;
+    try std.testing.expectEqual(rowsource.SourceKind.external_iceberg, vector.binding.source_kind);
+    try std.testing.expectEqualStrings("events-source", vector.binding.source_id);
+
+    const mismatched_base_source = manifest_base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://warehouse/events",
+        .snapshot_id = "iceberg-stale",
+        .schema_fingerprint = "schema-v9",
+        .file_inventory_artifact = "inventory-artifact",
+    } };
+    try std.testing.expectError(
+        error.ExternalSourceInventoryMismatch,
+        desiredArtifactsFromResolvedExternalSourceAlloc(alloc, mismatched_base_source, inventory, .{
+            .table_name = "events",
+            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+        }),
+    );
 }
 
 test "lake rebuild desired artifacts use default lake columns for named indexes" {

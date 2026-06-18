@@ -363,6 +363,7 @@ pub const LakeRebuildExecutionResult = build.LakeRebuildExecutionResult;
 pub const LakeRebuildReconciledManifest = build.LakeRebuildReconciledManifest;
 pub const planLakeRebuildAlloc = build.planLakeRebuildAlloc;
 pub const lakeRebuildDesiredArtifactsFromTableDefinitionAlloc = build.lakeRebuildDesiredArtifactsFromTableDefinitionAlloc;
+pub const lakeRebuildDesiredArtifactsFromResolvedExternalSourceAlloc = build.lakeRebuildDesiredArtifactsFromResolvedExternalSourceAlloc;
 pub const planLakeRebuildOperationsAlloc = build.planLakeRebuildOperationsAlloc;
 pub const executeLakeRebuildOperationsAlloc = build.executeLakeRebuildOperationsAlloc;
 pub const reconcileLakeRebuildExecutedOperationsAlloc = build.reconcileLakeRebuildExecutedOperationsAlloc;
@@ -783,6 +784,7 @@ test "serverless module compiles" {
     _ = LakeRebuildReconciledManifest;
     _ = planLakeRebuildAlloc;
     _ = lakeRebuildDesiredArtifactsFromTableDefinitionAlloc;
+    _ = lakeRebuildDesiredArtifactsFromResolvedExternalSourceAlloc;
     _ = planLakeRebuildOperationsAlloc;
     _ = executeLakeRebuildOperationsAlloc;
     _ = reconcileLakeRebuildExecutedOperationsAlloc;
