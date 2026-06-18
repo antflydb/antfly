@@ -3015,7 +3015,6 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     if (schema.storage_mode != .relational) return error.InvalidRowsRequest;
     if (request.source_cte.len != 0) return error.UnsupportedRowsQuery;
     if (request.row_claim != null) return error.UnsupportedRowsQuery;
-    if (request.doc_key_range != null) return error.UnsupportedRowsQuery;
     try validateLakeRowsQueryPredicateGroupsSupported(alloc, schema, request);
     for (request.distinct_on) |field| {
         const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
@@ -3133,7 +3132,7 @@ pub fn buildLakeRowsScanRequestForRowsQueryAlloc(
     const scan = lake_rows.ScanRequest{
         .projected_columns = projected_columns,
         .predicate = predicate,
-        .limit = if (request.order_by.len == 0 and request.distinct_on.len == 0 and request.distinct_on_expressions.len == 0 and !lakeRowsQueryHasResidualPredicates(request)) if (request.limit) |limit| std.math.add(usize, @as(usize, request.offset), @as(usize, limit)) catch return error.InvalidRowsRequest else null else null,
+        .limit = if (request.order_by.len == 0 and request.distinct_on.len == 0 and request.distinct_on_expressions.len == 0 and request.doc_key_range == null and !lakeRowsQueryHasResidualPredicates(request)) if (request.limit) |limit| std.math.add(usize, @as(usize, request.offset), @as(usize, limit)) catch return error.InvalidRowsRequest else null else null,
     };
     return .{
         .request = scan,
@@ -3147,13 +3146,24 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
     request: OwnedRowsQueryRequest,
     result: lake_rows.ScanResult,
 ) !OwnedRowsQueryResult {
+    return try buildRowsQueryResultFromLakeRowsWithSchemaAlloc(alloc, null, request, result);
+}
+
+pub fn buildRowsQueryResultFromLakeRowsWithSchemaAlloc(
+    alloc: std.mem.Allocator,
+    maybe_schema: ?runtime_schema.TableSchema,
+    request: OwnedRowsQueryRequest,
+    result: lake_rows.ScanResult,
+) !OwnedRowsQueryResult {
     var filtered_rows: []lake_rows.ProjectedRow = result.rows;
     var owns_filtered_rows = false;
     const has_residual_predicates = lakeRowsQueryHasResidualPredicates(request);
-    if (has_residual_predicates) {
+    const has_doc_key_range = request.doc_key_range != null;
+    if (has_residual_predicates or has_doc_key_range) {
         var filtered = std.ArrayListUnmanaged(lake_rows.ProjectedRow).empty;
         errdefer filtered.deinit(alloc);
         for (result.rows) |row| {
+            if (!try lakeProjectedRowInDocKeyRangeAlloc(alloc, maybe_schema, row, request.doc_key_range)) continue;
             if (try lakeRowsQueryResidualPredicatesMatchAlloc(alloc, request, row)) {
                 try filtered.append(alloc, row);
             }
@@ -3215,7 +3225,7 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
         .rows = try rows.toOwnedSlice(alloc),
         .total = if (request.distinct_on.len > 0 or request.distinct_on_expressions.len > 0)
             @intCast(candidate_indexes.items.len)
-        else if (!has_residual_predicates) result.total else @intCast(filtered_rows.len),
+        else if (!has_residual_predicates and !has_doc_key_range) result.total else @intCast(filtered_rows.len),
     };
 }
 
@@ -3420,6 +3430,19 @@ fn lakeRowsProjectedColumnsAlloc(
         } else {
             const column = findRelationalColumn(schema.relational_columns, order.field) orelse return error.InvalidRowsRequest;
             try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
+        }
+    }
+    if (request.doc_key_range != null) {
+        if (schema.primary_key) |primary_key| {
+            for (primary_key.columns) |column_name| {
+                const column = findRelationalColumn(schema.relational_columns, column_name) orelse return error.InvalidRowsRequest;
+                try appendLakeProjectedColumnAlloc(alloc, &columns, column.name);
+            }
+            if (primary_key.without_overlaps_period) |period_name| {
+                const period = findRelationalPeriod(schema.periods, period_name) orelse return error.InvalidRowsRequest;
+                try appendLakeProjectedColumnAlloc(alloc, &columns, period.start_column);
+                try appendLakeProjectedColumnAlloc(alloc, &columns, period.end_column);
+            }
         }
     }
     for (request.distinct_on) |field| {
@@ -4032,6 +4055,36 @@ fn lakeProjectedRowQueryJsonAlloc(
     }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+fn lakeProjectedRowInDocKeyRangeAlloc(
+    alloc: std.mem.Allocator,
+    maybe_schema: ?runtime_schema.TableSchema,
+    row: lake_rows.ProjectedRow,
+    maybe_range: ?db_mod.types.RelationalRowsDocKeyRange,
+) !bool {
+    const range = maybe_range orelse return true;
+    const key = try lakeProjectedRowDocKeyAlloc(alloc, maybe_schema, row);
+    defer alloc.free(key);
+    if (range.start.len > 0 and std.mem.order(u8, key, range.start) == .lt) return false;
+    if (range.end.len > 0 and std.mem.order(u8, key, range.end) != .lt) return false;
+    return true;
+}
+
+fn lakeProjectedRowDocKeyAlloc(
+    alloc: std.mem.Allocator,
+    maybe_schema: ?runtime_schema.TableSchema,
+    row: lake_rows.ProjectedRow,
+) ![]u8 {
+    if (maybe_schema) |schema| if (schema.primary_key != null) {
+        const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
+        defer alloc.free(row_json);
+        return try physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+    };
+    return switch (row.row_ref) {
+        .relational_key => |key| try alloc.dupe(u8, key),
+        .serverless, .external => error.InvalidRowsRequest,
+    };
 }
 
 fn writeLakeRowsExpressionProjectionValueJsonAlloc(
