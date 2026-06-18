@@ -951,6 +951,75 @@ be validated against that operator package.
 - Keep automatic promotion disabled unless Phase 7 fencing requirements are
   satisfied by the configured environment.
 
+## Operator Runbooks
+
+Hot-standby HA should ship with boring operator runbooks before it is called
+production grade. The runbooks should cover the Kubernetes operator path in
+`go/pkg/operator`, the typed `/admin/v1/ha` path generated from
+`specs/openapi/antfly/admin.yaml`, and the supported Zig CLI path. They should
+make the split explicit:
+
+- typed `/admin/v1/ha` calls are the preferred operator and SDK automation
+  surface;
+- CLI commands are human and break-glass helpers, or pod-local helpers for
+  workflows that need mounted data paths;
+- `/internal/v1` remains runtime-to-runtime replication plumbing, not an
+  operator control surface.
+
+The runbook prerequisites should require `HotStandby` mode, an explicit HA
+identity (`clusterID`, timeline, epoch, and current primary), standby topology,
+admin URLs, durable runtime paths, and matching admin bearer-token environment
+injection for the operator and Antfly pods. Automatic failover additionally
+requires `executePlannedActions`, a supported fencing authority, route selectors
+for the primary endpoint, and admin URLs for the primary, standbys, and any
+former-primary repair target.
+
+Daily checks should teach operators to inspect `status.haStatus` and the HA
+conditions, especially `HAAvailable`, `HADegraded`, `HAUnhealthy`, `HALagging`,
+`HARetentionPressure`, `HAReseedRequired`, and
+`HAAutomaticFailoverReady`. The minimum status fields to check are primary
+admin reachability, primary LSN, standby received/applied/safe-read LSNs,
+retention pressure, sync-policy satisfaction, primary route state, former
+primary state, and `plannedActions`.
+
+Bootstrap and reseed runbooks should follow the typed planned actions instead
+of ad hoc shelling out. A standby seed should be visible as actions such as
+slot creation, seed scheduling, seed bootstrap, and seed completion. A reseed
+should be explicit when retained WAL is no longer sufficient. Operators should
+verify the action target, admin method/path, admin URL, admin node id, action
+receipt, backup manifest, checkpoint, and safe-read progress before marking a
+standby healthy. A lagging standby must not pin WAL forever without either a
+catch-up path or an operator-visible reseed decision.
+
+Promotion runbooks should require a machine-checkable fence before automatic
+promotion. With Kubernetes Lease fencing, the Lease must be scoped to the exact
+cluster, shard/table identity, current primary, timeline, epoch, and observed
+primary LSN. A stale Lease from an older identity, timeline, epoch, primary, or
+LSN blocks automatic promotion. The operator should record planned actions for
+fence acquisition, promotion assessment, standby promotion, primary-route
+update, and former-primary demotion, rewind, or reseed. Forced promotion should
+produce a distinct lossy receipt and should never look identical to a safe
+promotion.
+
+Former-primary runbooks should be first-class. A returning old primary cannot
+resume writes merely because it restarted. It must observe the newer timeline
+and either demote, rewind using retained WAL and fork evidence, or reseed from
+the current primary. Rewind targets the former primary's admin URL because it
+uses that node's local state. Reseed scheduling targets the current primary for
+slot/seed coordination and uses a pod-local helper only for the data replacement
+step on the former primary. The status and receipt must prove which node was
+acted on and whether rewind or reseed was required.
+
+Alert guidance should cover admin 401/403 responses, missing or unreachable
+admin URLs, missing typed result evidence, unhealthy or lagging standbys,
+retention pressure, reseed requirements, degraded synchronous commit, stale
+fences, unsafe promotion requests, and old-primary write attempts after
+promotion. The useful evidence is not just log text: preserve `plannedActions`,
+typed admin receipts, fence token/generation, timeline/epoch/LSN boundaries,
+admin action ids, target node ids, and route-update status so an operator can
+explain exactly why the system promoted, refused to promote, rewound, or
+required a reseed.
+
 ## Production Readiness and Postgres-Parity Gaps
 
 Antfly should not call hot standby production grade merely because records can

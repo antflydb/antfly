@@ -72,6 +72,8 @@ Secret reference. The operator does not need Kubernetes Secret read permissions;
 Kubernetes injects the environment variable into the operator pod.
 Create the Secret before installing the operator, or restart the operator
 deployment after changing the Secret so the pod environment is refreshed.
+See the [Hot-Standby HA runbook](../docs/operations/hot-standby-ha.md) for
+status checks, promotion, reseed, and former-primary repair operations.
 
 **Deploy:**
 ```bash
