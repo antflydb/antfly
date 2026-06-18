@@ -97,7 +97,7 @@ const PostingBaseHeaderCacheEntry = struct {
 const PostingDeltaTailCacheEntry = struct {
     posting_id: u64 = 0,
     valid: bool = false,
-    sequence_id_storage: []u64 = &.{},
+    storage: []u64 = &.{},
     sequences: []u64 = &.{},
     ids: []u64 = &.{},
     ops: []u8 = &.{},
@@ -115,22 +115,17 @@ const PostingDeltaTailCacheEntry = struct {
             const current_capacity = @min(self.sequences.len, @min(self.ids.len, self.ops.len));
             const doubled = current_capacity *| 2;
             const capacity = @max(needed, @max(doubled, @as(usize, 8)));
-            if (self.sequences.len < capacity or self.ids.len < capacity) {
-                const old_capacity = self.sequences.len;
-                const old_count = self.count;
-                const storage_len = try std.math.mul(usize, capacity, 2);
-                self.sequence_id_storage = try alloc.realloc(self.sequence_id_storage, storage_len);
-                if (old_count != 0 and old_capacity != capacity) {
-                    std.mem.copyBackwards(
-                        u64,
-                        self.sequence_id_storage[capacity .. capacity + old_count],
-                        self.sequence_id_storage[old_capacity .. old_capacity + old_count],
-                    );
-                }
-                self.sequences = self.sequence_id_storage[0..capacity];
-                self.ids = self.sequence_id_storage[capacity..storage_len];
-            }
-            self.ops = try alloc.realloc(self.ops, capacity);
+            const replacement = try allocateDeltaTailCacheStorage(alloc, capacity);
+            errdefer alloc.free(replacement);
+            const views = carveDeltaTailCacheStorage(replacement, capacity);
+            @memcpy(views.sequences[0..self.count], self.sequences[0..self.count]);
+            @memcpy(views.ids[0..self.count], self.ids[0..self.count]);
+            @memcpy(views.ops[0..self.count], self.ops[0..self.count]);
+            alloc.free(self.storage);
+            self.storage = replacement;
+            self.sequences = views.sequences;
+            self.ids = views.ids;
+            self.ops = views.ops;
         }
         self.sequences[self.count] = sequence;
         self.ids[self.count] = vector_id;
@@ -147,12 +142,11 @@ const PostingDeltaTailCacheEntry = struct {
     }
 
     fn bytes(self: *const PostingDeltaTailCacheEntry) u64 {
-        return byteLen(self.sequence_id_storage) + byteLen(self.ops);
+        return byteLen(self.storage);
     }
 
     fn deinit(self: *PostingDeltaTailCacheEntry, alloc: Allocator) void {
-        alloc.free(self.sequence_id_storage);
-        alloc.free(self.ops);
+        alloc.free(self.storage);
         self.* = .{};
     }
 };
@@ -717,6 +711,12 @@ const QueryStorageViews = struct {
     vector_views: [][]const f32,
 };
 
+const DeltaTailCacheStorageViews = struct {
+    sequences: []u64,
+    ids: []u64,
+    ops: []u8,
+};
+
 const PostingOverlayAppendViews = struct {
     ids: []u64,
     live: []bool,
@@ -724,6 +724,12 @@ const PostingOverlayAppendViews = struct {
 
 fn allocateQueryStorage(alloc: Allocator, capacity: usize) ![]u64 {
     const bytes = queryStorageByteLen(capacity);
+    const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
+    return try alloc.alloc(u64, words);
+}
+
+fn allocateDeltaTailCacheStorage(alloc: Allocator, capacity: usize) ![]u64 {
+    const bytes = deltaTailCacheStorageByteLen(capacity);
     const words = (bytes + @sizeOf(u64) - 1) / @sizeOf(u64);
     return try alloc.alloc(u64, words);
 }
@@ -752,6 +758,14 @@ fn queryStorageByteLen(capacity: usize) usize {
     return alignForward(offset, @alignOf(u64));
 }
 
+fn deltaTailCacheStorageByteLen(capacity: usize) usize {
+    var offset: usize = 0;
+    addQueryStorageSlice(u64, &offset, capacity);
+    addQueryStorageSlice(u64, &offset, capacity);
+    addQueryStorageSlice(u8, &offset, capacity);
+    return alignForward(offset, @alignOf(u64));
+}
+
 fn postingOverlayAppendStorageByteLen(capacity: usize) usize {
     var offset: usize = 0;
     addQueryStorageSlice(u64, &offset, capacity);
@@ -777,6 +791,16 @@ fn carveQueryStorage(storage: []u64, capacity: usize) QueryStorageViews {
         .key_views = carveQueryStorageSlice([]const u8, bytes, &offset, capacity),
         .values = carveQueryStorageSlice(?[]const u8, bytes, &offset, capacity),
         .vector_views = carveQueryStorageSlice([]const f32, bytes, &offset, capacity),
+    };
+}
+
+fn carveDeltaTailCacheStorage(storage: []u64, capacity: usize) DeltaTailCacheStorageViews {
+    const bytes: []align(@alignOf(u64)) u8 = std.mem.sliceAsBytes(storage);
+    var offset: usize = 0;
+    return .{
+        .sequences = carveQueryStorageSlice(u64, bytes, &offset, capacity),
+        .ids = carveQueryStorageSlice(u64, bytes, &offset, capacity),
+        .ops = carveQueryStorageSlice(u8, bytes, &offset, capacity),
     };
 }
 
@@ -1026,14 +1050,16 @@ test "SearchScratch posting delta tail cache grows geometrically" {
     try std.testing.expectEqual(@as(usize, 9), view.sequences.len);
     try std.testing.expectEqual(@as(usize, 16), entry.sequences.len);
     try std.testing.expectEqual(entry.sequences.len, entry.ids.len);
-    try std.testing.expectEqual(@as(usize, 32), entry.sequence_id_storage.len);
-    try std.testing.expectEqual(entry.sequence_id_storage[0..16].ptr, entry.sequences.ptr);
-    try std.testing.expectEqual(entry.sequence_id_storage[16..32].ptr, entry.ids.ptr);
     try std.testing.expectEqual(entry.sequences.len, entry.ops.len);
+    try std.testing.expect(entry.storage.len > entry.sequences.len + entry.ids.len);
+    try std.testing.expectEqual(entry.storage[0..16].ptr, entry.sequences.ptr);
+    try std.testing.expectEqual(entry.storage[16..32].ptr, entry.ids.ptr);
     try std.testing.expectEqual(@as(u64, 1), view.sequences[0]);
     try std.testing.expectEqual(@as(u64, 9), view.sequences[8]);
     try std.testing.expectEqual(@as(u64, 100), view.ids[0]);
     try std.testing.expectEqual(@as(u64, 108), view.ids[8]);
+    try std.testing.expectEqual(@as(u8, 0), view.ops[0]);
+    try std.testing.expectEqual(@as(u8, 2), view.ops[8]);
 }
 
 test "SearchScratch grows posting overlay append buffers geometrically" {
