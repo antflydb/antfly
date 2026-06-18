@@ -3855,19 +3855,27 @@ func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyClust
 	if err != nil {
 		return nil, err
 	}
-	if token := haAdminBearerToken(cluster); token != "" {
+	token, err := haAdminBearerToken(cluster)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
 		client.WithToken(token)
 	}
 	return client, nil
 }
 
-func haAdminBearerToken(cluster *antflyv1.AntflyCluster) string {
+func haAdminBearerToken(cluster *antflyv1.AntflyCluster) (string, error) {
 	var admin *antflyv1.HAAdminSpec
 	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Admin != nil {
 		admin = cluster.Spec.HighAvailability.Admin
 	}
 	envVar := haAdminTokenEnvVar(admin)
-	return strings.TrimSpace(os.Getenv(envVar))
+	token := strings.TrimSpace(os.Getenv(envVar))
+	if haAdminConfiguredTokenEnvVar(admin) != "" && token == "" {
+		return "", fmt.Errorf("configured HA admin token env var %s is empty or unset", envVar)
+	}
+	return token, nil
 }
 
 func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatus) bool {
