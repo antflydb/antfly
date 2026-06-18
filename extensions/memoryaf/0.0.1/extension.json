@@ -90,19 +90,19 @@
         "kind": "mcp_tool",
         "name": "store_memory",
         "shape": "store_memory_request",
-        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/store_memory\"}"
+        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/store_memory\",\"required_capabilities\":[{\"name\":\"db:write\",\"scope\":\"memoryaf\"},{\"name\":\"ai:embed\",\"scope\":\"memoryaf\"}]}"
       },
       {
         "kind": "mcp_tool",
         "name": "search_memories",
         "shape": "search_memories_request",
-        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/search_memories\"}"
+        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/search_memories\",\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}]}"
       },
       {
         "kind": "mcp_tool",
         "name": "list_memories",
         "shape": "list_memories_request",
-        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/list_memories\"}"
+        "config_json": "{\"runtime\":\"memoryaf_wasm\",\"handler\":\"wasm:memoryaf_wasm/list_memories\",\"required_capabilities\":[{\"name\":\"db:read\",\"scope\":\"memoryaf\"}]}"
       }
     ],
     "runtimes": [

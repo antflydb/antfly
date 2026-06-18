@@ -3312,6 +3312,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "api http server serves mcp and a2a protocol surfaces",
+            "api http server filters extension mcp tools by trusted principal table permissions",
             "auth row filter resolver expands username references",
             "auth row filter resolver expands metadata references",
             "auth row filter validator accepts username references",
