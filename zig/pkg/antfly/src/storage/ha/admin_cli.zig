@@ -757,8 +757,6 @@ fn parseOperator(
         .timeline_id = 0,
         .epoch = 0,
     };
-    var former_has_shard_id = false;
-    var former_has_table_id = false;
     var former_node_id: ?[]const u8 = null;
     var former_last_lsn: ?u64 = null;
     var has_former_primary = false;
@@ -867,12 +865,10 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--former-shard-id")) {
             _ = cursor.next();
             has_former_primary = true;
-            former_has_shard_id = true;
             former_identity.shard_id = try parseU64(try cursor.value("--former-shard-id"));
         } else if (std.mem.eql(u8, arg, "--former-table-id")) {
             _ = cursor.next();
             has_former_primary = true;
-            former_has_table_id = true;
             former_identity.table_id = try parseU64(try cursor.value("--former-table-id"));
         } else if (std.mem.eql(u8, arg, "--former-timeline-id")) {
             _ = cursor.next();
@@ -949,8 +945,6 @@ fn parseOperator(
 
     if (has_former_primary) {
         if (former_identity.cluster_id == 0) return error.FormerClusterIdMissing;
-        if (!former_has_shard_id) return error.FormerShardIdMissing;
-        if (!former_has_table_id) return error.FormerTableIdMissing;
         if (former_identity.timeline_id == 0) return error.FormerTimelineIdMissing;
         if (former_identity.epoch == 0) return error.FormerEpochMissing;
         command.former_primary = .{
@@ -1582,9 +1576,7 @@ test "storage.ha admin cli parses operator plan command" {
         "7",                                    "--fence-reason",
         "LeaseAcquired",                        "--former-primary-id",
         "primary-a",                            "--former-cluster-id",
-        "100",                                  "--former-shard-id",
-        "0",                                    "--former-table-id",
-        "0",                                    "--former-timeline-id",
+        "100",                                  "--former-timeline-id",
         "1",                                    "--former-epoch",
         "1",                                    "--former-last-lsn",
         "12",                                   "--retained-from-lsn",
