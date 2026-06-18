@@ -2079,6 +2079,20 @@ pub const RelationalRowsJoinType = enum {
     left,
 };
 
+pub const RelationalRowsJoinStrategy = enum {
+    auto,
+    lookup,
+    hash,
+    merge,
+};
+
+pub const default_relational_rows_lookup_join_max_build_rows: usize = 256;
+
+pub const RelationalRowsJoinStrategySelection = struct {
+    requested: RelationalRowsJoinStrategy,
+    selected: RelationalRowsJoinStrategy,
+};
+
 pub const RelationalRowsJoinOn = struct {
     left_field: []const u8,
     right_field: []const u8,
@@ -2114,6 +2128,7 @@ pub const RelationalRowsJoinRequest = struct {
     match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
     join_type: RelationalRowsJoinType = .inner,
+    strategy: RelationalRowsJoinStrategy = .auto,
     select: []const RelationalRowsJoinProjection = &.{},
     order_by: []const RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
@@ -2174,6 +2189,50 @@ pub const RelationalRowsJoinRequest = struct {
         self.* = undefined;
     }
 };
+
+pub fn relationalRowsSelectJoinStrategy(
+    req: RelationalRowsJoinRequest,
+    left_rows: usize,
+    right_rows: usize,
+    inputs_sorted_on_join_keys: bool,
+) ?RelationalRowsJoinStrategySelection {
+    if (req.on.len == 0) return null;
+    const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
+        .lookup => .lookup,
+        .hash => .hash,
+        .merge => if (inputs_sorted_on_join_keys) .merge else return null,
+        .auto => if (inputs_sorted_on_join_keys and left_rows > default_relational_rows_lookup_join_max_build_rows and right_rows > default_relational_rows_lookup_join_max_build_rows)
+            .merge
+        else if (right_rows <= default_relational_rows_lookup_join_max_build_rows)
+            .lookup
+        else
+            .hash,
+    };
+    return .{
+        .requested = req.strategy,
+        .selected = selected,
+    };
+}
+
+test "relational rows join strategy selection is explicit and fail closed for unproven merge" {
+    const join_on = [_]RelationalRowsJoinOn{.{
+        .left_field = "customer_id",
+        .right_field = "id",
+    }};
+    const auto_small = RelationalRowsJoinRequest{ .on = join_on[0..] };
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.lookup, relationalRowsSelectJoinStrategy(auto_small, 1000, 16, false).?.selected);
+
+    const auto_large = RelationalRowsJoinRequest{ .on = join_on[0..] };
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.hash, relationalRowsSelectJoinStrategy(auto_large, 1000, 1000, false).?.selected);
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.merge, relationalRowsSelectJoinStrategy(auto_large, 1000, 1000, true).?.selected);
+
+    const explicit_hash = RelationalRowsJoinRequest{ .on = join_on[0..], .strategy = .hash };
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.hash, relationalRowsSelectJoinStrategy(explicit_hash, 1, 1, false).?.selected);
+
+    const explicit_merge = RelationalRowsJoinRequest{ .on = join_on[0..], .strategy = .merge };
+    try std.testing.expect(relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, false) == null);
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.merge, relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, true).?.selected);
+}
 
 pub const RelationalRowsJoinedMutationSourceRequest = struct {
     kind: RelationalRowsMutationKind,

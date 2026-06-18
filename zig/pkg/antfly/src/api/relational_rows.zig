@@ -672,6 +672,7 @@ pub fn executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(
     defer right_result.deinit(alloc);
 
     var join = plan.join;
+    _ = db_mod.types.relationalRowsSelectJoinStrategy(join, left_result.rows.len, right_result.rows.len, false) orelse return error.UnsupportedRowsQuery;
     join.left.source_cte = "";
     join.right.source_cte = "";
     join.left.doc_key_range = null;
@@ -2444,7 +2445,7 @@ fn parseRowsJoinRequestWithSchemas(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "left", "right", "on", "on_expression_where", "on_expression_any", "on_expression_not", "on_expression_array_contains", "match_expression_where", "match_expression_any", "match_expression_not", "match_expression_array_contains", "join_type", "select", "order_by", "limit", "offset" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "left", "right", "on", "on_expression_where", "on_expression_any", "on_expression_not", "on_expression_array_contains", "match_expression_where", "match_expression_any", "match_expression_not", "match_expression_array_contains", "join_type", "strategy", "select", "order_by", "limit", "offset" });
 
     var left = try parseRowsJoinSourceAlloc(alloc, left_schema, parsed.value.object.get("left") orelse return error.InvalidRowsRequest);
     errdefer left.deinit(alloc);
@@ -2494,6 +2495,7 @@ fn parseRowsJoinRequestWithSchemas(
         .match_expression_not_predicates = match_expression_not_predicates,
         .match_expression_array_contains = match_expression_array_contains,
         .join_type = try parseRowsJoinType(parsed.value.object.get("join_type")),
+        .strategy = try parseRowsJoinStrategy(parsed.value.object.get("strategy")),
         .select = select,
         .order_by = order_by,
         .limit = try parseOptionalU32(parsed.value.object.get("limit")),
@@ -5541,6 +5543,16 @@ fn parseRowsJoinType(maybe_type: ?std.json.Value) !db_mod.types.RelationalRowsJo
     if (type_value != .string) return error.InvalidRowsRequest;
     if (std.mem.eql(u8, type_value.string, "inner")) return .inner;
     if (std.mem.eql(u8, type_value.string, "left")) return .left;
+    return error.InvalidRowsRequest;
+}
+
+fn parseRowsJoinStrategy(maybe_strategy: ?std.json.Value) !db_mod.types.RelationalRowsJoinStrategy {
+    const strategy_value = maybe_strategy orelse return .auto;
+    if (strategy_value != .string) return error.InvalidRowsRequest;
+    if (std.mem.eql(u8, strategy_value.string, "auto")) return .auto;
+    if (std.mem.eql(u8, strategy_value.string, "lookup")) return .lookup;
+    if (std.mem.eql(u8, strategy_value.string, "hash")) return .hash;
+    if (std.mem.eql(u8, strategy_value.string, "merge")) return .merge;
     return error.InvalidRowsRequest;
 }
 
@@ -18161,6 +18173,20 @@ test "relational rows join contract accepts typed equality join plans" {
     try std.testing.expectEqual(@as(usize, 1), request.order_by.len);
     try std.testing.expectEqualStrings("order_id", request.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 25), request.limit.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.auto, request.strategy);
+
+    var hash_request = try parseRowsJoinRequest(
+        std.testing.allocator,
+        "{\"left\":{},\"right\":{},\"strategy\":\"hash\",\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}]}",
+        schema,
+    );
+    defer hash_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.hash, hash_request.strategy);
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinRequest(
+        std.testing.allocator,
+        "{\"left\":{},\"right\":{},\"strategy\":\"nested_loop\",\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}]}",
+        schema,
+    ));
 
     var rich_request = try parseRowsJoinRequest(
         std.testing.allocator,
@@ -19083,6 +19109,14 @@ test "relational rows cte plan contract executes derived outputs across read sta
     try std.testing.expectEqual(@as(u32, 2), db_join_result.total_rows);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"b\"}", db_join_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_id\":\"b\",\"right_id\":\"b\"}", db_join_result.rows[1]);
+
+    var merge_join_plan = try parseRowsJoinPlanRequest(
+        alloc,
+        "{\"join\":{\"left\":{},\"right\":{},\"strategy\":\"merge\",\"on\":[{\"left_field\":\"tenant\",\"right_field\":\"tenant\"}],\"select\":[{\"as\":\"left_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"right_id\",\"side\":\"right\",\"field\":\"id\"}]}}",
+        schema,
+    );
+    defer merge_join_plan.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedRowsQuery, executeRowsJoinPlanOnJsonRowsAlloc(alloc, schema, merge_join_plan, rows[0..], rows[0..], rows[0..]));
 
     var lateral_plan = try parseRowsLateralPlanRequest(
         alloc,
