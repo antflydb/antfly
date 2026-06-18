@@ -6779,19 +6779,16 @@ func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bo
 	if result == nil || result.SchemaVersion == 0 {
 		return false
 	}
-	return haAdminActionReceiptMatchesNode(action, true)
+	return haAdminActionReceiptMatches(action)
 }
 
 func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
-	return haAdminActionReceiptMatchesNode(action, false)
-}
-
-func haAdminActionReceiptMatchesNode(action antflyv1.HAPlannedActionStatus, requireExpectedNode bool) bool {
 	result := action.AdminResult
 	if result == nil {
 		return false
 	}
 	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
+	requireExpectedNode := haAdminActionReceiptRequiresPlannedNode(action)
 	return adminsdk.HAReceiptMatchesNode(adminsdk.HAActionReceipt{
 		ActionId:   result.ActionID,
 		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(result.ActionKind)),
@@ -6802,6 +6799,13 @@ func haAdminActionReceiptMatchesNode(action antflyv1.HAPlannedActionStatus, requ
 		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(expectedKind)),
 		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(expectedState)),
 	}, expectedTarget, action.AdminNodeID, requireExpectedNode)
+}
+
+func haAdminActionReceiptRequiresPlannedNode(action antflyv1.HAPlannedActionStatus) bool {
+	return action.AdminJobName == haAdminDirectAPIName ||
+		strings.TrimSpace(action.AdminURL) != "" ||
+		strings.TrimSpace(action.AdminMethod) != "" ||
+		strings.TrimSpace(action.AdminPath) != ""
 }
 
 func haDirectAdminActionReceiptExpectation(action antflyv1.HAPlannedActionStatus) (string, string, string) {

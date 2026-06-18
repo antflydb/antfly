@@ -3273,6 +3273,7 @@ func TestHADirectAdminActionReceiptExpectationsCoverDirectActions(t *testing.T) 
 			g.Expect(gotTarget).To(Equal(tt.wantTarget))
 			g.Expect(gotState).To(Equal(tt.wantState))
 
+			tt.action.AdminURL = "http://planned-admin.default.svc:8081"
 			tt.action.AdminResult = &antflyv1.HAAdminActionResultStatus{
 				SchemaVersion: 1,
 				ActionID:      tt.wantKind + ":" + tt.wantTarget,
@@ -3341,6 +3342,7 @@ func TestReconcileHAAdminJobsHonorsExplicitDependencyAfterUnrelatedFailure(t *te
 					SlotName:      "standby-a",
 					AdminCommand:  []string{"slot", "create", "--slot", "standby-a"},
 					AdminURL:      "http://primary-ha.default.svc:8081",
+					AdminNodeID:   "primary-a",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult: &antflyv1.HAAdminActionResultStatus{
 						ActionID:     "replication_slot_create:standby-a",
@@ -3443,6 +3445,7 @@ func TestReconcileHAPrimaryRouteWaitsForAdminPrerequisites(t *testing.T) {
 					StandbyName:   "standby-a",
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminURL:      "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:   "standby-a",
 					AdminJobName:  "promote-job",
 					AdminJobPhase: haAdminJobPhasePending,
 				}, {
@@ -3546,6 +3549,7 @@ func TestReconcileHAPrimaryRouteRequiresStandbyRouteSelector(t *testing.T) {
 					StandbyName:   "standby-a",
 					AdminCommand:  []string{"promote", "--current-fence"},
 					AdminURL:      "http://standby-a-ha.default.svc:8081",
+					AdminNodeID:   "standby-a",
 					AdminJobName:  "promote-job",
 					AdminJobPhase: haAdminJobPhaseSucceeded,
 					AdminResult:   haPromotionAdminResult(7, "ha-fence-token", "standby-a"),

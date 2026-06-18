@@ -565,6 +565,11 @@ func TestHAPlannedActionStatusesPreserveTypedSeedFinishDespiteCLIHintDrift(t *te
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
 		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID:        100,
+			ShardID:          10,
+			TableID:          20,
+			TimelineID:       4,
+			Epoch:            6,
 			CurrentPrimaryID: "primary-a",
 		},
 	}
