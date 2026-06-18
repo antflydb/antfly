@@ -2688,13 +2688,28 @@ pub const PostingStore = struct {
                 return error.UnsupportedPostingBackend;
             }
 
-            const base_header = index.loadPostingBackendBaseHeader(txn, posting_view.id, isNotFound) catch |err| {
-                if (isNotFound(err)) {
-                    notePostingOverlayFallback(profile);
-                    return try copyMemberIds(alloc, scratch, posting_view);
-                }
-                return err;
-            };
+            const base_data = if (canonical_base_delta) base_data: {
+                const data = index.loadPostingBackendBaseData(txn, posting_view.id, isNotFound) catch |err| {
+                    if (isNotFound(err)) {
+                        notePostingOverlayFallback(profile);
+                        return try copyMemberIds(alloc, scratch, posting_view);
+                    }
+                    return err;
+                };
+                break :base_data data;
+            } else null;
+            defer if (base_data) |data| index.alloc.free(data);
+
+            const base_header = if (base_data) |data|
+                try decodeBaseHeaderCachedIfAvailable(scratch, posting_view.id, data)
+            else
+                index.loadPostingBackendBaseHeader(txn, posting_view.id, isNotFound) catch |err| {
+                    if (isNotFound(err)) {
+                        notePostingOverlayFallback(profile);
+                        return try copyMemberIds(alloc, scratch, posting_view);
+                    }
+                    return err;
+                };
             if (!canonical_base_delta and base_header.generation < posting_view.state.mutation_version) {
                 notePostingOverlayFallback(profile);
                 return try copyMemberIds(alloc, scratch, posting_view);
@@ -2708,18 +2723,21 @@ pub const PostingStore = struct {
                 try notePostingMemberCacheMissIfAvailable(scratch, alloc, posting_view.id);
             }
 
-            const base_data = index.loadPostingBackendBaseData(txn, posting_view.id, isNotFound) catch |err| {
-                if (isNotFound(err)) {
-                    notePostingOverlayFallback(profile);
-                    return try copyMemberIds(alloc, scratch, posting_view);
-                }
-                return err;
+            const loaded_base_data = base_data orelse data: {
+                const data = index.loadPostingBackendBaseData(txn, posting_view.id, isNotFound) catch |err| {
+                    if (isNotFound(err)) {
+                        notePostingOverlayFallback(profile);
+                        return try copyMemberIds(alloc, scratch, posting_view);
+                    }
+                    return err;
+                };
+                break :data data;
             };
-            defer index.alloc.free(base_data);
+            defer if (base_data == null) index.alloc.free(loaded_base_data);
 
             if (canonical_base_delta and base_header.generation >= posting_view.state.mutation_version) {
                 const decode_start = now_fn();
-                _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
+                _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, loaded_base_data);
                 notePostingBaseDecode(profile, elapsed_fn(decode_start), base_header.member_count);
                 const member_ids = scratch.member_ids[0..base_header.member_count];
                 try cachePostingMembersIfAvailable(scratch, alloc, posting_view, base_header.generation, 0, member_ids, profile);
@@ -2729,7 +2747,7 @@ pub const PostingStore = struct {
             }
 
             const decode_start = now_fn();
-            _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, base_data);
+            _ = try PostingFormat.decodeBaseIntoScratch(alloc, scratch, loaded_base_data);
             notePostingBaseDecode(profile, elapsed_fn(decode_start), base_header.member_count);
             var materialized_len = base_header.member_count;
             const delta_replay_start = now_fn();
@@ -7482,7 +7500,7 @@ test "posting store segment query member cache hit skips full base load" {
         postingQueryTestElapsed,
     );
     try std.testing.expectEqualSlices(VectorId, base_members[0..], first);
-    try std.testing.expectEqual(@as(u64, 2), index.posting_backend_base_loads);
+    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_base_loads);
     try std.testing.expectEqual(@as(u64, 3), profile.posting_base_decode_members);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_cache_misses);
     try std.testing.expectEqual(@as(u64, 0), profile.posting_overlay_cache_hits);
@@ -7505,7 +7523,7 @@ test "posting store segment query member cache hit skips full base load" {
         postingQueryTestElapsed,
     );
     try std.testing.expectEqualSlices(VectorId, base_members[0..], second);
-    try std.testing.expectEqual(@as(u64, 2), index.posting_backend_base_loads);
+    try std.testing.expectEqual(@as(u64, 1), index.posting_backend_base_loads);
     try std.testing.expectEqual(@as(u64, 3), profile.posting_base_decode_members);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_cache_misses);
     try std.testing.expectEqual(@as(u64, 1), profile.posting_overlay_cache_hits);
