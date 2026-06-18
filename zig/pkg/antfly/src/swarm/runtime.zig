@@ -2286,7 +2286,7 @@ fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HASta
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
     const upstream = try requireHAString(cli.ha_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
     const slot = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
-    const parsed = std.Uri.parse(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
+    const parsed = antfly.ha.validation.parseURLNoHiddenWhitespace(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
     if (!isHAReplicationUpstreamScheme(parsed)) return error.HAStandbyUpstreamUrlInvalid;
     if (parsed.host == null) return error.HAStandbyUpstreamUrlInvalid;
     return .{
@@ -3101,6 +3101,14 @@ test "swarm HA standby replication flags require upstream and slot" {
 
     try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
         .ha_standby_upstream_url = "  http://primary.antfly.svc:8080 \n",
+        .ha_standby_slot = "standby-a",
+    }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "http://primary.antfly.svc:8080/\treplication",
+        .ha_standby_slot = "standby-a",
+    }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "http://primary antfly.svc:8080",
         .ha_standby_slot = "standby-a",
     }));
     try std.testing.expectError(error.HAStandbySlotInvalid, haStandbyReplicationConfigFromCli(.{

@@ -89,6 +89,26 @@ pub fn isAbsoluteNormalizedPathWithinRoot(path: []const u8, root: []const u8) bo
     return path.len > root.len and path[root.len] == '/';
 }
 
+pub fn parseURLNoHiddenWhitespace(raw: []const u8) !std.Uri {
+    if (containsASCIIWhitespace(raw)) return error.URLContainsWhitespace;
+    return std.Uri.parse(raw) catch error.InvalidURL;
+}
+
+pub fn isURLWithHostNoHiddenWhitespace(raw: []const u8) bool {
+    const uri = parseURLNoHiddenWhitespace(raw) catch return false;
+    return uri.scheme.len > 0 and uri.host != null;
+}
+
+pub fn containsASCIIWhitespace(raw: []const u8) bool {
+    for (raw) |byte| {
+        switch (byte) {
+            ' ', '\t', '\n', '\r', 0x0b, 0x0c => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 test "storage.ha validation classifies missing padded and valid strings" {
     try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(null));
     try std.testing.expectEqual(HAStringValidation.missing, classifyHAString(""));
@@ -125,4 +145,15 @@ test "storage.ha validation checks paths are bounded by an allowed root" {
     try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly/../primary.wal", "/var/lib/antfly"));
     try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("ha/primary.wal", "/var/lib/antfly"));
     try std.testing.expect(!isAbsoluteNormalizedPathWithinRoot("/var/lib/antfly/ha/primary.wal", "var/lib/antfly"));
+}
+
+test "storage.ha validation parses URLs and rejects hidden whitespace" {
+    const uri = try parseURLNoHiddenWhitespace("https://primary.antfly.svc:8080/admin/v1/ha");
+    try std.testing.expectEqualStrings("https", uri.scheme);
+    try std.testing.expect(uri.host != null);
+    try std.testing.expect(isURLWithHostNoHiddenWhitespace("http://127.0.0.1:8080"));
+    try std.testing.expect(!isURLWithHostNoHiddenWhitespace("http://primary antfly.svc:8080"));
+    try std.testing.expect(!isURLWithHostNoHiddenWhitespace("http://primary.antfly.svc:8080/\tadmin"));
+    try std.testing.expect(!isURLWithHostNoHiddenWhitespace("not-a-url"));
+    try std.testing.expect(!isURLWithHostNoHiddenWhitespace("file:///tmp/primary"));
 }

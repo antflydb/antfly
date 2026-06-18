@@ -1038,9 +1038,7 @@ fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
         .missing => return error.HAAdminURLMissing,
         .padded => return error.HAAdminURLInvalid,
     }
-    const uri = std.Uri.parse(raw_url) catch return error.HAAdminURLInvalid;
-    if (uri.scheme.len == 0) return error.HAAdminURLInvalid;
-    if (uri.host == null) return error.HAAdminURLInvalid;
+    if (!ha_validation.isURLWithHostNoHiddenWhitespace(raw_url)) return error.HAAdminURLInvalid;
     return raw_url;
 }
 
@@ -1197,6 +1195,8 @@ test "ha cmd rejects padded or invalid HA local option strings" {
     const alloc = std.testing.allocator;
 
     try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", " http://127.0.0.1:8081", "--", "status", "primary" }));
+    try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", "http://127.0.0.1:8081/\tadmin", "--", "status", "primary" }));
+    try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", "http://127.0.0.1:8081/a b", "--", "status", "primary" }));
     try std.testing.expectError(error.HAAdminURLInvalid, parseLocalArgs(alloc, &.{ "--ha-url", "not-a-url", "--", "status", "primary" }));
     try std.testing.expectError(error.HAPrimaryLogInvalid, parseLocalArgs(alloc, &.{ "--primary-log", " p.wal", "--", "slot", "list" }));
     try std.testing.expectError(error.HAPrimaryLogInvalid, parseLocalArgs(alloc, &.{ "--primary-log", "p.wal", "--", "slot", "list" }));
