@@ -7047,6 +7047,23 @@ func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *an
 		return
 	}
 	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhasePending || strings.TrimSpace(action.AdminError) == "" {
+			continue
+		}
+		executor := action.AdminJobName
+		if executor == "" {
+			executor = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAAdminActionRetrying,
+			fmt.Sprintf("HA admin action %s is retrying in %s after a transient error: %s", action.Kind, executor, strings.TrimSpace(action.AdminError)),
+		)
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
 		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
 			haAdminActionSucceededWithStatusEvidence(cluster.Status.HAStatus, action) {

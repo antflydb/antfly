@@ -224,6 +224,9 @@ const (
 	// ReasonHAAdminJobFailed indicates an HA admin execution failed.
 	ReasonHAAdminJobFailed = "HAAdminJobFailed"
 
+	// ReasonHAAdminActionRetrying indicates an HA admin action hit a retryable error and will be retried.
+	ReasonHAAdminActionRetrying = "HAAdminActionRetrying"
+
 	// ReasonHAStandbyUnhealthy indicates at least one desired standby is unhealthy.
 	ReasonHAStandbyUnhealthy = "HAStandbyUnhealthy"
 

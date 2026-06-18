@@ -1127,6 +1127,12 @@ func TestReconcileHAAdminJobsRetriesRetryableDirectAPIFailure(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("status 503"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("primary restarting"))
+	reconciler.updateHAAdminJobExecutionCondition(cluster)
+	degraded := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeHADegraded)
+	g.Expect(degraded).NotTo(BeNil())
+	g.Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(degraded.Reason).To(Equal(antflyv1.ReasonHAAdminActionRetrying))
+	g.Expect(degraded.Message).To(ContainSubstring("primary restarting"))
 
 	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
 	g.Expect(requests).To(Equal(2))
