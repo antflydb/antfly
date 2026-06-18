@@ -558,6 +558,16 @@ pub const RuntimeDirectoryStore = struct {
         return try self.batch.pendingCentroidDirectoryRecord(alloc, posting_id);
     }
 
+    pub fn loadCentroidDirectoryRecordsAlloc(self: *const RuntimeDirectoryStore, alloc: Allocator) ![]posting.OwnedCentroidDirectoryRecord {
+        var candidates = std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate).empty;
+        defer candidates.deinit(alloc);
+        errdefer deinitCentroidRecordCandidates(alloc, &candidates);
+
+        try self.lazy.snapshot().appendCentroidDirectoryRecordCandidates(alloc, &candidates);
+        try self.batch.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
+        return try centroidRecordCandidatesToOwnedSlice(alloc, &candidates);
+    }
+
     pub fn pendingDeltaTailAlloc(self: *const RuntimeDirectoryStore, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
         return try self.batch.pendingDeltaTailAlloc(alloc, posting_id, min_generation);
     }
@@ -862,6 +872,15 @@ pub const LazyDirectorySnapshot = struct {
         const centroid_data = (try self.readLatestPointValueAlloc(alloc, posting_id, .centroid_directory)) orelse return null;
         defer alloc.free(centroid_data);
         return try posting.CentroidDirectoryFormat.decode(alloc, centroid_data);
+    }
+
+    pub fn loadCentroidDirectoryRecordsAlloc(self: LazyDirectorySnapshot, alloc: Allocator) ![]posting.OwnedCentroidDirectoryRecord {
+        var candidates = std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate).empty;
+        defer candidates.deinit(alloc);
+        errdefer deinitCentroidRecordCandidates(alloc, &candidates);
+
+        try self.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
+        return try centroidRecordCandidatesToOwnedSlice(alloc, &candidates);
     }
 
     pub fn loadDeltaTail(self: LazyDirectorySnapshot, alloc: Allocator, posting_id: PostingId) ![]posting.PostingDeltaRecord {
@@ -1226,6 +1245,25 @@ pub const LazyDirectorySnapshot = struct {
             .meta = entry.meta,
             .path = entry.path,
         }, posting_id, base_generation);
+    }
+
+    fn appendCentroidDirectoryRecordCandidates(
+        self: LazyDirectorySnapshot,
+        alloc: Allocator,
+        candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+    ) !void {
+        for (self.manifest.segments) |entry| {
+            const segment_data = try self.readSegmentAlloc(alloc, entry);
+            defer alloc.free(segment_data);
+
+            var reader = try Reader.init(segment_data);
+            var iter = reader.entries();
+            while (try iter.next()) |segment_entry| {
+                if (segment_entry.kind != .centroid_directory) continue;
+                var record = try posting.CentroidDirectoryFormat.decode(alloc, segment_entry.value);
+                try putCentroidRecordCandidate(alloc, candidates, entry.meta.segment_id, &record);
+            }
+        }
     }
 };
 
@@ -2555,6 +2593,11 @@ const PointCandidate = struct {
     value: []const u8,
 };
 
+const CentroidRecordCandidate = struct {
+    segment_id: u64,
+    record: posting.OwnedCentroidDirectoryRecord,
+};
+
 const DeltaCandidate = struct {
     posting_id: PostingId,
     segment_id: u64,
@@ -2834,6 +2877,18 @@ pub const DirectoryBatchWriter = struct {
     pub fn pendingCentroidDirectoryRecord(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId) !?posting.OwnedCentroidDirectoryRecord {
         const value = self.pendingPointValue(posting_id, .centroid_directory) orelse return null;
         return try posting.CentroidDirectoryFormat.decode(alloc, value);
+    }
+
+    pub fn appendCentroidDirectoryRecordCandidates(
+        self: *const DirectoryBatchWriter,
+        alloc: Allocator,
+        candidates: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+    ) !void {
+        for (self.writer.entries.items) |entry| {
+            if (entry.kind != .centroid_directory) continue;
+            var record = try posting.CentroidDirectoryFormat.decode(alloc, entry.value);
+            try putCentroidRecordCandidate(alloc, candidates, std.math.maxInt(u64), &record);
+        }
     }
 
     pub fn pendingDeltaTailAlloc(self: *const DirectoryBatchWriter, alloc: Allocator, posting_id: PostingId, min_generation: ?u64) ![]posting.PostingDeltaRecord {
@@ -3900,6 +3955,79 @@ fn putNewestPoint(
             .value = value,
         };
     }
+}
+
+fn putCentroidRecordCandidate(
+    alloc: Allocator,
+    map: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+    segment_id: u64,
+    record: *posting.OwnedCentroidDirectoryRecord,
+) !void {
+    errdefer record.deinit(alloc);
+    const entry = try map.getOrPut(alloc, record.posting_id);
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{
+            .segment_id = segment_id,
+            .record = record.*,
+        };
+        record.* = emptyOwnedCentroidDirectoryRecord();
+        return;
+    }
+
+    if (segment_id >= entry.value_ptr.segment_id) {
+        entry.value_ptr.record.deinit(alloc);
+        entry.value_ptr.* = .{
+            .segment_id = segment_id,
+            .record = record.*,
+        };
+        record.* = emptyOwnedCentroidDirectoryRecord();
+        return;
+    }
+
+    record.deinit(alloc);
+}
+
+fn deinitCentroidRecordCandidates(alloc: Allocator, map: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate)) void {
+    var iter = map.iterator();
+    while (iter.next()) |entry| entry.value_ptr.record.deinit(alloc);
+}
+
+fn centroidRecordCandidatesToOwnedSlice(
+    alloc: Allocator,
+    map: *std.AutoHashMapUnmanaged(PostingId, CentroidRecordCandidate),
+) ![]posting.OwnedCentroidDirectoryRecord {
+    var out = std.ArrayListUnmanaged(posting.OwnedCentroidDirectoryRecord).empty;
+    errdefer {
+        for (out.items) |*record| record.deinit(alloc);
+        out.deinit(alloc);
+    }
+    try out.ensureTotalCapacity(alloc, map.count());
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        out.appendAssumeCapacity(entry.value_ptr.record);
+        entry.value_ptr.record = emptyOwnedCentroidDirectoryRecord();
+    }
+    std.mem.sort(posting.OwnedCentroidDirectoryRecord, out.items, {}, centroidRecordLessThan);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn centroidRecordLessThan(_: void, lhs: posting.OwnedCentroidDirectoryRecord, rhs: posting.OwnedCentroidDirectoryRecord) bool {
+    return lhs.posting_id < rhs.posting_id;
+}
+
+fn emptyOwnedCentroidDirectoryRecord() posting.OwnedCentroidDirectoryRecord {
+    return .{
+        .posting_id = 0,
+        .generation = 0,
+        .mutation_version = 0,
+        .payload_version = 0,
+        .flags = 0,
+        .parent = 0,
+        .level = 0,
+        .member_count = 0,
+        .bounds_radius = 0,
+        .centroid = &.{},
+    };
 }
 
 fn writeFileAtomicallyAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {

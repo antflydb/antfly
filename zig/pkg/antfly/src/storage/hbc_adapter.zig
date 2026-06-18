@@ -3627,6 +3627,14 @@ pub const HBCIndex = struct {
         return (try runtime.store.snapshot().loadCentroidDirectoryRecord(self.alloc, posting_id)) orelse error.NotFound;
     }
 
+    pub fn loadPostingBackendCentroidDirectoryRecords(self: *HBCIndex, txn: anytype) ![]vectorindex_posting.OwnedCentroidDirectoryRecord {
+        try self.bindTxnLike(txn);
+        lockAtomic(&self.posting_segment_mu);
+        defer self.posting_segment_mu.unlock();
+        const runtime = try self.postingSegmentRuntime();
+        return try runtime.store.loadCentroidDirectoryRecordsAlloc(self.alloc);
+    }
+
     pub fn loadPostingBackendDeltaTail(self: *HBCIndex, txn: anytype, posting_id: u64) ![]vectorindex_posting.PostingDeltaRecord {
         try self.bindTxnLike(txn);
         lockAtomic(&self.posting_segment_mu);
@@ -8031,6 +8039,54 @@ test "two-level rabitq centroid directory prunes posting blocks" {
     try std.testing.expect(profiled.profile.centroid_directory_posting_centroid_estimates < profiled.profile.centroid_directory_blocks_scanned);
 }
 
+test "segment posting backend builds two-level centroid directory from records" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .posting_storage_mode = .base_delta,
+        .posting_backend = .segments,
+        .centroid_directory_mode = .two_level_rabitq,
+        .flat_centroid_block_size = 1,
+        .flat_centroid_probe_count = 8,
+        .flat_centroid_block_probe_count = 1,
+    });
+    defer idx.close();
+
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &[_]f32{ 0.0, 0.0 }, .metadata = "doc:a" },
+        .{ .vector_id = 2, .vector = &[_]f32{ 0.2, 0.0 }, .metadata = "doc:b" },
+        .{ .vector_id = 3, .vector = &[_]f32{ 10.0, 10.0 }, .metadata = "doc:c" },
+        .{ .vector_id = 4, .vector = &[_]f32{ 10.2, 10.0 }, .metadata = "doc:d" },
+        .{ .vector_id = 5, .vector = &[_]f32{ 20.0, 20.0 }, .metadata = "doc:e" },
+        .{ .vector_id = 6, .vector = &[_]f32{ 20.2, 20.0 }, .metadata = "doc:f" },
+        .{ .vector_id = 7, .vector = &[_]f32{ 30.0, 30.0 }, .metadata = "doc:g" },
+        .{ .vector_id = 8, .vector = &[_]f32{ 30.2, 30.0 }, .metadata = "doc:h" },
+    };
+    try idx.bulkBuildWithMetadata(&items);
+
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &[_]f32{ 30.0, 30.0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+
+    const hits = profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqual(@as(u64, 7), hits[0].vector_id);
+    try std.testing.expect(profiled.profile.centroid_directory_blocks_scanned > 1);
+    try std.testing.expectEqual(@as(u64, 1), profiled.profile.centroid_directory_blocks_selected);
+}
+
 test "two-level rabitq default block probes cover requested posting probes" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -11712,6 +11768,15 @@ test "segment posting backend persists posting artifacts outside lsm namespace" 
         defer centroid_record.deinit(alloc);
         try std.testing.expectEqual(posting_id, centroid_record.posting_id);
         try std.testing.expectEqual(@as(u64, 2), centroid_record.member_count);
+
+        const centroid_records = try PostingStore.loadCentroidDirectoryRecords(&idx, &read_txn);
+        defer {
+            for (centroid_records) |*record| record.deinit(alloc);
+            alloc.free(centroid_records);
+        }
+        try std.testing.expectEqual(@as(usize, 1), centroid_records.len);
+        try std.testing.expectEqual(posting_id, centroid_records[0].posting_id);
+        try std.testing.expectEqual(@as(u64, 2), centroid_records[0].member_count);
     }
 
     {
