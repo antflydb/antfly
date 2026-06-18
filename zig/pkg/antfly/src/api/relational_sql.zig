@@ -3699,6 +3699,14 @@ const Parser = struct {
         };
     }
 
+    fn parseSequenceInteger(self: *@This()) !i64 {
+        const negative = self.match(.minus) != null;
+        const token = self.match(.number) orelse return error.UnsupportedSqlShape;
+        if (std.mem.indexOfScalar(u8, token.text, '.') != null) return error.UnsupportedSqlShape;
+        const value = std.fmt.parseInt(i64, token.text, 10) catch return error.UnsupportedSqlShape;
+        return if (negative) -value else value;
+    }
+
     fn parseCreateCollationDdl(self: *@This()) !CreateCollationPlan {
         var syntax = try sql_adapter.parseCreateCollationCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
@@ -3853,204 +3861,39 @@ const Parser = struct {
     }
 
     fn parseCreateSequenceDdl(self: *@This()) !CreateSequencePlan {
-        try self.expectKeyword("sequence");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const sequence_name = try self.parseSqlObjectIdentifierOwned();
-        var sequence_transferred = false;
-        errdefer if (!sequence_transferred) self.alloc.free(sequence_name);
-        var options: SequenceOptions = .{};
-        errdefer options.deinit(self.alloc);
-        while (!self.atEnd() and !self.peekKind(.semicolon)) {
-            try self.parseCreateSequenceOption(&options);
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        sequence_transferred = true;
-        return .{ .sequence_name = sequence_name, .if_not_exists = if_not_exists, .options = options };
+        var syntax = try sql_adapter.parseCreateSequenceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .sequence_name = syntax.sequence_name,
+            .if_not_exists = syntax.if_not_exists,
+            .options = syntax.options,
+        };
     }
 
     fn parseAlterSequenceDdl(self: *@This()) !AlterSequencePlan {
-        try self.expectKeyword("sequence");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const sequence_name = try self.parseSqlObjectIdentifierOwned();
-        var sequence_transferred = false;
-        errdefer if (!sequence_transferred) self.alloc.free(sequence_name);
-        var operations = std.ArrayListUnmanaged(SequenceAlterOperation).empty;
-        errdefer {
-            freeSequenceAlterOperations(self.alloc, operations.items);
-            operations.deinit(self.alloc);
-        }
-        while (!self.atEnd() and !self.peekKind(.semicolon)) {
-            try self.parseAlterSequenceOperation(&operations);
-        }
-        if (operations.items.len == 0) return error.UnsupportedSqlShape;
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        sequence_transferred = true;
+        var syntax = try sql_adapter.parseAlterSequenceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .sequence_name = sequence_name,
-            .if_exists = if_exists,
-            .operations = try operations.toOwnedSlice(self.alloc),
+            .sequence_name = syntax.sequence_name,
+            .if_exists = syntax.if_exists,
+            .operations = syntax.operations,
         };
     }
 
     fn parseDropSequenceDdl(self: *@This()) !DropSequencePlan {
-        try self.expectKeyword("sequence");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const sequence_name = try self.parseSqlObjectIdentifierOwned();
-        var sequence_transferred = false;
-        errdefer if (!sequence_transferred) self.alloc.free(sequence_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        sequence_transferred = true;
-        return .{ .sequence_name = sequence_name, .if_exists = if_exists, .cascade = cascade };
-    }
-
-    fn parseCreateSequenceOption(self: *@This(), options: *SequenceOptions) !void {
-        if (self.matchKeyword("as")) {
-            if (options.as_type != null) return error.UnsupportedSqlShape;
-            options.as_type = try self.parseSequenceTypeNameOwned();
-        } else if (self.matchKeyword("owned")) {
-            try self.expectKeyword("by");
-            if (options.owned_by != null) return error.UnsupportedSqlShape;
-            options.owned_by = try self.parseSequenceOwnedByAlloc();
-        } else if (self.matchKeyword("start")) {
-            _ = self.matchKeyword("with");
-            if (options.start_with != null) return error.UnsupportedSqlShape;
-            options.start_with = try self.parseSequenceInteger();
-        } else if (self.matchKeyword("increment")) {
-            _ = self.matchKeyword("by");
-            if (options.increment_by != null) return error.UnsupportedSqlShape;
-            options.increment_by = try self.parseSequenceInteger();
-        } else if (self.matchKeyword("minvalue")) {
-            if (options.min_value_specified) return error.UnsupportedSqlShape;
-            options.min_value_specified = true;
-            options.min_value = try self.parseSequenceInteger();
-        } else if (self.matchKeyword("maxvalue")) {
-            if (options.max_value_specified) return error.UnsupportedSqlShape;
-            options.max_value_specified = true;
-            options.max_value = try self.parseSequenceInteger();
-        } else if (self.matchKeyword("cache")) {
-            if (options.cache != null) return error.UnsupportedSqlShape;
-            options.cache = try self.parseSequenceInteger();
-        } else if (self.matchKeyword("cycle")) {
-            if (options.cycle != null) return error.UnsupportedSqlShape;
-            options.cycle = true;
-        } else if (self.matchKeyword("no")) {
-            if (self.matchKeyword("minvalue")) {
-                if (options.min_value_specified) return error.UnsupportedSqlShape;
-                options.min_value_specified = true;
-                options.min_value = null;
-            } else if (self.matchKeyword("maxvalue")) {
-                if (options.max_value_specified) return error.UnsupportedSqlShape;
-                options.max_value_specified = true;
-                options.max_value = null;
-            } else if (self.matchKeyword("cycle")) {
-                if (options.cycle != null) return error.UnsupportedSqlShape;
-                options.cycle = false;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-    }
-
-    fn parseAlterSequenceOperation(
-        self: *@This(),
-        operations: *std.ArrayListUnmanaged(SequenceAlterOperation),
-    ) !void {
-        if (self.matchKeyword("as")) {
-            const type_name = try self.parseSequenceTypeNameOwned();
-            errdefer self.alloc.free(type_name);
-            try operations.append(self.alloc, .{ .set_type = type_name });
-        } else if (self.matchKeyword("owned")) {
-            try self.expectKeyword("by");
-            var owned_by = try self.parseSequenceOwnedByAlloc();
-            errdefer owned_by.deinit(self.alloc);
-            try operations.append(self.alloc, .{ .set_owned_by = owned_by });
-        } else if (self.matchKeyword("restart")) {
-            const value = if (self.matchKeyword("with")) try self.parseSequenceInteger() else null;
-            try operations.append(self.alloc, .{ .restart = value });
-        } else if (self.matchKeyword("start")) {
-            _ = self.matchKeyword("with");
-            try operations.append(self.alloc, .{ .set_start = try self.parseSequenceInteger() });
-        } else if (self.matchKeyword("increment")) {
-            _ = self.matchKeyword("by");
-            try operations.append(self.alloc, .{ .set_increment = try self.parseSequenceInteger() });
-        } else if (self.matchKeyword("minvalue")) {
-            try operations.append(self.alloc, .{ .set_min = try self.parseSequenceInteger() });
-        } else if (self.matchKeyword("maxvalue")) {
-            try operations.append(self.alloc, .{ .set_max = try self.parseSequenceInteger() });
-        } else if (self.matchKeyword("cache")) {
-            try operations.append(self.alloc, .{ .set_cache = try self.parseSequenceInteger() });
-        } else if (self.matchKeyword("cycle")) {
-            try operations.append(self.alloc, .{ .set_cycle = true });
-        } else if (self.matchKeyword("no")) {
-            if (self.matchKeyword("minvalue")) {
-                try operations.append(self.alloc, .{ .set_min = null });
-            } else if (self.matchKeyword("maxvalue")) {
-                try operations.append(self.alloc, .{ .set_max = null });
-            } else if (self.matchKeyword("cycle")) {
-                try operations.append(self.alloc, .{ .set_cycle = false });
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-    }
-
-    fn parseSequenceTypeNameOwned(self: *@This()) ![]const u8 {
-        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        if (std.ascii.eqlIgnoreCase(token.text, "smallint")) return try self.alloc.dupe(u8, "smallint");
-        if (std.ascii.eqlIgnoreCase(token.text, "integer") or std.ascii.eqlIgnoreCase(token.text, "int")) return try self.alloc.dupe(u8, "integer");
-        if (std.ascii.eqlIgnoreCase(token.text, "bigint")) return try self.alloc.dupe(u8, "bigint");
-        return error.UnsupportedSqlShape;
-    }
-
-    fn parseSequenceOwnedByAlloc(self: *@This()) !SequenceOwnedBy {
-        if (self.matchKeyword("none")) return .{};
-        const token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        const raw = token.text;
-        const first_dot = std.mem.indexOfScalar(u8, raw, '.') orelse return error.UnsupportedSqlShape;
-        const table_start = if (std.ascii.eqlIgnoreCase(raw[0..first_dot], "public")) first_dot + 1 else 0;
-        const table_and_column = raw[table_start..];
-        const dot = std.mem.indexOfScalar(u8, table_and_column, '.') orelse return error.UnsupportedSqlShape;
-        if (std.mem.indexOfScalar(u8, table_and_column[dot + 1 ..], '.') != null) return error.UnsupportedSqlShape;
-        const table_name = table_and_column[0..dot];
-        const column_name = table_and_column[dot + 1 ..];
-        if (table_name.len == 0 or column_name.len == 0) return error.UnsupportedSqlShape;
-        const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer self.alloc.free(owned_table_name);
+        var syntax = try sql_adapter.parseDropSequenceCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .table_name = owned_table_name,
-            .column_name = try self.alloc.dupe(u8, column_name),
+            .sequence_name = syntax.sequence_name,
+            .if_exists = syntax.if_exists,
+            .cascade = syntax.cascade,
         };
-    }
-
-    fn parseSequenceInteger(self: *@This()) !i64 {
-        const negative = self.match(.minus) != null;
-        const token = self.match(.number) orelse return error.UnsupportedSqlShape;
-        if (std.mem.indexOfScalar(u8, token.text, '.') != null) return error.UnsupportedSqlShape;
-        const value = std.fmt.parseInt(i64, token.text, 10) catch return error.UnsupportedSqlShape;
-        return if (negative) -value else value;
     }
 
     fn parseDomainCheckConstraint(
@@ -4085,102 +3928,40 @@ const Parser = struct {
     }
 
     fn parseCreateEnumTypeDdl(self: *@This()) !CreateEnumTypePlan {
-        try self.expectKeyword("type");
-        const type_name = try self.parseSqlObjectIdentifierOwned();
-        var type_transferred = false;
-        errdefer if (!type_transferred) self.alloc.free(type_name);
-        try self.expectKeyword("as");
-        try self.expectKeyword("enum");
-        try self.expect(.lparen);
-        var values = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            freeStringSlice(self.alloc, values.items);
-            values.deinit(self.alloc);
-        }
-        while (true) {
-            const value = try self.parseEnumLabelOwned();
-            var value_transferred = false;
-            errdefer if (!value_transferred) self.alloc.free(value);
-            for (values.items) |existing| {
-                if (std.mem.eql(u8, existing, value)) return error.UnsupportedSqlShape;
-            }
-            try values.append(self.alloc, value);
-            value_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (values.items.len == 0) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        type_transferred = true;
+        var syntax = try sql_adapter.parseCreateEnumTypeCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .type_name = type_name,
-            .values = try values.toOwnedSlice(self.alloc),
+            .type_name = syntax.type_name,
+            .values = syntax.values,
         };
     }
 
     fn parseAlterEnumTypeDdl(self: *@This()) !AddEnumValuePlan {
-        try self.expectKeyword("type");
-        const type_name = try self.parseSqlObjectIdentifierOwned();
-        var type_transferred = false;
-        errdefer if (!type_transferred) self.alloc.free(type_name);
-        try self.expectKeyword("add");
-        try self.expectKeyword("value");
-        var if_not_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("not");
-            try self.expectKeyword("exists");
-            if_not_exists = true;
-        }
-        const value = try self.parseEnumLabelOwned();
-        var value_transferred = false;
-        errdefer if (!value_transferred) self.alloc.free(value);
-        var position: EnumValuePosition = .none;
-        var neighbor_value: ?[]const u8 = null;
-        errdefer if (neighbor_value) |neighbor| self.alloc.free(neighbor);
-        if (self.matchKeyword("before")) {
-            position = .before;
-            neighbor_value = try self.parseEnumLabelOwned();
-        } else if (self.matchKeyword("after")) {
-            position = .after;
-            neighbor_value = try self.parseEnumLabelOwned();
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        type_transferred = true;
-        value_transferred = true;
+        var syntax = try sql_adapter.parseAlterEnumTypeCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
         return .{
-            .type_name = type_name,
-            .value = value,
-            .if_not_exists = if_not_exists,
-            .position = position,
-            .neighbor_value = neighbor_value,
+            .type_name = syntax.type_name,
+            .value = syntax.value,
+            .if_not_exists = syntax.if_not_exists,
+            .position = syntax.position,
+            .neighbor_value = syntax.neighbor_value,
         };
     }
 
     fn parseDropEnumTypeDdl(self: *@This()) !DropEnumTypePlan {
-        try self.expectKeyword("type");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const type_name = try self.parseSqlObjectIdentifierOwned();
-        var type_transferred = false;
-        errdefer if (!type_transferred) self.alloc.free(type_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        type_transferred = true;
-        return .{ .type_name = type_name, .if_exists = if_exists, .cascade = cascade };
-    }
-
-    fn parseEnumLabelOwned(self: *@This()) ![]const u8 {
-        const token = self.match(.string) orelse return error.UnsupportedSqlShape;
-        if (token.text.len == 0) return error.UnsupportedSqlShape;
-        return try self.alloc.dupe(u8, token.text);
+        var syntax = try sql_adapter.parseDropEnumTypeCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .type_name = syntax.type_name,
+            .if_exists = syntax.if_exists,
+            .cascade = syntax.cascade,
+        };
     }
 
     fn parseRelationLifetimeDdl(self: *@This()) !RelationLifetimePlan {
@@ -5362,8 +5143,7 @@ const Parser = struct {
     }
 
     fn parseIdentitySequenceOption(self: *@This(), options: *SequenceOptions) !void {
-        if (self.peekKeyword("as") or self.peekKeyword("owned")) return error.UnsupportedSqlShape;
-        try self.parseCreateSequenceOption(options);
+        try sql_adapter.parseIdentitySequenceOptionAlloc(self.alloc, self.tokens, &self.pos, options);
     }
 
     fn parseCreateTableDdl(self: *@This()) !CreateTablePlan {

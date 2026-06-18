@@ -1093,6 +1093,10 @@ type-system catalog grammar for collation, operator, aggregate, and cast
 create/drop/rename forms,
 routine catalog grammar for `CREATE FUNCTION`, `CREATE PROCEDURE`,
 `DROP FUNCTION`, and `DROP PROCEDURE`,
+sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
+`DROP SEQUENCE`,
+enum-type catalog grammar for `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD
+VALUE`, and `DROP TYPE`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -4593,7 +4597,9 @@ PostgreSQL enum type DDL now lowers to a typed enum catalog intent.
 `CREATE TYPE ... AS ENUM (...)` records the enum type name and ordered label
 set, `ALTER TYPE ... ADD VALUE [IF NOT EXISTS] ... [BEFORE|AFTER ...]` records
 the append/positioning intent, and `DROP TYPE [IF EXISTS] ... [CASCADE]`
-records typed removal metadata. Schema application remains fail-closed until
+records typed removal metadata. Enum-type tails parse in
+`api/sql_adapter/grammar.zig`; the SQL lowerer only transfers owned grammar
+syntax into typed enum catalog plans. Schema application remains fail-closed until
 the durable type catalog exists: enum-typed columns must validate labels
 through catalog metadata, record dependencies from tables/checks/defaults, and
 route enum-label additions, drops, and dependency cleanup through ordinary
@@ -4614,7 +4620,10 @@ PostgreSQL standalone sequence DDL lowers to typed sequence catalog intents.
 and `CYCLE`), and `OWNED BY` dependency metadata including `OWNED BY NONE`;
 `ALTER SEQUENCE` records typed type, restart, option-change, and ownership operations; and
 `DROP SEQUENCE [IF EXISTS] ... [CASCADE]` records typed removal metadata.
-Schema application remains fail-closed until the durable sequence catalog and
+Standalone sequence tails and generated-identity sequence option clauses parse
+in `api/sql_adapter/grammar.zig`; the SQL lowerer only transfers owned grammar
+syntax into typed sequence and identity-allocator plans. Schema application
+remains fail-closed until the durable sequence catalog and
 allocator exist: sequences must allocate transactionally through owner/range
 routing, expose snapshot-consistent catalog state, and track schema-owned
 dependencies. Column-level `serial`/`bigserial`, `GENERATED ... AS IDENTITY`,

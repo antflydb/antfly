@@ -33,6 +33,8 @@ pub const ColumnChunk = struct {
     encoding: []u8 = &.{},
     physical_type: []u8 = &.{},
     logical_type: []u8 = &.{},
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
     nullable: bool = false,
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {

@@ -301,6 +301,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .encoding = encoding,
         .physical_type = physical_type,
         .logical_type = logical_type,
+        .decimal_precision = chunk.decimal_precision,
+        .decimal_scale = chunk.decimal_scale,
         .nullable = chunk.nullable,
     };
 }
@@ -356,6 +358,8 @@ const SchemaElement = struct {
     repetition_type: ?i32 = null,
     child_count: u32 = 0,
     logical_type: []u8 = &.{},
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
 
     fn deinit(self: *SchemaElement, alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
@@ -368,6 +372,8 @@ const SchemaColumn = struct {
     column_id: []u8,
     nullable: bool,
     logical_type: []u8 = &.{},
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
 
     fn deinit(self: *SchemaColumn, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
@@ -416,6 +422,8 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     var repetition_type: ?i32 = null;
     var child_count: u32 = 0;
     var logical_type: []u8 = &.{};
+    var decimal_precision: i32 = 0;
+    var decimal_scale: i32 = 0;
     errdefer if (name) |value| alloc.free(value);
     errdefer if (logical_type.len > 0) alloc.free(logical_type);
 
@@ -434,12 +442,17 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
                 }
                 logical_type = try logicalTypeNameForConvertedTypeAlloc(alloc, try reader.readRequiredI32(field.type));
             },
+            7 => decimal_scale = try reader.readRequiredI32(field.type),
+            8 => decimal_precision = try reader.readRequiredI32(field.type),
             10 => {
                 if (logical_type.len > 0) {
                     alloc.free(logical_type);
                     logical_type = &.{};
                 }
-                logical_type = try parseLogicalTypeNameAlloc(alloc, reader, field.type);
+                const logical_annotation = try parseLogicalTypeAnnotationAlloc(alloc, reader, field.type);
+                logical_type = logical_annotation.name;
+                decimal_precision = logical_annotation.decimal_precision;
+                decimal_scale = logical_annotation.decimal_scale;
             },
             else => try reader.skip(field.type),
         }
@@ -453,6 +466,8 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
         .repetition_type = repetition_type,
         .child_count = child_count,
         .logical_type = logical_type,
+        .decimal_precision = decimal_precision,
+        .decimal_scale = decimal_scale,
     };
 }
 
@@ -483,6 +498,8 @@ fn collectSchemaColumnsAlloc(
                 .column_id = column_id,
                 .nullable = element_nullable,
                 .logical_type = logical_type,
+                .decimal_precision = element.decimal_precision,
+                .decimal_scale = element.decimal_scale,
             });
         } else {
             try collectSchemaColumnsAlloc(alloc, elements, cursor, element.child_count, element_nullable, path, columns);
@@ -527,6 +544,8 @@ fn applySchemaNullability(alloc: Allocator, row_groups: []external_source.RowGro
                 if (chunk.logical_type.len > 0) alloc.free(chunk.logical_type);
                 chunk.logical_type = logical_type;
             }
+            chunk.decimal_precision = schema_column.decimal_precision;
+            chunk.decimal_scale = schema_column.decimal_scale;
         }
     }
 }
@@ -801,30 +820,63 @@ fn physicalTypeNameAlloc(alloc: Allocator, physical_type: i32) ![]u8 {
 
 fn logicalTypeNameForConvertedTypeAlloc(alloc: Allocator, converted_type: i32) ![]u8 {
     return switch (converted_type) {
+        5 => try alloc.dupe(u8, "decimal"),
         9 => try alloc.dupe(u8, "timestamp_millis"),
         10 => try alloc.dupe(u8, "timestamp_micros"),
         else => &.{},
     };
 }
 
-fn parseLogicalTypeNameAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {
+const LogicalTypeAnnotation = struct {
+    name: []u8 = &.{},
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
+
+    fn deinit(self: *LogicalTypeAnnotation, alloc: Allocator) void {
+        if (self.name.len > 0) alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) !LogicalTypeAnnotation {
     if (field_type != .struct_) return error.InvalidParquetMetadata;
     var previous_field_id: i16 = 0;
-    var logical_type: []u8 = &.{};
-    errdefer if (logical_type.len > 0) alloc.free(logical_type);
+    var annotation = LogicalTypeAnnotation{};
+    errdefer annotation.deinit(alloc);
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
+            5 => {
+                annotation.deinit(alloc);
+                annotation = try parseDecimalLogicalTypeAnnotationAlloc(alloc, reader, field.type);
+            },
             8 => {
-                if (logical_type.len > 0) {
-                    alloc.free(logical_type);
-                    logical_type = &.{};
-                }
-                logical_type = try parseTimestampLogicalTypeNameAlloc(alloc, reader, field.type);
+                annotation.deinit(alloc);
+                annotation = .{ .name = try parseTimestampLogicalTypeNameAlloc(alloc, reader, field.type) };
             },
             else => try reader.skip(field.type),
         }
     }
-    return logical_type;
+    return annotation;
+}
+
+fn parseDecimalLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) !LogicalTypeAnnotation {
+    if (field_type != .struct_) return error.InvalidParquetMetadata;
+    var previous_field_id: i16 = 0;
+    var scale: i32 = 0;
+    var precision: i32 = 0;
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        switch (field.id) {
+            1 => scale = try reader.readRequiredI32(field.type),
+            2 => precision = try reader.readRequiredI32(field.type),
+            else => try reader.skip(field.type),
+        }
+    }
+    if (precision <= 0 or scale < 0 or scale > precision) return error.InvalidParquetMetadata;
+    return .{
+        .name = try alloc.dupe(u8, "decimal"),
+        .decimal_precision = precision,
+        .decimal_scale = scale,
+    };
 }
 
 fn parseTimestampLogicalTypeNameAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {

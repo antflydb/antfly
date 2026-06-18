@@ -17,6 +17,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const classifier = @import("classifier.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
@@ -333,6 +334,79 @@ pub const DropRoutineSyntax = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.routine_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateSequenceSyntax = struct {
+    sequence_name: []const u8,
+    if_not_exists: bool = false,
+    options: ddl_plan.SequenceOptions = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.sequence_name));
+        self.options.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const AlterSequenceSyntax = struct {
+    sequence_name: []const u8,
+    if_exists: bool = false,
+    operations: []const ddl_plan.SequenceAlterOperation = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.sequence_name));
+        freeSequenceAlterOperations(alloc, self.operations);
+        if (self.operations.len > 0) alloc.free(@constCast(self.operations));
+        self.* = undefined;
+    }
+};
+
+pub const DropSequenceSyntax = struct {
+    sequence_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.sequence_name));
+        self.* = undefined;
+    }
+};
+
+pub const CreateEnumTypeSyntax = struct {
+    type_name: []const u8,
+    values: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.type_name));
+        freeStringSlice(alloc, self.values);
+        self.* = undefined;
+    }
+};
+
+pub const AddEnumValueSyntax = struct {
+    type_name: []const u8,
+    value: []const u8,
+    if_not_exists: bool = false,
+    position: ddl_plan.EnumValuePosition = .none,
+    neighbor_value: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.type_name));
+        alloc.free(@constCast(self.value));
+        if (self.neighbor_value) |neighbor_value| alloc.free(@constCast(neighbor_value));
+        self.* = undefined;
+    }
+};
+
+pub const DropEnumTypeSyntax = struct {
+    type_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.type_name));
         self.* = undefined;
     }
 };
@@ -1649,6 +1723,207 @@ pub fn parseDropRoutineCatalogTailAlloc(
     };
 }
 
+pub fn parseCreateSequenceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateSequenceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("sequence");
+    var if_not_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("exists");
+        if_not_exists = true;
+    }
+    const sequence_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var sequence_transferred = false;
+    errdefer if (!sequence_transferred) alloc.free(sequence_name);
+    var options: ddl_plan.SequenceOptions = .{};
+    errdefer options.deinit(alloc);
+    while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
+        try parseCreateSequenceOption(alloc, cursor, tokens, pos, &options);
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    sequence_transferred = true;
+    const out = CreateSequenceSyntax{
+        .sequence_name = sequence_name,
+        .if_not_exists = if_not_exists,
+        .options = options,
+    };
+    options = .{};
+    return out;
+}
+
+pub fn parseAlterSequenceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterSequenceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("sequence");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const sequence_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var sequence_transferred = false;
+    errdefer if (!sequence_transferred) alloc.free(sequence_name);
+    var operations = std.ArrayListUnmanaged(ddl_plan.SequenceAlterOperation).empty;
+    errdefer {
+        freeSequenceAlterOperations(alloc, operations.items);
+        operations.deinit(alloc);
+    }
+    while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
+        try parseAlterSequenceOperation(alloc, cursor, tokens, pos, &operations);
+    }
+    if (operations.items.len == 0) return error.UnsupportedSqlShape;
+    try parseAdapterNoopStatementEnd(cursor);
+    sequence_transferred = true;
+    return .{
+        .sequence_name = sequence_name,
+        .if_exists = if_exists,
+        .operations = try operations.toOwnedSlice(alloc),
+    };
+}
+
+pub fn parseDropSequenceCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropSequenceSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("sequence");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const sequence_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var sequence_transferred = false;
+    errdefer if (!sequence_transferred) alloc.free(sequence_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    sequence_transferred = true;
+    return .{ .sequence_name = sequence_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseIdentitySequenceOptionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    options: *ddl_plan.SequenceOptions,
+) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.peekKeyword("as") or cursor.peekKeyword("owned")) return error.UnsupportedSqlShape;
+    try parseCreateSequenceOption(alloc, cursor, tokens, pos, options);
+}
+
+pub fn parseCreateEnumTypeCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateEnumTypeSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("type");
+    const type_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var type_transferred = false;
+    errdefer if (!type_transferred) alloc.free(type_name);
+    try cursor.expectKeyword("as");
+    try cursor.expectKeyword("enum");
+    try cursor.expectToken(.lparen);
+    var values = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &values);
+    while (true) {
+        const value = try parseEnumLabelOwnedAlloc(alloc, cursor);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value);
+        for (values.items) |existing| {
+            if (std.mem.eql(u8, existing, value)) return error.UnsupportedSqlShape;
+        }
+        try values.append(alloc, value);
+        value_transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    if (values.items.len == 0) return error.UnsupportedSqlShape;
+    try cursor.expectToken(.rparen);
+    try parseAdapterNoopStatementEnd(cursor);
+    type_transferred = true;
+    return .{
+        .type_name = type_name,
+        .values = try values.toOwnedSlice(alloc),
+    };
+}
+
+pub fn parseAlterEnumTypeCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AddEnumValueSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("type");
+    const type_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var type_transferred = false;
+    errdefer if (!type_transferred) alloc.free(type_name);
+    try cursor.expectKeyword("add");
+    try cursor.expectKeyword("value");
+    var if_not_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("exists");
+        if_not_exists = true;
+    }
+    const value = try parseEnumLabelOwnedAlloc(alloc, cursor);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value);
+    var position: ddl_plan.EnumValuePosition = .none;
+    var neighbor_value: ?[]const u8 = null;
+    errdefer if (neighbor_value) |neighbor| alloc.free(@constCast(neighbor));
+    if (cursor.matchKeyword("before")) {
+        position = .before;
+        neighbor_value = try parseEnumLabelOwnedAlloc(alloc, cursor);
+    } else if (cursor.matchKeyword("after")) {
+        position = .after;
+        neighbor_value = try parseEnumLabelOwnedAlloc(alloc, cursor);
+    }
+    try parseAdapterNoopStatementEnd(cursor);
+    type_transferred = true;
+    value_transferred = true;
+    return .{
+        .type_name = type_name,
+        .value = value,
+        .if_not_exists = if_not_exists,
+        .position = position,
+        .neighbor_value = neighbor_value,
+    };
+}
+
+pub fn parseDropEnumTypeCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropEnumTypeSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("type");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const type_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var type_transferred = false;
+    errdefer if (!type_transferred) alloc.free(type_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    type_transferred = true;
+    return .{ .type_name = type_name, .if_exists = if_exists, .cascade = cascade };
+}
+
 pub fn parseCreateRoleCatalogTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2283,6 +2558,157 @@ pub fn parseSqlTableReferenceIdentifierOwnedAlloc(
     return try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
 }
 
+fn parseCreateSequenceOption(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+    options: *ddl_plan.SequenceOptions,
+) !void {
+    if (cursor.matchKeyword("as")) {
+        if (options.as_type != null) return error.UnsupportedSqlShape;
+        options.as_type = try parseSequenceTypeNameOwnedAlloc(alloc, cursor);
+    } else if (cursor.matchKeyword("owned")) {
+        try cursor.expectKeyword("by");
+        if (options.owned_by != null) return error.UnsupportedSqlShape;
+        options.owned_by = try parseSequenceOwnedByAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("start")) {
+        _ = cursor.matchKeyword("with");
+        if (options.start_with != null) return error.UnsupportedSqlShape;
+        options.start_with = try parseSequenceInteger(cursor);
+    } else if (cursor.matchKeyword("increment")) {
+        _ = cursor.matchKeyword("by");
+        if (options.increment_by != null) return error.UnsupportedSqlShape;
+        options.increment_by = try parseSequenceInteger(cursor);
+    } else if (cursor.matchKeyword("minvalue")) {
+        if (options.min_value_specified) return error.UnsupportedSqlShape;
+        options.min_value_specified = true;
+        options.min_value = try parseSequenceInteger(cursor);
+    } else if (cursor.matchKeyword("maxvalue")) {
+        if (options.max_value_specified) return error.UnsupportedSqlShape;
+        options.max_value_specified = true;
+        options.max_value = try parseSequenceInteger(cursor);
+    } else if (cursor.matchKeyword("cache")) {
+        if (options.cache != null) return error.UnsupportedSqlShape;
+        options.cache = try parseSequenceInteger(cursor);
+    } else if (cursor.matchKeyword("cycle")) {
+        if (options.cycle != null) return error.UnsupportedSqlShape;
+        options.cycle = true;
+    } else if (cursor.matchKeyword("no")) {
+        if (cursor.matchKeyword("minvalue")) {
+            if (options.min_value_specified) return error.UnsupportedSqlShape;
+            options.min_value_specified = true;
+            options.min_value = null;
+        } else if (cursor.matchKeyword("maxvalue")) {
+            if (options.max_value_specified) return error.UnsupportedSqlShape;
+            options.max_value_specified = true;
+            options.max_value = null;
+        } else if (cursor.matchKeyword("cycle")) {
+            if (options.cycle != null) return error.UnsupportedSqlShape;
+            options.cycle = false;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    } else {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn parseAlterSequenceOperation(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+    operations: *std.ArrayListUnmanaged(ddl_plan.SequenceAlterOperation),
+) !void {
+    if (cursor.matchKeyword("as")) {
+        const type_name = try parseSequenceTypeNameOwnedAlloc(alloc, cursor);
+        errdefer alloc.free(type_name);
+        try operations.append(alloc, .{ .set_type = type_name });
+    } else if (cursor.matchKeyword("owned")) {
+        try cursor.expectKeyword("by");
+        var owned_by = try parseSequenceOwnedByAlloc(alloc, tokens, pos);
+        errdefer owned_by.deinit(alloc);
+        try operations.append(alloc, .{ .set_owned_by = owned_by });
+    } else if (cursor.matchKeyword("restart")) {
+        const value = if (cursor.matchKeyword("with")) try parseSequenceInteger(cursor) else null;
+        try operations.append(alloc, .{ .restart = value });
+    } else if (cursor.matchKeyword("start")) {
+        _ = cursor.matchKeyword("with");
+        try operations.append(alloc, .{ .set_start = try parseSequenceInteger(cursor) });
+    } else if (cursor.matchKeyword("increment")) {
+        _ = cursor.matchKeyword("by");
+        try operations.append(alloc, .{ .set_increment = try parseSequenceInteger(cursor) });
+    } else if (cursor.matchKeyword("minvalue")) {
+        try operations.append(alloc, .{ .set_min = try parseSequenceInteger(cursor) });
+    } else if (cursor.matchKeyword("maxvalue")) {
+        try operations.append(alloc, .{ .set_max = try parseSequenceInteger(cursor) });
+    } else if (cursor.matchKeyword("cache")) {
+        try operations.append(alloc, .{ .set_cache = try parseSequenceInteger(cursor) });
+    } else if (cursor.matchKeyword("cycle")) {
+        try operations.append(alloc, .{ .set_cycle = true });
+    } else if (cursor.matchKeyword("no")) {
+        if (cursor.matchKeyword("minvalue")) {
+            try operations.append(alloc, .{ .set_min = null });
+        } else if (cursor.matchKeyword("maxvalue")) {
+            try operations.append(alloc, .{ .set_max = null });
+        } else if (cursor.matchKeyword("cycle")) {
+            try operations.append(alloc, .{ .set_cycle = false });
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    } else {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn parseSequenceTypeNameOwnedAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) ![]const u8 {
+    const token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(token.text, "smallint")) return try alloc.dupe(u8, "smallint");
+    if (std.ascii.eqlIgnoreCase(token.text, "integer") or std.ascii.eqlIgnoreCase(token.text, "int")) return try alloc.dupe(u8, "integer");
+    if (std.ascii.eqlIgnoreCase(token.text, "bigint")) return try alloc.dupe(u8, "bigint");
+    return error.UnsupportedSqlShape;
+}
+
+fn parseSequenceOwnedByAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.SequenceOwnedBy {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("none")) return .{};
+    const token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const raw = token.text;
+    const first_dot = std.mem.indexOfScalar(u8, raw, '.') orelse return error.UnsupportedSqlShape;
+    const table_start = if (std.ascii.eqlIgnoreCase(raw[0..first_dot], "public")) first_dot + 1 else 0;
+    const table_and_column = raw[table_start..];
+    const dot = std.mem.indexOfScalar(u8, table_and_column, '.') orelse return error.UnsupportedSqlShape;
+    if (std.mem.indexOfScalar(u8, table_and_column[dot + 1 ..], '.') != null) return error.UnsupportedSqlShape;
+    const table_name = table_and_column[0..dot];
+    const column_name = table_and_column[dot + 1 ..];
+    if (table_name.len == 0 or column_name.len == 0) return error.UnsupportedSqlShape;
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+    return .{
+        .table_name = owned_table_name,
+        .column_name = try alloc.dupe(u8, column_name),
+    };
+}
+
+fn parseSequenceInteger(cursor: parser.Cursor) !i64 {
+    const negative = cursor.matchToken(.minus) != null;
+    const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    if (std.mem.indexOfScalar(u8, token.text, '.') != null) return error.UnsupportedSqlShape;
+    const value = std.fmt.parseInt(i64, token.text, 10) catch return error.UnsupportedSqlShape;
+    return if (negative) -value else value;
+}
+
+fn parseEnumLabelOwnedAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) ![]const u8 {
+    const token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+    if (token.text.len == 0) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
 fn parsePrivilegeListAlloc(
     alloc: std.mem.Allocator,
     cursor: parser.Cursor,
@@ -2595,6 +3021,21 @@ fn freeStringList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]cons
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(@constCast(value));
     if (values.len > 0) alloc.free(values);
+}
+
+fn freeSequenceAlterOperation(alloc: std.mem.Allocator, operation: ddl_plan.SequenceAlterOperation) void {
+    switch (operation) {
+        .set_type => |value| alloc.free(@constCast(value)),
+        .set_owned_by => |owned_by| {
+            var owned_by_mut = owned_by;
+            owned_by_mut.deinit(alloc);
+        },
+        else => {},
+    }
+}
+
+fn freeSequenceAlterOperations(alloc: std.mem.Allocator, operations: []const ddl_plan.SequenceAlterOperation) void {
+    for (operations) |operation| freeSequenceAlterOperation(alloc, operation);
 }
 
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
@@ -3220,6 +3661,110 @@ test "sql adapter grammar parses routine catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses sequence catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "SEQUENCE IF NOT EXISTS public.order_id_seq AS bigint START WITH 10 INCREMENT BY 2 MINVALUE 1 MAXVALUE 99 CACHE 5 CYCLE OWNED BY public.orders.id;");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateSequenceCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("order_id_seq", create.sequence_name);
+    try std.testing.expect(create.if_not_exists);
+    try std.testing.expectEqualStrings("bigint", create.options.as_type.?);
+    try std.testing.expectEqual(@as(i64, 10), create.options.start_with.?);
+    try std.testing.expectEqual(@as(i64, 2), create.options.increment_by.?);
+    try std.testing.expect(create.options.min_value_specified);
+    try std.testing.expectEqual(@as(i64, 1), create.options.min_value.?);
+    try std.testing.expect(create.options.max_value_specified);
+    try std.testing.expectEqual(@as(i64, 99), create.options.max_value.?);
+    try std.testing.expectEqual(@as(i64, 5), create.options.cache.?);
+    try std.testing.expectEqual(true, create.options.cycle.?);
+    try std.testing.expectEqualStrings("orders", create.options.owned_by.?.table_name);
+    try std.testing.expectEqualStrings("id", create.options.owned_by.?.column_name);
+
+    var alter_tokens = try lexer.tokenizeAlloc(alloc, "SEQUENCE IF EXISTS order_id_seq RESTART WITH 1000 INCREMENT BY -5 NO CYCLE;");
+    defer lexer.freeTokens(alloc, &alter_tokens);
+    var alter_pos: usize = 0;
+    var alter = try parseAlterSequenceCatalogTailAlloc(alloc, alter_tokens.items, &alter_pos);
+    defer alter.deinit(alloc);
+    try std.testing.expectEqual(alter_tokens.items.len, alter_pos);
+    try std.testing.expectEqualStrings("order_id_seq", alter.sequence_name);
+    try std.testing.expect(alter.if_exists);
+    try std.testing.expectEqual(@as(usize, 3), alter.operations.len);
+    switch (alter.operations[0]) {
+        .restart => |value| try std.testing.expectEqual(@as(i64, 1000), value.?),
+        else => return error.TestExpectedEqual,
+    }
+    switch (alter.operations[1]) {
+        .set_increment => |value| try std.testing.expectEqual(@as(i64, -5), value),
+        else => return error.TestExpectedEqual,
+    }
+    switch (alter.operations[2]) {
+        .set_cycle => |value| try std.testing.expectEqual(false, value),
+        else => return error.TestExpectedEqual,
+    }
+
+    var drop_tokens = try lexer.tokenizeAlloc(alloc, "SEQUENCE IF EXISTS public.order_id_seq CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_tokens);
+    var drop_pos: usize = 0;
+    var drop = try parseDropSequenceCatalogTailAlloc(alloc, drop_tokens.items, &drop_pos);
+    defer drop.deinit(alloc);
+    try std.testing.expectEqual(drop_tokens.items.len, drop_pos);
+    try std.testing.expectEqualStrings("order_id_seq", drop.sequence_name);
+    try std.testing.expect(drop.if_exists);
+    try std.testing.expect(drop.cascade);
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "SEQUENCE order_id_seq START 1 START 2;");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateSequenceCatalogTailAlloc(alloc, duplicate_tokens.items, &duplicate_pos));
+}
+
+test "sql adapter grammar parses enum type catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var create_tokens = try lexer.tokenizeAlloc(alloc, "TYPE public.order_status AS ENUM ('new', 'paid', 'shipped');");
+    defer lexer.freeTokens(alloc, &create_tokens);
+    var create_pos: usize = 0;
+    var create = try parseCreateEnumTypeCatalogTailAlloc(alloc, create_tokens.items, &create_pos);
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(create_tokens.items.len, create_pos);
+    try std.testing.expectEqualStrings("order_status", create.type_name);
+    try std.testing.expectEqual(@as(usize, 3), create.values.len);
+    try std.testing.expectEqualStrings("new", create.values[0]);
+    try std.testing.expectEqualStrings("paid", create.values[1]);
+    try std.testing.expectEqualStrings("shipped", create.values[2]);
+
+    var alter_tokens = try lexer.tokenizeAlloc(alloc, "TYPE order_status ADD VALUE IF NOT EXISTS 'returned' AFTER 'shipped';");
+    defer lexer.freeTokens(alloc, &alter_tokens);
+    var alter_pos: usize = 0;
+    var alter = try parseAlterEnumTypeCatalogTailAlloc(alloc, alter_tokens.items, &alter_pos);
+    defer alter.deinit(alloc);
+    try std.testing.expectEqual(alter_tokens.items.len, alter_pos);
+    try std.testing.expectEqualStrings("order_status", alter.type_name);
+    try std.testing.expectEqualStrings("returned", alter.value);
+    try std.testing.expect(alter.if_not_exists);
+    try std.testing.expectEqual(ddl_plan.EnumValuePosition.after, alter.position);
+    try std.testing.expectEqualStrings("shipped", alter.neighbor_value.?);
+
+    var drop_tokens = try lexer.tokenizeAlloc(alloc, "TYPE IF EXISTS public.order_status RESTRICT;");
+    defer lexer.freeTokens(alloc, &drop_tokens);
+    var drop_pos: usize = 0;
+    var drop = try parseDropEnumTypeCatalogTailAlloc(alloc, drop_tokens.items, &drop_pos);
+    defer drop.deinit(alloc);
+    try std.testing.expectEqual(drop_tokens.items.len, drop_pos);
+    try std.testing.expectEqualStrings("order_status", drop.type_name);
+    try std.testing.expect(drop.if_exists);
+    try std.testing.expect(!drop.cascade);
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "TYPE order_status AS ENUM ('new', 'new');");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateEnumTypeCatalogTailAlloc(alloc, duplicate_tokens.items, &duplicate_pos));
 }
 
 test "sql adapter grammar parses authorization catalog tails" {
