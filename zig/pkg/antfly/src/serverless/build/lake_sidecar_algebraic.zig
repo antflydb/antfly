@@ -52,6 +52,32 @@ pub const AlgebraicGroupBySidecarPublishResult = struct {
     }
 };
 
+pub const AlgebraicExpressionSidecarBuildOptions = struct {
+    name: []const u8,
+    expressions: []const algebraic_segment.ExpressionSpec,
+    artifact_id: []const u8 = &.{},
+};
+
+pub const AlgebraicExpressionSidecarBuildResult = struct {
+    payload: []u8,
+    declaration: sidecar_manifest.DeclaredArtifact,
+
+    pub fn deinit(self: *AlgebraicExpressionSidecarBuildResult, alloc: Allocator) void {
+        alloc.free(self.payload);
+        freeOwnedDeclaration(alloc, self.declaration);
+        self.* = undefined;
+    }
+};
+
+pub const AlgebraicExpressionSidecarPublishResult = struct {
+    declaration: sidecar_manifest.DeclaredArtifact,
+
+    pub fn deinit(self: *AlgebraicExpressionSidecarPublishResult, alloc: Allocator) void {
+        freeOwnedDeclaration(alloc, self.declaration);
+        self.* = undefined;
+    }
+};
+
 pub fn buildAlgebraicGroupBySidecarFromRowSourceAlloc(
     alloc: Allocator,
     source: rowsource.Source,
@@ -126,6 +152,74 @@ pub fn publishAlgebraicGroupBySidecarFromRowSourceAlloc(
     return .{ .declaration = built.declaration };
 }
 
+pub fn buildAlgebraicExpressionSidecarFromRowSourceAlloc(
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: AlgebraicExpressionSidecarBuildOptions,
+) !AlgebraicExpressionSidecarBuildResult {
+    try validateExpressionOptions(binding, source.kind, options);
+
+    const accumulators = try alloc.alloc(ExpressionAccumulator, options.expressions.len);
+    defer alloc.free(accumulators);
+    for (options.expressions, accumulators) |spec, *accumulator| {
+        accumulator.* = initExpressionAccumulator(spec.op);
+    }
+
+    while (try source.next(alloc)) |batch| {
+        try source_binding.validateBatchAgainstBinding(binding, batch);
+        try appendBatchExpressions(accumulators, batch, options);
+    }
+
+    var materialization = try accumulatorsToExpressionMaterializationAlloc(alloc, accumulators, binding, options);
+    defer algebraic_segment.freeExpressionMaterialization(alloc, &materialization);
+
+    const payload = try algebraic_segment.encodeExpressionAlloc(alloc, materialization);
+    errdefer alloc.free(payload);
+
+    var declaration = try declaredArtifactForNameAlloc(
+        alloc,
+        binding,
+        options.name,
+        options.artifact_id,
+        payload.len,
+        "lake-algebraic-expression",
+    );
+    errdefer freeOwnedDeclaration(alloc, declaration);
+    try declaration.validate();
+
+    return .{
+        .payload = payload,
+        .declaration = declaration,
+    };
+}
+
+pub fn publishAlgebraicExpressionSidecarFromRowSourceAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: AlgebraicExpressionSidecarBuildOptions,
+) !AlgebraicExpressionSidecarPublishResult {
+    var built = try buildAlgebraicExpressionSidecarFromRowSourceAlloc(alloc, source, binding, options);
+    defer alloc.free(built.payload);
+    errdefer freeOwnedDeclaration(alloc, built.declaration);
+
+    var metadata = try artifacts.put(built.payload);
+    var metadata_owned = true;
+    errdefer if (metadata_owned) metadata.deinit(alloc);
+
+    alloc.free(built.declaration.artifact.artifact_id);
+    alloc.free(built.declaration.artifact.checksum);
+    built.declaration.artifact.artifact_id = metadata.artifact_id;
+    built.declaration.artifact.byte_len = metadata.byte_len;
+    built.declaration.artifact.checksum = metadata.checksum;
+    metadata_owned = false;
+
+    try built.declaration.validate();
+    return .{ .declaration = built.declaration };
+}
+
 fn validateGroupByOptions(
     binding: source_binding.Binding,
     source_kind: rowsource.SourceKind,
@@ -148,6 +242,51 @@ fn validateGroupByOptions(
     if (options.op != .count and !std.mem.eql(u8, binding.column_bindings[1], options.value_column)) {
         return error.SidecarSourceBindingMismatch;
     }
+}
+
+fn validateExpressionOptions(
+    binding: source_binding.Binding,
+    source_kind: rowsource.SourceKind,
+    options: AlgebraicExpressionSidecarBuildOptions,
+) !void {
+    try binding.validate();
+    if (binding.sidecar_kind != .algebraic) return error.InvalidLakeSidecarAlgebraicBuildOptions;
+    if (source_kind != binding.source_kind) return error.SidecarSourceBindingMismatch;
+    if (options.name.len == 0 or options.expressions.len == 0) {
+        return error.InvalidLakeSidecarAlgebraicBuildOptions;
+    }
+
+    var expected_binding_idx: usize = 0;
+    for (options.expressions, 0..) |expression, expression_idx| {
+        if (expression.name.len == 0) return error.InvalidLakeSidecarAlgebraicBuildOptions;
+        for (options.expressions[0..expression_idx]) |previous| {
+            if (std.mem.eql(u8, previous.name, expression.name)) {
+                return error.InvalidLakeSidecarAlgebraicBuildOptions;
+            }
+        }
+
+        if (expression.op == .count) {
+            if (expression.value_column.len != 0) return error.InvalidLakeSidecarAlgebraicBuildOptions;
+            continue;
+        }
+        if (expression.value_column.len == 0) return error.InvalidLakeSidecarAlgebraicBuildOptions;
+
+        var first_value_column_use = true;
+        for (options.expressions[0..expression_idx]) |previous| {
+            if (previous.op != .count and std.mem.eql(u8, previous.value_column, expression.value_column)) {
+                first_value_column_use = false;
+                break;
+            }
+        }
+        if (first_value_column_use) {
+            if (expected_binding_idx >= binding.column_bindings.len) return error.InvalidLakeSidecarAlgebraicBuildOptions;
+            if (!std.mem.eql(u8, binding.column_bindings[expected_binding_idx], expression.value_column)) {
+                return error.SidecarSourceBindingMismatch;
+            }
+            expected_binding_idx += 1;
+        }
+    }
+    if (expected_binding_idx != binding.column_bindings.len) return error.InvalidLakeSidecarAlgebraicBuildOptions;
 }
 
 fn appendBatchGroupBy(
@@ -207,6 +346,62 @@ fn combine(
     };
 }
 
+const ExpressionAccumulator = struct {
+    value: algebraic_segment.AggregateValue,
+    seen_non_null: bool,
+};
+
+fn initExpressionAccumulator(op: algebraic_segment.AggregateOp) ExpressionAccumulator {
+    return .{
+        .value = switch (op) {
+            .count => .{ .count = 0 },
+            .sum_i64 => .{ .sum_i64 = 0 },
+            .min_i64 => .{ .min_i64 = 0 },
+            .max_i64 => .{ .max_i64 = 0 },
+        },
+        .seen_non_null = switch (op) {
+            .count, .sum_i64 => true,
+            .min_i64, .max_i64 => false,
+        },
+    };
+}
+
+fn appendBatchExpressions(
+    accumulators: []ExpressionAccumulator,
+    batch: rowsource.ColumnBatch,
+    options: AlgebraicExpressionSidecarBuildOptions,
+) !void {
+    for (options.expressions, accumulators) |expression, *accumulator| {
+        if (expression.op == .count) {
+            accumulator.value.count += @intCast(batch.rowCount());
+            continue;
+        }
+
+        const value_column = batch.findColumn(expression.value_column) orelse return error.RowSourceColumnNotFound;
+        if (value_column.kind() != .i64) return error.UnsupportedAlgebraicValueColumnKind;
+        for (0..batch.rowCount()) |row_idx| {
+            if (value_column.nulls.isNull(row_idx)) continue;
+            const value = value_column.values.i64[row_idx];
+            switch (expression.op) {
+                .count => unreachable,
+                .sum_i64 => accumulator.value.sum_i64 += value,
+                .min_i64 => {
+                    if (!accumulator.seen_non_null or value < accumulator.value.min_i64) {
+                        accumulator.value.min_i64 = value;
+                    }
+                    accumulator.seen_non_null = true;
+                },
+                .max_i64 => {
+                    if (!accumulator.seen_non_null or value > accumulator.value.max_i64) {
+                        accumulator.value.max_i64 = value;
+                    }
+                    accumulator.seen_non_null = true;
+                },
+            }
+        }
+    }
+}
+
 fn groupMapToSegmentAlloc(
     alloc: Allocator,
     folds: *std.StringHashMapUnmanaged(algebraic_segment.AggregateValue),
@@ -249,6 +444,54 @@ fn groupMapToSegmentAlloc(
     return segment;
 }
 
+fn accumulatorsToExpressionMaterializationAlloc(
+    alloc: Allocator,
+    accumulators: []const ExpressionAccumulator,
+    binding: source_binding.Binding,
+    options: AlgebraicExpressionSidecarBuildOptions,
+) !algebraic_segment.ExpressionMaterialization {
+    const expressions = try alloc.alloc(algebraic_segment.ExpressionFold, options.expressions.len);
+    errdefer alloc.free(expressions);
+    var initialized: usize = 0;
+    errdefer {
+        for (expressions[0..initialized]) |*expression| expression.deinit(alloc);
+    }
+
+    for (options.expressions, accumulators, expressions) |spec, accumulator, *out| {
+        switch (spec.op) {
+            .count, .sum_i64 => {},
+            .min_i64, .max_i64 => if (!accumulator.seen_non_null) return error.EmptyAlgebraicExpressionFold,
+        }
+
+        const name = try alloc.dupe(u8, spec.name);
+        errdefer alloc.free(name);
+        var value_column: []u8 = &.{};
+        if (spec.value_column.len != 0) value_column = try alloc.dupe(u8, spec.value_column);
+        errdefer if (value_column.len != 0) alloc.free(value_column);
+
+        out.* = .{
+            .name = name,
+            .value_column = value_column,
+            .op = spec.op,
+            .value = accumulator.value,
+        };
+        initialized += 1;
+    }
+
+    var materialization = algebraic_segment.ExpressionMaterialization{
+        .source = .{
+            .kind = try algebraicSourceKind(binding.source_kind),
+            .snapshot_id = try alloc.dupe(u8, binding.snapshot_id),
+            .schema_fingerprint = try alloc.dupe(u8, binding.schema_fingerprint),
+            .source_id = if (binding.source_id.len == 0) &.{} else try alloc.dupe(u8, binding.source_id),
+        },
+        .expressions = expressions,
+    };
+    errdefer materialization.deinit(alloc);
+    try materialization.validate();
+    return materialization;
+}
+
 fn algebraicSourceKind(kind: rowsource.SourceKind) !algebraic_segment.SourceKind {
     return switch (kind) {
         .serverless_fragment => .serverless_fragment,
@@ -270,18 +513,29 @@ fn declaredArtifactAlloc(
     options: AlgebraicGroupBySidecarBuildOptions,
     payload_len: usize,
 ) !sidecar_manifest.DeclaredArtifact {
-    const name = try alloc.dupe(u8, options.name);
+    return declaredArtifactForNameAlloc(alloc, binding, options.name, options.artifact_id, payload_len, "lake-algebraic");
+}
+
+fn declaredArtifactForNameAlloc(
+    alloc: Allocator,
+    binding: source_binding.Binding,
+    artifact_name_value: []const u8,
+    explicit_artifact_id: []const u8,
+    payload_len: usize,
+    default_artifact_prefix: []const u8,
+) !sidecar_manifest.DeclaredArtifact {
+    const name = try alloc.dupe(u8, artifact_name_value);
     errdefer alloc.free(name);
-    const artifact_name = try alloc.dupe(u8, options.name);
+    const artifact_name = try alloc.dupe(u8, artifact_name_value);
     errdefer alloc.free(artifact_name);
-    const artifact_id = if (options.artifact_id.len == 0)
+    const artifact_id = if (explicit_artifact_id.len == 0)
         try std.fmt.allocPrint(
             alloc,
-            "lake-algebraic:{d}:{s}:{d}:{s}:{d}",
-            .{ options.name.len, options.name, binding.snapshot_id.len, binding.snapshot_id, payload_len },
+            "{s}:{d}:{s}:{d}:{s}:{d}",
+            .{ default_artifact_prefix, artifact_name_value.len, artifact_name_value, binding.snapshot_id.len, binding.snapshot_id, payload_len },
         )
     else
-        try alloc.dupe(u8, options.artifact_id);
+        try alloc.dupe(u8, explicit_artifact_id);
     errdefer alloc.free(artifact_id);
     const checksum = try std.fmt.allocPrint(alloc, "len:{d}", .{payload_len});
     errdefer alloc.free(checksum);
@@ -616,6 +870,179 @@ test "lake algebraic group-by sidecar builder rejects stale source batches" {
             .name = "orders.count_by_tenant",
             .group_column = "tenant",
             .op = .count,
+        }),
+    );
+}
+
+test "lake algebraic expression sidecar builder folds external row source batches" {
+    const alloc = std.testing.allocator;
+    const external_binding = external_rowsource.Binding{
+        .format = .iceberg,
+        .source_id = "orders",
+        .source_uri = "s3://bucket/warehouse/orders",
+        .snapshot_id = "iceberg-237",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs_a = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 1),
+    };
+    const amounts_a = [_]i64{ 7, 11 };
+    const columns_a = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts_a } },
+    };
+    const row_refs_b = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "file-b.parquet", 0, 0),
+        try external_rowsource.makeRowRef(external_binding, "file-b.parquet", 0, 1),
+    };
+    const amounts_b = [_]i64{ 13, 0 };
+    const amount_nulls_b = [_]u8{ 0, 1 };
+    const columns_b = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts_b }, .nulls = .{ .bytes = &amount_nulls_b } },
+    };
+    const batches = [_]rowsource.ColumnBatch{
+        .{ .snapshot = external_binding.snapshot(), .row_refs = &row_refs_a, .columns = &columns_a },
+        .{ .snapshot = external_binding.snapshot(), .row_refs = &row_refs_b, .columns = &columns_b },
+    };
+
+    var batch_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+    const binding = source_binding.bindingFromSnapshot(
+        .algebraic,
+        .external_iceberg,
+        external_binding.snapshot(),
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"amount"},
+        "sha256:expr:v1",
+    );
+    const expressions = [_]algebraic_segment.ExpressionSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+        .{ .name = "amount_min", .value_column = "amount", .op = .min_i64 },
+        .{ .name = "amount_max", .value_column = "amount", .op = .max_i64 },
+    };
+
+    var result = try buildAlgebraicExpressionSidecarFromRowSourceAlloc(alloc, batch_source.rowSource(), binding, .{
+        .name = "orders.amount_expression_folds",
+        .expressions = &expressions,
+    });
+    defer result.deinit(alloc);
+
+    try result.declaration.validate();
+    try sidecar_manifest.validateBatchAgainstDeclaredArtifact(result.declaration, batches[0]);
+
+    var materialization = try algebraic_segment.decodeExpressionAlloc(alloc, result.payload);
+    defer algebraic_segment.freeExpressionMaterialization(alloc, &materialization);
+    try std.testing.expectEqual(algebraic_segment.SourceKind.external_iceberg, materialization.source.kind);
+    try std.testing.expectEqualStrings("orders", materialization.source.source_id);
+    try std.testing.expectEqual(@as(usize, 4), materialization.expressions.len);
+    try std.testing.expectEqual(@as(u64, 4), materialization.expressions[0].value.count);
+    try std.testing.expectEqual(@as(i64, 31), materialization.expressions[1].value.sum_i64);
+    try std.testing.expectEqual(@as(i64, 7), materialization.expressions[2].value.min_i64);
+    try std.testing.expectEqual(@as(i64, 13), materialization.expressions[3].value.max_i64);
+}
+
+test "lake algebraic expression sidecar publisher writes artifact store metadata into declaration" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    const external_binding = external_rowsource.Binding{
+        .format = .iceberg,
+        .source_id = "orders",
+        .source_uri = "s3://bucket/warehouse/orders",
+        .snapshot_id = "iceberg-238",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 1),
+    };
+    const amounts = [_]i64{ 3, 5 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{
+        .{ .snapshot = external_binding.snapshot(), .row_refs = &row_refs, .columns = &columns },
+    };
+
+    var batch_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+    const binding = source_binding.bindingFromSnapshot(
+        .algebraic,
+        .external_iceberg,
+        external_binding.snapshot(),
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"amount"},
+        "sha256:expr:v1",
+    );
+    const expressions = [_]algebraic_segment.ExpressionSpec{
+        .{ .name = "row_count", .op = .count },
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+    };
+
+    var result = try publishAlgebraicExpressionSidecarFromRowSourceAlloc(
+        alloc,
+        &artifacts,
+        batch_source.rowSource(),
+        binding,
+        .{
+            .name = "orders.amount_expression_folds",
+            .expressions = &expressions,
+        },
+    );
+    defer result.deinit(alloc);
+
+    try result.declaration.validate();
+    try std.testing.expectEqualStrings("mem:algebraic-sidecar", result.declaration.artifact.artifact_id);
+
+    const stored = try artifacts.getAlloc(result.declaration.artifact.artifact_id);
+    defer alloc.free(stored);
+    var materialization = try algebraic_segment.decodeExpressionAlloc(alloc, stored);
+    defer algebraic_segment.freeExpressionMaterialization(alloc, &materialization);
+    try std.testing.expectEqual(@as(usize, 2), materialization.expressions.len);
+    try std.testing.expectEqual(@as(u64, 2), materialization.expressions[0].value.count);
+    try std.testing.expectEqual(@as(i64, 8), materialization.expressions[1].value.sum_i64);
+}
+
+test "lake algebraic expression sidecar builder rejects stale source batches" {
+    const alloc = std.testing.allocator;
+    const external_binding = external_rowsource.Binding{
+        .format = .iceberg,
+        .source_id = "orders",
+        .source_uri = "s3://bucket/warehouse/orders",
+        .snapshot_id = "iceberg-239",
+        .schema_fingerprint = "schema-v1",
+    };
+    const row_refs = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "file-a.parquet", 0, 0),
+    };
+    const amounts = [_]i64{7};
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amounts } },
+    };
+    const batches = [_]rowsource.ColumnBatch{
+        .{ .snapshot = external_binding.snapshot(), .row_refs = &row_refs, .columns = &columns },
+    };
+
+    var batch_source = try external_rowsource.BatchSource.init(external_binding, &batches);
+    const stale_snapshot = rowsource.SnapshotRef{ .table_id = "orders", .snapshot_id = "iceberg-238" };
+    const binding = source_binding.bindingFromSnapshot(
+        .algebraic,
+        .external_iceberg,
+        stale_snapshot,
+        external_binding.schema_fingerprint,
+        &[_][]const u8{"amount"},
+        "sha256:expr:v1",
+    );
+    const expressions = [_]algebraic_segment.ExpressionSpec{
+        .{ .name = "amount_sum", .value_column = "amount", .op = .sum_i64 },
+    };
+
+    try std.testing.expectError(
+        error.SidecarSourceBindingMismatch,
+        buildAlgebraicExpressionSidecarFromRowSourceAlloc(alloc, batch_source.rowSource(), binding, .{
+            .name = "orders.amount_expression_folds",
+            .expressions = &expressions,
         }),
     );
 }
