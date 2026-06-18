@@ -9602,10 +9602,7 @@ fn buildBulkParentFromNodeRange(
     nodes: []BuiltBulkNode,
     level: u16,
 ) !BuiltBulkNode {
-    const indexes = try self.alloc.alloc(usize, nodes.len);
-    defer self.alloc.free(indexes);
-    for (indexes, 0..) |*index, i| index.* = i;
-    return try buildBulkParentFromNodeIndexes(self, txn, nodes, indexes, level);
+    return try buildBulkParentFromNodeSelection(self, txn, nodes, null, level);
 }
 
 fn buildBulkParentFromNodeIndexes(
@@ -9615,8 +9612,19 @@ fn buildBulkParentFromNodeIndexes(
     indexes: []const usize,
     level: u16,
 ) !BuiltBulkNode {
+    return try buildBulkParentFromNodeSelection(self, txn, nodes, indexes, level);
+}
+
+fn buildBulkParentFromNodeSelection(
+    self: anytype,
+    txn: anytype,
+    nodes: []BuiltBulkNode,
+    indexes: ?[]const usize,
+    level: u16,
+) !BuiltBulkNode {
     const node_id = self.nextNodeId();
-    var child_ids = try self.alloc.alloc(u64, indexes.len);
+    const child_count = if (indexes) |selected| selected.len else nodes.len;
+    var child_ids = try self.alloc.alloc(u64, child_count);
     errdefer self.alloc.free(child_ids);
 
     const centroid = try self.alloc.alloc(f32, self.config.dims);
@@ -9627,7 +9635,8 @@ fn buildBulkParentFromNodeIndexes(
     errdefer if (merged_range) |*owned| owned.deinit(self.alloc);
 
     var member_count: usize = 0;
-    for (indexes, 0..) |node_index, i| {
+    for (0..child_count) |i| {
+        const node_index = if (indexes) |selected| selected[i] else i;
         const child = &nodes[node_index];
         child_ids[i] = child.node_id;
         addWeightedVector(centroid, child.centroid, child.member_count);
