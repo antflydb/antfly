@@ -414,6 +414,18 @@ const PlainI64Mode = enum {
     dictionary_optional,
     int96_timestamp_required,
     int96_timestamp_optional,
+    timestamp_millis_required,
+    timestamp_millis_optional,
+    timestamp_millis_dictionary_required,
+    timestamp_millis_dictionary_optional,
+    timestamp_micros_required,
+    timestamp_micros_optional,
+    timestamp_micros_dictionary_required,
+    timestamp_micros_dictionary_optional,
+    timestamp_nanos_required,
+    timestamp_nanos_optional,
+    timestamp_nanos_dictionary_required,
+    timestamp_nanos_dictionary_optional,
 };
 
 const SupportedColumnMode = union(enum) {
@@ -542,6 +554,36 @@ fn buildPlainI64RowGroupBatchAlloc(
                 },
                 .int96_timestamp_optional => {
                     var decoded = try parquet_page.scanOptionalPlainInt96TimestampNsColumnChunkAlloc(alloc, input.bytes, compression);
+                    decoded_columns[idx] = .{ .i64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
+                },
+                .timestamp_millis_required, .timestamp_micros_required, .timestamp_nanos_required => {
+                    const values = try parquet_page.scanPlainI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    errdefer alloc.free(values);
+                    try scaleTimestampNsValues(values, timestampScaleFactorForMode(i64_mode));
+                    decoded_columns[idx] = .{ .i64 = values };
+                    null_bitmaps[idx] = &.{};
+                },
+                .timestamp_millis_optional, .timestamp_micros_optional, .timestamp_nanos_optional => {
+                    var decoded = try parquet_page.scanOptionalPlainI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    errdefer decoded.deinit(alloc);
+                    try scaleTimestampNsValues(decoded.values, timestampScaleFactorForMode(i64_mode));
+                    decoded_columns[idx] = .{ .i64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                    decoded = undefined;
+                },
+                .timestamp_millis_dictionary_required, .timestamp_micros_dictionary_required, .timestamp_nanos_dictionary_required => {
+                    const values = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    errdefer alloc.free(values);
+                    try scaleTimestampNsValues(values, timestampScaleFactorForMode(i64_mode));
+                    decoded_columns[idx] = .{ .i64 = values };
+                    null_bitmaps[idx] = &.{};
+                },
+                .timestamp_millis_dictionary_optional, .timestamp_micros_dictionary_optional, .timestamp_nanos_dictionary_optional => {
+                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    errdefer decoded.deinit(alloc);
+                    try scaleTimestampNsValues(decoded.values, timestampScaleFactorForMode(i64_mode));
                     decoded_columns[idx] = .{ .i64 = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
@@ -1189,8 +1231,32 @@ fn plainI64ModeForColumnChunk(chunk: external_source.ColumnChunk) !PlainI64Mode 
     return error.UnsupportedParquetPage;
 }
 
+fn timestampI64ModeForColumnChunk(chunk: external_source.ColumnChunk, unit: TimestampUnit) !PlainI64Mode {
+    if (chunk.physical_type.len != 0 and !std.ascii.eqlIgnoreCase(chunk.physical_type, "int64")) return error.UnsupportedParquetPage;
+    if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) {
+        return switch (unit) {
+            .millis => if (chunk.nullable) .timestamp_millis_optional else .timestamp_millis_required,
+            .micros => if (chunk.nullable) .timestamp_micros_optional else .timestamp_micros_required,
+            .nanos => if (chunk.nullable) .timestamp_nanos_optional else .timestamp_nanos_required,
+        };
+    }
+    if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
+        std.ascii.eqlIgnoreCase(chunk.encoding, "plain_dictionary"))
+    {
+        return switch (unit) {
+            .millis => if (chunk.nullable) .timestamp_millis_dictionary_optional else .timestamp_millis_dictionary_required,
+            .micros => if (chunk.nullable) .timestamp_micros_dictionary_optional else .timestamp_micros_dictionary_required,
+            .nanos => if (chunk.nullable) .timestamp_nanos_dictionary_optional else .timestamp_nanos_dictionary_required,
+        };
+    }
+    return error.UnsupportedParquetPage;
+}
+
 fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !SupportedColumnMode {
     if (chunk.physical_type.len == 0 or std.ascii.eqlIgnoreCase(chunk.physical_type, "int64")) {
+        if (timestampUnitForLogicalType(chunk.logical_type)) |unit| {
+            return .{ .i64 = try timestampI64ModeForColumnChunk(chunk, unit) };
+        }
         return .{ .i64 = try plainI64ModeForColumnChunk(chunk) };
     }
     if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32")) {
@@ -1232,6 +1298,47 @@ fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !Suppor
         }
     }
     return error.UnsupportedParquetPage;
+}
+
+const TimestampUnit = enum {
+    millis,
+    micros,
+    nanos,
+};
+
+fn timestampUnitForLogicalType(logical_type: []const u8) ?TimestampUnit {
+    if (std.ascii.eqlIgnoreCase(logical_type, "timestamp_millis")) return .millis;
+    if (std.ascii.eqlIgnoreCase(logical_type, "timestamp_micros")) return .micros;
+    if (std.ascii.eqlIgnoreCase(logical_type, "timestamp_nanos")) return .nanos;
+    return null;
+}
+
+fn timestampScaleFactorForMode(mode: PlainI64Mode) i64 {
+    return switch (mode) {
+        .timestamp_millis_required,
+        .timestamp_millis_optional,
+        .timestamp_millis_dictionary_required,
+        .timestamp_millis_dictionary_optional,
+        => 1_000_000,
+        .timestamp_micros_required,
+        .timestamp_micros_optional,
+        .timestamp_micros_dictionary_required,
+        .timestamp_micros_dictionary_optional,
+        => 1_000,
+        .timestamp_nanos_required,
+        .timestamp_nanos_optional,
+        .timestamp_nanos_dictionary_required,
+        .timestamp_nanos_dictionary_optional,
+        => 1,
+        else => unreachable,
+    };
+}
+
+fn scaleTimestampNsValues(values: []i64, scale_factor: i64) !void {
+    if (scale_factor == 1) return;
+    for (values) |*value| {
+        value.* = std.math.mul(i64, value.*, scale_factor) catch return error.InvalidParquetPage;
+    }
 }
 
 fn compressionCodecForColumnChunk(chunk: external_source.ColumnChunk) !parquet_page.CompressionCodec {
@@ -3172,6 +3279,93 @@ test "parquet row group batch dispatches int96 timestamp columns from inventory"
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[1].nulls.bytes);
 
     var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "created_at", "processed_at" });
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+}
+
+test "parquet row group batch dispatches logical int64 timestamp columns from inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "sha256:objects"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v1"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-a.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
+        .etag = try alloc.dupe(u8, "etag-a"),
+        .byte_len = 2048,
+        .row_count = 3,
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 3,
+            .file_offset = 100,
+            .total_byte_len = 288,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "created_ms"),
+                    .file_offset = 100,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int64"),
+                    .logical_type = try alloc.dupe(u8, "timestamp_millis"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "processed_us"),
+                    .file_offset = 196,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int64"),
+                    .logical_type = try alloc.dupe(u8, "timestamp_micros"),
+                    .nullable = true,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "event_ns"),
+                    .file_offset = 292,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "rle_dictionary"),
+                    .physical_type = try alloc.dupe(u8, "int64"),
+                    .logical_type = try alloc.dupe(u8, "timestamp_nanos"),
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var created_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer created_chunk.deinit(alloc);
+    try appendPlainI64DataPage(&created_chunk, alloc, &[_]i64{ 1, 2, 3 });
+
+    var processed_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer processed_chunk.deinit(alloc);
+    try appendOptionalPlainI64DataPageV2(&processed_chunk, alloc, &[_]?i64{ 4, null, 5 });
+
+    var event_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer event_chunk.deinit(alloc);
+    try appendPlainI64DictionaryPage(&event_chunk, alloc, &[_]i64{ 6, 7 });
+    try appendDictionaryI64DataPage(&event_chunk, alloc, 3, 1, &[_]u8{ 3, 0b00000110 });
+
+    var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
+        .{ .column_id = "created_ms", .bytes = created_chunk.items },
+        .{ .column_id = "processed_us", .bytes = processed_chunk.items },
+        .{ .column_id = "event_ns", .bytes = event_chunk.items },
+    });
+    defer owned.deinit(alloc);
+
+    try owned.batch.validate();
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1_000_000, 2_000_000, 3_000_000 }, owned.batch.columns[0].values.i64);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 4_000, 0, 5_000 }, owned.batch.columns[1].values.i64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[1].nulls.bytes);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 6, 7, 7 }, owned.batch.columns[2].values.i64);
+
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "created_ms", "processed_us", "event_ns" });
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 }

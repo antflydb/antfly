@@ -32,6 +32,7 @@ pub const ColumnChunk = struct {
     compression_codec: []u8 = &.{},
     encoding: []u8 = &.{},
     physical_type: []u8 = &.{},
+    logical_type: []u8 = &.{},
     nullable: bool = false,
 
     pub fn deinit(self: *ColumnChunk, alloc: Allocator) void {
@@ -39,6 +40,7 @@ pub const ColumnChunk = struct {
         if (self.compression_codec.len > 0) alloc.free(self.compression_codec);
         if (self.encoding.len > 0) alloc.free(self.encoding);
         if (self.physical_type.len > 0) alloc.free(self.physical_type);
+        if (self.logical_type.len > 0) alloc.free(self.logical_type);
         self.* = undefined;
     }
 

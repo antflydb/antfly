@@ -290,6 +290,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
     errdefer if (encoding.len > 0) alloc.free(encoding);
     const physical_type: []u8 = if (chunk.physical_type.len == 0) &.{} else try alloc.dupe(u8, chunk.physical_type);
     errdefer if (physical_type.len > 0) alloc.free(physical_type);
+    const logical_type: []u8 = if (chunk.logical_type.len == 0) &.{} else try alloc.dupe(u8, chunk.logical_type);
+    errdefer if (logical_type.len > 0) alloc.free(logical_type);
     return .{
         .column_id = column_id,
         .file_offset = chunk.file_offset,
@@ -298,6 +300,7 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .compression_codec = compression_codec,
         .encoding = encoding,
         .physical_type = physical_type,
+        .logical_type = logical_type,
         .nullable = chunk.nullable,
     };
 }
@@ -331,7 +334,7 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     const got_row_count = row_count orelse return error.InvalidParquetMetadata;
     const got_row_groups = row_groups orelse return error.InvalidParquetMetadata;
     if (schema_columns) |columns| {
-        try applySchemaNullability(got_row_groups, columns);
+        try applySchemaNullability(alloc, got_row_groups, columns);
         freeSchemaColumns(alloc, columns);
         schema_columns = null;
     }
@@ -352,9 +355,11 @@ const SchemaElement = struct {
     name: []u8,
     repetition_type: ?i32 = null,
     child_count: u32 = 0,
+    logical_type: []u8 = &.{},
 
     fn deinit(self: *SchemaElement, alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
+        if (self.logical_type.len > 0) alloc.free(self.logical_type);
         self.* = undefined;
     }
 };
@@ -362,9 +367,11 @@ const SchemaElement = struct {
 const SchemaColumn = struct {
     column_id: []u8,
     nullable: bool,
+    logical_type: []u8 = &.{},
 
     fn deinit(self: *SchemaColumn, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
+        if (self.logical_type.len > 0) alloc.free(self.logical_type);
         self.* = undefined;
     }
 };
@@ -408,7 +415,9 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     var name: ?[]u8 = null;
     var repetition_type: ?i32 = null;
     var child_count: u32 = 0;
+    var logical_type: []u8 = &.{};
     errdefer if (name) |value| alloc.free(value);
+    errdefer if (logical_type.len > 0) alloc.free(logical_type);
 
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
@@ -418,6 +427,20 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
                 name = try reader.readBinaryAlloc(alloc);
             },
             5 => child_count = @intCast(try reader.readRequiredI32NonNegative(field.type)),
+            6 => {
+                if (logical_type.len > 0) {
+                    alloc.free(logical_type);
+                    logical_type = &.{};
+                }
+                logical_type = try logicalTypeNameForConvertedTypeAlloc(alloc, try reader.readRequiredI32(field.type));
+            },
+            10 => {
+                if (logical_type.len > 0) {
+                    alloc.free(logical_type);
+                    logical_type = &.{};
+                }
+                logical_type = try parseLogicalTypeNameAlloc(alloc, reader, field.type);
+            },
             else => try reader.skip(field.type),
         }
     }
@@ -429,6 +452,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
         .name = got_name,
         .repetition_type = repetition_type,
         .child_count = child_count,
+        .logical_type = logical_type,
     };
 }
 
@@ -453,9 +477,12 @@ fn collectSchemaColumnsAlloc(
         if (element.child_count == 0) {
             const column_id = try joinSchemaPathAlloc(alloc, path.items);
             errdefer alloc.free(column_id);
+            const logical_type: []u8 = if (element.logical_type.len == 0) &.{} else try alloc.dupe(u8, element.logical_type);
+            errdefer if (logical_type.len > 0) alloc.free(logical_type);
             try columns.append(alloc, .{
                 .column_id = column_id,
                 .nullable = element_nullable,
+                .logical_type = logical_type,
             });
         } else {
             try collectSchemaColumnsAlloc(alloc, elements, cursor, element.child_count, element_nullable, path, columns);
@@ -490,11 +517,16 @@ fn joinSchemaPathAlloc(alloc: Allocator, parts: []const []const u8) ![]u8 {
     return out;
 }
 
-fn applySchemaNullability(row_groups: []external_source.RowGroup, columns: []const SchemaColumn) !void {
+fn applySchemaNullability(alloc: Allocator, row_groups: []external_source.RowGroup, columns: []const SchemaColumn) !void {
     for (row_groups) |*row_group| {
         for (row_group.column_chunks) |*chunk| {
             const schema_column = schemaColumnForId(columns, chunk.column_id) orelse return error.InvalidParquetMetadata;
             chunk.nullable = schema_column.nullable;
+            if (schema_column.logical_type.len != 0) {
+                const logical_type = try alloc.dupe(u8, schema_column.logical_type);
+                if (chunk.logical_type.len > 0) alloc.free(chunk.logical_type);
+                chunk.logical_type = logical_type;
+            }
         }
     }
 }
@@ -767,6 +799,78 @@ fn physicalTypeNameAlloc(alloc: Allocator, physical_type: i32) ![]u8 {
     });
 }
 
+fn logicalTypeNameForConvertedTypeAlloc(alloc: Allocator, converted_type: i32) ![]u8 {
+    return switch (converted_type) {
+        9 => try alloc.dupe(u8, "timestamp_millis"),
+        10 => try alloc.dupe(u8, "timestamp_micros"),
+        else => &.{},
+    };
+}
+
+fn parseLogicalTypeNameAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {
+    if (field_type != .struct_) return error.InvalidParquetMetadata;
+    var previous_field_id: i16 = 0;
+    var logical_type: []u8 = &.{};
+    errdefer if (logical_type.len > 0) alloc.free(logical_type);
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        switch (field.id) {
+            8 => {
+                if (logical_type.len > 0) {
+                    alloc.free(logical_type);
+                    logical_type = &.{};
+                }
+                logical_type = try parseTimestampLogicalTypeNameAlloc(alloc, reader, field.type);
+            },
+            else => try reader.skip(field.type),
+        }
+    }
+    return logical_type;
+}
+
+fn parseTimestampLogicalTypeNameAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {
+    if (field_type != .struct_) return error.InvalidParquetMetadata;
+    var previous_field_id: i16 = 0;
+    var logical_type: []u8 = &.{};
+    errdefer if (logical_type.len > 0) alloc.free(logical_type);
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        switch (field.id) {
+            2 => {
+                if (logical_type.len > 0) {
+                    alloc.free(logical_type);
+                    logical_type = &.{};
+                }
+                logical_type = try parseTimestampUnitNameAlloc(alloc, reader, field.type);
+            },
+            else => try reader.skip(field.type),
+        }
+    }
+    return logical_type;
+}
+
+fn parseTimestampUnitNameAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {
+    if (field_type != .struct_) return error.InvalidParquetMetadata;
+    var previous_field_id: i16 = 0;
+    var logical_type: []u8 = &.{};
+    errdefer if (logical_type.len > 0) alloc.free(logical_type);
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        const name: []const u8 = switch (field.id) {
+            1 => "timestamp_millis",
+            2 => "timestamp_micros",
+            3 => "timestamp_nanos",
+            else => "",
+        };
+        if (name.len == 0) {
+            try reader.skip(field.type);
+            continue;
+        }
+        if (field.type != .struct_) return error.InvalidParquetMetadata;
+        try reader.skip(field.type);
+        if (logical_type.len > 0) alloc.free(logical_type);
+        logical_type = try alloc.dupe(u8, name);
+    }
+    return logical_type;
+}
+
 fn encodingName(encoding: i32) []const u8 {
     return switch (encoding) {
         0 => "plain",
@@ -1019,6 +1123,21 @@ test "parquet metadata parser derives nullable columns from schema repetition" {
     try std.testing.expect(!required_footer.row_groups[0].column_chunks[0].nullable);
 }
 
+test "parquet metadata parser derives logical timestamp columns from schema annotations" {
+    const alloc = std.testing.allocator;
+    var converted_bytes = try buildSingleColumnTimestampConvertedTypeMetadataFixture(alloc, 10);
+    defer converted_bytes.deinit(alloc);
+    var converted_footer = try parseFooterMetadataAlloc(alloc, converted_bytes.items, 1024);
+    defer converted_footer.deinit(alloc);
+    try std.testing.expectEqualStrings("timestamp_micros", converted_footer.row_groups[0].column_chunks[0].logical_type);
+
+    var logical_bytes = try buildSingleColumnTimestampLogicalTypeMetadataFixture(alloc);
+    defer logical_bytes.deinit(alloc);
+    var logical_footer = try parseFooterMetadataAlloc(alloc, logical_bytes.items, 1024);
+    defer logical_footer.deinit(alloc);
+    try std.testing.expectEqualStrings("timestamp_nanos", logical_footer.row_groups[0].column_chunks[0].logical_type);
+}
+
 test "parquet metadata parser rejects inconsistent row counts and ranges" {
     const alloc = std.testing.allocator;
     var bytes = try buildSingleColumnMetadataFixture(alloc);
@@ -1224,6 +1343,111 @@ fn buildSingleColumnMetadataFixtureWithSchema(alloc: Allocator, nullable: bool) 
     try appendI32(&out, alloc, if (nullable) 1 else 0);
     try appendField(&out, alloc, &leaf_prev, 4, .binary);
     try appendBinary(&out, alloc, "amount");
+    try appendStop(&out, alloc);
+
+    try appendField(&out, alloc, &file_prev, 3, .i64);
+    try appendI64(&out, alloc, 2);
+    try appendField(&out, alloc, &file_prev, 4, .list);
+    try appendListHeader(&out, alloc, .struct_, 1);
+
+    var rg_prev: i16 = 0;
+    try appendField(&out, alloc, &rg_prev, 1, .list);
+    try appendListHeader(&out, alloc, .struct_, 1);
+
+    var chunk_prev: i16 = 0;
+    try appendField(&out, alloc, &chunk_prev, 2, .i64);
+    try appendI64(&out, alloc, 100);
+    try appendField(&out, alloc, &chunk_prev, 3, .struct_);
+
+    var meta_prev: i16 = 0;
+    try appendField(&out, alloc, &meta_prev, 1, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &meta_prev, 2, .list);
+    try appendListHeader(&out, alloc, .i32, 1);
+    try appendI32(&out, alloc, 0);
+    try appendField(&out, alloc, &meta_prev, 3, .list);
+    try appendListHeader(&out, alloc, .binary, 1);
+    try appendBinary(&out, alloc, "amount");
+    try appendField(&out, alloc, &meta_prev, 4, .i32);
+    try appendI32(&out, alloc, 6);
+    try appendField(&out, alloc, &meta_prev, 5, .i64);
+    try appendI64(&out, alloc, 2);
+    try appendField(&out, alloc, &meta_prev, 6, .i64);
+    try appendI64(&out, alloc, 80);
+    try appendField(&out, alloc, &meta_prev, 7, .i64);
+    try appendI64(&out, alloc, 40);
+    try appendField(&out, alloc, &meta_prev, 9, .i64);
+    try appendI64(&out, alloc, 120);
+    try appendField(&out, alloc, &meta_prev, 11, .i64);
+    try appendI64(&out, alloc, 100);
+    try appendStop(&out, alloc);
+
+    try appendStop(&out, alloc);
+
+    try appendField(&out, alloc, &rg_prev, 2, .i64);
+    try appendI64(&out, alloc, 80);
+    try appendField(&out, alloc, &rg_prev, 3, .i64);
+    try appendI64(&out, alloc, 2);
+    try appendField(&out, alloc, &rg_prev, 5, .i64);
+    try appendI64(&out, alloc, 100);
+    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendI64(&out, alloc, 0);
+    try appendStop(&out, alloc);
+
+    try appendStop(&out, alloc);
+    return out;
+}
+
+fn buildSingleColumnTimestampConvertedTypeMetadataFixture(alloc: Allocator, converted_type: i32) !std.ArrayListUnmanaged(u8) {
+    return try buildSingleColumnTimestampMetadataFixture(alloc, converted_type, false);
+}
+
+fn buildSingleColumnTimestampLogicalTypeMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+    return try buildSingleColumnTimestampMetadataFixture(alloc, null, true);
+}
+
+fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?i32, logical_nanos: bool) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var file_prev: i16 = 0;
+    try appendField(&out, alloc, &file_prev, 1, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &file_prev, 2, .list);
+    try appendListHeader(&out, alloc, .struct_, 2);
+
+    var root_prev: i16 = 0;
+    try appendField(&out, alloc, &root_prev, 4, .binary);
+    try appendBinary(&out, alloc, "schema");
+    try appendField(&out, alloc, &root_prev, 5, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendStop(&out, alloc);
+
+    var leaf_prev: i16 = 0;
+    try appendField(&out, alloc, &leaf_prev, 1, .i32);
+    try appendI32(&out, alloc, 1);
+    try appendField(&out, alloc, &leaf_prev, 3, .i32);
+    try appendI32(&out, alloc, 0);
+    try appendField(&out, alloc, &leaf_prev, 4, .binary);
+    try appendBinary(&out, alloc, "amount");
+    if (converted_type) |value| {
+        try appendField(&out, alloc, &leaf_prev, 6, .i32);
+        try appendI32(&out, alloc, value);
+    }
+    if (logical_nanos) {
+        try appendField(&out, alloc, &leaf_prev, 10, .struct_);
+        var logical_prev: i16 = 0;
+        try appendField(&out, alloc, &logical_prev, 8, .struct_);
+        var timestamp_prev: i16 = 0;
+        try appendField(&out, alloc, &timestamp_prev, 1, .boolean_true);
+        try appendField(&out, alloc, &timestamp_prev, 2, .struct_);
+        var unit_prev: i16 = 0;
+        try appendField(&out, alloc, &unit_prev, 3, .struct_);
+        try appendStop(&out, alloc);
+        try appendStop(&out, alloc);
+        try appendStop(&out, alloc);
+        try appendStop(&out, alloc);
+    }
     try appendStop(&out, alloc);
 
     try appendField(&out, alloc, &file_prev, 3, .i64);
