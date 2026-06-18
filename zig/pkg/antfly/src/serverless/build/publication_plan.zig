@@ -21,6 +21,7 @@ const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const schema_mod = @import("../../schema/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const external_binding = @import("../external_source/catalog_binding.zig");
+const external_source_manifest = @import("external_source_manifest.zig");
 const manifest_base_source = @import("../manifest/base_source.zig");
 
 pub const ArtifactAction = enum {
@@ -137,6 +138,7 @@ pub const TablePublicationPlan = struct {
     targets: builder_mod.Builder.PublicationTargets,
     policy: catalog_types.NamespacePolicy = .{},
     table_definition: TableDefinitionSnapshot = .{},
+    external_source_plan: ?external_source_manifest.Plan = null,
     metadata_republish: MetadataRepublishReasons = .{},
     artifact_actions: ArtifactActions = .{},
     full_text_index_actions: []FullTextIndexAction = &.{},
@@ -148,6 +150,7 @@ pub const TablePublicationPlan = struct {
     pub fn deinit(self: *TablePublicationPlan, alloc: Allocator) void {
         search_sources.deinitPublishedSearchSources(alloc, &self.targets.published_search_sources);
         self.table_definition.deinit(alloc);
+        if (self.external_source_plan) |*plan| plan.deinit(alloc);
         for (self.full_text_index_actions) |*entry| entry.deinit(alloc);
         if (self.full_text_index_actions.len > 0) alloc.free(self.full_text_index_actions);
         for (self.vector_index_actions) |*entry| entry.deinit(alloc);

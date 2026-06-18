@@ -32,6 +32,8 @@ const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
+const external_source_manifest = @import("external_source_manifest.zig");
+const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
@@ -404,6 +406,7 @@ pub const Builder = struct {
                 plan.table_definition,
             );
         defer manifest.deinit(self.alloc);
+        try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
@@ -597,6 +600,7 @@ pub const Builder = struct {
             plan.table_definition,
         );
         defer manifest.deinit(self.alloc);
+        try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         self.manifests.put(manifest) catch |err| switch (err) {
             error.ManifestVersionAlreadyExists => return error.HeadChanged,
@@ -1110,6 +1114,20 @@ fn cloneTableDefinitionBaseSourceAlloc(
         try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor)
     else
         null;
+}
+
+fn attachResolvedExternalSourcePlanIfPresent(
+    alloc: Allocator,
+    manifest: *manifest_mod.Manifest,
+    plan: publication_plan.TablePublicationPlan,
+) !void {
+    const external_plan = plan.external_source_plan orelse return;
+    _ = try external_source_publication.attachPlanToOwnedManifestAlloc(
+        alloc,
+        manifest,
+        external_plan,
+        .{},
+    );
 }
 
 pub fn detectMaterializedDerivedOutputsAlloc(
@@ -3899,6 +3917,88 @@ test "manifest builder carries pinned external lake base source from table defin
     try std.testing.expectEqualStrings("s3://bucket/events", manifest.base_source.?.external_parquet.source_uri);
     try std.testing.expectEqualStrings("sha256:objects", manifest.base_source.?.external_parquet.snapshot_id);
     try std.testing.expectEqualStrings("schema-v5", manifest.base_source.?.external_parquet.schema_fingerprint);
+}
+
+test "builder attaches resolved external source plan during live publication" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-external-source-plan");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-external-source-plan");
+    const wal_root = tmpPath(&wal_root_buf, "wal-external-source-plan");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    const encoded = try api_codec.encodeMutationAlloc(alloc, .{
+        .kind = .upsert,
+        .doc_id = "doc-1",
+        .body = "{\"id\":\"doc-1\"}",
+    });
+    defer alloc.free(encoded);
+    _ = try wal_store.append("events", 100, encoded);
+
+    var inventory_artifact = try artifact_store.put("encoded external inventory");
+    defer inventory_artifact.deinit(alloc);
+    const schema_json =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var plan = publication_plan.TablePublicationPlan{
+        .targets = .{
+            .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
+                alloc,
+                search_sources.defaultPublishedSearchSources(),
+            ),
+            .include_graph = true,
+        },
+        .table_definition = try publication_plan.tableDefinitionSnapshotAlloc(alloc, schema_json, "", "{}"),
+        .external_source_plan = try external_source_manifest.planAlloc(
+            alloc,
+            .iceberg,
+            "s3://bucket/warehouse/events",
+            "iceberg-123",
+            "schema-v5",
+            .{
+                .artifact_id = inventory_artifact.artifact_id,
+                .byte_len = inventory_artifact.byte_len,
+                .checksum = inventory_artifact.checksum,
+                .name = "events.external-files",
+            },
+        ),
+    };
+    defer plan.deinit(alloc);
+
+    var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var result = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, plan);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.published);
+
+    var manifest = try manifest_store.getAlloc("events", 1);
+    defer manifest.deinit(alloc);
+    try std.testing.expect(manifest.base_source != null);
+    try std.testing.expectEqual(manifest_mod.BaseSourceKind.external_iceberg, std.meta.activeTag(manifest.base_source.?));
+    try std.testing.expectEqualStrings("iceberg-123", manifest.base_source.?.external_iceberg.snapshot_id);
+    try std.testing.expectEqualStrings(inventory_artifact.artifact_id, manifest.base_source.?.external_iceberg.file_inventory_artifact.?);
+    const external_artifact_index = findArtifactIndex(manifest, .external_base_source).?;
+    try std.testing.expectEqualStrings(inventory_artifact.artifact_id, manifest.artifacts[external_artifact_index].artifact_id);
 }
 
 test "builder reuses unchanged artifacts during metadata-only republish" {
