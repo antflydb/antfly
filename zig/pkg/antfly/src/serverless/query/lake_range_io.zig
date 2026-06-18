@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const external_source = @import("../external_source/types.zig");
+const iceberg_avro = @import("../external_source/iceberg_avro.zig");
 const Allocator = std.mem.Allocator;
 
 pub const CacheLane = enum {
@@ -173,6 +174,54 @@ pub fn objectRefForExternalFileUri(file: external_source.FileEntry) !ObjectRef {
     return try objectRefForExternalFile(location.bucket, location.key, file);
 }
 
+pub fn icebergObjectVersionIdAlloc(
+    alloc: Allocator,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+    sequence_number: i64,
+    uri: []const u8,
+) ![]u8 {
+    if (snapshot_id.len == 0 or schema_fingerprint.len == 0 or uri.len == 0) return error.InvalidLakeRangeRead;
+    return try std.fmt.allocPrint(
+        alloc,
+        "iceberg-metadata:v1:snapshot={s}:schema={s}:seq={d}:uri={s}",
+        .{ snapshot_id, schema_fingerprint, sequence_number, uri },
+    );
+}
+
+pub fn objectRefForIcebergUri(
+    uri: []const u8,
+    byte_len: u64,
+    version: ObjectVersion,
+) !ObjectRef {
+    const location = try parseObjectUri(uri);
+    const object = ObjectRef{
+        .bucket = location.bucket,
+        .key = location.key,
+        .byte_len = byte_len,
+        .version = version,
+    };
+    try object.validate();
+    return object;
+}
+
+pub fn planIcebergManifestListRead(object: ObjectRef) !RangeRead {
+    return try planFullObjectMetadataRead(object, .iceberg_metadata);
+}
+
+pub fn planIcebergManifestRead(
+    object: ObjectRef,
+    content: iceberg_avro.ManifestContent,
+) !RangeRead {
+    return try planFullObjectMetadataRead(
+        object,
+        switch (content) {
+            .data => .iceberg_metadata,
+            .deletes => .iceberg_delete_metadata,
+        },
+    );
+}
+
 pub fn planColumnChunkRead(object: ObjectRef, chunk: external_source.ColumnChunk) !RangeRead {
     const read = RangeRead{
         .object = object,
@@ -180,6 +229,17 @@ pub fn planColumnChunkRead(object: ObjectRef, chunk: external_source.ColumnChunk
         .purpose = .parquet_column_chunk,
         .compression_codec = chunk.compression_codec,
         .decoded_column_id = chunk.column_id,
+    };
+    try read.validate();
+    return read;
+}
+
+fn planFullObjectMetadataRead(object: ObjectRef, purpose: RangePurpose) !RangeRead {
+    try object.validate();
+    const read = RangeRead{
+        .object = object,
+        .range = .{ .offset = 0, .len = object.byte_len },
+        .purpose = purpose,
     };
     try read.validate();
     return read;
@@ -317,6 +377,60 @@ test "lake range planner derives object refs from external file uris" {
     const object_store_object = try objectRefForExternalFileUri(file);
     try std.testing.expectEqualStrings("external-lake", object_store_object.bucket);
     try std.testing.expectEqualStrings("part-a.parquet", object_store_object.key);
+}
+
+test "lake range planner creates Iceberg metadata and manifest reads" {
+    const alloc = std.testing.allocator;
+    const version_id = try icebergObjectVersionIdAlloc(
+        alloc,
+        "snapshot-12",
+        "iceberg-schema:7",
+        42,
+        "s3://bucket/t/metadata/snap-12.avro",
+    );
+    defer alloc.free(version_id);
+
+    const manifest_list_object = try objectRefForIcebergUri(
+        "s3://bucket/t/metadata/snap-12.avro",
+        2048,
+        .{ .version_id = version_id },
+    );
+    const manifest_list_read = try planIcebergManifestListRead(manifest_list_object);
+    try std.testing.expectEqual(@as(u64, 0), manifest_list_read.range.offset);
+    try std.testing.expectEqual(@as(u64, 2048), manifest_list_read.range.len);
+    try std.testing.expectEqual(CacheLane.metadata, manifest_list_read.cacheLane());
+    try std.testing.expectEqual(RangePurpose.iceberg_metadata, manifest_list_read.purpose);
+    const key = try manifest_list_read.cacheKeyAlloc(alloc);
+    defer alloc.free(key);
+    try std.testing.expect(std.mem.indexOf(u8, key, "purpose=iceberg_metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "version=iceberg-metadata:v1:snapshot=snapshot-12") != null);
+
+    const data_manifest_read = try planIcebergManifestRead(manifest_list_object, .data);
+    try std.testing.expectEqual(RangePurpose.iceberg_metadata, data_manifest_read.purpose);
+    const delete_manifest_read = try planIcebergManifestRead(manifest_list_object, .deletes);
+    try std.testing.expectEqual(RangePurpose.iceberg_delete_metadata, delete_manifest_read.purpose);
+}
+
+test "lake range planner derives Iceberg refs from supported object URI schemes" {
+    const version = ObjectVersion{ .version_id = "iceberg-v1" };
+    const gs_object = try objectRefForIcebergUri("gs://bucket/t/metadata/m0.avro", 128, version);
+    try std.testing.expectEqualStrings("bucket", gs_object.bucket);
+    try std.testing.expectEqualStrings("t/metadata/m0.avro", gs_object.key);
+
+    const file_object = try objectRefForIcebergUri("file:///tmp/t/metadata/m0.avro", 128, version);
+    try std.testing.expectEqualStrings("file", file_object.bucket);
+    try std.testing.expectEqualStrings("/tmp/t/metadata/m0.avro", file_object.key);
+
+    try std.testing.expectError(error.InvalidLakeRangeRead, objectRefForIcebergUri(
+        "s3://bucket/t/metadata/m0.avro",
+        0,
+        version,
+    ));
+    try std.testing.expectError(error.InvalidLakeRangeRead, objectRefForIcebergUri(
+        "s3://bucket/t/metadata/m0.avro",
+        128,
+        .{},
+    ));
 }
 
 test "lake range planner coalesces adjacent column chunks by object version" {
