@@ -153,6 +153,9 @@ pub const Standby = struct {
         const replayed = try standby.replayProgress();
         standby.progress = replayed.progress;
         const received_identity = try standby.validateReceivedLog();
+        if (received_identity) |received| {
+            standby.identity = try advanceOpenIdentityFromReceived(standby.identity, received);
+        }
 
         const durable_received_lsn = standby.receive_log.lastLsn();
         const replayed_progress = standby.progress;
@@ -569,6 +572,19 @@ fn validateIdentityMatches(actual: Identity, expected: Identity) !void {
     if (actual.table_id != expected.table_id) return error.WrongTable;
     if (actual.timeline_id != expected.timeline_id) return error.WrongTimeline;
     if (actual.epoch != expected.epoch) return error.WrongEpoch;
+}
+
+fn advanceOpenIdentityFromReceived(expected: Identity, received: Identity) !Identity {
+    if (received.cluster_id != expected.cluster_id) return error.WrongCluster;
+    if (received.shard_id != expected.shard_id) return error.WrongShard;
+    if (received.table_id != expected.table_id) return error.WrongTable;
+    if (received.timeline_id < expected.timeline_id) return error.WrongTimeline;
+    if (received.timeline_id == expected.timeline_id) {
+        if (received.epoch != expected.epoch) return error.WrongEpoch;
+        return expected;
+    }
+    if (received.epoch <= expected.epoch) return error.InvalidTimelineSwitch;
+    return received;
 }
 
 fn validateOpenIdentities(progress_identity: ?Identity, received_identity: ?Identity, expected: Identity) !void {
@@ -1100,7 +1116,15 @@ test "storage.ha promoted standby reopens on new timeline and rejects old timeli
         });
     }
 
-    try std.testing.expectError(error.WrongTimeline, Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{}));
+    {
+        var recovered = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer recovered.close();
+        try std.testing.expectEqual(@as(u64, 2), recovered.identity.timeline_id);
+        try std.testing.expectEqual(@as(u64, 2), recovered.identity.epoch);
+        try std.testing.expectEqual(@as(u64, 2), recovered.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 2), recovered.currentProgress().applied_lsn);
+        try std.testing.expectError(error.WrongTimeline, recovered.receive(baseRecord(identity, 3, "old-timeline")));
+    }
 
     {
         var reopened = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, promoted_identity, .{});
