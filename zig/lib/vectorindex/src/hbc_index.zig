@@ -3230,10 +3230,25 @@ fn loadTransformedVectorIdsIntoMatrix(
     const matrix_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
     if (matrix.len < matrix_floats) return error.BufferTooSmall;
 
-    const missing_ids = try self.alloc.alloc(u64, vector_ids.len);
-    defer self.alloc.free(missing_ids);
-    const missing_positions = try self.alloc.alloc(usize, vector_ids.len);
-    defer self.alloc.free(missing_positions);
+    const small_vector_count = 64;
+    const small_vector_scratch_floats = 1024;
+    const small_batch_scratch_floats = 4096;
+
+    var missing_ids_stack: [small_vector_count]u64 = undefined;
+    const use_stack_missing_ids = vector_ids.len <= missing_ids_stack.len;
+    const missing_ids = if (use_stack_missing_ids)
+        missing_ids_stack[0..vector_ids.len]
+    else
+        try self.alloc.alloc(u64, vector_ids.len);
+    defer if (!use_stack_missing_ids) self.alloc.free(missing_ids);
+
+    var missing_positions_stack: [small_vector_count]usize = undefined;
+    const use_stack_missing_positions = vector_ids.len <= missing_positions_stack.len;
+    const missing_positions = if (use_stack_missing_positions)
+        missing_positions_stack[0..vector_ids.len]
+    else
+        try self.alloc.alloc(usize, vector_ids.len);
+    defer if (!use_stack_missing_positions) self.alloc.free(missing_positions);
 
     var missing_count: usize = 0;
     const lookup = batchVectorLookup(options);
@@ -3251,14 +3266,37 @@ fn loadTransformedVectorIdsIntoMatrix(
     }
     if (missing_count == 0) return;
 
-    const lookups = try self.alloc.alloc(FixedKeyLookup, missing_count);
-    defer self.alloc.free(lookups);
-    const key_views = try self.alloc.alloc([]const u8, missing_count);
-    defer self.alloc.free(key_views);
-    const values = try self.alloc.alloc(?[]const u8, missing_count);
-    defer self.alloc.free(values);
-    const vector_scratch = try self.alloc.alloc(f32, dims);
-    defer self.alloc.free(vector_scratch);
+    var lookups_stack: [small_vector_count]FixedKeyLookup = undefined;
+    const use_stack_lookups = missing_count <= lookups_stack.len;
+    const lookups = if (use_stack_lookups)
+        lookups_stack[0..missing_count]
+    else
+        try self.alloc.alloc(FixedKeyLookup, missing_count);
+    defer if (!use_stack_lookups) self.alloc.free(lookups);
+
+    var key_views_stack: [small_vector_count][]const u8 = undefined;
+    const use_stack_key_views = missing_count <= key_views_stack.len;
+    const key_views = if (use_stack_key_views)
+        key_views_stack[0..missing_count]
+    else
+        try self.alloc.alloc([]const u8, missing_count);
+    defer if (!use_stack_key_views) self.alloc.free(key_views);
+
+    var values_stack: [small_vector_count]?[]const u8 = undefined;
+    const use_stack_values = missing_count <= values_stack.len;
+    const values = if (use_stack_values)
+        values_stack[0..missing_count]
+    else
+        try self.alloc.alloc(?[]const u8, missing_count);
+    defer if (!use_stack_values) self.alloc.free(values);
+
+    var vector_scratch_stack: [small_vector_scratch_floats]f32 = undefined;
+    const use_stack_vector_scratch = dims <= vector_scratch_stack.len;
+    const vector_scratch = if (use_stack_vector_scratch)
+        vector_scratch_stack[0..dims]
+    else
+        try self.alloc.alloc(f32, dims);
+    defer if (!use_stack_vector_scratch) self.alloc.free(vector_scratch);
 
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "loadExternalVectorsTransformedIntoMatrix")) {
@@ -3274,16 +3312,27 @@ fn loadTransformedVectorIdsIntoMatrix(
         )) return;
     }
 
-    const vector_views = try self.alloc.alloc([]const f32, missing_count);
-    defer self.alloc.free(vector_views);
+    var vector_views_stack: [small_vector_count][]const f32 = undefined;
+    const use_stack_vector_views = missing_count <= vector_views_stack.len;
+    const vector_views = if (use_stack_vector_views)
+        vector_views_stack[0..missing_count]
+    else
+        try self.alloc.alloc([]const f32, missing_count);
+    defer if (!use_stack_vector_views) self.alloc.free(vector_views);
+
     const batch_scratch_floats = std.math.mul(usize, missing_count, dims) catch return error.BufferTooSmall;
-    const batch_scratch = try self.alloc.alloc(f32, batch_scratch_floats);
+    var batch_scratch_stack: [small_batch_scratch_floats]f32 = undefined;
+    const use_stack_batch_scratch = batch_scratch_floats <= batch_scratch_stack.len;
+    const batch_scratch = if (use_stack_batch_scratch)
+        batch_scratch_stack[0..batch_scratch_floats]
+    else
+        try self.alloc.alloc(f32, batch_scratch_floats);
     const batch_scratch_bytes = std.math.mul(usize, batch_scratch_floats, @sizeOf(f32)) catch return error.BufferTooSmall;
-    addApplyWorkspaceBytes(self, @intCast(batch_scratch_bytes));
-    defer {
+    if (!use_stack_batch_scratch) addApplyWorkspaceBytes(self, @intCast(batch_scratch_bytes));
+    defer if (!use_stack_batch_scratch) {
         releaseApplyWorkspaceBytes(self, @intCast(batch_scratch_bytes));
         self.alloc.free(batch_scratch);
-    }
+    };
 
     try loadVectorIdsSortedWithScratch(
         self,
@@ -3442,6 +3491,68 @@ test "loadTransformedVectorIdsIntoMatrix uses external transformed matrix loader
 
     try std.testing.expectEqual(@as(usize, 1), direct_calls);
     try std.testing.expectEqual(@as(usize, 0), fallback_calls);
+    try std.testing.expectEqual(@as(f32, 3), matrix[0]);
+    try std.testing.expectEqual(@as(f32, 30), matrix[1]);
+    try std.testing.expectEqual(@as(f32, 4), matrix[2]);
+    try std.testing.expectEqual(@as(f32, 40), matrix[3]);
+}
+
+test "loadTransformedVectorIdsIntoMatrix uses stack scratch for small fallback batches" {
+    const TestTxn = struct {};
+    const TestConfig = struct {
+        dims: usize = 2,
+    };
+    const TestIndex = struct {
+        alloc: std.mem.Allocator,
+        config: TestConfig,
+        calls: *usize,
+
+        fn hasExternalVectorLoader(_: @This()) bool {
+            return true;
+        }
+
+        fn transformVector(_: @This(), original: []const f32, transformed: []f32) []const f32 {
+            @memcpy(transformed, original);
+            return transformed;
+        }
+
+        fn getExternalVectorViewsSortedWithScratch(
+            self: @This(),
+            _: TestTxn,
+            vector_ids: []const u64,
+            vector_views: [][]const f32,
+            _: []FixedKeyLookup,
+            _: [][]const u8,
+            _: []?[]const u8,
+            _: []f32,
+            batch_scratch: []f32,
+        ) !bool {
+            self.calls.* += 1;
+            for (vector_ids, 0..) |vector_id, slot| {
+                const view = batch_scratch[slot * self.config.dims ..][0..self.config.dims];
+                view[0] = @floatFromInt(vector_id);
+                view[1] = @floatFromInt(vector_id * 10);
+                vector_views[slot] = view;
+            }
+            return true;
+        }
+
+        fn getVectorInto(_: @This(), _: TestTxn, _: u64, _: []f32) ![]const f32 {
+            return error.UnexpectedFallback;
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var calls: usize = 0;
+    const index = TestIndex{
+        .alloc = failing.allocator(),
+        .config = .{},
+        .calls = &calls,
+    };
+    var matrix: [4]f32 = undefined;
+    try loadTransformedVectorIdsIntoMatrix(index, TestTxn{}, &.{ 3, 4 }, matrix[0..], .{});
+
+    try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(f32, 3), matrix[0]);
     try std.testing.expectEqual(@as(f32, 30), matrix[1]);
     try std.testing.expectEqual(@as(f32, 4), matrix[2]);

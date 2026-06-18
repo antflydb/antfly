@@ -146,7 +146,9 @@ Current status:
   on hash-backed overlay replay. Search scratch member-id, vector-batch, and
   posting-delta-record buffers also grow geometrically across reused query
   scratch handles, and the grouped query/distance slabs now grow geometrically
-  instead of resizing exactly to each transient candidate count.
+  instead of resizing exactly to each transient candidate count. Small
+  transformed-vector matrix loads now use stack-backed lookup, vector-view, and
+  batch-vector scratch before falling back to heap allocation.
 - Delete-heavy posting mutations now switch `PostingStore.removeMembers` from
   repeated linear membership checks to a temporary removal set for larger
   postings/delete lists, preserving member order while avoiding quadratic CPU
@@ -838,7 +840,9 @@ implementations cleanly:
    views, values, and vector views share `query_storage`, while distances and
    error bounds share `distance_storage`. The remaining separate hot buffers
    are for distinct lifetime/shape classes such as vector batches, member ids,
-   posting overlay summaries, and posting caches.
+   posting overlay summaries, and posting caches. Small transformed-vector
+   matrix loads now use stack-backed scratch before falling back to heap
+   allocation.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.
