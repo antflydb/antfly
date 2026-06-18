@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
+const base_source = @import("../manifest/base_source.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const source_binding = @import("source_binding.zig");
 
@@ -101,6 +102,55 @@ pub fn validateBatchAgainstDeclaredArtifact(
 ) !void {
     try declaration.validate();
     try source_binding.validateBatchAgainstBinding(declaration.binding, batch);
+}
+
+pub fn validateManifestAgainstBaseSource(
+    manifest: Manifest,
+    descriptor: base_source.BaseSourceDescriptor,
+) !void {
+    try manifest.validate();
+    const expected = try sourceInfoFromBaseSource(descriptor);
+    for (manifest.artifacts) |declaration| {
+        const binding = declaration.binding;
+        if (binding.source_kind != expected.source_kind) return error.SidecarSourceBindingMismatch;
+        if (!std.mem.eql(u8, binding.snapshot_id, expected.snapshot_id)) return error.SidecarSourceBindingMismatch;
+        if (!std.mem.eql(u8, binding.schema_fingerprint, expected.schema_fingerprint)) {
+            return error.SidecarSourceBindingMismatch;
+        }
+    }
+}
+
+const SourceInfo = struct {
+    source_kind: rowsource.SourceKind,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+};
+
+fn sourceInfoFromBaseSource(descriptor: base_source.BaseSourceDescriptor) !SourceInfo {
+    try descriptor.validate();
+    return switch (descriptor) {
+        .antfly_row_fragments => |source| .{
+            .source_kind = .serverless_fragment,
+            .snapshot_id = source.snapshot_id,
+            .schema_fingerprint = source.schema_fingerprint,
+        },
+        .external_parquet => |source| .{
+            .source_kind = .external_parquet,
+            .snapshot_id = source.snapshot_id,
+            .schema_fingerprint = source.schema_fingerprint,
+        },
+        .external_iceberg => |source| .{
+            .source_kind = .external_iceberg,
+            .snapshot_id = source.snapshot_id,
+            .schema_fingerprint = source.schema_fingerprint,
+        },
+        .external_lance => |source| .{
+            .source_kind = .external_lance,
+            .snapshot_id = source.snapshot_id,
+            .schema_fingerprint = source.schema_fingerprint,
+        },
+        .antfly_document_segments, .antfly_lsm_overlay => return error.SidecarSourceBindingMismatch,
+    };
 }
 
 test "sidecar manifest declares text vector sparse and graph source bindings" {
@@ -257,5 +307,44 @@ test "sidecar manifest validates declared artifacts against RowSource batches" {
     try std.testing.expectError(
         error.SidecarSourceBindingMismatch,
         validateBatchAgainstDeclaredArtifact(declaration, stale_batch),
+    );
+}
+
+test "sidecar manifest validates declared artifacts against pinned base source" {
+    const descriptor = base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-7",
+        .schema_fingerprint = "schema-v2",
+    } };
+    const declaration = DeclaredArtifact{
+        .name = "events.embedding.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_iceberg,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "iceberg-7",
+            .schema_fingerprint = "schema-v2",
+            .column_bindings = &[_][]const u8{"embedding"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = .vector_segment,
+            .name = "events.embedding.vector",
+            .artifact_id = "vector-iceberg-7",
+            .byte_len = 512,
+            .checksum = "len:512",
+        },
+    };
+    const manifest = Manifest{ .artifacts = &[_]DeclaredArtifact{declaration} };
+
+    try validateManifestAgainstBaseSource(manifest, descriptor);
+
+    var stale = declaration;
+    stale.binding.snapshot_id = "iceberg-8";
+    try std.testing.expectError(
+        error.SidecarSourceBindingMismatch,
+        validateManifestAgainstBaseSource(.{ .artifacts = &[_]DeclaredArtifact{stale} }, descriptor),
     );
 }

@@ -35,6 +35,7 @@ pub const artifactKindForSidecarKind = sidecar_manifest.artifactKindForSidecarKi
 pub const sidecarKindForArtifactKind = sidecar_manifest.sidecarKindForArtifactKind;
 pub const validateSidecarArtifactBinding = sidecar_manifest.validateArtifactBinding;
 pub const validateSidecarBatchAgainstDeclaredArtifact = sidecar_manifest.validateBatchAgainstDeclaredArtifact;
+pub const validateSidecarManifestAgainstBaseSource = sidecar_manifest.validateManifestAgainstBaseSource;
 
 test "serverless segment module compiles" {
     _ = types;
@@ -57,4 +58,5 @@ test "serverless segment module compiles" {
     _ = sidecarKindForArtifactKind;
     _ = validateSidecarArtifactBinding;
     _ = validateSidecarBatchAgainstDeclaredArtifact;
+    _ = validateSidecarManifestAgainstBaseSource;
 }

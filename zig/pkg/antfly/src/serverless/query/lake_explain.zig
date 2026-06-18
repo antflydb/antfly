@@ -22,6 +22,7 @@ const std = @import("std");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const base_source = @import("../manifest/base_source.zig");
 const lake_promotion = @import("../build/lake_promotion.zig");
+const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 
 pub const Operation = enum {
     scan,
@@ -40,6 +41,7 @@ pub const CacheClass = enum {
 pub const Request = struct {
     base_source: base_source.BaseSourceDescriptor,
     artifacts: []const artifact_ref.ArtifactRef,
+    sidecars: []const sidecar_manifest.DeclaredArtifact = &.{},
     operation: Operation,
     projected_column_count: u16 = 0,
     observation: ?lake_promotion.Observation = null,
@@ -73,6 +75,7 @@ pub fn explain(request: Request) !Plan {
         try accountArtifact(&accounting, artifact);
     }
     try validateBaseSourceArtifacts(request.base_source, request.artifacts);
+    try validateSidecarDeclarations(request.base_source, request.artifacts, request.sidecars);
 
     const source_info = sourceInfo(request.base_source);
     return .{
@@ -88,6 +91,21 @@ pub fn explain(request: Request) !Plan {
         else
             .{ .kind = .none },
     };
+}
+
+fn validateSidecarDeclarations(
+    descriptor: base_source.BaseSourceDescriptor,
+    artifacts: []const artifact_ref.ArtifactRef,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+) !void {
+    if (sidecars.len == 0) return;
+    const manifest = sidecar_manifest.Manifest{ .artifacts = sidecars };
+    try sidecar_manifest.validateManifestAgainstBaseSource(manifest, descriptor);
+    for (sidecars) |declaration| {
+        if (!hasArtifact(artifacts, declaration.artifact.artifact_id, declaration.artifact.kind)) {
+            return error.LakeExplainMissingArtifact;
+        }
+    }
 }
 
 fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.ArtifactRef) !void {
@@ -273,6 +291,47 @@ test "lake explain rejects missing manifest artifacts" {
     try std.testing.expectError(error.LakeExplainMissingArtifact, explain(.{
         .base_source = descriptor,
         .artifacts = &.{},
+        .operation = .scan,
+    }));
+}
+
+test "lake explain rejects stale declared sidecars" {
+    const descriptor = base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+        .file_inventory_artifact = "files-1",
+    } };
+    const artifacts = [_]artifact_ref.ArtifactRef{
+        .{ .kind = .external_base_source, .artifact_id = "files-1", .byte_len = 4096, .checksum = "len:4096" },
+        .{ .kind = .vector_segment, .name = "events.embedding.vector", .artifact_id = "vector-1", .byte_len = 512, .checksum = "len:512" },
+    };
+    const stale_sidecar = sidecar_manifest.DeclaredArtifact{
+        .name = "events.embedding.vector",
+        .binding = .{
+            .sidecar_kind = .vector,
+            .source_kind = .external_iceberg,
+            .row_ref_kind = .external,
+            .source_id = "events",
+            .snapshot_id = "iceberg-8",
+            .schema_fingerprint = "schema-v2",
+            .column_bindings = &[_][]const u8{"embedding"},
+            .index_config_hash = "sha256:vector",
+        },
+        .artifact = .{
+            .kind = .vector_segment,
+            .name = "events.embedding.vector",
+            .artifact_id = "vector-1",
+            .byte_len = 512,
+            .checksum = "len:512",
+        },
+    };
+
+    try std.testing.expectError(error.SidecarSourceBindingMismatch, explain(.{
+        .base_source = descriptor,
+        .artifacts = &artifacts,
+        .sidecars = &[_]sidecar_manifest.DeclaredArtifact{stale_sidecar},
         .operation = .scan,
     }));
 }
