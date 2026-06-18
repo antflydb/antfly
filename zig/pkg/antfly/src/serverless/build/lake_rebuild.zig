@@ -471,6 +471,47 @@ pub fn desiredArtifactsFromResolvedExternalSourceAlloc(
     return try desiredArtifactsFromTableDefinitionAlloc(alloc, source, table);
 }
 
+pub fn publishedArtifactsFromDeclarationsAlloc(
+    alloc: Allocator,
+    declarations: []const sidecar_manifest.DeclaredArtifact,
+) ![]PublishedArtifact {
+    const published = try alloc.alloc(PublishedArtifact, declarations.len);
+    errdefer alloc.free(published);
+    for (declarations, published) |declaration, *out| {
+        try declaration.validate();
+        out.* = .{
+            .name = declaration.name,
+            .binding = declaration.binding,
+            .artifact = declaration.artifact,
+        };
+    }
+    return published;
+}
+
+pub fn reconcileResolvedExternalSourceSidecarsAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source_provider: RowSourceProvider,
+    base_source: manifest_base_source.BaseSourceDescriptor,
+    inventory: external_source.Inventory,
+    table: TableIndexDefinition,
+    published_declarations: []const sidecar_manifest.DeclaredArtifact,
+) !ReconciledManifest {
+    var desired = try desiredArtifactsFromResolvedExternalSourceAlloc(alloc, base_source, inventory, table);
+    defer desired.deinit(alloc);
+
+    const published = try publishedArtifactsFromDeclarationsAlloc(alloc, published_declarations);
+    defer alloc.free(published);
+
+    var operation_plan = try planOperationsAlloc(alloc, desired.artifacts, published);
+    defer operation_plan.deinit(alloc);
+
+    var executed = try executeOperationsAlloc(alloc, artifacts, source_provider, operation_plan);
+    defer executed.deinit(alloc);
+
+    return try reconcileExecutedOperationsAlloc(alloc, published, operation_plan, executed);
+}
+
 pub fn planOperationsAlloc(
     alloc: Allocator,
     desired: []const DesiredArtifact,
@@ -2106,6 +2147,71 @@ test "lake rebuild operation executor publishes row-source sidecars" {
     try std.testing.expect(executed.declaration != null);
     try std.testing.expectEqualStrings("mem:0", executed.artifact_id);
     const stored = try artifacts.getAlloc(executed.artifact_id);
+    defer alloc.free(stored);
+    try std.testing.expect(stored.len > 0);
+}
+
+test "lake rebuild reconciles resolved external sidecars end to end" {
+    const alloc = std.testing.allocator;
+    var memory = MemoryArtifactStore.init(alloc);
+    var artifacts = memory.artifactStore();
+    defer artifacts.deinit();
+
+    var inventory = external_source.Inventory{
+        .format = .parquet,
+        .source_id = try alloc.dupe(u8, "docs"),
+        .source_uri = try alloc.dupe(u8, "s3://warehouse/docs"),
+        .snapshot_id = try alloc.dupe(u8, "parquet-31"),
+        .schema_fingerprint = try alloc.dupe(u8, "schema-v3"),
+        .files = try alloc.alloc(external_source.FileEntry, 0),
+    };
+    defer inventory.deinit(alloc);
+    const base_source = manifest_base_source.BaseSourceDescriptor{ .external_parquet = .{
+        .format = .parquet_prefix,
+        .source_uri = "s3://warehouse/docs",
+        .snapshot_id = "parquet-31",
+        .schema_fingerprint = "schema-v3",
+        .file_inventory_artifact = "inventory-docs",
+    } };
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .external = .{ .source_id = "docs", .snapshot_id = "parquet-31", .file_id = "file-a.parquet", .row_group_ordinal = 0, .row_ordinal = 0 } },
+        .{ .external = .{ .source_id = "docs", .snapshot_id = "parquet-31", .file_id = "file-a.parquet", .row_group_ordinal = 0, .row_ordinal = 1 } },
+    };
+    const bodies = [_][]const u8{ "lake rebuild workflow", "sidecar reconcile" };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "body", .values = .{ .bytes = &bodies } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "docs", .snapshot_id = "parquet-31" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+    var source_provider = TestRowSourceProvider{ .source_kind = .external_parquet, .batches = &batches };
+
+    var reconciled = try reconcileResolvedExternalSourceSidecarsAlloc(
+        alloc,
+        &artifacts,
+        source_provider.provider(),
+        base_source,
+        inventory,
+        .{
+            .table_name = "docs",
+            .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+        },
+        &.{},
+    );
+    defer reconciled.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), reconciled.artifacts.len);
+    const declaration = reconciled.find("body_text").?;
+    try std.testing.expectEqual(source_binding.SidecarKind.text, declaration.binding.sidecar_kind);
+    try std.testing.expectEqual(rowsource.SourceKind.external_parquet, declaration.binding.source_kind);
+    try std.testing.expectEqualStrings("docs", declaration.binding.source_id);
+    try std.testing.expectEqualStrings("parquet-31", declaration.binding.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v3", declaration.binding.schema_fingerprint);
+    try std.testing.expectEqualStrings("mem:0", declaration.artifact.artifact_id);
+    const stored = try artifacts.getAlloc(declaration.artifact.artifact_id);
     defer alloc.free(stored);
     try std.testing.expect(stored.len > 0);
 }
