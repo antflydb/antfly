@@ -3203,6 +3203,11 @@ pub const DirectoryBatchWriter = struct {
             if (entry.posting_id != posting_id or entry.kind != .delta) continue;
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             if (min_generation) |generation| {
+                if (posting.PostingFormat.deltaSequenceGeneration(entry.sequence) > generation) {
+                    try records.ensureUnusedCapacity(alloc, iterator.recordCount());
+                    while (try iterator.next()) |record| records.appendAssumeCapacity(record);
+                    continue;
+                }
                 var reserved = false;
                 while (try iterator.next()) |record| {
                     if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= generation) continue;
@@ -3229,6 +3234,10 @@ pub const DirectoryBatchWriter = struct {
     ) !void {
         for (self.writer.entries.items) |entry| {
             if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            if (posting.PostingFormat.deltaSequenceGeneration(entry.sequence) > base_generation) {
+                try appendDeltaValueAllRecordsWithStatsAlloc(alloc, entry.value, records, stats);
+                continue;
+            }
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             stats.records += iterator.recordCount();
             stats.encoded_value_bytes += entry.value.len;
@@ -3257,6 +3266,10 @@ pub const DirectoryBatchWriter = struct {
     ) !void {
         for (self.writer.entries.items) |entry| {
             if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            if (posting.PostingFormat.deltaSequenceGeneration(entry.sequence) > base_generation) {
+                try appendDeltaValueAllRecordsIntoScratchWithStatsAlloc(alloc, entry.value, scratch, stats);
+                continue;
+            }
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             stats.records += iterator.recordCount();
             stats.encoded_value_bytes += entry.value.len;
@@ -3284,7 +3297,10 @@ pub const DirectoryBatchWriter = struct {
         for (self.writer.entries.items) |entry| {
             if (entry.posting_id != posting_id or entry.kind != .delta) continue;
             out.encoded_value_bytes += entry.value.len;
-            const stats = try posting.PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
+            const stats = if (posting.PostingFormat.deltaSequenceGeneration(entry.sequence) > base_generation)
+                try posting.PostingFormat.deltaTailStatsAllRecords(entry.value)
+            else
+                try posting.PostingFormat.deltaTailStatsAfterGeneration(entry.value, base_generation);
             out.records += stats.records;
             out.records_after_generation += stats.records_after_generation;
             out.tombstones_after_generation += stats.tombstones_after_generation;
@@ -3302,10 +3318,11 @@ pub const DirectoryBatchWriter = struct {
     ) !void {
         for (self.writer.entries.items) |entry| {
             if (entry.posting_id != posting_id or entry.kind != .delta) continue;
+            const entry_all_live = posting.PostingFormat.deltaSequenceGeneration(entry.sequence) > base_generation;
             var iterator = try posting.PostingFormat.DeltaTailIterator.init(entry.value);
             while (try iterator.next()) |record| {
                 if (record.vector_id != vector_id) continue;
-                if (posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
+                if (!entry_all_live and posting.PostingFormat.deltaSequenceGeneration(record.sequence) <= base_generation) continue;
                 if (best_record.* == null or record.sequence >= best_sequence.*) {
                     best_sequence.* = record.sequence;
                     best_record.* = record;
