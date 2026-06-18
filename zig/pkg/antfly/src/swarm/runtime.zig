@@ -2200,7 +2200,7 @@ fn validateHARole(cli: CliConfig) !void {
     if (cli.ha_former_primary_log != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_admin_token_env != null and !primary_requested and !standby_requested) return error.HARoleMissing;
     if (cli.ha_former_primary_log != null) {
-        _ = try requireHAString(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
+        _ = try requireHAPath(cli.ha_former_primary_log, error.HAFormerPrimaryLogInvalid, error.HAFormerPrimaryLogInvalid);
     }
     if (cli.ha_admin_token_env) |env_var| {
         switch (antfly.ha.validation.classifyString(env_var)) {
@@ -2211,7 +2211,7 @@ fn validateHARole(cli: CliConfig) !void {
         if (!antfly.ha.validation.isEnvVarName(env_var)) return error.HAAdminTokenEnvInvalid;
     }
     if (primary_requested or standby_requested) {
-        _ = try requireHAString(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
+        _ = try requireHAPath(cli.ha_fence_wal, error.HAFenceWalMissing, error.HAFenceWalInvalid);
     }
     if (primary_requested or standby_requested) try validateHAIdentity(cli);
     if (primary_requested) try validateHAPrimaryRoleComplete(cli);
@@ -2234,24 +2234,37 @@ fn requireHAString(value: ?[]const u8, comptime missing_err: anyerror, comptime 
     }
 }
 
+fn requireHAPath(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
+    const raw = try requireHAString(value, missing_err, invalid_err);
+    if (!antfly.ha.validation.isAbsoluteNormalizedPath(raw)) return invalid_err;
+    return raw;
+}
+
+fn requireHAIdentifier(value: ?[]const u8, comptime missing_err: anyerror, comptime invalid_err: anyerror) ![]const u8 {
+    const raw = try requireHAString(value, missing_err, invalid_err);
+    if (!antfly.ha.validation.isIdentifier(raw)) return invalid_err;
+    return raw;
+}
+
 fn validateHAPrimaryRoleComplete(cli: CliConfig) !void {
-    _ = try requireHAString(cli.ha_primary_log, error.HAPrimaryLogMissing, error.HAPrimaryLogInvalid);
-    _ = try requireHAString(cli.ha_primary_slots, error.HAPrimarySlotsMissing, error.HAPrimarySlotsInvalid);
-    _ = try requireHAString(cli.ha_primary_node_id, error.HAPrimaryNodeIdMissing, error.HAPrimaryNodeIdInvalid);
+    _ = try requireHAPath(cli.ha_primary_log, error.HAPrimaryLogMissing, error.HAPrimaryLogInvalid);
+    _ = try requireHAPath(cli.ha_primary_slots, error.HAPrimarySlotsMissing, error.HAPrimarySlotsInvalid);
+    _ = try requireHAIdentifier(cli.ha_primary_node_id, error.HAPrimaryNodeIdMissing, error.HAPrimaryNodeIdInvalid);
 }
 
 fn validateHAStandbyRoleComplete(cli: CliConfig) !void {
-    _ = try requireHAString(cli.ha_standby_log, error.HAStandbyLogMissing, error.HAStandbyLogInvalid);
-    _ = try requireHAString(cli.ha_standby_progress, error.HAStandbyProgressMissing, error.HAStandbyProgressInvalid);
-    _ = try requireHAString(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid);
+    _ = try requireHAPath(cli.ha_standby_log, error.HAStandbyLogMissing, error.HAStandbyLogInvalid);
+    _ = try requireHAPath(cli.ha_standby_progress, error.HAStandbyProgressMissing, error.HAStandbyProgressInvalid);
+    _ = try requireHAIdentifier(cli.ha_standby_node_id, error.HAStandbyNodeIdMissing, error.HAStandbyNodeIdInvalid);
 }
 
 fn haStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
     if (cli.ha_standby_upstream_url == null and cli.ha_standby_slot == null) return null;
     const upstream = try requireHAString(cli.ha_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
-    const slot = try requireHAString(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
+    const slot = try requireHAIdentifier(cli.ha_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
     const parsed = std.Uri.parse(upstream) catch return error.HAStandbyUpstreamUrlInvalid;
     if (!isHAReplicationUpstreamScheme(parsed)) return error.HAStandbyUpstreamUrlInvalid;
+    if (parsed.host == null) return error.HAStandbyUpstreamUrlInvalid;
     return .{
         .upstream_base_uri = upstream,
         .slot_name = slot,
@@ -3075,8 +3088,16 @@ test "swarm HA standby replication flags require upstream and slot" {
         .ha_standby_slot = "standby-a",
     }));
     try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "http:///replication",
+        .ha_standby_slot = "standby-a",
+    }));
+    try std.testing.expectError(error.HAStandbyUpstreamUrlInvalid, haStandbyReplicationConfigFromCli(.{
         .ha_standby_upstream_url = "file:///tmp/primary",
         .ha_standby_slot = "standby-a",
+    }));
+    try std.testing.expectError(error.HAStandbySlotInvalid, haStandbyReplicationConfigFromCli(.{
+        .ha_standby_upstream_url = "http://primary.antfly.svc:8080",
+        .ha_standby_slot = "standby a",
     }));
 
     const replication_cfg = (try haStandbyReplicationConfigFromCli(.{
@@ -3187,12 +3208,31 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_timeline_id = 3,
         .ha_epoch = 4,
     }));
+    try std.testing.expectError(error.HAFenceWalInvalid, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
     try std.testing.expectError(error.HAFormerPrimaryLogInvalid, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_primary_slots = "/tmp/slots.wal",
         .ha_primary_node_id = "primary-a",
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_former_primary_log = " /tmp/former-primary.wal ",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAFormerPrimaryLogInvalid, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_former_primary_log = "/tmp/../former-primary.wal",
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
         .ha_epoch = 4,
@@ -3248,9 +3288,27 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_timeline_id = 3,
         .ha_epoch = 4,
     }));
+    try std.testing.expectError(error.HAPrimaryLogInvalid, validateHARole(.{
+        .ha_primary_log = "primary.log",
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
     try std.testing.expectError(error.HAPrimarySlotsInvalid, validateHARole(.{
         .ha_primary_log = "/tmp/primary.log",
         .ha_primary_slots = " /tmp/slots.wal ",
+        .ha_primary_node_id = "primary-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAPrimarySlotsInvalid, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_slots = "/tmp//slots.wal",
         .ha_primary_node_id = "primary-a",
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_cluster_id = 100,
@@ -3261,6 +3319,15 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_primary_log = "/tmp/primary.log",
         .ha_primary_slots = "/tmp/slots.wal",
         .ha_primary_node_id = " primary-a ",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAPrimaryNodeIdInvalid, validateHARole(.{
+        .ha_primary_log = "/tmp/primary.log",
+        .ha_primary_slots = "/tmp/slots.wal",
+        .ha_primary_node_id = "primary a",
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
@@ -3305,9 +3372,27 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_timeline_id = 3,
         .ha_epoch = 4,
     }));
+    try std.testing.expectError(error.HAStandbyLogInvalid, validateHARole(.{
+        .ha_standby_log = "standby.log",
+        .ha_standby_progress = "/tmp/progress.wal",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
     try std.testing.expectError(error.HAStandbyProgressInvalid, validateHARole(.{
         .ha_standby_log = "/tmp/standby.log",
         .ha_standby_progress = " /tmp/progress.wal ",
+        .ha_standby_node_id = "standby-a",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAStandbyProgressInvalid, validateHARole(.{
+        .ha_standby_log = "/tmp/standby.log",
+        .ha_standby_progress = "/tmp/../progress.wal",
         .ha_standby_node_id = "standby-a",
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_cluster_id = 100,
@@ -3318,6 +3403,15 @@ test "swarm HA runtime rejects ambiguous role flags" {
         .ha_standby_log = "/tmp/standby.log",
         .ha_standby_progress = "/tmp/progress.wal",
         .ha_standby_node_id = " standby-a ",
+        .ha_fence_wal = "/tmp/fence.wal",
+        .ha_cluster_id = 100,
+        .ha_timeline_id = 3,
+        .ha_epoch = 4,
+    }));
+    try std.testing.expectError(error.HAStandbyNodeIdInvalid, validateHARole(.{
+        .ha_standby_log = "/tmp/standby.log",
+        .ha_standby_progress = "/tmp/progress.wal",
+        .ha_standby_node_id = "standby a",
         .ha_fence_wal = "/tmp/fence.wal",
         .ha_cluster_id = 100,
         .ha_timeline_id = 3,
