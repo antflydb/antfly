@@ -1021,6 +1021,8 @@ pub const LazyDirectorySnapshot = struct {
 
         _ = try self.appendDeltaTailAfterGenerationIntoScratchWithStats(alloc, posting_id, base_iter.header.generation, scratch);
         const records = scratch.deltaRecordsMut();
+        if (records.len == 0) return member_count;
+
         sortPostingDeltaRecordsIfNeeded(records);
 
         try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
@@ -1241,6 +1243,8 @@ pub const Snapshot = struct {
 
         try self.catalog.appendDeltaRecordsIntoScratch(alloc, posting_id, base_iter.header.generation, &scratch);
         const records = scratch.deltaRecordsMut();
+        if (records.len == 0) return try alloc.dupe(posting.VectorId, scratch.member_ids[0..member_count]);
+
         sortPostingDeltaRecordsIfNeeded(records);
 
         try scratch.ensureMemberIdCapacity(alloc, member_count + posting.PostingFormat.liveDeltaRecordCount(records));
