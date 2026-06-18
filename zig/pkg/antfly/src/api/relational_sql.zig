@@ -247,6 +247,18 @@ pub const AnalyzeMaintenancePlan = sql_adapter.AnalyzeMaintenancePlan;
 pub const ReindexMaintenancePlan = sql_adapter.ReindexMaintenancePlan;
 pub const ReindexMaintenanceTarget = sql_adapter.ReindexMaintenanceTarget;
 pub const ClusterMaintenancePlan = sql_adapter.ClusterMaintenancePlan;
+pub const BulkIoPlan = sql_adapter.BulkIoPlan;
+pub const BulkIoDirection = sql_adapter.BulkIoDirection;
+pub const MaterializedViewCatalogPlan = sql_adapter.MaterializedViewCatalogPlan;
+pub const CreateMaterializedViewPlan = sql_adapter.CreateMaterializedViewPlan;
+pub const RefreshMaterializedViewPlan = sql_adapter.RefreshMaterializedViewPlan;
+pub const DropMaterializedViewPlan = sql_adapter.DropMaterializedViewPlan;
+pub const ViewCatalogPlan = sql_adapter.ViewCatalogPlan;
+pub const CreateViewPlan = sql_adapter.CreateViewPlan;
+pub const RenameViewPlan = sql_adapter.RenameViewPlan;
+pub const DropViewPlan = sql_adapter.DropViewPlan;
+pub const TableClonePlan = sql_adapter.TableClonePlan;
+pub const TableCloneOptions = sql_adapter.TableCloneOptions;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -443,27 +455,6 @@ const PrivilegeChangeAction = enum {
     revoke,
 };
 
-pub const BulkIoPlan = struct {
-    direction: BulkIoDirection,
-    table_name: []const u8,
-    columns: []const []const u8 = &.{},
-    endpoint: []const u8,
-    format: ?[]const u8 = null,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        freeStringSlice(alloc, self.columns);
-        alloc.free(self.endpoint);
-        if (self.format) |format| alloc.free(format);
-        self.* = undefined;
-    }
-};
-
-pub const BulkIoDirection = enum {
-    from,
-    to,
-};
-
 pub const TablePartitionCatalogPlan = union(enum) {
     create_partitioned: CreatePartitionedTablePlan,
     create_partition: CreateTablePartitionPlan,
@@ -614,152 +605,6 @@ pub const RowSecurityCurrentSettingPredicate = struct {
         alloc.free(self.field);
         alloc.free(self.setting_name);
         self.* = undefined;
-    }
-};
-
-pub const MaterializedViewCatalogPlan = union(enum) {
-    create: CreateMaterializedViewPlan,
-    refresh: RefreshMaterializedViewPlan,
-    drop: DropMaterializedViewPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .refresh => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateMaterializedViewPlan = struct {
-    view_name: []const u8,
-    source_table_name: []const u8,
-    source_fields: []const []const u8 = &.{},
-    output_fields: []const []const u8 = &.{},
-    replace_existing: bool = false,
-    if_not_exists: bool = false,
-    populate_on_create: bool = true,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.view_name);
-        alloc.free(self.source_table_name);
-        freeStringSlice(alloc, self.source_fields);
-        freeStringSlice(alloc, self.output_fields);
-        self.* = undefined;
-    }
-};
-
-pub const RefreshMaterializedViewPlan = struct {
-    view_name: []const u8,
-    concurrently: bool = false,
-    populate: bool = true,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.view_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropMaterializedViewPlan = struct {
-    view_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.view_name);
-        self.* = undefined;
-    }
-};
-
-pub const ViewCatalogPlan = union(enum) {
-    create: CreateViewPlan,
-    rename: RenameViewPlan,
-    drop: DropViewPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .create => |*plan| plan.deinit(alloc),
-            .rename => |*plan| plan.deinit(alloc),
-            .drop => |*plan| plan.deinit(alloc),
-        }
-        self.* = undefined;
-    }
-};
-
-pub const CreateViewPlan = struct {
-    view_name: []const u8,
-    source_table_name: []const u8,
-    source_fields: []const []const u8 = &.{},
-    output_fields: []const []const u8 = &.{},
-    replace_existing: bool = false,
-    if_not_exists: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.view_name);
-        alloc.free(self.source_table_name);
-        freeStringSlice(alloc, self.source_fields);
-        freeStringSlice(alloc, self.output_fields);
-        self.* = undefined;
-    }
-};
-
-pub const RenameViewPlan = struct {
-    view_name: []const u8,
-    new_view_name: []const u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.view_name);
-        alloc.free(self.new_view_name);
-        self.* = undefined;
-    }
-};
-
-pub const DropViewPlan = struct {
-    view_name: []const u8,
-    if_exists: bool = false,
-    cascade: bool = false,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.view_name);
-        self.* = undefined;
-    }
-};
-
-pub const TableClonePlan = struct {
-    table_name: []const u8,
-    source_table_name: []const u8,
-    if_not_exists: bool = false,
-    options: TableCloneOptions = .{},
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.table_name);
-        alloc.free(self.source_table_name);
-        self.* = undefined;
-    }
-};
-
-pub const TableCloneOptions = struct {
-    columns: bool = true,
-    defaults: bool = false,
-    generated: bool = false,
-    checks: bool = false,
-    constraints: bool = false,
-    indexes: bool = false,
-    periods: bool = false,
-    update_policies: bool = false,
-
-    fn includingAll() TableCloneOptions {
-        return .{
-            .columns = true,
-            .defaults = true,
-            .generated = true,
-            .checks = true,
-            .constraints = true,
-            .indexes = true,
-            .periods = true,
-            .update_policies = true,
-        };
     }
 };
 

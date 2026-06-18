@@ -1289,7 +1289,7 @@ pub const ApiHttpServer = struct {
     cfg: ApiHttpServerConfig,
     source: StatusSource,
     table_reads: ?table_reads.TableReadSource = null,
-    external_lake_remote_resolver: table_reads.RemoteUriExternalLakeObjectStoreResolver = .{},
+    external_lake_configured_resolver: table_reads.ConfiguredExternalLakeObjectStoreResolver = .{},
     external_lake_routing_reads: ?table_reads.ExternalLakeRoutingTableReadSource = null,
     table_writes: ?table_writes.TableWriteSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -1369,7 +1369,8 @@ pub const ApiHttpServer = struct {
     fn effectivePublicTableReads(self: *ApiHttpServer) ?table_reads.TableReadSource {
         const base = self.table_reads orelse return null;
         if (self.external_lake_routing_reads == null) {
-            const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_remote_resolver.resolver();
+            self.external_lake_configured_resolver.configure(self.cfg.node_config, self.cfg.secret_store);
+            const resolver = self.cfg.external_lake_object_store_resolver orelse self.external_lake_configured_resolver.resolver();
             self.external_lake_routing_reads = table_reads.ExternalLakeRoutingTableReadSource.init(base, resolver, .{});
         }
         return self.external_lake_routing_reads.?.source();
@@ -7390,7 +7391,7 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows query request"),
-            error.UnsupportedOperation, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
+            error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
             else => {
@@ -7429,7 +7430,7 @@ pub const ApiHttpServer = struct {
 
         var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
             error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
-            error.UnsupportedOperation, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
+            error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
             else => {
@@ -17351,6 +17352,135 @@ test "api http server routes public external lake row queries through configured
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), response.status);
     try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
+    try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
+}
+
+test "api http server resolves credentialed external lake rows from node config" {
+    const alloc = std.testing.allocator;
+    const schema_template =
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{{"kind":"external","table_id":"events","format":"parquet","uri":"file://{s}","credentials":{{"ref":"prod-lake-read","scope":"events"}},"schema_fingerprint":"schema-v1"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"keyword"}},"amount":{{"type":"numeric"}}}},"required":["id"],"additionalProperties":false}}}}}},"primary_key":{{"columns":["id"]}}}}
+    ;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lake_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lake", .{tmp.sub_path});
+    defer alloc.free(lake_root);
+    const events_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lake/events", .{tmp.sub_path});
+    defer alloc.free(events_path);
+    const bucket_path = try std.fmt.allocPrint(alloc, "{s}/external-lake", .{events_path});
+    defer alloc.free(bucket_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, bucket_path);
+    const part_path = try std.fmt.allocPrint(alloc, "{s}/part-a.parquet", .{bucket_path});
+    defer alloc.free(part_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = part_path, .data = "not-a-real-parquet-file" });
+
+    const schema_json = try std.fmt.allocPrint(alloc, schema_template, .{events_path});
+    defer alloc.free(schema_json);
+    const cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "prod-lake-read": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {{
+        \\        "protocol": "filesystem",
+        \\        "prefix": "{s}"
+        \\      }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{lake_root});
+    defer alloc.free(cfg_json);
+    var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
+    defer cfg.deinit();
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeBaseReads = struct {
+        rows_query_count: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedBaseLookup;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedBaseScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedBaseQuery;
+        }
+
+        fn rowsQueryPlan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: runtime_schema_mod.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rows_query_count += 1;
+            return error.BaseRowsQueryReached;
+        }
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var base_reads = FakeBaseReads{};
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .node_config = &cfg },
+        source.iface(),
+        base_reads.source(),
+        null,
+    );
+    defer server.deinit();
+
+    var response = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"amount\"]}}", null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), response.status);
     try std.testing.expectEqual(@as(u32, 0), base_reads.rows_query_count);
 }
 

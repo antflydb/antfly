@@ -1147,6 +1147,173 @@ pub const ClusterMaintenancePlan = struct {
     }
 };
 
+pub const BulkIoPlan = struct {
+    direction: BulkIoDirection,
+    table_name: []const u8,
+    columns: []const []const u8 = &.{},
+    endpoint: []const u8,
+    format: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        freeStringSlice(alloc, self.columns);
+        alloc.free(self.endpoint);
+        if (self.format) |format| alloc.free(format);
+        self.* = undefined;
+    }
+};
+
+pub const BulkIoDirection = enum {
+    from,
+    to,
+};
+
+pub const MaterializedViewCatalogPlan = union(enum) {
+    create: CreateMaterializedViewPlan,
+    refresh: RefreshMaterializedViewPlan,
+    drop: DropMaterializedViewPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .refresh => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateMaterializedViewPlan = struct {
+    view_name: []const u8,
+    source_table_name: []const u8,
+    source_fields: []const []const u8 = &.{},
+    output_fields: []const []const u8 = &.{},
+    replace_existing: bool = false,
+    if_not_exists: bool = false,
+    populate_on_create: bool = true,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.view_name);
+        alloc.free(self.source_table_name);
+        freeStringSlice(alloc, self.source_fields);
+        freeStringSlice(alloc, self.output_fields);
+        self.* = undefined;
+    }
+};
+
+pub const RefreshMaterializedViewPlan = struct {
+    view_name: []const u8,
+    concurrently: bool = false,
+    populate: bool = true,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.view_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropMaterializedViewPlan = struct {
+    view_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.view_name);
+        self.* = undefined;
+    }
+};
+
+pub const ViewCatalogPlan = union(enum) {
+    create: CreateViewPlan,
+    rename: RenameViewPlan,
+    drop: DropViewPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*plan| plan.deinit(alloc),
+            .rename => |*plan| plan.deinit(alloc),
+            .drop => |*plan| plan.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CreateViewPlan = struct {
+    view_name: []const u8,
+    source_table_name: []const u8,
+    source_fields: []const []const u8 = &.{},
+    output_fields: []const []const u8 = &.{},
+    replace_existing: bool = false,
+    if_not_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.view_name);
+        alloc.free(self.source_table_name);
+        freeStringSlice(alloc, self.source_fields);
+        freeStringSlice(alloc, self.output_fields);
+        self.* = undefined;
+    }
+};
+
+pub const RenameViewPlan = struct {
+    view_name: []const u8,
+    new_view_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.view_name);
+        alloc.free(self.new_view_name);
+        self.* = undefined;
+    }
+};
+
+pub const DropViewPlan = struct {
+    view_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.view_name);
+        self.* = undefined;
+    }
+};
+
+pub const TableClonePlan = struct {
+    table_name: []const u8,
+    source_table_name: []const u8,
+    if_not_exists: bool = false,
+    options: TableCloneOptions = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.source_table_name);
+        self.* = undefined;
+    }
+};
+
+pub const TableCloneOptions = struct {
+    columns: bool = true,
+    defaults: bool = false,
+    generated: bool = false,
+    checks: bool = false,
+    constraints: bool = false,
+    indexes: bool = false,
+    periods: bool = false,
+    update_policies: bool = false,
+
+    pub fn includingAll() TableCloneOptions {
+        return .{
+            .columns = true,
+            .defaults = true,
+            .generated = true,
+            .checks = true,
+            .constraints = true,
+            .indexes = true,
+            .periods = true,
+            .update_policies = true,
+        };
+    }
+};
+
 pub const AdvisoryLockPlan = struct {
     action: AdvisoryLockAction,
     key1: i64,
@@ -1545,4 +1712,91 @@ test "SQL adapter DDL maintenance plans own strings" {
         .verbose = true,
     } };
     cluster.deinit(alloc);
+}
+
+test "SQL adapter DDL bulk io plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var columns = try alloc.alloc([]const u8, 2);
+    columns[0] = try alloc.dupe(u8, "id");
+    columns[1] = try alloc.dupe(u8, "amount");
+
+    var bulk_io = BulkIoPlan{
+        .direction = .from,
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .columns = columns,
+        .endpoint = try alloc.dupe(u8, "s3://bucket/usage.csv"),
+        .format = try alloc.dupe(u8, "csv"),
+    };
+    bulk_io.deinit(alloc);
+}
+
+test "SQL adapter DDL view plans own nested fields" {
+    const alloc = std.testing.allocator;
+
+    var source_fields = try alloc.alloc([]const u8, 2);
+    source_fields[0] = try alloc.dupe(u8, "id");
+    source_fields[1] = try alloc.dupe(u8, "amount");
+    var output_fields = try alloc.alloc([]const u8, 2);
+    output_fields[0] = try alloc.dupe(u8, "record_id");
+    output_fields[1] = try alloc.dupe(u8, "total_amount");
+    var create_view: ViewCatalogPlan = .{ .create = .{
+        .view_name = try alloc.dupe(u8, "usage_summary"),
+        .source_table_name = try alloc.dupe(u8, "usage_records"),
+        .source_fields = source_fields,
+        .output_fields = output_fields,
+        .replace_existing = true,
+    } };
+    create_view.deinit(alloc);
+
+    var rename_view: ViewCatalogPlan = .{ .rename = .{
+        .view_name = try alloc.dupe(u8, "usage_summary"),
+        .new_view_name = try alloc.dupe(u8, "usage_summary_v2"),
+    } };
+    rename_view.deinit(alloc);
+}
+
+test "SQL adapter DDL materialized view plans own nested fields" {
+    const alloc = std.testing.allocator;
+
+    var source_fields = try alloc.alloc([]const u8, 1);
+    source_fields[0] = try alloc.dupe(u8, "amount");
+    var output_fields = try alloc.alloc([]const u8, 1);
+    output_fields[0] = try alloc.dupe(u8, "amount_sum");
+    var create_mv: MaterializedViewCatalogPlan = .{ .create = .{
+        .view_name = try alloc.dupe(u8, "usage_amounts_mv"),
+        .source_table_name = try alloc.dupe(u8, "usage_records"),
+        .source_fields = source_fields,
+        .output_fields = output_fields,
+        .if_not_exists = true,
+    } };
+    create_mv.deinit(alloc);
+
+    var refresh_mv: MaterializedViewCatalogPlan = .{ .refresh = .{
+        .view_name = try alloc.dupe(u8, "usage_amounts_mv"),
+        .concurrently = true,
+    } };
+    refresh_mv.deinit(alloc);
+}
+
+test "SQL adapter DDL table clone plans own strings and expose all options" {
+    const alloc = std.testing.allocator;
+
+    const all = TableCloneOptions.includingAll();
+    try std.testing.expect(all.columns);
+    try std.testing.expect(all.defaults);
+    try std.testing.expect(all.generated);
+    try std.testing.expect(all.checks);
+    try std.testing.expect(all.constraints);
+    try std.testing.expect(all.indexes);
+    try std.testing.expect(all.periods);
+    try std.testing.expect(all.update_policies);
+
+    var clone = TableClonePlan{
+        .table_name = try alloc.dupe(u8, "usage_archive"),
+        .source_table_name = try alloc.dupe(u8, "usage_records"),
+        .if_not_exists = true,
+        .options = all,
+    };
+    clone.deinit(alloc);
 }

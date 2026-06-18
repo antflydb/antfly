@@ -83,9 +83,31 @@ pub const OpenedObjectStore = struct {
     }
 
     pub fn initS3Uri(alloc: Allocator, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initS3UriWithOverrides(alloc, bucket, prefix, .{});
+    }
+
+    pub const S3Overrides = struct {
+        endpoint: ?[]const u8 = null,
+        use_ssl: bool = true,
+        access_key_id: ?[]const u8 = null,
+        secret_access_key: ?[]const u8 = null,
+        session_token: ?[]const u8 = null,
+        region: ?[]const u8 = null,
+    };
+
+    pub fn initS3UriWithOverrides(alloc: Allocator, bucket: []const u8, prefix: []const u8, overrides: S3Overrides) !OpenedObjectStore {
         const s3 = try alloc.create(object_storage.S3.Client);
         errdefer alloc.destroy(s3);
-        const cfg = try object_storage.S3.fromEnvAlloc(alloc, null, true, null, null, null, null, .path);
+        const cfg = try object_storage.S3.fromEnvAlloc(
+            alloc,
+            overrides.endpoint,
+            overrides.use_ssl,
+            overrides.access_key_id,
+            overrides.secret_access_key,
+            overrides.session_token,
+            overrides.region,
+            .path,
+        );
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
 
         var owned_client = s3.client();
