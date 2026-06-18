@@ -1257,9 +1257,23 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
 
 fn fileMayMatchPredicate(file: external_source.FileEntry, predicate: ?lake_rows.Predicate) bool {
     const pred = predicate orelse return true;
-    if (pred.op != .eq_bytes) return true;
     const partition = findPartitionValue(file, pred.column) orelse return true;
-    return std.mem.eql(u8, partition.string_value, pred.bytes_value);
+    return partitionMayMatchPredicate(partition, pred);
+}
+
+fn partitionMayMatchPredicate(partition: external_source.PartitionValue, predicate: lake_rows.Predicate) bool {
+    return switch (predicate.op) {
+        .eq_bytes => std.mem.eql(u8, partition.string_value, predicate.bytes_value),
+        .eq_i64 => {
+            const value = std.fmt.parseInt(i64, partition.string_value, 10) catch return true;
+            return value == predicate.i64_value;
+        },
+        .eq_bool => {
+            if (std.mem.eql(u8, partition.string_value, "true")) return predicate.bool_value;
+            if (std.mem.eql(u8, partition.string_value, "false")) return !predicate.bool_value;
+            return true;
+        },
+    };
 }
 
 fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?lake_rows.Predicate) bool {
@@ -4909,6 +4923,48 @@ test "iceberg object range planner prunes files with partition equality metadata
 
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
     try std.testing.expectEqualStrings("part-west.parquet", plan.row_groups[0].file_id);
+}
+
+test "iceberg partition predicate pruning supports typed equality metadata" {
+    const int_partition = external_source.PartitionValue{
+        .column_id = @constCast("bucket_id"),
+        .string_value = @constCast("42"),
+    };
+    try std.testing.expect(partitionMayMatchPredicate(int_partition, .{
+        .column = "bucket_id",
+        .op = .eq_i64,
+        .i64_value = 42,
+    }));
+    try std.testing.expect(!partitionMayMatchPredicate(int_partition, .{
+        .column = "bucket_id",
+        .op = .eq_i64,
+        .i64_value = 7,
+    }));
+
+    const bool_partition = external_source.PartitionValue{
+        .column_id = @constCast("is_active"),
+        .string_value = @constCast("true"),
+    };
+    try std.testing.expect(partitionMayMatchPredicate(bool_partition, .{
+        .column = "is_active",
+        .op = .eq_bool,
+        .bool_value = true,
+    }));
+    try std.testing.expect(!partitionMayMatchPredicate(bool_partition, .{
+        .column = "is_active",
+        .op = .eq_bool,
+        .bool_value = false,
+    }));
+
+    const transformed_partition = external_source.PartitionValue{
+        .column_id = @constCast("bucket_id"),
+        .string_value = @constCast("bucket-42"),
+    };
+    try std.testing.expect(partitionMayMatchPredicate(transformed_partition, .{
+        .column = "bucket_id",
+        .op = .eq_i64,
+        .i64_value = 42,
+    }));
 }
 
 test "parquet object range discovery reads footers and builds row group source" {
