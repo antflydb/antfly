@@ -715,6 +715,12 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert retained_stale_slot["reseed_required"] is True
     assert retained_stale_slot["status"] == "reseed_required"
 
+    old_primary_slot = ha_cluster.primary.admin_post(
+        "/replication-slots",
+        {"slot_name": "primary-a", "initial_lsn": second_lsn},
+    )
+    assert old_primary_slot["slot"]["slot_name"] == "primary-a"
+
     fence_request = _promotion_fence_request(ha_cluster, second_lsn)
     fence = ha_cluster.standby.admin_post("/fence", fence_request)
     assert fence["receipt"]["promoted_node_id"] == "standby-a"
@@ -742,6 +748,44 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert fenced_write_check["decision"]["role"] == "fenced_primary"
     assert fenced_write_check["decision"]["action"] == "reject_fenced_primary"
+
+    rejoin_request = {
+        "node_id": "primary-a",
+        "identity": _identity(ha_cluster),
+        "last_lsn": second_lsn,
+        "retained_from_lsn": 0,
+        "allow_rewind_after_forced_promotion": False,
+    }
+    unfenced_rejoin = ha_cluster.primary.admin_post("/rejoin/assess", rejoin_request)
+    assert unfenced_rejoin["action"]["action_kind"] == "rejoin_assess"
+    assert unfenced_rejoin["assessment"]["action"] == "reject_unfenced"
+    assert unfenced_rejoin["assessment"]["reason"] == "no_fence"
+
+    reseed_rejoin_request = {
+        **rejoin_request,
+        "retained_from_lsn": second_lsn + 1,
+        "receipt": fence["receipt"],
+    }
+    rejoin_assessment = ha_cluster.primary.admin_post("/rejoin/assess", reseed_rejoin_request)
+    assert rejoin_assessment["assessment"]["action"] == "reseed"
+    assert rejoin_assessment["assessment"]["reason"] == "parent_timeline_wal_expired"
+    assert rejoin_assessment["assessment"]["former_node_id"] == "primary-a"
+    assert rejoin_assessment["assessment"]["target_timeline_id"] == 2
+    assert rejoin_assessment["assessment"]["target_epoch"] == 2
+    assert rejoin_assessment["assessment"]["fork_lsn"] == second_lsn
+
+    rejoin_reseed = ha_cluster.primary.admin_post("/rejoin/reseed", reseed_rejoin_request)
+    assert rejoin_reseed["action"]["action_kind"] == "rejoin_reseed"
+    assert rejoin_reseed["action"]["state"] == "applied"
+    assert rejoin_reseed["action"]["target"] == "primary-a"
+    assert rejoin_reseed["reseed"]["node_id"] == "primary-a"
+    assert rejoin_reseed["reseed"]["slot_name"] == "primary-a"
+    assert rejoin_reseed["reseed"]["reseed_required"] is True
+    assert rejoin_reseed["reseed"]["base_backup_required"] is True
+    post_reseed_status = ha_cluster.primary.admin_get("/primary/status")
+    reseeded_old_primary_slot = _slot_by_name(post_reseed_status, "primary-a")
+    assert reseeded_old_primary_slot["reseed_required"] is True
+    assert reseeded_old_primary_slot["status"] == "reseed_required"
 
     rejected = ha_cluster.primary.batch_write_response(
         table_name,
