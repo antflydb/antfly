@@ -532,6 +532,10 @@ pub const RuntimeDirectoryStore = struct {
         return self.batch.pendingEntries();
     }
 
+    pub fn pendingPointEntries(self: RuntimeDirectoryStore) usize {
+        return self.batch.pendingPointEntries();
+    }
+
     pub fn pendingDeltaRecords(self: RuntimeDirectoryStore) usize {
         return self.batch.pendingDeltaRecords();
     }
@@ -566,7 +570,9 @@ pub const RuntimeDirectoryStore = struct {
         errdefer deinitCentroidRecordCandidates(alloc, &candidates);
 
         try self.lazy.snapshot().appendCentroidDirectoryRecordCandidates(alloc, &candidates);
-        try self.batch.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
+        if (self.batch.pendingPointEntries() != 0) {
+            try self.batch.appendCentroidDirectoryRecordCandidates(alloc, &candidates);
+        }
         return try centroidRecordCandidatesToOwnedSlice(alloc, &candidates);
     }
 
@@ -2851,6 +2857,10 @@ pub const DirectoryBatchWriter = struct {
 
     pub fn pendingEntries(self: DirectoryBatchWriter) usize {
         return self.writer.entries.items.len + self.pending_delta_batches.count();
+    }
+
+    pub fn pendingPointEntries(self: DirectoryBatchWriter) usize {
+        return self.writer.entries.items.len;
     }
 
     pub fn pendingDeltaRecords(self: DirectoryBatchWriter) usize {

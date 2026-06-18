@@ -3583,7 +3583,9 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        if (try runtime.store.pendingBase(self.alloc, posting_id)) |base| return base;
+        if (runtime.store.pendingPointEntries() != 0) {
+            if (try runtime.store.pendingBase(self.alloc, posting_id)) |base| return base;
+        }
         return (try runtime.store.snapshot().loadBase(self.alloc, posting_id)) orelse error.NotFound;
     }
 
@@ -3593,7 +3595,9 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        if (try runtime.store.pendingBaseHeader(posting_id)) |header| return header;
+        if (runtime.store.pendingPointEntries() != 0) {
+            if (try runtime.store.pendingBaseHeader(posting_id)) |header| return header;
+        }
         return (try runtime.store.snapshot().loadBaseHeader(self.alloc, posting_id)) orelse error.NotFound;
     }
 
@@ -3603,7 +3607,9 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        if (try runtime.store.pendingBaseStats(posting_id)) |base_stats| return base_stats;
+        if (runtime.store.pendingPointEntries() != 0) {
+            if (try runtime.store.pendingBaseStats(posting_id)) |base_stats| return base_stats;
+        }
         return (try runtime.store.snapshot().loadBaseStats(self.alloc, posting_id)) orelse error.NotFound;
     }
 
@@ -3613,7 +3619,9 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        if (try runtime.store.pendingBaseDataAlloc(self.alloc, posting_id)) |data| return data;
+        if (runtime.store.pendingPointEntries() != 0) {
+            if (try runtime.store.pendingBaseDataAlloc(self.alloc, posting_id)) |data| return data;
+        }
         return (try runtime.store.snapshot().loadBaseData(self.alloc, posting_id)) orelse error.NotFound;
     }
 
@@ -3623,7 +3631,9 @@ pub const HBCIndex = struct {
         lockAtomic(&self.posting_segment_mu);
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
-        if (try runtime.store.pendingCentroidDirectoryRecord(self.alloc, posting_id)) |record| return record;
+        if (runtime.store.pendingPointEntries() != 0) {
+            if (try runtime.store.pendingCentroidDirectoryRecord(self.alloc, posting_id)) |record| return record;
+        }
         return (try runtime.store.snapshot().loadCentroidDirectoryRecord(self.alloc, posting_id)) orelse error.NotFound;
     }
 
@@ -3682,7 +3692,10 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         const committed = try runtime.store.snapshot().latestDeltaRecordAfterGenerationForMember(self.alloc, posting_id, vector_id, base_generation);
-        const pending = try runtime.store.pendingLatestDeltaRecordAfterGenerationForMember(posting_id, vector_id, base_generation);
+        const pending = if (runtime.store.pendingDeltaRecords() == 0)
+            null
+        else
+            try runtime.store.pendingLatestDeltaRecordAfterGenerationForMember(posting_id, vector_id, base_generation);
         if (committed == null) return if (pending) |record| record.op else null;
         if (pending == null) return committed.?.op;
         return if (pending.?.sequence >= committed.?.sequence) pending.?.op else committed.?.op;
@@ -3734,8 +3747,12 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         const snapshot = runtime.store.snapshot();
-        if (try runtime.store.pendingBase(self.alloc, posting_id)) |pending_base_value| {
-            var pending_base = pending_base_value;
+        const pending_base_value = if (runtime.store.pendingPointEntries() == 0)
+            null
+        else
+            try runtime.store.pendingBase(self.alloc, posting_id);
+        if (pending_base_value) |pending_base_loaded| {
+            var pending_base = pending_base_loaded;
             defer pending_base.deinit(self.alloc);
             scratch.resetDeltaRecords();
             _ = try snapshot.appendDeltaTailAfterGenerationIntoScratchWithStats(self.alloc, posting_id, pending_base.generation, &scratch);
@@ -3784,7 +3801,10 @@ pub const HBCIndex = struct {
         defer self.posting_segment_mu.unlock();
         const runtime = try self.postingSegmentRuntime();
         const snapshot = runtime.store.snapshot();
-        var pending_base: ?vectorindex_posting.OwnedPostingBase = try runtime.store.pendingBase(self.alloc, posting_id);
+        var pending_base: ?vectorindex_posting.OwnedPostingBase = if (runtime.store.pendingPointEntries() == 0)
+            null
+        else
+            try runtime.store.pendingBase(self.alloc, posting_id);
         defer if (pending_base) |*base| base.deinit(self.alloc);
 
         const base_header = if (pending_base) |base|
