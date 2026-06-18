@@ -842,7 +842,8 @@ implementations cleanly:
    are for distinct lifetime/shape classes such as vector batches, member ids,
    posting overlay summaries, and posting caches. Small transformed-vector
    matrix loads and small metadata batch lookups now use stack-backed scratch
-   before falling back to heap allocation.
+   before falling back to heap allocation. `SearchScratch` also slabs the fixed
+   transformed-query, centroid, and vector work buffers into one allocation.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.

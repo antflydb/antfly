@@ -147,6 +147,7 @@ const PostingDeltaTailCacheEntry = struct {
 pub const SearchScratch = struct {
     dims: usize,
     estimate: quantizer.RaBitQuantizer.EstimateScratch,
+    vector_storage: []f32,
     transformed_query: []f32,
     centroid: []f32,
     vector: []f32,
@@ -204,12 +205,12 @@ pub const SearchScratch = struct {
             var tmp = estimate;
             tmp.deinit(alloc);
         }
-        const transformed_query = try alloc.alloc(f32, dims);
-        errdefer alloc.free(transformed_query);
-        const centroid = try alloc.alloc(f32, dims);
-        errdefer alloc.free(centroid);
-        const vector = try alloc.alloc(f32, dims);
-        errdefer alloc.free(vector);
+        const vector_storage_len = try std.math.mul(usize, dims, 3);
+        const vector_storage = try alloc.alloc(f32, vector_storage_len);
+        errdefer alloc.free(vector_storage);
+        const transformed_query = vector_storage[0..dims];
+        const centroid = vector_storage[dims .. 2 * dims];
+        const vector = vector_storage[2 * dims .. 3 * dims];
         const member_ids = try alloc.alloc(u64, max_leaf);
         errdefer alloc.free(member_ids);
         const query_storage = try allocateQueryStorage(alloc, max_candidates);
@@ -220,6 +221,7 @@ pub const SearchScratch = struct {
         return .{
             .dims = dims,
             .estimate = estimate,
+            .vector_storage = vector_storage,
             .transformed_query = transformed_query,
             .centroid = centroid,
             .vector = vector,
@@ -243,16 +245,12 @@ pub const SearchScratch = struct {
                 max_posting_member_cache_entry_bytes,
             ),
             .scratch_allocation_count = initialScratchAllocationCount(.{
-                transformed_query,
-                centroid,
-                vector,
+                vector_storage,
                 member_ids,
                 query_storage,
                 distance_storage,
             }),
-            .scratch_allocation_bytes = byteLen(transformed_query) +
-                byteLen(centroid) +
-                byteLen(vector) +
+            .scratch_allocation_bytes = byteLen(vector_storage) +
                 byteLen(member_ids) +
                 byteLen(query_storage) +
                 byteLen(distance_storage),
@@ -654,9 +652,7 @@ pub const SearchScratch = struct {
         var posting_delta_tail_cache_bytes: u64 = 0;
         for (&self.posting_delta_tail_cache) |*entry| posting_delta_tail_cache_bytes += entry.bytes();
         return estimateScratchBytes(&self.estimate) +
-            byteLen(self.transformed_query) +
-            byteLen(self.centroid) +
-            byteLen(self.vector) +
+            byteLen(self.vector_storage) +
             byteLen(self.vector_batch) +
             byteLen(self.member_ids) +
             byteLen(self.query_storage) +
@@ -673,9 +669,7 @@ pub const SearchScratch = struct {
 
     pub fn deinit(self: *SearchScratch, alloc: Allocator) void {
         self.estimate.deinit(alloc);
-        alloc.free(self.transformed_query);
-        alloc.free(self.centroid);
-        alloc.free(self.vector);
+        alloc.free(self.vector_storage);
         alloc.free(self.vector_batch);
         alloc.free(self.member_ids);
         alloc.free(self.query_storage);
@@ -820,6 +814,17 @@ test "SearchScratch grows error bounds with vector fetch capacity" {
     try std.testing.expect(scratch.distances.len >= 5);
     try std.testing.expect(scratch.error_bounds.len >= 5);
     try std.testing.expect(scratch.vector_batch.len >= 4 * 5);
+}
+
+test "SearchScratch slabs fixed vector work buffers" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2, 0, 0);
+    defer scratch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 12), scratch.vector_storage.len);
+    try std.testing.expectEqual(scratch.vector_storage[0..4].ptr, scratch.transformed_query.ptr);
+    try std.testing.expectEqual(scratch.vector_storage[4..8].ptr, scratch.centroid.ptr);
+    try std.testing.expectEqual(scratch.vector_storage[8..12].ptr, scratch.vector.ptr);
 }
 
 test "SearchScratch grows distance capacity without vector fetch buffers" {
