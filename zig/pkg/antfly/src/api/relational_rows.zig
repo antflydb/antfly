@@ -4177,6 +4177,20 @@ const LakeTypedNumericExpression = union(enum) {
             else => unreachable,
         };
     }
+
+    fn isUnsupported(self: @This()) bool {
+        return switch (self) {
+            .unsupported => true,
+            else => false,
+        };
+    }
+
+    fn isNull(self: @This()) bool {
+        return switch (self) {
+            .null => true,
+            else => false,
+        };
+    }
 };
 
 fn lakeRowsTypedNumericExpressionAlloc(
@@ -4546,11 +4560,70 @@ fn lakeRowsExpressionConditionMatchesAlloc(
     row: lake_rows.ProjectedRow,
     condition: db_mod.types.RelationalRowsExpressionCondition,
 ) !bool {
+    if (try lakeRowsTypedNumericExpressionConditionMatchesAlloc(alloc, row, condition)) |matched| return matched;
     const row_json = try lakeProjectedRowJsonAlloc(alloc, row);
     defer alloc.free(row_json);
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     return try expressionConditionMatches(alloc, parsed.value, condition);
+}
+
+fn lakeRowsTypedNumericExpressionConditionMatchesAlloc(
+    alloc: std.mem.Allocator,
+    row: lake_rows.ProjectedRow,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) !?bool {
+    const lhs = try lakeRowsTypedNumericExpressionAlloc(alloc, row, condition.lhs);
+    if (lhs.isUnsupported()) return null;
+    return switch (condition.op) {
+        .is_null => lhs.isNull(),
+        .is_not_null => !lhs.isNull(),
+        .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => blk: {
+            if (condition.rhs.len != 1) return error.InvalidRowsRequest;
+            const rhs = try lakeRowsTypedNumericExpressionAlloc(alloc, row, condition.rhs[0]);
+            if (rhs.isUnsupported()) return null;
+            if (condition.op == .is_distinct or condition.op == .is_not_distinct) {
+                const not_distinct = lakeRowsTypedNumericValuesNotDistinct(lhs, rhs);
+                break :blk if (condition.op == .is_not_distinct) not_distinct else !not_distinct;
+            }
+            if (condition.op == .eq or condition.op == .ne) {
+                const equal = lakeRowsTypedNumericValuesEqual(lhs, rhs);
+                break :blk if (condition.op == .eq) equal else !equal;
+            }
+            if (lhs.isNull() or rhs.isNull()) return error.InvalidRowsRequest;
+            const comparison = compareLakeRowsTypedNumericValues(lhs, rhs);
+            break :blk switch (condition.op) {
+                .gt => comparison == .gt,
+                .gte => comparison == .gt or comparison == .eq,
+                .lt => comparison == .lt,
+                .lte => comparison == .lt or comparison == .eq,
+                else => unreachable,
+            };
+        },
+    };
+}
+
+fn lakeRowsTypedNumericValuesNotDistinct(lhs: LakeTypedNumericExpression, rhs: LakeTypedNumericExpression) bool {
+    if (lhs.isNull() or rhs.isNull()) return lhs.isNull() and rhs.isNull();
+    return compareLakeRowsTypedNumericValues(lhs, rhs) == .eq;
+}
+
+fn lakeRowsTypedNumericValuesEqual(lhs: LakeTypedNumericExpression, rhs: LakeTypedNumericExpression) bool {
+    if (lhs.isNull() or rhs.isNull()) return lhs.isNull() and rhs.isNull();
+    return compareLakeRowsTypedNumericValues(lhs, rhs) == .eq;
+}
+
+fn compareLakeRowsTypedNumericValues(lhs: LakeTypedNumericExpression, rhs: LakeTypedNumericExpression) ScalarComparison {
+    if (lhs == .i64 and rhs == .i64) {
+        if (lhs.i64 < rhs.i64) return .lt;
+        if (lhs.i64 > rhs.i64) return .gt;
+        return .eq;
+    }
+    const lhs_number = lhs.asF64();
+    const rhs_number = rhs.asF64();
+    if (lhs_number < rhs_number) return .lt;
+    if (lhs_number > rhs_number) return .gt;
+    return .eq;
 }
 
 fn lakeRowsJsonContainsPredicateMatchesAlloc(
@@ -19181,6 +19254,19 @@ test "relational rows lake bridge applies scalar aggregate filters" {
         .op = .eq,
         .rhs = &open_status_rhs,
     }};
+    const amount_minus_rank_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "amount", .field_source = .row },
+        .{ .kind = .field, .field = "rank", .field_source = .row },
+    };
+    const amount_minus_rank_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "18",
+    }};
+    const amount_minus_rank_filter = [_]db_mod.types.RelationalRowsExpressionCondition{.{
+        .lhs = .{ .kind = .sub, .operands = &amount_minus_rank_operands },
+        .op = .gte,
+        .rhs = &amount_minus_rank_rhs,
+    }};
     const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "row_count", .op = .count },
         .{ .name = "large_amount_sum", .op = .sum, .field = "amount", .filter_predicates = &filter_predicates },
@@ -19192,6 +19278,7 @@ test "relational rows lake bridge applies scalar aggregate filters" {
         .{ .name = "source_api_amount_sum", .op = .sum, .field = "amount", .filter_json_path_eq = &source_api_filter },
         .{ .name = "flags_amount_sum", .op = .sum, .field = "amount", .filter_json_path_exists = &flags_exists_filter },
         .{ .name = "open_expr_amount_sum", .op = .sum, .field = "amount", .filter_expressions = &open_status_expression_filter },
+        .{ .name = "large_net_expr_amount_sum", .op = .sum, .field = "amount", .filter_expressions = &amount_minus_rank_filter },
     };
     const request = OwnedRowsAggregateRequest{
         .group_by = &group_by,
@@ -19206,8 +19293,8 @@ test "relational rows lake bridge applies scalar aggregate filters" {
 
     try std.testing.expectEqual(@as(u32, 2), result.total_groups);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
-    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0,\"rank_two_amount_sum\":0,\"rank_not_two_amount_sum\":10,\"open_amount_sum\":0,\"not_open_amount_sum\":10,\"api_attrs_amount_sum\":0,\"source_api_amount_sum\":0,\"flags_amount_sum\":0,\"open_expr_amount_sum\":0}", result.rows[0]);
-    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50,\"rank_two_amount_sum\":30,\"rank_not_two_amount_sum\":20,\"open_amount_sum\":20,\"not_open_amount_sum\":30,\"api_attrs_amount_sum\":50,\"source_api_amount_sum\":50,\"flags_amount_sum\":20,\"open_expr_amount_sum\":20}", result.rows[1]);
+    try std.testing.expectEqualStrings("{\"tenant\":7,\"row_count\":1,\"large_amount_sum\":0,\"rank_two_amount_sum\":0,\"rank_not_two_amount_sum\":10,\"open_amount_sum\":0,\"not_open_amount_sum\":10,\"api_attrs_amount_sum\":0,\"source_api_amount_sum\":0,\"flags_amount_sum\":0,\"open_expr_amount_sum\":0,\"large_net_expr_amount_sum\":0}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"tenant\":8,\"row_count\":2,\"large_amount_sum\":50,\"rank_two_amount_sum\":30,\"rank_not_two_amount_sum\":20,\"open_amount_sum\":20,\"not_open_amount_sum\":30,\"api_attrs_amount_sum\":50,\"source_api_amount_sum\":50,\"flags_amount_sum\":20,\"open_expr_amount_sum\":20,\"large_net_expr_amount_sum\":30}", result.rows[1]);
 }
 
 test "relational rows lake bridge applies array aggregate filters" {

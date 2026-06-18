@@ -304,6 +304,7 @@ pub const parseSqlObjectIdentifierOwnedAlloc = grammar.parseSqlObjectIdentifierO
 pub const parseSqlTableReferenceIdentifierOwnedAlloc = grammar.parseSqlTableReferenceIdentifierOwnedAlloc;
 pub const parseSqlTimestampLiteralNs = value.parseSqlTimestampLiteralNs;
 pub const parseDelimitedUsizeToken = corpus.parseDelimitedUsizeToken;
+pub const parenthesizedPredicateGroupCanStartAt = lower_expr.parenthesizedPredicateGroupCanStartAt;
 pub const peekKeyword = parser.peekKeyword;
 pub const peekKind = parser.peekKind;
 pub const planBoolTokenSumMatches = corpus.planBoolTokenSumMatches;

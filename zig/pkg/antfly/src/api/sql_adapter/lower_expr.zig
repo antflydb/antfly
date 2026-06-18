@@ -14,6 +14,11 @@
 
 const std = @import("std");
 
+const parser = @import("parser.zig");
+const token_mod = @import("token.zig");
+
+pub const Token = token_mod.Token;
+
 pub fn sqlKeywordIsAnyOrSome(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "any") or std.ascii.eqlIgnoreCase(text, "some");
 }
@@ -265,6 +270,42 @@ pub fn sqlWindowTailClauseKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "for");
 }
 
+pub fn parenthesizedPredicateGroupCanStartAt(tokens: []const Token, index: usize) bool {
+    if (index >= tokens.len or tokens[index].kind != .lparen) return false;
+    const close = parser.findMatchingRParenIndex(tokens, index) orelse return false;
+    if (close + 1 >= tokens.len) return true;
+    return !tokenContinuesScalarExpressionPredicate(tokens, close + 1);
+}
+
+fn tokenContinuesScalarExpressionPredicate(tokens: []const Token, index: usize) bool {
+    const token = tokens[index];
+    switch (token.kind) {
+        .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json => return true,
+        .identifier => {
+            if (std.ascii.eqlIgnoreCase(token.text, "is") or
+                std.ascii.eqlIgnoreCase(token.text, "like") or
+                std.ascii.eqlIgnoreCase(token.text, "ilike") or
+                std.ascii.eqlIgnoreCase(token.text, "in") or
+                std.ascii.eqlIgnoreCase(token.text, "between"))
+            {
+                return true;
+            }
+            if (std.ascii.eqlIgnoreCase(token.text, "not") and index + 1 < tokens.len and tokens[index + 1].kind == .identifier) {
+                const after_not = tokens[index + 1].text;
+                if (std.ascii.eqlIgnoreCase(after_not, "like") or
+                    std.ascii.eqlIgnoreCase(after_not, "ilike") or
+                    std.ascii.eqlIgnoreCase(after_not, "in") or
+                    std.ascii.eqlIgnoreCase(after_not, "between"))
+                {
+                    return true;
+                }
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
 test "sql adapter expression keyword predicates classify function and tail tokens" {
     try std.testing.expect(sqlKeywordIsAnyOrSome("SOME"));
     try std.testing.expect(sqlKeywordStartsScalarPredicate("between"));
@@ -276,4 +317,35 @@ test "sql adapter expression keyword predicates classify function and tail token
     try std.testing.expect(rowExpressionBoundaryKeyword("returning") == false);
     try std.testing.expect(sqlWhereTailClauseKeyword("returning"));
     try std.testing.expect(sqlWindowTailClauseKeyword("fetch"));
+}
+
+test "sql adapter expression grammar distinguishes grouped predicates from scalar expression predicates" {
+    const grouped = [_]Token{
+        .{ .kind = .lparen, .text = "(", .source_start = 0, .source_end = 1 },
+        .{ .kind = .identifier, .text = "a", .source_start = 1, .source_end = 2 },
+        .{ .kind = .eq, .text = "=", .source_start = 3, .source_end = 4 },
+        .{ .kind = .number, .text = "1", .source_start = 5, .source_end = 6 },
+        .{ .kind = .rparen, .text = ")", .source_start = 6, .source_end = 7 },
+        .{ .kind = .identifier, .text = "and", .source_start = 8, .source_end = 11 },
+    };
+    try std.testing.expect(parenthesizedPredicateGroupCanStartAt(grouped[0..], 0));
+
+    const compared_expression = [_]Token{
+        .{ .kind = .lparen, .text = "(", .source_start = 0, .source_end = 1 },
+        .{ .kind = .identifier, .text = "a", .source_start = 1, .source_end = 2 },
+        .{ .kind = .rparen, .text = ")", .source_start = 2, .source_end = 3 },
+        .{ .kind = .eq, .text = "=", .source_start = 4, .source_end = 5 },
+        .{ .kind = .number, .text = "1", .source_start = 6, .source_end = 7 },
+    };
+    try std.testing.expect(!parenthesizedPredicateGroupCanStartAt(compared_expression[0..], 0));
+
+    const not_like_expression = [_]Token{
+        .{ .kind = .lparen, .text = "(", .source_start = 0, .source_end = 1 },
+        .{ .kind = .identifier, .text = "name", .source_start = 1, .source_end = 5 },
+        .{ .kind = .rparen, .text = ")", .source_start = 5, .source_end = 6 },
+        .{ .kind = .identifier, .text = "not", .source_start = 7, .source_end = 10 },
+        .{ .kind = .identifier, .text = "ilike", .source_start = 11, .source_end = 16 },
+        .{ .kind = .string, .text = "%bot%", .source_start = 17, .source_end = 24 },
+    };
+    try std.testing.expect(!parenthesizedPredicateGroupCanStartAt(not_like_expression[0..], 0));
 }

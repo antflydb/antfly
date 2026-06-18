@@ -6989,7 +6989,7 @@ const Parser = struct {
             return;
         }
 
-        if (self.ddlCheckParenthesizedGroupCanStartAt(self.pos)) {
+        if (sql_adapter.parenthesizedPredicateGroupCanStartAt(self.tokens, self.pos)) {
             try self.expect(.lparen);
             const groups = try self.parseDdlCheckExpressionPredicateGroupsAlloc();
             var groups_transferred = false;
@@ -7005,7 +7005,7 @@ const Parser = struct {
     }
 
     fn parseDdlCheckNegatedPredicateGroupsAlloc(self: *@This()) anyerror![]db_mod.types.RelationalRowsExpressionPredicateGroup {
-        if (self.ddlCheckParenthesizedGroupCanStartAt(self.pos)) {
+        if (sql_adapter.parenthesizedPredicateGroupCanStartAt(self.tokens, self.pos)) {
             try self.expect(.lparen);
             const groups = try self.parseDdlCheckExpressionPredicateGroupsAlloc();
             errdefer {
@@ -7023,38 +7023,6 @@ const Parser = struct {
         }
         try self.parseExpressionWhereConditionAlternatives(&groups);
         return try groups.toOwnedSlice(self.alloc);
-    }
-
-    fn ddlCheckParenthesizedGroupCanStartAt(self: *@This(), index: usize) bool {
-        if (index >= self.tokens.len or self.tokens[index].kind != .lparen) return false;
-        const close = sql_adapter.findMatchingRParenIndex(self.tokens, index) orelse return false;
-        if (close + 1 >= self.tokens.len) return true;
-        const next = self.tokens[close + 1];
-        switch (next.kind) {
-            .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json => return false,
-            else => {},
-        }
-        if (next.kind == .identifier) {
-            if (std.ascii.eqlIgnoreCase(next.text, "is") or
-                std.ascii.eqlIgnoreCase(next.text, "like") or
-                std.ascii.eqlIgnoreCase(next.text, "ilike") or
-                std.ascii.eqlIgnoreCase(next.text, "in") or
-                std.ascii.eqlIgnoreCase(next.text, "between"))
-            {
-                return false;
-            }
-            if (std.ascii.eqlIgnoreCase(next.text, "not") and close + 2 < self.tokens.len and self.tokens[close + 2].kind == .identifier) {
-                const after_not = self.tokens[close + 2].text;
-                if (std.ascii.eqlIgnoreCase(after_not, "like") or
-                    std.ascii.eqlIgnoreCase(after_not, "ilike") or
-                    std.ascii.eqlIgnoreCase(after_not, "in") or
-                    std.ascii.eqlIgnoreCase(after_not, "between"))
-                {
-                    return false;
-                }
-            }
-        }
-        return true;
     }
 
     fn booleanExpressionFromPredicateGroupsAlloc(

@@ -1092,7 +1092,10 @@ cursor/portal, savepoint transaction, comment metadata, and transaction-control
 plan containers, with the remaining DDL families scheduled to move through the
 same facade as their lowerers are extracted;
 `api/sql_adapter/lower_expr.zig` owns the expression keyword, function-name, and
-tail-boundary predicates that the shared expression lowerer uses;
+tail-boundary predicates that the shared expression lowerer uses, plus the
+token-level rule that distinguishes a parenthesized boolean predicate group
+from a parenthesized scalar expression followed by comparison, pattern, range,
+membership, or JSON/path operators;
 `api/relational_sql.zig` keeps the public lowering entrypoints and maps adapter
 syntax into Antfly-native typed plans. Row-lock target
 validation remains in the lowerer/binder boundary because it depends on table
