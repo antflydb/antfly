@@ -1215,6 +1215,12 @@ fn appendBinary(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, bytes: []con
     try out.appendSlice(alloc, bytes);
 }
 
+fn appendPlainI32StatBinary(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: i32) !void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &bytes, value, .little);
+    try appendBinary(out, alloc, &bytes);
+}
+
 test "parquet metadata parser extracts row groups and column chunks" {
     const alloc = std.testing.allocator;
     var bytes = try buildSingleColumnMetadataFixture(alloc);
@@ -1236,6 +1242,8 @@ test "parquet metadata parser extracts row groups and column chunks" {
     try std.testing.expectEqualStrings("plain", footer.row_groups[0].column_chunks[0].encoding);
     try std.testing.expectEqual(@as(u64, 100), footer.row_groups[0].column_chunks[0].file_offset);
     try std.testing.expectEqual(@as(u64, 40), footer.row_groups[0].column_chunks[0].compressed_len);
+    try std.testing.expectEqual(@as(?i64, 10), footer.row_groups[0].column_chunks[0].stats_min_i64);
+    try std.testing.expectEqual(@as(?i64, 20), footer.row_groups[0].column_chunks[0].stats_max_i64);
 }
 
 test "parquet metadata parser derives nullable columns from schema repetition" {
@@ -1330,6 +1338,8 @@ test "parquet metadata parser enriches raw inventory for projected scan planning
     try std.testing.expectEqual(@as(u64, 2), enriched.files[0].row_count);
     try std.testing.expectEqual(@as(usize, 1), enriched.files[0].row_groups.len);
     try std.testing.expectEqualStrings("amount", enriched.files[0].row_groups[0].column_chunks[0].column_id);
+    try std.testing.expectEqual(@as(?i64, 10), enriched.files[0].row_groups[0].column_chunks[0].stats_min_i64);
+    try std.testing.expectEqual(@as(?i64, 20), enriched.files[0].row_groups[0].column_chunks[0].stats_max_i64);
 
     const binding = external_binding.Binding{
         .table_id = "events",
@@ -1448,6 +1458,13 @@ fn buildSingleColumnMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8
     try appendI64(&out, alloc, 120);
     try appendField(&out, alloc, &meta_prev, 11, .i64);
     try appendI64(&out, alloc, 100);
+    try appendField(&out, alloc, &meta_prev, 12, .struct_);
+    var stats_prev: i16 = 0;
+    try appendField(&out, alloc, &stats_prev, 1, .binary);
+    try appendPlainI32StatBinary(&out, alloc, 20);
+    try appendField(&out, alloc, &stats_prev, 2, .binary);
+    try appendPlainI32StatBinary(&out, alloc, 10);
+    try appendStop(&out, alloc);
     try appendStop(&out, alloc);
 
     try appendStop(&out, alloc);
