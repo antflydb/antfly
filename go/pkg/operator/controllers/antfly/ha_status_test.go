@@ -3164,6 +3164,33 @@ func TestPeriodicRequeueRenewsKubernetesLeaseBeforeExpiry(t *testing.T) {
 	}
 }
 
+func TestPeriodicRequeueRetriesDirectHAAdminAction(t *testing.T) {
+	cluster := haCluster()
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind:          string(haActionCreateSlot),
+			AdminJobName:  haAdminDirectAPIName,
+			AdminJobPhase: haAdminJobPhasePending,
+			AdminError:    "HA admin API returned status 503: primary restarting",
+		}},
+	}
+
+	if got, want := periodicRequeueAfter(cluster), haAdminRetryRequeueAfter; got != want {
+		t.Fatalf("expected direct HA admin retry requeue %s, got %s", want, got)
+	}
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminError = ""
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("expected no retry requeue without transient error, got %s", got)
+	}
+
+	cluster.Status.HAStatus.PlannedActions[0].AdminError = "HA admin API returned status 503"
+	cluster.Status.HAStatus.PlannedActions[0].AdminJobName = "antfly-ha-action"
+	if got := periodicRequeueAfter(cluster); got != 0 {
+		t.Fatalf("expected no retry requeue for CLI admin job, got %s", got)
+	}
+}
+
 func haCluster() *antflyv1.AntflyCluster {
 	return &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

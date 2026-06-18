@@ -85,6 +85,7 @@ const (
 	defaultHAFencePath                      = "/antflydb/ha/fence.wal"
 	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
 	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
+	haAdminRetryRequeueAfter                = 5 * time.Second
 
 	haAdminJobPhaseWaitingDependency = "WaitingDependency"
 	haAdminJobPhasePending           = "Pending"
@@ -1669,6 +1670,9 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 	if haKubernetesLeaseRenewalEnabled(cluster) {
 		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter())
 	}
+	if haRetryingDirectAdminAction(cluster) {
+		requeueAfter = minPositiveDuration(requeueAfter, haAdminRetryRequeueAfter)
+	}
 	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
 		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
 	}
@@ -1676,6 +1680,20 @@ func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
 		requeueAfter = minPositiveDuration(requeueAfter, 60*time.Second)
 	}
 	return requeueAfter
+}
+
+func haRetryingDirectAdminAction(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return false
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobName == haAdminDirectAPIName &&
+			action.AdminJobPhase == haAdminJobPhasePending &&
+			strings.TrimSpace(action.AdminError) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func minPositiveDuration(current time.Duration, candidate time.Duration) time.Duration {

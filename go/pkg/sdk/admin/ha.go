@@ -1937,6 +1937,10 @@ func HAIsRetryable(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true

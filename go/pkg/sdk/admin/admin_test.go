@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -1531,6 +1532,10 @@ func TestHAErrorRetryability(t *testing.T) {
 	}, {
 		name: "deadline",
 		err:  context.DeadlineExceeded,
+		want: true,
+	}, {
+		name: "transport url error",
+		err:  &url.Error{Op: "Post", URL: "http://standby-a/admin/v1/ha/primary/status", Err: errors.New("connection refused")},
 		want: true,
 	}, {
 		name: "canceled",
