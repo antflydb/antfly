@@ -155,15 +155,25 @@ export function parseModelRef(model: string): ModelRef {
   if (parts.length > 3) {
     throw new Error(`model must be owner/repo[:format[:variant]], got ${JSON.stringify(model)}`);
   }
-  const nameParts = parts[0].split("/");
-  if (nameParts.length !== 2 || !nameParts[0] || !nameParts[1] || nameParts[1].includes("..")) {
+  const base = parts[0];
+  if (!base) {
     throw new Error(`model must be owner/repo[:format[:variant]], got ${JSON.stringify(model)}`);
   }
-  const ref: ModelRef = { owner: nameParts[0], repo: nameParts[1] };
+  const nameParts = base.split("/");
+  const owner = nameParts[0];
+  const repo = nameParts[1];
+  if (nameParts.length !== 2 || !owner || !repo || repo.includes("..")) {
+    throw new Error(`model must be owner/repo[:format[:variant]], got ${JSON.stringify(model)}`);
+  }
+  const ref: ModelRef = { owner, repo };
   if (parts.length === 2) {
     ref.variant = parts[1];
   } else if (parts.length === 3) {
-    ref.format = parts[1].toLowerCase();
+    const format = parts[1];
+    if (!format) {
+      throw new Error(`model must be owner/repo[:format[:variant]], got ${JSON.stringify(model)}`);
+    }
+    ref.format = format.toLowerCase();
     ref.variant = parts[2];
   }
   return ref;
