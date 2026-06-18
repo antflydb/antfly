@@ -185,6 +185,17 @@ pub const SavepointTransactionPlan = sql_adapter.SavepointTransactionPlan;
 pub const SavepointNamePlan = sql_adapter.SavepointNamePlan;
 pub const CommentMetadataPlan = sql_adapter.CommentMetadataPlan;
 pub const CommentMetadataTarget = sql_adapter.CommentMetadataTarget;
+pub const TransactionControlPlan = sql_adapter.TransactionControlPlan;
+pub const TableLockPlan = sql_adapter.TableLockPlan;
+pub const TableLockMode = sql_adapter.TableLockMode;
+pub const ConstraintModePlan = sql_adapter.ConstraintModePlan;
+pub const ConstraintCheckMode = sql_adapter.ConstraintCheckMode;
+pub const TransactionModePlan = sql_adapter.TransactionModePlan;
+pub const TransactionModeStarter = sql_adapter.TransactionModeStarter;
+pub const TransactionIsolationLevel = sql_adapter.TransactionIsolationLevel;
+pub const TransactionAccessMode = sql_adapter.TransactionAccessMode;
+pub const AdvisoryLockPlan = sql_adapter.AdvisoryLockPlan;
+pub const AdvisoryLockAction = sql_adapter.AdvisoryLockAction;
 
 pub const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
@@ -1165,98 +1176,6 @@ pub const ClusterMaintenancePlan = struct {
         if (self.index_name) |index_name| alloc.free(index_name);
         self.* = undefined;
     }
-};
-
-pub const TransactionControlPlan = union(enum) {
-    table_lock: TableLockPlan,
-    constraint_mode: ConstraintModePlan,
-    transaction_mode: TransactionModePlan,
-    advisory_lock: AdvisoryLockPlan,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        switch (self.*) {
-            .table_lock => |*plan| plan.deinit(alloc),
-            .constraint_mode => |*plan| plan.deinit(alloc),
-            .transaction_mode => {},
-            .advisory_lock => {},
-        }
-        self.* = undefined;
-    }
-};
-
-pub const TableLockPlan = struct {
-    table_names: []const []const u8,
-    mode: TableLockMode,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.table_names) |table_name| alloc.free(table_name);
-        if (self.table_names.len > 0) alloc.free(self.table_names);
-        self.* = undefined;
-    }
-};
-
-pub const TableLockMode = enum {
-    access_share,
-    row_share,
-    row_exclusive,
-    share_update_exclusive,
-    share,
-    share_row_exclusive,
-    exclusive,
-    access_exclusive,
-};
-
-pub const ConstraintModePlan = struct {
-    all: bool = false,
-    constraint_names: []const []const u8 = &.{},
-    mode: ConstraintCheckMode,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.constraint_names) |constraint_name| alloc.free(constraint_name);
-        if (self.constraint_names.len > 0) alloc.free(self.constraint_names);
-        self.* = undefined;
-    }
-};
-
-pub const ConstraintCheckMode = enum {
-    immediate,
-    deferred,
-};
-
-pub const TransactionModePlan = struct {
-    starter: TransactionModeStarter,
-    isolation_level: ?TransactionIsolationLevel = null,
-    access_mode: ?TransactionAccessMode = null,
-    deferrable: ?bool = null,
-};
-
-pub const TransactionModeStarter = enum {
-    set_transaction,
-    start_transaction,
-    begin,
-};
-
-pub const TransactionIsolationLevel = enum {
-    serializable,
-    repeatable_read,
-    read_committed,
-    read_uncommitted,
-};
-
-pub const TransactionAccessMode = enum {
-    read_only,
-    read_write,
-};
-
-pub const AdvisoryLockPlan = struct {
-    action: AdvisoryLockAction,
-    key1: i64,
-    key2: ?i64 = null,
-};
-
-pub const AdvisoryLockAction = enum {
-    lock,
-    unlock,
 };
 
 pub const MaterializedViewCatalogPlan = union(enum) {

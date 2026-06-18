@@ -456,6 +456,96 @@ pub const CommentMetadataTarget = enum {
     constraint,
 };
 
+pub const TransactionControlPlan = union(enum) {
+    table_lock: TableLockPlan,
+    constraint_mode: ConstraintModePlan,
+    transaction_mode: TransactionModePlan,
+    advisory_lock: AdvisoryLockPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .table_lock => |*plan| plan.deinit(alloc),
+            .constraint_mode => |*plan| plan.deinit(alloc),
+            .transaction_mode => {},
+            .advisory_lock => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const TableLockPlan = struct {
+    table_names: []const []const u8,
+    mode: TableLockMode,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.table_names);
+        self.* = undefined;
+    }
+};
+
+pub const TableLockMode = enum {
+    access_share,
+    row_share,
+    row_exclusive,
+    share_update_exclusive,
+    share,
+    share_row_exclusive,
+    exclusive,
+    access_exclusive,
+};
+
+pub const ConstraintModePlan = struct {
+    all: bool = false,
+    constraint_names: []const []const u8 = &.{},
+    mode: ConstraintCheckMode,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.constraint_names);
+        self.* = undefined;
+    }
+};
+
+pub const ConstraintCheckMode = enum {
+    immediate,
+    deferred,
+};
+
+pub const TransactionModePlan = struct {
+    starter: TransactionModeStarter,
+    isolation_level: ?TransactionIsolationLevel = null,
+    access_mode: ?TransactionAccessMode = null,
+    deferrable: ?bool = null,
+};
+
+pub const TransactionModeStarter = enum {
+    set_transaction,
+    start_transaction,
+    begin,
+};
+
+pub const TransactionIsolationLevel = enum {
+    serializable,
+    repeatable_read,
+    read_committed,
+    read_uncommitted,
+};
+
+pub const TransactionAccessMode = enum {
+    read_only,
+    read_write,
+};
+
+pub const AdvisoryLockPlan = struct {
+    action: AdvisoryLockAction,
+    key1: i64,
+    key2: ?i64 = null,
+};
+
+pub const AdvisoryLockAction = enum {
+    lock,
+    unlock,
+};
+
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
@@ -618,4 +708,41 @@ test "SQL adapter DDL savepoint and comment plans own strings" {
         .comment_json = try alloc.dupe(u8, "\"Usage event rows\""),
     };
     table_comment.deinit(alloc);
+}
+
+test "SQL adapter DDL transaction-control plans own strings" {
+    const alloc = std.testing.allocator;
+
+    var table_names = try alloc.alloc([]const u8, 2);
+    table_names[0] = try alloc.dupe(u8, "usage_records");
+    table_names[1] = try alloc.dupe(u8, "jobs");
+    var table_lock: TransactionControlPlan = .{ .table_lock = .{
+        .table_names = table_names,
+        .mode = .share_row_exclusive,
+    } };
+    table_lock.deinit(alloc);
+
+    var constraint_names = try alloc.alloc([]const u8, 2);
+    constraint_names[0] = try alloc.dupe(u8, "usage_records_status_check");
+    constraint_names[1] = try alloc.dupe(u8, "usage_records_account_fkey");
+    var constraint_mode: TransactionControlPlan = .{ .constraint_mode = .{
+        .constraint_names = constraint_names,
+        .mode = .deferred,
+    } };
+    constraint_mode.deinit(alloc);
+
+    var transaction_mode: TransactionControlPlan = .{ .transaction_mode = .{
+        .starter = .begin,
+        .isolation_level = .serializable,
+        .access_mode = .read_write,
+        .deferrable = false,
+    } };
+    transaction_mode.deinit(alloc);
+
+    var advisory_lock: TransactionControlPlan = .{ .advisory_lock = .{
+        .action = .lock,
+        .key1 = 42,
+        .key2 = 7,
+    } };
+    advisory_lock.deinit(alloc);
 }
