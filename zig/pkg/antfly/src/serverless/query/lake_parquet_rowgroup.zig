@@ -1216,7 +1216,7 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
     predicate: ?lake_rows.Predicate,
 ) !ObjectRangeRowGroupPlan {
     try inventory.validate();
-    if (inventory.format != .parquet) return error.InvalidParquetRowGroupBatch;
+    if (inventory.format != .parquet and inventory.format != .iceberg) return error.InvalidParquetRowGroupBatch;
     if (projected_columns.len == 0) return error.InvalidParquetRowGroupBatch;
     for (projected_columns) |column| {
         if (column.len == 0) return error.InvalidParquetRowGroupBatch;
@@ -1224,6 +1224,7 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
 
     var total_row_groups: usize = 0;
     for (inventory.files) |file| {
+        if (!fileMayMatchPredicate(file, predicate)) continue;
         for (file.row_groups) |row_group| {
             for (projected_columns) |column| {
                 const chunk = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
@@ -1239,6 +1240,7 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
     errdefer alloc.free(row_groups);
     var out_idx: usize = 0;
     for (inventory.files) |file| {
+        if (!fileMayMatchPredicate(file, predicate)) continue;
         for (file.row_groups) |row_group| {
             if (!rowGroupMayMatchPredicate(row_group, predicate)) continue;
             row_groups[out_idx] = .{
@@ -1253,6 +1255,13 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
     return .{ .row_groups = row_groups };
 }
 
+fn fileMayMatchPredicate(file: external_source.FileEntry, predicate: ?lake_rows.Predicate) bool {
+    const pred = predicate orelse return true;
+    if (pred.op != .eq_bytes) return true;
+    const partition = findPartitionValue(file, pred.column) orelse return true;
+    return std.mem.eql(u8, partition.string_value, pred.bytes_value);
+}
+
 fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?lake_rows.Predicate) bool {
     const pred = predicate orelse return true;
     if (pred.op != .eq_i64) return true;
@@ -1260,6 +1269,13 @@ fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?la
     const min = chunk.stats_min_i64 orelse return true;
     const max = chunk.stats_max_i64 orelse return true;
     return pred.i64_value >= min and pred.i64_value <= max;
+}
+
+fn findPartitionValue(file: external_source.FileEntry, column_id: []const u8) ?external_source.PartitionValue {
+    for (file.partition_values) |partition| {
+        if (std.mem.eql(u8, partition.column_id, column_id)) return partition;
+    }
+    return null;
 }
 
 fn validatePlannedChunk(chunk: external_source.ColumnChunk, validation: RowGroupPlanValidation) !void {
@@ -4804,6 +4820,95 @@ test "parquet object range rows query prunes row groups with i64 statistics" {
     try std.testing.expectEqual(@as(usize, 1), range_reader.read_count);
     try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
     try std.testing.expectEqual(@as(u32, 0), empty.total);
+}
+
+test "iceberg object range planner prunes files with partition equality metadata" {
+    const alloc = std.testing.allocator;
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/events"),
+        .snapshot_id = try alloc.dupe(u8, "12"),
+        .schema_fingerprint = try alloc.dupe(u8, "iceberg-schema:7"),
+        .files = try alloc.alloc(external_source.FileEntry, 2),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, "part-east.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-east.parquet"),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:east"),
+        .byte_len = 1024,
+        .row_count = 2,
+        .partition_values = try alloc.dupe(external_source.PartitionValue, &[_]external_source.PartitionValue{.{
+            .column_id = try alloc.dupe(u8, "region"),
+            .string_value = try alloc.dupe(u8, "us-east"),
+        }}),
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 2,
+            .file_offset = 100,
+            .total_byte_len = 16,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{.{
+                .column_id = try alloc.dupe(u8, "amount"),
+                .file_offset = 100,
+                .compressed_len = 16,
+                .uncompressed_len = 16,
+                .encoding = try alloc.dupe(u8, "plain"),
+                .physical_type = try alloc.dupe(u8, "int64"),
+            }}),
+        }}),
+    };
+    inventory.files[1] = .{
+        .file_id = try alloc.dupe(u8, "part-west.parquet"),
+        .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-west.parquet"),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:west"),
+        .byte_len = 1024,
+        .row_count = 2,
+        .partition_values = try alloc.dupe(external_source.PartitionValue, &[_]external_source.PartitionValue{.{
+            .column_id = try alloc.dupe(u8, "region"),
+            .string_value = try alloc.dupe(u8, "us-west"),
+        }}),
+        .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
+            .ordinal = 0,
+            .row_count = 2,
+            .file_offset = 100,
+            .total_byte_len = 32,
+            .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
+                .{
+                    .column_id = try alloc.dupe(u8, "amount"),
+                    .file_offset = 100,
+                    .compressed_len = 16,
+                    .uncompressed_len = 16,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "int64"),
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "region"),
+                    .file_offset = 116,
+                    .compressed_len = 16,
+                    .uncompressed_len = 16,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "byte_array"),
+                },
+            }),
+        }}),
+    };
+    try inventory.validate();
+
+    var plan = try planSupportedI64ObjectRangeRowGroupsForQueryAlloc(
+        alloc,
+        inventory,
+        &[_][]const u8{ "amount", "region" },
+        .{
+            .column = "region",
+            .op = .eq_bytes,
+            .bytes_value = "us-west",
+        },
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
+    try std.testing.expectEqualStrings("part-west.parquet", plan.row_groups[0].file_id);
 }
 
 test "parquet object range discovery reads footers and builds row group source" {
