@@ -304,6 +304,58 @@ pub const DropExtensionSyntax = struct {
     }
 };
 
+pub const PrivilegeChangeActionSyntax = enum {
+    grant,
+    revoke,
+};
+
+pub const CreateRoleSyntax = struct {
+    role_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.role_name));
+        self.* = undefined;
+    }
+};
+
+pub const AlterRoleSyntax = struct {
+    role_name: []const u8,
+    setting_name: []const u8,
+    setting_value: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.role_name));
+        alloc.free(@constCast(self.setting_name));
+        alloc.free(@constCast(self.setting_value));
+        self.* = undefined;
+    }
+};
+
+pub const DropRoleSyntax = struct {
+    role_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.role_name));
+        self.* = undefined;
+    }
+};
+
+pub const PrivilegeChangeSyntax = struct {
+    privileges: []const []const u8 = &.{},
+    object_kind: []const u8,
+    object_name: []const u8,
+    principal_name: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.privileges);
+        alloc.free(@constCast(self.object_kind));
+        alloc.free(@constCast(self.object_name));
+        alloc.free(@constCast(self.principal_name));
+        self.* = undefined;
+    }
+};
+
 pub const BulkIoDirectionSyntax = enum {
     from,
     to,
@@ -1315,6 +1367,123 @@ pub fn parseDropExtensionCatalogTailAlloc(
     return .{ .extension_name = extension_name, .if_exists = if_exists, .cascade = cascade };
 }
 
+pub fn parseCreateRoleCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !CreateRoleSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("role");
+    const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var role_transferred = false;
+    errdefer if (!role_transferred) alloc.free(role_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    role_transferred = true;
+    return .{ .role_name = role_name };
+}
+
+pub fn parseAlterRoleCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !AlterRoleSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("role");
+    const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var role_transferred = false;
+    errdefer if (!role_transferred) alloc.free(role_name);
+    try cursor.expectKeyword("set");
+    const setting_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var setting_transferred = false;
+    errdefer if (!setting_transferred) alloc.free(setting_name);
+    try cursor.expectToken(.eq);
+    if (cursor.atEnd() or cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+    const setting_value = try alloc.dupe(u8, tokens[pos.*].text);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(setting_value);
+    pos.* += 1;
+    try parseAdapterNoopStatementEnd(cursor);
+    role_transferred = true;
+    setting_transferred = true;
+    value_transferred = true;
+    return .{
+        .role_name = role_name,
+        .setting_name = setting_name,
+        .setting_value = setting_value,
+    };
+}
+
+pub fn parseDropRoleCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropRoleSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("role");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var role_transferred = false;
+    errdefer if (!role_transferred) alloc.free(role_name);
+    try parseAdapterNoopStatementEnd(cursor);
+    role_transferred = true;
+    return .{ .role_name = role_name, .if_exists = if_exists };
+}
+
+pub fn parsePrivilegeChangeTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    action: PrivilegeChangeActionSyntax,
+) !PrivilegeChangeSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const privileges = try parsePrivilegeListAlloc(alloc, cursor, tokens, pos);
+    var privileges_transferred = false;
+    errdefer if (!privileges_transferred) freeStringSlice(alloc, privileges);
+    try cursor.expectKeyword("on");
+
+    var object_kind: ?[]const u8 = null;
+    var object_kind_transferred = false;
+    errdefer if (!object_kind_transferred) if (object_kind) |value| alloc.free(@constCast(value));
+    var object_name: ?[]const u8 = null;
+    var object_name_transferred = false;
+    errdefer if (!object_name_transferred) if (object_name) |value| alloc.free(@constCast(value));
+
+    if (cursor.matchKeyword("all")) {
+        try cursor.expectKeyword("tables");
+        try cursor.expectKeyword("in");
+        try cursor.expectKeyword("schema");
+        object_kind = try alloc.dupe(u8, "ALL_TABLES_IN_SCHEMA");
+        object_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    } else {
+        object_kind = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        object_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    }
+
+    switch (action) {
+        .grant => try cursor.expectKeyword("to"),
+        .revoke => try cursor.expectKeyword("from"),
+    }
+    const principal_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var principal_transferred = false;
+    errdefer if (!principal_transferred) alloc.free(principal_name);
+
+    try parseAdapterNoopStatementEnd(cursor);
+    privileges_transferred = true;
+    object_kind_transferred = true;
+    object_name_transferred = true;
+    principal_transferred = true;
+    return .{
+        .privileges = privileges,
+        .object_kind = object_kind.?,
+        .object_name = object_name.?,
+        .principal_name = principal_name,
+    };
+}
+
 pub fn parseBulkIoTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1499,6 +1668,29 @@ pub fn parseSqlTableReferenceIdentifierOwnedAlloc(
 ) ![]const u8 {
     _ = parser.matchKeyword(tokens, pos, "only");
     return try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+}
+
+fn parsePrivilegeListAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    var privileges = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &privileges);
+    while (true) {
+        if (cursor.peekKeyword("on")) break;
+        const privilege = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var privilege_transferred = false;
+        errdefer if (!privilege_transferred) alloc.free(privilege);
+        try privileges.append(alloc, privilege);
+        privilege_transferred = true;
+        if (std.ascii.eqlIgnoreCase(privilege, "all")) _ = cursor.matchKeyword("privileges");
+        if (cursor.matchToken(.comma) != null) continue;
+        break;
+    }
+    if (privileges.items.len == 0) return error.UnsupportedSqlShape;
+    return try privileges.toOwnedSlice(alloc);
 }
 
 fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
