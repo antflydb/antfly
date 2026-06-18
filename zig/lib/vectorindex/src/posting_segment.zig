@@ -39,6 +39,7 @@ const compact_sorted_delta_max_records: usize = 64;
 const compact_sorted_delta_scratch_max_records: usize = 512;
 const centroid_directory_bulk_read_max_bytes: usize = 1024 * 1024;
 const centroid_directory_bulk_read_max_gap_bytes: usize = 16 * 1024;
+const point_lookup_stack_index_max_bytes: usize = 64 * 1024;
 
 pub const segment_directory = "postings";
 pub const default_manifest_path = "postings/manifest.afpm";
@@ -2021,11 +2022,23 @@ pub fn readSegmentPointValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir,
 
 fn readSegmentPointIndexEntryAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, posting_id: PostingId, kind: EntryKind) !?IndexEntry {
     if (kind == .delta) return error.InvalidPostingSegmentEntryKind;
+    const index_bytes = try segmentIndexByteLen(entry);
+    if (index_bytes <= point_lookup_stack_index_max_bytes) {
+        var stack_index: [point_lookup_stack_index_max_bytes]u8 = undefined;
+        const index_data = stack_index[0..index_bytes];
+        try readFileRangeInto(io, dir, entry.path, @intCast(entry.meta.index_offset), index_data);
+        try validateSegmentIndexBytes(entry, index_data);
+        return try pointIndexEntryFromIndexData(index_data, entry.meta.entry_count, posting_id, kind);
+    }
+
     const index_data = try readSegmentIndexAlloc(alloc, io, dir, entry);
     defer alloc.free(index_data);
+    return try pointIndexEntryFromIndexData(index_data, entry.meta.entry_count, posting_id, kind);
+}
 
-    const match_index = lowerBoundIndexData(index_data, entry.meta.entry_count, posting_id, kind, 0);
-    if (match_index >= entry.meta.entry_count) return null;
+fn pointIndexEntryFromIndexData(index_data: []const u8, entry_count: usize, posting_id: PostingId, kind: EntryKind) !?IndexEntry {
+    const match_index = lowerBoundIndexData(index_data, entry_count, posting_id, kind, 0);
+    if (match_index >= entry_count) return null;
     const found = try indexEntryFromBytes(index_data[match_index * index_entry_size ..][0..index_entry_size]);
     if (found.posting_id != posting_id or found.kind != kind or found.sequence != 0) return null;
     return found;
@@ -3743,15 +3756,26 @@ fn validateSegmentDataMatchesMeta(data: []const u8, expected: SegmentMeta) !void
 }
 
 fn readSegmentIndexAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry) ![]u8 {
+    const index_bytes = try segmentIndexByteLen(entry);
+
+    const index_data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(entry.meta.index_offset), index_bytes);
+    errdefer alloc.free(index_data);
+    try validateSegmentIndexBytes(entry, index_data);
+    return index_data;
+}
+
+fn segmentIndexByteLen(entry: ManifestEntry) !usize {
     try validateManifestEntry(entry);
     const index_bytes = std.math.mul(usize, entry.meta.entry_count, index_entry_size) catch return error.CorruptedPostingSegment;
     const index_end = std.math.add(usize, entry.meta.index_offset, index_bytes) catch return error.CorruptedPostingSegment;
     if (entry.meta.index_offset > entry.meta.byte_len or index_end > entry.meta.byte_len - footer_size) return error.CorruptedPostingSegment;
+    return index_bytes;
+}
 
-    const index_data = try readFileRangeAlloc(alloc, io, dir, entry.path, @intCast(entry.meta.index_offset), index_bytes);
-    errdefer alloc.free(index_data);
+fn validateSegmentIndexBytes(entry: ManifestEntry, index_data: []const u8) !void {
+    const expected_len = try segmentIndexByteLen(entry);
+    if (index_data.len != expected_len) return error.CorruptedPostingSegment;
     if (indexChecksum(index_data) != entry.meta.index_checksum) return error.BadPostingSegmentChecksum;
-    return index_data;
 }
 
 fn readSegmentEntryValueAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Dir, entry: ManifestEntry, found: IndexEntry) ![]u8 {
