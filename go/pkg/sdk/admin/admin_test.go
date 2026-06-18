@@ -503,6 +503,46 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 		want HAOperation
 	}{
 		{
+			name: "primary status",
+			got:  HAPrimaryStatusOperation(),
+			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/primary/status"},
+		},
+		{
+			name: "standby status",
+			got:  HAStandbyStatusOperation(),
+			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/standby/status"},
+		},
+		{
+			name: "check commit",
+			got:  HACheckCommitOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/commit/check"},
+		},
+		{
+			name: "append commit",
+			got:  HAAppendCommitOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/commit/append"},
+		},
+		{
+			name: "check read",
+			got:  HACheckReadOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/read/check"},
+		},
+		{
+			name: "check write",
+			got:  HACheckWriteOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/write/check"},
+		},
+		{
+			name: "check owner job",
+			got:  HACheckOwnerJobOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/owner-jobs/check"},
+		},
+		{
+			name: "list replication slots",
+			got:  HAListReplicationSlotsOperation(),
+			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/replication-slots"},
+		},
+		{
 			name: "create replication slot",
 			got:  HACreateReplicationSlotOperation(),
 			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/replication-slots"},
@@ -528,6 +568,11 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/fence"},
 		},
 		{
+			name: "current fence",
+			got:  HACurrentFenceOperation(),
+			want: HAOperation{Method: http.MethodGet, Path: "/admin/v1/ha/fence/current"},
+		},
+		{
 			name: "assess promotion",
 			got:  HAAssessPromotionOperation(),
 			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion/assess"},
@@ -536,6 +581,11 @@ func TestHAOperationMetadataUsesAdminAPIPaths(t *testing.T) {
 			name: "promote with current fence",
 			got:  HAPromoteWithCurrentFenceOperation(),
 			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion/current-fence"},
+		},
+		{
+			name: "promote",
+			got:  HAPromoteOperation(),
+			want: HAOperation{Method: http.MethodPost, Path: "/admin/v1/ha/promotion"},
 		},
 		{
 			name: "assess rejoin",

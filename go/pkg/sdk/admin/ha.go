@@ -1741,6 +1741,34 @@ func HAReplicationSlotComplete(slot HAReplicationSlot) bool {
 		slot.TimelineId > 0
 }
 
+func HAPrimaryStatusOperation() HAOperation {
+	return HAOperation{Method: http.MethodGet, Path: HAPrimaryStatusPath}
+}
+
+func HAStandbyStatusOperation() HAOperation {
+	return HAOperation{Method: http.MethodGet, Path: HAStandbyStatusPath}
+}
+
+func HACheckCommitOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HACommitCheckPath}
+}
+
+func HAAppendCommitOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HACommitAppendPath}
+}
+
+func HACheckReadOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAReadCheckPath}
+}
+
+func HACheckWriteOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAWriteCheckPath}
+}
+
+func HACheckOwnerJobOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAOwnerJobCheckPath}
+}
+
 func HAListReplicationSlotsOperation() HAOperation {
 	return HAOperation{Method: http.MethodGet, Path: HAReplicationSlotsPath}
 }
@@ -1789,12 +1817,20 @@ func HAAcquireFenceOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HAFencePath}
 }
 
+func HACurrentFenceOperation() HAOperation {
+	return HAOperation{Method: http.MethodGet, Path: HAFenceCurrentPath}
+}
+
 func HAAssessPromotionOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HAPromotionAssessPath}
 }
 
 func HAPromoteWithCurrentFenceOperation() HAOperation {
 	return HAOperation{Method: http.MethodPost, Path: HAPromotionCurrentFencePath}
+}
+
+func HAPromoteOperation() HAOperation {
+	return HAOperation{Method: http.MethodPost, Path: HAPromotionPath}
 }
 
 func HAAssessRejoinOperation() HAOperation {
