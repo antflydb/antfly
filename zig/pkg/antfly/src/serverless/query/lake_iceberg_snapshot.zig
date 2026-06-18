@@ -49,7 +49,7 @@ pub fn readSnapshotInventoryAlloc(
     var client = request.client;
     client.allocator = alloc;
 
-    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata);
+    const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null);
     defer alloc.free(metadata_bytes);
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
@@ -60,7 +60,7 @@ pub fn readSnapshotInventoryAlloc(
     defer metadata_plan.deinit(alloc);
 
     const current_snapshot = metadata_plan.currentSnapshot();
-    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata);
+    const manifest_list_bytes = try readFullObjectAlloc(alloc, &client, request.cache, current_snapshot.manifest_list_uri, .iceberg_metadata, null);
     defer alloc.free(manifest_list_bytes);
     var manifest_list = try iceberg_avro.parseManifestListAlloc(alloc, manifest_list_bytes);
     defer manifest_list.deinit(alloc);
@@ -82,6 +82,7 @@ pub fn readSnapshotInventoryAlloc(
             request.cache,
             manifest_entry.manifest_path,
             .iceberg_metadata,
+            manifest_entry.manifest_length,
         );
         defer alloc.free(manifest_bytes);
         decoded_manifests[idx] = .{
@@ -105,10 +106,14 @@ fn readFullObjectAlloc(
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache,
     uri: []const u8,
     purpose: lake_range_io.RangePurpose,
+    expected_byte_len: ?u64,
 ) ![]u8 {
     const location = try lake_range_io.objectLocationForUri(uri);
     var meta = try client.statObject(location.bucket, location.key);
     defer meta.deinit(alloc);
+    if (expected_byte_len) |expected| {
+        if (meta.content_length != expected) return error.IcebergManifestLengthMismatch;
+    }
     const version = try objectVersionForMetadataAlloc(alloc, meta, uri);
     defer {
         if (version.etag.len > 0) alloc.free(@constCast(version.etag));
@@ -202,12 +207,12 @@ test "iceberg snapshot reader plans inventory from object storage metadata and m
 
     var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
     defer metadata_file.deinit(alloc);
-    var manifest_list = try buildManifestListFixture(alloc);
+    var data_manifest = try buildDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var manifest_list = try buildManifestListFixture(alloc, data_manifest.items.len);
     defer manifest_list.deinit(alloc);
     var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
     defer manifest_list_put.deinit(alloc);
-    var data_manifest = try buildDataManifestFixture(alloc);
-    defer data_manifest.deinit(alloc);
     var data_manifest_put = try client.putObject("bucket", "t/metadata/m-a.avro", data_manifest.items, .{});
     defer data_manifest_put.deinit(alloc);
 
@@ -238,12 +243,12 @@ test "iceberg snapshot reader reuses cached metadata and manifest ranges" {
 
     var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
     defer metadata_file.deinit(alloc);
-    var manifest_list = try buildManifestListFixture(alloc);
+    var data_manifest = try buildDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var manifest_list = try buildManifestListFixture(alloc, data_manifest.items.len);
     defer manifest_list.deinit(alloc);
     var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
     defer manifest_list_put.deinit(alloc);
-    var data_manifest = try buildDataManifestFixture(alloc);
-    defer data_manifest.deinit(alloc);
     var data_manifest_put = try client.putObject("bucket", "t/metadata/m-a.avro", data_manifest.items, .{});
     defer data_manifest_put.deinit(alloc);
 
@@ -276,6 +281,32 @@ test "iceberg snapshot reader reuses cached metadata and manifest ranges" {
     try std.testing.expectEqual(@as(usize, 3), second_stats.hits);
     try std.testing.expectEqualStrings(first.snapshot_id, second.snapshot_id);
     try std.testing.expectEqual(first.files.len, second.files.len);
+}
+
+test "iceberg snapshot reader rejects manifest length mismatches" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+
+    var metadata_file = try client.putObject("bucket", "t/metadata/v1.metadata.json", testMetadataJson(), .{});
+    defer metadata_file.deinit(alloc);
+    var data_manifest = try buildDataManifestFixture(alloc);
+    defer data_manifest.deinit(alloc);
+    var manifest_list = try buildManifestListFixture(alloc, data_manifest.items.len + 1);
+    defer manifest_list.deinit(alloc);
+    var manifest_list_put = try client.putObject("bucket", "t/metadata/snap-12.avro", manifest_list.items, .{});
+    defer manifest_list_put.deinit(alloc);
+    var data_manifest_put = try client.putObject("bucket", "t/metadata/m-a.avro", data_manifest.items, .{});
+    defer data_manifest_put.deinit(alloc);
+
+    try std.testing.expectError(error.IcebergManifestLengthMismatch, readSnapshotInventoryAlloc(alloc, .{
+        .client = client,
+        .source_id = "events",
+        .metadata_uri = "s3://bucket/t/metadata/v1.metadata.json",
+        .requested_snapshot_id = "12",
+    }));
 }
 
 test "iceberg snapshot reader rejects requested snapshot mismatch" {
@@ -315,7 +346,7 @@ fn testMetadataJson() []const u8 {
     ;
 }
 
-fn buildManifestListFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
+fn buildManifestListFixture(alloc: Allocator, manifest_length: usize) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try appendAvroHeader(alloc, &out, manifestListSchema(), "0123456789abcdef");
@@ -323,7 +354,7 @@ fn buildManifestListFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8) {
     var block = std.ArrayListUnmanaged(u8).empty;
     defer block.deinit(alloc);
     try appendString(alloc, &block, "s3://bucket/t/metadata/m-a.avro");
-    try appendLong(alloc, &block, 512);
+    try appendLong(alloc, &block, @intCast(manifest_length));
     try appendLong(alloc, &block, 0);
     try appendLong(alloc, &block, 0);
     try appendLong(alloc, &block, 42);
