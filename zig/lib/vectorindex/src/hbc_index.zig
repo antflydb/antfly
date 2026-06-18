@@ -87,6 +87,7 @@ pub const LeafKeyEntry = struct {
 };
 
 const FixedKeyLookup = search_runtime.RerankLookup;
+const small_metadata_batch_count = 64;
 
 pub const SplitResult = struct {
     c1: []f32,
@@ -1884,12 +1885,30 @@ pub fn getMetadataInTxn(self: anytype, txn: anytype, vector_id: u64, is_not_foun
 }
 
 pub fn getMetadataManySortedInTxn(self: anytype, txn: anytype, vector_ids: []const u64, out_metadata: []?[]const u8) !void {
-    const lookups = try self.alloc.alloc(FixedKeyLookup, vector_ids.len);
-    defer self.alloc.free(lookups);
-    const key_views = try self.alloc.alloc([]const u8, vector_ids.len);
-    defer self.alloc.free(key_views);
-    const values = try self.alloc.alloc(?[]const u8, vector_ids.len);
-    defer self.alloc.free(values);
+    var lookups_stack: [small_metadata_batch_count]FixedKeyLookup = undefined;
+    const use_stack_lookups = vector_ids.len <= lookups_stack.len;
+    const lookups = if (use_stack_lookups)
+        lookups_stack[0..vector_ids.len]
+    else
+        try self.alloc.alloc(FixedKeyLookup, vector_ids.len);
+    defer if (!use_stack_lookups) self.alloc.free(lookups);
+
+    var key_views_stack: [small_metadata_batch_count][]const u8 = undefined;
+    const use_stack_key_views = vector_ids.len <= key_views_stack.len;
+    const key_views = if (use_stack_key_views)
+        key_views_stack[0..vector_ids.len]
+    else
+        try self.alloc.alloc([]const u8, vector_ids.len);
+    defer if (!use_stack_key_views) self.alloc.free(key_views);
+
+    var values_stack: [small_metadata_batch_count]?[]const u8 = undefined;
+    const use_stack_values = vector_ids.len <= values_stack.len;
+    const values = if (use_stack_values)
+        values_stack[0..vector_ids.len]
+    else
+        try self.alloc.alloc(?[]const u8, vector_ids.len);
+    defer if (!use_stack_values) self.alloc.free(values);
+
     try getMetadataManySortedInTxnWithScratch(self, txn, vector_ids, out_metadata, lookups, key_views, values);
 }
 
@@ -1985,6 +2004,35 @@ test "getMetadataManySortedInTxnWithScratch validates scratch capacity" {
             values[0..],
         ),
     );
+}
+
+test "getMetadataManySortedInTxn uses stack scratch for small batches" {
+    const TestIndex = struct {
+        alloc: Allocator,
+
+        fn getCachedMetadata(_: @This(), _: u64) ?[]const u8 {
+            return null;
+        }
+
+        fn cacheMetadata(_: @This(), _: u64, metadata: []const u8) ![]const u8 {
+            return metadata;
+        }
+    };
+
+    const TestTxn = struct {
+        fn getManySorted(_: @This(), _: anytype, _: []const []const u8, values: []?[]const u8) !void {
+            values[0] = "one";
+            values[1] = "two";
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const index = TestIndex{ .alloc = failing.allocator() };
+    var out_metadata: [2]?[]const u8 = .{ null, null };
+
+    try getMetadataManySortedInTxn(index, TestTxn{}, &.{ 1, 2 }, out_metadata[0..]);
+    try std.testing.expectEqualStrings("one", out_metadata[0].?);
+    try std.testing.expectEqualStrings("two", out_metadata[1].?);
 }
 
 pub fn getNodeSplitRange(self: anytype, node_id: u64, is_not_found: fn (anyerror) bool) !?types.NodeSplitRange {
@@ -3984,12 +4032,30 @@ fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_res
 }
 
 fn populateMetadataBatched(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
-    const lookups = try self.alloc.alloc(FixedKeyLookup, results.items.items.len);
-    defer self.alloc.free(lookups);
-    const key_views = try self.alloc.alloc([]const u8, results.items.items.len);
-    defer self.alloc.free(key_views);
-    const values = try self.alloc.alloc(?[]const u8, results.items.items.len);
-    defer self.alloc.free(values);
+    var lookups_stack: [small_metadata_batch_count]FixedKeyLookup = undefined;
+    const use_stack_lookups = results.items.items.len <= lookups_stack.len;
+    const lookups = if (use_stack_lookups)
+        lookups_stack[0..results.items.items.len]
+    else
+        try self.alloc.alloc(FixedKeyLookup, results.items.items.len);
+    defer if (!use_stack_lookups) self.alloc.free(lookups);
+
+    var key_views_stack: [small_metadata_batch_count][]const u8 = undefined;
+    const use_stack_key_views = results.items.items.len <= key_views_stack.len;
+    const key_views = if (use_stack_key_views)
+        key_views_stack[0..results.items.items.len]
+    else
+        try self.alloc.alloc([]const u8, results.items.items.len);
+    defer if (!use_stack_key_views) self.alloc.free(key_views);
+
+    var values_stack: [small_metadata_batch_count]?[]const u8 = undefined;
+    const use_stack_values = results.items.items.len <= values_stack.len;
+    const values = if (use_stack_values)
+        values_stack[0..results.items.items.len]
+    else
+        try self.alloc.alloc(?[]const u8, results.items.items.len);
+    defer if (!use_stack_values) self.alloc.free(values);
+
     try populateMetadataBatchedWithScratch(self, txn, results, lookups, key_views, values);
 }
 

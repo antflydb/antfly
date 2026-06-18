@@ -841,8 +841,8 @@ implementations cleanly:
    error bounds share `distance_storage`. The remaining separate hot buffers
    are for distinct lifetime/shape classes such as vector batches, member ids,
    posting overlay summaries, and posting caches. Small transformed-vector
-   matrix loads now use stack-backed scratch before falling back to heap
-   allocation.
+   matrix loads and small metadata batch lookups now use stack-backed scratch
+   before falling back to heap allocation.
 
    Expected win: lower allocator CPU, fewer fragmented allocations, and better
    cache behavior.
