@@ -296,12 +296,12 @@ fn sameObjectVersion(a: ObjectRef, b: ObjectRef) bool {
         std.mem.eql(u8, a.version.version_id, b.version.version_id);
 }
 
-const ObjectLocation = struct {
+pub const ObjectLocation = struct {
     bucket: []const u8,
     key: []const u8,
 };
 
-fn parseObjectUri(uri: []const u8) !ObjectLocation {
+pub fn objectLocationForUri(uri: []const u8) !ObjectLocation {
     if (std.mem.startsWith(u8, uri, "s3://")) return parseBucketKey(uri["s3://".len..]);
     if (std.mem.startsWith(u8, uri, "gs://")) return parseBucketKey(uri["gs://".len..]);
     if (std.mem.startsWith(u8, uri, "object://")) return parseBucketKey(uri["object://".len..]);
@@ -311,6 +311,10 @@ fn parseObjectUri(uri: []const u8) !ObjectLocation {
         return .{ .bucket = "file", .key = key };
     }
     return error.UnsupportedLakeObjectUri;
+}
+
+fn parseObjectUri(uri: []const u8) !ObjectLocation {
+    return objectLocationForUri(uri);
 }
 
 fn parseBucketKey(rest: []const u8) !ObjectLocation {
