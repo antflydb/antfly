@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 5;
+const version: u32 = 6;
 
 pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8 {
     try inventory.validate();
@@ -56,6 +56,7 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
                 try appendBytes(alloc, &out, chunk.compression_codec);
                 try appendBytes(alloc, &out, chunk.encoding);
                 try appendBytes(alloc, &out, chunk.physical_type);
+                try appendI32(alloc, &out, chunk.type_length);
                 try appendBytes(alloc, &out, chunk.logical_type);
                 try appendI32(alloc, &out, chunk.decimal_precision);
                 try appendI32(alloc, &out, chunk.decimal_scale);
@@ -73,7 +74,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
     cursor += magic.len;
     const got_version = try readU32(bytes, &cursor);
-    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
+    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
     if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
     const format = try decodeFormat(bytes[cursor]);
     cursor += 1;
@@ -140,6 +141,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
                 errdefer if (!keep_chunk and encoding.len > 0) alloc.free(encoding);
                 const physical_type: []u8 = if (got_version >= 3) try readBytesAlloc(alloc, bytes, &cursor) else @constCast(&.{});
                 errdefer if (!keep_chunk and physical_type.len > 0) alloc.free(physical_type);
+                const type_length: i32 = if (got_version >= 6) try readI32(bytes, &cursor) else 0;
                 const logical_type: []u8 = if (got_version >= 4) try readBytesAlloc(alloc, bytes, &cursor) else @constCast(&.{});
                 errdefer if (!keep_chunk and logical_type.len > 0) alloc.free(logical_type);
                 const decimal_precision: i32 = if (got_version >= 5) try readI32(bytes, &cursor) else 0;
@@ -159,6 +161,7 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) !external_source.Invento
                     .compression_codec = compression_codec,
                     .encoding = encoding,
                     .physical_type = physical_type,
+                    .type_length = type_length,
                     .logical_type = logical_type,
                     .decimal_precision = decimal_precision,
                     .decimal_scale = decimal_scale,
@@ -298,6 +301,7 @@ test "external source inventory codec round-trips file inventory" {
                     .compression_codec = try alloc.dupe(u8, "zstd"),
                     .encoding = try alloc.dupe(u8, "plain"),
                     .physical_type = try alloc.dupe(u8, "int64"),
+                    .type_length = 0,
                     .logical_type = try alloc.dupe(u8, "timestamp_micros"),
                     .decimal_precision = 0,
                     .decimal_scale = 0,
@@ -326,6 +330,7 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqual(@as(u64, 128), decoded.files[0].row_groups[0].column_chunks[0].file_offset);
     try std.testing.expectEqualStrings("zstd", decoded.files[0].row_groups[0].column_chunks[0].compression_codec);
     try std.testing.expectEqualStrings("int64", decoded.files[0].row_groups[0].column_chunks[0].physical_type);
+    try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].type_length);
     try std.testing.expectEqualStrings("timestamp_micros", decoded.files[0].row_groups[0].column_chunks[0].logical_type);
     try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].decimal_precision);
     try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].decimal_scale);

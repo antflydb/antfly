@@ -32,6 +32,7 @@ pub const ColumnChunk = struct {
     compression_codec: []u8 = &.{},
     encoding: []u8 = &.{},
     physical_type: []u8 = &.{},
+    type_length: i32 = 0,
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,

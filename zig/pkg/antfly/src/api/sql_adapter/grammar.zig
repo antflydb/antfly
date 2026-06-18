@@ -425,6 +425,27 @@ pub const CommentMetadataSyntax = struct {
     }
 };
 
+pub const DropTableSyntax = struct {
+    table_name: []const u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        self.* = undefined;
+    }
+};
+
+pub const DropIndexSyntax = struct {
+    index_name: []const u8,
+    if_exists: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.index_name));
+        self.* = undefined;
+    }
+};
+
 pub const PrivilegeChangeActionSyntax = enum {
     grant,
     revoke,
@@ -1989,6 +2010,51 @@ pub fn parseCommentMetadataCatalogTailAlloc(
         .parent_table_name = parent_table_name,
         .comment_json = comment_json,
     };
+}
+
+pub fn parseDropTableCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropTableSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("table");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    const cascade = cursor.matchKeyword("cascade");
+    if (!cascade) _ = cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    table_transferred = true;
+    return .{ .table_name = table_name, .if_exists = if_exists, .cascade = cascade };
+}
+
+pub fn parseDropIndexCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DropIndexSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("index");
+    _ = cursor.matchKeyword("concurrently");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
+    const index_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var index_transferred = false;
+    errdefer if (!index_transferred) alloc.free(index_name);
+    _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
+    try parseAdapterNoopStatementEnd(cursor);
+    index_transferred = true;
+    return .{ .index_name = index_name, .if_exists = if_exists };
 }
 
 pub fn parseCreateRoleCatalogTailAlloc(
@@ -3873,6 +3939,34 @@ test "sql adapter grammar parses comment metadata catalog tails" {
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCommentMetadataCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses drop table and index catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var drop_table_tokens = try lexer.tokenizeAlloc(alloc, "TABLE IF EXISTS ONLY public.usage_records CASCADE;");
+    defer lexer.freeTokens(alloc, &drop_table_tokens);
+    var drop_table_pos: usize = 0;
+    var drop_table = try parseDropTableCatalogTailAlloc(alloc, drop_table_tokens.items, &drop_table_pos);
+    defer drop_table.deinit(alloc);
+    try std.testing.expectEqual(drop_table_tokens.items.len, drop_table_pos);
+    try std.testing.expectEqualStrings("usage_records", drop_table.table_name);
+    try std.testing.expect(drop_table.if_exists);
+    try std.testing.expect(drop_table.cascade);
+
+    var drop_index_tokens = try lexer.tokenizeAlloc(alloc, "INDEX CONCURRENTLY IF EXISTS public.usage_records_status_idx RESTRICT;");
+    defer lexer.freeTokens(alloc, &drop_index_tokens);
+    var drop_index_pos: usize = 0;
+    var drop_index = try parseDropIndexCatalogTailAlloc(alloc, drop_index_tokens.items, &drop_index_pos);
+    defer drop_index.deinit(alloc);
+    try std.testing.expectEqual(drop_index_tokens.items.len, drop_index_pos);
+    try std.testing.expectEqualStrings("usage_records_status_idx", drop_index.index_name);
+    try std.testing.expect(drop_index.if_exists);
+
+    var multi_table_tokens = try lexer.tokenizeAlloc(alloc, "TABLE usage_records, usage_archives;");
+    defer lexer.freeTokens(alloc, &multi_table_tokens);
+    var multi_table_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDropTableCatalogTailAlloc(alloc, multi_table_tokens.items, &multi_table_pos));
 }
 
 test "sql adapter grammar parses authorization catalog tails" {

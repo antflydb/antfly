@@ -1099,6 +1099,8 @@ enum-type catalog grammar for `CREATE TYPE ... AS ENUM`, `ALTER TYPE ... ADD
 VALUE`, and `DROP TYPE`,
 comment metadata grammar for `COMMENT ON TABLE`, `COMMENT ON COLUMN`,
 `COMMENT ON INDEX`, and `COMMENT ON CONSTRAINT`,
+drop-catalog grammar for `DROP TABLE`, `DROP TABLE IF EXISTS`, `DROP INDEX`,
+and `DROP INDEX CONCURRENTLY`,
 prepared-statement subject classification for read, write, and DDL
 subjects, including `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
@@ -5041,6 +5043,8 @@ no-ops when the target table is absent. SQL `DROP TABLE ... CASCADE` is a typed
 DDL target flag: catalog application first removes child-table foreign-key
 metadata that references the dropped parent through ordinary schema-update
 validation, then drops the parent table.
+`DROP TABLE` and `DROP INDEX` tails parse in `api/sql_adapter/grammar.zig`; the
+SQL lowerer only transfers owned grammar syntax into typed drop catalog plans.
 
 The remaining PostgreSQL/API work should land in these model-level slices:
 

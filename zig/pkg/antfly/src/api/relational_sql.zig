@@ -4203,40 +4203,26 @@ const Parser = struct {
     }
 
     fn parseDropTableDdl(self: *@This()) !DropTablePlan {
-        try self.expectKeyword("table");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const table_name = try self.parseSqlObjectIdentifierOwned();
-        var table_name_transferred = false;
-        errdefer if (!table_name_transferred) self.alloc.free(table_name);
-        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
-        const cascade = self.matchKeyword("cascade");
-        if (!cascade) _ = self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        table_name_transferred = true;
-        return .{ .table_name = table_name, .if_exists = if_exists, .cascade = cascade };
+        var syntax = try sql_adapter.parseDropTableCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .table_name = syntax.table_name,
+            .if_exists = syntax.if_exists,
+            .cascade = syntax.cascade,
+        };
     }
 
     fn parseDropIndexDdl(self: *@This()) !DropIndexPlan {
-        try self.expectKeyword("index");
-        _ = self.matchKeyword("concurrently");
-        var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
-            if_exists = true;
-        }
-        const index_name = try self.parseSqlObjectIdentifierOwned();
-        var index_name_transferred = false;
-        errdefer if (!index_name_transferred) self.alloc.free(index_name);
-        _ = self.matchKeyword("cascade") or self.matchKeyword("restrict");
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        index_name_transferred = true;
-        return .{ .index_name = index_name, .if_exists = if_exists };
+        var syntax = try sql_adapter.parseDropIndexCatalogTailAlloc(self.alloc, self.tokens, &self.pos);
+        var transferred = false;
+        errdefer if (!transferred) syntax.deinit(self.alloc);
+        transferred = true;
+        return .{
+            .index_name = syntax.index_name,
+            .if_exists = syntax.if_exists,
+        };
     }
 
     fn parseDropTriggerPolicyDdl(self: *@This()) !AlterTablePlan {

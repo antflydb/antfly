@@ -300,6 +300,7 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .compression_codec = compression_codec,
         .encoding = encoding,
         .physical_type = physical_type,
+        .type_length = chunk.type_length,
         .logical_type = logical_type,
         .decimal_precision = chunk.decimal_precision,
         .decimal_scale = chunk.decimal_scale,
@@ -356,6 +357,7 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
 const SchemaElement = struct {
     name: []u8,
     repetition_type: ?i32 = null,
+    type_length: i32 = 0,
     child_count: u32 = 0,
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
@@ -371,6 +373,7 @@ const SchemaElement = struct {
 const SchemaColumn = struct {
     column_id: []u8,
     nullable: bool,
+    type_length: i32 = 0,
     logical_type: []u8 = &.{},
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
@@ -420,6 +423,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     var previous_field_id: i16 = 0;
     var name: ?[]u8 = null;
     var repetition_type: ?i32 = null;
+    var type_length: i32 = 0;
     var child_count: u32 = 0;
     var logical_type: []u8 = &.{};
     var decimal_precision: i32 = 0;
@@ -429,6 +433,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
 
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
+            2 => type_length = try reader.readRequiredI32(field.type),
             3 => repetition_type = try reader.readRequiredI32(field.type),
             4 => {
                 if (field.type != .binary) return error.InvalidParquetMetadata;
@@ -464,6 +469,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     return .{
         .name = got_name,
         .repetition_type = repetition_type,
+        .type_length = type_length,
         .child_count = child_count,
         .logical_type = logical_type,
         .decimal_precision = decimal_precision,
@@ -497,6 +503,7 @@ fn collectSchemaColumnsAlloc(
             try columns.append(alloc, .{
                 .column_id = column_id,
                 .nullable = element_nullable,
+                .type_length = element.type_length,
                 .logical_type = logical_type,
                 .decimal_precision = element.decimal_precision,
                 .decimal_scale = element.decimal_scale,
@@ -539,6 +546,7 @@ fn applySchemaNullability(alloc: Allocator, row_groups: []external_source.RowGro
         for (row_group.column_chunks) |*chunk| {
             const schema_column = schemaColumnForId(columns, chunk.column_id) orelse return error.InvalidParquetMetadata;
             chunk.nullable = schema_column.nullable;
+            chunk.type_length = schema_column.type_length;
             if (schema_column.logical_type.len != 0) {
                 const logical_type = try alloc.dupe(u8, schema_column.logical_type);
                 if (chunk.logical_type.len > 0) alloc.free(chunk.logical_type);
@@ -1199,6 +1207,7 @@ test "parquet metadata parser derives decimal columns from schema annotations" {
     try std.testing.expectEqualStrings("decimal", footer.row_groups[0].column_chunks[0].logical_type);
     try std.testing.expectEqual(@as(i32, 9), footer.row_groups[0].column_chunks[0].decimal_precision);
     try std.testing.expectEqual(@as(i32, 2), footer.row_groups[0].column_chunks[0].decimal_scale);
+    try std.testing.expectEqual(@as(i32, 8), footer.row_groups[0].column_chunks[0].type_length);
 }
 
 test "parquet metadata parser rejects inconsistent row counts and ranges" {
@@ -1492,7 +1501,11 @@ fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?
 
     var leaf_prev: i16 = 0;
     try appendField(&out, alloc, &leaf_prev, 1, .i32);
-    try appendI32(&out, alloc, 1);
+    try appendI32(&out, alloc, if (converted_type == 5) 7 else 1);
+    if (converted_type == 5) {
+        try appendField(&out, alloc, &leaf_prev, 2, .i32);
+        try appendI32(&out, alloc, 8);
+    }
     try appendField(&out, alloc, &leaf_prev, 3, .i32);
     try appendI32(&out, alloc, 0);
     try appendField(&out, alloc, &leaf_prev, 4, .binary);
@@ -1539,7 +1552,7 @@ fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?
 
     var meta_prev: i16 = 0;
     try appendField(&out, alloc, &meta_prev, 1, .i32);
-    try appendI32(&out, alloc, 1);
+    try appendI32(&out, alloc, if (converted_type == 5) 7 else 1);
     try appendField(&out, alloc, &meta_prev, 2, .list);
     try appendListHeader(&out, alloc, .i32, 1);
     try appendI32(&out, alloc, 0);

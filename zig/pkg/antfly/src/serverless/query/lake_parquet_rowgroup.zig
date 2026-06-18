@@ -465,6 +465,8 @@ const PlainF64Mode = enum {
 const DecimalPhysical = enum {
     int32,
     int64,
+    byte_array,
+    fixed_len_byte_array,
 };
 
 const DecimalMode = struct {
@@ -472,6 +474,7 @@ const DecimalMode = struct {
     nullable: bool = false,
     dictionary: bool = false,
     scale: i32 = 0,
+    type_length: usize = 0,
 };
 
 const PlainBoolMode = enum {
@@ -1329,14 +1332,23 @@ fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
         .int32
     else if (chunk.physical_type.len == 0 or std.ascii.eqlIgnoreCase(chunk.physical_type, "int64"))
         .int64
+    else if (std.ascii.eqlIgnoreCase(chunk.physical_type, "byte_array"))
+        .byte_array
+    else if (std.ascii.eqlIgnoreCase(chunk.physical_type, "fixed_len_byte_array"))
+        .fixed_len_byte_array
     else
         return error.UnsupportedParquetPage;
+    const type_length: usize = if (physical == .fixed_len_byte_array) blk: {
+        if (chunk.type_length <= 0 or chunk.type_length > 8) return error.UnsupportedParquetPage;
+        break :blk @intCast(chunk.type_length);
+    } else 0;
     if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) {
         return .{
             .physical = physical,
             .nullable = chunk.nullable,
             .dictionary = false,
             .scale = chunk.decimal_scale,
+            .type_length = type_length,
         };
     }
     if (std.ascii.eqlIgnoreCase(chunk.encoding, "rle_dictionary") or
@@ -1347,6 +1359,7 @@ fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
             .nullable = chunk.nullable,
             .dictionary = true,
             .scale = chunk.decimal_scale,
+            .type_length = type_length,
         };
     }
     return error.UnsupportedParquetPage;
@@ -1402,6 +1415,8 @@ fn scanDecimalAsF64ColumnChunkAlloc(
     const unscaled = switch (mode.physical) {
         .int32 => try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode),
         .int64 => try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode),
+        .byte_array => try scanDecimalByteArrayUnscaledAlloc(alloc, bytes, compression, mode),
+        .fixed_len_byte_array => try scanDecimalFixedLenByteArrayUnscaledAlloc(alloc, bytes, compression, mode),
     };
     errdefer {
         alloc.free(unscaled.values);
@@ -1460,6 +1475,91 @@ fn scanDecimalInt64UnscaledAlloc(
         .values = try parquet_page.scanPlainI64ColumnChunkAlloc(alloc, bytes, compression),
         .nulls = &.{},
     };
+}
+
+fn scanDecimalByteArrayUnscaledAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    compression: parquet_page.CompressionCodec,
+    mode: DecimalMode,
+) !parquet_page.NullableI64Values {
+    const decoded = if (mode.dictionary) blk: {
+        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAlloc(alloc, bytes, compression);
+        break :blk parquet_page.NullableByteArrayValues{
+            .values = try parquet_page.scanDictionaryByteArrayColumnChunkAlloc(alloc, bytes, compression),
+            .nulls = &.{},
+        };
+    } else blk: {
+        if (mode.nullable) break :blk try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, bytes, compression);
+        break :blk parquet_page.NullableByteArrayValues{
+            .values = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, bytes, compression),
+            .nulls = &.{},
+        };
+    };
+    return try decimalBytesToUnscaledI64Alloc(alloc, decoded);
+}
+
+fn scanDecimalFixedLenByteArrayUnscaledAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    compression: parquet_page.CompressionCodec,
+    mode: DecimalMode,
+) !parquet_page.NullableI64Values {
+    if (mode.type_length == 0 or mode.type_length > 8) return error.UnsupportedParquetPage;
+    const decoded = if (mode.dictionary) blk: {
+        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryFixedLenByteArrayColumnChunkAlloc(alloc, bytes, compression, mode.type_length);
+        break :blk parquet_page.NullableByteArrayValues{
+            .values = try parquet_page.scanDictionaryFixedLenByteArrayColumnChunkAlloc(alloc, bytes, compression, mode.type_length),
+            .nulls = &.{},
+        };
+    } else blk: {
+        if (mode.nullable) break :blk try parquet_page.scanOptionalPlainFixedLenByteArrayColumnChunkAlloc(alloc, bytes, compression, mode.type_length);
+        break :blk parquet_page.NullableByteArrayValues{
+            .values = try parquet_page.scanPlainFixedLenByteArrayColumnChunkAlloc(alloc, bytes, compression, mode.type_length),
+            .nulls = &.{},
+        };
+    };
+    return try decimalBytesToUnscaledI64Alloc(alloc, decoded);
+}
+
+fn decimalBytesToUnscaledI64Alloc(
+    alloc: Allocator,
+    decoded: parquet_page.NullableByteArrayValues,
+) !parquet_page.NullableI64Values {
+    var input = decoded;
+    defer {
+        parquet_page.freePlainByteArrays(alloc, input.values);
+        if (input.nulls.len > 0) alloc.free(input.nulls);
+    }
+
+    const values = try alloc.alloc(i64, input.values.len);
+    errdefer alloc.free(values);
+    for (input.values, 0..) |bytes, idx| {
+        if (input.nulls.len > 0 and input.nulls[idx] != 0) {
+            values[idx] = 0;
+            continue;
+        }
+        values[idx] = try signedBigEndianDecimalBytesToI64(bytes);
+    }
+
+    const nulls = input.nulls;
+    input.nulls = &.{};
+    return .{
+        .values = values,
+        .nulls = nulls,
+    };
+}
+
+fn signedBigEndianDecimalBytesToI64(bytes: []const u8) !i64 {
+    if (bytes.len == 0) return error.InvalidParquetPage;
+    if (bytes.len > 8) return error.UnsupportedParquetPage;
+    var raw: u64 = 0;
+    for (bytes) |byte| raw = (raw << 8) | byte;
+    if ((bytes[0] & 0x80) != 0 and bytes.len < 8) {
+        const bit_count: u6 = @intCast(bytes.len * 8);
+        raw |= (~@as(u64, 0)) << bit_count;
+    }
+    return @as(i64, @bitCast(raw));
 }
 
 fn decimalScaleDivisor(scale: i32) !f64 {
@@ -1701,6 +1801,19 @@ fn appendPlainByteArrayDataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocat
     try out.appendSlice(alloc, payload.items);
 }
 
+fn appendPlainFixedLenByteArrayDataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const []const u8) !void {
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    defer payload.deinit(alloc);
+    const type_length = if (values.len == 0) 0 else values[0].len;
+    if (type_length == 0) return error.InvalidParquetRowGroupBatch;
+    for (values) |value| {
+        if (value.len != type_length) return error.InvalidParquetRowGroupBatch;
+        try payload.appendSlice(alloc, value);
+    }
+    try appendPlainI64DataPageHeader(out, alloc, values.len, payload.items.len, payload.items.len);
+    try out.appendSlice(alloc, payload.items);
+}
+
 fn appendPlainI64DataPageHeader(
     out: *std.ArrayListUnmanaged(u8),
     alloc: Allocator,
@@ -1841,6 +1954,36 @@ fn appendPlainByteArrayDictionaryPage(out: *std.ArrayListUnmanaged(u8), alloc: A
         var len_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_buf, @intCast(value.len), .little);
         try payload.appendSlice(alloc, &len_buf);
+        try payload.appendSlice(alloc, value);
+    }
+
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 2);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, @intCast(payload.items.len));
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(payload.items.len));
+    try appendField(out, alloc, &page_prev, 7, .struct_);
+
+    var dictionary_prev: i16 = 0;
+    try appendField(out, alloc, &dictionary_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &dictionary_prev, 2, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try out.appendSlice(alloc, payload.items);
+}
+
+fn appendPlainFixedLenByteArrayDictionaryPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const []const u8) !void {
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    defer payload.deinit(alloc);
+    const type_length = if (values.len == 0) 0 else values[0].len;
+    if (type_length == 0) return error.InvalidParquetRowGroupBatch;
+    for (values) |value| {
+        if (value.len != type_length) return error.InvalidParquetRowGroupBatch;
         try payload.appendSlice(alloc, value);
     }
 
@@ -2474,6 +2617,61 @@ fn appendOptionalPlainByteArrayDataPageV2(out: *std.ArrayListUnmanaged(u8), allo
         var len_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_buf, @intCast(value.len), .little);
         try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, value);
+    }
+}
+
+fn appendOptionalPlainFixedLenByteArrayDataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?[]const u8) !void {
+    var type_length: usize = 0;
+    var present_count: usize = 0;
+    for (values) |maybe| {
+        if (maybe) |value| {
+            if (type_length == 0) type_length = value.len;
+            if (value.len == 0 or value.len != type_length) return error.InvalidParquetRowGroupBatch;
+            present_count += 1;
+        }
+    }
+    if (type_length == 0) return error.InvalidParquetRowGroupBatch;
+    const level_group_count = (values.len + 7) / 8;
+    const definition_level_bytes: i32 = @intCast(1 + level_group_count);
+    const present_byte_len = present_count * type_length;
+    const byte_len: i32 = @intCast(@as(usize, @intCast(definition_level_bytes)) + present_byte_len);
+    const null_count: i32 = @intCast(values.len - present_count);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 3);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 8, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, null_count);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 0);
+    try appendField(out, alloc, &data_prev, 5, .i32);
+    try appendI32(out, alloc, definition_level_bytes);
+    try appendField(out, alloc, &data_prev, 6, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try appendVarint(out, alloc, (@as(u64, @intCast(level_group_count)) << 1) | 1);
+    var packed_levels = try alloc.alloc(u8, level_group_count);
+    defer alloc.free(packed_levels);
+    @memset(packed_levels, 0);
+    for (values, 0..) |maybe, idx| {
+        if (maybe != null) packed_levels[idx / 8] |= @as(u8, 1) << @intCast(idx % 8);
+    }
+    try out.appendSlice(alloc, packed_levels);
+    for (values) |maybe| {
+        const value = maybe orelse continue;
         try out.appendSlice(alloc, value);
     }
 }
@@ -3514,13 +3712,13 @@ test "parquet row group batch dispatches decimal columns from inventory" {
         .file_id = try alloc.dupe(u8, "part-a.parquet"),
         .object_uri = try alloc.dupe(u8, "s3://bucket/events/part-a.parquet"),
         .etag = try alloc.dupe(u8, "etag-a"),
-        .byte_len = 2048,
+        .byte_len = 4096,
         .row_count = 3,
         .row_groups = try alloc.dupe(external_source.RowGroup, &[_]external_source.RowGroup{.{
             .ordinal = 0,
             .row_count = 3,
             .file_offset = 100,
-            .total_byte_len = 288,
+            .total_byte_len = 480,
             .column_chunks = try alloc.dupe(external_source.ColumnChunk, &[_]external_source.ColumnChunk{
                 .{
                     .column_id = try alloc.dupe(u8, "price"),
@@ -3556,6 +3754,30 @@ test "parquet row group batch dispatches decimal columns from inventory" {
                     .decimal_precision = 9,
                     .decimal_scale = 2,
                 },
+                .{
+                    .column_id = try alloc.dupe(u8, "rebate"),
+                    .file_offset = 388,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "byte_array"),
+                    .logical_type = try alloc.dupe(u8, "decimal"),
+                    .decimal_precision = 9,
+                    .decimal_scale = 2,
+                },
+                .{
+                    .column_id = try alloc.dupe(u8, "fee"),
+                    .file_offset = 484,
+                    .compressed_len = 96,
+                    .uncompressed_len = 96,
+                    .encoding = try alloc.dupe(u8, "plain"),
+                    .physical_type = try alloc.dupe(u8, "fixed_len_byte_array"),
+                    .type_length = 4,
+                    .logical_type = try alloc.dupe(u8, "decimal"),
+                    .decimal_precision = 9,
+                    .decimal_scale = 2,
+                    .nullable = true,
+                },
             }),
         }}),
     };
@@ -3574,10 +3796,28 @@ test "parquet row group batch dispatches decimal columns from inventory" {
     try appendPlainI64DictionaryPage(&tax_chunk, alloc, &[_]i64{ 75, 125 });
     try appendDictionaryI64DataPage(&tax_chunk, alloc, 3, 1, &[_]u8{ 3, 0b00000110 });
 
+    var rebate_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer rebate_chunk.deinit(alloc);
+    try appendPlainByteArrayDataPage(&rebate_chunk, alloc, &[_][]const u8{
+        &[_]u8{ 0x04, 0xd2 },
+        &[_]u8{ 0xff, 0x06 },
+        &[_]u8{0x00},
+    });
+
+    var fee_chunk = std.ArrayListUnmanaged(u8).empty;
+    defer fee_chunk.deinit(alloc);
+    try appendOptionalPlainFixedLenByteArrayDataPageV2(&fee_chunk, alloc, &[_]?[]const u8{
+        &[_]u8{ 0x00, 0x00, 0x04, 0xd2 },
+        null,
+        &[_]u8{ 0xff, 0xff, 0xff, 0x06 },
+    });
+
     var owned = try buildSupportedI64RowGroupBatchAlloc(alloc, inventory, "part-a.parquet", 0, &[_]ColumnChunkInput{
         .{ .column_id = "price", .bytes = price_chunk.items },
         .{ .column_id = "discount", .bytes = discount_chunk.items },
         .{ .column_id = "tax", .bytes = tax_chunk.items },
+        .{ .column_id = "rebate", .bytes = rebate_chunk.items },
+        .{ .column_id = "fee", .bytes = fee_chunk.items },
     });
     defer owned.deinit(alloc);
 
@@ -3586,8 +3826,11 @@ test "parquet row group batch dispatches decimal columns from inventory" {
     try std.testing.expectEqualSlices(f64, &[_]f64{ 1.25, 0, -0.5 }, owned.batch.columns[1].values.f64);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[1].nulls.bytes);
     try std.testing.expectEqualSlices(f64, &[_]f64{ 0.75, 1.25, 1.25 }, owned.batch.columns[2].values.f64);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 12.34, -2.5, 0 }, owned.batch.columns[3].values.f64);
+    try std.testing.expectEqualSlices(f64, &[_]f64{ 12.34, 0, -2.5 }, owned.batch.columns[4].values.f64);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[4].nulls.bytes);
 
-    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "price", "discount", "tax" });
+    var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "price", "discount", "tax", "rebate", "fee" });
     defer plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), plan.row_groups.len);
 }
