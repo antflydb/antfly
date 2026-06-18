@@ -30,6 +30,7 @@ pub const graph_segment = @import("graph_segment/mod.zig");
 pub const row_fragment = @import("row_fragment/mod.zig");
 pub const algebraic_segment = @import("algebraic_segment/mod.zig");
 pub const external_source = @import("external_source/mod.zig");
+pub const configured_object_store_support = @import("configured_object_store_support.zig");
 pub const document_projection = @import("document_projection.zig");
 pub const search_sources = @import("search_sources.zig");
 pub const enrichment = @import("enrichment/mod.zig");
@@ -410,6 +411,7 @@ test "serverless module compiles" {
     _ = row_fragment;
     _ = algebraic_segment;
     _ = external_source;
+    _ = configured_object_store_support;
     _ = document_projection;
     _ = search_sources;
     _ = enrichment;

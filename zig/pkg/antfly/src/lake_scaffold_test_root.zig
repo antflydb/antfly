@@ -23,6 +23,8 @@ pub const row_fragment_build = @import("serverless/build/row_fragments.zig");
 pub const row_fragment_manifest = @import("serverless/build/row_fragment_manifest.zig");
 pub const row_fragment_publish = @import("serverless/build/row_fragment_publish.zig");
 pub const external_source_manifest = @import("serverless/build/external_source_manifest.zig");
+pub const external_source_plan_resolver = @import("serverless/build/external_source_plan_resolver.zig");
+pub const external_source_plan_resolver_api = @import("serverless/build/external_source_plan_resolver_api.zig");
 pub const algebraic_manifest = @import("serverless/build/algebraic_manifest.zig");
 pub const algebraic_publish = @import("serverless/build/algebraic_publish.zig");
 pub const lake_gc = @import("serverless/build/lake_gc.zig");
@@ -59,6 +61,8 @@ test {
     _ = row_fragment_manifest;
     _ = row_fragment_publish;
     _ = external_source_manifest;
+    _ = external_source_plan_resolver;
+    _ = external_source_plan_resolver_api;
     _ = algebraic_manifest;
     _ = algebraic_publish;
     _ = lake_gc;

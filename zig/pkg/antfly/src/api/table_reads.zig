@@ -53,6 +53,7 @@ const relational_sql_api = @import("relational_sql.zig");
 const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../serverless/external_source/mod.zig");
 const object_store_support = @import("../serverless/object_store_support.zig");
+const configured_object_store_support = @import("../serverless/configured_object_store_support.zig");
 const remote_uri = @import("../serverless/remote_uri.zig");
 const serverless_query = @import("../serverless/query/mod.zig");
 const object_storage_api = @import("../storage/object_storage.zig");
@@ -5263,106 +5264,15 @@ pub const ConfiguredExternalLakeObjectStoreResolver = struct {
         options: ExternalObjectStorageLakeRowsSourceOptions,
     ) !object_store_support.OpenedObjectStore {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
         if (binding.credential_ref == null) {
             return try self.fallback.resolver().openParquetPrefixAlloc(alloc, binding, options);
         }
-        if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
-        return try self.openCredentialedParquetPrefix(alloc, binding, options);
-    }
-
-    fn openCredentialedParquetPrefix(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        binding: external_binding_api.Binding,
-        options: ExternalObjectStorageLakeRowsSourceOptions,
-    ) !object_store_support.OpenedObjectStore {
-        const credential = binding.credential_ref orelse return error.ExternalLakeCredentialRefRequired;
-        const node_config = self.node_config orelse return error.ExternalLakeCredentialRefNotFound;
-        const connection = node_config.connections.get(credential.ref_id) orelse return error.ExternalLakeCredentialRefNotFound;
-        if (connection.kind != .external_io) return error.UnsupportedExternalLakeCredentialRef;
-        if (!hasConnectionCapability(connection, "lake_read")) return error.UnsupportedExternalLakeCredentialRef;
-        const external_io = connection.external_io orelse return error.UnsupportedExternalLakeCredentialRef;
-
-        var parsed = try remote_uri.parseAlloc(alloc, binding.source_uri);
-        defer switch (parsed) {
-            .file => |value| alloc.free(value),
-            .gcs => |*value| value.deinit(alloc),
-            .s3 => |*value| value.deinit(alloc),
-        };
-
-        return switch (parsed) {
-            .s3 => |value| try self.openCredentialedS3Prefix(alloc, external_io, value.bucket, value.prefix),
-            .gcs => |value| try openCredentialedGcsPrefix(alloc, external_io, value.bucket, value.prefix),
-            .file => |path| blk: {
-                if (external_io.protocol != .filesystem) return error.UnsupportedExternalLakeCredentialRef;
-                if (external_io.prefix) |allowed| try ensurePrefixAllowed(path, allowed);
-                const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
-                defer alloc.free(file_uri);
-                break :blk try object_store_support.OpenedObjectStore.initFileUri(alloc, file_uri, options.file_bucket);
-            },
-        };
-    }
-
-    fn openCredentialedS3Prefix(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        external_io: common_config.Config.ExternalIoConnectionConfig,
-        bucket: []const u8,
-        prefix: []const u8,
-    ) !object_store_support.OpenedObjectStore {
-        if (external_io.protocol != .s3) return error.UnsupportedExternalLakeCredentialRef;
-        try ensureBucketAllowed(bucket, external_io.buckets);
-        if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
-
-        const endpoint = if (external_io.endpoint) |value| try common_secrets.resolveReferenceOwned(alloc, self.secret_store, value) else null;
-        defer if (endpoint) |value| alloc.free(value);
-        const access_key_id = if (external_io.access_key_id) |value| try common_secrets.resolveReferenceOwned(alloc, self.secret_store, value) else null;
-        defer if (access_key_id) |value| alloc.free(value);
-        const secret_access_key = if (external_io.secret_access_key) |value| try common_secrets.resolveReferenceOwned(alloc, self.secret_store, value) else null;
-        defer if (secret_access_key) |value| alloc.free(value);
-        const session_token = if (external_io.session_token) |value| try common_secrets.resolveReferenceOwned(alloc, self.secret_store, value) else null;
-        defer if (session_token) |value| alloc.free(value);
-
-        return try object_store_support.OpenedObjectStore.initS3UriWithOverrides(alloc, bucket, prefix, .{
-            .endpoint = endpoint,
-            .use_ssl = external_io.use_ssl orelse true,
-            .access_key_id = access_key_id,
-            .secret_access_key = secret_access_key,
-            .session_token = session_token,
+        return try configured_object_store_support.openBindingObjectStoreAlloc(alloc, binding, .{
+            .file_bucket = options.file_bucket,
+            .node_config = self.node_config,
+            .secret_store = self.secret_store,
         });
-    }
-
-    fn openCredentialedGcsPrefix(
-        alloc: std.mem.Allocator,
-        external_io: common_config.Config.ExternalIoConnectionConfig,
-        bucket: []const u8,
-        prefix: []const u8,
-    ) !object_store_support.OpenedObjectStore {
-        if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
-        try ensureBucketAllowed(bucket, external_io.buckets);
-        if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
-        return try object_store_support.OpenedObjectStore.initGcsUri(alloc, bucket, prefix);
-    }
-
-    fn ensureBucketAllowed(bucket: []const u8, allowed_buckets: []const []const u8) !void {
-        if (allowed_buckets.len == 0) return;
-        for (allowed_buckets) |allowed| {
-            if (std.mem.eql(u8, allowed, "*") or std.mem.eql(u8, allowed, bucket)) return;
-        }
-        return error.ExternalLakeCredentialScopeMismatch;
-    }
-
-    fn ensurePrefixAllowed(prefix: []const u8, allowed_prefix: []const u8) !void {
-        if (allowed_prefix.len == 0) return;
-        if (std.mem.startsWith(u8, prefix, allowed_prefix)) return;
-        return error.ExternalLakeCredentialScopeMismatch;
-    }
-
-    fn hasConnectionCapability(connection: common_config.Config.ConnectionConfig, capability: []const u8) bool {
-        for (connection.capabilities) |value| {
-            if (std.mem.eql(u8, value, capability)) return true;
-        }
-        return false;
     }
 };
 
