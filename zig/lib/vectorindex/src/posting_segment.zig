@@ -1867,17 +1867,19 @@ pub fn collectDirectoryGarbageAlloc(alloc: Allocator, io: std.Io, dir: std.Io.Di
         }
 
         stats.segment_files += 1;
-        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
-        defer alloc.free(path);
+        {
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
+            defer alloc.free(path);
 
-        if (live_paths.contains(path)) {
-            stats.referenced_segment_files += 1;
-            continue;
+            if (live_paths.contains(path)) {
+                stats.referenced_segment_files += 1;
+                continue;
+            }
+
+            stats.orphan_segment_files += 1;
+            try dir.deleteFile(io, path);
+            stats.deleted_segment_files += 1;
         }
-
-        stats.orphan_segment_files += 1;
-        try dir.deleteFile(io, path);
-        stats.deleted_segment_files += 1;
     }
 
     return stats;
@@ -1912,10 +1914,12 @@ pub fn collectDirectoryTemporaryGarbageAlloc(alloc: Allocator, io: std.Io, dir: 
         if (is_segment_tmp) stats.segment_temp_files += 1;
         if (is_manifest_tmp) stats.manifest_temp_files += 1;
 
-        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
-        defer alloc.free(path);
-        try dir.deleteFile(io, path);
-        stats.deleted_temp_files += 1;
+        {
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ segment_directory, entry.name });
+            defer alloc.free(path);
+            try dir.deleteFile(io, path);
+            stats.deleted_temp_files += 1;
+        }
     }
 
     return stats;
