@@ -81,12 +81,14 @@ pub const SidecarCandidateAccounting = struct {
     supplied_ref_count: u64 = 0,
     usable_set_count: u32 = 0,
     usable_ref_count: u64 = 0,
+    intersected_ref_count: u64 = 0,
     empty_usable_set_count: u32 = 0,
     selected_without_candidates_count: u32 = 0,
     stale_ignored_candidate_set_count: u32 = 0,
     not_requested_candidate_set_count: u32 = 0,
     missing_declaration_candidate_set_count: u32 = 0,
     hydration_possible: bool = false,
+    candidate_intersection_empty: bool = false,
 };
 
 pub const RangeCacheLaneAccounting = struct {
@@ -263,7 +265,83 @@ fn summarizeSidecarCandidates(
     }
 
     accounting.hydration_possible = accounting.usable_set_count != 0;
+    accounting.intersected_ref_count = try countIntersectedCandidateRefs(
+        descriptor,
+        sidecars,
+        desired,
+        policy,
+        candidate_sets,
+    );
+    accounting.candidate_intersection_empty =
+        accounting.usable_set_count != 0 and accounting.intersected_ref_count == 0;
     return accounting;
+}
+
+fn countIntersectedCandidateRefs(
+    descriptor: base_source.BaseSourceDescriptor,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const lake_sidecar_selection.DesiredSidecar,
+    policy: lake_sidecar_selection.Policy,
+    candidate_sets: []const lake_rows.SidecarCandidateSet,
+) !u64 {
+    const first = try firstUsableCandidateSet(descriptor, sidecars, desired, policy, candidate_sets) orelse return 0;
+    var total: u64 = 0;
+    for (first.row_refs, 0..) |row_ref, row_idx| {
+        if (containsRowRef(first.row_refs[0..row_idx], row_ref)) continue;
+        if (!try rowRefInEveryUsableCandidateSet(descriptor, sidecars, desired, policy, candidate_sets, row_ref)) continue;
+        total += 1;
+    }
+    return total;
+}
+
+fn firstUsableCandidateSet(
+    descriptor: base_source.BaseSourceDescriptor,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const lake_sidecar_selection.DesiredSidecar,
+    policy: lake_sidecar_selection.Policy,
+    candidate_sets: []const lake_rows.SidecarCandidateSet,
+) !?lake_rows.SidecarCandidateSet {
+    for (candidate_sets) |candidate_set| {
+        if (try candidateSetUsable(descriptor, sidecars, desired, policy, candidate_set)) {
+            return candidate_set;
+        }
+    }
+    return null;
+}
+
+fn rowRefInEveryUsableCandidateSet(
+    descriptor: base_source.BaseSourceDescriptor,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const lake_sidecar_selection.DesiredSidecar,
+    policy: lake_sidecar_selection.Policy,
+    candidate_sets: []const lake_rows.SidecarCandidateSet,
+    row_ref: rowsource.RowRef,
+) !bool {
+    for (candidate_sets) |candidate_set| {
+        if (!(try candidateSetUsable(descriptor, sidecars, desired, policy, candidate_set))) continue;
+        if (!containsRowRef(candidate_set.row_refs, row_ref)) return false;
+    }
+    return true;
+}
+
+fn candidateSetUsable(
+    descriptor: base_source.BaseSourceDescriptor,
+    sidecars: []const sidecar_manifest.DeclaredArtifact,
+    desired: []const lake_sidecar_selection.DesiredSidecar,
+    policy: lake_sidecar_selection.Policy,
+    candidate_set: lake_rows.SidecarCandidateSet,
+) !bool {
+    const declaration = findSidecarDeclaration(sidecars, candidate_set.sidecar_name) orelse return false;
+    if (!(try lake_sidecar_selection.declarationMatchesDesired(declaration, desired))) return false;
+    const fresh = try lake_sidecar_selection.declarationMatchesBaseSource(descriptor, declaration.binding);
+    if (!fresh) {
+        return switch (policy.stale) {
+            .reject => error.StaleLakeSidecar,
+            .ignore => false,
+        };
+    }
+    try source_binding.validateCandidateRowRefsAgainstBinding(declaration.binding, candidate_set.row_refs);
+    return true;
 }
 
 fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.ArtifactRef) !void {
@@ -298,6 +376,33 @@ fn findSidecarDeclaration(
         if (std.mem.eql(u8, declaration.name, sidecar_name)) return declaration;
     }
     return null;
+}
+
+fn containsRowRef(haystack: []const rowsource.RowRef, needle: rowsource.RowRef) bool {
+    for (haystack) |candidate| {
+        if (rowRefsEqual(candidate, needle)) return true;
+    }
+    return false;
+}
+
+fn rowRefsEqual(a: rowsource.RowRef, b: rowsource.RowRef) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .relational_key => |key| std.mem.eql(u8, key, b.relational_key),
+        .serverless => |value| blk: {
+            const other = b.serverless;
+            break :blk std.mem.eql(u8, value.fragment_id, other.fragment_id) and
+                value.row_ordinal == other.row_ordinal;
+        },
+        .external => |value| blk: {
+            const other = b.external;
+            break :blk std.mem.eql(u8, value.source_id, other.source_id) and
+                std.mem.eql(u8, value.snapshot_id, other.snapshot_id) and
+                std.mem.eql(u8, value.file_id, other.file_id) and
+                value.row_group_ordinal == other.row_group_ordinal and
+                value.row_ordinal == other.row_ordinal;
+        },
+    };
 }
 
 fn validateBaseSourceArtifacts(
@@ -703,8 +808,91 @@ test "lake explain reports sidecar candidate hydration accounting" {
     try std.testing.expectEqual(@as(u64, 2), plan.sidecar_candidates.supplied_ref_count);
     try std.testing.expectEqual(@as(u32, 1), plan.sidecar_candidates.usable_set_count);
     try std.testing.expectEqual(@as(u64, 2), plan.sidecar_candidates.usable_ref_count);
+    try std.testing.expectEqual(@as(u64, 2), plan.sidecar_candidates.intersected_ref_count);
     try std.testing.expectEqual(@as(u32, 1), plan.sidecar_candidates.selected_without_candidates_count);
     try std.testing.expect(plan.sidecar_candidates.hydration_possible);
+    try std.testing.expect(!plan.sidecar_candidates.candidate_intersection_empty);
+}
+
+test "lake explain reports intersected sidecar candidate hydration refs" {
+    const descriptor = base_source.BaseSourceDescriptor{ .external_iceberg = .{
+        .format = .iceberg,
+        .source_uri = "s3://bucket/warehouse/events",
+        .snapshot_id = "iceberg-9",
+        .schema_fingerprint = "schema-v2",
+        .file_inventory_artifact = "files-1",
+    } };
+    const artifacts = [_]artifact_ref.ArtifactRef{
+        .{ .kind = .external_base_source, .artifact_id = "files-1", .byte_len = 4096, .checksum = "len:4096" },
+        .{ .kind = .text_segment, .name = "events.body.text", .artifact_id = "text-1", .byte_len = 256, .checksum = "len:256" },
+        .{ .kind = .vector_segment, .name = "events.embedding.vector", .artifact_id = "vector-1", .byte_len = 512, .checksum = "len:512" },
+    };
+    const sidecars = [_]sidecar_manifest.DeclaredArtifact{
+        .{
+            .name = "events.body.text",
+            .binding = .{
+                .sidecar_kind = .text,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-9",
+                .schema_fingerprint = "schema-v2",
+                .column_bindings = &[_][]const u8{"body"},
+                .index_config_hash = "sha256:text",
+            },
+            .artifact = .{
+                .kind = .text_segment,
+                .name = "events.body.text",
+                .artifact_id = "text-1",
+                .byte_len = 256,
+                .checksum = "len:256",
+            },
+        },
+        .{
+            .name = "events.embedding.vector",
+            .binding = .{
+                .sidecar_kind = .vector,
+                .source_kind = .external_iceberg,
+                .row_ref_kind = .external,
+                .source_id = "events",
+                .snapshot_id = "iceberg-9",
+                .schema_fingerprint = "schema-v2",
+                .column_bindings = &[_][]const u8{"embedding"},
+                .index_config_hash = "sha256:vector",
+            },
+            .artifact = .{
+                .kind = .vector_segment,
+                .name = "events.embedding.vector",
+                .artifact_id = "vector-1",
+                .byte_len = 512,
+                .checksum = "len:512",
+            },
+        },
+    };
+    const row_7 = rowsource.RowRef{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-9", .file_id = "part-a", .row_group_ordinal = 0, .row_ordinal = 7 } };
+    const row_9 = rowsource.RowRef{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-9", .file_id = "part-a", .row_group_ordinal = 0, .row_ordinal = 9 } };
+    const row_11 = rowsource.RowRef{ .external = .{ .source_id = "events", .snapshot_id = "iceberg-9", .file_id = "part-a", .row_group_ordinal = 0, .row_ordinal = 11 } };
+    const text_candidates = [_]rowsource.RowRef{ row_7, row_9, row_9 };
+    const vector_candidates = [_]rowsource.RowRef{ row_9, row_11 };
+    const candidates = [_]lake_rows.SidecarCandidateSet{
+        .{ .sidecar_name = "events.body.text", .row_refs = &text_candidates },
+        .{ .sidecar_name = "events.embedding.vector", .row_refs = &vector_candidates },
+    };
+
+    const plan = try explain(.{
+        .base_source = descriptor,
+        .artifacts = &artifacts,
+        .sidecars = &sidecars,
+        .candidate_sets = &candidates,
+        .operation = .hydrate,
+    });
+
+    try std.testing.expectEqual(@as(u32, 2), plan.sidecar_candidates.usable_set_count);
+    try std.testing.expectEqual(@as(u64, 5), plan.sidecar_candidates.usable_ref_count);
+    try std.testing.expectEqual(@as(u64, 1), plan.sidecar_candidates.intersected_ref_count);
+    try std.testing.expectEqual(@as(u32, 0), plan.sidecar_candidates.selected_without_candidates_count);
+    try std.testing.expect(plan.sidecar_candidates.hydration_possible);
+    try std.testing.expect(!plan.sidecar_candidates.candidate_intersection_empty);
 }
 
 test "lake explain reports object range cache lane accounting" {
