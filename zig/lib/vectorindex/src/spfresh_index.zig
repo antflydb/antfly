@@ -206,29 +206,71 @@ fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !vo
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node.id, .packed_node), encoded);
 }
 
-fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCentroidProbe) void {
-    if (probes.len == 0) return;
-    if (count.* < probes.len) {
-        probes[count.*] = candidate;
-        count.* += 1;
-    } else {
-        var worst_index: usize = 0;
-        var worst_score = probes[0].distance - probes[0].error_bound;
-        for (probes[1..], 1..) |probe, i| {
-            const score = probe.distance - probe.error_bound;
-            if (score > worst_score) {
-                worst_score = score;
-                worst_index = i;
-            }
-        }
-        if (candidate.distance - candidate.error_bound >= worst_score) return;
-        probes[worst_index] = candidate;
-    }
-}
-
 fn flatProbeLowerBound(probe: FlatCentroidProbe) f32 {
     return probe.distance - probe.error_bound;
 }
+
+const FlatProbeCollector = struct {
+    probes: []FlatCentroidProbe,
+    count: usize = 0,
+    heap_ready: bool = false,
+
+    fn init(probes: []FlatCentroidProbe) FlatProbeCollector {
+        return .{ .probes = probes };
+    }
+
+    fn insert(self: *FlatProbeCollector, candidate: FlatCentroidProbe) void {
+        if (self.probes.len == 0) return;
+        if (self.count < self.probes.len) {
+            self.probes[self.count] = candidate;
+            self.count += 1;
+            if (self.count == self.probes.len) self.buildHeap();
+            return;
+        }
+
+        if (!self.heap_ready) self.buildHeap();
+        if (flatProbeLowerBound(candidate) >= flatProbeLowerBound(self.probes[0])) return;
+        self.probes[0] = candidate;
+        self.siftDown(0);
+    }
+
+    fn items(self: *const FlatProbeCollector) []FlatCentroidProbe {
+        return self.probes[0..self.count];
+    }
+
+    fn wouldRejectLowerBound(self: *FlatProbeCollector, lower_bound: f32) bool {
+        if (self.probes.len == 0) return true;
+        if (self.count < self.probes.len) return false;
+        if (!self.heap_ready) self.buildHeap();
+        return lower_bound >= flatProbeLowerBound(self.probes[0]);
+    }
+
+    fn buildHeap(self: *FlatProbeCollector) void {
+        std.debug.assert(self.count == self.probes.len);
+        var i = self.count / 2;
+        while (i > 0) {
+            i -= 1;
+            self.siftDown(i);
+        }
+        self.heap_ready = true;
+    }
+
+    fn siftDown(self: *FlatProbeCollector, start_index: usize) void {
+        var index = start_index;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.count) break;
+            const right = left + 1;
+            var largest = left;
+            if (right < self.count and flatProbeLowerBound(self.probes[right]) > flatProbeLowerBound(self.probes[left])) {
+                largest = right;
+            }
+            if (flatProbeLowerBound(self.probes[index]) >= flatProbeLowerBound(self.probes[largest])) break;
+            std.mem.swap(FlatCentroidProbe, &self.probes[index], &self.probes[largest]);
+            index = largest;
+        }
+    }
+};
 
 fn flatProbeUpperBound(probe: FlatCentroidProbe) f32 {
     return probe.distance + probe.error_bound;
@@ -843,13 +885,13 @@ pub fn selectFlatRabitqPostings(
     const directory = try acquireFlatCentroidDirectory(self, txn);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
-    var probe_count: usize = 0;
     const dims: usize = @intCast(self.config.dims);
     const query_measure: f32 = switch (self.config.metric) {
         .l2_squared => vec.dot(query, query),
         .cosine => vec.norm(query),
         .inner_product => 0,
     };
+    var probe_collector = FlatProbeCollector.init(probes[0..probe_limit]);
 
     const max_block_postings = @max(self.config.flat_centroid_block_size, @as(usize, 1));
     try scratch.ensureDistanceCapacity(self.alloc, @max(directory.blocks.len, max_block_postings));
@@ -945,10 +987,10 @@ pub fn selectFlatRabitqPostings(
             try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
             profile.centroid_directory_posting_centroid_estimates += @intCast(count);
 
-            var candidate_count: usize = 0;
+            var candidate_collector = FlatProbeCollector.init(quantized_posting_candidates);
             for (block.posting_ids, 0..) |posting_id, i| {
                 const posting_error_bound = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
-                insertFlatProbe(quantized_posting_candidates, &candidate_count, .{
+                candidate_collector.insert(.{
                     .posting_id = posting_id,
                     .parent = block.parents[i],
                     .level = block.levels[i],
@@ -959,11 +1001,14 @@ pub fn selectFlatRabitqPostings(
                     .error_bound = error_bounds[i] + posting_error_bound,
                 });
             }
-            profile.centroid_directory_posting_centroids_scored += @intCast(candidate_count);
-            for (quantized_posting_candidates[0..candidate_count]) |candidate| {
+            const candidates = candidate_collector.items();
+            var scored_candidates: usize = 0;
+            for (candidates) |candidate| {
+                if (probe_collector.wouldRejectLowerBound(flatProbeLowerBound(candidate))) continue;
                 const centroid = block.centroids[candidate.entry_index * dims ..][0..dims];
                 const distance = vec.distanceToQuery(query, query_measure, centroid, self.config.metric);
-                insertFlatProbe(probes[0..probe_limit], &probe_count, .{
+                scored_candidates += 1;
+                probe_collector.insert(.{
                     .posting_id = candidate.posting_id,
                     .parent = candidate.parent,
                     .level = candidate.level,
@@ -974,6 +1019,7 @@ pub fn selectFlatRabitqPostings(
                     .error_bound = centroidBlockProbeErrorBound(self.config.metric, distance, block.radii[candidate.entry_index]),
                 });
             }
+            profile.centroid_directory_posting_centroids_scored += @intCast(scored_candidates);
         } else {
             profile.centroid_directory_posting_centroids_scored += @intCast(count);
             for (0..count) |i| {
@@ -982,7 +1028,7 @@ pub fn selectFlatRabitqPostings(
                 error_bounds[i] = centroidBlockProbeErrorBound(self.config.metric, distances[i], block.radii[i]);
             }
             for (block.posting_ids, 0..) |posting_id, i| {
-                insertFlatProbe(probes[0..probe_limit], &probe_count, .{
+                probe_collector.insert(.{
                     .posting_id = posting_id,
                     .parent = block.parents[i],
                     .level = block.levels[i],
@@ -996,9 +1042,10 @@ pub fn selectFlatRabitqPostings(
         }
     }
 
-    std.mem.sort(FlatCentroidProbe, probes[0..probe_count], {}, flatProbeLess);
+    const selected_probes = probe_collector.items();
+    std.mem.sort(FlatCentroidProbe, selected_probes, {}, flatProbeLess);
     profile.approx_nodes_expanded += @intCast(selected_blocks.len);
-    return probe_count;
+    return selected_probes.len;
 }
 
 fn recomputeAncestorCentroids(
@@ -1952,6 +1999,29 @@ test "adaptive flat centroid block probing expands ambiguous boundary" {
     };
 
     try std.testing.expectEqual(@as(usize, 3), adaptiveFlatCentroidBlockProbeCount(&probes, 2));
+}
+
+test "flat probe collector keeps bounded lowest lower bounds" {
+    var storage: [3]FlatCentroidProbe = undefined;
+    var collector = FlatProbeCollector.init(&storage);
+
+    collector.insert(.{ .posting_id = 1, .distance = 10, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 2, .distance = 5, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 3, .distance = 7, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 4, .distance = 3, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 5, .distance = 8, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 6, .distance = 1, .error_bound = 0 });
+    collector.insert(.{ .posting_id = 7, .distance = 5, .error_bound = 0 });
+
+    try std.testing.expect(collector.wouldRejectLowerBound(5));
+    try std.testing.expect(!collector.wouldRejectLowerBound(4));
+
+    const items = collector.items();
+    std.mem.sort(FlatCentroidProbe, items, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqual(@as(u64, 6), items[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 4), items[1].posting_id);
+    try std.testing.expectEqual(@as(u64, 2), items[2].posting_id);
 }
 
 test "adaptive flat centroid block probing stops at clear margin" {
