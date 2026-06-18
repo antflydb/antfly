@@ -1362,6 +1362,10 @@ fn copyNodeMemberVectorsFromSource(
     const out = try self.alloc.alloc(f32, node.members.len * dims);
     errdefer self.alloc.free(out);
 
+    if (copyMemberVectorsFromSourceOrder(out, node.members, source_ids, source_vectors, dims)) {
+        return out;
+    }
+
     var positions = std.AutoHashMapUnmanaged(u64, usize).empty;
     defer positions.deinit(self.alloc);
     try positions.ensureTotalCapacity(self.alloc, @intCast(source_ids.len));
@@ -1377,6 +1381,38 @@ fn copyNodeMemberVectorsFromSource(
     }
 
     return out;
+}
+
+fn copyMemberVectorsFromSourceOrder(
+    out: []f32,
+    member_ids: []const u64,
+    source_ids: []const u64,
+    source_vectors: []const f32,
+    dims: usize,
+) bool {
+    var source_index: usize = 0;
+    for (member_ids, 0..) |member_id, i| {
+        while (source_index < source_ids.len and source_ids[source_index] != member_id) {
+            source_index += 1;
+        }
+        if (source_index == source_ids.len) return false;
+        const src = source_vectors[source_index * dims ..][0..dims];
+        const dst = out[i * dims ..][0..dims];
+        @memcpy(dst, src);
+        source_index += 1;
+    }
+    return true;
+}
+
+test "copy member vectors from source order copies ordered subsequences only" {
+    const source_ids = [_]u64{ 10, 20, 30 };
+    const source_vectors = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var out: [4]f32 = undefined;
+
+    try std.testing.expect(copyMemberVectorsFromSourceOrder(&out, &.{ 10, 30 }, &source_ids, &source_vectors, 2));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, &out);
+
+    try std.testing.expect(!copyMemberVectorsFromSourceOrder(&out, &.{ 30, 10 }, &source_ids, &source_vectors, 2));
 }
 
 pub fn saveNodeBodyWithAddedVector(
