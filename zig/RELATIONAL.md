@@ -4313,9 +4313,9 @@ request over those native objects instead of remaining an adapter no-op.
 Prepared statement, cursor, and explain syntax is protocol/query-control
 surface over typed plans rather than storage syntax. `PREPARE`, `EXECUTE`, and
 `DEALLOCATE [PREPARE] name|ALL` cleanup tails are parsed in
-`api/sql_adapter/grammar.zig`; the resulting typed prepared-statement intents
-capture statement name, parameter or argument count, and the prepared subject
-family. They still fail closed when applied to storage until Antfly has a native
+`api/sql_adapter/grammar.zig`; the resulting typed prepared-statement syntax
+captures statement name, parameter or argument count, and the prepared subject
+family before the lowerer allocates the public intent plan. They still fail closed when applied to storage until Antfly has a native
 prepared-plan cache keyed by typed plan fingerprints, parameter schemas, catalog
 epochs, authorization context, and invalidation rules. `DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]

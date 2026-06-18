@@ -2651,6 +2651,14 @@ fn cursorFetchDirectionFromSyntax(syntax: sql_adapter.CursorFetchDirectionSyntax
     };
 }
 
+fn preparedStatementSubjectKindFromSyntax(syntax: sql_adapter.PreparedStatementSubjectSyntax) PreparedStatementSubjectKind {
+    return switch (syntax) {
+        .read => .read,
+        .write => .write,
+        .ddl => .ddl,
+    };
+}
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3821,30 +3829,25 @@ const Parser = struct {
     }
 
     fn parsePrepareStatementDdl(self: *@This()) !PrepareStatementPlan {
-        const statement_name = try self.parseIdentifierOwned();
+        const syntax = try sql_adapter.parsePrepareStatementTail(self.tokens, &self.pos);
+        const statement_name = try self.alloc.dupe(u8, syntax.statement_name);
         var statement_transferred = false;
         errdefer if (!statement_transferred) self.alloc.free(statement_name);
-        const parameter_count = if (self.peekKind(.lparen)) try self.countParenthesizedTypeList() else 0;
-        try self.expectKeyword("as");
-        const statement_kind = try self.parsePreparedStatementSubjectKind();
-        try self.consumePreparedStatementSubjectTail();
         statement_transferred = true;
         return .{
             .statement_name = statement_name,
-            .parameter_count = parameter_count,
-            .statement_kind = statement_kind,
+            .parameter_count = syntax.parameter_count,
+            .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind),
         };
     }
 
     fn parseExecutePreparedStatementDdl(self: *@This()) !ExecutePreparedStatementPlan {
-        const statement_name = try self.parseIdentifierOwned();
+        const syntax = try sql_adapter.parseExecutePreparedStatementTail(self.tokens, &self.pos);
+        const statement_name = try self.alloc.dupe(u8, syntax.statement_name);
         var statement_transferred = false;
         errdefer if (!statement_transferred) self.alloc.free(statement_name);
-        const argument_count = try self.countParenthesizedUntypedValues();
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
         statement_transferred = true;
-        return .{ .statement_name = statement_name, .argument_count = argument_count };
+        return .{ .statement_name = statement_name, .argument_count = syntax.argument_count };
     }
 
     fn parseDeallocatePreparedStatementDdl(self: *@This()) !DeallocatePreparedStatementPlan {
@@ -3852,52 +3855,18 @@ const Parser = struct {
         return try self.deallocatePreparedStatementPlanFromSyntax(syntax);
     }
 
-    fn parsePreparedStatementSubjectKind(self: *@This()) !PreparedStatementSubjectKind {
-        return switch (sql_adapter.classifyPreparedStatementSubjectKind(self.tokens, self.pos) orelse return error.UnsupportedSqlShape) {
-            .read => .read,
-            .write => .write,
-            .ddl => .ddl,
-        };
-    }
-
-    fn consumePreparedStatementSubjectTail(self: *@This()) !void {
-        while (!self.atEnd()) {
-            if (self.match(.semicolon) != null) {
-                if (!self.atEnd()) return error.UnsupportedSqlShape;
-                return;
-            }
-            self.pos += 1;
-        }
-    }
-
-    fn countParenthesizedUntypedValues(self: *@This()) !usize {
-        if (self.match(.lparen) == null) return 0;
-        if (self.match(.rparen) != null) return 0;
-        var count: usize = 0;
-        while (true) {
-            const value_json = try self.parseSqlUntypedValueJsonAlloc();
-            self.alloc.free(value_json);
-            count += 1;
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        return count;
-    }
-
     fn parseDeclareCursorPortalDdl(self: *@This()) !DeclareCursorPortalPlan {
-        const syntax = try sql_adapter.parseDeclareCursorPortalPrefix(self.tokens, &self.pos);
+        const syntax = try sql_adapter.parseDeclareCursorPortalTail(self.tokens, &self.pos);
         const portal_name = try self.alloc.dupe(u8, syntax.portal_name);
         var portal_transferred = false;
         errdefer if (!portal_transferred) self.alloc.free(portal_name);
-        const statement_kind = try self.parsePreparedStatementSubjectKind();
-        try self.consumePreparedStatementSubjectTail();
         portal_transferred = true;
         return .{
             .portal_name = portal_name,
             .scroll = cursorScrollModeFromSyntax(syntax.scroll),
             .binary = syntax.binary,
             .hold = syntax.hold,
-            .statement_kind = statement_kind,
+            .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind orelse return error.UnsupportedSqlShape),
         };
     }
 

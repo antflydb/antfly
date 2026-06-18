@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
+const classifier = @import("classifier.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -37,6 +38,19 @@ pub const AdapterNoopTransactionBoundaryTail = struct {
 
 pub const SavepointNameSyntax = struct {
     savepoint_name: []const u8,
+};
+
+pub const PreparedStatementSubjectSyntax = classifier.SqlPreparedStatementSubjectKind;
+
+pub const PrepareStatementSyntax = struct {
+    statement_name: []const u8,
+    parameter_count: usize = 0,
+    statement_kind: PreparedStatementSubjectSyntax,
+};
+
+pub const ExecutePreparedStatementSyntax = struct {
+    statement_name: []const u8,
+    argument_count: usize = 0,
 };
 
 pub const RowClaimSyntax = struct {
@@ -66,6 +80,7 @@ pub const DeclareCursorPortalSyntax = struct {
     scroll: CursorScrollSyntax = .default,
     binary: bool = false,
     hold: bool = false,
+    statement_kind: ?PreparedStatementSubjectSyntax = null,
 };
 
 pub const CursorFetchDirectionSyntax = enum {
@@ -365,6 +380,31 @@ pub fn parseDeallocatePreparedStatementTail(tokens: []const Token, pos: *usize) 
     return try parseNamedOrAllTail(cursor);
 }
 
+pub fn parsePrepareStatementTail(tokens: []const Token, pos: *usize) !PrepareStatementSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const statement_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const parameter_count = if (cursor.peekKind(.lparen)) try countParenthesizedTypeList(cursor) else 0;
+    try cursor.expectKeyword("as");
+    const statement_kind = classifier.classifyPreparedStatementSubjectKind(tokens, cursor.checkpoint()) orelse return error.UnsupportedSqlShape;
+    try consumePreparedStatementSubjectTail(cursor);
+    return .{
+        .statement_name = statement_token.text,
+        .parameter_count = parameter_count,
+        .statement_kind = statement_kind,
+    };
+}
+
+pub fn parseExecutePreparedStatementTail(tokens: []const Token, pos: *usize) !ExecutePreparedStatementSyntax {
+    var cursor = parser.Cursor.init(tokens, pos);
+    const statement_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const argument_count = try countParenthesizedUntypedValues(cursor);
+    try parseAdapterNoopStatementEnd(cursor);
+    return .{
+        .statement_name = statement_token.text,
+        .argument_count = argument_count,
+    };
+}
+
 pub fn parseDeclareCursorPortalPrefix(tokens: []const Token, pos: *usize) !DeclareCursorPortalSyntax {
     var cursor = parser.Cursor.init(tokens, pos);
     const portal_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
@@ -398,6 +438,14 @@ pub fn parseDeclareCursorPortalPrefix(tokens: []const Token, pos: *usize) !Decla
         .binary = binary,
         .hold = hold,
     };
+}
+
+pub fn parseDeclareCursorPortalTail(tokens: []const Token, pos: *usize) !DeclareCursorPortalSyntax {
+    var syntax = try parseDeclareCursorPortalPrefix(tokens, pos);
+    const cursor = parser.Cursor.init(tokens, pos);
+    syntax.statement_kind = classifier.classifyPreparedStatementSubjectKind(tokens, cursor.checkpoint()) orelse return error.UnsupportedSqlShape;
+    try consumePreparedStatementSubjectTail(cursor);
+    return syntax;
 }
 
 pub fn parseFetchCursorPortalTail(tokens: []const Token, pos: *usize) !FetchCursorPortalSyntax {
@@ -584,6 +632,55 @@ fn parseCursorFetchCount(cursor: parser.Cursor) !i64 {
     var count = std.fmt.parseInt(i64, count_token.text, 10) catch return error.UnsupportedSqlShape;
     if (negative) count = -count;
     return count;
+}
+
+fn countParenthesizedTypeList(cursor: parser.Cursor) !usize {
+    try cursor.expectToken(.lparen);
+    if (cursor.matchToken(.rparen) != null) return 0;
+    var count: usize = 0;
+    while (true) {
+        _ = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+        count += 1;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    return count;
+}
+
+fn countParenthesizedUntypedValues(cursor: parser.Cursor) !usize {
+    if (cursor.matchToken(.lparen) == null) return 0;
+    if (cursor.matchToken(.rparen) != null) return 0;
+    var count: usize = 0;
+    while (true) {
+        try parseUntypedValue(cursor);
+        count += 1;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    return count;
+}
+
+fn parseUntypedValue(cursor: parser.Cursor) !void {
+    if (cursor.matchKeyword("true")) return;
+    if (cursor.matchKeyword("false")) return;
+    if (cursor.matchKeyword("null")) return;
+    if (cursor.matchToken(.string) != null) return;
+    if (cursor.matchToken(.number) != null) return;
+    if (cursor.matchToken(.minus) != null) {
+        try cursor.expectToken(.number);
+        return;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn consumePreparedStatementSubjectTail(cursor: parser.Cursor) !void {
+    while (!cursor.atEnd()) {
+        if (cursor.matchToken(.semicolon) != null) {
+            if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+            return;
+        }
+        try cursor.advance(1);
+    }
 }
 
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
@@ -964,6 +1061,49 @@ test "sql adapter grammar parses protocol cleanup tails" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseCloseCursorPortalTail(extra_tokens.items, &extra_pos));
 }
 
+test "sql adapter grammar parses prepared statement syntax" {
+    const alloc = std.testing.allocator;
+
+    var prepare_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan(text, uuid) AS SELECT id FROM usage_records WHERE status = $1;");
+    defer lexer.freeTokens(alloc, &prepare_tokens);
+    var prepare_pos: usize = 0;
+    const prepare = try parsePrepareStatementTail(prepare_tokens.items, &prepare_pos);
+    try std.testing.expectEqualStrings("usage_plan", prepare.statement_name);
+    try std.testing.expectEqual(@as(usize, 2), prepare.parameter_count);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.read, prepare.statement_kind);
+    try std.testing.expectEqual(prepare_tokens.items.len, prepare_pos);
+
+    var prepare_merge_tokens = try lexer.tokenizeAlloc(alloc, "merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
+    defer lexer.freeTokens(alloc, &prepare_merge_tokens);
+    var prepare_merge_pos: usize = 0;
+    const prepare_merge = try parsePrepareStatementTail(prepare_merge_tokens.items, &prepare_merge_pos);
+    try std.testing.expectEqualStrings("merge_plan", prepare_merge.statement_name);
+    try std.testing.expectEqual(@as(usize, 0), prepare_merge.parameter_count);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.write, prepare_merge.statement_kind);
+    try std.testing.expectEqual(prepare_merge_tokens.items.len, prepare_merge_pos);
+
+    var execute_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan('open', -3, true, null);");
+    defer lexer.freeTokens(alloc, &execute_tokens);
+    var execute_pos: usize = 0;
+    const execute = try parseExecutePreparedStatementTail(execute_tokens.items, &execute_pos);
+    try std.testing.expectEqualStrings("usage_plan", execute.statement_name);
+    try std.testing.expectEqual(@as(usize, 4), execute.argument_count);
+    try std.testing.expectEqual(execute_tokens.items.len, execute_pos);
+
+    var execute_bare_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan;");
+    defer lexer.freeTokens(alloc, &execute_bare_tokens);
+    var execute_bare_pos: usize = 0;
+    const execute_bare = try parseExecutePreparedStatementTail(execute_bare_tokens.items, &execute_bare_pos);
+    try std.testing.expectEqualStrings("usage_plan", execute_bare.statement_name);
+    try std.testing.expectEqual(@as(usize, 0), execute_bare.argument_count);
+    try std.testing.expectEqual(execute_bare_tokens.items.len, execute_bare_pos);
+
+    var extra_tokens = try lexer.tokenizeAlloc(alloc, "usage_plan('open'); EXECUTE other_plan;");
+    defer lexer.freeTokens(alloc, &extra_tokens);
+    var extra_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseExecutePreparedStatementTail(extra_tokens.items, &extra_pos));
+}
+
 test "sql adapter grammar parses cursor portal syntax" {
     const alloc = std.testing.allocator;
 
@@ -976,6 +1116,15 @@ test "sql adapter grammar parses cursor portal syntax" {
     try std.testing.expect(declare.binary);
     try std.testing.expect(declare.hold);
     try std.testing.expect(parser.peekKeyword(declare_tokens.items, declare_pos, "select"));
+
+    var declare_tail_tokens = try lexer.tokenizeAlloc(alloc, "usage_cursor BINARY NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records;");
+    defer lexer.freeTokens(alloc, &declare_tail_tokens);
+    var declare_tail_pos: usize = 0;
+    const declare_tail = try parseDeclareCursorPortalTail(declare_tail_tokens.items, &declare_tail_pos);
+    try std.testing.expectEqualStrings("usage_cursor", declare_tail.portal_name);
+    try std.testing.expectEqual(CursorScrollSyntax.no_scroll, declare_tail.scroll);
+    try std.testing.expectEqual(PreparedStatementSubjectSyntax.read, declare_tail.statement_kind.?);
+    try std.testing.expectEqual(declare_tail_tokens.items.len, declare_tail_pos);
 
     var fetch_tokens = try lexer.tokenizeAlloc(alloc, "BACKWARD -5 FROM usage_cursor;");
     defer lexer.freeTokens(alloc, &fetch_tokens);
