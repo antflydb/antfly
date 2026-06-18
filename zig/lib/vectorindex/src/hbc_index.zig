@@ -8926,7 +8926,8 @@ pub fn refreshQuantizedWithOptions(
 
     const dims: usize = @intCast(self.metadata.dims);
     const vectors = try self.alloc.alloc(f32, count * dims);
-    defer self.alloc.free(vectors);
+    var vectors_owned = true;
+    defer if (vectors_owned) self.alloc.free(vectors);
 
     const load_start = now_fn();
     if (node.is_leaf) {
@@ -8976,12 +8977,9 @@ pub fn refreshQuantizedWithOptions(
                 }
                 set.vectors.dims = @intCast(dims);
                 set.vectors.count = @intCast(count);
-                if (set.vectors.data.len == 0) {
-                    set.vectors.data = try self.alloc.alloc(f32, count * dims);
-                } else {
-                    set.vectors.data = try self.alloc.realloc(set.vectors.data, count * dims);
-                }
-                @memcpy(set.vectors.data, vectors);
+                if (set.vectors.data.len > 0) self.alloc.free(set.vectors.data);
+                set.vectors.data = vectors;
+                vectors_owned = false;
                 noteMutatedCachedQuantized(self, node.id);
                 const store_start = now_fn();
                 try putQuantizedCached(self, txn, node.id, cached, now_fn, elapsed_fn);
@@ -8995,9 +8993,10 @@ pub fn refreshQuantizedWithOptions(
                         .vectors = .{
                             .dims = @intCast(dims),
                             .count = @intCast(count),
-                            .data = try self.alloc.dupe(f32, vectors),
+                            .data = vectors,
                         },
                     } };
+                    vectors_owned = false;
                     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
                     defer fresh.deinit(self.alloc);
                     const store_start = now_fn();
@@ -9018,16 +9017,16 @@ pub fn refreshQuantizedWithOptions(
     }
 
     const compute_start = now_fn();
-    var qs: hbc_runtime.QuantizedSet = if (usesNonQuantizedPayload(node))
-        .{ .nonquant = .{
+    var qs: hbc_runtime.QuantizedSet = if (usesNonQuantizedPayload(node)) blk: {
+        vectors_owned = false;
+        break :blk .{ .nonquant = .{
             .vectors = .{
                 .dims = @intCast(dims),
                 .count = @intCast(count),
-                .data = try self.alloc.dupe(f32, vectors),
+                .data = vectors,
             },
-        } }
-    else
-        .{ .rabit = try self.quantizer.quantize(node.centroid, vectors, count) };
+        } };
+    } else .{ .rabit = try self.quantizer.quantize(node.centroid, vectors, count) };
     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
     defer qs.deinit(self.alloc);
     const store_start = now_fn();
