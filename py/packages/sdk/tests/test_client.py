@@ -113,7 +113,9 @@ from antfly.client_generated.models.rows_window_frame_end import RowsWindowFrame
 from antfly.client_generated.models.rows_window_frame_start import RowsWindowFrameStart  # noqa: E402
 from antfly.client_generated.models.rows_window_frame_unit import RowsWindowFrameUnit  # noqa: E402
 from antfly.client_generated.models.rows_window_spec import RowsWindowSpec  # noqa: E402
-from antfly.client_generated.types import UNSET  # noqa: E402
+from antfly.client_generated.types import UNSET, Unset  # noqa: E402
+
+type RowsExpression = RowsExpressionField | RowsExpressionOperator | RowsExpressionValue
 
 
 def where_atom(field: str, op: RowsWhereType0Op, value: object) -> RowsWhereType0:
@@ -144,7 +146,7 @@ def expr_value(value: object) -> RowsExpressionValue:
     return RowsExpressionValue(value=value)
 
 
-def expr_op(op: RowsExpressionOperatorOp, args: list[object]) -> RowsExpressionOperator:
+def expr_op(op: RowsExpressionOperatorOp, args: list[RowsExpression]) -> RowsExpressionOperator:
     return RowsExpressionOperator(op=op, args=args)
 
 
@@ -266,8 +268,11 @@ class TestAntflyClient:
         assert result_dict["rows"][0]["physical_key"] == "row:t1:u1"
 
         round_tripped = RowsGetResultSet.from_dict(result_dict)
-        assert round_tripped.rows[0].row["status"] == "ready"
-        assert round_tripped.rows[0].identity == {"primary": {"tenant_id": "t1", "user_id": "u1"}}
+        assert not isinstance(round_tripped.rows, Unset)
+        round_tripped_row = round_tripped.rows[0]
+        assert not isinstance(round_tripped_row.row, Unset)
+        assert round_tripped_row.row["status"] == "ready"
+        assert round_tripped_row.identity == {"primary": {"tenant_id": "t1", "user_id": "u1"}}
 
     def test_rows_plan_request_models_serialize_join_and_lateral(self) -> None:
         join_plan = RowsJoinPlanRequest(
