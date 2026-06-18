@@ -6748,6 +6748,7 @@ func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandby
 			existing.Status = observed.Status
 		}
 		existing.LastError = observed.LastError
+		existing.AdminStatusCode = 0
 		return
 	}
 	status.Standbys = append(status.Standbys, observed)
@@ -6766,6 +6767,10 @@ func markHAStandbyAdminError(status *antflyv1.HAStatus, standbyName string, slot
 	if lastError == "" {
 		lastError = "standby admin status unavailable"
 	}
+	adminStatusCode := 0
+	if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+		adminStatusCode = statusCode
+	}
 	for i := range status.Standbys {
 		existing := &status.Standbys[i]
 		if !haStandbyStatusMatches(*existing, standbyName, slotName) {
@@ -6779,15 +6784,17 @@ func markHAStandbyAdminError(status *antflyv1.HAStatus, standbyName string, slot
 		}
 		existing.Status = "unreachable"
 		existing.LastError = lastError
+		existing.AdminStatusCode = adminStatusCode
 		existing.CaughtUpToReceived = false
 		existing.CanServeSafeReads = false
 		return
 	}
 	status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
-		Name:      standbyName,
-		SlotName:  slotName,
-		Status:    "unreachable",
-		LastError: lastError,
+		Name:            standbyName,
+		SlotName:        slotName,
+		Status:          "unreachable",
+		LastError:       lastError,
+		AdminStatusCode: adminStatusCode,
 	})
 }
 

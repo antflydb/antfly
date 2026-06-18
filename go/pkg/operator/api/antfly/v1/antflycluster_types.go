@@ -1622,6 +1622,10 @@ type HAStandbyStatus struct {
 
 	LastError string `json:"lastError,omitempty"`
 
+	// AdminStatusCode records the latest typed /admin/v1 HA standby status-observation HTTP status code.
+	// +optional
+	AdminStatusCode int `json:"adminStatusCode,omitempty"`
+
 	LastAttemptNs uint64 `json:"lastAttemptNs,omitempty"`
 
 	LastSuccessNs uint64 `json:"lastSuccessNs,omitempty"`

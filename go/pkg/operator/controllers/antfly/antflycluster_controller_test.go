@@ -5834,10 +5834,11 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 				Mode:       antflyv1.HAModeHotStandby,
 				PrimaryLSN: 13,
 				Standbys: []antflyv1.HAStandbyStatus{{
-					Name:       "standby-a",
-					SlotName:   "slot-a",
-					Active:     true,
-					RestartLSN: 7,
+					Name:            "standby-a",
+					SlotName:        "slot-a",
+					Active:          true,
+					RestartLSN:      7,
+					AdminStatusCode: http.StatusServiceUnavailable,
 				}},
 			},
 		},
@@ -5865,6 +5866,7 @@ func TestObserveHAStandbyAdminStatuses(t *testing.T) {
 	g.Expect(standby.LastAttemptNs).To(Equal(uint64(1000)))
 	g.Expect(standby.LastSuccessNs).To(Equal(uint64(900)))
 	g.Expect(standby.ReplicationFailuresTotal).To(Equal(uint64(3)))
+	g.Expect(standby.AdminStatusCode).To(BeZero())
 	g.Expect(standby.Status).To(Equal("unhealthy"))
 }
 
@@ -5909,6 +5911,50 @@ func TestObserveHAStandbyAdminStatusesRejectsMissingSDKFieldEvidence(t *testing.
 	g.Expect(cluster.Status.HAStatus.Standbys[0].Name).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.Standbys[0].Status).To(Equal("unreachable"))
 	g.Expect(cluster.Status.HAStatus.Standbys[0].LastError).To(ContainSubstring("missing standby status progress field evidence"))
+}
+
+func TestObserveHAStandbyAdminStatusesRecordsUnauthorizedStatus(t *testing.T) {
+	g := NewWithT(t)
+
+	reconciler := &AntflyClusterReconciler{
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			g.Expect(req.Method).To(Equal(http.MethodGet))
+			g.Expect(req.URL.Path).To(Equal("/admin/v1/ha/standby/status"))
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader("missing bearer token")),
+			}, nil
+		})},
+	}
+	cluster := &antflyv1.AntflyCluster{
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Standbys: []antflyv1.HAStandbySpec{{
+					Name:     "standby-a",
+					SlotName: "slot-a",
+					AdminURL: "http://standby-a-ha.default.svc:8081",
+				}},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				Mode:       antflyv1.HAModeHotStandby,
+				PrimaryLSN: 13,
+			},
+		},
+	}
+
+	err := reconciler.observeHAStandbyAdminStatuses(context.Background(), cluster)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("status 401"))
+	g.Expect(cluster.Status.HAStatus.Standbys).To(HaveLen(1))
+	standby := cluster.Status.HAStatus.Standbys[0]
+	g.Expect(standby.Name).To(Equal("standby-a"))
+	g.Expect(standby.SlotName).To(Equal("slot-a"))
+	g.Expect(standby.Status).To(Equal("unreachable"))
+	g.Expect(standby.AdminStatusCode).To(Equal(http.StatusUnauthorized))
+	g.Expect(standby.LastError).To(ContainSubstring("status 401"))
 }
 
 func TestObserveHAStandbyAdminStatusesMarksFailedProbeUnhealthy(t *testing.T) {

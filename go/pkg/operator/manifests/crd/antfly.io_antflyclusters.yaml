@@ -9324,6 +9324,10 @@ spec:
                       properties:
                         active:
                           type: boolean
+                        adminStatusCode:
+                          description: AdminStatusCode records the latest typed /admin/v1
+                            HA standby status-observation HTTP status code.
+                          type: integer
                         appliedLSN:
                           format: int64
                           type: integer
