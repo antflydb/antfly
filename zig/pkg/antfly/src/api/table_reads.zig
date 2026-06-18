@@ -4892,6 +4892,38 @@ pub const ExternalObjectStorageLakeRowsSourceOptions = struct {
     object_uri_base: ?[]const u8 = null,
 };
 
+pub const ExternalLakePinnedSourceState = struct {
+    format: external_source_api.Format,
+    source_uri: []const u8,
+    snapshot_id: []const u8,
+    schema_fingerprint: []const u8,
+    file_count: usize,
+    row_group_count: usize,
+    row_count: u64,
+    byte_len: u64,
+
+    pub fn fromInventory(inventory: external_source_api.Inventory) ExternalLakePinnedSourceState {
+        var row_group_count: usize = 0;
+        var row_count: u64 = 0;
+        var byte_len: u64 = 0;
+        for (inventory.files) |file| {
+            byte_len +|= file.byte_len;
+            row_count +|= file.row_count;
+            row_group_count +|= file.row_groups.len;
+        }
+        return .{
+            .format = inventory.format,
+            .source_uri = inventory.source_uri,
+            .snapshot_id = inventory.snapshot_id,
+            .schema_fingerprint = inventory.schema_fingerprint,
+            .file_count = inventory.files.len,
+            .row_group_count = row_group_count,
+            .row_count = row_count,
+            .byte_len = byte_len,
+        };
+    }
+};
+
 pub const OwnedExternalObjectStorageLakeRowsSource = struct {
     alloc: std.mem.Allocator,
     inventory: external_source_api.Inventory,
@@ -4934,6 +4966,10 @@ pub const OwnedExternalObjectStorageLakeRowsSource = struct {
 
     pub fn source(self: *@This()) TableReadSource {
         return self.pinned_source.source();
+    }
+
+    pub fn pinnedState(self: *const @This()) ExternalLakePinnedSourceState {
+        return ExternalLakePinnedSourceState.fromInventory(self.inventory);
     }
 
     pub fn deinit(self: *@This()) void {
@@ -4999,6 +5035,10 @@ pub const OpenedExternalObjectStorageLakeRowsSource = struct {
 
     pub fn source(self: *@This()) TableReadSource {
         return self.owned_source.source();
+    }
+
+    pub fn pinnedState(self: *const @This()) ExternalLakePinnedSourceState {
+        return self.owned_source.pinnedState();
     }
 
     pub fn deinit(self: *@This()) void {
@@ -17205,6 +17245,15 @@ test "owned object storage lake source discovers and pins parquet prefix invento
     try std.testing.expectEqual(@as(usize, 1), owned_source.inventory.files.len);
     try std.testing.expectEqualStrings("part-a.parquet", owned_source.inventory.files[0].file_id);
     try std.testing.expectEqualStrings("s3://bucket/events/part-a.parquet", owned_source.inventory.files[0].object_uri);
+    const pinned_state = owned_source.pinnedState();
+    try std.testing.expectEqual(external_source_api.Format.parquet, pinned_state.format);
+    try std.testing.expectEqualStrings("s3://bucket/events", pinned_state.source_uri);
+    try std.testing.expectEqualStrings(owned_source.inventory.snapshot_id, pinned_state.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v1", pinned_state.schema_fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), pinned_state.file_count);
+    try std.testing.expectEqual(@as(usize, 0), pinned_state.row_group_count);
+    try std.testing.expectEqual(@as(u64, 0), pinned_state.row_count);
+    try std.testing.expectEqual(@as(u64, "not-a-real-parquet-file".len), pinned_state.byte_len);
     _ = owned_source.source();
 
     const stale_schema = storage_schema.TableSchema{
@@ -17277,6 +17326,15 @@ test "opened object storage lake source owns store and pins parquet prefix inven
     try std.testing.expectEqualStrings("s3://bucket/events", opened_source.owned_source.inventory.source_uri);
     try std.testing.expect(std.mem.startsWith(u8, opened_source.owned_source.inventory.snapshot_id, "sha256:"));
     try std.testing.expectEqual(@as(usize, 2), opened_source.owned_source.inventory.files.len);
+    const pinned_state = opened_source.pinnedState();
+    try std.testing.expectEqual(external_source_api.Format.parquet, pinned_state.format);
+    try std.testing.expectEqualStrings("s3://bucket/events", pinned_state.source_uri);
+    try std.testing.expectEqualStrings(opened_source.owned_source.inventory.snapshot_id, pinned_state.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v1", pinned_state.schema_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), pinned_state.file_count);
+    try std.testing.expectEqual(@as(usize, 0), pinned_state.row_group_count);
+    try std.testing.expectEqual(@as(u64, 0), pinned_state.row_count);
+    try std.testing.expectEqual(@as(u64, "not-a-real-parquet-file".len * 2), pinned_state.byte_len);
     _ = opened_source.source();
 }
 
