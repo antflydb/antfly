@@ -9634,7 +9634,17 @@ fn buildBulkKmeansParentLevel(
     }, points, self.rng.intN(nodes.len), centroids, next_centroids, assignments, distances, counts, entries);
     recordKmeansRunStats(self, stats);
 
-    var out = try self.alloc.alloc(BuiltBulkNode, nodes.len);
+    var output_group_count: usize = 0;
+    var count_cluster_start: usize = 0;
+    while (count_cluster_start < entries.len) {
+        const cluster = entries[count_cluster_start].cluster;
+        var cluster_end = count_cluster_start + 1;
+        while (cluster_end < entries.len and entries[cluster_end].cluster == cluster) : (cluster_end += 1) {}
+        output_group_count += std.math.divCeil(usize, cluster_end - count_cluster_start, max_group_size) catch unreachable;
+        count_cluster_start = cluster_end;
+    }
+
+    var out = try self.alloc.alloc(BuiltBulkNode, output_group_count);
     var out_count: usize = 0;
     errdefer {
         for (out[0..out_count]) |*node| node.deinit(self.alloc);
@@ -9668,7 +9678,7 @@ fn buildBulkKmeansParentLevel(
         cluster_start = cluster_end;
     }
 
-    return try self.alloc.realloc(out, out_count);
+    return out[0..out_count];
 }
 
 fn buildBulkParentFromNodeRange(
