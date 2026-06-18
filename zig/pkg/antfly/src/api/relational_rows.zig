@@ -3823,7 +3823,8 @@ fn lakeRowsPredicateFromRowsPredicateAlloc(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     return switch (column.field_type) {
-        .numeric, .datetime => .{
+        .numeric => try lakeRowsNumericPredicateFromJson(column, field, parsed.value),
+        .datetime => .{
             .column = field,
             .op = .eq_i64,
             .i64_value = try jsonValueAsI64(parsed.value),
@@ -3858,6 +3859,32 @@ fn lakeRowsPredicateFromRowsPredicateAlloc(
             };
         },
         else => return error.UnsupportedRowsQuery,
+    };
+}
+
+fn lakeRowsNumericPredicateFromJson(
+    column: runtime_schema.RelationalColumn,
+    field: []const u8,
+    value: std.json.Value,
+) !lake_rows.Predicate {
+    return switch (value) {
+        .integer => |number| .{
+            .column = field,
+            .op = .eq_i64,
+            .i64_value = number,
+        },
+        .float => |number| {
+            if (!std.math.isFinite(number)) return error.InvalidRowsRequest;
+            return .{
+                .column = field,
+                .op = .eq_f64,
+                .f64_value = number,
+            };
+        },
+        else => switch (column.field_type) {
+            .numeric => error.InvalidRowsRequest,
+            else => error.UnsupportedRowsQuery,
+        },
     };
 }
 

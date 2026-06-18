@@ -411,10 +411,12 @@ fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_id
         },
         .eq_i64 => switch (column.values) {
             .i64 => |items| items[row_idx] == predicate.i64_value,
+            .f64 => |items| items[row_idx] == @as(f64, @floatFromInt(predicate.i64_value)),
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
         .eq_f64 => switch (column.values) {
             .f64 => |items| items[row_idx] == predicate.f64_value,
+            .i64 => |items| if (exactI64FromF64(predicate.f64_value)) |value| items[row_idx] == value else false,
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
         .eq_bool => switch (column.values) {
@@ -422,6 +424,16 @@ fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_id
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
     };
+}
+
+fn exactI64FromF64(value: f64) ?i64 {
+    if (!std.math.isFinite(value)) return null;
+    if (@trunc(value) != value) return null;
+    if (value < @as(f64, @floatFromInt(std.math.minInt(i64)))) return null;
+    if (value > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return null;
+    const as_i64: i64 = @intFromFloat(value);
+    if (@as(f64, @floatFromInt(as_i64)) != value) return null;
+    return as_i64;
 }
 
 fn validateSidecarCandidateSets(candidates: []const SidecarCandidateSet) !void {
@@ -784,6 +796,68 @@ test "lake rows scans projected local rows with a predicate" {
     try std.testing.expect(rowRefsEqual(row_refs[1], result.rows[0].row_ref));
     try std.testing.expectEqual(@as(i64, 20), result.rows[0].find("amount").?.value.?.i64);
     try std.testing.expectEqual(true, result.rows[0].find("active").?.value.?.bool);
+}
+
+test "lake rows numeric predicates match exact i64 and f64 representations" {
+    const alloc = std.testing.allocator;
+    const local = @import("../../storage/rowsource/local.zig");
+
+    const row_refs = [_]rowsource.RowRef{
+        .{ .relational_key = "row:a" },
+        .{ .relational_key = "row:b" },
+        .{ .relational_key = "row:c" },
+    };
+    const amount_i64 = [_]i64{ 10, 20, 30 };
+    const score_f64 = [_]f64{ 1.5, 2.0, 3.25 };
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "amount", .values = .{ .i64 = &amount_i64 } },
+        .{ .name = "score", .values = .{ .f64 = &score_f64 } },
+    };
+    const batches = [_]rowsource.ColumnBatch{.{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "lsm-1" },
+        .row_refs = &row_refs,
+        .columns = &columns,
+    }};
+
+    const i64_projection = [_][]const u8{"amount"};
+    var i64_source = try local.relationalStoreSource(&batches);
+    var i64_result = try scanRowsAlloc(alloc, i64_source.rowSource(), .{
+        .projected_columns = &i64_projection,
+        .predicate = .{
+            .column = "amount",
+            .op = .eq_f64,
+            .f64_value = 20.0,
+        },
+    });
+    defer i64_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), i64_result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], i64_result.rows[0].row_ref));
+
+    const f64_projection = [_][]const u8{"score"};
+    var f64_source = try local.relationalStoreSource(&batches);
+    var f64_result = try scanRowsAlloc(alloc, f64_source.rowSource(), .{
+        .projected_columns = &f64_projection,
+        .predicate = .{
+            .column = "score",
+            .op = .eq_i64,
+            .i64_value = 2,
+        },
+    });
+    defer f64_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), f64_result.rows.len);
+    try std.testing.expect(rowRefsEqual(row_refs[1], f64_result.rows[0].row_ref));
+
+    var fractional_source = try local.relationalStoreSource(&batches);
+    var fractional_result = try scanRowsAlloc(alloc, fractional_source.rowSource(), .{
+        .projected_columns = &i64_projection,
+        .predicate = .{
+            .column = "amount",
+            .op = .eq_f64,
+            .f64_value = 20.5,
+        },
+    });
+    defer fractional_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), fractional_result.rows.len);
 }
 
 test "lake rows scans external rows through the same projection contract" {

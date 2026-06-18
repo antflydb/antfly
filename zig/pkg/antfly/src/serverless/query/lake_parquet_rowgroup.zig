@@ -1512,14 +1512,24 @@ fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?la
     const chunk = findColumnChunk(row_group, pred.column) orelse return true;
     return switch (pred.op) {
         .eq_i64 => blk: {
-            const min = chunk.stats_min_i64 orelse return true;
-            const max = chunk.stats_max_i64 orelse return true;
-            break :blk pred.i64_value >= min and pred.i64_value <= max;
-        },
-        .eq_f64 => blk: {
+            if (chunk.stats_min_i64) |min| {
+                const max = chunk.stats_max_i64 orelse return true;
+                break :blk pred.i64_value >= min and pred.i64_value <= max;
+            }
             const min = chunk.stats_min_f64 orelse return true;
             const max = chunk.stats_max_f64 orelse return true;
-            break :blk pred.f64_value >= min and pred.f64_value <= max;
+            const value: f64 = @floatFromInt(pred.i64_value);
+            break :blk value >= min and value <= max;
+        },
+        .eq_f64 => blk: {
+            if (chunk.stats_min_f64) |min| {
+                const max = chunk.stats_max_f64 orelse return true;
+                break :blk pred.f64_value >= min and pred.f64_value <= max;
+            }
+            const value = exactI64FromF64(pred.f64_value) orelse break :blk false;
+            const min = chunk.stats_min_i64 orelse return true;
+            const max = chunk.stats_max_i64 orelse return true;
+            break :blk value >= min and value <= max;
         },
         .eq_bytes => blk: {
             const min = chunk.stats_min_bytes orelse return true;
@@ -1533,6 +1543,16 @@ fn rowGroupMayMatchPredicate(row_group: external_source.RowGroup, predicate: ?la
             break :blk true;
         },
     };
+}
+
+fn exactI64FromF64(value: f64) ?i64 {
+    if (!std.math.isFinite(value)) return null;
+    if (@trunc(value) != value) return null;
+    if (value < @as(f64, @floatFromInt(std.math.minInt(i64)))) return null;
+    if (value > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return null;
+    const as_i64: i64 = @intFromFloat(value);
+    if (@as(f64, @floatFromInt(as_i64)) != value) return null;
+    return as_i64;
 }
 
 fn findPartitionValue(file: external_source.FileEntry, column_id: []const u8) ?external_source.PartitionValue {
@@ -6110,6 +6130,54 @@ test "parquet object range rows query prunes row groups with f64 statistics" {
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(f64, 2.5), result.rows[0].cells[0].value.?.f64);
     try std.testing.expectEqual(@as(u32, 1), result.rows[0].row_ref.external.row_group_ordinal);
+}
+
+test "parquet row-group predicate pruning bridges exact i64 and f64 statistics" {
+    const i64_chunks = [_]external_source.ColumnChunk{.{
+        .column_id = @constCast("amount"),
+        .file_offset = 0,
+        .compressed_len = 1,
+        .stats_min_i64 = 10,
+        .stats_max_i64 = 20,
+    }};
+    const i64_group = external_source.RowGroup{
+        .ordinal = 0,
+        .row_count = 1,
+        .column_chunks = @constCast(i64_chunks[0..]),
+    };
+    try std.testing.expect(rowGroupMayMatchPredicate(i64_group, .{
+        .column = "amount",
+        .op = .eq_f64,
+        .f64_value = 20.0,
+    }));
+    try std.testing.expect(!rowGroupMayMatchPredicate(i64_group, .{
+        .column = "amount",
+        .op = .eq_f64,
+        .f64_value = 20.5,
+    }));
+
+    const f64_chunks = [_]external_source.ColumnChunk{.{
+        .column_id = @constCast("score"),
+        .file_offset = 0,
+        .compressed_len = 1,
+        .stats_min_f64 = 1.5,
+        .stats_max_f64 = 2.5,
+    }};
+    const f64_group = external_source.RowGroup{
+        .ordinal = 0,
+        .row_count = 1,
+        .column_chunks = @constCast(f64_chunks[0..]),
+    };
+    try std.testing.expect(rowGroupMayMatchPredicate(f64_group, .{
+        .column = "score",
+        .op = .eq_i64,
+        .i64_value = 2,
+    }));
+    try std.testing.expect(!rowGroupMayMatchPredicate(f64_group, .{
+        .column = "score",
+        .op = .eq_i64,
+        .i64_value = 3,
+    }));
 }
 
 test "iceberg object range planner prunes files with partition equality metadata" {
