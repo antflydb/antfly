@@ -6326,8 +6326,8 @@ pub fn splitInternalWithOptions(
 
     if (node.parent == 0) {
         const new_root_id = self.nextNodeId();
-        const root_centroid = try self.alloc.dupe(f32, n1.centroid);
-        defer self.alloc.free(root_centroid);
+        var root_centroid = try self.alloc.dupe(f32, n1.centroid);
+        errdefer if (root_centroid.len > 0) self.alloc.free(root_centroid);
         vec.add(root_centroid, n2.centroid);
         vec.scale(0.5, root_centroid);
         normalizeCentroidForMetric(self, root_centroid);
@@ -6338,8 +6338,8 @@ pub fn splitInternalWithOptions(
         try saveNodeWithOptions(self, txn, &n1, options, now_fn, elapsed_fn);
         try saveNodeWithOptions(self, txn, &n2, options, now_fn, elapsed_fn);
 
-        const root_children = try self.alloc.alloc(u64, 2);
-        defer self.alloc.free(root_children);
+        var root_children = try self.alloc.alloc(u64, 2);
+        errdefer if (root_children.len > 0) self.alloc.free(root_children);
         root_children[0] = n1_id;
         root_children[1] = n2_id;
 
@@ -6348,10 +6348,12 @@ pub fn splitInternalWithOptions(
             .is_leaf = false,
             .level = node.level + 1,
             .parent = 0,
-            .centroid = try self.alloc.dupe(f32, root_centroid),
-            .children = try self.alloc.dupe(u64, root_children),
+            .centroid = root_centroid,
+            .children = root_children,
             .members = &.{},
         };
+        root_centroid = &.{};
+        root_children = &.{};
         defer new_root.deinit(self.alloc);
         try saveNodeWithOptions(self, txn, &new_root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
@@ -6658,8 +6660,8 @@ pub fn splitLeafWithOptions(
 
     if (splitting_root) {
         const new_root_id = self.nextNodeId();
-        const root_centroid = try self.alloc.dupe(f32, left_node.centroid);
-        defer self.alloc.free(root_centroid);
+        var root_centroid = try self.alloc.dupe(f32, left_node.centroid);
+        errdefer if (root_centroid.len > 0) self.alloc.free(root_centroid);
         vec.add(root_centroid, right_node.centroid);
         vec.scale(0.5, root_centroid);
         normalizeCentroidForMetric(self, root_centroid);
@@ -6677,8 +6679,8 @@ pub fn splitLeafWithOptions(
             try saveNodeWithOptions(self, txn, &right_node, options, now_fn, elapsed_fn);
         }
 
-        const root_children = try self.alloc.alloc(u64, 2);
-        defer self.alloc.free(root_children);
+        var root_children = try self.alloc.alloc(u64, 2);
+        errdefer if (root_children.len > 0) self.alloc.free(root_children);
         root_children[0] = left_id;
         root_children[1] = right_id;
 
@@ -6687,10 +6689,12 @@ pub fn splitLeafWithOptions(
             .is_leaf = false,
             .level = leaf_level,
             .parent = 0,
-            .centroid = try self.alloc.dupe(f32, root_centroid),
-            .children = try self.alloc.dupe(u64, root_children),
+            .centroid = root_centroid,
+            .children = root_children,
             .members = &.{},
         };
+        root_centroid = &.{};
+        root_children = &.{};
         defer new_root.deinit(self.alloc);
         try saveNodeWithOptions(self, txn, &new_root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
