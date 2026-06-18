@@ -18,6 +18,10 @@ const catalog_types = @import("../catalog/types.zig");
 const builder_mod = @import("builder.zig");
 const search_sources = @import("../search_sources.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const schema_mod = @import("../../schema/mod.zig");
+const storage_schema = @import("../../storage/schema.zig");
+const external_binding = @import("../external_source/catalog_binding.zig");
+const manifest_base_source = @import("../manifest/base_source.zig");
 
 pub const ArtifactAction = enum {
     reuse,
@@ -103,14 +107,31 @@ pub const TableDefinitionSnapshot = struct {
     schema_json: []u8 = &.{},
     read_schema_json: []u8 = &.{},
     indexes_json: []u8 = &.{},
+    base_source: ?manifest_base_source.BaseSourceDescriptor = null,
 
     pub fn deinit(self: *TableDefinitionSnapshot, alloc: Allocator) void {
         if (self.schema_json.len > 0) alloc.free(self.schema_json);
         if (self.read_schema_json.len > 0) alloc.free(self.read_schema_json);
         if (self.indexes_json.len > 0) alloc.free(self.indexes_json);
+        if (self.base_source) |*descriptor| manifest_base_source.freeOwnedDescriptor(alloc, descriptor);
         self.* = undefined;
     }
 };
+
+pub fn tableDefinitionSnapshotAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+) !TableDefinitionSnapshot {
+    var snapshot = TableDefinitionSnapshot{};
+    errdefer snapshot.deinit(alloc);
+    snapshot.schema_json = try alloc.dupe(u8, schema_json);
+    snapshot.read_schema_json = try alloc.dupe(u8, read_schema_json);
+    snapshot.indexes_json = try alloc.dupe(u8, indexes_json);
+    snapshot.base_source = try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc, schema_json);
+    return snapshot;
+}
 
 pub const TablePublicationPlan = struct {
     targets: builder_mod.Builder.PublicationTargets,
@@ -186,6 +207,26 @@ pub fn collapseNamedArtifactAction(
     return if (artifact_present) .drop else .drop;
 }
 
+pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+) !?manifest_base_source.BaseSourceDescriptor {
+    if (schema_json.len == 0) return null;
+
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const source = runtime_schema.external_base_source orelse return null;
+    const binding = external_binding.bindingFromRuntimeExternalBaseSource(source);
+    try binding.validateReadOnlyMvp();
+    const pinned_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() orelse return null;
+    const descriptor = try binding.toManifestBaseSource(pinned_snapshot_id, null);
+    return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);
+}
+
 test "metadata republish reasons report when any flag is set" {
     try std.testing.expect(!(MetadataRepublishReasons{}).any());
     try std.testing.expect((MetadataRepublishReasons{ .published_search_sources_changed = true }).any());
@@ -233,6 +274,46 @@ test "publication plan republish follows explicit metadata reasons" {
 test "table definition snapshot deinit handles empty fields" {
     var snapshot = TableDefinitionSnapshot{};
     snapshot.deinit(std.testing.allocator);
+}
+
+test "table definition snapshot owns pinned external base source" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":{"mode":"object_version_digest","digest":"sha256:objects"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var snapshot = try tableDefinitionSnapshotAlloc(
+        alloc,
+        schema_json,
+        "",
+        "{}",
+    );
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expect(snapshot.base_source != null);
+    try std.testing.expectEqual(manifest_base_source.BaseSourceKind.external_parquet, std.meta.activeTag(snapshot.base_source.?));
+    try std.testing.expectEqualStrings("sha256:objects", snapshot.base_source.?.external_parquet.snapshot_id);
+}
+
+test "publication plan derives pinned external lake base source from schema" {
+    const alloc = std.testing.allocator;
+    var descriptor = (try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc,
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","credentials":{"ref":"prod-lake-read","scope":"events"},"snapshot":{"mode":"snapshot_id","id":"iceberg-123"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    )).?;
+    defer manifest_base_source.freeOwnedDescriptor(alloc, &descriptor);
+
+    try std.testing.expectEqual(manifest_base_source.BaseSourceKind.external_iceberg, std.meta.activeTag(descriptor));
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/events", descriptor.external_iceberg.source_uri);
+    try std.testing.expectEqualStrings("iceberg-123", descriptor.external_iceberg.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", descriptor.external_iceberg.schema_fingerprint);
+    try std.testing.expectEqual(@as(?[]const u8, null), descriptor.external_iceberg.file_inventory_artifact);
+}
+
+test "publication plan leaves current external lake base source unpinned" {
+    const alloc = std.testing.allocator;
+    const descriptor = try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc,
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    try std.testing.expectEqual(@as(?manifest_base_source.BaseSourceDescriptor, null), descriptor);
 }
 
 test "collapse full text artifact action uses per-index actions when present" {

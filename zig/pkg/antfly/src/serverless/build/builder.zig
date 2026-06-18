@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
+const manifest_base_source = @import("../manifest/base_source.zig");
 const wal_mod = @import("../wal/mod.zig");
 const query_mod = @import("../query/mod.zig");
 const query_reader = @import("../query/indexed_reader.zig");
@@ -861,6 +862,11 @@ fn buildManifestAlloc(
         table_definition,
     );
     errdefer search_sources.deinitPublishedSearchSources(alloc, &manifest_sources);
+    const base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, table_definition);
+    errdefer if (base_source) |descriptor| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+    };
 
     return .{
         .namespace = try alloc.dupe(u8, namespace),
@@ -884,6 +890,7 @@ fn buildManifestAlloc(
             .indexes_json = if (table_definition.indexes_json.len == 0) &.{} else try alloc.dupe(u8, table_definition.indexes_json),
         },
         .artifacts = artifacts,
+        .base_source = base_source,
     };
 }
 
@@ -978,6 +985,11 @@ fn buildRebasedManifestFromRefsAlloc(
         table_definition,
     );
     errdefer search_sources.deinitPublishedSearchSources(alloc, &manifest_sources);
+    const base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, table_definition);
+    errdefer if (base_source) |descriptor| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+    };
 
     return .{
         .namespace = try alloc.dupe(u8, namespace),
@@ -1001,6 +1013,7 @@ fn buildRebasedManifestFromRefsAlloc(
             .indexes_json = if (table_definition.indexes_json.len == 0) &.{} else try alloc.dupe(u8, table_definition.indexes_json),
         },
         .artifacts = artifacts,
+        .base_source = base_source,
     };
 }
 
@@ -1057,6 +1070,11 @@ fn buildCompactedManifestFromRefsAlloc(
         table_definition,
     );
     errdefer search_sources.deinitPublishedSearchSources(alloc, &manifest_sources);
+    const base_source = try cloneTableDefinitionBaseSourceAlloc(alloc, table_definition);
+    errdefer if (base_source) |descriptor| {
+        var cleanup = descriptor;
+        manifest_base_source.freeOwnedDescriptor(alloc, &cleanup);
+    };
 
     return .{
         .namespace = try alloc.dupe(u8, namespace),
@@ -1080,7 +1098,18 @@ fn buildCompactedManifestFromRefsAlloc(
             .indexes_json = if (table_definition.indexes_json.len == 0) &.{} else try alloc.dupe(u8, table_definition.indexes_json),
         },
         .artifacts = artifacts,
+        .base_source = base_source,
     };
+}
+
+fn cloneTableDefinitionBaseSourceAlloc(
+    alloc: Allocator,
+    table_definition: publication_plan.TableDefinitionSnapshot,
+) !?manifest_base_source.BaseSourceDescriptor {
+    return if (table_definition.base_source) |descriptor|
+        try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor)
+    else
+        null;
 }
 
 pub fn detectMaterializedDerivedOutputsAlloc(
@@ -3825,6 +3854,51 @@ test "resolve published text specs includes chunk preview for chunker full text 
     try std.testing.expectEqualStrings("full_text_index_v0", specs[0].name);
     try std.testing.expectEqual(FullTextSourceMode.document_plus_artifact, specs[0].source_mode);
     try std.testing.expectEqualStrings(search_sources.default_chunk_preview_output_name, specs[0].source_artifact_name.?);
+}
+
+test "manifest builder carries pinned external lake base source from table definition" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":{"mode":"object_version_digest","digest":"sha256:objects"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+        alloc,
+        schema_json,
+        "",
+        "{}",
+    );
+    defer table_definition.deinit(alloc);
+
+    const document_ref = manifest_mod.ArtifactRef{
+        .kind = .document_segment,
+        .artifact_id = "documents-0001",
+        .byte_len = 128,
+        .checksum = "len:128",
+    };
+    var manifest = try buildCompactedManifestFromRefsAlloc(
+        alloc,
+        "events",
+        7,
+        7,
+        10,
+        7,
+        .inline_rebase,
+        document_ref,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        .{},
+        .{},
+        table_definition,
+    );
+    defer manifest.deinit(alloc);
+
+    try std.testing.expect(manifest.base_source != null);
+    try std.testing.expectEqual(manifest_mod.BaseSourceKind.external_parquet, std.meta.activeTag(manifest.base_source.?));
+    try std.testing.expectEqualStrings("s3://bucket/events", manifest.base_source.?.external_parquet.source_uri);
+    try std.testing.expectEqualStrings("sha256:objects", manifest.base_source.?.external_parquet.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", manifest.base_source.?.external_parquet.schema_fingerprint);
 }
 
 test "builder reuses unchanged artifacts during metadata-only republish" {

@@ -830,11 +830,12 @@ pub const CatalogService = struct {
                 return .{
                     .targets = targets,
                     .policy = effective_policy,
-                    .table_definition = .{
-                        .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                        .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                        .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                    },
+                    .table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                        self.alloc,
+                        table.schema_json,
+                        table.read_schema_json,
+                        table.indexes_json,
+                    ),
                     .metadata_republish = metadata_republish,
                     .artifact_actions = artifact_actions,
                     .full_text_index_actions = full_text_index_actions,
@@ -881,11 +882,12 @@ pub const CatalogService = struct {
             return .{
                 .targets = targets,
                 .policy = effective_policy,
-                .table_definition = .{
-                    .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                    .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                    .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                },
+                .table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                    self.alloc,
+                    table.schema_json,
+                    table.read_schema_json,
+                    table.indexes_json,
+                ),
                 .metadata_republish = metadata_republish,
                 .artifact_actions = .{
                     .document_segment = .rebuild,
