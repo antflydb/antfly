@@ -14,9 +14,8 @@
 
 //! Minimal Parquet page header parsing and PLAIN value decoding.
 //!
-//! This supports the first uncompressed required-column scan path. Dictionary
-//! decoding, repetition/definition levels, compression codecs, and nested data
-//! are separate scanner layers.
+//! This supports the first uncompressed required-column scan paths. Repetition
+//! levels, compression codecs, and nested data are separate scanner layers.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -66,13 +65,28 @@ pub const Header = struct {
     repetition_level_bytes: usize = 0,
     data_payload_offset: usize = 0,
 
+    pub fn validatePlainDictionary(self: Header) !void {
+        if (self.page_type != .dictionary_page) return error.UnsupportedParquetPage;
+        if (self.encoding != .plain) return error.UnsupportedParquetPage;
+    }
+
     pub fn validatePlainRequired(self: Header) !void {
         if (self.page_type != .data_page and self.page_type != .data_page_v2) return error.UnsupportedParquetPage;
         if (self.encoding != .plain) return error.UnsupportedParquetPage;
     }
 
+    pub fn validateDictionaryRequired(self: Header) !void {
+        if (self.page_type != .data_page and self.page_type != .data_page_v2) return error.UnsupportedParquetPage;
+        if (self.encoding != .rle_dictionary and self.encoding != .plain_dictionary) return error.UnsupportedParquetPage;
+    }
+
     pub fn validateUncompressedPlainRequired(self: Header) !void {
         try self.validatePlainRequired();
+        if (self.compressed_page_size != self.uncompressed_page_size) return error.UnsupportedParquetPage;
+    }
+
+    pub fn validateUncompressedDictionaryRequired(self: Header) !void {
+        try self.validateDictionaryRequired();
         if (self.compressed_page_size != self.uncompressed_page_size) return error.UnsupportedParquetPage;
     }
 };
@@ -132,6 +146,76 @@ pub fn scanUncompressedPlainI64ColumnChunkAlloc(alloc: Allocator, column_chunk_b
     return try values.toOwnedSlice(alloc);
 }
 
+pub fn decodePlainI64DictionaryPageAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
+    try header.validatePlainDictionary();
+    const count: usize = @intCast(header.value_count);
+    const needed = count * 8;
+    if (page_payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(i64, count);
+    for (values, 0..) |*value, idx| {
+        value.* = std.mem.readInt(i64, page_payload[idx * 8 .. idx * 8 + 8][0..8], .little);
+    }
+    return values;
+}
+
+pub fn decodeDictionaryI64DataPageAlloc(
+    alloc: Allocator,
+    header: Header,
+    dictionary: []const i64,
+    page_payload: []const u8,
+) ![]i64 {
+    try header.validateDictionaryRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    if (payload.len == 0) return error.InvalidParquetPage;
+    const bit_width_raw = payload[0];
+    if (bit_width_raw > 32) return error.UnsupportedParquetPage;
+    const bit_width: u6 = @intCast(bit_width_raw);
+    const row_count: usize = @intCast(header.value_count);
+    const indexes = try decodeHybridIndexesAlloc(alloc, payload[1..], bit_width, row_count);
+    defer alloc.free(indexes);
+    const values = try alloc.alloc(i64, row_count);
+    errdefer alloc.free(values);
+    for (indexes, values) |index, *value| {
+        if (index >= dictionary.len) return error.InvalidParquetPage;
+        value.* = dictionary[@intCast(index)];
+    }
+    return values;
+}
+
+pub fn scanUncompressedDictionaryI64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]i64 {
+    var cursor: usize = 0;
+    if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
+
+    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+    try parsed_dictionary.header.validatePlainDictionary();
+    if (parsed_dictionary.header.compressed_page_size != parsed_dictionary.header.uncompressed_page_size) {
+        return error.UnsupportedParquetPage;
+    }
+    cursor += parsed_dictionary.header_len;
+    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+    const dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+    cursor += parsed_dictionary.header.compressed_page_size;
+    const dictionary = try decodePlainI64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload);
+    defer alloc.free(dictionary);
+
+    var values = std.ArrayListUnmanaged(i64).empty;
+    errdefer values.deinit(alloc);
+    while (cursor < column_chunk_bytes.len) {
+        const parsed = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed.header.validateUncompressedDictionaryRequired();
+        cursor += parsed.header_len;
+        if (parsed.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const payload = column_chunk_bytes[cursor .. cursor + parsed.header.compressed_page_size];
+        cursor += parsed.header.compressed_page_size;
+
+        const page_values = try decodeDictionaryI64DataPageAlloc(alloc, parsed.header, dictionary, payload);
+        defer alloc.free(page_values);
+        try values.appendSlice(alloc, page_values);
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
 pub fn decodeHybridLevelsAlloc(
     alloc: Allocator,
     encoded: []const u8,
@@ -173,6 +257,48 @@ pub fn decodeHybridLevelsAlloc(
     }
     if (reader.cursor != reader.bytes.len) return error.InvalidParquetPage;
     return levels;
+}
+
+pub fn decodeHybridIndexesAlloc(
+    alloc: Allocator,
+    encoded: []const u8,
+    bit_width: u6,
+    expected_count: usize,
+) ![]u32 {
+    if (expected_count == 0) return try alloc.alloc(u32, 0);
+    if (bit_width > 32) return error.UnsupportedParquetPage;
+    const indexes = try alloc.alloc(u32, expected_count);
+    errdefer alloc.free(indexes);
+
+    var reader = LevelReader{ .bytes = encoded };
+    var out_idx: usize = 0;
+    while (out_idx < expected_count) {
+        const header = try reader.readVarintU64();
+        if (header == 0) return error.InvalidParquetPage;
+        if ((header & 1) == 0) {
+            const run_len: usize = std.math.cast(usize, header >> 1) orelse return error.InvalidParquetPage;
+            if (run_len == 0) return error.InvalidParquetPage;
+            const value = try reader.readFixedWidthValueU32(bit_width);
+            if (run_len > expected_count - out_idx) return error.InvalidParquetPage;
+            @memset(indexes[out_idx..][0..run_len], value);
+            out_idx += run_len;
+        } else {
+            const group_count: usize = std.math.cast(usize, header >> 1) orelse return error.InvalidParquetPage;
+            if (group_count == 0) return error.InvalidParquetPage;
+            const value_count = group_count * 8;
+            const byte_count = try packedByteCount(value_count, bit_width);
+            if (byte_count > reader.bytes.len - reader.cursor) return error.InvalidParquetPage;
+            const packed_bytes = reader.bytes[reader.cursor..][0..byte_count];
+            reader.cursor += byte_count;
+            const to_copy = @min(value_count, expected_count - out_idx);
+            for (0..to_copy) |idx| {
+                indexes[out_idx + idx] = try readPackedValueU32(packed_bytes, idx, bit_width);
+            }
+            out_idx += to_copy;
+        }
+    }
+    if (reader.cursor != reader.bytes.len) return error.InvalidParquetPage;
+    return indexes;
 }
 
 pub fn decodeOptionalPlainI64V2ByteLevelsAlloc(
@@ -355,6 +481,7 @@ fn parseHeaderStruct(reader: *Reader) !Header {
     var uncompressed_page_size: ?u32 = null;
     var compressed_page_size: ?u32 = null;
     var data_page: ?DataPageHeader = null;
+    var dictionary_page: ?DataPageHeader = null;
     var data_page_v2: ?DataPageHeader = null;
 
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
@@ -365,6 +492,10 @@ fn parseHeaderStruct(reader: *Reader) !Header {
             5 => {
                 if (field.type != .struct_) return error.InvalidParquetPage;
                 data_page = try parseDataPageHeader(reader);
+            },
+            7 => {
+                if (field.type != .struct_) return error.InvalidParquetPage;
+                dictionary_page = try parseDictionaryPageHeader(reader);
             },
             8 => {
                 if (field.type != .struct_) return error.InvalidParquetPage;
@@ -377,6 +508,7 @@ fn parseHeaderStruct(reader: *Reader) !Header {
     const got_page_type = page_type orelse return error.InvalidParquetPage;
     const page_header = switch (got_page_type) {
         .data_page => data_page orelse return error.InvalidParquetPage,
+        .dictionary_page => dictionary_page orelse return error.InvalidParquetPage,
         .data_page_v2 => data_page_v2 orelse return error.InvalidParquetPage,
         else => return error.UnsupportedParquetPage,
     };
@@ -401,6 +533,23 @@ const DataPageHeader = struct {
 };
 
 fn parseDataPageHeader(reader: *Reader) !DataPageHeader {
+    var previous_field_id: i16 = 0;
+    var value_count: ?u32 = null;
+    var encoding: ?Encoding = null;
+    while (try reader.readFieldHeader(&previous_field_id)) |field| {
+        switch (field.id) {
+            1 => value_count = try reader.readRequiredU32(field.type),
+            2 => encoding = try encodingFromInt(try reader.readRequiredI32(field.type)),
+            else => try reader.skip(field.type),
+        }
+    }
+    return .{
+        .value_count = value_count orelse return error.InvalidParquetPage,
+        .encoding = encoding orelse return error.InvalidParquetPage,
+    };
+}
+
+fn parseDictionaryPageHeader(reader: *Reader) !DataPageHeader {
     var previous_field_id: i16 = 0;
     var value_count: ?u32 = null;
     var encoding: ?Encoding = null;
@@ -609,13 +758,26 @@ const LevelReader = struct {
         if (value > std.math.maxInt(u8)) return error.InvalidParquetPage;
         return @intCast(value);
     }
+
+    fn readFixedWidthValueU32(self: *LevelReader, bit_width: u6) !u32 {
+        if (bit_width == 0) return 0;
+        const byte_count = fixedWidthByteCount(bit_width);
+        if (byte_count > 4) return error.UnsupportedParquetPage;
+        if (byte_count > self.bytes.len - self.cursor) return error.InvalidParquetPage;
+        var value: u32 = 0;
+        for (self.bytes[self.cursor..][0..byte_count], 0..) |byte, idx| {
+            value |= @as(u32, byte) << @intCast(idx * 8);
+        }
+        self.cursor += byte_count;
+        return value;
+    }
 };
 
-fn fixedWidthByteCount(bit_width: u4) usize {
+fn fixedWidthByteCount(bit_width: anytype) usize {
     return (@as(usize, bit_width) + 7) / 8;
 }
 
-fn packedByteCount(value_count: usize, bit_width: u4) !usize {
+fn packedByteCount(value_count: usize, bit_width: anytype) !usize {
     const bits = std.math.mul(usize, value_count, bit_width) catch return error.InvalidParquetPage;
     return (bits + 7) / 8;
 }
@@ -634,6 +796,21 @@ fn readPackedValue(packed_bytes: []const u8, value_idx: usize, bit_width: u4) !u
     }
     if (value > std.math.maxInt(u8)) return error.InvalidParquetPage;
     return @intCast(value);
+}
+
+fn readPackedValueU32(packed_bytes: []const u8, value_idx: usize, bit_width: u6) !u32 {
+    if (bit_width == 0) return 0;
+    var value: u32 = 0;
+    const start_bit = value_idx * @as(usize, bit_width);
+    for (0..@as(usize, bit_width)) |bit_offset| {
+        const absolute_bit = start_bit + bit_offset;
+        const byte_idx = absolute_bit / 8;
+        if (byte_idx >= packed_bytes.len) return error.InvalidParquetPage;
+        const bit_idx: u3 = @intCast(absolute_bit % 8);
+        const bit = (packed_bytes[byte_idx] >> bit_idx) & 1;
+        value |= @as(u32, bit) << @intCast(bit_offset);
+    }
+    return value;
 }
 
 fn zigzagDecode(raw: u64) i64 {
@@ -680,6 +857,15 @@ fn appendVarint(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: anyty
 }
 
 fn buildDataPageHeaderFixture(alloc: Allocator, value_count: i32, compressed_size: i32) !std.ArrayListUnmanaged(u8) {
+    return try buildDataPageHeaderFixtureWithEncoding(alloc, value_count, compressed_size, 0);
+}
+
+fn buildDataPageHeaderFixtureWithEncoding(
+    alloc: Allocator,
+    value_count: i32,
+    compressed_size: i32,
+    encoding: i32,
+) !std.ArrayListUnmanaged(u8) {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -696,7 +882,59 @@ fn buildDataPageHeaderFixture(alloc: Allocator, value_count: i32, compressed_siz
     try appendField(&out, alloc, &data_prev, 1, .i32);
     try appendI32(&out, alloc, value_count);
     try appendField(&out, alloc, &data_prev, 2, .i32);
+    try appendI32(&out, alloc, encoding);
+    try appendField(&out, alloc, &data_prev, 3, .i32);
+    try appendI32(&out, alloc, 2);
+    try appendField(&out, alloc, &data_prev, 4, .i32);
+    try appendI32(&out, alloc, 2);
+    try appendStop(&out, alloc);
+
+    try appendStop(&out, alloc);
+    return out;
+}
+
+fn buildDictionaryPageHeaderFixture(alloc: Allocator, value_count: i32, compressed_size: i32) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var page_prev: i16 = 0;
+    try appendField(&out, alloc, &page_prev, 1, .i32);
+    try appendI32(&out, alloc, 2);
+    try appendField(&out, alloc, &page_prev, 2, .i32);
+    try appendI32(&out, alloc, compressed_size);
+    try appendField(&out, alloc, &page_prev, 3, .i32);
+    try appendI32(&out, alloc, compressed_size);
+    try appendField(&out, alloc, &page_prev, 7, .struct_);
+
+    var dictionary_prev: i16 = 0;
+    try appendField(&out, alloc, &dictionary_prev, 1, .i32);
+    try appendI32(&out, alloc, value_count);
+    try appendField(&out, alloc, &dictionary_prev, 2, .i32);
     try appendI32(&out, alloc, 0);
+    try appendStop(&out, alloc);
+
+    try appendStop(&out, alloc);
+    return out;
+}
+
+fn buildDictionaryDataPageHeaderFixture(alloc: Allocator, value_count: i32, compressed_size: i32) !std.ArrayListUnmanaged(u8) {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var page_prev: i16 = 0;
+    try appendField(&out, alloc, &page_prev, 1, .i32);
+    try appendI32(&out, alloc, 0);
+    try appendField(&out, alloc, &page_prev, 2, .i32);
+    try appendI32(&out, alloc, compressed_size);
+    try appendField(&out, alloc, &page_prev, 3, .i32);
+    try appendI32(&out, alloc, compressed_size);
+    try appendField(&out, alloc, &page_prev, 5, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(&out, alloc, &data_prev, 1, .i32);
+    try appendI32(&out, alloc, value_count);
+    try appendField(&out, alloc, &data_prev, 2, .i32);
+    try appendI32(&out, alloc, 7);
     try appendField(&out, alloc, &data_prev, 3, .i32);
     try appendI32(&out, alloc, 2);
     try appendField(&out, alloc, &data_prev, 4, .i32);
@@ -905,6 +1143,41 @@ test "parquet page scanner concatenates uncompressed plain i64 pages" {
     const values = try scanUncompressedPlainI64ColumnChunkAlloc(alloc, chunk.items);
     defer alloc.free(values);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, values);
+}
+
+test "parquet page scanner decodes dictionary i64 pages" {
+    const alloc = std.testing.allocator;
+    var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 3, 24);
+    defer dictionary_header.deinit(alloc);
+    var data_header = try buildDictionaryDataPageHeaderFixture(alloc, 4, 4);
+    defer data_header.deinit(alloc);
+
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, dictionary_header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        100, 0, 0, 0, 0, 0, 0, 0,
+        110, 0, 0, 0, 0, 0, 0, 0,
+        120, 0, 0, 0, 0, 0, 0, 0,
+    });
+    try chunk.appendSlice(alloc, data_header.items);
+    try chunk.appendSlice(alloc, &[_]u8{
+        2,
+        3,
+        0b10010010,
+        0,
+    });
+
+    const values = try scanUncompressedDictionaryI64ColumnChunkAlloc(alloc, chunk.items);
+    defer alloc.free(values);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 120, 100, 110, 120 }, values);
+
+    const parsed_data = try parsePageHeader(data_header.items);
+    const invalid_payload = [_]u8{ 1, 3, 0b00000010 };
+    try std.testing.expectError(
+        error.InvalidParquetPage,
+        decodeDictionaryI64DataPageAlloc(alloc, parsed_data.header, &[_]i64{100}, &invalid_payload),
+    );
 }
 
 test "parquet page scanner concatenates optional plain i64 pages" {

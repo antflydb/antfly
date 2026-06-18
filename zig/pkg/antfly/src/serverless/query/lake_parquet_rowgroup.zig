@@ -264,9 +264,20 @@ pub fn buildOptionalPlainI64RowGroupBatchAlloc(
     return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .optional);
 }
 
+pub fn buildDictionaryPlainI64RowGroupBatchAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+) !OwnedBatch {
+    return try buildPlainI64RowGroupBatchAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .dictionary_required);
+}
+
 const PlainI64Mode = enum {
     required,
     optional,
+    dictionary_required,
 };
 
 fn buildPlainI64RowGroupBatchAlloc(
@@ -329,6 +340,10 @@ fn buildPlainI64RowGroupBatchAlloc(
                 i64_values[idx] = decoded.values;
                 null_bitmaps[idx] = decoded.nulls;
                 decoded = undefined;
+            },
+            .dictionary_required => {
+                i64_values[idx] = try parquet_page.scanUncompressedDictionaryI64ColumnChunkAlloc(alloc, input.bytes);
+                null_bitmaps[idx] = &.{};
             },
         }
         initialized_values += 1;
@@ -540,6 +555,65 @@ fn appendPlainI64DataPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, va
         std.mem.writeInt(i64, &buf, value, .little);
         try out.appendSlice(alloc, &buf);
     }
+}
+
+fn appendPlainI64DictionaryPage(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const i64) !void {
+    const byte_len: i32 = @intCast(values.len * 8);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 2);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 7, .struct_);
+
+    var dictionary_prev: i16 = 0;
+    try appendField(out, alloc, &dictionary_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(values.len));
+    try appendField(out, alloc, &dictionary_prev, 2, .i32);
+    try appendI32(out, alloc, 0);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    for (values) |value| {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &buf, value, .little);
+        try out.appendSlice(alloc, &buf);
+    }
+}
+
+fn appendDictionaryI64DataPage(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    value_count: usize,
+    bit_width: u8,
+    encoded_indexes: []const u8,
+) !void {
+    const byte_len: i32 = @intCast(1 + encoded_indexes.len);
+    var page_prev: i16 = 0;
+    try appendField(out, alloc, &page_prev, 1, .i32);
+    try appendI32(out, alloc, 0);
+    try appendField(out, alloc, &page_prev, 2, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 3, .i32);
+    try appendI32(out, alloc, byte_len);
+    try appendField(out, alloc, &page_prev, 5, .struct_);
+
+    var data_prev: i16 = 0;
+    try appendField(out, alloc, &data_prev, 1, .i32);
+    try appendI32(out, alloc, @intCast(value_count));
+    try appendField(out, alloc, &data_prev, 2, .i32);
+    try appendI32(out, alloc, 7);
+    try appendField(out, alloc, &data_prev, 3, .i32);
+    try appendI32(out, alloc, 2);
+    try appendField(out, alloc, &data_prev, 4, .i32);
+    try appendI32(out, alloc, 2);
+    try appendStop(out, alloc);
+    try appendStop(out, alloc);
+
+    try out.append(alloc, bit_width);
+    try out.appendSlice(alloc, encoded_indexes);
 }
 
 fn appendOptionalPlainI64DataPageV2(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, values: []const ?i64) !void {
