@@ -40,6 +40,7 @@ from .auth_subject_kind import AuthSubjectKind
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
 from .backup_list_response import BackupListResponse
+from .backup_namespace_table_response_201 import BackupNamespaceTableResponse201
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
@@ -56,6 +57,7 @@ from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
+from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -514,6 +516,7 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
+from .restore_namespace_table_response_202 import RestoreNamespaceTableResponse202
 from .restore_table_response_202 import RestoreTableResponse202
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -773,6 +776,7 @@ __all__ = (
     "BackupInfo",
     "BackupInfoFormat",
     "BackupListResponse",
+    "BackupNamespaceTableResponse201",
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
@@ -789,6 +793,7 @@ __all__ = (
     "CalendarInterval",
     "Capability",
     "CardinalityMode",
+    "CatalogTablespaceBindingRequest",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -1245,6 +1250,7 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
+    "RestoreNamespaceTableResponse202",
     "RestoreTableResponse202",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
