@@ -173,6 +173,49 @@ func TestHAClientCreateReplicationSlotUsesAdminAPI(t *testing.T) {
 	}
 }
 
+func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
+	t.Parallel()
+
+	expectedAuth := make(chan string, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if r.URL.Path != HAReplicationSlotsPath {
+			t.Fatalf("path = %s, want %s", r.URL.Path, HAReplicationSlotsPath)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+		if got, want := r.Header.Get("Authorization"), <-expectedAuth; got != want {
+			t.Fatalf("Authorization = %q, want %q", got, want)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"schema_version":1,"slots":[]}`)
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+
+	expectedAuth <- "Bearer first-token"
+	if _, err := client.WithToken(" first-token ").ListReplicationSlots(context.Background()); err != nil {
+		t.Fatalf("ListReplicationSlots with first token returned error: %v", err)
+	}
+
+	expectedAuth <- "Bearer second-token"
+	if _, err := client.WithToken("second-token").ListReplicationSlots(context.Background()); err != nil {
+		t.Fatalf("ListReplicationSlots with second token returned error: %v", err)
+	}
+
+	expectedAuth <- ""
+	if _, err := client.WithToken("  ").ListReplicationSlots(context.Background()); err != nil {
+		t.Fatalf("ListReplicationSlots with cleared token returned error: %v", err)
+	}
+}
+
 func TestHAClientPublicAPIDoesNotExposeGeneratedClient(t *testing.T) {
 	t.Parallel()
 
