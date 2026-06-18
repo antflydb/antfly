@@ -88,6 +88,7 @@ pub const OwnedRowsQueryPlan = db_mod.types.RelationalRowsQueryPlan;
 pub const OwnedRowsQueryResult = db_mod.types.RelationalRowsQueryResult;
 pub const OwnedRowsAggregateRequest = db_mod.types.RelationalRowsAggregateRequest;
 pub const OwnedRowsAggregatePlan = db_mod.types.RelationalRowsAggregatePlan;
+pub const OwnedRowsAggregateResult = db_mod.types.RelationalRowsAggregateResult;
 pub const OwnedRowsWindowRequest = db_mod.types.RelationalRowsWindowRequest;
 pub const OwnedRowsWindowPlan = db_mod.types.RelationalRowsWindowPlan;
 pub const OwnedRowsJoinRequest = db_mod.types.RelationalRowsJoinRequest;
@@ -3074,6 +3075,66 @@ pub fn buildRowsQueryResultFromLakeRowsAlloc(
     };
 }
 
+pub fn buildLakeRowsScanRequestForRowsAggregateAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    request: OwnedRowsAggregateRequest,
+) !OwnedRowsLakeScanRequest {
+    try validateLakeRowsAggregateRequestSupported(schema, request);
+
+    const projected_columns = try lakeRowsAggregateProjectedColumnsAlloc(alloc, schema, request);
+    errdefer freeLakeProjectedColumns(alloc, projected_columns);
+
+    var predicate_bytes_value: ?[]const u8 = null;
+    errdefer if (predicate_bytes_value) |value| alloc.free(@constCast(value));
+    const predicate: ?lake_rows.Predicate = if (request.source.predicates.len == 0) null else pred_blk: {
+        const source = request.source.predicates[0];
+        if (source.op != .eq) return error.UnsupportedRowsQuery;
+        const value_json = source.value_json orelse return error.InvalidRowsRequest;
+        const column = findRelationalColumn(schema.relational_columns, source.field) orelse return error.InvalidRowsRequest;
+        break :pred_blk try lakeRowsPredicateFromRowsPredicateAlloc(alloc, column, source.field, value_json, &predicate_bytes_value);
+    };
+
+    return .{
+        .request = .{
+            .projected_columns = projected_columns,
+            .predicate = predicate,
+            .limit = null,
+        },
+        .projected_columns = projected_columns,
+        .predicate_bytes_value = predicate_bytes_value,
+    };
+}
+
+pub fn buildRowsAggregateResultFromLakeRowsAlloc(
+    alloc: std.mem.Allocator,
+    request: OwnedRowsAggregateRequest,
+    result: lake_rows.ScanResult,
+) !OwnedRowsAggregateResult {
+    try validateLakeRowsAggregateShapeSupported(request);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (request.aggregations, 0..) |aggregation, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(aggregation.name, .{})});
+        try writeLakeRowsAggregateValueJson(writer, aggregation, result);
+    }
+    try writer.writeByte('}');
+
+    const encoded = try out.toOwnedSlice();
+    errdefer alloc.free(encoded);
+    const rows = try alloc.alloc([]const u8, 1);
+    errdefer alloc.free(rows);
+    rows[0] = encoded;
+    return .{
+        .rows = rows,
+        .total_groups = 1,
+    };
+}
+
 fn lakeRowsProjectedColumnsAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
@@ -3106,6 +3167,123 @@ fn lakeRowsProjectedColumnsAlloc(
         initialized += 1;
     }
     return out;
+}
+
+fn validateLakeRowsAggregateRequestSupported(
+    schema: runtime_schema.TableSchema,
+    request: OwnedRowsAggregateRequest,
+) !void {
+    if (schema.storage_mode != .relational) return error.InvalidRowsRequest;
+    try validateLakeRowsAggregateShapeSupported(request);
+    for (request.aggregations) |aggregation| {
+        switch (aggregation.op) {
+            .count => if (aggregation.field) |field| {
+                _ = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+            },
+            .sum, .avg => {
+                const field = aggregation.field orelse return error.InvalidRowsRequest;
+                const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+                if (column.field_type != .numeric) return error.InvalidRowsRequest;
+            },
+            .min, .max => {
+                const field = aggregation.field orelse return error.InvalidRowsRequest;
+                const column = findRelationalColumn(schema.relational_columns, field) orelse return error.InvalidRowsRequest;
+                if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidRowsRequest;
+            },
+            else => return error.UnsupportedRowsQuery,
+        }
+    }
+    if (request.source.predicates.len == 1) {
+        const predicate = request.source.predicates[0];
+        _ = findRelationalColumn(schema.relational_columns, predicate.field) orelse return error.InvalidRowsRequest;
+    }
+}
+
+fn validateLakeRowsAggregateShapeSupported(request: OwnedRowsAggregateRequest) !void {
+    try validateLakeRowsAggregateSourceSupported(request.source);
+    if (request.group_by.len != 0 or request.group_expressions.len != 0) return error.UnsupportedRowsQuery;
+    if (request.having_predicates.len != 0 or request.having_expressions.len != 0 or request.having_any.len != 0 or request.having_not.len != 0) return error.UnsupportedRowsQuery;
+    if (request.order_by.len != 0 or request.limit != null or request.offset != 0) return error.UnsupportedRowsQuery;
+    if (request.aggregations.len == 0) return error.InvalidRowsRequest;
+    for (request.aggregations) |aggregation| {
+        if (aggregation.name.len == 0) return error.InvalidRowsRequest;
+        if (aggregation.expression != null or aggregation.distinct) return error.UnsupportedRowsQuery;
+        if (aggregation.array_order_by.len != 0 or aggregation.string_delimiter != null) return error.UnsupportedRowsQuery;
+        if (aggregation.filter_predicates.len != 0 or aggregation.filter_array_any.len != 0 or aggregation.filter_array_contains.len != 0 or aggregation.filter_array_eq.len != 0) return error.UnsupportedRowsQuery;
+        if (aggregation.filter_in_predicates.len != 0 or aggregation.filter_json_contains.len != 0 or aggregation.filter_json_path_eq.len != 0 or aggregation.filter_json_path_exists.len != 0) return error.UnsupportedRowsQuery;
+        if (aggregation.filter_text_patterns.len != 0 or aggregation.filter_expressions.len != 0 or aggregation.filter_expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
+        if (aggregation.filter_any.len != 0 or aggregation.filter_not.len != 0) return error.UnsupportedRowsQuery;
+        switch (aggregation.op) {
+            .count => {},
+            .sum, .min, .max, .avg => if (aggregation.field == null) return error.InvalidRowsRequest,
+            else => return error.UnsupportedRowsQuery,
+        }
+    }
+}
+
+fn validateLakeRowsAggregateSourceSupported(source: OwnedRowsQueryRequest) !void {
+    if (source.source_cte.len != 0) return error.UnsupportedRowsQuery;
+    if (source.row_claim != null) return error.UnsupportedRowsQuery;
+    if (source.doc_key_range != null) return error.UnsupportedRowsQuery;
+    if (source.limit != null or source.offset != 0) return error.UnsupportedRowsQuery;
+    if (!source.select_all or source.select.len != 0) return error.UnsupportedRowsQuery;
+    if (source.order_by.len != 0) return error.UnsupportedRowsQuery;
+    if (source.distinct_on.len != 0 or source.distinct_on_expressions.len != 0) return error.UnsupportedRowsQuery;
+    if (source.json_extract.len != 0 or source.array_length.len != 0 or source.coalesce.len != 0 or source.field_aliases.len != 0 or source.expressions.len != 0) return error.UnsupportedRowsQuery;
+    if (source.array_any.len != 0 or source.array_contains.len != 0 or source.array_eq.len != 0 or source.in_predicates.len != 0) return error.UnsupportedRowsQuery;
+    if (source.json_contains.len != 0 or source.json_path_eq.len != 0 or source.json_path_exists.len != 0 or source.text_patterns.len != 0) return error.UnsupportedRowsQuery;
+    if (source.or_predicates.len != 0 or source.not_predicates.len != 0 or source.access_or_predicates.len != 0 or source.access_not_predicates.len != 0) return error.UnsupportedRowsQuery;
+    if (source.expression_predicates.len != 0 or source.expression_or_predicates.len != 0 or source.expression_not_predicates.len != 0 or source.expression_array_contains.len != 0) return error.UnsupportedRowsQuery;
+    if (source.predicates.len > 1) return error.UnsupportedRowsQuery;
+    if (source.predicates.len == 1 and source.predicates[0].op != .eq) return error.UnsupportedRowsQuery;
+}
+
+fn lakeRowsAggregateProjectedColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    request: OwnedRowsAggregateRequest,
+) ![]const []const u8 {
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeLakeProjectedColumnList(alloc, &columns);
+
+    for (request.aggregations) |aggregation| {
+        if (aggregation.field) |field| try appendLakeProjectedColumnAlloc(alloc, &columns, field);
+    }
+    if (request.source.predicates.len == 1) {
+        try appendLakeProjectedColumnAlloc(alloc, &columns, request.source.predicates[0].field);
+    }
+    if (columns.items.len == 0) {
+        if (schema.relational_columns.len == 0) return error.InvalidRowsRequest;
+        try appendLakeProjectedColumnAlloc(alloc, &columns, schema.relational_columns[0].name);
+    }
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn appendLakeProjectedColumnAlloc(
+    alloc: std.mem.Allocator,
+    columns: *std.ArrayListUnmanaged([]const u8),
+    field: []const u8,
+) !void {
+    if (field.len == 0) return error.InvalidRowsRequest;
+    for (columns.items) |existing| {
+        if (std.mem.eql(u8, existing, field)) return;
+    }
+    const owned = try alloc.dupe(u8, field);
+    errdefer alloc.free(owned);
+    try columns.append(alloc, owned);
+}
+
+fn freeLakeProjectedColumns(alloc: std.mem.Allocator, columns: []const []const u8) void {
+    for (columns) |column| alloc.free(@constCast(column));
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn freeLakeProjectedColumnList(
+    alloc: std.mem.Allocator,
+    columns: *std.ArrayListUnmanaged([]const u8),
+) void {
+    for (columns.items) |column| alloc.free(@constCast(column));
+    columns.deinit(alloc);
 }
 
 fn lakeRowsPredicateFromRowsPredicateAlloc(
@@ -3207,6 +3385,144 @@ fn writeLakeRowsCellJson(
             try writer.writeByte(']');
         },
     }
+}
+
+const LakeNumericFold = struct {
+    count: u64 = 0,
+    sum_i128: i128 = 0,
+    sum_f64: f64 = 0,
+    min_i64: i64 = 0,
+    max_i64: i64 = 0,
+    min_f64: f64 = 0,
+    max_f64: f64 = 0,
+    all_integral: bool = true,
+
+    fn addI64(self: *@This(), value: i64) !void {
+        if (self.count == 0) {
+            self.min_i64 = value;
+            self.max_i64 = value;
+            self.min_f64 = @floatFromInt(value);
+            self.max_f64 = @floatFromInt(value);
+        } else {
+            self.min_i64 = @min(self.min_i64, value);
+            self.max_i64 = @max(self.max_i64, value);
+            const as_float: f64 = @floatFromInt(value);
+            self.min_f64 = @min(self.min_f64, as_float);
+            self.max_f64 = @max(self.max_f64, as_float);
+        }
+        self.sum_i128 = try std.math.add(i128, self.sum_i128, @as(i128, value));
+        self.sum_f64 += @floatFromInt(value);
+        self.count += 1;
+    }
+
+    fn addF64(self: *@This(), value: f64) void {
+        if (self.count == 0) {
+            self.min_f64 = value;
+            self.max_f64 = value;
+        } else {
+            self.min_f64 = @min(self.min_f64, value);
+            self.max_f64 = @max(self.max_f64, value);
+        }
+        self.sum_f64 += value;
+        self.count += 1;
+        self.all_integral = false;
+    }
+};
+
+fn writeLakeRowsAggregateValueJson(
+    writer: *std.Io.Writer,
+    aggregation: db_mod.types.RelationalRowsAggregateSpec,
+    result: lake_rows.ScanResult,
+) !void {
+    switch (aggregation.op) {
+        .count => {
+            const field = aggregation.field orelse {
+                const total = if (result.total == 0 and result.rows.len != 0) @as(u32, @intCast(result.rows.len)) else result.total;
+                try writer.print("{d}", .{total});
+                return;
+            };
+            var count: u64 = 0;
+            for (result.rows) |row| {
+                if ((try lakeRowsAggregateCellValue(row, field)) != null) count += 1;
+            }
+            try writer.print("{d}", .{count});
+        },
+        .sum, .min, .max, .avg => {
+            const field = aggregation.field orelse return error.InvalidRowsRequest;
+            const fold = try lakeRowsNumericFold(result.rows, field);
+            switch (aggregation.op) {
+                .sum => {
+                    if (fold.all_integral) {
+                        try writer.print("{d}", .{fold.sum_i128});
+                    } else {
+                        try std.json.Stringify.value(fold.sum_f64, .{}, writer);
+                    }
+                },
+                .min => try writeLakeNumericExtremumJson(writer, fold, .min),
+                .max => try writeLakeNumericExtremumJson(writer, fold, .max),
+                .avg => {
+                    if (fold.count == 0) {
+                        try writer.writeAll("null");
+                    } else {
+                        const average = fold.sum_f64 / @as(f64, @floatFromInt(fold.count));
+                        try std.json.Stringify.value(average, .{}, writer);
+                    }
+                },
+                else => unreachable,
+            }
+        },
+        else => return error.UnsupportedRowsQuery,
+    }
+}
+
+const LakeExtremum = enum { min, max };
+
+fn writeLakeNumericExtremumJson(
+    writer: *std.Io.Writer,
+    fold: LakeNumericFold,
+    extremum: LakeExtremum,
+) !void {
+    if (fold.count == 0) {
+        try writer.writeAll("null");
+        return;
+    }
+    if (fold.all_integral) {
+        const value = switch (extremum) {
+            .min => fold.min_i64,
+            .max => fold.max_i64,
+        };
+        try writer.print("{d}", .{value});
+    } else {
+        const value = switch (extremum) {
+            .min => fold.min_f64,
+            .max => fold.max_f64,
+        };
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+}
+
+fn lakeRowsNumericFold(
+    rows: []const lake_rows.ProjectedRow,
+    field: []const u8,
+) !LakeNumericFold {
+    var fold = LakeNumericFold{};
+    for (rows) |row| {
+        const value = (try lakeRowsAggregateCellValue(row, field)) orelse continue;
+        switch (value) {
+            .i64 => |number| try fold.addI64(number),
+            .f64 => |number| fold.addF64(number),
+            else => return error.UnsupportedRowsQuery,
+        }
+    }
+    return fold;
+}
+
+fn lakeRowsAggregateCellValue(
+    row: lake_rows.ProjectedRow,
+    field: []const u8,
+) !?lake_rows.CellValue {
+    const cell = row.find(field) orelse return error.RowSourceColumnNotFound;
+    return cell.value;
 }
 
 fn executeRowsQueryOnJsonRowsAcrossRangesAlloc(
@@ -16043,6 +16359,93 @@ test "relational rows lake bridge formats projected cells as public rows result"
     try std.testing.expectEqual(@as(u32, 3), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"amount\":20,\"active\":true,\"attrs\":{\"tier\":\"gold\"}}", result.rows[0]);
+}
+
+test "relational rows lake bridge lowers supported aggregate to scan request" {
+    const alloc = std.testing.allocator;
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "tenant", .path = "tenant", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+    const predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "tenant",
+        .op = .eq,
+        .value_json = "\"t2\"",
+    }};
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "count_all", .op = .count },
+        .{ .name = "sum_amount", .op = .sum, .field = "amount" },
+        .{ .name = "latest_created_at", .op = .max, .field = "created_at" },
+    };
+    const request = OwnedRowsAggregateRequest{
+        .source = .{ .predicates = &predicates },
+        .aggregations = &aggregations,
+    };
+
+    var lake_request = try buildLakeRowsScanRequestForRowsAggregateAlloc(alloc, schema, request);
+    defer lake_request.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), lake_request.request.projected_columns.len);
+    try std.testing.expectEqualStrings("amount", lake_request.request.projected_columns[0]);
+    try std.testing.expectEqualStrings("created_at", lake_request.request.projected_columns[1]);
+    try std.testing.expectEqualStrings("tenant", lake_request.request.projected_columns[2]);
+    try std.testing.expect(lake_request.request.limit == null);
+    try std.testing.expect(lake_request.request.predicate != null);
+    try std.testing.expectEqual(lake_rows.PredicateOp.eq_bytes, lake_request.request.predicate.?.op);
+    try std.testing.expectEqualStrings("tenant", lake_request.request.predicate.?.column);
+    try std.testing.expectEqualStrings("t2", lake_request.request.predicate.?.bytes_value);
+}
+
+test "relational rows lake bridge folds projected rows as aggregate result" {
+    const alloc = std.testing.allocator;
+    const amount_name = @constCast("amount"[0..]);
+    var cells_0 = [_]lake_rows.ProjectedCell{.{ .name = amount_name, .value = .{ .i64 = 10 } }};
+    var cells_1 = [_]lake_rows.ProjectedCell{.{ .name = amount_name, .value = .{ .i64 = 20 } }};
+    var cells_2 = [_]lake_rows.ProjectedCell{.{ .name = amount_name, .value = null }};
+    var projected = [_]lake_rows.ProjectedRow{
+        .{ .row_ref = .{ .relational_key = "row:1" }, .cells = &cells_0 },
+        .{ .row_ref = .{ .relational_key = "row:2" }, .cells = &cells_1 },
+        .{ .row_ref = .{ .relational_key = "row:3" }, .cells = &cells_2 },
+    };
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "count_all", .op = .count },
+        .{ .name = "count_amount", .op = .count, .field = "amount" },
+        .{ .name = "sum_amount", .op = .sum, .field = "amount" },
+        .{ .name = "min_amount", .op = .min, .field = "amount" },
+        .{ .name = "max_amount", .op = .max, .field = "amount" },
+        .{ .name = "avg_amount", .op = .avg, .field = "amount" },
+    };
+    const request = OwnedRowsAggregateRequest{ .aggregations = &aggregations };
+
+    var result = try buildRowsAggregateResultFromLakeRowsAlloc(alloc, request, .{
+        .rows = &projected,
+        .total = 3,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.rows[0], .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 3), object.get("count_all").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), object.get("count_amount").?.integer);
+    try std.testing.expectEqual(@as(i64, 30), object.get("sum_amount").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), object.get("min_amount").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), object.get("max_amount").?.integer);
+    const avg_amount = object.get("avg_amount").?;
+    switch (avg_amount) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 15), value),
+        .float => |value| try std.testing.expectApproxEqAbs(@as(f64, 15), value, 0.000001),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "relational rows batch derives deterministic physical primary keys" {
