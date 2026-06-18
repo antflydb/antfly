@@ -623,6 +623,90 @@ func TestHAClientWithTokenCanChangeAndClearBearerAuth(t *testing.T) {
 	}
 }
 
+func TestHAClientStatusWrappersExposeLagAndRetention(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want %s", r.Method, http.MethodGet)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("Accept = %q, want application/json", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case HAPrimaryStatusPath:
+			query := r.URL.Query()
+			syncStandbys := query["sync_standby"]
+			if query.Get("max_lag_lsn") != "8" ||
+				query.Get("max_retained_bytes") != "1024" ||
+				query.Get("max_retained_age_ns") != "5000" ||
+				query.Get("sync_mode") != "remote-write" ||
+				query.Get("sync_selection") != "any" ||
+				query.Get("sync_required") != "1" ||
+				query.Get("sync_failure") != "fail-closed" ||
+				len(syncStandbys) != 1 ||
+				syncStandbys[0] != "standby-a" {
+				t.Fatalf("primary status query = %s, want retention and sync policy params", r.URL.RawQuery)
+			}
+			_, _ = fmt.Fprint(w, haPrimaryStatusResponseJSON())
+		case HAStandbyStatusPath:
+			if got := r.URL.Query().Get("upstream_lsn"); got != "20" {
+				t.Fatalf("standby upstream_lsn = %q, want 20", got)
+			}
+			_, _ = fmt.Fprint(w, haStandbyStatusResponseJSON())
+		default:
+			t.Fatalf("path = %s, want HA status endpoint", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHAClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatalf("NewHAClient returned error: %v", err)
+	}
+	client.WithToken("test-token")
+
+	primary, err := client.PrimaryStatus(context.Background(), &HAPrimaryStatusParams{
+		MaxLagLsn:        8,
+		MaxRetainedBytes: 1024,
+		MaxRetainedAgeNs: 5000,
+		SyncMode:         HAPrimaryStatusSyncModeRemoteWrite,
+		SyncSelection:    HAPrimaryStatusSyncSelectionAny,
+		SyncRequired:     1,
+		SyncStandby:      []string{"standby-a"},
+		SyncFailure:      HAPrimaryStatusSyncFailureFailClosed,
+	})
+	if err != nil {
+		t.Fatalf("PrimaryStatus returned error: %v", err)
+	}
+	if primary.Snapshot.Retention.RetainedLsnCount != 8 ||
+		primary.Snapshot.Retention.RetainedByteCount != 1024 ||
+		primary.Snapshot.Slots[0].RetentionLagLsn != 8 ||
+		primary.Snapshot.Slots[0].WriteLagLsn != 2 ||
+		primary.Snapshot.Durability.Mode != HADurabilityModeRemoteWrite {
+		t.Fatalf("primary status = %#v, want retention, lag, and remote_write durability evidence", primary.Snapshot)
+	}
+
+	standby, err := client.StandbyStatus(context.Background(), &HAStandbyStatusParams{UpstreamLsn: 20})
+	if err != nil {
+		t.Fatalf("StandbyStatus returned error: %v", err)
+	}
+	if standby.Snapshot.UpstreamLsn != 20 ||
+		standby.Snapshot.WriteLagLsn != 2 ||
+		standby.Snapshot.ReceiveLagLsn != 2 ||
+		standby.Snapshot.ApplyLagLsn != 3 ||
+		standby.Snapshot.UnappliedLsnCount != 1 ||
+		!standby.Snapshot.CanServeSafeReads ||
+		standby.Snapshot.CaughtUpToReceived {
+		t.Fatalf("standby status = %#v, want lag and freshness evidence", standby.Snapshot)
+	}
+}
+
 func TestHAClientPublicAPIDoesNotExposeGeneratedClient(t *testing.T) {
 	t.Parallel()
 
@@ -2365,6 +2449,90 @@ func haFenceAcquireResponseJSON() string {
 			"forced":false,
 			"token":"ha-fence-token",
 			"reason":"LeaseAcquired"
+		}
+	}`
+}
+
+func haPrimaryStatusResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"snapshot":{
+			"role":"primary",
+			"node_id":"primary-a",
+			"identity":{
+				"cluster_id":100,
+				"shard_id":10,
+				"table_id":20,
+				"timeline_id":4,
+				"epoch":6
+			},
+			"current_lsn":20,
+			"retention":{
+				"primary_lsn":20,
+				"oldest_restart_lsn":12,
+				"retained_lsn_count":8,
+				"retained_byte_count":1024,
+				"retained_age_ns":5000,
+				"active_slots":1,
+				"reseed_recommended":0
+			},
+			"durability":{
+				"status":"satisfied",
+				"mode":"remote_write",
+				"selection":"any",
+				"target_lsn":20,
+				"progress_lsn":20,
+				"missing_lsn_count":0,
+				"satisfied_count":1,
+				"required_count":1,
+				"candidate_count":1
+			},
+			"slots":[{
+				"name":"standby-a",
+				"timeline_id":4,
+				"active":true,
+				"reseed_required":false,
+				"restart_lsn":12,
+				"received_lsn":18,
+				"applied_lsn":17,
+				"safe_read_lsn":17,
+				"write_lag_lsn":2,
+				"apply_lag_lsn":3,
+				"safe_read_lag_lsn":3,
+				"retention_lag_lsn":8,
+				"status":"healthy"
+			}]
+		}
+	}`
+}
+
+func haStandbyStatusResponseJSON() string {
+	return `{
+		"schema_version":1,
+		"snapshot":{
+			"role":"standby",
+			"node_id":"standby-a",
+			"identity":{
+				"cluster_id":100,
+				"shard_id":10,
+				"table_id":20,
+				"timeline_id":4,
+				"epoch":6
+			},
+			"received_lsn":18,
+			"applied_lsn":17,
+			"safe_read_lsn":17,
+			"upstream_lsn":20,
+			"write_lag_lsn":2,
+			"receive_lag_lsn":2,
+			"apply_lag_lsn":3,
+			"unapplied_lsn_count":1,
+			"caught_up_to_received":false,
+			"can_serve_safe_reads":true,
+			"last_attempt_ns":1000,
+			"last_success_ns":900,
+			"replication_failures_total":1,
+			"last_error":"transient pull timeout"
 		}
 	}`
 }
